@@ -90,3 +90,39 @@ fn blocks_absent_from_the_svd_are_absent_from_the_table() {
     // The flash MMU table has no SVD description: `soc-esp32c3` models it by hand.
     assert_eq!(lookup(0x600C_5000), None);
 }
+
+#[test]
+fn addr_resolves_names_to_the_addresses_the_reports_measured() {
+    use crate::esp32c3::addr;
+    assert_eq!(addr("UART0", "FIFO"), 0x6000_0000);
+    assert_eq!(addr("EXTMEM", "ICACHE_SYNC_CTRL"), 0x600C_4028); // CM §2
+    assert_eq!(addr("SHA", "M_MEM0"), 0x6003_B080); // FB §B.7
+    assert_eq!(addr("SPI1", "W0"), 0x6000_2058); // FB §B.6
+    assert_eq!(addr("RNG", "DATA"), 0x6002_60B0); // BA §2 row 88
+    assert_eq!(addr("TIMG0", "RTCCALICFG"), 0x6001_F068); // BA §9
+}
+
+#[test]
+fn addr_is_usable_in_a_constant() {
+    const STRAP_OFFSET: u32 =
+        crate::esp32c3::addr("GPIO", "STRAP") - crate::esp32c3::addr("GPIO", "BT_SELECT");
+    assert_eq!(STRAP_OFFSET, 0x38);
+}
+
+#[test]
+fn find_returns_the_whole_entry_or_none() {
+    let reg = crate::esp32c3::find("SPI1", "CTRL").unwrap();
+    assert_eq!(
+        (reg.addr, reg.reset_value, reg.reset_explicit),
+        (0x6000_2008, 0x002C_A000, true)
+    );
+    assert!(crate::esp32c3::find("SPI1", "NOPE").is_none());
+    assert!(crate::esp32c3::find("NOPE", "CTRL").is_none());
+}
+
+#[test]
+#[should_panic(expected = "no such register in the ESP32-C3 SVD")]
+fn addr_of_an_unknown_register_panics_when_evaluated_at_run_time() {
+    let name = std::hint::black_box("NOPE");
+    let _ = crate::esp32c3::addr("SPI1", name);
+}

@@ -72,7 +72,7 @@ mod tests {
     use super::*;
     use emu_core::Peripheral;
 
-    const UART0: u32 = 0x6000_0000;
+    const UART0: u32 = svd_regs::esp32c3::addr("UART0", "FIFO");
 
     #[test]
     fn bytes_written_to_the_fifo_come_out_in_order_and_only_once() {

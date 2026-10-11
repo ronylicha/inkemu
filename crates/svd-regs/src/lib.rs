@@ -43,6 +43,56 @@ pub mod esp32c3 {
     pub fn registers() -> &'static [RegisterInfo] {
         &REGISTERS
     }
+
+    const fn same(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    const fn position(peripheral: &str, name: &str) -> Option<usize> {
+        let mut i = 0;
+        while i < REGISTERS.len() {
+            if same(REGISTERS[i].peripheral, peripheral) && same(REGISTERS[i].name, name) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Absolute address of the register `peripheral.name`.
+    ///
+    /// Meant for constants: `const CMD: u32 = addr("SPI1", "CMD") - SPI1_BASE;`. There, a name the
+    /// SVD does not contain stops the build.
+    ///
+    /// # Panics
+    /// When the SVD has no such register (at compile time in a `const`).
+    #[must_use]
+    pub const fn addr(peripheral: &str, name: &str) -> u32 {
+        match position(peripheral, name) {
+            Some(i) => REGISTERS[i].addr,
+            None => panic!("no such register in the ESP32-C3 SVD"),
+        }
+    }
+
+    /// The register `peripheral.name`, if the SVD documents it.
+    #[must_use]
+    pub fn find(peripheral: &str, name: &str) -> Option<&'static RegisterInfo> {
+        match position(peripheral, name) {
+            Some(i) => REGISTERS.get(i),
+            None => None,
+        }
+    }
 }
 
 #[cfg(test)]

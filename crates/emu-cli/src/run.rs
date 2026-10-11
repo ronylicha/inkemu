@@ -180,8 +180,8 @@ mod tests {
     use soc_esp32c3::test_support::{
         HANG, T0, T1, flat_rom, load_register, print_program, unmodeled_register,
     };
-    const UART0: u32 = 0x6000_0000;
-    const USB: u32 = 0x6004_3000;
+    const UART0: u32 = svd_regs::esp32c3::addr("UART0", "FIFO");
+    const USB: u32 = svd_regs::esp32c3::addr("USB_DEVICE", "EP1");
 
     fn machine(program: &[u32], options: MachineOptions) -> Esp32C3 {
         boards::builtin("x4")

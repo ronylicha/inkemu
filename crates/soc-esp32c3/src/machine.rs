@@ -159,6 +159,9 @@ mod tests {
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
     use emu_core::{AccessKind, AccessSize, Bus};
 
+    const UART0: u32 = svd_regs::esp32c3::addr("UART0", "FIFO");
+    const USB: u32 = svd_regs::esp32c3::addr("USB_DEVICE", "EP1");
+
     fn machine_with(program: &[u32], config: SocConfig) -> Esp32C3 {
         Esp32C3::new(flat_rom(program), &config)
     }
@@ -187,7 +190,7 @@ mod tests {
 
     #[test]
     fn starts_at_the_reset_vector_and_prints_through_uart0() {
-        let mut program = print(0x6000_0000, b"Hi");
+        let mut program = print(UART0, b"Hi");
         program.push(HANG);
         let mut m = machine(&program);
         assert_eq!(m.pc(), ROM_BASE);
@@ -204,7 +207,7 @@ mod tests {
 
     #[test]
     fn usb_serial_jtag_console_is_a_separate_channel() {
-        let mut program = print(0x6004_3000, b"ok");
+        let mut program = print(USB, b"ok");
         program.extend([addi(T1, 0, 1), sw(T1, T0, 4), HANG]);
         let mut m = machine(&program);
         m.run_until(Cycles(500));
@@ -395,8 +398,8 @@ mod tests {
             m.run_until(Cycles(2_000));
             (m.trace_hash().unwrap(), m.instructions(), m.cycles())
         };
-        let a = print(0x6000_0000, b"A");
-        let b = print(0x6000_0000, b"AB");
+        let a = print(UART0, b"A");
+        let b = print(UART0, b"AB");
         assert_eq!(run(&a), run(&a));
         assert_ne!(run(&a).0, run(&b).0);
         assert_eq!(machine(&a).trace_hash(), None, "off unless asked for");
