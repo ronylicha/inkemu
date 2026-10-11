@@ -1,11 +1,20 @@
 //! `inkemu run`: drives a machine and relays its console and diagnostics.
+use crate::exit::{EXIT_ERROR, EXIT_IDLE, EXIT_OK, EXIT_STRICT_MMIO};
 use emu_core::Cycles;
+use soc_esp32c3::diag::MAX_DISTINCT_DIAGNOSTICS;
 use soc_esp32c3::{ConsoleChannel, Esp32C3, StopReason};
 use std::io::{self, Write};
 
 /// Cycles executed between two flushes of the console and the diagnostics: a fraction of a second
 /// of host time, so output appears as the firmware prints it.
 const SLICE_CYCLES: u64 = 1_000_000;
+
+/// How many of the most repeated diagnostics the end-of-run summary lists.
+const MAX_REPEATED_SHOWN: usize = 3;
+
+/// Both consoles are drained every slice: the one that is not selected would otherwise grow without bound.
+const CONSOLE_CHANNELS: [ConsoleChannel; 2] =
+    [ConsoleChannel::Uart0, ConsoleChannel::UsbSerialJtag];
 
 #[derive(Clone, Copy, Debug)]
 pub struct RunOptions {
@@ -30,10 +39,10 @@ impl RunEnd {
     #[must_use]
     pub const fn exit_code(self) -> u8 {
         match self {
-            RunEnd::Budget | RunEnd::ConsoleClosed => 0,
-            RunEnd::ConsoleError => 2,
-            RunEnd::StrictMmio => 3,
-            RunEnd::Idle => 4,
+            RunEnd::Budget | RunEnd::ConsoleClosed => EXIT_OK,
+            RunEnd::ConsoleError => EXIT_ERROR,
+            RunEnd::StrictMmio => EXIT_STRICT_MMIO,
+            RunEnd::Idle => EXIT_IDLE,
         }
     }
 }
@@ -50,6 +59,37 @@ pub fn relay(out: &mut dyn Write, bytes: &[u8]) -> io::Result<bool> {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
         Err(e) => Err(e),
+    }
+}
+
+/// Takes the bytes of every console and relays those of `selected`; the others are discarded.
+fn relay_selected_console(
+    machine: &mut Esp32C3,
+    selected: ConsoleChannel,
+    console: &mut dyn Write,
+) -> io::Result<bool> {
+    let mut outcome = Ok(true);
+    for channel in CONSOLE_CHANNELS {
+        let bytes = machine.take_console(channel);
+        if channel == selected {
+            outcome = relay(console, &bytes);
+        }
+    }
+    outcome
+}
+
+/// Says what the firmware kept doing: the warnings list each diagnostic once, so a register polled
+/// a million times looks like a single line without this.
+fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
+    for (diagnostic, count) in machine.most_repeated_diagnostics(MAX_REPEATED_SHOWN) {
+        let _ = writeln!(log, "inkemu: repeated {count} times: {diagnostic}");
+    }
+    let suppressed = machine.suppressed_diagnostics();
+    if suppressed > 0 {
+        let _ = writeln!(
+            log,
+            "inkemu: {suppressed} further diagnostics were not listed (more than {MAX_DISTINCT_DIAGNOSTICS} distinct)"
+        );
     }
 }
 
@@ -70,24 +110,33 @@ pub fn execute(
             .max_cycles
             .map_or(slice_end, |max| max.min(slice_end));
         let stop = machine.run_until(Cycles(limit));
-        let console_open = relay(console, &machine.take_console(options.console));
+        let console_open = relay_selected_console(machine, options.console, console);
+        // The stop line carries the violation: listing it as a warning too would print it twice.
+        let violation = match &stop {
+            StopReason::StrictMmio(diagnostic) => Some(diagnostic),
+            _ => None,
+        };
         for diagnostic in machine.drain_diagnostics() {
-            // A failing log writer must not hide the run's outcome: there is nowhere left to report it.
-            let _ = writeln!(log, "warning: {diagnostic}");
+            if Some(&diagnostic) != violation {
+                // A failing log writer must not hide the run's outcome: there is nowhere left to report it.
+                let _ = writeln!(log, "warning: {diagnostic}");
+            }
+        }
+        // A failure to write the console is logged whatever else ended the run in the same slice.
+        if let Err(e) = &console_open {
+            let _ = writeln!(
+                log,
+                "error: cannot write the console output: {e}; check where stdout is redirected"
+            );
         }
         match (console_open, stop) {
-            (Ok(false), _) => break RunEnd::ConsoleClosed,
-            (Err(e), _) => {
-                let _ = writeln!(
-                    log,
-                    "error: cannot write the console output: {e}; check where stdout is redirected"
-                );
-                break RunEnd::ConsoleError;
-            }
-            (Ok(true), StopReason::StrictMmio(diagnostic)) => {
+            // `--strict-mmio` exists for CI: its exit code must not depend on the state of the console.
+            (_, StopReason::StrictMmio(diagnostic)) => {
                 let _ = writeln!(log, "inkemu: stopped by --strict-mmio: {diagnostic}");
                 break RunEnd::StrictMmio;
             }
+            (Ok(false), _) => break RunEnd::ConsoleClosed,
+            (Err(_), _) => break RunEnd::ConsoleError,
             (Ok(true), StopReason::Idle) => {
                 let _ = writeln!(
                     log,
@@ -116,6 +165,7 @@ pub fn execute(
         machine.cycles().get(),
         machine.instructions()
     );
+    summarize_diagnostics(machine, log);
     if let Some(hash) = machine.trace_hash() {
         let _ = writeln!(log, "trace-hash {hash:016x}");
     }
@@ -126,10 +176,10 @@ pub fn execute(
 mod tests {
     use super::*;
     use boards::MachineOptions;
-    use cpu_rv32::asm::{addi, lui, lw, sw, wfi};
-    use soc_esp32c3::test_support::flat_rom;
-
-    const HANG: u32 = 0x0000_006f;
+    use cpu_rv32::asm::{addi, jal, sw, wfi};
+    use soc_esp32c3::test_support::{
+        HANG, T0, T1, flat_rom, load_register, print_program, unmodeled_register,
+    };
     const UART0: u32 = 0x6000_0000;
     const USB: u32 = 0x6004_3000;
 
@@ -139,13 +189,20 @@ mod tests {
             .instantiate(flat_rom(program), options)
     }
     fn printing(base: u32, text: &[u8], tail: &[u32]) -> Vec<u32> {
-        let mut program = vec![lui(5, base)];
-        for &byte in text {
-            program.extend([addi(6, 0, i32::from(byte)), sw(6, 5, 0)]);
-        }
+        let mut program = print_program(base, text);
         program.extend_from_slice(tail);
         program
     }
+    /// A program that reads the unmodelled register once, then parks.
+    fn reading_unmodeled_register() -> Vec<u32> {
+        let mut program = load_register(unmodeled_register().addr).to_vec();
+        program.push(HANG);
+        program
+    }
+    const STRICT: MachineOptions = MachineOptions {
+        strict_mmio: true,
+        trace_hash: false,
+    };
     fn options(max_cycles: u64) -> RunOptions {
         RunOptions {
             max_cycles: Some(max_cycles),
@@ -154,13 +211,6 @@ mod tests {
     }
     fn text(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
-    }
-    fn ledc_register() -> u32 {
-        svd_regs::esp32c3::registers()
-            .iter()
-            .find(|r| r.peripheral == "LEDC")
-            .unwrap()
-            .addr
     }
 
     #[test]
@@ -199,7 +249,7 @@ mod tests {
 
     #[test]
     fn selected_console_channel_is_the_one_printed() {
-        let program = printing(USB, b"usb", &[addi(6, 0, 1), sw(6, 5, 4), HANG]);
+        let program = printing(USB, b"usb", &[addi(T1, 0, 1), sw(T1, T0, 4), HANG]);
         let mut m = machine(&program, MachineOptions::default());
         let (mut console, mut log) = (Vec::new(), Vec::new());
         execute(
@@ -216,10 +266,7 @@ mod tests {
 
     #[test]
     fn unmodeled_access_is_a_named_warning_and_the_run_goes_on() {
-        let mut m = machine(
-            &[lui(5, ledc_register()), lw(6, 5, 0), HANG],
-            MachineOptions::default(),
-        );
+        let mut m = machine(&reading_unmodeled_register(), MachineOptions::default());
         let (mut console, mut log) = (Vec::new(), Vec::new());
         assert_eq!(
             execute(&mut m, &options(10_000), &mut console, &mut log),
@@ -228,17 +275,40 @@ mod tests {
         let log = text(&log);
         assert_eq!(log.matches("warning: ").count(), 1, "{log}");
         assert!(log.contains("LEDC") && log.contains("0x40000004"), "{log}");
+        assert!(
+            !log.contains("repeated"),
+            "a single access is not summarized as repeated: {log}"
+        );
+    }
+
+    #[test]
+    fn a_register_the_firmware_keeps_polling_is_summarized_with_its_count() {
+        // lui, lw, then `jal -4` back to the lw: the same unmodelled read, over and over.
+        let mut program = load_register(unmodeled_register().addr).to_vec();
+        program.push(jal(0, -4));
+        let mut m = machine(&program, MachineOptions::default());
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        execute(&mut m, &options(10_000), &mut console, &mut log);
+        let log = text(&log);
+        assert_eq!(log.matches("warning: ").count(), 1, "{log}");
+        let repeated: Vec<&str> = log
+            .lines()
+            .filter(|l| l.starts_with("inkemu: repeated "))
+            .collect();
+        assert_eq!(repeated.len(), 1, "{log}");
+        assert!(repeated[0].contains("LEDC."), "{}", repeated[0]);
+        let count: u64 = repeated[0]
+            .trim_start_matches("inkemu: repeated ")
+            .split(' ')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("a count");
+        assert!(count > 1, "{}", repeated[0]);
     }
 
     #[test]
     fn strict_mode_ends_with_its_own_exit_code_and_names_the_register() {
-        let mut m = machine(
-            &[lui(5, ledc_register()), lw(6, 5, 0), HANG],
-            MachineOptions {
-                strict_mmio: true,
-                trace_hash: false,
-            },
-        );
+        let mut m = machine(&reading_unmodeled_register(), STRICT);
         let (mut console, mut log) = (Vec::new(), Vec::new());
         let end = execute(&mut m, &options(10_000), &mut console, &mut log);
         assert_eq!((end, end.exit_code()), (RunEnd::StrictMmio, 3));
@@ -246,6 +316,42 @@ mod tests {
         assert!(
             log.contains("--strict-mmio") && log.contains("LEDC"),
             "{log}"
+        );
+        assert_eq!(
+            log.matches("LEDC").count(),
+            1,
+            "the violation is printed once, in the stop line: {log}"
+        );
+        assert!(!log.contains("warning:"), "{log}");
+    }
+
+    #[test]
+    fn a_strict_stop_wins_over_a_console_whose_reader_went_away() {
+        // The console has bytes to relay in the very slice that hits the violation.
+        let program = printing(UART0, b"x", &reading_unmodeled_register());
+        let mut m = machine(&program, STRICT);
+        let mut log = Vec::new();
+        let end = execute(&mut m, &options(10_000), &mut Closed, &mut log);
+        assert_eq!((end, end.exit_code()), (RunEnd::StrictMmio, 3));
+        assert!(
+            text(&log).contains("stopped by --strict-mmio"),
+            "{}",
+            text(&log)
+        );
+    }
+
+    #[test]
+    fn the_console_that_is_not_selected_is_drained_too() {
+        let mut program = printing(USB, b"jtag", &[addi(T1, 0, 1), sw(T1, T0, 4)]);
+        program.extend(printing(UART0, b"uart", &[HANG]));
+        let mut m = machine(&program, MachineOptions::default());
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        execute(&mut m, &options(10_000), &mut console, &mut log);
+        assert_eq!(console, b"uart");
+        assert_eq!(
+            m.take_console(ConsoleChannel::UsbSerialJtag),
+            Vec::<u8>::new(),
+            "the USB-Serial-JTAG bytes were discarded, not kept"
         );
     }
 

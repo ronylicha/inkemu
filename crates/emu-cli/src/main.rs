@@ -2,11 +2,11 @@
 use boards::{DeviceProfile, MachineOptions};
 use clap::{Parser, Subcommand};
 use cpu_rv32::{HartConfig, MisalignedPolicy};
-use emu_cli::rom_store::{
-    self, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource, RomStoreError,
-};
+use emu_cli::exit::{EXIT_ERROR, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
+use emu_cli::rom_store::{self, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource};
 use emu_cli::run::{RunOptions, execute, relay};
 use emu_cli::rvtest::{RunResult, TestMachine};
+use emu_cli::term::sanitize;
 use soc_esp32c3::ConsoleChannel;
 use std::fmt::Write as _;
 use std::io;
@@ -14,8 +14,6 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const EXIT_FAIL: u8 = 1;
-const EXIT_ERROR: u8 = 2;
 /// Size granularity of the download notice: 0.1 MB (decimal megabytes).
 const TENTH_OF_A_MEGABYTE: u64 = 100_000;
 
@@ -50,14 +48,16 @@ enum Command {
     /// Describe a firmware image and check that inkemu can load it.
     Inspect { file: PathBuf },
     /// Boot a device from its mask ROM and print its console.
+    #[command(after_help = RUN_EXIT_CODES_HELP)]
     Run {
-        /// Device profile: x4 or x3.
+        /// Device profile id; an unknown id prints the available ones.
         #[arg(long)]
         device: String,
         /// Stop when the CPU has executed this many clock cycles.
         #[arg(long)]
         max_cycles: Option<u64>,
-        /// Stop at the first access to a register the emulator does not model (exit code 3).
+        /// Stop at the first access to a register the emulator does not model, or the first 8/16-bit
+        /// write to a peripheral register (exit code 3).
         #[arg(long)]
         strict_mmio: bool,
         /// Which console of the device goes to standard output.
@@ -177,24 +177,23 @@ fn print_stdout(text: &str) -> ControlFlow<ExitCode> {
 fn profile_for(id: &str) -> Result<DeviceProfile, boards::ProfileError> {
     boards::builtin(id).map_err(|e| match e {
         boards::ProfileError::UnknownDevice { id, known } => boards::ProfileError::UnknownDevice {
-            id: emu_cli::inspect::sanitize(&id),
+            id: sanitize(&id),
             known,
         },
         other @ boards::ProfileError::Parse { .. } => other,
     })
 }
 
-/// `--rom-dir`, or else the per-user cache directory.
-fn rom_directory(rom_dir: Option<PathBuf>) -> Result<PathBuf, RomStoreError> {
-    rom_dir.map_or_else(rom_store::default_cache_dir, Ok)
-}
-
-/// Says on standard error that `entry` is about to be downloaded, when the cache does not hold it yet.
-fn announce_download(source: &RomSource<'_>, entry: &RomEntry) {
+/// Says on standard error that the archive is about to be downloaded, when the cache lacks at least
+/// one of `entries`. It is said once however many files are missing: the archive is downloaded once.
+fn announce_download(source: &RomSource<'_>, entries: &[&RomEntry]) {
     let RomSource::Cache { dir, .. } = source else {
         return;
     };
-    if dir.join(entry.elf_name).exists() {
+    if entries
+        .iter()
+        .all(|entry| dir.join(entry.elf_name).exists())
+    {
         return;
     }
     // Tenths of a megabyte, in integers: the size is only shown to one decimal.
@@ -204,7 +203,7 @@ fn announce_download(source: &RomSource<'_>, entry: &RomEntry) {
         ESP_ROM_ELFS.release,
         tenths / 10,
         tenths % 10,
-        emu_cli::inspect::sanitize(&dir.display().to_string())
+        sanitize(&dir.display().to_string())
     );
 }
 
@@ -223,10 +222,10 @@ fn run_device(
     // An explicit directory is read only; without one the cache downloads on first use.
     let source = match rom_dir {
         Some(dir) => Ok(RomSource::Directory(dir)),
-        None => rom_directory(None).map(|dir| RomSource::Cache { dir, fetch: &fetch }),
+        None => rom_store::default_cache_dir().map(|dir| RomSource::Cache { dir, fetch: &fetch }),
     };
     let rom = source.and_then(|source| {
-        announce_download(&source, entry);
+        announce_download(&source, &[entry]);
         rom_store::load_rom(&source, &ESP_ROM_ELFS, entry)
     });
     let rom = match rom {
@@ -267,25 +266,28 @@ fn run_rom_fetch(device: Option<&str>, all: bool, rom_dir: Option<PathBuf>) -> E
             Ok(profile) => vec![rom_store::rom_entry_for(profile.chip_revision)],
             Err(e) => return fail(&e),
         },
-        _ => ESP32C3_ROMS.iter().collect(),
+        (None, true) => ESP32C3_ROMS.iter().collect(),
+        // clap already refuses these; refusing again keeps `--all`'s download from being the default.
+        (Some(_), true) | (None, false) => return fail(&"pass either --device <id> or --all"),
     };
     let fetch = HttpFetch;
-    let dir = match rom_directory(rom_dir) {
+    let dir = match rom_dir.map_or_else(rom_store::default_cache_dir, Ok) {
         Ok(dir) => dir,
         Err(e) => return fail(&e),
     };
-    let source = RomSource::Cache {
-        dir: dir.clone(),
-        fetch: &fetch,
-    };
+    let source = RomSource::Cache { dir, fetch: &fetch };
+    announce_download(&source, &entries);
+    if let Err(e) = rom_store::ensure_elfs(&source, &ESP_ROM_ELFS, &entries) {
+        return fail(&e);
+    }
     for entry in entries {
-        announce_download(&source, entry);
+        // Every file is present now; loading it also checks the hash of the image built from it.
         if let Err(e) = rom_store::load_rom(&source, &ESP_ROM_ELFS, entry) {
             return fail(&e);
         }
         let line = format!(
             "{}\n",
-            emu_cli::inspect::sanitize(&dir.join(entry.elf_name).display().to_string())
+            sanitize(&source.dir().join(entry.elf_name).display().to_string())
         );
         if let ControlFlow::Break(code) = print_stdout(&line) {
             return code;
@@ -295,7 +297,7 @@ fn run_rom_fetch(device: Option<&str>, all: bool, rom_dir: Option<PathBuf>) -> E
 }
 
 fn run_inspect(path: &Path) -> ExitCode {
-    let shown = emu_cli::inspect::sanitize(&path.display().to_string());
+    let shown = sanitize(&path.display().to_string());
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -383,7 +385,7 @@ fn run_rvtest(
         }
         RunResult::Failed { test_number } => {
             println!("FAILED at test #{test_number}");
-            ExitCode::from(EXIT_FAIL)
+            ExitCode::from(EXIT_TEST_FAILURE)
         }
         RunResult::Timeout => {
             eprintln!(

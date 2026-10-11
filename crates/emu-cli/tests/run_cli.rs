@@ -1,6 +1,6 @@
 //! `inkemu run` and `inkemu rom fetch` through the real binary. Nothing here touches the network or the
 //! default ROM cache: every run names its ROM directory.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
 use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
@@ -50,7 +50,28 @@ fn tampered_rom_is_refused_before_anything_runs() {
         .assert()
         .code(2)
         .stdout(predicate::str::is_empty())
-        .stderr(contains("expected sha256 19ac22e0").and(contains("got ")));
+        .stderr(
+            contains("expected sha256 19ac22e0")
+                .and(contains("got "))
+                .and(contains("rom fetch"))
+                .and(contains("download it again").not()),
+        );
+}
+
+#[test]
+fn run_help_lists_every_exit_code() {
+    let help = inkemu().args(["run", "--help"]).assert().success();
+    let out = String::from_utf8_lossy(&help.get_output().stdout).into_owned();
+    for code in ["0", "2", "3", "4"] {
+        assert!(
+            out.contains(&format!("\n  {code}  ")),
+            "exit code {code} missing from:\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("x4 or x3"),
+        "the help must not enumerate device ids:\n{out}"
+    );
 }
 
 #[test]
@@ -123,4 +144,37 @@ fn x4_boots_the_real_rom_to_its_banner() {
     };
     assert!(hash(&first).is_some());
     assert_eq!(hash(&first), hash(&run()));
+}
+
+/// The command the `rom-boot` CI job and the README recommend, on ROM files that are already there:
+/// no download, one line per file.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rom_fetch_all_prints_one_path_per_rom_and_downloads_nothing_when_they_are_present() {
+    let source = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let names = [
+        "esp32c3_rev0_rom.elf",
+        "esp32c3_rev3_rom.elf",
+        "esp32c3_rev101_rom.elf",
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    for name in names {
+        std::fs::copy(
+            std::path::Path::new(&source).join(name),
+            dir.path().join(name),
+        )
+        .unwrap();
+    }
+    let assert = inkemu()
+        .args(["rom", "fetch", "--all", "--rom-dir"])
+        .arg(dir.path())
+        .assert()
+        .code(0)
+        .stderr(contains("downloading").not());
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    for (line, name) in lines.iter().zip(names) {
+        assert!(line.ends_with(name), "{line} should end with {name}");
+    }
 }

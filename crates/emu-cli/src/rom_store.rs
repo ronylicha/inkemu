@@ -6,17 +6,19 @@
 //! - the archive hash is checked before anything is decompressed;
 //! - no path taken from the archive is ever written to disk: only the entry whose name is exactly the
 //!   expected one is read, into memory;
-//! - the cache is written to a temporary file and renamed into place;
-//! - a cached file whose hash differs is reported, never loaded, replaced or deleted;
-//! - an explicit directory ([`RomSource::Directory`]) is never downloaded into.
+//! - the cache is written to a temporary file, created with `create_new` so a planted symlink is never
+//!   followed, and renamed into place;
+//! - a file already in the directory is read through a bound (a few MiB, regular files only) before it
+//!   is hashed; one whose hash differs is reported, never loaded, replaced or deleted;
+//! - an explicit directory ([`RomSource::Directory`]) is never downloaded into;
+//! - however many ROMs are missing, the archive is downloaded once ([`ensure_elfs`]).
 //!
 //! Sources: `docs/research/esp32c3-rom-elfs.md`, §2 (archive content, hashes) and §9 (image hashes).
-use crate::inspect::sanitize;
+use crate::term::sanitize;
 use etcetera::app_strategy::AppStrategy as _;
 use sha2::{Digest, Sha256};
 use soc_esp32c3::{ChipRevision, RomError, RomImage};
-use std::fmt::Write as _;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -101,14 +103,23 @@ pub enum RomStoreError {
         "the archive {url} holds no `{elf_name}`; the pinned release changed layout, report it and supply the ROM with --rom-dir meanwhile"
     )]
     MissingInArchive { url: String, elf_name: &'static str },
-    #[error(
-        "{path} is not the expected ROM (expected sha256 {expected}, got {found}); delete it to download it again, or point --rom-dir at a directory holding the genuine file"
-    )]
+    #[error("{path} is not the expected ROM (expected sha256 {expected}, got {found}); {remedy}")]
     ElfMismatch {
         path: String,
         expected: &'static str,
         found: String,
+        /// What to do about it: depends on whether the file sits in the cache, in a user directory
+        /// or came out of the downloaded archive.
+        remedy: String,
     },
+    #[error(
+        "{path} cannot be a ROM ELF ({reason}); replace it with the genuine file, or delete it and run `inkemu rom fetch`"
+    )]
+    UnsuitableFile { path: String, reason: String },
+    #[error(
+        "cannot read the verified archive {url}: {detail}; the pinned release does not have the expected layout: report it, and supply the ROM with --rom-dir meanwhile"
+    )]
+    Archive { url: String, detail: String },
     #[error(
         "{path} not found; --rom-dir must point at a directory holding the ROM ELF files of esp-rom-elfs release {release}"
     )]
@@ -175,6 +186,16 @@ pub enum RomSource<'a> {
     Directory(PathBuf),
 }
 
+impl RomSource<'_> {
+    /// The directory the ROM files are read from (and, for the cache, stored into).
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        match self {
+            RomSource::Cache { dir, .. } | RomSource::Directory(dir) => dir,
+        }
+    }
+}
+
 impl std::fmt::Debug for RomSource<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -222,10 +243,7 @@ pub fn default_cache_dir() -> Result<PathBuf, RomStoreError> {
     Ok(strategy.data_dir().join(CACHE_SUBDIR))
 }
 
-/// The verified bytes of the ROM ELF described by `entry`.
-///
-/// A file already in the directory is only read and checked; the cache downloads the pinned `archive`
-/// when the file is absent.
+/// The verified bytes of the ROM ELF described by `entry`: the one-entry case of [`ensure_elfs`].
 ///
 /// # Errors
 /// Any [`RomStoreError`] except `ImageMismatch` and `Rom`: a missing or mismatching file, a failed
@@ -235,25 +253,108 @@ pub fn load_elf(
     archive: &RomArchive,
     entry: &RomEntry,
 ) -> Result<Vec<u8>, RomStoreError> {
-    let (dir, fetch) = match source {
-        RomSource::Cache { dir, fetch } => (dir, Some(*fetch)),
-        RomSource::Directory(dir) => (dir, None),
+    let mut elfs = ensure_elfs(source, archive, &[entry])?;
+    let Some(elf) = elfs.pop() else {
+        // INVARIANT: `ensure_elfs` returns exactly one ELF per entry it is given.
+        unreachable!("ensure_elfs returned no ELF for one entry")
     };
-    let path = dir.join(entry.elf_name);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            check_elf(&bytes, entry, &path)?;
-            Ok(bytes)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fetch {
-            Some(fetch) => download(fetch, archive, entry, dir),
-            None => Err(RomStoreError::NotInDirectory {
-                path: shown(&path),
-                release: archive.release,
-            }),
-        },
-        Err(e) => Err(io_error("read", &path, &e)),
+    Ok(elf)
+}
+
+/// The verified bytes of every ROM ELF in `entries` (in the same order), downloading the pinned
+/// `archive` **once** when the cache lacks some of them.
+///
+/// 1. Every file already present is read and hash-checked first: a mismatch is returned at once,
+///    before any network access, and nothing is written.
+/// 2. When nothing is missing, that is all.
+/// 3. For a [`RomSource::Directory`] the first missing file is an error: that source never downloads.
+/// 4. For a [`RomSource::Cache`] the archive is fetched once, verified, and each missing ELF is
+///    extracted, hash-checked and stored.
+///
+/// # Errors
+/// The errors of [`load_elf`].
+pub fn ensure_elfs(
+    source: &RomSource<'_>,
+    archive: &RomArchive,
+    entries: &[&RomEntry],
+) -> Result<Vec<Vec<u8>>, RomStoreError> {
+    let mut elfs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        elfs.push(read_present(source, archive, entry)?);
     }
+    let Some(first_missing) = elfs.iter().position(Option::is_none) else {
+        return Ok(elfs.into_iter().flatten().collect());
+    };
+    let fetch = match source {
+        RomSource::Cache { fetch, .. } => *fetch,
+        RomSource::Directory(dir) => {
+            return Err(RomStoreError::NotInDirectory {
+                path: shown(&dir.join(entries[first_missing].elf_name)),
+                release: archive.release,
+            });
+        }
+    };
+    let body = download(fetch, archive, entries[first_missing])?;
+    for (slot, entry) in elfs.iter_mut().zip(entries) {
+        if slot.is_none() {
+            *slot = Some(extract_and_store(&body, archive, entry, source.dir())?);
+        }
+    }
+    Ok(elfs.into_iter().flatten().collect())
+}
+
+/// The ELF of `entry` when `source` already holds it (hash-checked); `None` when the file is absent.
+fn read_present(
+    source: &RomSource<'_>,
+    archive: &RomArchive,
+    entry: &RomEntry,
+) -> Result<Option<Vec<u8>>, RomStoreError> {
+    let path = source.dir().join(entry.elf_name);
+    let Some(bytes) = read_bounded(&path)? else {
+        return Ok(None);
+    };
+    let provenance = match source {
+        RomSource::Cache { .. } => Provenance::Cache,
+        RomSource::Directory(dir) => Provenance::Directory {
+            dir: shown(dir),
+            release: archive.release,
+        },
+    };
+    check_elf(&bytes, entry, &path, &provenance)?;
+    Ok(Some(bytes))
+}
+
+/// The content of the regular file at `path`, reading at most [`MAX_ELF_BYTES`] bytes; `None` when it
+/// does not exist. Anything that is not a regular file, or is longer than the bound, is refused without
+/// being hashed: the path may be a directory, a pipe that would block, or a huge file.
+fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, RomStoreError> {
+    let unsuitable = |reason: &str| RomStoreError::UnsuitableFile {
+        path: shown(path),
+        reason: reason.to_owned(),
+    };
+    // Checked before opening: opening a pipe would wait for a writer.
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => return Err(unsuitable("it is not a regular file")),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_error("read", path, &e)),
+    }
+    let file = std::fs::File::open(path).map_err(|e| io_error("read", path, &e))?;
+    let metadata = file.metadata().map_err(|e| io_error("read", path, &e))?;
+    if !metadata.is_file() {
+        return Err(unsuitable("it is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    // One byte past the bound, so a longer file is told from one of exactly the bound.
+    file.take(MAX_ELF_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_error("read", path, &e))?;
+    if bytes.len() as u64 > MAX_ELF_BYTES {
+        return Err(unsuitable(&format!(
+            "it is longer than the {MAX_ELF_BYTES} byte (4 MiB) limit of a ROM ELF"
+        )));
+    }
+    Ok(Some(bytes))
 }
 
 /// The ROM image built from the verified ELF, checked against the pinned image hash.
@@ -267,10 +368,7 @@ pub fn load_rom(
     entry: &RomEntry,
 ) -> Result<RomImage, RomStoreError> {
     let elf = load_elf(source, archive, entry)?;
-    let dir = match source {
-        RomSource::Cache { dir, .. } | RomSource::Directory(dir) => dir,
-    };
-    let path = shown(&dir.join(entry.elf_name));
+    let path = shown(&source.dir().join(entry.elf_name));
     let image = RomImage::from_elf(&elf).map_err(|source| RomStoreError::Rom {
         path: path.clone(),
         source,
@@ -286,12 +384,12 @@ pub fn load_rom(
     Ok(image)
 }
 
-/// Fetches the archive, verifies it, extracts the one expected ELF and stores it in `dir`.
+/// Fetches the pinned archive and verifies its size and hash. Which ELF the caller is after only
+/// shows in the error message of a failed download.
 fn download(
     fetch: &dyn Fetch,
     archive: &RomArchive,
-    entry: &RomEntry,
-    dir: &Path,
+    wanted: &RomEntry,
 ) -> Result<Vec<u8>, RomStoreError> {
     let body =
         fetch
@@ -299,7 +397,7 @@ fn download(
             .map_err(|detail| RomStoreError::Download {
                 url: archive.url.to_owned(),
                 detail: sanitize(&detail),
-                elf_name: entry.elf_name,
+                elf_name: wanted.elf_name,
             })?;
     // The hash is checked before the archive is decompressed: hostile data never reaches the decoder.
     let found = sha256_hex(&body);
@@ -310,9 +408,18 @@ fn download(
             found,
         });
     }
-    let path = dir.join(entry.elf_name);
-    let elf = extract_entry(&body, archive, entry)?;
-    check_elf(&elf, entry, &path)?;
+    Ok(body)
+}
+
+/// Extracts `entry` from the verified archive `body`, checks it against the manifest and stores it.
+fn extract_and_store(
+    body: &[u8],
+    archive: &RomArchive,
+    entry: &RomEntry,
+    dir: &Path,
+) -> Result<Vec<u8>, RomStoreError> {
+    let elf = extract_entry(body, archive, entry)?;
+    check_elf(&elf, entry, &dir.join(entry.elf_name), &Provenance::Archive)?;
     store(dir, entry.elf_name, &elf)?;
     Ok(elf)
 }
@@ -325,7 +432,10 @@ fn extract_entry(
     archive: &RomArchive,
     entry: &RomEntry,
 ) -> Result<Vec<u8>, RomStoreError> {
-    let read_error = |e: &std::io::Error| io_error_at("read the archive from", archive.url, e);
+    let read_error = |e: &std::io::Error| RomStoreError::Archive {
+        url: sanitize(archive.url),
+        detail: sanitize(&e.to_string()),
+    };
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(body));
     for member in tar.entries().map_err(|e| read_error(&e))? {
         let member = member.map_err(|e| read_error(&e))?;
@@ -335,9 +445,8 @@ fn extract_entry(
             continue;
         }
         if member.size() > MAX_ELF_BYTES {
-            return Err(RomStoreError::Io {
-                action: "read the archive from",
-                path: sanitize(archive.url),
+            return Err(RomStoreError::Archive {
+                url: sanitize(archive.url),
                 detail: format!(
                     "the entry `{}` is {} bytes, above the {MAX_ELF_BYTES} byte (4 MiB) limit of a ROM ELF",
                     entry.elf_name,
@@ -358,7 +467,34 @@ fn extract_entry(
     })
 }
 
-fn check_elf(bytes: &[u8], entry: &RomEntry, path: &Path) -> Result<(), RomStoreError> {
+/// Where a ROM file under verification came from, which decides what the user can do about a mismatch.
+enum Provenance {
+    /// The per-user cache: deleting the file makes the next run download it again.
+    Cache,
+    /// A directory the user supplied: nothing is downloaded there unless `inkemu rom fetch` is told to.
+    Directory { dir: String, release: &'static str },
+    /// The verified archive itself held something else.
+    Archive,
+}
+
+impl Provenance {
+    fn remedy(&self) -> String {
+        match self {
+            Provenance::Cache => "delete it to download it again, or point --rom-dir at a directory holding the genuine file".to_owned(),
+            Provenance::Directory { dir, release } => format!(
+                "replace it with the genuine file of esp-rom-elfs release {release}, or delete it and run `inkemu rom fetch --rom-dir {dir}`"
+            ),
+            Provenance::Archive => "retry the download, or supply the ROM yourself with --rom-dir".to_owned(),
+        }
+    }
+}
+
+fn check_elf(
+    bytes: &[u8],
+    entry: &RomEntry,
+    path: &Path,
+    provenance: &Provenance,
+) -> Result<(), RomStoreError> {
     let found = sha256_hex(bytes);
     if found == entry.elf_sha256 {
         return Ok(());
@@ -367,7 +503,40 @@ fn check_elf(bytes: &[u8], entry: &RomEntry, path: &Path) -> Result<(), RomStore
         path: shown(path),
         expected: entry.elf_sha256,
         found,
+        remedy: provenance.remedy(),
     })
+}
+
+/// The temporary file `store` writes before the rename. One helper, so tests can plant something there.
+fn temporary_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!(".{name}.{}.tmp", std::process::id()))
+}
+
+/// Creates `path` and writes `bytes` into it. The file is created with `create_new`, which fails rather
+/// than follow a symlink or reuse a file planted at the predictable temporary name; such a leftover (a
+/// killed run, or an attack) is removed (a symlink itself, never its target) and the creation retried once.
+fn write_new(path: &Path, bytes: &[u8]) -> Result<(), RomStoreError> {
+    let create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    };
+    let mut file = match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path).map_err(|e| io_error("remove", path, &e))?;
+            create()
+        }
+        other => other,
+    }
+    .map_err(|e| io_error("create", path, &e))?;
+    file.write_all(bytes)
+        .and_then(|()| file.flush())
+        .map_err(|e| {
+            // Best effort: the write error is the one worth reporting.
+            let _ = std::fs::remove_file(path);
+            io_error("write", path, &e)
+        })
 }
 
 /// Writes `bytes` to `dir/name` through a temporary file and a rename, so a crash or a concurrent
@@ -375,12 +544,8 @@ fn check_elf(bytes: &[u8], entry: &RomEntry, path: &Path) -> Result<(), RomStore
 fn store(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), RomStoreError> {
     let target = dir.join(name);
     std::fs::create_dir_all(dir).map_err(|e| io_error("create", dir, &e))?;
-    let temporary = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    std::fs::write(&temporary, bytes).map_err(|e| {
-        // Best effort: the write error is the one worth reporting.
-        let _ = std::fs::remove_file(&temporary);
-        io_error("write", &temporary, &e)
-    })?;
+    let temporary = temporary_path(dir, name);
+    write_new(&temporary, bytes)?;
     std::fs::rename(&temporary, &target).map_err(|e| {
         let _ = std::fs::remove_file(&temporary);
         io_error("move into place", &target, &e)
@@ -388,13 +553,7 @@ fn store(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), RomStoreError> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .fold(String::new(), |mut hex, byte| {
-            // Writing to a String cannot fail.
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        })
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// A path as it may be printed: control characters escaped, since it can come from the command line.
@@ -584,6 +743,10 @@ mod tests {
                 && text.contains(&sha(&tampered)),
             "{text}"
         );
+        assert!(
+            text.contains("delete it"),
+            "the cache remedy is to delete: {text}"
+        );
         assert_eq!(
             fetch.calls.get(),
             0,
@@ -756,16 +919,7 @@ mod tests {
             &entry,
         )
         .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                RomStoreError::Io {
-                    action: "read the archive from",
-                    ..
-                }
-            ),
-            "{err}"
-        );
+        assert!(matches!(err, RomStoreError::Archive { .. }), "{err}");
         let text = err.to_string();
         assert!(
             text.contains(ELF_NAME) && text.contains("4 MiB") && text.contains(archive.url),
@@ -776,13 +930,20 @@ mod tests {
 
     #[test]
     fn default_cache_dir_is_the_rom_folder_of_the_inkemu_data_dir() {
-        let dir = default_cache_dir().unwrap();
-        assert_eq!(dir.file_name().unwrap(), "rom");
-        assert!(
-            dir.parent().unwrap().to_string_lossy().contains("inkemu"),
-            "{}",
-            dir.display()
-        );
+        // The environment cannot be set in-process (`set_var` is unsafe, `unsafe_code` is forbidden),
+        // so a machine with no home directory has nothing to check here.
+        match default_cache_dir() {
+            Ok(dir) => {
+                assert_eq!(dir.file_name().unwrap(), "rom");
+                assert!(
+                    dir.parent().unwrap().to_string_lossy().contains("inkemu"),
+                    "{}",
+                    dir.display()
+                );
+            }
+            Err(RomStoreError::NoDataDir) => {}
+            Err(other) => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
@@ -859,6 +1020,353 @@ mod tests {
             assert_eq!(entry.rom_revision, revision);
             assert_eq!(entry.elf_name, format!("esp32c3_rev{revision}_rom.elf"));
             assert!(hex64(entry.elf_sha256) && hex64(entry.image_sha256));
+        }
+    }
+
+    /// Three distinct tiny ROM ELFs (one per revision of the real manifest), the archive holding them
+    /// and the manifest entries that pin them.
+    fn trio() -> (Vec<u8>, RomArchive, [RomEntry; 3], [Vec<u8>; 3]) {
+        const REVISIONS: [(u16, &str); 3] = [
+            (0, "esp32c3_rev0_rom.elf"),
+            (3, "esp32c3_rev3_rom.elf"),
+            (101, "esp32c3_rev101_rom.elf"),
+        ];
+        let elfs = [0u8, 1, 2].map(|variant| {
+            let mut elf = soc_esp32c3::test_support::rom_elf();
+            elf.sections[0].2[0] = 10 + variant; // another initial-data byte: another file hash
+            elf.build()
+        });
+        let files: Vec<(&str, &[u8])> = REVISIONS
+            .iter()
+            .zip(&elfs)
+            .map(|(&(_, name), elf)| (name, elf.as_slice()))
+            .collect();
+        let body = archive_of(&files);
+        let archive = RomArchive {
+            release: "test",
+            url: "https://example.invalid/trio.tar.gz",
+            sha256: leak(sha(&body)),
+            size: body.len() as u64,
+        };
+        let entries = [0, 1, 2].map(|i| RomEntry {
+            rom_revision: REVISIONS[i].0,
+            elf_name: REVISIONS[i].1,
+            elf_sha256: leak(sha(&elfs[i])),
+            image_sha256: "",
+        });
+        (body, archive, entries, elfs)
+    }
+
+    fn cache_of<'a>(dir: &std::path::Path, fetch: &'a FakeFetch) -> RomSource<'a> {
+        RomSource::Cache {
+            dir: dir.to_path_buf(),
+            fetch,
+        }
+    }
+
+    #[test]
+    fn every_missing_rom_comes_from_a_single_download() {
+        let (body, archive, entries, elfs) = trio();
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = FakeFetch::serving(body);
+        let all: Vec<&RomEntry> = entries.iter().collect();
+        let loaded = ensure_elfs(&cache_of(dir.path(), &fetch), &archive, &all).unwrap();
+        assert_eq!(loaded, elfs);
+        assert_eq!(fetch.calls.get(), 1);
+        let mut stored = entries.map(|e| e.elf_name.to_owned());
+        stored.sort();
+        assert_eq!(files_in(dir.path()), stored);
+    }
+
+    #[test]
+    fn a_rom_already_present_is_left_alone_and_the_others_still_cost_one_download() {
+        let (body, archive, entries, elfs) = trio();
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join(entries[1].elf_name);
+        std::fs::write(&present, &elfs[1]).unwrap();
+        let modified = std::fs::metadata(&present).unwrap().modified().unwrap();
+        let fetch = FakeFetch::serving(body);
+        let all: Vec<&RomEntry> = entries.iter().collect();
+        let loaded = ensure_elfs(&cache_of(dir.path(), &fetch), &archive, &all).unwrap();
+        assert_eq!(loaded, elfs);
+        assert_eq!(fetch.calls.get(), 1);
+        assert_eq!(files_in(dir.path()).len(), 3);
+        assert_eq!(
+            std::fs::metadata(&present).unwrap().modified().unwrap(),
+            modified,
+            "the file that was already there is not rewritten"
+        );
+    }
+
+    #[test]
+    fn nothing_is_downloaded_when_every_rom_is_present() {
+        let (body, archive, entries, elfs) = trio();
+        let dir = tempfile::tempdir().unwrap();
+        for (entry, elf) in entries.iter().zip(&elfs) {
+            std::fs::write(dir.path().join(entry.elf_name), elf).unwrap();
+        }
+        let fetch = FakeFetch::serving(body);
+        let all: Vec<&RomEntry> = entries.iter().collect();
+        assert_eq!(
+            ensure_elfs(&cache_of(dir.path(), &fetch), &archive, &all).unwrap(),
+            elfs
+        );
+        assert_eq!(fetch.calls.get(), 0);
+    }
+
+    #[test]
+    fn a_tampered_rom_stops_the_batch_before_any_download_or_write() {
+        let (body, archive, entries, elfs) = trio();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(entries[0].elf_name), &elfs[0]).unwrap();
+        std::fs::write(dir.path().join(entries[2].elf_name), b"tampered").unwrap();
+        let fetch = FakeFetch::serving(body);
+        let all: Vec<&RomEntry> = entries.iter().collect();
+        let err = ensure_elfs(&cache_of(dir.path(), &fetch), &archive, &all).unwrap_err();
+        assert!(matches!(err, RomStoreError::ElfMismatch { .. }), "{err}");
+        assert_eq!(fetch.calls.get(), 0, "no network access before the check");
+        assert_eq!(
+            files_in(dir.path()),
+            [entries[0].elf_name, entries[2].elf_name],
+            "the missing ROM was not fetched, nothing was written"
+        );
+    }
+
+    #[test]
+    fn an_explicit_directory_reports_the_first_missing_rom_without_downloading() {
+        let (_, archive, entries, elfs) = trio();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(entries[0].elf_name), &elfs[0]).unwrap();
+        let all: Vec<&RomEntry> = entries.iter().collect();
+        let err = ensure_elfs(
+            &RomSource::Directory(dir.path().to_path_buf()),
+            &archive,
+            &all,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, RomStoreError::NotInDirectory { path, .. } if path.contains(entries[1].elf_name)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_mismatch_in_an_explicit_directory_does_not_promise_a_download() {
+        let (_, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ELF_NAME), b"not the ROM").unwrap();
+        let err = load_elf(
+            &RomSource::Directory(dir.path().to_path_buf()),
+            &archive,
+            &entry,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("rom fetch --rom-dir") && text.contains("esp-rom-elfs release test"),
+            "{text}"
+        );
+        assert!(!text.contains("download it again"), "{text}");
+    }
+
+    #[test]
+    fn a_file_longer_than_any_rom_elf_is_refused_without_being_hashed_or_replaced() {
+        let (body, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ELF_NAME);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_ELF_BYTES + 1).unwrap();
+        let fetch = FakeFetch::serving(body);
+        let err = load_elf(&cache_of(dir.path(), &fetch), &archive, &entry).unwrap_err();
+        assert!(matches!(err, RomStoreError::UnsuitableFile { .. }), "{err}");
+        assert!(err.to_string().contains("4 MiB"), "{err}");
+        assert_eq!(fetch.calls.get(), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), MAX_ELF_BYTES + 1);
+    }
+
+    #[test]
+    fn a_file_of_exactly_the_limit_is_read_and_judged_by_its_hash() {
+        let (_, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join(ELF_NAME)).unwrap();
+        file.set_len(MAX_ELF_BYTES).unwrap();
+        let err = load_elf(
+            &RomSource::Directory(dir.path().to_path_buf()),
+            &archive,
+            &entry,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RomStoreError::ElfMismatch { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_directory_where_the_rom_should_be_is_refused() {
+        let (body, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(ELF_NAME)).unwrap();
+        let fetch = FakeFetch::serving(body);
+        let err = load_elf(&cache_of(dir.path(), &fetch), &archive, &entry).unwrap_err();
+        assert!(matches!(err, RomStoreError::UnsuitableFile { .. }), "{err}");
+        assert!(err.to_string().contains("rom fetch"), "{err}");
+        assert_eq!(fetch.calls.get(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_planted_at_the_temporary_name_is_never_followed() {
+        let (body, archive, entry) = fixture();
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("rom");
+        std::fs::create_dir(&cache).unwrap();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        std::os::unix::fs::symlink(&victim, temporary_path(&cache, ELF_NAME)).unwrap();
+        let fetch = FakeFetch::serving(body);
+        load_rom(&cache_of(&cache, &fetch), &archive, &entry).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert_eq!(
+            files_in(&cache),
+            [ELF_NAME],
+            "ELF in place, no temporary left"
+        );
+        assert!(
+            !std::fs::symlink_metadata(cache.join(ELF_NAME))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn a_stale_temporary_file_does_not_stop_the_load() {
+        let (body, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temporary_path(dir.path(), ELF_NAME),
+            b"left by a killed run",
+        )
+        .unwrap();
+        let fetch = FakeFetch::serving(body);
+        load_rom(&cache_of(dir.path(), &fetch), &archive, &entry).unwrap();
+        assert_eq!(files_in(dir.path()), [ELF_NAME]);
+    }
+
+    #[test]
+    fn a_cache_directory_that_is_a_regular_file_cannot_be_created() {
+        let root = tempfile::tempdir().unwrap();
+        let not_a_directory = root.path().join("rom");
+        std::fs::write(&not_a_directory, b"x").unwrap();
+        let err = store(&not_a_directory, ELF_NAME, b"elf").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RomStoreError::Io {
+                    action: "create",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_target_that_is_a_directory_reports_the_rename_and_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(ELF_NAME)).unwrap();
+        let err = store(dir.path(), ELF_NAME, b"elf").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RomStoreError::Io {
+                    action: "move into place",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            files_in(dir.path()),
+            [ELF_NAME],
+            "only the directory is left"
+        );
+    }
+
+    #[test]
+    fn an_archive_that_is_not_a_gzip_tar_is_reported_as_an_unexpected_layout() {
+        let body = b"pinned by hash but not an archive".to_vec();
+        let archive = RomArchive {
+            release: "test",
+            url: "https://example.invalid/a.tar.gz",
+            sha256: leak(sha(&body)),
+            size: body.len() as u64,
+        };
+        let (_, _, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = FakeFetch::serving(body);
+        let err = load_elf(&cache_of(dir.path(), &fetch), &archive, &entry).unwrap_err();
+        assert!(matches!(err, RomStoreError::Archive { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains(archive.url)
+                && text.contains("report it")
+                && !text.contains("permissions"),
+            "{text}"
+        );
+    }
+
+    /// A gzip-compressed tar archive whose members are `(name, entry type, bytes)`; a symlink member
+    /// points at `/etc/passwd`.
+    fn archive_with_types(members: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for &(name, kind, bytes) in members {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            if kind == tar::EntryType::Symlink {
+                header.set_link_name("/etc/passwd").unwrap();
+            }
+            header.set_cksum();
+            tar.append(&header, bytes).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn a_symlink_member_with_the_expected_name_is_not_taken_for_the_rom() {
+        let elf = soc_esp32c3::test_support::rom_elf().build();
+        let (_, _, entry) = fixture();
+        for (members, extracted) in [
+            (
+                vec![
+                    (ELF_NAME, tar::EntryType::Symlink, &b""[..]),
+                    (ELF_NAME, tar::EntryType::Regular, &elf[..]),
+                ],
+                true,
+            ),
+            (vec![(ELF_NAME, tar::EntryType::Symlink, &b""[..])], false),
+        ] {
+            let body = archive_with_types(&members);
+            let archive = RomArchive {
+                release: "test",
+                url: "https://example.invalid/a.tar.gz",
+                sha256: leak(sha(&body)),
+                size: body.len() as u64,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let fetch = FakeFetch::serving(body);
+            let result = load_elf(&cache_of(dir.path(), &fetch), &archive, &entry);
+            if extracted {
+                assert_eq!(result.unwrap(), elf);
+            } else {
+                assert!(
+                    matches!(result, Err(RomStoreError::MissingInArchive { .. })),
+                    "{result:?}"
+                );
+            }
         }
     }
 }
