@@ -73,6 +73,7 @@ const SCLK_DIV_NUM_MASK: u32 = 0xFF;
 const SCLK_SEL_SHIFT: u32 = 20;
 const SCLK_SEL_MASK: u32 = 0b11;
 const SCLK_SEL_APB: u32 = 1;
+const SCLK_SEL_XTAL: u32 = 3;
 /// `CONF0` bit 18 `TXFIFO_RST`: empties the transmit FIFO (`ROM3:Uart_Init@0x4004c306` sets it,
 /// then clears it; BC §G.2).
 const TXFIFO_RST: u32 = 1 << 18;
@@ -173,25 +174,41 @@ impl Uart {
         }
     }
 
-    /// The time one byte takes, in sixteenths of a time-base cycle: 10 bits, each `CLKDIV` (with
-    /// its fraction) cycles of the source clock divided by `SCLK_DIV_NUM + 1`.
+    /// The period of the source clock a byte sent now is timed with, in time-base cycles.
     ///
-    /// Known simplification: a source selection other than `APB_CLK` is clocked by the crystal. 3
-    /// is the crystal. 2 selects the RC fast clock (`case UART_SCLK_RTC: hw->clk_conf.sclk_sel =
-    /// 2;`, `components/hal/esp32c3/include/hal/uart_ll.h:178-179`, ESP-IDF v5.5.2; `uart_reg.h:1189`
-    /// documents only the reset value, 3); the RC fast clock is modelled at the crystal frequency,
-    /// and nothing on the measured paths selects it. The fractional divider of the source clock
-    /// (`SCLK_DIV_A/B`) is ignored: it resets to 0 and no measured code writes it.
-    fn byte_time(&self, ctx: &Ctx) -> u64 {
+    /// `SCLK_SEL` 1 is `APB_CLK` and 3 the crystal. 2 selects the RC fast clock
+    /// (`case UART_SCLK_RTC: hw->clk_conf.sclk_sel = 2;`,
+    /// `components/hal/esp32c3/include/hal/uart_ll.h:178-179`, ESP-IDF v5.5.2), 17.5 MHz nominal,
+    /// and 0 has no documented source (`uart_reg.h:1189` documents only the reset value, 3). The
+    /// model has a clock for neither: a byte sent with one of them is refused by name
+    /// ([`Unsupported::UartClock`], a stop under `--strict-mmio`) and timed with the crystal so
+    /// that a lenient run goes on, instead of being given a duration that is silently wrong (the
+    /// calibration of the timer groups measures the same oscillator at its 17.5 MHz). Nothing on
+    /// the measured paths selects either.
+    fn source_period(&self, ctx: &mut Ctx) -> u64 {
+        let clk_conf = self.config.read(CLK_CONF).unwrap_or(0);
+        match (clk_conf >> SCLK_SEL_SHIFT) & SCLK_SEL_MASK {
+            SCLK_SEL_APB => ctx.clock().apb_period,
+            SCLK_SEL_XTAL => XTAL_PERIOD,
+            sclk_sel => {
+                ctx.unsupported(Unsupported::UartClock {
+                    uart: self.index,
+                    sclk_sel,
+                });
+                XTAL_PERIOD
+            }
+        }
+    }
+
+    /// The time one byte takes, in sixteenths of a time-base cycle: 10 bits, each `CLKDIV` (with
+    /// its fraction) cycles of the source clock divided by `SCLK_DIV_NUM + 1`. The fractional
+    /// divider of the source clock (`SCLK_DIV_A/B`) is ignored: it resets to 0 and no measured
+    /// code writes it.
+    fn byte_time(&self, source_period: u64) -> u64 {
         let clkdiv = self.config.read(CLKDIV).unwrap_or(0);
         let clk_conf = self.config.read(CLK_CONF).unwrap_or(0);
         let divider = u64::from(clkdiv & CLKDIV_INTEGER_MASK) * SUBCYCLES
             + u64::from((clkdiv >> CLKDIV_FRAG_SHIFT) & CLKDIV_FRAG_MASK);
-        let source_period = if (clk_conf >> SCLK_SEL_SHIFT) & SCLK_SEL_MASK == SCLK_SEL_APB {
-            ctx.clock().apb_period
-        } else {
-            XTAL_PERIOD
-        };
         let source_divider = u64::from((clk_conf >> SCLK_DIV_NUM_SHIFT) & SCLK_DIV_NUM_MASK) + 1;
         BITS_PER_BYTE * divider * source_divider * source_period
     }
@@ -202,12 +219,13 @@ impl Uart {
             ctx.unsupported(Unsupported::UartOverflow { uart: self.index });
             return;
         }
+        let byte_time = self.byte_time(self.source_period(ctx));
         // A byte keeps the duration it was given when it was written: a later change of `CLKDIV`,
         // `CLK_CONF` or the APB clock applies to the bytes written after it. This is the model's
         // choice; firmware that changes the clock with bytes on their way out is not modelled.
         let now = ctx.now().get().saturating_mul(SUBCYCLES);
         let starts_at = self.in_flight.back().map_or(now, |&(gone_at, _)| gone_at);
-        let gone_at = starts_at.max(now).saturating_add(self.byte_time(ctx));
+        let gone_at = starts_at.max(now).saturating_add(byte_time);
         self.in_flight.push_back((gone_at, byte));
         self.wake.arm(
             ctx,
@@ -563,23 +581,70 @@ mod tests {
         assert_eq!(uart.read(ctx, FSM_STATUS), Some(0));
     }
 
+    fn select_source(ctx: &mut Ctx, uart: &mut Uart, selection: u32) {
+        uart.write(
+            ctx,
+            CLK_CONF,
+            (CLK_CONF_XTAL & !(SCLK_SEL_MASK << SCLK_SEL_SHIFT)) | (selection << SCLK_SEL_SHIFT),
+        );
+    }
+
     #[test]
-    fn the_rc_fast_selections_are_timed_from_the_crystal() {
-        // A known simplification: values 0 and 2 of `SCLK_SEL` run at the crystal frequency.
+    fn a_byte_sent_on_a_source_clock_the_model_does_not_have_is_refused_by_name() {
+        // `SCLK_SEL` 2 is the RC fast clock, 17.5 MHz, and 0 selects no documented source: the
+        // model has neither. The selection alone is not refused (the register is only stored);
+        // each byte sent with it is, and the byte is timed with the crystal.
         for selection in [0, 2] {
             let ctx = &mut Ctx::default();
             let mut uart = console(ctx);
-            uart.write(
-                ctx,
-                CLK_CONF,
-                (CLK_CONF_XTAL & !(SCLK_SEL_MASK << SCLK_SEL_SHIFT))
-                    | (selection << SCLK_SEL_SHIFT),
-            );
+            select_source(ctx, &mut uart, selection);
+            assert_eq!(ctx.take_unsupported(), None, "selecting is not sending");
             uart.write(ctx, FIFO, u32::from(b'r'));
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::UartClock {
+                    uart: 0,
+                    sclk_sel: selection
+                })
+            );
             assert_eq!(uart.take_tx(ctx.now()), [], "SCLK_SEL {selection}");
             after_bytes(ctx, 1);
             assert_eq!(uart.take_tx(ctx.now()), b"r", "SCLK_SEL {selection}");
+            uart.write(ctx, FIFO, u32::from(b's'));
+            assert!(ctx.take_unsupported().is_some(), "every byte is reported");
         }
+    }
+
+    #[test]
+    fn a_byte_sent_on_the_crystal_or_on_the_apb_clock_is_not_refused() {
+        for selection in [SCLK_SEL_APB, SCLK_SEL_XTAL] {
+            let ctx = &mut Ctx::new(true);
+            let mut uart = console(ctx);
+            select_source(ctx, &mut uart, selection);
+            uart.write(ctx, FIFO, u32::from(b'k'));
+            assert_eq!(ctx.take_unsupported(), None, "SCLK_SEL {selection}");
+            assert_eq!(ctx.diag.take_violation(), None);
+        }
+    }
+
+    #[test]
+    fn a_strict_run_stops_on_a_byte_sent_on_the_rc_fast_clock() {
+        let ctx = &mut Ctx::new(true);
+        ctx.set_pc(0x4200_0010);
+        let mut uart = Uart::new(1, UART1);
+        select_source(ctx, &mut uart, 2);
+        assert_eq!(ctx.diag.take_violation(), None);
+        uart.write(ctx, FIFO, u32::from(b'x'));
+        assert_eq!(
+            ctx.diag.take_violation(),
+            Some(crate::diag::Diagnostic::Unsupported {
+                what: Unsupported::UartClock {
+                    uart: 1,
+                    sclk_sel: 2
+                },
+                pc: 0x4200_0010
+            })
+        );
     }
 
     #[test]

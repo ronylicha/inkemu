@@ -39,6 +39,10 @@ pub enum Unsupported {
     /// writing 129 bytes or more without waiting on `TXFIFO_CNT` on a real chip and reading what
     /// comes out would settle it.
     UartOverflow { uart: u8 },
+    /// A byte sent by a UART whose `CLK_CONF.SCLK_SEL` selects a source clock the model has no
+    /// frequency for: the RC fast clock (2), or no documented source (0). The byte is timed with
+    /// the crystal.
+    UartClock { uart: u8, sclk_sel: u32 },
 }
 
 impl Unsupported {
@@ -87,6 +91,10 @@ impl Unsupported {
             Unsupported::UartOverflow { uart } => write!(
                 f,
                 "a byte was written to UART{uart} while its 128-byte transmit FIFO was full (pc {pc:#010x}), so inkemu dropped the byte; wait for room in the FIFO (UART.STATUS TXFIFO_CNT) before writing"
+            ),
+            Unsupported::UartClock { uart, sclk_sel } => write!(
+                f,
+                "UART{uart} sent a byte with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = {sclk_sel}, pc {pc:#010x}), so the byte was timed with the 40 MHz crystal and its duration differs from the device; select the crystal (SCLK_SEL = 3) or APB_CLK (SCLK_SEL = 1)"
             ),
         }
     }
@@ -164,6 +172,7 @@ impl Diagnostic {
                 } => (8, sysclk_conf, cpu_per_conf),
                 Unsupported::SlowClock { .. } => (9, 0, 0),
                 Unsupported::UartOverflow { uart } => (12, u32::from(uart), 0),
+                Unsupported::UartClock { uart, sclk_sel } => (13, u32::from(uart), sclk_sel),
                 // A command is 1 to 16 bits long, so 0 is free for "no command phase".
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
@@ -524,6 +533,10 @@ mod tests {
                 clk_conf: 0x4000_0000,
             }),
             unsupported(Unsupported::UartOverflow { uart: 0 }),
+            unsupported(Unsupported::UartClock {
+                uart: 1,
+                sclk_sel: 2,
+            }),
             mapping(3, MappingFault::InvalidEntry),
             mapping(3, MappingFault::BeyondFlash),
         ] {
@@ -593,6 +606,13 @@ mod tests {
                     clk_conf: 0x4000_0000,
                 }),
                 "RTC slow clock",
+            ),
+            (
+                unsupported(Unsupported::UartClock {
+                    uart: 1,
+                    sclk_sel: 2,
+                }),
+                "UART1 sent a byte with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = 2",
             ),
             (mapping(3, MappingFault::InvalidEntry), "MMU entry 3"),
             (
