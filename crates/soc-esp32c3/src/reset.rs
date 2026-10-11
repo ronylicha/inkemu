@@ -1,5 +1,6 @@
 //! Resets: how much of the chip each one returns to its reset state, and the cause it leaves in
 //! `RTC_CNTL.RESET_STATE`. Sources: TRM §6.1 (figure 6.1-1, table 6.1-1); reports IR §4.2 and TW §D.
+use std::fmt;
 
 /// How much of the chip a reset returns to its reset state (TRM §6.1.3; TW §D.2).
 ///
@@ -16,6 +17,17 @@ pub enum ResetLevel {
     /// "The whole digital system, including RTC". The RTC timer keeps counting (TRM §9.3.3) and
     /// the memories keep their content (TRM §6.1.1).
     System,
+}
+
+/// The level in words, for a message: `a core reset`.
+impl fmt::Display for ResetLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ResetLevel::Cpu => "a CPU reset",
+            ResetLevel::Core => "a core reset",
+            ResetLevel::System => "a system reset",
+        })
+    }
 }
 
 /// Why the chip was reset: the code `RTC_CNTL.RESET_STATE[5:0]` reads at the next boot (TRM table
@@ -81,6 +93,28 @@ impl ResetCause {
             ResetCause::RtcWatchdogSystem | ResetCause::SuperWatchdog => ResetLevel::System,
         }
     }
+
+    /// What asked for the reset, in words.
+    const fn source(self) -> &'static str {
+        match self {
+            ResetCause::SoftwareSystem | ResetCause::SoftwareCpu => "the firmware",
+            ResetCause::Mwdt0Core | ResetCause::Mwdt0Cpu => "main watchdog 0",
+            ResetCause::Mwdt1Core | ResetCause::Mwdt1Cpu => "main watchdog 1",
+            ResetCause::RtcWatchdogCore
+            | ResetCause::RtcWatchdogCpu
+            | ResetCause::RtcWatchdogSystem => "the RTC watchdog",
+            ResetCause::SuperWatchdog => "the super watchdog",
+        }
+    }
+}
+
+/// The cause in words, for a message: what asked for the reset, then its level, as in
+/// `main watchdog 0, a core reset`. The one place that names a cause for a person; the name the
+/// ROM prints next to the code (`TG0WDT_SYS_RST`) is the ROM's own.
+impl fmt::Display for ResetCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}, {}", self.source(), self.level())
+    }
 }
 
 #[cfg(test)]
@@ -105,5 +139,39 @@ mod tests {
             assert_eq!((cause.code(), cause.level()), (code, level), "{cause:?}");
         }
         assert!(ResetLevel::Cpu < ResetLevel::Core && ResetLevel::Core < ResetLevel::System);
+    }
+
+    #[test]
+    fn every_cause_has_its_own_words_which_name_what_asked_and_how_deep_the_reset_goes() {
+        let words: Vec<String> = [
+            ResetCause::SoftwareSystem,
+            ResetCause::Mwdt0Core,
+            ResetCause::Mwdt1Core,
+            ResetCause::RtcWatchdogCore,
+            ResetCause::Mwdt0Cpu,
+            ResetCause::SoftwareCpu,
+            ResetCause::RtcWatchdogCpu,
+            ResetCause::RtcWatchdogSystem,
+            ResetCause::Mwdt1Cpu,
+            ResetCause::SuperWatchdog,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            words,
+            [
+                "the firmware, a core reset",
+                "main watchdog 0, a core reset",
+                "main watchdog 1, a core reset",
+                "the RTC watchdog, a core reset",
+                "main watchdog 0, a CPU reset",
+                "the firmware, a CPU reset",
+                "the RTC watchdog, a CPU reset",
+                "the RTC watchdog, a system reset",
+                "main watchdog 1, a CPU reset",
+                "the super watchdog, a system reset",
+            ]
+        );
     }
 }

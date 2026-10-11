@@ -9,7 +9,8 @@ mod common;
 use emu_core::Cycles;
 use sha2::{Digest, Sha256};
 use soc_esp32c3::diag::Unsupported;
-use soc_esp32c3::memmap::{ROM_BASE, ROM_SIZE};
+use soc_esp32c3::memmap::{ROM_BASE, ROM_SIZE, SRAM_DBUS_BASE, SRAM_SIZE};
+use soc_esp32c3::reset::ResetCause;
 use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason};
 
 /// SHA-256 of the merged reference image (`docs/research/sp1b-test-oracle.md`, §2).
@@ -194,6 +195,30 @@ struct Run {
     device_time_nanos: u64,
 }
 
+/// The instruction after the store with which the ROM's `software_reset_cpu` asks for the reset
+/// (`ROM3:software_reset_cpu@0x40048b84`): the PC the restart finds, in the journal of the run as
+/// in the `Saved PC` line of the second boot.
+const RESTART_PC: u32 = 0x4004_8b92;
+
+/// Asserts that the journal of a whole life cycle holds the restart and nothing else: one reset,
+/// asked for by the firmware, found at [`RESTART_PC`] with a stack pointer in the data RAM.
+fn assert_only_the_restart_is_reported(diagnostics: &[Diagnostic]) {
+    let [
+        Diagnostic::Reset {
+            cause: ResetCause::SoftwareCpu,
+            pc: RESTART_PC,
+            sp,
+        },
+    ] = diagnostics
+    else {
+        panic!("expected the restart and nothing else, got: {diagnostics:#?}");
+    };
+    assert!(
+        (SRAM_DBUS_BASE..SRAM_DBUS_BASE + SRAM_SIZE).contains(sp),
+        "the stack pointer of the task that called `esp_restart` is in the data RAM: {sp:#010x}"
+    );
+}
+
 /// How many times the application printed its first line: once per boot that reached it.
 fn application_starts(console: &str) -> usize {
     console.matches("cpu_start: Unicore app\n").count()
@@ -312,10 +337,11 @@ fn the_whole_life_cycle_prints_the_golden_log_and_boots_a_second_time() {
         life.diagnostics
     );
     assert_eq!(life.resets, 1, "one reset: the restart");
+    assert_only_the_restart_is_reported(&life.diagnostics);
     assert_eq!(
-        life.diagnostics,
-        Vec::new(),
-        "nothing to report in a whole life"
+        SECOND_BOOT_ROM_LINES[2],
+        format!("Saved PC:{RESTART_PC:#010x}"),
+        "the journal and the ROM's own line name the same instruction"
     );
 }
 
@@ -335,7 +361,9 @@ fn a_strict_run_crosses_the_restart_without_anything_unmodelled() {
         life.stop,
         life.console
     );
-    assert_eq!(life.diagnostics, Vec::new());
+    // The restart is an entry of the journal, not a violation: strict mode lets it pass and
+    // nothing else was reported.
+    assert_only_the_restart_is_reported(&life.diagnostics);
     assert_eq!(application_starts(&life.console), 2, "{}", life.console);
     assert_eq!(life.resets, 1);
 }

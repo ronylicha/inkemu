@@ -7,6 +7,7 @@ mod common;
 use emu_core::Cycles;
 use firmware::builder::{ImageSpec, build_image};
 use sha2::{Digest, Sha256};
+use soc_esp32c3::reset::ResetCause;
 use soc_esp32c3::{
     ChipRevision, ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason,
 };
@@ -474,6 +475,10 @@ fn two_flash_boots_are_identical_down_to_the_trace_hash() {
 
 /// One second of device time, in nanoseconds.
 const SECOND_NS: u64 = 1_000_000_000;
+/// Where the watchdogs catch the ROM of a blank chip: in its UART routine
+/// (`ROM3:uart_tx_one_char_uart.part.0@0x4004c0be`), in the loop that waits for room in the FIFO
+/// while it prints `invalid header`.
+const ROM_UART_WAIT_PC: u32 = 0x4004_c0d4;
 /// Cycles between two looks at the machine in the watchdog tests: 50 us at the 20 MHz the ROM
 /// runs at, the resolution the instant of a reset is observed with.
 const WATCHDOG_SLICE: u64 = 1_000;
@@ -484,7 +489,22 @@ struct WatchdogRun {
     console: String,
     /// Device time, in nanoseconds, at the first look that found each reset done.
     reset_seen_at: Vec<u64>,
+    /// The journal of the run: each diagnostic the first time it came.
     diagnostics: Vec<Diagnostic>,
+    /// The diagnostics that came more than once, with their number of occurrences.
+    repeated: Vec<(Diagnostic, u64)>,
+}
+
+/// The entry a reset leaves in the journal, for a comparison that leaves the stack pointer out:
+/// the tests below pin the cause and the PC.
+fn reset_entries(diagnostics: &[Diagnostic]) -> Vec<(ResetCause, u32)> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| match diagnostic {
+            Diagnostic::Reset { cause, pc, .. } => (*cause, *pc),
+            other => panic!("strict mode: nothing but resets is reported, got: {other}"),
+        })
+        .collect()
 }
 
 /// Runs the rev3 ROM on `flash` until `resets` resets took place and `done` accepts the console.
@@ -532,6 +552,7 @@ fn run_to_resets(
         console: text(&uart0),
         reset_seen_at,
         diagnostics,
+        repeated: machine.most_repeated_diagnostics(8),
     }
 }
 
@@ -556,10 +577,22 @@ fn a_blank_flash_is_reset_by_the_main_watchdog_then_by_the_rtc_watchdog() {
             .nth(1)
             .is_some_and(|rest| rest.contains(INVALID_HEADER_BLANK))
     });
+    // Strict mode: nothing unmodelled. The journal holds the resets and nothing else: the two of
+    // main watchdog 0 found the ROM at the same instruction, so they are one entry counted
+    // twice, and the RTC watchdog found it there too.
     assert_eq!(
-        run.diagnostics,
-        Vec::new(),
-        "strict mode: nothing unmodelled"
+        reset_entries(&run.diagnostics),
+        [
+            (ResetCause::Mwdt0Core, ROM_UART_WAIT_PC),
+            (ResetCause::RtcWatchdogSystem, ROM_UART_WAIT_PC),
+        ]
+    );
+    assert_eq!(
+        run.repeated
+            .iter()
+            .map(|(diagnostic, count)| (reset_entries(std::slice::from_ref(diagnostic))[0], *count))
+            .collect::<Vec<_>>(),
+        [((ResetCause::Mwdt0Core, ROM_UART_WAIT_PC), 2)]
     );
     // A reset is seen at the first look after it: the loop looks every `WATCHDOG_SLICE` cycles, 50 us
     // at 20 MHz, so a reset is seen up to 50 us after its instant. The window of 100 us is that
@@ -611,10 +644,11 @@ fn a_blank_flash_is_reset_by_the_main_watchdog_then_by_the_rtc_watchdog() {
             lines[*boot..*next].join("\n")
         );
     }
-    // The ROM was printing `invalid header` when it was reset: the PC is in its UART routine
-    // (`ROM3:uart_tx_one_char_uart.part.0@0x4004c0be`, the loop that waits for room in the FIFO).
-    assert_eq!(lines[boots[1] + 1], "Saved PC:0x4004c0d4");
-    assert_eq!(lines[boots[2] + 1], "Saved PC:0x4004c0d4");
+    // The ROM was printing `invalid header` when it was reset: the line the next boot prints
+    // names the instruction the journal names.
+    let saved_pc = format!("Saved PC:{ROM_UART_WAIT_PC:#010x}");
+    assert_eq!(lines[boots[1] + 1], saved_pc);
+    assert_eq!(lines[boots[2] + 1], saved_pc);
     assert_eq!(
         lines[boots[3] + 1],
         INVALID_HEADER_BLANK.trim_end(),
@@ -697,7 +731,12 @@ fn a_firmware_that_hangs_with_interrupts_masked_is_reset_by_its_own_watchdog() {
                 .is_some_and(|rest| rest.contains('\n'))
         },
     );
-    assert_eq!(run.diagnostics, Vec::new());
+    assert_eq!(
+        reset_entries(&run.diagnostics),
+        [(ResetCause::Mwdt1Core, hang_pc)],
+        "the journal: the reset by the firmware's own watchdog, in its `j .`, and nothing else"
+    );
+    assert_eq!(run.repeated, Vec::new());
     let seen = run.reset_seen_at[0];
     assert!(
         (expected_ns..=expected_ns + 2 * WATCHDOG_SLICE_NS).contains(&seen),

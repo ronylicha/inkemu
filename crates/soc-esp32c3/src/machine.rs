@@ -356,6 +356,11 @@ impl Esp32C3 {
     /// reaches its cycle limit.
     fn reset(&mut self, cause: ResetCause) {
         let (pc, sp) = (self.hart.pc, self.hart.x[STACK_POINTER]);
+        // Spec §7: a reset leaves an entry in the journal, with the PC and the stack it found.
+        self.bus
+            .ctx
+            .diag
+            .record(Diagnostic::Reset { cause, pc, sp });
         self.bus.reset(cause, pc, sp);
         // The flash-window page versions (`SocBus::page_version`) restart at 0 with the MMU and
         // the cache registers: a version can repeat with another mapping. That is safe only
@@ -1876,11 +1881,14 @@ mod tests {
         let marker = load_register(MARKER);
         let mut first = stop_watchdogs();
         first.extend(store_register(MARKER, 1));
+        first.push(lui(2, 0x3FC9_0000));
         first.extend(store_register(reg("RTC_CNTL", "OPTIONS0"), 1 << 5));
         first.push(HANG);
         let skip = 4 * (i32::try_from(first.len()).unwrap() + 1);
         let mut body = vec![marker[0], marker[1], cpu_rv32::asm::bne(T1, 0, skip)];
         body.extend(first);
+        // The `HANG` the reset kept the first pass from reaching.
+        let after_the_store = ROM_BASE + 4 * u32::try_from(body.len() - 1).unwrap();
         body.push(HANG);
         let mut m = machine_with(
             &body,
@@ -1891,7 +1899,39 @@ mod tests {
         );
         assert_eq!(m.run_until(Cycles(1_000)), StopReason::CycleBudget);
         assert_eq!(m.resets(), 1);
-        assert_eq!(m.drain_diagnostics(), Vec::new());
+        assert_eq!(
+            m.drain_diagnostics(),
+            [Diagnostic::Reset {
+                cause: ResetCause::SoftwareCpu,
+                pc: after_the_store,
+                sp: 0x3FC9_0000,
+            }],
+            "the reset is in the journal, with the PC and the stack it found, and nothing else is"
+        );
+    }
+
+    #[test]
+    fn a_boot_loop_is_one_entry_of_the_journal_counted_once_per_reset() {
+        // `wfi` under the watchdogs of the reset values: main watchdog 0 at 1.3 s and at 2.6 s,
+        // the RTC watchdog at 2.94 s, each time with the CPU asleep after the same `wfi`.
+        let mut m = machine(&[wfi(), HANG]);
+        run_to_the_time_limit(&mut m, 3 * SECOND_NS, |_| NO_CYCLE_LIMIT);
+        assert_eq!(m.resets(), 3);
+        let by = |cause| Diagnostic::Reset {
+            cause,
+            pc: ROM_BASE + 4,
+            sp: 0,
+        };
+        assert_eq!(
+            m.drain_diagnostics(),
+            [by(ResetCause::Mwdt0Core), by(ResetCause::RtcWatchdogSystem)],
+            "listed once per cause and PC, in the order they first came"
+        );
+        assert_eq!(
+            m.most_repeated_diagnostics(4),
+            [(by(ResetCause::Mwdt0Core), 2)],
+            "and every reset is counted"
+        );
     }
 
     #[test]

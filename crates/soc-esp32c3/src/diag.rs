@@ -1,4 +1,6 @@
-//! What the emulator has to tell the user about the run: accesses it does not model, CPU exceptions.
+//! What the emulator has to tell the user about the run: accesses it does not model, CPU
+//! exceptions, resets.
+use crate::reset::ResetCause;
 use cpu_rv32::Exception;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -143,6 +145,20 @@ pub enum Diagnostic {
         /// that is shown keeps the stack pointer of the first occurrence.
         sp: u32,
     },
+    /// The chip was reset while it ran, by a watchdog or at the firmware's request: the entry of
+    /// the journal spec §7 asks for, with the program counter and the stack. It is no fault of
+    /// the emulator and none it can judge of the firmware (`esp_restart` ends with one): it never
+    /// stops a strict run, and a front end lists it as an event of the run, not as a warning.
+    Reset {
+        cause: ResetCause,
+        /// The instruction the reset kept from executing: where a watchdog caught the program,
+        /// or the instruction after the store that asked for the reset.
+        pc: u32,
+        /// The stack pointer at that instant. A reset is listed once per cause and PC: when the
+        /// same one comes again with another stack pointer (a boot loop), the entry that is shown
+        /// keeps the stack pointer of the first occurrence.
+        sp: u32,
+    },
     /// Emitted once when [`MAX_DISTINCT_DIAGNOSTICS`] is reached.
     Suppressed,
 }
@@ -183,10 +199,12 @@ impl Diagnostic {
                 }
             },
             Diagnostic::FlashMapping { entry, fault, .. } => (10, entry, fault as u32),
+            Diagnostic::Reset { cause, pc, .. } => (14, pc, cause.code()),
         }
     }
 
-    /// Whether `--strict-mmio` stops the run on this diagnostic.
+    /// Whether `--strict-mmio` stops the run on this diagnostic. A CPU exception and a reset do
+    /// not: both are what the firmware does on the device.
     const fn stops_a_strict_run(&self) -> bool {
         matches!(
             self,
@@ -262,6 +280,13 @@ impl fmt::Display for Diagnostic {
             } => write!(
                 f,
                 "CPU exception: {cause} at pc {pc:#010x} (tval {tval:#010x}, sp {sp:#010x}); the firmware's trap handler takes it, as on the device"
+            ),
+            // The code as the ROM prints it at the next boot (`rst:0x7`), so that the two lines
+            // of one reset can be matched by eye.
+            Diagnostic::Reset { cause, pc, sp } => write!(
+                f,
+                "reset by {cause} (rst:{code:#x}) at pc {pc:#010x}, sp {sp:#010x}",
+                code = cause.code()
             ),
             Diagnostic::Suppressed => write!(
                 f,
@@ -568,6 +593,73 @@ mod tests {
             sp: 0,
         });
         assert_eq!(d.take_violation(), None);
+    }
+
+    fn reset_at(cause: ResetCause, pc: u32, sp: u32) -> Diagnostic {
+        Diagnostic::Reset { cause, pc, sp }
+    }
+
+    #[test]
+    fn a_reset_is_an_entry_of_the_journal_and_never_a_strict_violation() {
+        let reset = reset_at(ResetCause::Mwdt0Core, 0x4004_c0d4, 0x3FCD_E710);
+        let mut strict = Diagnostics::new(true);
+        strict.record(reset.clone());
+        assert_eq!(
+            strict.take_violation(),
+            None,
+            "a strict run goes on across a reset"
+        );
+        assert_eq!(strict.drain(), vec![reset]);
+    }
+
+    #[test]
+    fn a_reset_names_its_cause_in_words_with_the_code_the_rom_prints_its_pc_and_its_stack() {
+        for (cause, pc, sp, text) in [
+            (
+                ResetCause::Mwdt0Core,
+                0x4004_c0d4,
+                0x3FCD_E710,
+                "reset by main watchdog 0, a core reset (rst:0x7) at pc 0x4004c0d4, sp 0x3fcde710",
+            ),
+            (
+                ResetCause::SoftwareCpu,
+                0x4004_8b92,
+                0x3FC9_0000,
+                "reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x3fc90000",
+            ),
+            (
+                ResetCause::RtcWatchdogSystem,
+                0x10,
+                0,
+                "reset by the RTC watchdog, a system reset (rst:0x10) at pc 0x00000010, sp 0x00000000",
+            ),
+        ] {
+            assert_eq!(reset_at(cause, pc, sp).to_string(), text);
+        }
+    }
+
+    #[test]
+    fn resets_are_listed_once_per_cause_and_pc_and_counted() {
+        let mut d = Diagnostics::new(false);
+        let first = reset_at(ResetCause::Mwdt0Core, 0x4004_c0d4, 0x3FCD_E710);
+        d.record(first.clone());
+        // The loop of a blank chip: the same watchdog at the same instruction, another stack.
+        d.record(reset_at(ResetCause::Mwdt0Core, 0x4004_c0d4, 0x3FCD_E700));
+        // Another cause at the same instruction, and the same cause at another one.
+        d.record(reset_at(
+            ResetCause::RtcWatchdogSystem,
+            0x4004_c0d4,
+            0x3FCD_E710,
+        ));
+        d.record(reset_at(ResetCause::Mwdt0Core, 0x4004_c0d8, 0x3FCD_E710));
+        let listed = d.drain();
+        assert_eq!(listed.len(), 3, "{listed:?}");
+        assert_eq!(
+            listed[0], first,
+            "the entry shown is the first occurrence, with its stack pointer"
+        );
+        assert_eq!(d.occurrences(&first), 2, "the second one is counted");
+        assert_eq!(d.most_repeated(4), vec![(first, 2)]);
     }
 
     #[test]

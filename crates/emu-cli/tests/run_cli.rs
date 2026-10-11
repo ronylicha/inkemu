@@ -528,8 +528,17 @@ fn x4_boots_the_reference_firmware_through_its_restart_into_a_second_boot() {
     }
     let log = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(log.contains("cycle limit reached"), "{log}");
+    // The restart is an entry of the journal of the run, whatever prefix its line has.
     assert!(
-        !log.contains("warning:") && !log.contains("stopped by --strict-mmio"),
-        "nothing was reported in a whole life cycle: {log}"
+        log.contains("reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x"),
+        "{log}"
+    );
+    let other_warnings: Vec<&str> = log
+        .lines()
+        .filter(|line| line.starts_with("warning:") && !line.starts_with("warning: reset by "))
+        .collect();
+    assert!(
+        other_warnings.is_empty() && !log.contains("stopped by --strict-mmio"),
+        "nothing but the restart was reported in a whole life cycle: {log}"
     );
 }
