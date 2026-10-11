@@ -13,10 +13,6 @@ const SLICE_CYCLES: u64 = 1_000_000;
 /// How many of the most repeated diagnostics the end-of-run summary lists.
 const MAX_REPEATED_SHOWN: usize = 3;
 
-/// Both consoles are drained every slice: the one that is not selected would otherwise grow without bound.
-const CONSOLE_CHANNELS: [ConsoleChannel; 2] =
-    [ConsoleChannel::Uart0, ConsoleChannel::UsbSerialJtag];
-
 #[derive(Clone, Copy, Debug)]
 pub struct RunOptions {
     /// Stop when the CPU cycle counter reaches this value; `None` is no limit. A sleeping CPU
@@ -135,13 +131,18 @@ fn log_console_error(log: &mut dyn Write, outcome: &io::Result<bool>) {
 }
 
 /// Takes the bytes of every console and relays those of `selected`; the others are discarded.
+///
+/// Every channel the machine has is taken on every pass ([`ConsoleChannel::ALL`], so that a
+/// channel added to the model is drained here without an edit): the machine keeps what a
+/// console sent until a caller takes it, and the ones nobody reads would otherwise grow for as
+/// long as the firmware writes to them.
 fn relay_selected_console(
     machine: &mut Esp32C3,
     selected: ConsoleChannel,
     console: &mut dyn Write,
 ) -> io::Result<bool> {
     let mut outcome = Ok(true);
-    for channel in CONSOLE_CHANNELS {
+    for channel in ConsoleChannel::ALL {
         let bytes = machine.take_console(channel);
         if channel == selected {
             outcome = relay(console, &bytes);
@@ -314,6 +315,7 @@ mod tests {
     };
     use std::time::Duration;
     const UART0: u32 = svd_regs::esp32c3::addr("UART0", "FIFO");
+    const UART1: u32 = svd_regs::esp32c3::addr("UART1", "FIFO");
     const USB: u32 = svd_regs::esp32c3::addr("USB_DEVICE", "EP1");
 
     fn machine(program: &[u32], options: MachineOptions) -> Esp32C3 {
@@ -559,6 +561,83 @@ mod tests {
             Vec::<u8>::new(),
             "the USB-Serial-JTAG bytes were discarded, not kept"
         );
+    }
+
+    /// Three bytes on UART1, then four on UART0, then the program parks. At the reset baud rate
+    /// and clock a byte takes 6 940 cycles to leave either UART: 60 000 cycles see them all out.
+    fn printing_on_both_uarts() -> Vec<u32> {
+        let mut program = printing(UART1, b"one", &[]);
+        program.extend(printing(UART0, b"zero", &[HANG]));
+        program
+    }
+
+    #[test]
+    fn a_console_no_one_reads_holds_nothing_at_the_end_of_a_run() {
+        // Every channel is taken on every pass of the loop, the selected one or not: a firmware
+        // that logs without end on a console nobody asked for must not fill the host's memory.
+        let mut m = machine(&printing_on_both_uarts(), MachineOptions::default());
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        execute(
+            &mut m,
+            &options(60_000),
+            &NOT_INTERRUPTED,
+            &mut console,
+            &mut log,
+        );
+        assert_eq!(console, b"zero");
+        for channel in ConsoleChannel::ALL {
+            assert_eq!(
+                m.flush_console(channel),
+                Vec::<u8>::new(),
+                "{channel:?} still holds bytes the run should have taken"
+            );
+        }
+    }
+
+    #[test]
+    fn the_second_uart_is_relayed_as_the_run_goes_when_it_is_the_console() {
+        // The console raises the interrupt flag when it is first written to: the run ends after
+        // its first slice only if the bytes of UART1 are relayed by the loop, and not kept for
+        // the flush at the end of the run.
+        let mut m = machine(&printing_on_both_uarts(), MachineOptions::default());
+        let interrupt = AtomicBool::new(false);
+        let mut console = RaisesInterrupt {
+            interrupt: &interrupt,
+            received: Vec::new(),
+        };
+        let mut log = Vec::new();
+        let end = execute(
+            &mut m,
+            &RunOptions {
+                console: ConsoleChannel::Uart1,
+                ..options(3 * SLICE_CYCLES)
+            },
+            &interrupt,
+            &mut console,
+            &mut log,
+        );
+        assert_eq!(console.received, b"one");
+        assert_eq!(end, RunEnd::Interrupted);
+        assert!(m.cycles().get() < 2 * SLICE_CYCLES, "{:?}", m.cycles());
+    }
+
+    #[test]
+    fn the_end_of_a_run_shows_what_the_second_uart_had_not_sent_yet() {
+        // Stopped after 500 cycles, when no byte has left UART1: the flush at the end of the run
+        // covers the selected channel, whichever it is.
+        let mut m = machine(&printing(UART1, b"one", &[HANG]), MachineOptions::default());
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        execute(
+            &mut m,
+            &RunOptions {
+                console: ConsoleChannel::Uart1,
+                ..options(500)
+            },
+            &NOT_INTERRUPTED,
+            &mut console,
+            &mut log,
+        );
+        assert_eq!(console, b"one");
     }
 
     #[test]

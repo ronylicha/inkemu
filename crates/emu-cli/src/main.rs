@@ -95,6 +95,7 @@ enum Command {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum ConsoleArg {
     Uart0,
+    Uart1,
     UsbSerialJtag,
 }
 
@@ -102,6 +103,7 @@ impl From<ConsoleArg> for ConsoleChannel {
     fn from(arg: ConsoleArg) -> ConsoleChannel {
         match arg {
             ConsoleArg::Uart0 => ConsoleChannel::Uart0,
+            ConsoleArg::Uart1 => ConsoleChannel::Uart1,
             ConsoleArg::UsbSerialJtag => ConsoleChannel::UsbSerialJtag,
         }
     }
@@ -504,6 +506,19 @@ mod tests {
             remedy.contains("--device <id>") && remedy.contains("--all"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn every_console_of_the_device_can_be_asked_for() {
+        use clap::ValueEnum as _;
+        for channel in ConsoleChannel::ALL {
+            assert!(
+                ConsoleArg::value_variants()
+                    .iter()
+                    .any(|arg| ConsoleChannel::from(*arg) == channel),
+                "no value of --console selects {channel:?}"
+            );
+        }
     }
 
     #[test]

@@ -115,6 +115,20 @@ fn run_help_tells_the_two_limits_apart() {
 }
 
 #[test]
+fn a_console_the_device_does_not_have_exits_2_and_lists_the_three_it_has() {
+    inkemu()
+        .args(["run", "--device", "x4", "--console", "uart2"])
+        .assert()
+        .code(2)
+        .stderr(
+            contains("'--console <CONSOLE>'")
+                .and(contains("uart0"))
+                .and(contains("uart1"))
+                .and(contains("usb-serial-jtag")),
+        );
+}
+
+#[test]
 fn rom_fetch_requires_a_device_or_all() {
     inkemu().args(["rom", "fetch"]).assert().code(2);
 }
