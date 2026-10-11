@@ -2,6 +2,7 @@
 use crate::app_desc::AppDesc;
 use crate::chip::{ChipId, FlashSize, SpiMode};
 use crate::error::FirmwareError;
+use crate::partition::{ENTRY_MAGIC, FIRST_PARTITION_OFFSET, PARTITION_TABLE_OFFSET};
 use sha2::{Digest, Sha256};
 
 /// Header byte 0 of every ESP-IDF application image.
@@ -54,6 +55,15 @@ fn le_u32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
+/// A flash dump or merged image holds the partition table at 0x8000, so its first entry magic is
+/// there and the file reaches the first partition (0x9000). The bytes at offset 0 are then the
+/// bootloader, which parses as a valid-looking image and must not be mistaken for the application.
+fn is_flash_image(bytes: &[u8]) -> bool {
+    let table = PARTITION_TABLE_OFFSET as usize;
+    bytes.len() >= FIRST_PARTITION_OFFSET as usize
+        && bytes.get(table..table + ENTRY_MAGIC.len()) == Some(&ENTRY_MAGIC[..])
+}
+
 impl FirmwareImage {
     /// Parses and fully verifies an image: header, every segment, checksum and hash.
     ///
@@ -62,6 +72,9 @@ impl FirmwareImage {
     pub fn parse(bytes: &[u8]) -> Result<FirmwareImage, FirmwareError> {
         if bytes.starts_with(XOTA_MAGIC) {
             return Err(FirmwareError::EncryptedOta);
+        }
+        if is_flash_image(bytes) {
+            return Err(FirmwareError::FlashImage);
         }
         if bytes.len() < HEADER_LEN {
             return Err(FirmwareError::TooShort { len: bytes.len() });
@@ -259,7 +272,41 @@ mod tests {
         assert_eq!(err, FirmwareError::EncryptedOta);
         let msg = err.to_string();
         assert!(msg.contains("encrypted"), "{msg}");
-        assert!(msg.contains("plain .bin"), "{msg}");
+        assert!(msg.contains("plain application .bin"), "{msg}");
+        assert!(!msg.contains("flash dump"), "{msg}");
+    }
+
+    /// A bootloader-first flash image: here the application image stands in for the bootloader
+    /// at offset 0, padded with erased flash up to the partition table at 0x8000.
+    fn flash_image(len: usize) -> Vec<u8> {
+        let mut b = build_image(&ImageSpec::default());
+        b.resize(len, 0xFF);
+        b[0x8000] = 0xAA;
+        b[0x8001] = 0x50;
+        b
+    }
+
+    #[test]
+    fn refuses_a_full_flash_image_instead_of_describing_its_bootloader() {
+        let err = FirmwareImage::parse(&flash_image(0x9000)).unwrap_err();
+        assert_eq!(err, FirmwareError::FlashImage);
+        let msg = err.to_string();
+        assert!(msg.contains("full flash image"), "{msg}");
+        assert!(msg.contains("; select the application .bin"), "{msg}");
+    }
+
+    #[test]
+    fn flash_image_detection_starts_at_the_end_of_the_partition_table_sector() {
+        // One byte short of 0x9000: the table bytes exist but this is not yet a flash image.
+        assert!(FirmwareImage::parse(&flash_image(0x8FFF)).is_ok());
+    }
+
+    #[test]
+    fn a_large_application_image_without_a_partition_table_magic_is_unaffected() {
+        let mut b = flash_image(0x9000);
+        b[0x8000] = 0xFF;
+        b[0x8001] = 0xFF;
+        assert!(FirmwareImage::parse(&b).is_ok());
     }
 
     #[test]

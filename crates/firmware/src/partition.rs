@@ -8,7 +8,8 @@ use thiserror::Error;
 pub const PARTITION_TABLE_OFFSET: u32 = 0x8000;
 pub const PARTITION_TABLE_LEN: usize = 0xC00;
 const ENTRY_LEN: usize = 32;
-const ENTRY_MAGIC: [u8; 2] = [0xAA, 0x50];
+/// First two bytes of every partition table entry.
+pub(crate) const ENTRY_MAGIC: [u8; 2] = [0xAA, 0x50];
 const MD5_MAGIC: [u8; 2] = [0xEB, 0xEB];
 const ERASED: u8 = 0xFF;
 const NAME_LEN: usize = 16;

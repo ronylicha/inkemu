@@ -61,6 +61,22 @@ fn inspect_explains_encrypted_ota() {
 }
 
 #[test]
+fn inspect_refuses_a_full_flash_image() {
+    // Bootloader image at 0x0, partition table magic at 0x8000: a flash dump, not an app image.
+    let mut bytes = build_image(&ImageSpec::default());
+    bytes.resize(0x9000, 0xFF);
+    bytes[0x8000..0x8002].copy_from_slice(&[0xAA, 0x50]);
+    let (_d, path) = write_temp(&bytes);
+    inspect()
+        .arg(&path)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(contains("full flash image"))
+        .stderr(contains("; select the application .bin"));
+}
+
+#[test]
 fn inspect_explains_wrong_format() {
     let (_d, path) = write_temp(&[0x7f, b'E', b'L', b'F'].repeat(16));
     inspect()

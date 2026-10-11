@@ -15,9 +15,13 @@ pub enum FirmwareError {
     )]
     TooShort { len: usize },
     #[error(
-        "this is an encrypted OTA update (.xota), which inkemu cannot read; use a flash dump or a plain .bin release, not the encrypted OTA file"
+        "this is an encrypted OTA update (.xota), which inkemu cannot read; use the plain application .bin of a release, not the encrypted OTA file"
     )]
     EncryptedOta,
+    #[error(
+        "this is a full flash image (bootloader + partition table + application), not an application image; select the application .bin, or wait for full-flash-image support in a later version"
+    )]
+    FlashImage,
     #[error(
         "not an ESP-IDF application image: first byte is {found:#04x}, expected 0xe9; select the application .bin from the build directory, not a merged flash image or another format"
     )]
@@ -80,6 +84,7 @@ mod tests {
         let all = vec![
             FirmwareError::TooShort { len: 0 },
             FirmwareError::EncryptedOta,
+            FirmwareError::FlashImage,
             FirmwareError::BadMagic { found: 0 },
             FirmwareError::TooManySegments { count: 17, max: 16 },
             FirmwareError::TruncatedSegmentHeader {
@@ -110,7 +115,7 @@ mod tests {
                 available: 4,
             },
         ];
-        let mut seen = [false; 14];
+        let mut seen = [false; 15];
         for e in &all {
             seen[variant_index(e)] = true;
         }
@@ -125,18 +130,19 @@ mod tests {
         match e {
             FirmwareError::TooShort { .. } => 0,
             FirmwareError::EncryptedOta => 1,
-            FirmwareError::BadMagic { .. } => 2,
-            FirmwareError::TooManySegments { .. } => 3,
-            FirmwareError::TruncatedSegmentHeader { .. } => 4,
-            FirmwareError::TruncatedSegment { .. } => 5,
-            FirmwareError::MisalignedSegment { .. } => 6,
-            FirmwareError::BadSpiMode { .. } => 7,
-            FirmwareError::BadFlashSize { .. } => 8,
-            FirmwareError::TruncatedTrailer => 9,
-            FirmwareError::ChecksumMismatch { .. } => 10,
-            FirmwareError::HashMismatch => 11,
-            FirmwareError::ChipMismatch { .. } => 12,
-            FirmwareError::FlashTooSmall { .. } => 13,
+            FirmwareError::FlashImage => 2,
+            FirmwareError::BadMagic { .. } => 3,
+            FirmwareError::TooManySegments { .. } => 4,
+            FirmwareError::TruncatedSegmentHeader { .. } => 5,
+            FirmwareError::TruncatedSegment { .. } => 6,
+            FirmwareError::MisalignedSegment { .. } => 7,
+            FirmwareError::BadSpiMode { .. } => 8,
+            FirmwareError::BadFlashSize { .. } => 9,
+            FirmwareError::TruncatedTrailer => 10,
+            FirmwareError::ChecksumMismatch { .. } => 11,
+            FirmwareError::HashMismatch => 12,
+            FirmwareError::ChipMismatch { .. } => 13,
+            FirmwareError::FlashTooSmall { .. } => 14,
         }
     }
 
