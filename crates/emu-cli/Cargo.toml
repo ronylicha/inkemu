@@ -20,6 +20,7 @@ clap.workspace = true
 goblin.workspace = true
 thiserror.workspace = true
 soc-esp32c3.workspace = true
+boards.workspace = true
 sha2.workspace = true
 ureq.workspace = true
 flate2.workspace = true
@@ -30,5 +31,7 @@ etcetera.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile = "3"
+svd-regs.workspace = true
+cpu-rv32 = { workspace = true, features = ["test-support"] }
 soc-esp32c3 = { workspace = true, features = ["test-support"] }
 firmware = { workspace = true, features = ["test-support"] }

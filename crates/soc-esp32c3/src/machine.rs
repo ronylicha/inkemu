@@ -7,7 +7,7 @@ use crate::rom::RomImage;
 use cpu_rv32::{
     DatasheetTiming, Exception, Hart, HartConfig, MisalignedPolicy, StepOutcome, VendorCsrs,
 };
-use emu_core::{Cycles, TraceHash};
+use emu_core::{Cycles, TimingModel, TraceHash};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleChannel {
@@ -113,6 +113,12 @@ impl Esp32C3 {
         self.bus.diag.drain()
     }
 
+    /// The model that prices each instruction, so a front end can say whether timing is calibrated.
+    #[must_use]
+    pub fn timing_model(&self) -> &dyn TimingModel {
+        &self.timing
+    }
+
     /// Fingerprint of the executed PC sequence, when [`SocConfig::trace_hash`] is set.
     #[must_use]
     pub fn trace_hash(&self) -> Option<u64> {
@@ -153,6 +159,13 @@ mod tests {
             program.extend([addi(T1, 0, i32::from(byte)), sw(T1, T0, 0)]);
         }
         program
+    }
+
+    #[test]
+    fn timing_model_is_exposed_and_says_it_is_not_calibrated() {
+        let m = machine(&[HANG]);
+        assert!(!m.timing_model().is_calibrated());
+        assert_eq!(m.timing_model().name(), "datasheet-uncalibrated");
     }
 
     #[test]
