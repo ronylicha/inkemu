@@ -2,7 +2,7 @@
 use boards::{DeviceProfile, MachineOptions, SocFamily};
 use clap::{Parser, Subcommand};
 use cpu_rv32::{HartConfig, MisalignedPolicy};
-use emu_cli::exit::{EXIT_ERROR, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
+use emu_cli::exit::{EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
 use emu_cli::flash_file;
 use emu_cli::rom_store::{
     self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
@@ -17,6 +17,8 @@ use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Parser)]
 #[command(
@@ -267,13 +269,33 @@ fn run_device(
         None => profile.instantiate(rom, machine_options),
     };
     eprintln!("{}; {flash_note}", header(&profile, entry, &machine));
+    let interrupt = Arc::new(AtomicBool::new(false));
+    if let Err(e) = watch_ctrl_c(&interrupt) {
+        eprintln!(
+            "warning: cannot watch for Ctrl-C: {e}; the run is not affected, but interrupting it will not print its summary: use --max-cycles to bound it"
+        );
+    }
     let end = execute(
         &mut machine,
         run_options,
+        &interrupt,
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     );
     ExitCode::from(end.exit_code())
+}
+
+/// Makes Ctrl-C end the run at the next slice, with its summary. A second Ctrl-C ends the process
+/// at once, for a run that does not come back to the slice boundary.
+///
+/// The handler runs on a thread of its own, not in the signal context; it only sets the flag.
+fn watch_ctrl_c(interrupt: &Arc<AtomicBool>) -> Result<(), ctrlc::Error> {
+    let requested = Arc::clone(interrupt);
+    ctrlc::set_handler(move || {
+        if requested.swap(true, Ordering::Relaxed) {
+            std::process::exit(i32::from(EXIT_SECOND_INTERRUPT));
+        }
+    })
 }
 
 /// The one line that says what is being emulated and how much to trust its timing.

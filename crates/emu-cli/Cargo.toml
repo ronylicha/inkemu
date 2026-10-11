@@ -17,6 +17,7 @@ emu-core.workspace = true
 cpu-rv32.workspace = true
 firmware.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 goblin.workspace = true
 thiserror.workspace = true
 soc-esp32c3.workspace = true

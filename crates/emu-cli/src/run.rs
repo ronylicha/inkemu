@@ -4,6 +4,7 @@ use emu_core::Cycles;
 use soc_esp32c3::diag::MAX_DISTINCT_DIAGNOSTICS;
 use soc_esp32c3::{ConsoleChannel, Esp32C3, StopReason};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Cycles executed between two flushes of the console and the diagnostics: a fraction of a second
 /// of host time, so output appears as the firmware prints it.
@@ -32,6 +33,8 @@ pub enum RunEnd {
     ConsoleError,
     StrictMmio,
     Idle,
+    /// The user asked the run to stop (Ctrl-C).
+    Interrupted,
 }
 
 impl RunEnd {
@@ -39,7 +42,7 @@ impl RunEnd {
     #[must_use]
     pub const fn exit_code(self) -> u8 {
         match self {
-            RunEnd::Budget | RunEnd::ConsoleClosed => EXIT_OK,
+            RunEnd::Budget | RunEnd::ConsoleClosed | RunEnd::Interrupted => EXIT_OK,
             RunEnd::ConsoleError => EXIT_ERROR,
             RunEnd::StrictMmio => EXIT_STRICT_MMIO,
             RunEnd::Idle => EXIT_IDLE,
@@ -107,14 +110,23 @@ fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
 /// Runs `machine` until it stops, sending the firmware console to `console` and everything else
 /// (warnings, the reason the run ended, the summary) to `log`.
 ///
-/// Output is relayed every [`SLICE_CYCLES`] cycles so a long run shows progress.
+/// Output is relayed every [`SLICE_CYCLES`] cycles so a long run shows progress. `interrupt` is
+/// read at the start of every pass of the loop, whatever the previous pass ended on (a sleeping
+/// CPU included, which can go on for ever without the cycle count advancing): once it is set
+/// (Ctrl-C), the run ends with the same summary as a run that reached its cycle limit. It is the
+/// only thing the run takes from the host, and nothing of it enters a trace.
 pub fn execute(
     machine: &mut Esp32C3,
     options: &RunOptions,
+    interrupt: &AtomicBool,
     console: &mut dyn Write,
     log: &mut dyn Write,
 ) -> RunEnd {
     let mut end = loop {
+        if interrupt.load(Ordering::Relaxed) {
+            let _ = writeln!(log, "inkemu: interrupted by the user");
+            break RunEnd::Interrupted;
+        }
         let now = machine.cycles().get();
         let slice_end = now.saturating_add(SLICE_CYCLES);
         let limit = options
@@ -219,7 +231,8 @@ mod tests {
     use boards::MachineOptions;
     use cpu_rv32::asm::{addi, jal, sw, wfi};
     use soc_esp32c3::test_support::{
-        HANG, T0, T1, flat_rom, load_register, print_program, stop_watchdogs, unmodeled_register,
+        HANG, T0, T1, flat_rom, load_register, print_program, stop_watchdogs, store_register,
+        unmodeled_register,
     };
     const UART0: u32 = svd_regs::esp32c3::addr("UART0", "FIFO");
     const USB: u32 = svd_regs::esp32c3::addr("USB_DEVICE", "EP1");
@@ -244,6 +257,8 @@ mod tests {
         strict_mmio: true,
         trace_hash: false,
     };
+    static NOT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
     fn options(max_cycles: u64) -> RunOptions {
         RunOptions {
             max_cycles: Some(max_cycles),
@@ -263,7 +278,13 @@ mod tests {
         let (mut console, mut log) = (Vec::new(), Vec::new());
         assert_eq!(
             // A byte takes 6 940 CPU cycles to leave the UART at the reset baud rate and clock.
-            execute(&mut m, &options(60_000), &mut console, &mut log),
+            execute(
+                &mut m,
+                &options(60_000),
+                &NOT_INTERRUPTED,
+                &mut console,
+                &mut log
+            ),
             RunEnd::Budget
         );
         assert_eq!(console, b"hello\n");
@@ -274,7 +295,13 @@ mod tests {
     fn max_cycles_ends_the_run_cleanly() {
         let mut m = machine(&[HANG], MachineOptions::default());
         let (mut console, mut log) = (Vec::new(), Vec::new());
-        let end = execute(&mut m, &options(2_500_000), &mut console, &mut log);
+        let end = execute(
+            &mut m,
+            &options(2_500_000),
+            &NOT_INTERRUPTED,
+            &mut console,
+            &mut log,
+        );
         assert_eq!((end, end.exit_code()), (RunEnd::Budget, 0));
         assert!(
             m.cycles().get() >= 2_500_000 && m.cycles().get() < 2_500_100,
@@ -319,6 +346,7 @@ mod tests {
                 max_cycles: Some(10_000),
                 console: ConsoleChannel::UsbSerialJtag,
             },
+            &NOT_INTERRUPTED,
             &mut console,
             &mut log,
         );
@@ -330,7 +358,13 @@ mod tests {
         let mut m = machine(&reading_unmodeled_register(), MachineOptions::default());
         let (mut console, mut log) = (Vec::new(), Vec::new());
         assert_eq!(
-            execute(&mut m, &options(10_000), &mut console, &mut log),
+            execute(
+                &mut m,
+                &options(10_000),
+                &NOT_INTERRUPTED,
+                &mut console,
+                &mut log
+            ),
             RunEnd::Budget
         );
         let log = text(&log);
@@ -349,7 +383,13 @@ mod tests {
         program.push(jal(0, -4));
         let mut m = machine(&program, MachineOptions::default());
         let (mut console, mut log) = (Vec::new(), Vec::new());
-        execute(&mut m, &options(10_000), &mut console, &mut log);
+        execute(
+            &mut m,
+            &options(10_000),
+            &NOT_INTERRUPTED,
+            &mut console,
+            &mut log,
+        );
         let log = text(&log);
         assert_eq!(log.matches("warning: ").count(), 1, "{log}");
         let repeated: Vec<&str> = log
@@ -371,7 +411,13 @@ mod tests {
     fn strict_mode_ends_with_its_own_exit_code_and_names_the_register() {
         let mut m = machine(&reading_unmodeled_register(), STRICT);
         let (mut console, mut log) = (Vec::new(), Vec::new());
-        let end = execute(&mut m, &options(10_000), &mut console, &mut log);
+        let end = execute(
+            &mut m,
+            &options(10_000),
+            &NOT_INTERRUPTED,
+            &mut console,
+            &mut log,
+        );
         assert_eq!((end, end.exit_code()), (RunEnd::StrictMmio, 3));
         let log = text(&log);
         assert!(
@@ -392,7 +438,13 @@ mod tests {
         let program = printing(UART0, b"x", &reading_unmodeled_register());
         let mut m = machine(&program, STRICT);
         let mut log = Vec::new();
-        let end = execute(&mut m, &options(10_000), &mut Closed, &mut log);
+        let end = execute(
+            &mut m,
+            &options(10_000),
+            &NOT_INTERRUPTED,
+            &mut Closed,
+            &mut log,
+        );
         assert_eq!((end, end.exit_code()), (RunEnd::StrictMmio, 3));
         assert!(
             text(&log).contains("stopped by --strict-mmio"),
@@ -407,7 +459,13 @@ mod tests {
         program.extend(printing(UART0, b"uart", &[HANG]));
         let mut m = machine(&program, MachineOptions::default());
         let (mut console, mut log) = (Vec::new(), Vec::new());
-        execute(&mut m, &options(10_000), &mut console, &mut log);
+        execute(
+            &mut m,
+            &options(10_000),
+            &NOT_INTERRUPTED,
+            &mut console,
+            &mut log,
+        );
         assert_eq!(console, b"uart");
         assert_eq!(
             m.take_console(ConsoleChannel::UsbSerialJtag),
@@ -429,6 +487,7 @@ mod tests {
                 max_cycles: None,
                 console: ConsoleChannel::Uart0,
             },
+            &NOT_INTERRUPTED,
             &mut console,
             &mut log,
         );
@@ -451,7 +510,13 @@ mod tests {
                 },
             );
             let (mut console, mut log) = (Vec::new(), Vec::new());
-            execute(&mut m, &options(5_000), &mut console, &mut log);
+            execute(
+                &mut m,
+                &options(5_000),
+                &NOT_INTERRUPTED,
+                &mut console,
+                &mut log,
+            );
             text(&log)
                 .lines()
                 .find(|l| l.starts_with("trace-hash "))
@@ -486,6 +551,7 @@ mod tests {
                 max_cycles: None,
                 console: ConsoleChannel::Uart0,
             },
+            &NOT_INTERRUPTED,
             &mut Closed,
             &mut log,
         );
@@ -515,6 +581,7 @@ mod tests {
                 max_cycles: None,
                 console: ConsoleChannel::Uart0,
             },
+            &NOT_INTERRUPTED,
             &mut Failing,
             &mut log,
         );
@@ -534,7 +601,13 @@ mod tests {
     fn a_console_that_fails_at_the_final_flush_ends_the_run_as_a_console_error() {
         let mut m = bytes_still_in_the_uart(&[HANG], MachineOptions::default());
         let mut log = Vec::new();
-        let end = execute(&mut m, &options(3_000), &mut Failing, &mut log);
+        let end = execute(
+            &mut m,
+            &options(3_000),
+            &NOT_INTERRUPTED,
+            &mut Failing,
+            &mut log,
+        );
         assert_eq!((end, end.exit_code()), (RunEnd::ConsoleError, 2));
         let log = text(&log);
         assert!(
@@ -549,7 +622,13 @@ mod tests {
     fn a_console_closed_at_the_final_flush_ends_the_run_as_console_closed() {
         let mut m = bytes_still_in_the_uart(&[HANG], MachineOptions::default());
         let mut log = Vec::new();
-        let end = execute(&mut m, &options(3_000), &mut Closed, &mut log);
+        let end = execute(
+            &mut m,
+            &options(3_000),
+            &NOT_INTERRUPTED,
+            &mut Closed,
+            &mut log,
+        );
         assert_eq!((end, end.exit_code()), (RunEnd::ConsoleClosed, 0));
         assert!(!text(&log).contains("cannot write"), "{}", text(&log));
     }
@@ -558,7 +637,13 @@ mod tests {
     fn a_strict_mmio_stop_keeps_its_end_when_the_final_flush_fails() {
         let mut m = bytes_still_in_the_uart(&reading_unmodeled_register(), STRICT);
         let mut log = Vec::new();
-        let end = execute(&mut m, &options(10_000), &mut Failing, &mut log);
+        let end = execute(
+            &mut m,
+            &options(10_000),
+            &NOT_INTERRUPTED,
+            &mut Failing,
+            &mut log,
+        );
         assert_eq!(end, RunEnd::StrictMmio);
         let log = text(&log);
         assert!(log.contains("cannot write the console output"), "{log}");
@@ -573,7 +658,13 @@ mod tests {
         program.extend(reading_unmodeled_register());
         let mut m = machine(&program, STRICT);
         let (mut console, mut log) = (Vec::new(), Vec::new());
-        let end = execute(&mut m, &options(10_000), &mut console, &mut log);
+        let end = execute(
+            &mut m,
+            &options(10_000),
+            &NOT_INTERRUPTED,
+            &mut console,
+            &mut log,
+        );
         assert_eq!(end, RunEnd::StrictMmio);
         assert_eq!(
             console, b"hello",
@@ -591,7 +682,13 @@ mod tests {
             MachineOptions::default(),
         );
         let (mut console, mut log) = (Vec::new(), Vec::new());
-        let end = execute(&mut m, &options(300), &mut console, &mut log);
+        let end = execute(
+            &mut m,
+            &options(300),
+            &NOT_INTERRUPTED,
+            &mut console,
+            &mut log,
+        );
         assert_eq!(end, RunEnd::Budget);
         assert!(
             console.len() > 5 && console.iter().all(|&byte| byte == b'a'),
@@ -604,5 +701,158 @@ mod tests {
             "{lives} bytes"
         );
         assert!(m.device_time_nanos() > 5 * 1_300_000_000);
+    }
+
+    #[test]
+    fn an_interrupted_run_ends_with_the_summary_of_a_limit_stop() {
+        // Ctrl-C sets the flag; the run ends at the next slice like a cycle limit.
+        let mut m = machine(&[HANG], MachineOptions::default());
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        let interrupt = AtomicBool::new(true);
+        let end = execute(
+            &mut m,
+            &RunOptions {
+                max_cycles: None,
+                console: ConsoleChannel::Uart0,
+            },
+            &interrupt,
+            &mut console,
+            &mut log,
+        );
+        assert_eq!((end, end.exit_code()), (RunEnd::Interrupted, 0));
+        let log = text(&log);
+        assert!(log.contains("inkemu: interrupted by the user\n"), "{log}");
+        assert!(
+            log.contains("inkemu: stopped at pc ") && log.contains(" us of device time; "),
+            "the same summary as any other end: {log}"
+        );
+    }
+
+    /// A console that raises the interrupt flag when the run first writes to it, as a user
+    /// pressing Ctrl-C once output has appeared.
+    struct RaisesInterrupt<'a> {
+        interrupt: &'a AtomicBool,
+        received: Vec<u8>,
+    }
+    impl io::Write for RaisesInterrupt<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.interrupt.store(true, Ordering::Relaxed);
+            self.received.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_interrupt_ends_a_run_whose_cpu_sleeps_for_ever() {
+        // A period alarm at every count of the 16 MHz counter whose interrupt is not enabled
+        // (`TARGET0_CONF`: bit 30 `PERIOD_MODE`, period 1): the CPU sleeps and wakes without an
+        // interrupt for ever, `run_until` returns `Asleep` again and again, and the cycle count
+        // never reaches a limit. The flag, raised once the byte printed before the sleep has
+        // reached the console, must be read on that path too.
+        let mut tail = Vec::new();
+        tail.extend(store_register(
+            svd_regs::esp32c3::addr("SYSTIMER", "TARGET0_CONF"),
+            (1 << 30) | 1,
+        ));
+        tail.extend(store_register(
+            svd_regs::esp32c3::addr("SYSTIMER", "COMP0_LOAD"),
+            1,
+        ));
+        tail.extend(store_register(
+            svd_regs::esp32c3::addr("SYSTIMER", "CONF"),
+            0x4600_0000 | (1 << 24),
+        ));
+        tail.extend([wfi(), HANG]);
+        let mut m = machine(&printing(UART0, b"x", &tail), MachineOptions::default());
+        let interrupt = AtomicBool::new(false);
+        let mut console = RaisesInterrupt {
+            interrupt: &interrupt,
+            received: Vec::new(),
+        };
+        let mut log = Vec::new();
+        let end = execute(
+            &mut m,
+            &RunOptions {
+                max_cycles: None,
+                console: ConsoleChannel::Uart0,
+            },
+            &interrupt,
+            &mut console,
+            &mut log,
+        );
+        assert_eq!((end, end.exit_code()), (RunEnd::Interrupted, 0));
+        assert_eq!(console.received, b"x");
+        assert!(
+            m.cycles().get() < SLICE_CYCLES,
+            "the CPU slept: no slice of cycles was ever used up ({} cycles)",
+            m.cycles().get()
+        );
+        let log = text(&log);
+        assert!(log.contains("inkemu: interrupted by the user\n"), "{log}");
+        assert!(log.contains(" us of device time; "), "{log}");
+    }
+
+    #[test]
+    fn an_interrupted_run_still_flushes_what_the_uart_holds() {
+        // Five bytes written, none sent yet when the run stops: the interrupt ends the run like a
+        // limit, and the end-of-run flush hands them to the console before the summary.
+        let mut m = bytes_still_in_the_uart(&[HANG], MachineOptions::default());
+        assert_eq!(m.run_until(Cycles(3_000)), StopReason::CycleBudget);
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        let interrupt = AtomicBool::new(true);
+        let end = execute(&mut m, &options(10_000), &interrupt, &mut console, &mut log);
+        assert_eq!(end, RunEnd::Interrupted);
+        assert_eq!(console, b"hello");
+    }
+
+    #[test]
+    fn a_console_that_fails_at_the_flush_of_an_interrupted_run_ends_it_as_a_console_error() {
+        let mut m = bytes_still_in_the_uart(&[HANG], MachineOptions::default());
+        assert_eq!(m.run_until(Cycles(3_000)), StopReason::CycleBudget);
+        let mut log = Vec::new();
+        let interrupt = AtomicBool::new(true);
+        let end = execute(&mut m, &options(10_000), &interrupt, &mut Failing, &mut log);
+        assert_eq!((end, end.exit_code()), (RunEnd::ConsoleError, 2));
+        let log = text(&log);
+        assert!(log.contains("interrupted by the user"), "{log}");
+        assert!(log.contains("cannot write the console output"), "{log}");
+    }
+
+    #[test]
+    fn an_interrupt_does_not_change_the_trace_of_the_run_it_ends() {
+        // The request is read between two slices and never enters a trace: the hash of a run
+        // ended by the interrupt is that of the same run ended by its limit, at the same cycle.
+        let hash = |interrupt: &AtomicBool, max_cycles: Option<u64>| {
+            let mut m = machine(
+                &printing(UART0, b"x", &[HANG]),
+                MachineOptions {
+                    strict_mmio: false,
+                    trace_hash: true,
+                },
+            );
+            assert_eq!(m.run_until(Cycles(5_000)), StopReason::CycleBudget);
+            let (mut console, mut log) = (Vec::new(), Vec::new());
+            execute(
+                &mut m,
+                &RunOptions {
+                    max_cycles,
+                    console: ConsoleChannel::Uart0,
+                },
+                interrupt,
+                &mut console,
+                &mut log,
+            );
+            text(&log)
+                .lines()
+                .find(|l| l.starts_with("trace-hash "))
+                .map(str::to_owned)
+        };
+        let interrupted = AtomicBool::new(true);
+        let by_limit = hash(&NOT_INTERRUPTED, Some(5_000));
+        assert!(by_limit.is_some());
+        assert_eq!(hash(&interrupted, None), by_limit);
     }
 }
