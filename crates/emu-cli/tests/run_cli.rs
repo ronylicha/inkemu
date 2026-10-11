@@ -102,16 +102,40 @@ fn run_help_lists_every_exit_code() {
 
 #[test]
 fn a_time_limit_that_is_not_a_number_of_seconds_exits_2_and_says_what_to_write() {
-    inkemu()
-        .args(["run", "--device", "x4", "--max-time", "abc"])
-        .assert()
-        .code(2)
-        .stdout(predicate::str::is_empty())
-        .stderr(
-            contains("'--max-time <SECONDS>'").and(contains(
-                "`abc` is not a number of seconds; write digits with an optional fraction, like 30 or 0.25",
-            )),
-        );
+    // A negative number included: it is a value of the option, refused for what it is, and not
+    // an unknown flag.
+    for value in ["abc", "-1", "1e3"] {
+        inkemu()
+            .args(["run", "--device", "x4", "--max-time", value])
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(contains("'--max-time <SECONDS>'").and(contains(format!(
+                "`{value}` is not a number of seconds; write digits with an optional fraction, like 30 or 0.25"
+            ))));
+    }
+}
+
+#[test]
+fn a_time_limit_too_fine_or_too_long_exits_2_and_says_which() {
+    for (value, message) in [
+        (
+            "1.0000000001",
+            "has more than 9 digits after the point, which is finer than a nanosecond; give at most 9",
+        ),
+        (
+            "18446744074",
+            "seconds is more than device time can count (584 years); give a smaller number",
+        ),
+    ] {
+        inkemu()
+            .args(["run", "--device", "x4", "--max-time", value])
+            .assert()
+            .code(2)
+            .stderr(
+                contains("'--max-time <SECONDS>'").and(contains(format!("`{value}` {message}"))),
+            );
+    }
 }
 
 #[test]

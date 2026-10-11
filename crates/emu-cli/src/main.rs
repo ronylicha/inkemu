@@ -68,7 +68,13 @@ enum Command {
         max_cycles: Option<u64>,
         /// Stop when this many seconds of device time have elapsed since power-on (a decimal
         /// number: 30, 2.5, 0.001). Device time goes on while the CPU sleeps and across resets.
-        #[arg(long, value_name = "SECONDS", value_parser = parse_device_seconds)]
+        // A negative number is a value, so that it is refused by the parser, with its message.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            value_parser = parse_device_seconds,
+            allow_negative_numbers = true
+        )]
         max_time: Option<u64>,
         /// Stop at the first access to a register the emulator does not model, 8/16-bit write to a
         /// peripheral register, operation the emulator cannot perform faithfully, or access to flash
