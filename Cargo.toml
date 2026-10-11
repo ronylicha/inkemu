@@ -22,8 +22,8 @@ md-5 = "0.10"
 roxmltree = "0.21"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-toml = "1"
-goblin = "0.10"
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
+goblin = { version = "0.10", default-features = false, features = ["std", "elf32", "elf64", "endian_fd"] }
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 flate2 = "1.1"
 tar = "0.4"
