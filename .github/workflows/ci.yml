@@ -56,3 +56,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - if: steps.scope.outputs.run == 'true'
         run: tools/conformance/run-arch-test.sh
+  rom-boot:
+    # Boots the real ESP32-C3 mask ROM. The ROM is downloaded from Espressif's pinned release and
+    # verified by inkemu itself; it is never stored in this repository. The cache below saves a
+    # download and replaces no check: `rom fetch` re-hashes every file already present.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.99.0" }
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/rom
+          key: esp-rom-elfs-20260528
+      - name: Fetch and verify the mask ROMs
+        run: cargo run --release -p emu-cli -- rom fetch --all --rom-dir "$RUNNER_TEMP/rom"
+      - name: Boot the ROM
+        env:
+          INKEMU_ROM_ELF_DIR: ${{ runner.temp }}/rom
+        run: |
+          cargo test --release -p soc-esp32c3 --test real_rom -- --ignored
+          cargo test --release -p emu-cli --test run_cli -- --ignored

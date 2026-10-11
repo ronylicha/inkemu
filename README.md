@@ -2,21 +2,28 @@
 
 **A binary-level emulator for embedded e-ink devices.** inkemu runs the real, unmodified firmware image of a device on a virtual replica of its hardware. You can check how a firmware renders and behaves before you flash it.
 
-> **Status: early development.** Sub-project 1a is implemented: the RV32IMC core (validated against riscv-tests and, through RISCOF, against the Sail reference model with riscv-arch-test), the ESP-IDF image and partition-table tooling, and the `inkemu inspect` and `inkemu rvtest` commands. It cannot boot a firmware yet: the ESP32-C3 SoC and the boot chain (sub-project 1b) are next. See the [design spec](docs/superpowers/specs/2026-10-11-inkemu-design.md) and the [roadmap](#roadmap).
+> **Status: early development.** inkemu boots the real ESP32-C3 mask ROM from its reset vector and prints its banner. The RV32IMC core is validated against riscv-tests and, through RISCOF, against the Sail reference model. Flash, the second-stage bootloader and the application come next (sub-projects 1b-2 to 1b-4). See the [design spec](docs/superpowers/specs/2026-10-11-inkemu-design.md) and the [roadmap](#roadmap).
 
 ## Build & try
 
 ```bash
 cargo build --release
 
-# Describe an ESP-IDF application image and check that inkemu can load it.
-target/release/inkemu inspect <app.bin>
-
-# Run a bare-metal RISC-V conformance test (riscv-tests or riscv-arch-test) and print its verdict.
-target/release/inkemu rvtest <elf>
+# Boot a virtual Xteink X4 from its mask ROM and print its console.
+target/release/inkemu run --device x4 --max-cycles 5000000
 ```
 
-`inspect` expects the application `.bin` (not a full flash dump or an encrypted `.xota` update) and explains what is wrong when it refuses a file. For the pinned conformance suites and how to run riscv-arch-test against Sail, see [tools/conformance/README.md](tools/conformance/README.md).
+```text
+ESP-ROM:esp32c3-api1-20210207
+Build:Feb  7 2021
+rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)
+```
+
+The device console goes to standard output. Everything inkemu has to say goes to standard error: the device and timing model in use, then one `warning:` line for each register the firmware touches that inkemu does not model yet, with the peripheral, the register, its address and the program counter. `--strict-mmio` turns the first of them into a stop, for CI.
+
+The first run downloads the ROM (4.9 MB) from Espressif's `esp-rom-elfs` release `20260528` and checks its SHA-256 before using it. To work offline, extract the archive yourself and pass `--rom-dir <directory>`; `inkemu rom fetch --all` fills a directory in advance.
+
+Other commands: `inkemu inspect <app.bin>` describes an ESP-IDF application image and explains what is wrong when it refuses a file; `inkemu rvtest <elf>` runs a bare-metal RISC-V conformance test. For the pinned conformance suites and how to run riscv-arch-test against Sail, see [tools/conformance/README.md](tools/conformance/README.md).
 
 ## Why
 
@@ -44,7 +51,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 
 ## Roadmap
 
-1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a, the core, firmware tooling and CLI, is done; 1b, the SoC and the boot, is next.*
+1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, is next.*
 2. X4 peripherals, desktop UI, e-ink rendering: **first visual milestone**
 3. X3 support (UC8253 panel, I2C sensors)
 4. Debugging, resource monitor, headless test runner
@@ -63,7 +70,14 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 
 inkemu est un émulateur **au niveau binaire** d'appareils embarqués à écran e-ink. Il exécute le firmware réel, sans recompilation, sur une réplique virtuelle du matériel : mémoire exacte, modèle de cycles, rendu e-ink fidèle (ghosting, niveaux de gris, durées de rafraîchissement), Wi-Fi avec accès Internet réel, BLE, débogage GDB et tests automatisés. Il tourne sur Linux, macOS, Windows et dans le navigateur. Les liseuses Xteink sont les premières cibles ; d'autres appareils suivront.
 
-**État :** le cœur RV32IMC, la lecture des images ESP-IDF et les commandes `inkemu inspect` et `inkemu rvtest` sont en place (sous-projet 1a) ; le SoC ESP32-C3 et le démarrage du firmware (sous-projet 1b) sont la prochaine étape.
+**État :** inkemu démarre la vraie ROM masquée de l'ESP32-C3 depuis son vecteur de reset et affiche sa bannière (`inkemu run --device x4`). Le cœur RV32IMC est validé contre riscv-tests puis, avec RISCOF, contre le modèle de référence Sail ; les commandes `inkemu inspect` et `inkemu rvtest` sont en place. La flash, le bootloader de second niveau et l'application sont la prochaine étape (sous-projets 1b-2 à 1b-4).
+
+## Third-party material
+
+- **Mask ROM.** The ESP32-C3 ROM is Espressif's code and is not open source. inkemu never ships it: it downloads the ROM ELF files that Espressif publishes under Apache-2.0 in [`esp-rom-elfs`](https://github.com/espressif/esp-rom-elfs) and verifies them against pinned hashes.
+- **Register descriptions.** `third_party/espressif-svd/` holds an unmodified copy of Espressif's `esp32c3.svd` (Apache-2.0), from which `crates/svd-regs` is generated.
+
+See [ADR 0001](docs/adr/0001-espressif-rom-and-svd-licensing.md).
 
 ## License
 
