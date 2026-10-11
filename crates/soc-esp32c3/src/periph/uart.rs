@@ -188,7 +188,7 @@ impl Uart {
     fn source_period(&self, ctx: &mut Ctx) -> u64 {
         let clk_conf = self.config.read(CLK_CONF).unwrap_or(0);
         match (clk_conf >> SCLK_SEL_SHIFT) & SCLK_SEL_MASK {
-            SCLK_SEL_APB => ctx.clock().apb_period,
+            SCLK_SEL_APB => ctx.clock().apb_period(),
             SCLK_SEL_XTAL => XTAL_PERIOD,
             sclk_sel => {
                 ctx.unsupported(Unsupported::UartClock {

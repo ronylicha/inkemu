@@ -38,8 +38,10 @@ impl Frequency {
         NonZeroU64::new(hz).map(Frequency)
     }
 
+    /// The frequency in hertz. A `const fn`, so that a duration can be derived from a clock in a
+    /// constant instead of repeating its figure.
     #[must_use]
-    pub fn hz(&self) -> u64 {
+    pub const fn hz(&self) -> u64 {
         self.0.get()
     }
 
@@ -81,8 +83,10 @@ mod tests {
     }
 
     #[test]
-    fn a_frequency_can_be_a_constant() {
+    fn a_frequency_can_be_a_constant_and_so_can_what_is_derived_from_it() {
         const ONE: Frequency = Frequency::new(std::num::NonZeroU64::MIN);
+        const TWO_SECONDS_OF_IT: u64 = 2 * ONE.hz();
         assert_eq!(ONE.hz(), 1);
+        assert_eq!(TWO_SECONDS_OF_IT, 2);
     }
 }

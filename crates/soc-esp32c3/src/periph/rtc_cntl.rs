@@ -6,6 +6,7 @@
 //! This block is in the RTC power domain: a CPU reset and a core reset leave it as it is, RTC
 //! watchdog counter included; a system reset returns its registers to their reset values; nothing
 //! but a power-on stops the RTC timer (TRM §9.3.3; TW §D.2).
+use crate::clock::SECOND;
 use crate::ctx::{Ctx, Deadline, Event, Source};
 use crate::diag::Unsupported;
 use crate::periph::counter::{Counter, Rate};
@@ -67,8 +68,8 @@ const FIB_SEL: u32 = reg("FIB_SEL");
 /// real chip deviates from it, and runs at another, undocumented frequency until the bootloader
 /// has written `SCK_DCAP` (TW §C.1, §I question 2). A measurement on a real unit settles it.
 const SLOW_CLOCK: Rate = Rate::ratio(17, 20_000);
-/// One second of device time, in cycles of the time base.
-const SECOND: u64 = 160_000_000;
+// 136 000 cycles of the slow clock in one second of the time base.
+const _: () = assert!(SECOND * 17 == 136_000 * 20_000);
 
 // Reset values of the RTC watchdog registers (`rtc_cntl_reg.h:1565-1705`; TW §C.3).
 /// `FLASHBOOT_MOD_EN` and `PAUSE_IN_SLP` set, reset lengths 1, chip reset width 20.

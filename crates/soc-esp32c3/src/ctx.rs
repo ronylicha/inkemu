@@ -57,6 +57,8 @@ impl Source {
         1 << self.0
     }
 }
+// The levels of the sources are one bit each of a `u64` (`Ctx::sources`, `Source::mask`).
+const _: () = assert!(MAP_REGISTERS <= u64::BITS);
 
 /// The two timer groups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,7 +106,12 @@ pub enum Event {
 }
 
 /// The wake-up a device keeps for its next deadline.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// One deadline stands for at most one wake-up in the scheduler, which only it can withdraw. It
+/// is not `Copy` for that reason: a copy that armed again would leave the wake-up of the other
+/// live and tracked by nobody. A device that is cloned (the device models are `Clone`) must not
+/// go on using both clones with one context.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Deadline {
     armed: Option<(Cycles, EventId)>,
 }
@@ -114,6 +121,10 @@ impl Deadline {
     /// is kept: the device re-arms when it is called. An instant that is the end of device time
     /// never comes (see [`Ctx::schedule`]): it asks for nothing, and leaves a call due later in
     /// place.
+    ///
+    /// One deadline, one event: a device always passes the same `event` to the same deadline.
+    /// When an earlier call is kept, `event` is not looked at, so a different one would be
+    /// dropped without a trace.
     pub fn arm(&mut self, ctx: &mut Ctx, at: Cycles, event: Event) {
         match self.armed {
             Some((due, _)) if due <= at => {}
@@ -214,14 +225,15 @@ impl Ctx {
         self.now
     }
 
-    /// The CPU has run `cpu_cycles` cycles of its clock: device time moves on by as much.
-    pub fn advance(&mut self, cpu_cycles: u64) {
-        self.now = self.now + cpu_cycles.saturating_mul(self.clock.cpu_period);
+    /// The CPU has run `cpu_cycles` cycles of its clock: device time moves on by as much. The
+    /// machine's side of the door, like every `pub(crate)` method here: a device never moves time.
+    pub(crate) fn advance(&mut self, cpu_cycles: u64) {
+        self.now = self.now + cpu_cycles.saturating_mul(self.clock.cpu_period());
     }
 
     /// Device time jumps to `instant` while the CPU sleeps. Time never goes back: an instant in the
     /// past changes nothing.
-    pub fn sleep_until(&mut self, instant: Cycles) {
+    pub(crate) fn sleep_until(&mut self, instant: Cycles) {
         self.now = self.now.max(instant);
     }
 
@@ -232,7 +244,7 @@ impl Ctx {
     }
 
     /// From now on a CPU cycle and an APB cycle last what `clock` says.
-    pub fn set_clock(&mut self, clock: CpuClock) {
+    pub(crate) fn set_clock(&mut self, clock: CpuClock) {
         self.clock = clock;
     }
 
@@ -242,7 +254,7 @@ impl Ctx {
     }
 
     /// Whether a clock selection register was written since the last call.
-    pub fn take_clock_written(&mut self) -> bool {
+    pub(crate) fn take_clock_written(&mut self) -> bool {
         std::mem::take(&mut self.clock_written)
     }
 
@@ -343,7 +355,7 @@ impl Ctx {
     }
 
     /// The oldest event posted with [`Ctx::signal`] and not delivered yet.
-    pub fn take_signal(&mut self) -> Option<Event> {
+    pub(crate) fn take_signal(&mut self) -> Option<Event> {
         self.signals.pop_front()
     }
 
@@ -380,7 +392,7 @@ impl Ctx {
     }
 
     /// Whether a source level or the controller changed since the last call.
-    pub fn take_interrupts_changed(&mut self) -> bool {
+    pub(crate) fn take_interrupts_changed(&mut self) -> bool {
         std::mem::take(&mut self.interrupts_changed)
     }
 
@@ -411,7 +423,7 @@ impl Ctx {
     }
 
     /// The reset asked for since the last call.
-    pub fn take_reset(&mut self) -> Option<ResetCause> {
+    pub(crate) fn take_reset(&mut self) -> Option<ResetCause> {
         self.reset.take()
     }
 
@@ -444,14 +456,15 @@ mod tests {
 
     const TICK: Source = Source::of("SYSTIMER_TARGET0_INT_MAP");
     const SOFTWARE: Source = Source::of("CPU_INTR_FROM_CPU_0_MAP");
-    // Any event will do: the context does not look inside them.
-    const FIRST: Event = Event::FlashWindowStore {
+    // Any event will do: the context does not look inside them. Three that differ, named so
+    // that no name says in which order a test schedules them.
+    const ALPHA: Event = Event::FlashWindowStore {
         instruction_bus: true,
     };
-    const SECOND: Event = Event::FlashWindowStore {
+    const BETA: Event = Event::FlashWindowStore {
         instruction_bus: false,
     };
-    const THIRD: Event = Event::MmuFault {
+    const GAMMA: Event = Event::MmuFault {
         vaddr: 0x4200_0000,
         content: 0x100,
     };
@@ -495,11 +508,11 @@ mod tests {
     #[test]
     fn two_wake_ups_due_together_come_out_in_the_order_they_were_asked_for() {
         let mut ctx = Ctx::default();
-        ctx.schedule(Cycles(100), SECOND);
-        ctx.schedule(Cycles(100), FIRST);
+        ctx.schedule(Cycles(100), BETA);
+        ctx.schedule(Cycles(100), ALPHA);
         ctx.sleep_until(Cycles(100));
-        assert_eq!(ctx.take_due(), Some(SECOND));
-        assert_eq!(ctx.take_due(), Some(FIRST));
+        assert_eq!(ctx.take_due(), Some(BETA));
+        assert_eq!(ctx.take_due(), Some(ALPHA));
         assert_eq!(ctx.take_due(), None);
     }
 
@@ -507,14 +520,14 @@ mod tests {
     fn a_wake_up_asked_for_an_instant_already_past_is_due_at_once() {
         let mut ctx = Ctx::default();
         ctx.sleep_until(Cycles(500));
-        ctx.schedule(Cycles(100), FIRST);
+        ctx.schedule(Cycles(100), ALPHA);
         assert_eq!(
             ctx.next_wake(),
             Some(Cycles(500)),
             "an instant in the past is the present"
         );
         assert!(ctx.wake_due());
-        assert_eq!(ctx.take_due(), Some(FIRST));
+        assert_eq!(ctx.take_due(), Some(ALPHA));
         assert!(!ctx.wake_due());
     }
 
@@ -528,6 +541,55 @@ mod tests {
     }
 
     #[test]
+    fn device_time_is_the_exact_sum_of_the_cycles_at_the_clock_each_ran_on() {
+        // The boot of the reference image: 20 MHz, the crystal, 80 MHz, 160 MHz, with odd cycle
+        // counts, and the crystal divided by 3, whose frequency is no whole number of hertz but
+        // whose period is a whole number of time-base cycles.
+        use crate::clock::cpu_clock;
+        let mut ctx = Ctx::default();
+        let mut expected = 0u64;
+        for (sysclk_conf, cpu_per_conf, cpu_cycles, period) in [
+            (0x2_8001, 0xC, 1_000_003, 8),
+            (0x2_8000, 0xC, 7, 4),
+            (0x2_8400, 0xC, 999_999, 2),
+            (0x2_8400, 0xD, 12_345_679, 1),
+            (0x2_8002, 0xC, 333_331, 12),
+            (0x2_8001, 0xC, 1, 8),
+        ] {
+            let clock = cpu_clock(sysclk_conf, cpu_per_conf).unwrap();
+            assert_eq!(clock.cpu_period(), period);
+            ctx.set_clock(clock);
+            ctx.advance(cpu_cycles);
+            expected += cpu_cycles * period;
+            assert_eq!(ctx.now(), Cycles(expected), "after {cpu_cycles} cycles");
+        }
+        assert_eq!(expected, 26_345_709);
+        // One cycle at a time gives the same sum as one call: nothing is rounded per call.
+        let mut stepped = Ctx::default();
+        stepped.set_clock(cpu_clock(0x2_8002, 0xC).unwrap());
+        for _ in 0..1_001 {
+            stepped.advance(1);
+        }
+        assert_eq!(stepped.now(), Cycles(12_012));
+    }
+
+    #[test]
+    fn device_time_saturates_at_its_end_instead_of_wrapping() {
+        let mut ctx = Ctx::default();
+        ctx.sleep_until(Cycles(u64::MAX - 10));
+        ctx.advance(1);
+        assert_eq!(ctx.now(), Cycles(u64::MAX - 2), "8 time-base cycles");
+        ctx.advance(1);
+        assert_eq!(ctx.now(), Cycles(u64::MAX), "the sum would pass the end");
+        ctx.advance(u64::MAX);
+        assert_eq!(
+            ctx.now(),
+            Cycles(u64::MAX),
+            "nor does the product wrap: cycles times period saturates first"
+        );
+    }
+
+    #[test]
     fn device_time_follows_the_cpu_clock_and_never_goes_back() {
         let mut ctx = Ctx::default();
         ctx.advance(10);
@@ -536,10 +598,7 @@ mod tests {
             Cycles(80),
             "20 MHz: 8 time-base cycles per CPU cycle"
         );
-        ctx.set_clock(CpuClock {
-            cpu_period: 1,
-            apb_period: 2,
-        });
+        ctx.set_clock(CpuClock::new(1, 2));
         ctx.advance(10);
         assert_eq!(ctx.now(), Cycles(90));
         ctx.sleep_until(Cycles(1_000));
@@ -557,15 +616,15 @@ mod tests {
         let mut ctx = Ctx::default();
         assert_eq!(ctx.next_wake(), None);
         assert!(!ctx.wake_due());
-        let late = ctx.schedule(Cycles(300), THIRD).unwrap();
-        ctx.schedule(Cycles(100), FIRST);
-        ctx.schedule(Cycles(200), SECOND);
+        let late = ctx.schedule(Cycles(300), GAMMA).unwrap();
+        ctx.schedule(Cycles(100), ALPHA);
+        ctx.schedule(Cycles(200), BETA);
         assert_eq!(ctx.next_wake(), Some(Cycles(100)));
         assert_eq!(ctx.take_due(), None, "nothing is due at time 0");
         ctx.sleep_until(Cycles(250));
         assert!(ctx.wake_due());
-        assert_eq!(ctx.take_due(), Some(FIRST));
-        assert_eq!(ctx.take_due(), Some(SECOND));
+        assert_eq!(ctx.take_due(), Some(ALPHA));
+        assert_eq!(ctx.take_due(), Some(BETA));
         assert_eq!(ctx.take_due(), None);
         assert_eq!(ctx.next_wake(), Some(Cycles(300)));
         ctx.cancel(late);
@@ -578,24 +637,24 @@ mod tests {
     fn a_deadline_keeps_the_earliest_call_and_replaces_a_later_one() {
         let mut ctx = Ctx::default();
         let mut deadline = Deadline::default();
-        deadline.arm(&mut ctx, Cycles(500), FIRST);
-        deadline.arm(&mut ctx, Cycles(900), FIRST);
+        deadline.arm(&mut ctx, Cycles(500), ALPHA);
+        deadline.arm(&mut ctx, Cycles(900), ALPHA);
         assert_eq!(
             ctx.next_wake(),
             Some(Cycles(500)),
             "the earlier call is kept"
         );
-        deadline.arm(&mut ctx, Cycles(200), FIRST);
+        deadline.arm(&mut ctx, Cycles(200), ALPHA);
         assert_eq!(
             ctx.next_wake(),
             Some(Cycles(200)),
             "an earlier deadline replaces it"
         );
         ctx.sleep_until(Cycles(200));
-        assert_eq!(ctx.take_due(), Some(FIRST));
+        assert_eq!(ctx.take_due(), Some(ALPHA));
         assert_eq!(ctx.take_due(), None, "the replaced call was withdrawn");
         deadline.called(ctx.now());
-        deadline.arm(&mut ctx, Cycles(900), FIRST);
+        deadline.arm(&mut ctx, Cycles(900), ALPHA);
         assert_eq!(
             ctx.next_wake(),
             Some(Cycles(900)),
@@ -608,14 +667,14 @@ mod tests {
         // Device time ends at `u64::MAX`: an instant that saturates there never comes, and the
         // context reads `u64::MAX` as "no wake-up".
         let mut ctx = Ctx::default();
-        assert_eq!(ctx.schedule(Cycles(u64::MAX), FIRST), None);
+        assert_eq!(ctx.schedule(Cycles(u64::MAX), ALPHA), None);
         assert_eq!(ctx.next_wake(), None);
         assert_eq!(ctx.scheduled_entries(), 0);
         let mut deadline = Deadline::default();
-        deadline.arm(&mut ctx, Cycles(u64::MAX), FIRST);
+        deadline.arm(&mut ctx, Cycles(u64::MAX), ALPHA);
         assert_eq!((ctx.next_wake(), ctx.scheduled_entries()), (None, 0));
-        deadline.arm(&mut ctx, Cycles(900), FIRST);
-        deadline.arm(&mut ctx, Cycles(u64::MAX), FIRST);
+        deadline.arm(&mut ctx, Cycles(900), ALPHA);
+        deadline.arm(&mut ctx, Cycles(u64::MAX), ALPHA);
         assert_eq!(
             (ctx.next_wake(), ctx.scheduled_entries()),
             (Some(Cycles(900)), 1),
@@ -623,7 +682,7 @@ mod tests {
         );
         ctx.sleep_until(Cycles(u64::MAX));
         assert!(ctx.wake_due());
-        assert_eq!(ctx.take_due(), Some(FIRST));
+        assert_eq!(ctx.take_due(), Some(ALPHA));
         assert!(
             !ctx.wake_due(),
             "nothing is left to be due at the end of time"
@@ -638,18 +697,18 @@ mod tests {
         // wake-up far ahead, and ten withdrawn ones the scheduler has not removed yet.
         let mut ctx = Ctx::default();
         ctx.sleep_until(Cycles(1_000));
-        ctx.schedule(Cycles(1_000_000), THIRD);
+        ctx.schedule(Cycles(1_000_000), GAMMA);
         for _ in 0..10 {
-            let withdrawn = ctx.schedule(Cycles(2_000_000), SECOND).unwrap();
+            let withdrawn = ctx.schedule(Cycles(2_000_000), BETA).unwrap();
             ctx.cancel(withdrawn);
         }
         let mut deadline = Deadline::default();
-        deadline.arm(&mut ctx, Cycles(900), FIRST);
+        deadline.arm(&mut ctx, Cycles(900), ALPHA);
         assert!(ctx.scheduled_entries() >= 12, "the scheduler stores them");
         let mut calls = 0;
         for pass in 1..=3 {
             ctx.deliver_due(|ctx, event| {
-                assert_eq!(event, FIRST);
+                assert_eq!(event, ALPHA);
                 calls += 1;
                 // A cap of its own: a pass that is not bounded fails the assertion below
                 // instead of looping for ever.
@@ -658,7 +717,7 @@ mod tests {
                 }
                 deadline.called(ctx.now());
                 let now = ctx.now();
-                deadline.arm(ctx, now, FIRST);
+                deadline.arm(ctx, now, ALPHA);
             });
             assert_eq!(calls, pass, "one call per pass");
             assert!(ctx.wake_due(), "and the next pass has its call");
@@ -672,8 +731,8 @@ mod tests {
         let mut ctx = Ctx::default();
         ctx.sleep_until(Cycles(1_000));
         let mut deadline = Deadline::default();
-        deadline.arm(&mut ctx, Cycles(900), FIRST);
-        ctx.schedule(Cycles(1_000), SECOND);
+        deadline.arm(&mut ctx, Cycles(900), ALPHA);
+        ctx.schedule(Cycles(1_000), BETA);
         let mut delivered = Vec::new();
         for _ in 0..3 {
             ctx.deliver_due(|ctx, event| {
@@ -681,16 +740,16 @@ mod tests {
                 if delivered.len() > 10 {
                     return;
                 }
-                if event == FIRST {
+                if event == ALPHA {
                     deadline.called(ctx.now());
                     let past = Cycles(ctx.now().get() - 5);
-                    deadline.arm(ctx, past, FIRST);
+                    deadline.arm(ctx, past, ALPHA);
                 }
             });
         }
         assert_eq!(
             delivered,
-            [FIRST, SECOND, FIRST, FIRST],
+            [ALPHA, BETA, ALPHA, ALPHA],
             "the other device in the first pass, the re-arming one once per pass"
         );
     }
@@ -698,13 +757,13 @@ mod tests {
     #[test]
     fn a_delivery_pass_delivers_every_wake_up_that_was_pending_when_it_began() {
         let mut ctx = Ctx::default();
-        ctx.schedule(Cycles(10), FIRST);
-        ctx.schedule(Cycles(20), SECOND);
-        ctx.schedule(Cycles(30), THIRD);
+        ctx.schedule(Cycles(10), ALPHA);
+        ctx.schedule(Cycles(20), BETA);
+        ctx.schedule(Cycles(30), GAMMA);
         ctx.sleep_until(Cycles(25));
         let mut delivered = Vec::new();
         ctx.deliver_due(|_, event| delivered.push(event));
-        assert_eq!(delivered, [FIRST, SECOND], "the third is not due");
+        assert_eq!(delivered, [ALPHA, BETA], "the third is not due");
         assert_eq!(ctx.next_wake(), Some(Cycles(30)));
     }
 
@@ -712,11 +771,11 @@ mod tests {
     fn a_cancelled_deadline_leaves_no_call_and_arms_again_at_any_instant() {
         let mut ctx = Ctx::default();
         let mut deadline = Deadline::default();
-        deadline.arm(&mut ctx, Cycles(500), FIRST);
+        deadline.arm(&mut ctx, Cycles(500), ALPHA);
         deadline.cancel(&mut ctx);
         assert_eq!(ctx.next_wake(), None);
         deadline.cancel(&mut ctx);
-        deadline.arm(&mut ctx, Cycles(900), FIRST);
+        deadline.arm(&mut ctx, Cycles(900), ALPHA);
         assert_eq!(
             ctx.next_wake(),
             Some(Cycles(900)),
@@ -727,10 +786,10 @@ mod tests {
     #[test]
     fn signals_are_delivered_in_posting_order() {
         let mut ctx = Ctx::default();
-        ctx.signal(FIRST);
-        ctx.signal(SECOND);
-        assert_eq!(ctx.take_signal(), Some(FIRST));
-        assert_eq!(ctx.take_signal(), Some(SECOND));
+        ctx.signal(ALPHA);
+        ctx.signal(BETA);
+        assert_eq!(ctx.take_signal(), Some(ALPHA));
+        assert_eq!(ctx.take_signal(), Some(BETA));
         assert_eq!(ctx.take_signal(), None);
     }
 

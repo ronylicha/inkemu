@@ -33,19 +33,21 @@ const CPUPERIOD_SEL_MASK: u32 = 0x3;
 /// SYSTIMER counters at 16 MHz (10). One cycle lasts 6.25 ns. An event scheduled at a device time
 /// therefore stays at its instant whatever the CPU clock becomes (decision E2).
 pub const TIME_BASE: Frequency = megahertz(160);
+/// One second of device time, in cycles of the time base.
+pub const SECOND: u64 = TIME_BASE.hz();
 /// Time-base cycles in one cycle of the 40 MHz crystal.
 pub const XTAL_PERIOD: u64 = 4;
+// The crystal is a whole number of time-base cycles, and this is that number.
+const _: () = assert!(TIME_BASE.hz() == XTAL_PERIOD * XTAL.hz());
 const PLL_80_PERIOD: u64 = 2;
 const PLL_160_PERIOD: u64 = 1;
 
-/// The two clocks the selection registers decide, each as its period in time-base cycles.
+/// The two clocks the selection registers decide, each as its period in time-base cycles. A
+/// period is never 0: the fields are private so that only [`CpuClock::new`] builds one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CpuClock {
-    /// Time-base cycles in one CPU clock cycle.
-    pub cpu_period: u64,
-    /// Time-base cycles in one `APB_CLK` cycle. `APB_CLK` is 80 MHz when the CPU runs from the PLL
-    /// and equals `CPU_CLK` otherwise (TRM table 6.2-4; report TW §B.2).
-    pub apb_period: u64,
+    cpu_period: u64,
+    apb_period: u64,
 }
 
 impl CpuClock {
@@ -54,16 +56,39 @@ impl CpuClock {
     /// excludes 40 MHz). A CPU reset keeps the selection the firmware made: after `esp_restart`
     /// the ROM runs on the undivided crystal, 40 MHz (IR §4.1). The 20 MHz is a documented
     /// assumption, not a measured fact: see the `ASSUMPTION:` in the documentation of [`cpu_clock`].
-    pub const POWER_ON: CpuClock = CpuClock {
-        cpu_period: 2 * XTAL_PERIOD,
-        apb_period: 2 * XTAL_PERIOD,
-    };
+    pub const POWER_ON: CpuClock = CpuClock::new(2 * XTAL_PERIOD, 2 * XTAL_PERIOD);
+
+    /// A CPU clock and an APB clock by their periods in time-base cycles; a period of 0 is taken
+    /// as 1, the shortest there is.
+    #[must_use]
+    pub const fn new(cpu_period: u64, apb_period: u64) -> CpuClock {
+        CpuClock {
+            cpu_period: if cpu_period == 0 { 1 } else { cpu_period },
+            apb_period: if apb_period == 0 { 1 } else { apb_period },
+        }
+    }
+
+    /// Time-base cycles in one CPU clock cycle; at least 1.
+    #[must_use]
+    pub const fn cpu_period(self) -> u64 {
+        self.cpu_period
+    }
+
+    /// Time-base cycles in one `APB_CLK` cycle; at least 1. `APB_CLK` is 80 MHz when the CPU runs
+    /// from the PLL and equals `CPU_CLK` otherwise (TRM table 6.2-4; report TW §B.2).
+    #[must_use]
+    pub const fn apb_period(self) -> u64 {
+        self.apb_period
+    }
 
     /// The CPU clock frequency, rounded down to a whole number of hertz.
     #[must_use]
     pub fn cpu_frequency(self) -> Frequency {
-        // INVARIANT: `cpu_period` is at most 4 × 1024 (the crystal divider field is 10 bits wide),
-        // so the quotient is at least 39 062 Hz; the fallback is never taken.
+        // INVARIANT: `cpu_period` is at least 1 (`CpuClock::new`), so the division is defined. A
+        // period the clock registers select is at most 4 × 1024 (the crystal divider field is 10
+        // bits wide), so the quotient is at least 39 062 Hz and the fallback is never taken; a
+        // period longer than a second, which only a caller of `new` could ask for, reads as the
+        // time base rather than as 0 Hz.
         Frequency::from_hz(TIME_BASE.hz() / self.cpu_period).unwrap_or(TIME_BASE)
     }
 }
@@ -87,10 +112,7 @@ pub fn cpu_clock(sysclk_conf: u32, cpu_per_conf: u32) -> Option<CpuClock> {
     match (sysclk_conf >> SOC_CLK_SEL_SHIFT) & SOC_CLK_SEL_MASK {
         SOC_CLK_XTAL => {
             let period = XTAL_PERIOD * (u64::from(sysclk_conf & PRE_DIV_MASK) + 1);
-            Some(CpuClock {
-                cpu_period: period,
-                apb_period: period,
-            })
+            Some(CpuClock::new(period, period))
         }
         SOC_CLK_PLL => {
             let cpu_period = match cpu_per_conf & CPUPERIOD_SEL_MASK {
@@ -98,10 +120,7 @@ pub fn cpu_clock(sysclk_conf: u32, cpu_per_conf: u32) -> Option<CpuClock> {
                 1 => PLL_160_PERIOD,
                 _ => return None,
             };
-            Some(CpuClock {
-                cpu_period,
-                apb_period: PLL_80_PERIOD,
-            })
+            Some(CpuClock::new(cpu_period, PLL_80_PERIOD))
         }
         _ => None,
     }
@@ -161,36 +180,32 @@ mod tests {
             Some(CpuClock::POWER_ON),
             "power-on: 20 MHz, 8 time-base cycles per CPU and APB cycle"
         );
-        assert_eq!(CpuClock::POWER_ON.cpu_period, 8);
-        let clock = |sysclk, cpu_per| cpu_clock(sysclk, cpu_per).unwrap();
-        assert_eq!(
-            (
-                clock(0x2_8000, 0xC).cpu_period,
-                clock(0x2_8000, 0xC).apb_period
-            ),
-            (4, 4)
-        );
-        assert_eq!(
-            (
-                clock(0x2_8400, 0xC).cpu_period,
-                clock(0x2_8400, 0xC).apb_period
-            ),
-            (2, 2)
-        );
+        assert_eq!(CpuClock::POWER_ON.cpu_period(), 8);
+        let periods = |sysclk, cpu_per| {
+            let clock = cpu_clock(sysclk, cpu_per).unwrap();
+            (clock.cpu_period(), clock.apb_period())
+        };
+        assert_eq!(periods(0x2_8000, 0xC), (4, 4));
+        assert_eq!(periods(0x2_8400, 0xC), (2, 2));
         // At 160 MHz the APB clock stays at 80 MHz (TRM table 6.2-4).
-        assert_eq!(
-            (
-                clock(0x2_8400, 0xD).cpu_period,
-                clock(0x2_8400, 0xD).apb_period
-            ),
-            (1, 2)
-        );
-        assert_eq!(clock(0x2_83FF, 0xC).cpu_period, 4 * 1024);
+        assert_eq!(periods(0x2_8400, 0xD), (1, 2));
+        assert_eq!(periods(0x2_83FF, 0xC), (4 * 1024, 4 * 1024));
+        let clock = |sysclk, cpu_per| cpu_clock(sysclk, cpu_per).unwrap();
         assert_eq!(
             clock(0x2_8002, 0xC).cpu_frequency().hz(),
             13_333_333,
             "40 MHz / 3, rounded down"
         );
+    }
+
+    #[test]
+    fn a_clock_never_has_a_period_of_zero() {
+        // No selection of the registers gives one, and a caller that asks for one gets the
+        // shortest period there is: `cpu_frequency` divides by it.
+        let clock = CpuClock::new(0, 0);
+        assert_eq!((clock.cpu_period(), clock.apb_period()), (1, 1));
+        assert_eq!(clock.cpu_frequency(), TIME_BASE);
+        assert_eq!(SECOND, 160_000_000);
     }
 
     #[test]

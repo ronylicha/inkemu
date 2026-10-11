@@ -55,7 +55,7 @@ pub enum StopReason {
 
 /// Device time a call to [`Esp32C3::run_until`] spends asleep before it returns
 /// [`StopReason::Asleep`]: one second, in cycles of the time base.
-pub const SLEEP_SLICE: u64 = 160_000_000;
+pub const SLEEP_SLICE: u64 = clock::SECOND;
 /// Wake-ups without an interrupt one call goes through before it returns [`StopReason::Asleep`].
 pub const MAX_FRUITLESS_WAKES: u32 = 100_000;
 /// CPU clock cycles between the instant the controller selects a line and the instant the CPU
@@ -236,7 +236,7 @@ impl Esp32C3 {
                 Some((line, visible_at))
             }
             (Some(line), _) => {
-                let latency = INTERRUPT_LATENCY_CYCLES * self.bus.ctx.clock().cpu_period;
+                let latency = INTERRUPT_LATENCY_CYCLES * self.bus.ctx.clock().cpu_period();
                 Some((line, self.bus.ctx.now() + latency))
             }
         };

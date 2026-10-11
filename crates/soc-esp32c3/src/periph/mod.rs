@@ -1125,7 +1125,7 @@ mod tests {
         // withdraws the call of the one it replaces, however often the firmware does it.
         let ctx = &mut Ctx::default();
         let mut p = peripherals(ctx);
-        let protection = emu_core::Cycles(13 * 160_000_000 / 10);
+        let protection = emu_core::Cycles(13 * crate::clock::SECOND / 10);
         assert_eq!(ctx.next_wake(), Some(protection), "before the RTC watchdog");
         for _ in 0..10_000 {
             p.deliver(ctx, Event::ModuleReset(Module::Timg0));

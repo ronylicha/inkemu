@@ -373,7 +373,7 @@ impl Timg {
     /// 0 divides by 65 536 and 1 by 2 (TRM §11.2; TW §B.2).
     fn t0_rate(&self, ctx: &Ctx) -> Rate {
         let source = if self.t0_config & T0_USE_XTAL == 0 {
-            ctx.clock().apb_period
+            ctx.clock().apb_period()
         } else {
             XTAL_PERIOD
         };
@@ -391,7 +391,7 @@ impl Timg {
     /// says; ESP-IDF never writes 0. A probe on a real chip settles it.
     fn wdt_rate(&self, ctx: &Ctx) -> Rate {
         let source = if self.wdt_config0 & WDT_USE_XTAL == 0 {
-            ctx.clock().apb_period
+            ctx.clock().apb_period()
         } else {
             XTAL_PERIOD
         };
@@ -757,10 +757,8 @@ impl Peripheral<Ctx> for Timg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::CpuClock;
+    use crate::clock::{CpuClock, SECOND};
 
-    /// One second of device time.
-    const SECOND: u64 = 160_000_000;
     const MILLISECOND: u64 = SECOND / 1_000;
 
     fn group(ctx: &mut Ctx, group: Group) -> Timg {
@@ -867,10 +865,7 @@ mod tests {
         let mut timg = group(ctx, Group::Timg0);
         // Half of the timeout at 20 MHz, then APB at 40 MHz as after `esp_restart` (TW §D.4).
         after(ctx, &mut timg, 65 * SECOND / 100);
-        ctx.set_clock(CpuClock {
-            cpu_period: 4,
-            apb_period: 4,
-        });
+        ctx.set_clock(CpuClock::new(4, 4));
         timg.clock_changed(ctx);
         assert_eq!(
             ctx.next_wake(),
