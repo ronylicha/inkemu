@@ -83,9 +83,14 @@ pub enum RunEnd {
     ConsoleClosed,
     /// The console could not be written for any other reason.
     ConsoleError,
+    /// `--strict-mmio` stopped the run on something the emulator does not do as the device would.
     StrictMmio,
+    /// The CPU waits for an interrupt and nothing on the device can raise one.
     Idle,
-    /// The user asked the run to stop (Ctrl-C).
+    /// The user asked the run to stop (Ctrl-C). The request is read between two slices, at a
+    /// place that depends on the host: the trace hash of such a run covers what ran up to the
+    /// cut, and is not reproducible from one run to the next. The hash of a run ended by a limit
+    /// is.
     Interrupted,
 }
 
@@ -413,6 +418,10 @@ mod tests {
         console: ConsoleChannel::Uart0,
     };
     const SECOND_NS: u64 = 1_000_000_000;
+    /// A cycle limit for the runs that something else must end, and whose program executes: a
+    /// run that lost its end reaches this limit after ten slices, ends as [`RunEnd::Budget`],
+    /// and the assertion on its end fails, where a run without a limit would hang the suite.
+    const BACKSTOP: u64 = 10 * SLICE_CYCLES;
 
     fn options(max_cycles: u64) -> RunOptions {
         RunOptions {
@@ -722,21 +731,14 @@ mod tests {
         // With its watchdogs stopped, nothing on the device has anything scheduled.
         let mut program = stop_watchdogs();
         program.extend([wfi(), HANG]);
-        let mut m = machine(&program, MachineOptions::default());
-        let (mut console, mut log) = (Vec::new(), Vec::new());
-        let end = execute(
-            &mut m,
-            &UNLIMITED,
-            &NOT_INTERRUPTED,
-            &reader_stays,
-            &mut console,
-            &mut log,
-        );
-        assert_eq!((end, end.exit_code()), (RunEnd::Idle, 4));
+        // A CPU that can never wake advances neither cycles nor device time: no limit of the
+        // run could end it if it stopped ending by itself, only the bound on host time.
+        let run = run_bounded(program, UNLIMITED);
+        assert_eq!((run.end, run.end.exit_code()), (RunEnd::Idle, 4));
         assert!(
-            text(&log).contains("waits for an interrupt and none can come"),
+            run.log.contains("waits for an interrupt and none can come"),
             "{}",
-            text(&log)
+            run.log
         );
     }
 
@@ -789,7 +791,7 @@ mod tests {
         let mut log = Vec::new();
         let end = execute(
             &mut m,
-            &UNLIMITED,
+            &options(BACKSTOP),
             &NOT_INTERRUPTED,
             &reader_stays,
             &mut Closed,
@@ -823,7 +825,7 @@ mod tests {
         let mut log = Vec::new();
         let end = execute(
             &mut m,
-            &UNLIMITED,
+            &options(BACKSTOP),
             &NOT_INTERRUPTED,
             &reader_stays,
             &mut Failing,
@@ -1030,6 +1032,13 @@ mod tests {
             &mut log,
         );
         assert_eq!(end, RunEnd::Budget);
+        // A life is four instructions (`lui`, `addi`, `sw`, `wfi`) and 6 cycles, then a sleep
+        // that a watchdog ends: the 300 cycles of the limit are 50 lives. Measured when this was
+        // written: 50 bytes, 49 resets (33 by main watchdog 0, 16 by the RTC watchdog) and
+        // 48.36 s of device time. The bounds below ask for a tenth of that: more than 5 lives,
+        // and more than 5 times the 1.3 s of the longest one. They are loose on purpose: the
+        // cost of an instruction or the stage of a watchdog can change without this test, which
+        // is about the run going on, having anything to say.
         assert!(
             console.len() > 5 && console.iter().all(|&byte| byte == b'a'),
             "one `a` per life: {console:?}"
@@ -1041,6 +1050,11 @@ mod tests {
             "{lives} bytes"
         );
         assert!(m.device_time_nanos() > 5 * 1_300_000_000);
+        assert!(
+            text(&log).contains("; the CPU is asleep, waiting for an interrupt\n"),
+            "the limit is reached by the `wfi` of the last life: {}",
+            text(&log)
+        );
     }
 
     #[test]
@@ -1087,13 +1101,14 @@ mod tests {
         let interrupt = AtomicBool::new(true);
         let end = execute(
             &mut m,
-            &UNLIMITED,
+            &options(BACKSTOP),
             &interrupt,
             &reader_stays,
             &mut console,
             &mut log,
         );
         assert_eq!((end, end.exit_code()), (RunEnd::Interrupted, 0));
+        assert_eq!(m.cycles().get(), 0, "read before anything runs");
         let log = text(&log);
         assert!(log.contains("inkemu: interrupted by the user\n"), "{log}");
         assert!(
@@ -1416,8 +1431,10 @@ mod tests {
 
     #[test]
     fn an_interrupt_ends_a_run_whose_cpu_sleeps_for_ever() {
-        // The flag, raised once the byte printed before the sleep has reached the console, must
-        // be read on the path of a sleeping CPU too.
+        // An alarm at every count of the 16 MHz counter. The flag, raised once the byte printed
+        // before the sleep has reached the console, must be read on the path of a sleeping CPU
+        // too. A cycle limit could not end this run if the flag were no longer read; ten
+        // seconds of device time do, as `TimeLimit`, and the assertion on the end fails.
         let mut m = machine(&sleeping_for_ever(1), MachineOptions::default());
         let interrupt = AtomicBool::new(false);
         let mut console = RaisesInterrupt {
@@ -1427,7 +1444,10 @@ mod tests {
         let mut log = Vec::new();
         let end = execute(
             &mut m,
-            &UNLIMITED,
+            &RunOptions {
+                max_device_nanos: Some(10 * SECOND_NS),
+                ..UNLIMITED
+            },
             &interrupt,
             &reader_stays,
             &mut console,
@@ -1596,37 +1616,57 @@ mod tests {
 
     #[test]
     fn an_interrupt_does_not_change_the_trace_of_the_run_it_ends() {
-        // The request is read between two slices and never enters a trace: the hash of a run
-        // ended by the interrupt is that of the same run ended by its limit, at the same cycle.
-        let hash = |interrupt: &AtomicBool, max_cycles: Option<u64>| {
-            let mut m = machine(
-                &printing(UART0, b"x", &[HANG]),
-                MachineOptions {
-                    strict_mmio: false,
-                    trace_hash: true,
-                },
-            );
-            assert_eq!(m.run_until(Cycles(5_000)), StopReason::CycleBudget);
-            let (mut console, mut log) = (Vec::new(), Vec::new());
-            execute(
-                &mut m,
-                &RunOptions {
-                    max_cycles,
-                    ..UNLIMITED
-                },
-                interrupt,
-                &reader_stays,
-                &mut console,
-                &mut log,
-            );
-            text(&log)
+        // The request is read between two calls of the machine and never enters a trace. The
+        // console raises the flag when the byte the firmware printed reaches it, at the end of
+        // the first slice: the run executes that slice, and ends at the next pass. A second run,
+        // limited to the cycle count the first one stopped at, must print the same hash.
+        const TRACED: MachineOptions = MachineOptions {
+            strict_mmio: false,
+            trace_hash: true,
+        };
+        let program = printing(UART0, b"x", &[HANG]);
+        let hash_line = |log: &[u8]| {
+            text(log)
                 .lines()
-                .find(|l| l.starts_with("trace-hash "))
+                .find(|line| line.starts_with("trace-hash "))
                 .map(str::to_owned)
         };
-        let interrupted = AtomicBool::new(true);
-        let by_limit = hash(&NOT_INTERRUPTED, Some(5_000));
-        assert!(by_limit.is_some());
-        assert_eq!(hash(&interrupted, None), by_limit);
+
+        let mut interrupted = machine(&program, TRACED);
+        let interrupt = AtomicBool::new(false);
+        let mut console = RaisesInterrupt {
+            interrupt: &interrupt,
+            received: Vec::new(),
+        };
+        let mut log = Vec::new();
+        let end = execute(
+            &mut interrupted,
+            &options(BACKSTOP),
+            &interrupt,
+            &reader_stays,
+            &mut console,
+            &mut log,
+        );
+        assert_eq!(end, RunEnd::Interrupted);
+        let cycles = interrupted.cycles().get();
+        assert!(
+            (SLICE_CYCLES..2 * SLICE_CYCLES).contains(&cycles),
+            "one slice ran before the flag was read: {cycles} cycles"
+        );
+
+        let mut limited = machine(&program, TRACED);
+        let (mut limited_console, mut limited_log) = (Vec::new(), Vec::new());
+        let end = execute(
+            &mut limited,
+            &options(cycles),
+            &NOT_INTERRUPTED,
+            &reader_stays,
+            &mut limited_console,
+            &mut limited_log,
+        );
+        assert_eq!((end, limited.cycles().get()), (RunEnd::Budget, cycles));
+        assert_eq!(limited_console, console.received);
+        assert!(hash_line(&log).is_some());
+        assert_eq!(hash_line(&log), hash_line(&limited_log));
     }
 }
