@@ -732,8 +732,8 @@ fn a_firmware_that_hangs_with_interrupts_masked_is_reset_by_its_own_watchdog() {
     }
     let enabled_ns = machine.device_time_nanos();
     // The reset takes place one stage, 500 counts of 1 ms, after that store. That a watchdog
-    // counts its first stage from 0 when it is switched on is the model's choice, marked
-    // `ASSUMPTION:` where the timer groups enable it: it is not observed on silicon.
+    // counts its first stage from 0 when it is switched on is the model's choice, marked as an
+    // assumption where the timer groups enable it: it is not observed on silicon.
     //
     // A prescaler half as large moves the reset by 250 ms and one twice as large by 500 ms, a
     // stage of 250 or 1 000 counts by 250 or 500 ms, an immediate expiry by 500 ms: the window

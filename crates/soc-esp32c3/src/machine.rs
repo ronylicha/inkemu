@@ -385,7 +385,7 @@ impl Esp32C3 {
         // because `Hart::reset` builds a new decode cache, at every level.
         self.hart.reset(RESET_PC);
         // A CPU reset is taken to leave the interrupt controller and the source levels as they
-        // are (the `ASSUMPTION:` of `Peripherals::reset`, with what settles it), and the hart
+        // are (the assumption marked on `Peripherals::reset`, with what settles it), and the hart
         // forgot the line it was shown: the next `service` selects again. The line becomes
         // visible 4 CPU cycles after the reset, as one that has just become selected does.
         self.selected = None;
@@ -1286,7 +1286,7 @@ mod tests {
 
     #[test]
     fn a_higher_priority_line_blanks_the_one_the_cpu_could_see_for_the_latency() {
-        // The `ASSUMPTION:` of `INTERRUPT_LATENCY_CYCLES`. Software interrupt 0 on line 3 at
+        // The assumption marked on `INTERRUPT_LATENCY_CYCLES`. Software interrupt 0 on line 3 at
         // priority 1 is raised with the interrupts masked and becomes visible; software interrupt
         // 1 on line 4 at priority 2 is raised next, and `MIE` is set by the instruction after.
         let mut body = vec![lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)];
@@ -1834,7 +1834,7 @@ mod tests {
 
     /// Two passes around a CPU reset. The first routes software interrupt 0 to line 3, raises it
     /// with the interrupts masked and asks for the reset; the controller and the source levels
-    /// are taken to survive a CPU reset (the `ASSUMPTION:` of `Peripherals::reset`), so the
+    /// are taken to survive a CPU reset (the assumption marked on `Peripherals::reset`), so the
     /// second pass finds the line still selected. It sets `MIE` when `mie` is true and sleeps in
     /// `wfi`.
     fn a_line_pending_across_a_cpu_reset(mie: bool) -> Esp32C3 {
@@ -1889,7 +1889,7 @@ mod tests {
     #[test]
     fn a_line_selected_before_a_cpu_reset_wakes_a_masked_wfi_after_it() {
         // A CPU reset is taken to leave the interrupt controller and the sources as they are
-        // (the `ASSUMPTION:` of `Peripherals::reset`).
+        // (the assumption marked on `Peripherals::reset`).
         let mut m = a_line_pending_across_a_cpu_reset(false);
         assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
         assert_eq!(m.resets(), 1);

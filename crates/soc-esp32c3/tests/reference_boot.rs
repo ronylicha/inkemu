@@ -107,8 +107,8 @@ const APPLICATION_LINES: [&str; 39] = [
 /// and the QEMU oracle never does (IR §4.4, §6 row 16).
 ///
 /// The address is the instruction after the store that asked for the reset, in the ROM's
-/// `software_reset_cpu`: the model resets at the end of that instruction (`ASSUMPTION:` in
-/// `AssistDebug::cpu_reset`; a real chip shows an application address).
+/// `software_reset_cpu`: the model resets at the end of that instruction (the assumption marked
+/// on `AssistDebug::cpu_reset`; a real chip shows an application address).
 const SECOND_BOOT_ROM_LINES: [&str; 9] = [
     "Build:Feb  7 2021",
     "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)",
