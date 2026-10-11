@@ -1,7 +1,8 @@
 //! `inkemu inspect`: exit 0 and a description for a valid image, exit 2 and the reason otherwise.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use assert_cmd::Command;
-use firmware::builder::{ImageSpec, build_image};
+use firmware::builder::{ImageSpec, app_desc_bytes, build_image};
+use predicates::prelude::*;
 use predicates::str::contains;
 use std::path::PathBuf;
 
@@ -34,6 +35,20 @@ fn inspect_describes_a_valid_image() {
 }
 
 #[test]
+fn inspect_escapes_control_characters_from_firmware_metadata() {
+    let mut spec = ImageSpec::default();
+    spec.segments[0].1 = app_desc_bytes("1.0\u{1b}]0;pwned\u{7}", "demo\u{1b}[31m", "v5.5.2");
+    let (_d, path) = write_temp(&build_image(&spec));
+    inspect()
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(predicate::function(|out: &[u8]| !out.contains(&0x1b)))
+        .stdout(predicate::function(|out: &[u8]| !out.contains(&0x07)))
+        .stdout(contains("demo\\u{1b}[31m 1.0\\u{1b}]0;pwned\\u{7}"));
+}
+
+#[test]
 fn inspect_explains_encrypted_ota() {
     let mut bytes = b"XOTA".to_vec();
     bytes.resize(1024, 0);
@@ -61,7 +76,8 @@ fn inspect_reports_missing_file() {
         .arg("/nonexistent/fw.bin")
         .assert()
         .code(2)
-        .stderr(contains("cannot read /nonexistent/fw.bin"));
+        .stderr(contains("cannot read /nonexistent/fw.bin"))
+        .stderr(contains("; check the path and read permissions"));
 }
 
 /// Real-firmware check, opt-in: set `INKEMU_REAL_FIRMWARE` to a `CrossPoint` X3/X4 .bin (never committed).

@@ -61,10 +61,11 @@ fn main() -> ExitCode {
 }
 
 fn run_inspect(path: &Path) -> ExitCode {
+    let shown = emu_cli::inspect::sanitize(&path.display().to_string());
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("error: cannot read {}: {e}", path.display());
+            eprintln!("error: cannot read {shown}: {e}; check the path and read permissions");
             return ExitCode::from(EXIT_ERROR);
         }
     };
@@ -78,7 +79,7 @@ fn run_inspect(path: &Path) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("error: {}: {e}", path.display());
+            eprintln!("error: {shown}: {e}");
             ExitCode::from(EXIT_ERROR)
         }
     }
