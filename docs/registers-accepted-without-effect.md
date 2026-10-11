@@ -142,8 +142,6 @@ SP1b-3, SP1b-4, SP2, SP5a and SP8.
 | `0x600c4030` | `EXTMEM.ICACHE_SYNC_SIZE` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
 | `0x600c4034` | `EXTMEM.ICACHE_PRELOAD_CTRL` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
 | `0x600c4040` | `EXTMEM.ICACHE_AUTOLOAD_CTRL` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
-| `0x600c4078` | `EXTMEM.CACHE_ILG_INT_ENA` | 1 | cache error interrupt: the status is latched, no interrupt is raised | SP1b-3 |
-| `0x600c4084` | `EXTMEM.CORE0_ACS_CACHE_INT_ENA` | 1 | cache error interrupt: the status is latched, no interrupt is raised | SP1b-3 |
 | `0x600c40a8` | `EXTMEM.CACHE_WRAP_AROUND_CTRL` | 1 | wrap-around read mode | SP1b-4 |
 | `0x600c40ac` | `EXTMEM.CACHE_MMU_POWER_CTRL` | 1 | MMU memory power | SP8 |
 | `0x600c40c4` | `EXTMEM.CACHE_MMU_OWNER` | 1 | MMU ownership bits | SP1b-4 |

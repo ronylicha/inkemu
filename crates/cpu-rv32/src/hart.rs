@@ -136,7 +136,9 @@ impl Hart {
         }
         let (raw, stall) = self.fetch(bus)?;
         let decoded = decode(raw);
-        self.dcache.insert(self.pc, decoded, &*bus);
+        if bus.fetch_is_memory(self.pc, u32::from(decoded.len)) {
+            self.dcache.insert(self.pc, decoded, &*bus);
+        }
         Ok((decoded, stall))
     }
 

@@ -667,4 +667,35 @@ mod tests {
             (1, 2)
         );
     }
+
+    /// Where the tests that take traps put their vector table: a page boundary, which `lui` can
+    /// load (`mtvec.BASE` only has to be aligned to 256 bytes).
+    const VECTORS: u32 = ROM_BASE + 0x1000;
+    const MTVEC: u16 = 0x305;
+
+    #[test]
+    fn an_instruction_fetched_through_an_unmapped_flash_page_is_fetched_again_each_time() {
+        // Carried over from SP1b-2: decoded once and kept, such an instruction would be reported
+        // and latched once however often it runs. The handler jumps back into the window.
+        let window = crate::memmap::FLASH_IBUS_BASE;
+        let mut body = vec![
+            lui(T0, VECTORS),
+            cpu_rv32::asm::csrrw(0, MTVEC, T0),
+            lui(T1, window),
+            cpu_rv32::asm::jalr(0, T1, 0),
+        ];
+        body.resize(((VECTORS - ROM_BASE) / 4) as usize, HANG);
+        // Exceptions enter at the base of the table.
+        body.push(cpu_rv32::asm::jalr(0, T1, 0));
+        let mut m = machine(&body);
+        assert_eq!(m.run_until(Cycles(200)), StopReason::CycleBudget);
+        let faults = m
+            .most_repeated_diagnostics(8)
+            .into_iter()
+            .find(|(d, _)| matches!(d, Diagnostic::FlashMapping { vaddr, .. } if *vaddr == window));
+        let Some((_, count)) = faults else {
+            panic!("the fetch through the invalid entry was not reported more than once");
+        };
+        assert!(count > 5, "one report per execution: {count}");
+    }
 }

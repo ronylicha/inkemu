@@ -1,6 +1,6 @@
 //! The modelled peripherals of the ESP32-C3 and their place in the address space.
 use crate::config::SocConfig;
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, Event};
 use crate::flash::FlashDevice;
 use emu_core::Peripheral;
 
@@ -392,6 +392,17 @@ impl Peripherals {
             uart0: Uart::new(UART0_BASE),
             uart1: Uart::new(UART1_BASE),
             usb_serial_jtag: UsbSerialJtag::new(),
+        }
+    }
+
+    /// Calls the device an event is for: a wake-up whose time has come, or what another part of the
+    /// machine has to tell it (ADR 0003).
+    pub(crate) fn deliver(&mut self, ctx: &mut Ctx, event: Event) {
+        match event {
+            Event::MmuFault { vaddr, content } => self.extmem.latch_mmu_fault(ctx, vaddr, content),
+            Event::FlashWindowStore { instruction_bus } => {
+                self.extmem.latch_store(ctx, instruction_bus);
+            }
         }
     }
 

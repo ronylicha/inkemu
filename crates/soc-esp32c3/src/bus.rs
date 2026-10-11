@@ -1,6 +1,6 @@
 //! The ESP32-C3 address space. Memory map: `docs/research/esp32c3-boot-chain.md`, §A.1.
 use crate::config::SocConfig;
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, Event};
 use crate::diag::{Diagnostic, Direction, MappingFault};
 use crate::flash::FlashDevice;
 use crate::memmap::{
@@ -111,6 +111,20 @@ impl SocBus {
         }
     }
 
+    /// Calls the device `event` is for, then every device the call had something to tell.
+    pub(crate) fn deliver(&mut self, event: Event) {
+        self.periph.deliver(&mut self.ctx, event);
+        self.settle();
+    }
+
+    /// Delivers what the devices posted for each other during a register access or a call: such
+    /// an event reaches its device before the instruction ends.
+    fn settle(&mut self) {
+        while let Some(event) = self.ctx.take_signal() {
+            self.periph.deliver(&mut self.ctx, event);
+        }
+    }
+
     /// Tells the bus which instruction is running, so diagnostics can name it.
     pub fn set_pc(&mut self, pc: u32) {
         self.ctx.set_pc(pc);
@@ -189,7 +203,10 @@ impl SocBus {
                 Err(unbacked) if reported == Some(unbacked) => {}
                 Err(unbacked) => {
                     // The fault registers and the diagnostic name the address of the access.
-                    self.periph.extmem.latch_mmu_fault(vaddr, unbacked.content);
+                    self.deliver(Event::MmuFault {
+                        vaddr,
+                        content: unbacked.content,
+                    });
                     self.ctx.diag.record(Diagnostic::FlashMapping {
                         vaddr,
                         entry: unbacked.entry,
@@ -216,6 +233,7 @@ impl SocBus {
             .periph
             .device(reg_addr)
             .and_then(|(device, base)| device.read(&mut self.ctx, reg_addr - base));
+        self.settle();
         let word = match modelled {
             Some(word) => word,
             None => self.unmodeled(reg_addr, Direction::Read, 0),
@@ -244,6 +262,7 @@ impl SocBus {
             .periph
             .device(reg_addr)
             .is_some_and(|(device, base)| device.write(&mut self.ctx, reg_addr - base, word));
+        self.settle();
         if !handled {
             self.unmodeled(reg_addr, Direction::Write, word);
         }
@@ -286,7 +305,7 @@ impl Bus for SocBus {
             Some(Region::Flash {
                 instruction_bus, ..
             }) => {
-                self.periph.extmem.latch_store(instruction_bus);
+                self.deliver(Event::FlashWindowStore { instruction_bus });
                 Err(BusError::Unmapped {
                     addr,
                     kind: AccessKind::Store,
@@ -297,6 +316,18 @@ impl Bus for SocBus {
                 addr,
                 kind: AccessKind::Store,
             }),
+        }
+    }
+
+    fn fetch_is_memory(&self, addr: u32, len: u32) -> bool {
+        match locate(addr, len) {
+            // Decision D23 serves 0 for a flash window byte no flash byte backs: that is no
+            // content to keep, and each such fetch is to be latched and reported.
+            Some(Region::Flash { offset, .. }) => {
+                self.flash_offset(offset).is_ok()
+                    && self.flash_offset(offset + len.saturating_sub(1)).is_ok()
+            }
+            _ => true,
         }
     }
 
