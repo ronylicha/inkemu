@@ -83,6 +83,9 @@ pub fn lw(rd: u8, rs1: u8, imm: i32) -> u32 {
 pub fn lbu(rd: u8, rs1: u8, imm: i32) -> u32 {
     i(imm, rs1, 4, rd, 0x03)
 }
+pub fn lhu(rd: u8, rs1: u8, imm: i32) -> u32 {
+    i(imm, rs1, 5, rd, 0x03)
+}
 pub fn sb(rs2: u8, rs1: u8, imm: i32) -> u32 {
     s(imm, rs2, rs1, 0, 0x23)
 }

@@ -10,6 +10,8 @@ const MCAUSE_INTERRUPT: u32 = 1 << 31;
 const MTVEC_MODE_MASK: u32 = 0b11;
 const MTVEC_VECTORED: u32 = 1;
 const COMPRESSED_MASK: u32 = 0b11;
+/// One 16-bit instruction parcel.
+const PARCEL_MASK: u32 = 0xffff;
 /// Bytes between two entries of a vectored trap table (one `jal`/`j` per entry).
 const VECTOR_ENTRY_BYTES: u32 = 4;
 
@@ -145,14 +147,19 @@ impl Hart {
         let lo = bus
             .read(self.pc, AccessSize::Half, AccessKind::Fetch)
             .map_err(|_| fault(self.pc))?;
-        if lo.value & COMPRESSED_MASK != COMPRESSED_MASK {
-            return Ok((lo.value, lo.stall));
+        // Each parcel is masked to 16 bits: the bus contract says so, but a peripheral may not comply.
+        let lo_parcel = lo.value & PARCEL_MASK;
+        if lo_parcel & COMPRESSED_MASK != COMPRESSED_MASK {
+            return Ok((lo_parcel, lo.stall));
         }
         let hi_addr = self.pc.wrapping_add(2);
         let hi = bus
             .read(hi_addr, AccessSize::Half, AccessKind::Fetch)
             .map_err(|_| fault(hi_addr))?;
-        Ok((lo.value | (hi.value << 16), lo.stall + hi.stall))
+        Ok((
+            lo_parcel | ((hi.value & PARCEL_MASK) << 16),
+            lo.stall + hi.stall,
+        ))
     }
 
     fn trap(&mut self, trap: Trap, cycles: u32) -> StepOutcome {
@@ -303,6 +310,70 @@ mod tests {
             (h.x[3], h.x[4], h.x[5], h.x[6]),
             (0xffff_ffff, 0xff, 0x0000_00ff, 0xffff_ffff)
         );
+    }
+
+    /// A bus whose sub-word reads leave garbage above the access size, as a peripheral
+    /// that answers a byte read with its whole register word would. Only reads of the
+    /// given kind are dirtied, so each test isolates one consumer of the contract.
+    #[derive(Debug)]
+    struct DirtyBus(Ram, AccessKind);
+    impl Bus for DirtyBus {
+        fn read(
+            &mut self,
+            a: u32,
+            s: AccessSize,
+            k: AccessKind,
+        ) -> Result<emu_core::ReadOutcome, emu_core::BusError> {
+            let mut o = self.0.read(a, s, k)?;
+            if k == self.1 {
+                o.value |= match s {
+                    AccessSize::Byte => 0xDEAD_BE00,
+                    AccessSize::Half => 0xDEAD_0000,
+                    AccessSize::Word => 0,
+                };
+            }
+            Ok(o)
+        }
+        fn write(&mut self, a: u32, s: AccessSize, v: u32) -> Result<u32, emu_core::BusError> {
+            self.0.write(a, s, v)
+        }
+        fn page_version(&self, a: u32) -> u64 {
+            self.0.page_version(a)
+        }
+    }
+
+    #[test]
+    fn sub_word_loads_ignore_bits_above_the_access_size() {
+        let (mut h, mut m) = machine(
+            &[
+                addi(1, 0, 0x200),
+                addi(2, 0, -0x80), // 0xffff_ff80
+                sw(2, 1, 0),       // memory holds 0x80 0xff 0xff 0xff
+                lb(3, 1, 0),
+                lbu(4, 1, 0),
+                lh(5, 1, 0),
+                lhu(6, 1, 0),
+            ],
+            MisalignedPolicy::Trap,
+        );
+        run(&mut h, &mut m, 3);
+        let mut bus = DirtyBus(m, AccessKind::Load);
+        for _ in 0..4 {
+            h.step(&mut bus, &OneCycle);
+        }
+        assert_eq!(h.x[3], 0xffff_ff80, "lb sign-extends the low byte");
+        assert_eq!(h.x[4], 0x0000_0080, "lbu zero-extends the low byte");
+        assert_eq!(h.x[5], 0xffff_ff80, "lh sign-extends the low half");
+        assert_eq!(h.x[6], 0x0000_ff80, "lhu zero-extends the low half");
+    }
+
+    #[test]
+    fn a_32_bit_instruction_fetched_as_two_halves_ignores_dirty_upper_bits() {
+        let (mut h, m) = machine(&[addi(5, 0, 7)], MisalignedPolicy::Trap);
+        let mut bus = DirtyBus(m, AccessKind::Fetch);
+        let out = h.step(&mut bus, &OneCycle);
+        assert_eq!(out, StepOutcome::Retired { cycles: 1 });
+        assert_eq!((h.x[5], h.pc), (7, 4));
     }
 
     #[test]

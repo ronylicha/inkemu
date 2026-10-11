@@ -46,7 +46,12 @@ pub enum BusError {
 }
 
 /// Reads may have side effects on peripherals, hence `&mut self`.
+///
+/// Sub-word accesses use a right-aligned value: a [`AccessSize::Byte`] read returns its byte in
+/// bits 7..0 and a [`AccessSize::Half`] read its halfword in bits 15..0, with every higher bit
+/// zero. A peripheral that exposes a wider register must shift and mask before answering.
 pub trait Bus {
+    /// The returned value is right-aligned and zero-extended to the access size.
     /// # Errors
     /// Returns [`BusError`] when nothing answers at `addr`.
     fn read(
@@ -56,6 +61,7 @@ pub trait Bus {
         kind: AccessKind,
     ) -> Result<ReadOutcome, BusError>;
 
+    /// Writes the low `size` bytes of `value`; bits above the access size are ignored.
     /// Returns the stall cycles of the write.
     /// # Errors
     /// Returns [`BusError`] when nothing answers at `addr`.

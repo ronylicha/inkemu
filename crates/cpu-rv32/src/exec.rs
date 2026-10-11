@@ -4,6 +4,9 @@ use crate::instr::{AluOp, BranchOp, CsrOp, Decoded, Instr, LoadOp, MulOp, Reg, S
 use crate::trap::{Exception, Trap};
 use emu_core::{AccessKind, AccessSize, Bus, InstrClass};
 
+const BYTE_MASK: u32 = 0xff;
+const HALF_MASK: u32 = 0xffff;
+
 /// The effects of a successfully executed instruction that the hart commits at retirement.
 pub(crate) struct Done {
     pub class: InstrClass,
@@ -156,10 +159,14 @@ impl Hart {
             cause: Exception::LoadAccessFault,
             tval: addr,
         })?;
+        // The bus contract already guarantees a right-aligned, zero-extended value; masking here
+        // keeps a peripheral that returns its whole register word from leaking upper bits into rd.
         let value = match op {
             LoadOp::B => i32::from(out.value as u8 as i8) as u32,
             LoadOp::H => i32::from(out.value as u16 as i16) as u32,
-            LoadOp::W | LoadOp::Bu | LoadOp::Hu => out.value,
+            LoadOp::Bu => out.value & BYTE_MASK,
+            LoadOp::Hu => out.value & HALF_MASK,
+            LoadOp::W => out.value,
         };
         self.w(rd, value);
         Ok(Done {
