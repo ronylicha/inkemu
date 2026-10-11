@@ -1,11 +1,26 @@
-//! `SYSTEM`: clock selection, peripheral clock gates and resets. Source: report §E.1.
-//! The CPU clock selection is read by `crate::clock`; gates and resets are stored.
-use crate::ctx::Ctx;
+//! `SYSTEM`: clock selection, peripheral clock gates and resets, software interrupts. Sources:
+//! reports BC §E.1, IR §4.1 and §5 (ESP-IDF `system_reg.h`).
+//! The CPU clock selection is read by `crate::clock`; gates and resets are stored; the four
+//! software interrupt registers are interrupt sources.
+use crate::ctx::{Ctx, Source};
 use crate::periph::{Accepted, SYSTEM_BASE, Storage};
 use emu_core::Peripheral;
 
 const SYSCLK_CONF: u32 = svd_regs::esp32c3::addr("SYSTEM", "SYSCLK_CONF") - SYSTEM_BASE;
 const CPU_PER_CONF: u32 = svd_regs::esp32c3::addr("SYSTEM", "CPU_PER_CONF") - SYSTEM_BASE;
+/// `CPU_INTR_FROM_CPU_0..3`: bit 0 of each register is the level of an interrupt source, set and
+/// cleared by software (`esp_crosscore_int_send` stores 1 at `APP@0x40381bc6`, its handler stores
+/// 0 at `APP@0x40381b50`: report IR §3.3, §5).
+const CPU_INTR_FROM_CPU_0: u32 =
+    svd_regs::esp32c3::addr("SYSTEM", "CPU_INTR_FROM_CPU_0") - SYSTEM_BASE;
+const SOFTWARE_INTERRUPTS: usize = 4;
+const SOFTWARE_SOURCES: [Source; SOFTWARE_INTERRUPTS] = [
+    Source::of("CPU_INTR_FROM_CPU_0_MAP"),
+    Source::of("CPU_INTR_FROM_CPU_1_MAP"),
+    Source::of("CPU_INTR_FROM_CPU_2_MAP"),
+    Source::of("CPU_INTR_FROM_CPU_3_MAP"),
+];
+const SOFTWARE_INTERRUPT_LEVEL: u32 = 1;
 /// `CPU_PERI_CLK_EN`, `CPU_PERI_RST_EN`, `PERIP_CLK_EN0/1`, `PERIP_RST_EN0/1`: gates and reset pulses the
 /// ROM toggles around each peripheral it sets up. Nothing acts on them yet. `CPU_PER_CONF` is stored
 /// as software wrote it; only its `CPUPERIOD_SEL` field acts, through `crate::clock`. `MEM_PD_MASK`
@@ -85,6 +100,8 @@ const XTAL_FREQ_MHZ: u32 = crate::clock::XTAL_MHZ;
 pub struct System {
     sysclk_writable: u32,
     registers: Storage,
+    /// `CPU_INTR_FROM_CPU_0..3`.
+    software_interrupts: [u32; SOFTWARE_INTERRUPTS],
 }
 
 impl System {
@@ -93,6 +110,7 @@ impl System {
         System {
             sysclk_writable: SYSCLK_RESET,
             registers: Storage::accepted(SYSTEM_BASE, &ACCEPTED),
+            software_interrupts: [0; SOFTWARE_INTERRUPTS],
         }
     }
 
@@ -108,6 +126,11 @@ impl System {
     }
 }
 
+fn software_interrupt(offset: u32) -> Option<usize> {
+    let index = usize::try_from(offset.checked_sub(CPU_INTR_FROM_CPU_0)? / 4).ok()?;
+    (index < SOFTWARE_INTERRUPTS).then_some(index)
+}
+
 impl Default for System {
     fn default() -> Self {
         System::new()
@@ -119,10 +142,21 @@ impl Peripheral<Ctx> for System {
         if offset == SYSCLK_CONF {
             return Some(self.clock_registers().0);
         }
+        if let Some(index) = software_interrupt(offset) {
+            return Some(self.software_interrupts[index]);
+        }
         self.registers.read(offset)
     }
 
     fn write(&mut self, ctx: &mut Ctx, offset: u32, value: u32) -> bool {
+        if let Some(index) = software_interrupt(offset) {
+            self.software_interrupts[index] = value & SOFTWARE_INTERRUPT_LEVEL;
+            ctx.irq(
+                SOFTWARE_SOURCES[index],
+                value & SOFTWARE_INTERRUPT_LEVEL != 0,
+            );
+            return true;
+        }
         match offset {
             SYSCLK_CONF => {
                 self.sysclk_writable = value & SYSCLK_WRITABLE;
@@ -212,5 +246,21 @@ mod tests {
             !ctx.take_clock_written(),
             "a clock gate is not the CPU clock"
         );
+    }
+
+    #[test]
+    fn a_software_interrupt_register_is_the_level_of_its_source() {
+        // IR §3.3: source 50 is asserted by a store of 1 and cleared by a store of 0.
+        let ctx = &mut Ctx::default();
+        let mut sys = System::new();
+        assert_eq!(sys.read(ctx, CPU_INTR_FROM_CPU_0), Some(0));
+        assert!(sys.write(ctx, CPU_INTR_FROM_CPU_0, 1));
+        assert_eq!(sys.read(ctx, CPU_INTR_FROM_CPU_0), Some(1));
+        assert_eq!(ctx.sources(), 1 << 50);
+        assert!(sys.write(ctx, CPU_INTR_FROM_CPU_0 + 12, 0xFFFF_FFFF));
+        assert_eq!(sys.read(ctx, CPU_INTR_FROM_CPU_0 + 12), Some(1), "one bit");
+        assert_eq!(ctx.sources(), (1 << 50) | (1 << 53));
+        sys.write(ctx, CPU_INTR_FROM_CPU_0, 0);
+        assert_eq!(ctx.sources(), 1 << 53);
     }
 }

@@ -140,7 +140,7 @@ pub fn execute(
             (Ok(true), StopReason::Idle) => {
                 let _ = writeln!(
                     log,
-                    "inkemu: the CPU is waiting for an interrupt and nothing can raise one; interrupt sources are not emulated yet"
+                    "inkemu: the CPU waits for an interrupt and none can come: no interrupt line is pending and no device has anything scheduled; check that the firmware enables the interrupt it waits for"
                 );
                 break RunEnd::Idle;
             }
@@ -155,7 +155,8 @@ pub fn execute(
                 );
                 break RunEnd::Budget;
             }
-            (Ok(true), StopReason::CycleBudget) => {}
+            // The CPU sleeps and device time goes on: the next slice continues.
+            (Ok(true), StopReason::CycleBudget | StopReason::Asleep) => {}
         }
     };
     let _ = writeln!(
@@ -410,7 +411,7 @@ mod tests {
         );
         assert_eq!((end, end.exit_code()), (RunEnd::Idle, 4));
         assert!(
-            text(&log).contains("waiting for an interrupt"),
+            text(&log).contains("waits for an interrupt and none can come"),
             "{}",
             text(&log)
         );

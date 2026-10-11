@@ -335,3 +335,21 @@ pub fn load_register(addr: u32) -> [u32; 2] {
     let offset = addr.wrapping_sub(page).cast_signed();
     [asm::lui(T0, page), asm::lw(T1, T0, offset)]
 }
+
+/// Stores `value` in the register at `addr`, through `T0` and `T1`.
+#[must_use]
+pub fn store_register(addr: u32, value: u32) -> [u32; 4] {
+    // `addi` and `sw` sign-extend their 12 bits: the upper part is rounded so the sum is the word.
+    let split = |word: u32| {
+        let upper = word.wrapping_add(0x800) & 0xFFFF_F000;
+        (upper, word.wrapping_sub(upper).cast_signed())
+    };
+    let (page, offset) = split(addr);
+    let (upper, lower) = split(value);
+    [
+        asm::lui(T0, page),
+        asm::lui(T1, upper),
+        asm::addi(T1, T1, lower),
+        asm::sw(T1, T0, offset),
+    ]
+}

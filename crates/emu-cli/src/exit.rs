@@ -8,7 +8,7 @@ pub const EXIT_TEST_FAILURE: u8 = 1;
 pub const EXIT_ERROR: u8 = 2;
 /// `inkemu run`: stopped by `--strict-mmio`.
 pub const EXIT_STRICT_MMIO: u8 = 3;
-/// `inkemu run`: the CPU waits for an interrupt and nothing can raise one.
+/// `inkemu run`: the CPU waits for an interrupt and none can come.
 pub const EXIT_IDLE: u8 = 4;
 
 /// The exit codes of `inkemu run`, for its `--help`.
@@ -18,7 +18,8 @@ Exit codes:
   2  error: unknown device, missing or invalid ROM, refused flash image, or standard output cannot be written
   3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
      emulator cannot perform faithfully, or flash that is not mapped)
-  4  the CPU is waiting for an interrupt and nothing can raise one (interrupts are not emulated yet)";
+  4  the CPU waits for an interrupt and none can come: no interrupt line is pending and no device
+     has anything scheduled";
 
 #[cfg(test)]
 mod tests {

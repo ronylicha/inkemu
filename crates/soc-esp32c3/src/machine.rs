@@ -7,7 +7,8 @@ use crate::flash::{FlashDevice, FlashImageError, NorFlash};
 use crate::memmap::RESET_PC;
 use crate::rom::RomImage;
 use cpu_rv32::{
-    DatasheetTiming, Exception, Hart, HartConfig, MisalignedPolicy, StepOutcome, VendorCsrs,
+    DatasheetTiming, Exception, Hart, HartConfig, InterruptModel, MisalignedPolicy, StepOutcome,
+    VendorCsrs,
 };
 use emu_core::{Cycles, Frequency, TimingModel, TraceHash};
 
@@ -26,9 +27,28 @@ pub enum StopReason {
     /// peripheral register with an 8- or 16-bit store, asked for an operation the emulator cannot
     /// perform faithfully, or used flash it had not mapped.
     StrictMmio(Diagnostic),
-    /// The CPU is in `wfi` and nothing can raise an interrupt yet (interrupt sources arrive in SP1b-3).
+    /// The CPU waits for an interrupt and none can come: no interrupt line is pending and no
+    /// device has anything scheduled.
     Idle,
+    /// The CPU has been waiting for an interrupt through [`SLEEP_SLICE`] of device time, or was
+    /// called [`MAX_FRUITLESS_WAKES`] times without one, since the call began. Device time goes
+    /// on while the CPU sleeps and its cycle counter does not: a caller that only watches the
+    /// cycle limit gets control back here, and calls again to go on.
+    Asleep,
 }
+
+/// Device time a call to [`Esp32C3::run_until`] spends asleep before it returns
+/// [`StopReason::Asleep`]: one second, in cycles of the time base.
+pub const SLEEP_SLICE: u64 = 160_000_000;
+/// Wake-ups without an interrupt one call goes through before it returns [`StopReason::Asleep`].
+pub const MAX_FRUITLESS_WAKES: u32 = 100_000;
+/// CPU clock cycles between the instant the controller selects a line and the instant the CPU
+/// can take it: "the interrupt controller ... takes 4 cycles" (TRM §1.6.1; report IR §2.7).
+///
+/// ASSUMPTION: only a line that becomes selectable waits; a line that is masked or released
+/// disappears at once. The TRM gives one figure and no direction; the SP1b-4 lockstep compares
+/// with an oracle that has no latency at all, and needs this to be configurable.
+pub const INTERRUPT_LATENCY_CYCLES: u64 = 4;
 
 /// An ESP32-C3: one hart, the bus with everything it reaches, and the model that prices each
 /// instruction. It performs no host I/O: output is handed over through [`Esp32C3::take_console`].
@@ -38,6 +58,8 @@ pub struct Esp32C3 {
     bus: SocBus,
     timing: DatasheetTiming,
     trace: Option<TraceHash>,
+    /// The line the interrupt controller selects, and the device time from which the CPU sees it.
+    selected: Option<(u32, Cycles)>,
 }
 
 impl Esp32C3 {
@@ -76,7 +98,7 @@ impl Esp32C3 {
         let hart_config = HartConfig {
             misaligned: MisalignedPolicy::Allow,
             vendor_csrs: VendorCsrs::Esp32C3,
-            ..HartConfig::default()
+            interrupts: InterruptModel::Controller,
         };
         let mut bus = SocBus::new(rom, flash, config);
         let (sysclk_conf, cpu_per_conf) = bus.periph.system.clock_registers();
@@ -91,18 +113,43 @@ impl Esp32C3 {
             bus,
             timing: DatasheetTiming,
             trace: config.trace_hash.then(TraceHash::new),
+            selected: None,
         }
     }
 
     /// Runs until the hart's cycle counter reaches `limit` (an absolute [`Esp32C3::cycles`] value) or
     /// the machine stops for another reason.
     pub fn run_until(&mut self, limit: Cycles) -> StopReason {
+        let mut slept: u64 = 0;
+        let mut fruitless_wakes: u32 = 0;
         while self.hart.cycles.get() < limit.get() {
             let pc = self.hart.pc;
             self.bus.set_pc(pc);
             let before = self.hart.cycles.get();
             match self.hart.step(&mut self.bus, &self.timing) {
-                StepOutcome::Waiting => return StopReason::Idle,
+                StepOutcome::Waiting => {
+                    // The CPU idles: device time jumps to the next instant a device asked for.
+                    let Some(duration) = self.sleep() else {
+                        return StopReason::Idle;
+                    };
+                    slept = slept.saturating_add(duration);
+                    fruitless_wakes += 1;
+                    self.service(pc);
+                    if let Some(violation) = self.bus.ctx.diag.take_violation() {
+                        return StopReason::StrictMmio(violation);
+                    }
+                    if slept >= SLEEP_SLICE || fruitless_wakes >= MAX_FRUITLESS_WAKES {
+                        return StopReason::Asleep;
+                    }
+                    continue;
+                }
+                StepOutcome::Interrupted { cause } => {
+                    // The CPU took the line: the controller marks the edge it had latched for it as
+                    // claimed (the latch stays until the firmware's `CPU_INT_CLEAR` toggle
+                    // releases it), and the lines are evaluated again.
+                    self.bus.periph.intmatrix.claim(cause);
+                    self.bus.ctx.interrupts_changed();
+                }
                 // An `ecall` is a request to the trap handler, not a fault worth reporting.
                 StepOutcome::Trapped { trap, .. } if trap.cause != Exception::EcallM => {
                     self.bus.ctx.diag.record(Diagnostic::Exception {
@@ -115,17 +162,88 @@ impl Esp32C3 {
             }
             // Device time follows the CPU: the cycles of this instruction, at the clock it ran on.
             self.bus.ctx.advance(self.hart.cycles.get() - before);
-            if self.bus.ctx.take_clock_written() {
-                self.retune(pc);
-            }
             if let Some(trace) = &mut self.trace {
                 trace.mix_u32(pc);
+            }
+            if self.needs_service() {
+                self.service(pc);
             }
             if let Some(violation) = self.bus.ctx.diag.take_violation() {
                 return StopReason::StrictMmio(violation);
             }
         }
         StopReason::CycleBudget
+    }
+
+    /// Whether anything happened that the loop has to act on before the next instruction.
+    fn needs_service(&self) -> bool {
+        let ctx = &self.bus.ctx;
+        ctx.wake_due()
+            || ctx.is_flagged()
+            || self
+                .selected
+                .is_some_and(|(_, visible_at)| visible_at <= ctx.now())
+    }
+
+    /// Acts on what the last instruction, or the passing of time, left in the context: wake-ups
+    /// that are due, a clock change, a change of the interrupt lines.
+    fn service(&mut self, pc: u32) {
+        while let Some(event) = self.bus.ctx.take_due() {
+            self.bus.deliver(event);
+        }
+        if self.bus.ctx.take_clock_written() {
+            self.retune(pc);
+        }
+        if self.bus.ctx.take_interrupts_changed() {
+            self.select_interrupt();
+        }
+        self.present_interrupt();
+    }
+
+    /// Asks the interrupt controller which line it selects now.
+    fn select_interrupt(&mut self) {
+        let sources = self.bus.ctx.sources();
+        let line = self.bus.periph.intmatrix.resolve(sources);
+        self.selected = match (line, self.selected) {
+            (None, _) => None,
+            // The same line as before: the instant it became visible stands.
+            (Some(line), Some((previous, visible_at))) if line == previous => {
+                Some((line, visible_at))
+            }
+            (Some(line), _) => {
+                let latency = INTERRUPT_LATENCY_CYCLES * self.bus.ctx.clock().cpu_period;
+                Some((line, self.bus.ctx.now() + latency))
+            }
+        };
+    }
+
+    /// Shows the CPU the selected line, once its latency has elapsed.
+    fn present_interrupt(&mut self) {
+        let now = self.bus.ctx.now();
+        let visible = self
+            .selected
+            .filter(|&(_, visible_at)| visible_at <= now)
+            .map(|(line, _)| line);
+        self.hart.set_external_interrupt(visible);
+    }
+
+    /// Moves device time to the next instant something is due: a wake-up a device asked for, or
+    /// the end of the latency of the selected interrupt line. Returns the time skipped, `None`
+    /// when nothing is due at any time.
+    ///
+    /// The CPU clock is gated while the CPU waits: its cycle counter does not move (TRM register
+    /// 1.12 `mpccr`, "the counter stops when the CPU is in WFI"; report TW §H.3).
+    fn sleep(&mut self) -> Option<u64> {
+        let now = self.bus.ctx.now();
+        let latency_end = self.selected.map(|(_, visible_at)| visible_at);
+        let wake = match (self.bus.ctx.next_wake(), latency_end) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        // A wake-up already due is delivered without moving time.
+        let target = wake.max(now);
+        self.bus.ctx.sleep_until(target);
+        Some(target.get() - now.get())
     }
 
     /// Applies a write to the clock registers: from the end of the instruction that wrote them,
@@ -221,7 +339,8 @@ mod tests {
     use crate::memmap::ROM_BASE;
     use crate::memmap::SRAM_DBUS_BASE;
     use crate::test_support::{
-        HANG, T0, T1, flat_rom, load_register, print_program as print, unmodeled_register,
+        HANG, T0, T1, flat_rom, load_register, print_program as print, store_register,
+        unmodeled_register,
     };
     use cpu_rv32::asm::{addi, csrrs, csrrwi, jal, lui, lw, sw, wfi};
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
@@ -440,6 +559,11 @@ mod tests {
     fn wfi_with_nothing_to_wake_it_stops_as_idle() {
         let mut m = machine(&[wfi(), HANG]);
         assert_eq!(m.run_until(Cycles(10_000)), StopReason::Idle);
+        assert_eq!(
+            m.device_time_nanos(),
+            150,
+            "`wfi` alone: 3 cycles at 20 MHz, no jump in time"
+        );
     }
 
     #[test]
@@ -698,5 +822,204 @@ mod tests {
             panic!("the fetch through the invalid entry was not reported more than once");
         };
         assert!(count > 5, "one report per execution: {count}");
+    }
+
+    /// `addi x0, x0, 0`: one cycle, no effect.
+    const NOP: u32 = 0x0000_0013;
+    const MSTATUS: u16 = 0x300;
+    const MSTATUS_MIE: u8 = 1 << 3;
+
+    fn reg(peripheral: &str, register: &str) -> u32 {
+        svd_regs::esp32c3::addr(peripheral, register)
+    }
+
+    /// `body` at the reset vector, then the vector table at [`VECTORS`]: every entry parks.
+    fn with_vectors(body: &[u32]) -> Vec<u32> {
+        let table_index = ((VECTORS - ROM_BASE) / 4) as usize;
+        assert!(
+            body.len() <= table_index,
+            "the body overlaps the vector table"
+        );
+        let mut program = body.to_vec();
+        program.resize(table_index, HANG);
+        program.extend([HANG; 32]);
+        program
+    }
+
+    /// Routes interrupt source `map_register` to CPU `line` at priority 1 and enables the line,
+    /// as `esp_intr_alloc` does (IR §3.2).
+    fn route(map_register: &str, line: u32) -> Vec<u32> {
+        let mut program = Vec::new();
+        program.extend(store_register(reg("INTERRUPT_CORE0", map_register), line));
+        program.extend(store_register(
+            reg("INTERRUPT_CORE0", "CPU_INT_PRI_0") + 4 * line,
+            1,
+        ));
+        program.extend(store_register(
+            reg("INTERRUPT_CORE0", "CPU_INT_ENABLE"),
+            1 << line,
+        ));
+        program
+    }
+
+    #[test]
+    fn a_software_interrupt_is_taken_four_cpu_cycles_after_it_becomes_pending() {
+        // IR §3.3: the application raises `CPU_INTR_FROM_CPU_0` (source 50) routed to line 3;
+        // IR §2.7: "the interrupt controller ... takes 4 cycles".
+        let mut body = Vec::new();
+        body.extend([lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)]);
+        body.extend(route("CPU_INTR_FROM_CPU_0_MAP", 3));
+        body.push(csrrwi(0, MSTATUS, MSTATUS_MIE));
+        body.extend(store_register(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"), 1));
+        let raised_at = ROM_BASE + 4 * u32::try_from(body.len()).unwrap();
+        body.extend([NOP; 16]);
+        let mut m = machine(&with_vectors(&body));
+        assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
+        assert_eq!(m.hart.csr.mcause, 0x8000_0003);
+        assert_eq!(
+            m.hart.csr.mepc,
+            raised_at + 4 * 4,
+            "four one-cycle instructions ran between the store and the interrupt"
+        );
+        assert_eq!(m.pc(), VECTORS + 4 * 3, "the entry of line 3 parks");
+        assert_eq!(
+            bus_word(&mut m, reg("INTERRUPT_CORE0", "CPU_INT_EIP_STATUS")),
+            1 << 3,
+            "the source is a level: the line stays pending until the handler clears it"
+        );
+    }
+
+    #[test]
+    fn a_level_raised_while_an_instruction_is_fetched_is_evaluated_before_the_next_one() {
+        // A fetch through an invalid MMU entry raises the cache error source (`EXTMEM`, source 36)
+        // in the middle of `step`: no store to a register of the controller follows, so only the
+        // flag the context keeps makes the machine ask the controller again. The exception
+        // handler enables interrupts; the interrupt on line 6 must be taken inside it.
+        let mut body = Vec::new();
+        body.extend([lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)]);
+        body.extend(route("CACHE_IA_INT_MAP", 6));
+        body.extend(store_register(reg("EXTMEM", "CACHE_ILG_INT_ENA"), 1 << 5));
+        body.extend([
+            lui(T1, crate::memmap::FLASH_IBUS_BASE),
+            cpu_rv32::asm::jalr(0, T1, 0),
+        ]);
+        let mut program = with_vectors(&body);
+        let table = ((VECTORS - ROM_BASE) / 4) as usize;
+        // Exceptions enter at the base of the table; the entry of line 6 is `table + 6`.
+        program[table] = csrrwi(0, MSTATUS, MSTATUS_MIE);
+        program[table + 1..table + 6].fill(NOP);
+        let mut m = machine(&program);
+        assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
+        assert_eq!(
+            m.hart.csr.mcause, 0x8000_0006,
+            "the interrupt, not the instruction access fault (1), was the last trap"
+        );
+        assert_eq!(m.pc(), VECTORS + 4 * 6, "the entry of line 6 parks");
+    }
+
+    #[test]
+    fn a_line_under_the_threshold_or_disabled_is_not_taken() {
+        let mut body = Vec::new();
+        body.extend([lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)]);
+        body.extend(route("CPU_INTR_FROM_CPU_0_MAP", 3));
+        // What a critical section does: `CPU_INT_THRESH` above the priority of the line (IR §3.3).
+        body.extend(store_register(reg("INTERRUPT_CORE0", "CPU_INT_THRESH"), 2));
+        body.push(csrrwi(0, MSTATUS, MSTATUS_MIE));
+        body.extend(store_register(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"), 1));
+        body.extend([NOP; 16]);
+        body.push(HANG);
+        let hang = ROM_BASE + 4 * u32::try_from(body.len() - 1).unwrap();
+        let mut m = machine(&with_vectors(&body));
+        assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
+        assert_eq!(m.pc(), hang, "masked by the threshold");
+        assert_eq!(m.hart.csr.mcause, 0);
+    }
+
+    #[test]
+    fn wfi_sleeps_to_the_alarm_and_resumes_without_a_trap_when_interrupts_are_masked() {
+        // A one-shot alarm of the SYSTIMER 16 384 counts ahead (1.024 ms at 16 MHz), on line 4.
+        let mut body = Vec::new();
+        body.extend(route("SYSTIMER_TARGET0_INT_MAP", 4));
+        body.extend(store_register(reg("SYSTIMER", "TARGET0_LO"), 16_384));
+        body.extend(store_register(reg("SYSTIMER", "COMP0_LOAD"), 1));
+        body.extend(store_register(reg("SYSTIMER", "INT_ENA"), 1));
+        // `CONF`: its reset value with `TARGET0_WORK_EN`, bit 24 (`systimer_ll_enable_alarm`).
+        body.extend(store_register(
+            reg("SYSTIMER", "CONF"),
+            0x4600_0000 | (1 << 24),
+        ));
+        body.extend([wfi(), addi(1, 0, 1), HANG]);
+        let mut m = machine(&body);
+        assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
+        assert_eq!(
+            m.hart.x[1], 1,
+            "`mstatus.MIE` is 0: execution goes on after `wfi`"
+        );
+        assert_eq!(m.hart.csr.mcause, 0, "no trap");
+        // Awake, a cycle lasts 50 ns; the rest of the time went by in `wfi`, from a few
+        // microseconds after reset to the alarm, 1.024 ms after the counter started.
+        let slept_ns = m.device_time_nanos() - 50 * m.cycles().get();
+        assert!(
+            (1_020_000..=1_024_200).contains(&slept_ns),
+            "slept {slept_ns} ns"
+        );
+        assert!(
+            (2_000..2_003).contains(&m.cycles().get()),
+            "the cycle counter stands still in `wfi`: {}",
+            m.cycles().get()
+        );
+    }
+
+    #[test]
+    fn a_cpu_that_sleeps_while_a_device_counts_gives_control_back_after_a_second() {
+        // A one-shot alarm two seconds ahead (32 000 000 counts at 16 MHz), its interrupt not
+        // enabled: nothing will wake the CPU, and time must still pass.
+        let mut body = Vec::new();
+        body.extend(store_register(reg("SYSTIMER", "TARGET0_LO"), 32_000_000));
+        body.extend(store_register(reg("SYSTIMER", "COMP0_LOAD"), 1));
+        body.extend(store_register(
+            reg("SYSTIMER", "CONF"),
+            0x4600_0000 | (1 << 24),
+        ));
+        body.extend([wfi(), HANG]);
+        let mut m = machine(&body);
+        assert_eq!(m.run_until(Cycles(10_000)), StopReason::Asleep);
+        assert_eq!(
+            m.device_time_nanos(),
+            2_000_000_000,
+            "slept to the alarm in one jump"
+        );
+        assert_eq!(
+            m.run_until(Cycles(10_000)),
+            StopReason::Idle,
+            "the alarm has fired and nothing else is scheduled"
+        );
+    }
+
+    #[test]
+    fn a_storm_of_wake_ups_without_an_interrupt_gives_control_back() {
+        // A period alarm at every count of the 16 MHz counter, its interrupt not enabled
+        // (`TARGET0_CONF`: bit 30 `PERIOD_MODE`, period 1): the SYSTIMER is called 100 000 times
+        // in 6.25 ms of device time and the CPU never wakes.
+        let mut body = Vec::new();
+        body.extend(store_register(
+            reg("SYSTIMER", "TARGET0_CONF"),
+            (1 << 30) | 1,
+        ));
+        body.extend(store_register(reg("SYSTIMER", "COMP0_LOAD"), 1));
+        body.extend(store_register(
+            reg("SYSTIMER", "CONF"),
+            0x4600_0000 | (1 << 24),
+        ));
+        body.extend([wfi(), HANG]);
+        let mut m = machine(&body);
+        assert_eq!(m.run_until(Cycles(10_000)), StopReason::Asleep);
+        let first = m.device_time_nanos();
+        assert!(
+            (6_250_000..6_300_000).contains(&first),
+            "MAX_FRUITLESS_WAKES counts of 62.5 ns: {first} ns"
+        );
+        assert_eq!(m.run_until(Cycles(10_000)), StopReason::Asleep, "and again");
+        assert!(m.device_time_nanos() > first);
     }
 }
