@@ -35,7 +35,7 @@ pub fn render(img: &FirmwareImage, file_name: &str, file_len: usize) -> String {
     let _ = writeln!(s, "Entry point: {:#010x}", img.entry);
     let _ = writeln!(
         s,
-        "Flash:       {} MB, {:?}, frequency code {:#x}",
+        "Flash:       {} MB, {}, frequency code {:#x}",
         img.flash_size.megabytes(),
         img.spi_mode,
         img.flash_freq_raw
@@ -90,5 +90,20 @@ mod tests {
     #[test]
     fn other_chips_have_no_region_names_yet() {
         assert_eq!(region(ChipId::Esp32S3, 0x3C00_0020), "-");
+    }
+
+    #[test]
+    fn the_flash_line_names_the_spi_mode_as_the_rom_does() {
+        use firmware::builder::{ImageSpec, build_image};
+        let bytes = build_image(&ImageSpec::default());
+        let text = render(
+            &FirmwareImage::parse(&bytes).unwrap(),
+            "app.bin",
+            bytes.len(),
+        );
+        assert!(
+            text.contains("Flash:       16 MB, DIO, frequency code 0xf\n"),
+            "{text}"
+        );
     }
 }

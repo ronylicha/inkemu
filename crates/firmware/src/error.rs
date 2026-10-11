@@ -49,7 +49,9 @@ pub enum FirmwareError {
     MisalignedSegment { index: usize, len: u32 },
     #[error("unknown SPI flash mode {raw}; re-download the file or rebuild the firmware")]
     BadSpiMode { raw: u8 },
-    #[error("unknown flash size code {raw}; re-download the file or rebuild the firmware")]
+    #[error(
+        "unknown flash size code {raw} (inkemu knows 0 to 7, that is 1 MB to 128 MB): the header is damaged, or the image targets a larger flash; re-download the file, or use an image built for a flash of at most 128 MB"
+    )]
     BadFlashSize { raw: u8 },
     #[error(
         "the image ends before its checksum/hash trailer; re-download the file or rebuild the firmware"
@@ -71,6 +73,18 @@ pub enum FirmwareError {
         "this firmware expects {needed} MB of flash, but the selected device has {available} MB; choose a device with at least {needed} MB of flash, or rebuild the firmware for a {available} MB flash"
     )]
     FlashTooSmall { needed: u32, available: u32 },
+    #[error(
+        "the file does not start with a bootloader image: its first byte is {found:#04x}, expected 0xe9; use a full flash dump, or an image merged with `esptool.py merge_bin` (bootloader at offset 0)"
+    )]
+    NotAFlashImage { found: u8 },
+    #[error(
+        "the file is empty or shorter than an image header ({len} bytes); use a full flash dump, or an image merged with `esptool.py merge_bin`"
+    )]
+    FlashImageTooShort { len: usize },
+    #[error(
+        "the file starts with an image but holds no partition table at offset 0x8000, so it is an application or a bootloader alone, not a full flash image; use a flash dump or the output of `esptool.py merge_bin` (bootloader, partition table and application)"
+    )]
+    NoPartitionTable,
 }
 
 #[cfg(test)]
@@ -114,8 +128,11 @@ mod tests {
                 needed: 16,
                 available: 4,
             },
+            FirmwareError::NotAFlashImage { found: 0x7F },
+            FirmwareError::FlashImageTooShort { len: 10 },
+            FirmwareError::NoPartitionTable,
         ];
-        let mut seen = [false; 15];
+        let mut seen = [false; 18];
         for e in &all {
             seen[variant_index(e)] = true;
         }
@@ -143,7 +160,25 @@ mod tests {
             FirmwareError::HashMismatch => 12,
             FirmwareError::ChipMismatch { .. } => 13,
             FirmwareError::FlashTooSmall { .. } => 14,
+            FirmwareError::NotAFlashImage { .. } => 15,
+            FirmwareError::FlashImageTooShort { .. } => 16,
+            FirmwareError::NoPartitionTable => 17,
         }
+    }
+
+    #[test]
+    fn an_unknown_flash_size_code_says_what_is_known_and_what_to_do() {
+        let text = FirmwareError::BadFlashSize { raw: 9 }.to_string();
+        assert!(
+            text.contains("code 9") && text.contains("0 to 7") && text.contains("128 MB"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "; re-download the file, or use an image built for a flash of at most 128 MB"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
