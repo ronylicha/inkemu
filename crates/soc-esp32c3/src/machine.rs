@@ -20,8 +20,9 @@ pub enum ConsoleChannel {
 pub enum StopReason {
     /// The cycle limit passed to [`Esp32C3::run_until`] was reached.
     CycleBudget,
-    /// `--strict-mmio`: the program touched a register the emulator does not model, or wrote a
-    /// peripheral register with an 8- or 16-bit store.
+    /// `--strict-mmio`: the program touched a register the emulator does not model, wrote a
+    /// peripheral register with an 8- or 16-bit store, asked for an operation the emulator cannot
+    /// perform faithfully, or used flash it had not mapped.
     StrictMmio(Diagnostic),
     /// The CPU is in `wfi` and nothing can raise an interrupt yet (interrupt sources arrive in SP1b-3).
     Idle,

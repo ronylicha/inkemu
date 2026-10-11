@@ -1,6 +1,16 @@
 //! `ASSIST_DEBUG`: the PC recorder the ROM consults to print `Saved PC` after a watchdog reset.
 //! Source: report §J, line 10. Recording a PC at reset arrives with the watchdogs (SP1b-3).
+use super::Accepted;
 use emu_core::Peripheral;
+
+pub(crate) fn accepted() -> Vec<Accepted> {
+    vec![Accepted::svd(
+        "ASSIST_DEBUG",
+        "CORE_0_RCD_EN",
+        "PC/SP recording at reset",
+        "SP1b-3",
+    )]
+}
 
 const CORE_0_RCD_EN: u32 = 0x44;
 const CORE_0_RCD_PDEBUGPC: u32 = 0x48;

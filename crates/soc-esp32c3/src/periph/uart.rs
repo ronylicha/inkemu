@@ -4,8 +4,26 @@
 //! always reads empty and the baud rate has no effect. Real timing, reception and interrupts arrive
 //! in SP1b-3; until then the emulated boot is shorter than the real one by the time the UART would
 //! take to send its log.
-use crate::periph::Storage;
+use crate::periph::{Accepted, Storage};
 use emu_core::Peripheral;
+
+/// `INT_CLR` is write-only and accepted; the five others are stored.
+pub(crate) fn accepted() -> Vec<Accepted> {
+    let mut rows = Vec::new();
+    for peripheral in ["UART0", "UART1"] {
+        for (register, not_modeled) in [
+            ("INT_ENA", "interrupt enables: nothing is raised"),
+            ("INT_CLR", "interrupt clear: nothing is pending"),
+            ("CLKDIV", "baud rate: bytes leave at once"),
+            ("CONF0", "frame format"),
+            ("CONF1", "FIFO thresholds"),
+            ("CLK_CONF", "clock source and divider"),
+        ] {
+            rows.push(Accepted::svd(peripheral, register, not_modeled, "SP1b-3"));
+        }
+    }
+    rows
+}
 
 const FIFO: u32 = 0x00;
 const INT_ENA: u32 = 0x0C;

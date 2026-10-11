@@ -1,6 +1,6 @@
 //! `RTC_CNTL`: reset cause, retention registers, pad and power configuration.
 //! Source: report §E.2. Software reset, the RTC timer and the watchdogs arrive in SP1b-3.
-use crate::periph::{RTC_CNTL_BASE, Storage};
+use crate::periph::{Accepted, RTC_CNTL_BASE, Storage};
 use emu_core::Peripheral;
 
 const RESET_STATE: u32 = 0x38;
@@ -17,7 +17,22 @@ const STORE: [u32; STORE_COUNT] = [0x50, 0x54, 0x58, 0x5C, 0xB8, 0xBC, 0xC0, 0xC
 /// `SWD_RST_FLAG_CLR` [28] and `SWD_FEED` [29] write-only. Storing them is harmless for the boot,
 /// which only reads bit 0 (it stays clear after a power-on reset); the super watchdog itself is
 /// modelled in SP1b-3.
-const CONFIG: [u32; 5] = [0x84, 0x8C, 0xAC, 0xD0, 0xD4];
+const ACCEPTED: [Accepted; 5] = [
+    Accepted::svd("RTC_CNTL", "PWC", "RTC power-domain control", "SP1b-3"),
+    Accepted::svd("RTC_CNTL", "DIG_ISO", "digital pad isolation", "SP1b-3"),
+    Accepted::svd(
+        "RTC_CNTL",
+        "SWD_CONF",
+        "super watchdog: auto-feed, reset flag, strobes",
+        "SP1b-3",
+    ),
+    Accepted::svd("RTC_CNTL", "PAD_HOLD", "pad hold", "SP2"),
+    Accepted::svd("RTC_CNTL", "DIG_PAD_HOLD", "digital pad hold", "SP2"),
+];
+
+pub(crate) fn accepted() -> Vec<Accepted> {
+    ACCEPTED.to_vec()
+}
 /// `RESET_CAUSE_PROCPU`, bits [5:0] of `RESET_STATE` (`soc/reset_reasons.h`).
 const RESET_CAUSE_MASK: u32 = 0x3F;
 const RESET_CAUSE_POWERON: u32 = 0x01;
@@ -40,7 +55,7 @@ impl RtcCntl {
             reset_cause: RESET_CAUSE_POWERON,
             reset_state_other: documented & !RESET_CAUSE_MASK,
             store: [0; STORE_COUNT],
-            config: Storage::for_offsets(RTC_CNTL_BASE, &CONFIG),
+            config: Storage::accepted(RTC_CNTL_BASE, &ACCEPTED),
         }
     }
 }

@@ -24,6 +24,65 @@ pub use system::System;
 pub use uart::Uart;
 pub use usb_serial_jtag::UsbSerialJtag;
 
+/// A register whose value the emulator stores although the hardware effect is not modelled
+/// (decision D12). The lists of these are what the storage of each model is built from, and what
+/// `docs/registers-accepted-without-effect.md` is rendered from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Accepted {
+    pub peripheral: &'static str,
+    /// The register, or the first register of a block of `count` consecutive ones.
+    pub register: &'static str,
+    pub addr: u32,
+    pub count: u32,
+    pub not_modeled: &'static str,
+    /// The plan that gives the register its effect.
+    pub heir: &'static str,
+}
+
+impl Accepted {
+    /// A register of the SVD; an unknown name fails the build when the list is a `const`.
+    #[must_use]
+    pub const fn svd(
+        peripheral: &'static str,
+        register: &'static str,
+        not_modeled: &'static str,
+        heir: &'static str,
+    ) -> Accepted {
+        Accepted::at(
+            peripheral,
+            register,
+            svd_regs::esp32c3::addr(peripheral, register),
+            not_modeled,
+            heir,
+        )
+    }
+
+    /// A register the SVD does not contain, at an address documented where the constant is defined.
+    #[must_use]
+    pub const fn at(
+        peripheral: &'static str,
+        register: &'static str,
+        addr: u32,
+        not_modeled: &'static str,
+        heir: &'static str,
+    ) -> Accepted {
+        Accepted {
+            peripheral,
+            register,
+            addr,
+            count: 1,
+            not_modeled,
+            heir,
+        }
+    }
+
+    /// The same row standing for `count` consecutive registers.
+    #[must_use]
+    pub const fn block(self, count: u32) -> Accepted {
+        Accepted { count, ..self }
+    }
+}
+
 /// Registers deliberately modelled as plain read/write memory: configuration the emulator
 /// acknowledges but does not act on. Listing them here is a decision; anything else is reported.
 #[derive(Clone, Debug)]
@@ -61,6 +120,17 @@ impl Storage {
         Storage { regs }
     }
 
+    /// The single registers of `list` (rows with `count == 1`), at their SVD reset value, 0 without one.
+    #[must_use]
+    pub fn accepted(base: u32, list: &[Accepted]) -> Storage {
+        let offsets: Vec<u32> = list
+            .iter()
+            .filter(|a| a.count == 1)
+            .map(|a| a.addr - base)
+            .collect();
+        Storage::for_offsets(base, &offsets)
+    }
+
     fn index(&self, offset: u32) -> Option<usize> {
         self.regs.binary_search_by_key(&offset, |&(o, _)| o).ok()
     }
@@ -79,6 +149,66 @@ impl Storage {
             None => false,
         }
     }
+}
+
+/// A block made only of registers accepted without effect.
+#[derive(Clone, Debug)]
+pub struct AcceptedBlock {
+    registers: Storage,
+}
+
+impl AcceptedBlock {
+    #[must_use]
+    pub fn new(base: u32, list: &[Accepted]) -> AcceptedBlock {
+        AcceptedBlock {
+            registers: Storage::accepted(base, list),
+        }
+    }
+}
+
+impl Peripheral for AcceptedBlock {
+    fn read(&mut self, offset: u32) -> Option<u32> {
+        self.registers.read(offset)
+    }
+
+    fn write(&mut self, offset: u32, value: u32) -> bool {
+        self.registers.write(offset, value)
+    }
+}
+
+/// Every register accepted without effect, in address order.
+#[must_use]
+pub fn accepted_without_effect() -> Vec<Accepted> {
+    let mut rows = [
+        io_mux::accepted(),
+        rtc_cntl::accepted(),
+        system::accepted(),
+        uart::accepted(),
+        intmatrix::accepted(),
+        assist_debug::accepted(),
+        extmem::accepted(),
+    ]
+    .concat();
+    rows.sort_by_key(|row| row.addr);
+    rows
+}
+
+/// The Markdown table of `docs/registers-accepted-without-effect.md`.
+#[must_use]
+pub fn render_accepted_table(rows: &[Accepted]) -> String {
+    use std::fmt::Write as _;
+    let mut table = String::from(
+        "| Address | Register | Count | Hardware effect not modelled | Made real by |\n|---|---|---|---|---|\n",
+    );
+    for row in rows {
+        // Writing to a String cannot fail.
+        let _ = writeln!(
+            table,
+            "| `{:#010x}` | `{}.{}` | {} | {} | {} |",
+            row.addr, row.peripheral, row.register, row.count, row.not_modeled, row.heir
+        );
+    }
+    table
 }
 
 // Base address and range of every modelled block (`reg_base.h`; report §A.2), in one place. A range
@@ -193,6 +323,81 @@ mod tests {
         );
         assert_eq!(picked.read(0x88), None);
         assert!(picked.write(0x8C, 9));
+    }
+
+    #[test]
+    fn accepted_storage_takes_its_registers_and_reset_values_from_the_list() {
+        // `SPI1.CMD` is the first SPI1 register of the SVD: its address is the base of the block.
+        const SPI1: u32 = svd_regs::esp32c3::addr("SPI1", "CMD");
+        const CTRL: u32 = svd_regs::esp32c3::addr("SPI1", "CTRL") - SPI1;
+        const CTRL1: u32 = svd_regs::esp32c3::addr("SPI1", "CTRL1") - SPI1;
+        // `DR_REG_SPI0_BASE` (BC §A.2) and SPI0 `MISO_DLEN`, which the SVD omits (FB §B.2).
+        const SPI0: u32 = 0x6000_3000;
+        const MISO_DLEN: u32 = 0x28;
+        const LIST: [Accepted; 2] = [
+            Accepted::svd("SPI1", "CTRL", "read mode", "SP8"),
+            Accepted::at(
+                "SPI0",
+                "MISO_DLEN",
+                SPI0 + MISO_DLEN,
+                "cache line length",
+                "SP8",
+            ),
+        ];
+        let mut s = Storage::accepted(SPI1, &LIST[..1]);
+        assert_eq!(
+            s.read(CTRL),
+            Some(0x002C_A000),
+            "SVD reset value of SPI1.CTRL (FB §D.2)"
+        );
+        assert_eq!(s.read(CTRL1), None, "not in the list");
+        let mut other = Storage::accepted(SPI0, &LIST[1..]);
+        assert_eq!(other.read(MISO_DLEN), Some(0), "no SVD entry: reset 0");
+        assert!(other.write(MISO_DLEN, 0xFF));
+        assert!(s.write(CTRL, 1));
+    }
+
+    #[test]
+    fn an_accepted_block_is_storage_and_nothing_else() {
+        // `SENSITIVE.ROM_TABLE_LOCK` is the first SENSITIVE register of the SVD: the base of the block.
+        const BASE: u32 = svd_regs::esp32c3::addr("SENSITIVE", "ROM_TABLE_LOCK");
+        const USAGE_1: u32 = svd_regs::esp32c3::addr("SENSITIVE", "INTERNAL_SRAM_USAGE_1") - BASE;
+        const LIST: [Accepted; 1] = [Accepted::svd(
+            "SENSITIVE",
+            "INTERNAL_SRAM_USAGE_1",
+            "SRAM0 given to the cache",
+            "SP8",
+        )];
+        let mut block = AcceptedBlock::new(BASE, &LIST);
+        assert_eq!(block.read(USAGE_1), Some(0xF), "CM §2.1");
+        assert!(block.write(USAGE_1, 0xE));
+        assert_eq!(block.read(USAGE_1), Some(0xE));
+        assert_eq!(
+            block.read(USAGE_1 + 4),
+            None,
+            "the next register is not in the list"
+        );
+        assert!(!block.write(USAGE_1 + 4, 0));
+    }
+
+    #[test]
+    fn the_table_lists_every_register_once_in_address_order() {
+        let rows = accepted_without_effect();
+        assert!(
+            rows.windows(2).all(|w| w[0].addr < w[1].addr),
+            "sorted, no duplicate address"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.count >= 1 && !r.not_modeled.is_empty() && r.heir.starts_with("SP"))
+        );
+        let io_mux = rows.iter().find(|r| r.peripheral == "IO_MUX").unwrap();
+        assert_eq!(io_mux.count, 24, "every IO_MUX register of the SVD");
+        let table = render_accepted_table(&rows);
+        assert!(table.starts_with(
+            "| Address | Register | Count | Hardware effect not modelled | Made real by |\n|---|---|---|---|---|\n"
+        ));
+        assert_eq!(table.lines().count(), rows.len() + 2);
     }
 
     #[test]

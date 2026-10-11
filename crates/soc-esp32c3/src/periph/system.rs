@@ -1,12 +1,53 @@
 //! `SYSTEM`: clock selection, peripheral clock gates and resets. Source: report §E.1.
 //! The clock tree itself (PLL, CPU frequency switch) arrives in SP1b-2.
-use crate::periph::{SYSTEM_BASE, Storage};
+use crate::periph::{Accepted, SYSTEM_BASE, Storage};
 use emu_core::Peripheral;
 
 const SYSCLK_CONF: u32 = 0x58;
 /// `CPU_PERI_CLK_EN`, `CPU_PERI_RST_EN`, `PERIP_CLK_EN0/1`, `PERIP_RST_EN0/1`: gates and reset pulses the
 /// ROM toggles around each peripheral it sets up. Nothing acts on them yet.
-const GATES: [u32; 6] = [0x00, 0x04, 0x10, 0x14, 0x18, 0x1C];
+const ACCEPTED: [Accepted; 6] = [
+    Accepted::svd(
+        "SYSTEM",
+        "CPU_PERI_CLK_EN",
+        "clock gates of the CPU peripherals",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "SYSTEM",
+        "CPU_PERI_RST_EN",
+        "resets of the CPU peripherals",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "SYSTEM",
+        "PERIP_CLK_EN0",
+        "peripheral clock gates",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "SYSTEM",
+        "PERIP_CLK_EN1",
+        "peripheral clock gates",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "SYSTEM",
+        "PERIP_RST_EN0",
+        "peripheral reset pulses",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "SYSTEM",
+        "PERIP_RST_EN1",
+        "peripheral reset pulses",
+        "SP1b-3",
+    ),
+];
+
+pub(crate) fn accepted() -> Vec<Accepted> {
+    ACCEPTED.to_vec()
+}
 /// `SYSCLK_CONF`: bits [9:0] `PRE_DIV_CNT` and [11:10] `SOC_CLK_SEL` are writable; a write keeps
 /// bits [11:0] only, because `CLK_XTAL_FREQ` [18:12] and `CLK_DIV_EN` [19] are read-only (report §E.1).
 const SYSCLK_WRITABLE: u32 = 0xFFF;
@@ -28,7 +69,7 @@ impl System {
     pub fn new() -> System {
         System {
             sysclk_writable: SYSCLK_RESET,
-            gates: Storage::for_offsets(SYSTEM_BASE, &GATES),
+            gates: Storage::accepted(SYSTEM_BASE, &ACCEPTED),
         }
     }
 }
