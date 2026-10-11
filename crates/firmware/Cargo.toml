@@ -8,6 +8,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes the test image builder (`builder`) to other crates and the CLI tests.
+test-support = []
+
 [dependencies]
 thiserror.workspace = true
 sha2.workspace = true
