@@ -1,4 +1,5 @@
 //! What the emulator has to tell the user about the run: accesses it does not model, CPU exceptions.
+use crate::reset::ResetCause;
 use cpu_rv32::Exception;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -32,8 +33,11 @@ pub enum Unsupported {
     ShaMode { mode: u32 },
     /// A clock selection without a known CPU frequency (D22).
     ClockSource { sysclk_conf: u32, cpu_per_conf: u32 },
-    /// A reset requested through `RTC_CNTL.OPTIONS0` (D27).
-    SoftwareReset { options0: u32 },
+    /// A reset the machine cannot perform yet: asked for through `RTC_CNTL.OPTIONS0`, or by a
+    /// watchdog that expired.
+    Reset { cause: ResetCause },
+    /// `RTC_CNTL.CLK_CONF` selects a slow clock other than the RC oscillator, the only one modelled.
+    SlowClock { clk_conf: u32 },
     /// A byte written to a UART whose transmit FIFO was full: the hardware drops it too.
     UartOverflow { uart: u8 },
 }
@@ -77,9 +81,26 @@ impl Unsupported {
                 f,
                 "the clock registers select a CPU clock inkemu cannot model (SYSCLK_CONF {sysclk_conf:#010x}, CPU_PER_CONF {cpu_per_conf:#010x}, pc {pc:#010x}), so emulated time keeps the previous frequency; select the crystal or the PLL at 80 or 160 MHz"
             ),
-            Unsupported::SoftwareReset { options0 } => write!(
+            Unsupported::Reset { cause } => write!(
                 f,
-                "a software reset was requested through RTC_CNTL.OPTIONS0 (value {options0:#010x}, pc {pc:#010x}) but resets are not emulated yet, so the write was ignored; restart inkemu to reset the device"
+                "{} (reset cause {:#04x}, pc {pc:#010x}) but resets are not emulated yet, so nothing was reset; restart inkemu to reset the device",
+                match cause {
+                    ResetCause::SoftwareSystem | ResetCause::SoftwareCpu =>
+                        "a software reset was requested through RTC_CNTL.OPTIONS0",
+                    ResetCause::RtcWatchdogCpu
+                    | ResetCause::RtcWatchdogCore
+                    | ResetCause::RtcWatchdogSystem => "the RTC watchdog expired",
+                    ResetCause::SuperWatchdog => "the super watchdog expired",
+                    ResetCause::Mwdt0Cpu
+                    | ResetCause::Mwdt0Core
+                    | ResetCause::Mwdt1Cpu
+                    | ResetCause::Mwdt1Core => "a main watchdog expired",
+                },
+                cause.code()
+            ),
+            Unsupported::SlowClock { clk_conf } => write!(
+                f,
+                "RTC_CNTL.CLK_CONF selects an RTC slow clock inkemu does not model (value {clk_conf:#010x}, pc {pc:#010x}), so the RTC timer and the RTC watchdog keep counting the 136 kHz RC oscillator; select the RC oscillator (ANA_CLK_RTC_SEL = 0) or expect their durations to differ from the device"
             ),
             Unsupported::UartOverflow { uart } => write!(
                 f,
@@ -157,7 +178,8 @@ impl Diagnostic {
                     sysclk_conf,
                     cpu_per_conf,
                 } => (8, sysclk_conf, cpu_per_conf),
-                Unsupported::SoftwareReset { .. } => (9, 0, 0),
+                Unsupported::Reset { cause } => (13, cause.code(), 0),
+                Unsupported::SlowClock { .. } => (9, 0, 0),
                 Unsupported::UartOverflow { uart } => (12, u32::from(uart), 0),
                 // A command is 1 to 16 bits long, so 0 is free for "no command phase".
                 Unsupported::FlashTransfer { command_bits, .. } => {
@@ -509,8 +531,14 @@ mod tests {
                 sysclk_conf: 0xC00,
                 cpu_per_conf: 0xC,
             }),
-            unsupported(Unsupported::SoftwareReset {
-                options0: 0x8000_0000,
+            unsupported(Unsupported::Reset {
+                cause: ResetCause::SoftwareSystem,
+            }),
+            unsupported(Unsupported::Reset {
+                cause: ResetCause::RtcWatchdogSystem,
+            }),
+            unsupported(Unsupported::SlowClock {
+                clk_conf: 0x4000_0000,
             }),
             unsupported(Unsupported::UartOverflow { uart: 0 }),
             mapping(3, MappingFault::InvalidEntry),
@@ -577,10 +605,22 @@ mod tests {
                 "SYSCLK_CONF 0x00000c00",
             ),
             (
-                unsupported(Unsupported::SoftwareReset {
-                    options0: 0x8000_0000,
+                unsupported(Unsupported::Reset {
+                    cause: ResetCause::SoftwareCpu,
                 }),
-                "software reset",
+                "a software reset was requested through RTC_CNTL.OPTIONS0 (reset cause 0x0c",
+            ),
+            (
+                unsupported(Unsupported::Reset {
+                    cause: ResetCause::RtcWatchdogSystem,
+                }),
+                "the RTC watchdog expired (reset cause 0x10",
+            ),
+            (
+                unsupported(Unsupported::SlowClock {
+                    clk_conf: 0x4000_0000,
+                }),
+                "RTC slow clock",
             ),
             (mapping(3, MappingFault::InvalidEntry), "MMU entry 3"),
             (

@@ -1,5 +1,5 @@
 //! The modelled peripherals of the ESP32-C3 and their place in the address space.
-use crate::config::SocConfig;
+use crate::config::{STRAP_SPI_FAST_FLASH_BOOT, SocConfig};
 use crate::ctx::{Ctx, Event};
 use crate::flash::FlashDevice;
 use emu_core::Peripheral;
@@ -398,16 +398,19 @@ pub struct Peripherals {
 
 impl Peripherals {
     /// The peripherals after a power-on, at the device time of `ctx`: a device that has a first
-    /// deadline schedules it there.
+    /// deadline schedules it there. The reset values arm the flash-boot protection of the RTC
+    /// watchdog when the chip is strapped to boot from flash.
     #[must_use]
     pub fn new(config: &SocConfig, flash: Box<dyn FlashDevice>, ctx: &mut Ctx) -> Peripherals {
+        let flash_boot = config.strapping & STRAP_SPI_FAST_FLASH_BOOT != 0;
+        let efuse = Efuse::new(config.chip_revision);
         let mut periph = Peripherals {
             gpio: Gpio::new(config.strapping),
             io_mux: IoMux::new(),
             intmatrix: IntMatrix::new(),
-            rtc_cntl: RtcCntl::new(),
+            rtc_cntl: RtcCntl::new(flash_boot, efuse.wdt_delay_sel(), ctx.now()),
             system: System::new(),
-            efuse: Efuse::new(config.chip_revision),
+            efuse,
             extmem: Extmem::new(),
             mmu: MmuTable::new(),
             sensitive: AcceptedBlock::new(SENSITIVE_BASE, &SENSITIVE_ACCEPTED),
@@ -425,6 +428,7 @@ impl Peripherals {
             uart1: Uart::new(1, UART1_BASE),
             usb_serial_jtag: UsbSerialJtag::new(),
         };
+        periph.rtc_cntl.wake(ctx);
         periph.systimer.wake(ctx);
         periph
     }
@@ -438,6 +442,7 @@ impl Peripherals {
                 self.extmem.latch_store(ctx, instruction_bus);
             }
             Event::Systimer => self.systimer.wake(ctx),
+            Event::RtcWatchdog => self.rtc_cntl.wake(ctx),
             Event::Uart(0) => self.uart0.wake(ctx),
             Event::Uart(_) => self.uart1.wake(ctx),
         }
@@ -755,25 +760,6 @@ mod tests {
             assert!(device.write(ctx, addr - base, value), "{addr:#010x}");
             assert_eq!(device.read(ctx, addr - base), Some(value), "{addr:#010x}");
         }
-        assert_eq!(ctx.take_unsupported(), None);
-    }
-
-    #[test]
-    fn a_software_reset_request_reaches_the_relay() {
-        let ctx = &mut Ctx::default();
-        let mut p = peripherals(ctx);
-        let options0 = svd_regs::esp32c3::addr("RTC_CNTL", "OPTIONS0");
-        let (device, base) = p.device(options0).expect("RTC_CNTL is routed");
-        assert!(device.write(ctx, options0 - base, 1 << 31));
-        assert!(device.write(ctx, options0 - base, 1 << 5));
-        assert_eq!(
-            ctx.take_unsupported(),
-            Some(Unsupported::SoftwareReset { options0: 1 << 31 })
-        );
-        assert_eq!(
-            ctx.take_unsupported(),
-            Some(Unsupported::SoftwareReset { options0: 1 << 5 })
-        );
         assert_eq!(ctx.take_unsupported(), None);
     }
 

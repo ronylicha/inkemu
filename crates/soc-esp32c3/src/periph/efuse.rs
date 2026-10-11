@@ -17,6 +17,10 @@ const fn reg(name: &str) -> u32 {
 /// First and last register of the read mirror: `RD_WR_DIS` to `RD_RS_ERR1`.
 const RD_FIRST: u32 = reg("RD_WR_DIS");
 const RD_LAST: u32 = reg("RD_RS_ERR1");
+/// `RD_REPEAT_DATA1` bits [17:16]: `WDT_DELAY_SEL`.
+const RD_REPEAT_DATA1: u32 = reg("RD_REPEAT_DATA1");
+const WDT_DELAY_SEL_SHIFT: u32 = 16;
+const WDT_DELAY_SEL_MASK: u32 = 0b11;
 /// `RD_MAC_SPI_SYS_3` bits [20:18]: `WAFER_VERSION_MINOR_LO`.
 const RD_MAC_SPI_SYS_3: u32 = reg("RD_MAC_SPI_SYS_3");
 const WAFER_MINOR_LO_SHIFT: u32 = 18;
@@ -100,6 +104,18 @@ impl Efuse {
             })
             .collect();
         Efuse { read_mirror }
+    }
+
+    /// `WDT_DELAY_SEL`, `RD_REPEAT_DATA1[17:16]`: the multiplier of the stage 0 timeout of the RTC
+    /// watchdog (`IDF:hal/esp32c3/include/hal/rwdt_ll.h:119`; report TW §C.2).
+    #[must_use]
+    pub fn wdt_delay_sel(&self) -> u32 {
+        let word = self
+            .read_mirror
+            .iter()
+            .find(|&&(offset, _)| offset == RD_REPEAT_DATA1)
+            .map_or(0, |&(_, value)| value);
+        (word >> WDT_DELAY_SEL_SHIFT) & WDT_DELAY_SEL_MASK
     }
 }
 

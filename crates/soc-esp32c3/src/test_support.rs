@@ -353,3 +353,18 @@ pub fn store_register(addr: u32, value: u32) -> [u32; 4] {
         asm::sw(T1, T0, offset),
     ]
 }
+
+/// What a program does first when it must outlive the flash-boot protection: it clears
+/// `WDTCONFIG0` of main watchdog 0 and of the RTC watchdog, as the bootloader does
+/// (`bootloader_config_wdt`). Both are unlocked at reset: their key registers reset to the key.
+#[must_use]
+pub fn stop_watchdogs() -> Vec<u32> {
+    let mut program = Vec::new();
+    for (peripheral, register) in [("TIMG0", "WDTCONFIG0"), ("RTC_CNTL", "WDTCONFIG0")] {
+        program.extend(store_register(
+            svd_regs::esp32c3::addr(peripheral, register),
+            0,
+        ));
+    }
+    program
+}

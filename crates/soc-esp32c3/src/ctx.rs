@@ -70,6 +70,8 @@ pub enum Event {
     Systimer,
     /// Wake-up of UART 0 or 1: its transmitter may have gone idle.
     Uart(u8),
+    /// Wake-up of `RTC_CNTL`: the RTC watchdog may have reached a stage timeout.
+    RtcWatchdog,
 }
 
 /// The wake-up a device keeps for its next deadline.

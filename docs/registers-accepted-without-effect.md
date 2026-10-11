@@ -63,31 +63,23 @@ SP1b-3, SP1b-4, SP2, SP5a and SP8.
 | `0x60004158` | `GPIO.FUNC1_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x600050f0` | `FE2.FE2_TX_INTERP_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60006090` | `FE.FE_GEN_CTRL` | 1 | radio memory power: there is no radio | SP5a |
-| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing (software reset bits are refused) | SP1b-3 |
-| `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays | SP1b-3 |
-| `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP1b-3 |
-| `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing | SP1b-3 |
-| `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time | SP1b-3 |
-| `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing | SP1b-3 |
-| `0x60008034` | `RTC_CNTL.ANA_CONF` | 1 | analog configuration, glitch reset | SP1b-3 |
-| `0x60008040` | `RTC_CNTL.INT_ENA_RTC` | 1 | RTC interrupt enables: nothing is raised | SP1b-3 |
-| `0x6000804c` | `RTC_CNTL.INT_CLR_RTC` | 1 | RTC interrupt clear: nothing is pending | SP1b-3 |
-| `0x60008070` | `RTC_CNTL.CLK_CONF` | 1 | RTC fast and slow clock sources and dividers | SP1b-3 |
-| `0x60008074` | `RTC_CNTL.SLOW_CLK_CONF` | 1 | RTC slow clock divider | SP1b-3 |
-| `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP1b-3 |
-| `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control | SP1b-3 |
-| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power-domain control | SP1b-3 |
-| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation | SP1b-3 |
-| `0x60008090` | `RTC_CNTL.WDTCONFIG0` | 1 | RTC watchdog enable and stages: it never expires (D11) | SP1b-3 |
-| `0x60008094` | `RTC_CNTL.WDTCONFIG1` | 1 | RTC watchdog stage 0 timeout | SP1b-3 |
-| `0x600080a4` | `RTC_CNTL.WDTFEED` | 1 | RTC watchdog feed | SP1b-3 |
-| `0x600080a8` | `RTC_CNTL.WDTWPROTECT` | 1 | RTC watchdog write protection: writes are never locked out | SP1b-3 |
-| `0x600080ac` | `RTC_CNTL.SWD_CONF` | 1 | super watchdog: auto-feed, reset flag, strobes | SP1b-3 |
-| `0x600080b0` | `RTC_CNTL.SWD_WPROTECT` | 1 | super watchdog write protection | SP1b-3 |
+| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits are reported) | SP1b-3b |
+| `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays | SP1b-3b |
+| `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP1b-3b |
+| `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing | SP1b-3b |
+| `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time | SP1b-3b |
+| `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing | SP1b-3b |
+| `0x60008034` | `RTC_CNTL.ANA_CONF` | 1 | analog configuration, glitch reset | SP8 |
+| `0x60008070` | `RTC_CNTL.CLK_CONF` | 1 | RTC fast clock source and dividers (a slow clock other than the RC oscillator is refused) | SP8 |
+| `0x60008074` | `RTC_CNTL.SLOW_CLK_CONF` | 1 | RTC slow clock divider | SP8 |
+| `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP8 |
+| `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control | SP1b-3b |
+| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power-domain control | SP1b-3b |
+| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation | SP1b-3b |
 | `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | pad hold | SP2 |
 | `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | digital pad hold | SP2 |
-| `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector | SP1b-3 |
-| `0x6000810c` | `RTC_CNTL.FIB_SEL` | 1 | brown-out and glitch reset selection | SP1b-3 |
+| `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector: the supply is always good | SP2 |
+| `0x6000810c` | `RTC_CNTL.FIB_SEL` | 1 | brown-out and glitch reset selection (the super watchdog bit acts) | SP2 |
 | `0x6000811c` | `RTC_CNTL.SENSOR_CTRL` | 1 | SAR ADC power forcing | SP2 |
 | `0x60009000` | `IO_MUX.PIN_CTRL` | 23 | pad function, pulls, drive strength, input enable | SP2 |
 | `0x600090fc` | `IO_MUX.DATE` | 1 | none: the version date of the block, stored as written | SP2 |

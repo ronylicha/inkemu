@@ -191,6 +191,11 @@ impl Esp32C3 {
         while let Some(event) = self.bus.ctx.take_due() {
             self.bus.deliver(event);
         }
+        // The machine does not reset yet: a request, from a software reset bit or from a watchdog,
+        // is reported by name, and stops a strict run, instead of vanishing.
+        if let Some(cause) = self.bus.ctx.take_reset() {
+            self.bus.ctx.unsupported(Unsupported::Reset { cause });
+        }
         if self.bus.ctx.take_clock_written() {
             self.retune(pc);
         }
@@ -351,8 +356,8 @@ mod tests {
     use crate::memmap::ROM_BASE;
     use crate::memmap::SRAM_DBUS_BASE;
     use crate::test_support::{
-        HANG, T0, T1, flat_rom, load_register, print_program as print, store_register,
-        unmodeled_register,
+        HANG, T0, T1, flat_rom, load_register, print_program as print, stop_watchdogs,
+        store_register, unmodeled_register,
     };
     use cpu_rv32::asm::{addi, csrrs, csrrwi, jal, lui, lw, sw, wfi};
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
@@ -575,7 +580,13 @@ mod tests {
 
     #[test]
     fn wfi_with_nothing_to_wake_it_stops_as_idle() {
-        let mut m = machine(&[wfi(), HANG]);
+        // Strapped for another boot mode, no watchdog runs at reset: no device has anything
+        // scheduled.
+        let config = SocConfig {
+            strapping: 0,
+            ..SocConfig::default()
+        };
+        let mut m = machine_with(&[wfi(), HANG], config);
         assert_eq!(m.run_until(Cycles(10_000)), StopReason::Idle);
         assert_eq!(
             m.device_time_nanos(),
@@ -991,8 +1002,9 @@ mod tests {
     #[test]
     fn a_cpu_that_sleeps_while_a_device_counts_gives_control_back_after_a_second() {
         // A one-shot alarm two seconds ahead (32 000 000 counts at 16 MHz), its interrupt not
-        // enabled: nothing will wake the CPU, and time must still pass.
-        let mut body = Vec::new();
+        // enabled: nothing will wake the CPU, and time must still pass. The RTC watchdog the reset
+        // values arm is stopped first: it would reset the chip at 2.94 s.
+        let mut body = stop_watchdogs();
         body.extend(store_register(reg("SYSTIMER", "TARGET0_LO"), 32_000_000));
         body.extend(store_register(reg("SYSTIMER", "COMP0_LOAD"), 1));
         body.extend(store_register(
@@ -1039,5 +1051,50 @@ mod tests {
         );
         assert_eq!(m.run_until(Cycles(10_000)), StopReason::Asleep, "and again");
         assert!(m.device_time_nanos() > first);
+    }
+
+    #[test]
+    fn a_reset_request_is_reported_by_name_and_stops_a_strict_run() {
+        use crate::reset::ResetCause;
+        let reported = |m: &mut Esp32C3, cause: ResetCause| {
+            m.drain_diagnostics().into_iter().any(|diagnostic| {
+                matches!(
+                    diagnostic,
+                    Diagnostic::Unsupported { what: Unsupported::Reset { cause: seen }, .. }
+                        if seen == cause
+                )
+            })
+        };
+        // What `esp_restart` ends with: `RTC_CNTL.OPTIONS0` bit 5 (IR §4.1).
+        let mut restart = stop_watchdogs();
+        restart.extend(store_register(reg("RTC_CNTL", "OPTIONS0"), 1 << 5));
+        restart.push(HANG);
+        let mut m = machine(&restart);
+        assert_eq!(m.run_until(Cycles(1_000)), StopReason::CycleBudget);
+        assert!(reported(&mut m, ResetCause::SoftwareCpu));
+        let mut strict = machine_with(
+            &restart,
+            SocConfig {
+                strict_mmio: true,
+                ..SocConfig::default()
+            },
+        );
+        assert!(matches!(
+            strict.run_until(Cycles(1_000)),
+            StopReason::StrictMmio(Diagnostic::Unsupported {
+                what: Unsupported::Reset {
+                    cause: ResetCause::SoftwareCpu
+                },
+                ..
+            })
+        ));
+        // A CPU that only sleeps: the RTC watchdog the reset values arm expires after 400 000
+        // cycles of the 136 kHz slow clock, 2.941 s (TW §D.4).
+        let mut asleep = machine(&[wfi(), HANG]);
+        for _ in 0..3 {
+            assert_eq!(asleep.run_until(Cycles(10_000)), StopReason::Asleep);
+        }
+        assert!(asleep.device_time_nanos() >= 2_941_176_470);
+        assert!(reported(&mut asleep, ResetCause::RtcWatchdogSystem));
     }
 }

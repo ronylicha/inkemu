@@ -205,7 +205,7 @@ mod tests {
     use boards::MachineOptions;
     use cpu_rv32::asm::{addi, jal, sw, wfi};
     use soc_esp32c3::test_support::{
-        HANG, T0, T1, flat_rom, load_register, print_program, unmodeled_register,
+        HANG, T0, T1, flat_rom, load_register, print_program, stop_watchdogs, unmodeled_register,
     };
     const UART0: u32 = svd_regs::esp32c3::addr("UART0", "FIFO");
     const USB: u32 = svd_regs::esp32c3::addr("USB_DEVICE", "EP1");
@@ -404,7 +404,10 @@ mod tests {
 
     #[test]
     fn idle_cpu_ends_the_run_and_says_why() {
-        let mut m = machine(&[wfi(), HANG], MachineOptions::default());
+        // With its watchdogs stopped, nothing on the device has anything scheduled.
+        let mut program = stop_watchdogs();
+        program.extend([wfi(), HANG]);
+        let mut m = machine(&program, MachineOptions::default());
         let (mut console, mut log) = (Vec::new(), Vec::new());
         let end = execute(
             &mut m,
