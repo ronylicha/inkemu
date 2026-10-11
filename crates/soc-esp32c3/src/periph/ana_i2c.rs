@@ -5,6 +5,7 @@
 //! The SVD does not describe this window (decision D17). No analog behaviour is modelled: a byte
 //! written to an analog register reads back, nothing more (decision D24).
 use super::Accepted;
+use crate::ctx::Ctx;
 use emu_core::Peripheral;
 use std::collections::BTreeMap;
 
@@ -96,8 +97,8 @@ impl AnaI2c {
     }
 }
 
-impl Peripheral for AnaI2c {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for AnaI2c {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
         match offset {
             HOST0_CMD => self.command.first().copied(),
             HOST1_CMD => self.command.get(1).copied(),
@@ -105,7 +106,7 @@ impl Peripheral for AnaI2c {
         }
     }
 
-    fn write(&mut self, offset: u32, value: u32) -> bool {
+    fn write(&mut self, _ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         let host = match offset {
             HOST0_CMD => 0,
             HOST1_CMD => 1,
@@ -141,45 +142,52 @@ mod tests {
     #[test]
     fn a_command_is_never_busy_and_a_read_returns_the_byte_written_before() {
         // BA §2.2: the ROM writes the command, spins while bit 25 is set, reads bits [23:16].
+        let ctx = &mut Ctx::default();
         let mut i2c = AnaI2c::new();
-        assert!(i2c.write(HOST0_CMD, write_cmd(0x69, 0x07, 0x5A)));
-        assert_eq!(i2c.read(HOST0_CMD).map(|v| v & BUSY), Some(0));
-        assert!(i2c.write(HOST0_CMD, read_cmd(0x69, 0x07))); // BA §2 row 76: 0x4000769
-        assert_eq!(i2c.read(HOST0_CMD), Some(0x0400_0769 | (0x5A << 16)));
+        assert!(i2c.write(ctx, HOST0_CMD, write_cmd(0x69, 0x07, 0x5A)));
+        assert_eq!(i2c.read(ctx, HOST0_CMD).map(|v| v & BUSY), Some(0));
+        assert!(i2c.write(ctx, HOST0_CMD, read_cmd(0x69, 0x07))); // BA §2 row 76: 0x4000769
+        assert_eq!(i2c.read(ctx, HOST0_CMD), Some(0x0400_0769 | (0x5A << 16)));
     }
 
     #[test]
     fn a_register_never_written_reads_zero_and_the_two_hosts_are_separate() {
+        let ctx = &mut Ctx::default();
         let mut i2c = AnaI2c::new();
-        i2c.write(HOST0_CMD, read_cmd(0x66, 0x02));
+        i2c.write(ctx, HOST0_CMD, read_cmd(0x66, 0x02));
         assert_eq!(
-            i2c.read(HOST0_CMD).map(|v| (v >> 16) & 0xFF),
+            i2c.read(ctx, HOST0_CMD).map(|v| (v >> 16) & 0xFF),
             Some(0),
             "decision D24"
         );
-        i2c.write(HOST0_CMD, write_cmd(0x66, 0x02, 0x6B)); // BBPLL MODE_HF = 0x6B (BA §5 step 10)
-        i2c.write(HOST1_CMD, read_cmd(0x66, 0x02));
-        assert_eq!(i2c.read(HOST1_CMD).map(|v| (v >> 16) & 0xFF), Some(0));
-        i2c.write(HOST0_CMD, read_cmd(0x66, 0x02));
-        assert_eq!(i2c.read(HOST0_CMD).map(|v| (v >> 16) & 0xFF), Some(0x6B));
+        i2c.write(ctx, HOST0_CMD, write_cmd(0x66, 0x02, 0x6B)); // BBPLL MODE_HF = 0x6B (BA §5 step 10)
+        i2c.write(ctx, HOST1_CMD, read_cmd(0x66, 0x02));
+        assert_eq!(i2c.read(ctx, HOST1_CMD).map(|v| (v >> 16) & 0xFF), Some(0));
+        i2c.write(ctx, HOST0_CMD, read_cmd(0x66, 0x02));
+        assert_eq!(
+            i2c.read(ctx, HOST0_CMD).map(|v| (v >> 16) & 0xFF),
+            Some(0x6B)
+        );
     }
 
     #[test]
     fn a_busy_bit_written_by_software_is_not_kept() {
+        let ctx = &mut Ctx::default();
         let mut i2c = AnaI2c::new();
-        i2c.write(HOST0_CMD, read_cmd(0x69, 0x07) | BUSY);
-        assert_eq!(i2c.read(HOST0_CMD).map(|v| v & BUSY), Some(0));
+        i2c.write(ctx, HOST0_CMD, read_cmd(0x69, 0x07) | BUSY);
+        assert_eq!(i2c.read(ctx, HOST0_CMD).map(|v| v & BUSY), Some(0));
     }
 
     #[test]
     fn the_three_configuration_registers_are_stored_from_zero() {
+        let ctx = &mut Ctx::default();
         let mut i2c = AnaI2c::new();
         for offset in [I2C_MST_ANA_CONF0, ANA_CONFIG, ANA_CONFIG2] {
-            assert_eq!(i2c.read(offset), Some(0), "decision D24");
-            assert!(i2c.write(offset, 0xFFFF_BFFF)); // BA §3 row 10
-            assert_eq!(i2c.read(offset), Some(0xFFFF_BFFF));
+            assert_eq!(i2c.read(ctx, offset), Some(0), "decision D24");
+            assert!(i2c.write(ctx, offset, 0xFFFF_BFFF)); // BA §3 row 10
+            assert_eq!(i2c.read(ctx, offset), Some(0xFFFF_BFFF));
         }
-        assert_eq!(i2c.read(0x08), None);
-        assert!(!i2c.write(0x4C, 0));
+        assert_eq!(i2c.read(ctx, 0x08), None);
+        assert!(!i2c.write(ctx, 0x4C, 0));
     }
 }

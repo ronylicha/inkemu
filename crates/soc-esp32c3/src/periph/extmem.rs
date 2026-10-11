@@ -5,6 +5,7 @@
 //! (decision D4). The operations software waits for (invalidate, preload, autoload, freeze)
 //! therefore complete at once, and the registers below only keep what software reads back.
 use super::{Accepted, EXTMEM_BASE, Storage};
+use crate::ctx::Ctx;
 use emu_core::Peripheral;
 use svd_regs::esp32c3::addr;
 
@@ -147,8 +148,8 @@ impl Default for Extmem {
     }
 }
 
-impl Peripheral for Extmem {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for Extmem {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
         Some(match offset {
             ICACHE_SYNC_CTRL => SYNC_DONE,
             ICACHE_PRELOAD_CTRL => PRELOAD_DONE | self.preload_order,
@@ -172,7 +173,7 @@ impl Peripheral for Extmem {
         })
     }
 
-    fn write(&mut self, offset: u32, value: u32) -> bool {
+    fn write(&mut self, _ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         match offset {
             // The invalidation has nothing to invalidate; `SYNC_DONE` already reads set.
             ICACHE_SYNC_CTRL => {}
@@ -207,46 +208,53 @@ mod tests {
 
     #[test]
     fn reset_state_lets_every_rom_poll_terminate() {
+        let ctx = &mut Ctx::default();
         let mut x = Extmem::new();
-        assert_eq!(x.read(reg("ICACHE_CTRL")), Some(0));
+        assert_eq!(x.read(ctx, reg("ICACHE_CTRL")), Some(0));
         assert_eq!(
-            x.read(reg("ICACHE_CTRL1")),
+            x.read(ctx, reg("ICACHE_CTRL1")),
             Some(3),
             "CM §2: both buses shut"
         );
-        assert_eq!(x.read(reg("ICACHE_SYNC_CTRL")), Some(2), "decision D23");
         assert_eq!(
-            x.read(reg("ICACHE_PRELOAD_CTRL")),
+            x.read(ctx, reg("ICACHE_SYNC_CTRL")),
+            Some(2),
+            "decision D23"
+        );
+        assert_eq!(
+            x.read(ctx, reg("ICACHE_PRELOAD_CTRL")),
             Some(2),
             "Cache_Suspend_ICache spins on bit 1"
         );
         assert_eq!(
-            x.read(reg("ICACHE_AUTOLOAD_CTRL")),
+            x.read(ctx, reg("ICACHE_AUTOLOAD_CTRL")),
             Some(8),
             "Cache_Suspend_ICache_Autoload spins on bit 3"
         );
         assert_eq!(
-            x.read(reg("CACHE_STATE")),
+            x.read(ctx, reg("CACHE_STATE")),
             Some(1),
             "Cache_Disable_ICache waits for exactly 1"
         );
-        assert_eq!(x.read(reg("ICACHE_FREEZE")), Some(0));
+        assert_eq!(x.read(ctx, reg("ICACHE_FREEZE")), Some(0));
     }
 
     #[test]
     fn invalidate_completes_at_once() {
         // CM §1.2: `R SYNC_CTRL=2 ; W SYNC_CTRL=3 ; R =2`, with SYNC_ADDR and SYNC_SIZE stored.
+        let ctx = &mut Ctx::default();
         let mut x = Extmem::new();
-        assert!(x.write(reg("ICACHE_SYNC_ADDR"), 0x3C55_0000));
-        assert!(x.write(reg("ICACHE_SYNC_SIZE"), 0x800));
-        assert!(x.write(reg("ICACHE_SYNC_CTRL"), 3));
-        assert_eq!(x.read(reg("ICACHE_SYNC_CTRL")), Some(2));
-        assert_eq!(x.read(reg("ICACHE_SYNC_ADDR")), Some(0x3C55_0000));
-        assert_eq!(x.read(reg("ICACHE_SYNC_SIZE")), Some(0x800));
+        assert!(x.write(ctx, reg("ICACHE_SYNC_ADDR"), 0x3C55_0000));
+        assert!(x.write(ctx, reg("ICACHE_SYNC_SIZE"), 0x800));
+        assert!(x.write(ctx, reg("ICACHE_SYNC_CTRL"), 3));
+        assert_eq!(x.read(ctx, reg("ICACHE_SYNC_CTRL")), Some(2));
+        assert_eq!(x.read(ctx, reg("ICACHE_SYNC_ADDR")), Some(0x3C55_0000));
+        assert_eq!(x.read(ctx, reg("ICACHE_SYNC_SIZE")), Some(0x800));
     }
 
     #[test]
     fn operation_registers_keep_their_configuration_bits_and_answer_done_whatever_is_written() {
+        let ctx = &mut Ctx::default();
         // (register, value written, value read back): the enable and done bits written together,
         // then every bit set. A `DONE` bit is the model's answer, never what software wrote.
         for (name, written, read) in [
@@ -274,43 +282,45 @@ mod tests {
             ("ICACHE_FREEZE", 0, 0),
         ] {
             let mut x = Extmem::new();
-            assert!(x.write(reg(name), written), "{name} <- {written:#x}");
-            assert_eq!(x.read(reg(name)), Some(read), "{name} <- {written:#x}");
+            assert!(x.write(ctx, reg(name), written), "{name} <- {written:#x}");
+            assert_eq!(x.read(ctx, reg(name)), Some(read), "{name} <- {written:#x}");
         }
     }
 
     #[test]
     fn freeze_done_follows_enable() {
         // FB §B.5: enable, poll DONE set; then the ROM writes back the value without bit 0, poll DONE clear.
+        let ctx = &mut Ctx::default();
         let mut x = Extmem::new();
-        x.write(reg("ICACHE_FREEZE"), 1);
-        let frozen = x.read(reg("ICACHE_FREEZE")).unwrap();
+        x.write(ctx, reg("ICACHE_FREEZE"), 1);
+        let frozen = x.read(ctx, reg("ICACHE_FREEZE")).unwrap();
         assert_ne!(frozen & 4, 0);
-        x.write(reg("ICACHE_FREEZE"), frozen & !1);
+        x.write(ctx, reg("ICACHE_FREEZE"), frozen & !1);
         assert_eq!(
-            x.read(reg("ICACHE_FREEZE")),
+            x.read(ctx, reg("ICACHE_FREEZE")),
             Some(0),
             "software cannot hold DONE"
         );
-        x.write(reg("ICACHE_FREEZE"), 3);
-        assert_eq!(x.read(reg("ICACHE_FREEZE")), Some(7), "MODE is stored");
+        x.write(ctx, reg("ICACHE_FREEZE"), 3);
+        assert_eq!(x.read(ctx, reg("ICACHE_FREEZE")), Some(7), "MODE is stored");
     }
 
     #[test]
     fn autoload_enable_is_a_stored_bit_and_done_cannot_be_cleared() {
+        let ctx = &mut Ctx::default();
         let mut x = Extmem::new();
-        x.write(reg("ICACHE_AUTOLOAD_CTRL"), 4);
-        assert_eq!(x.read(reg("ICACHE_AUTOLOAD_CTRL")), Some(0xC));
+        x.write(ctx, reg("ICACHE_AUTOLOAD_CTRL"), 4);
+        assert_eq!(x.read(ctx, reg("ICACHE_AUTOLOAD_CTRL")), Some(0xC));
         assert_eq!(
-            x.read(reg("ICACHE_AUTOLOAD_CTRL")),
+            x.read(ctx, reg("ICACHE_AUTOLOAD_CTRL")),
             Some(0xC),
             "a read does not clear ENA (CM §2)"
         );
-        x.write(reg("ICACHE_AUTOLOAD_CTRL"), 0);
-        assert_eq!(x.read(reg("ICACHE_AUTOLOAD_CTRL")), Some(8));
-        x.write(reg("ICACHE_PRELOAD_CTRL"), 5);
+        x.write(ctx, reg("ICACHE_AUTOLOAD_CTRL"), 0);
+        assert_eq!(x.read(ctx, reg("ICACHE_AUTOLOAD_CTRL")), Some(8));
+        x.write(ctx, reg("ICACHE_PRELOAD_CTRL"), 5);
         assert_eq!(
-            x.read(reg("ICACHE_PRELOAD_CTRL")),
+            x.read(ctx, reg("ICACHE_PRELOAD_CTRL")),
             Some(6),
             "ENA self-clears, ORDER kept, DONE set"
         );
@@ -318,6 +328,7 @@ mod tests {
 
     #[test]
     fn configuration_is_stored_from_its_reset_value() {
+        let ctx = &mut Ctx::default();
         let mut x = Extmem::new();
         for (name, reset) in [
             ("CACHE_MMU_OWNER", 0),
@@ -327,70 +338,77 @@ mod tests {
             ("CACHE_ILG_INT_ENA", 0),
             ("CORE0_ACS_CACHE_INT_ENA", 0),
         ] {
-            assert_eq!(x.read(reg(name)), Some(reset), "{name}");
-            assert!(x.write(reg(name), 0xF));
-            assert_eq!(x.read(reg(name)), Some(0xF), "{name}");
+            assert_eq!(x.read(ctx, reg(name)), Some(reset), "{name}");
+            assert!(x.write(ctx, reg(name), 0xF));
+            assert_eq!(x.read(ctx, reg(name)), Some(0xF), "{name}");
         }
     }
 
     #[test]
     fn bus_enable_writes_change_the_generation() {
+        let ctx = &mut Ctx::default();
         let mut x = Extmem::new();
         let before = x.generation();
-        x.write(reg("ICACHE_CTRL"), 1);
+        x.write(ctx, reg("ICACHE_CTRL"), 1);
         assert_ne!(x.generation(), before);
         let before = x.generation();
-        x.write(reg("ICACHE_CTRL1"), 0);
+        x.write(ctx, reg("ICACHE_CTRL1"), 0);
         assert_ne!(x.generation(), before);
         let before = x.generation();
-        x.write(reg("ICACHE_SYNC_CTRL"), 1);
+        x.write(ctx, reg("ICACHE_SYNC_CTRL"), 1);
         assert_eq!(x.generation(), before, "an invalidation maps nothing new");
     }
 
     #[test]
     fn an_invalid_mapping_is_latched_until_software_clears_it() {
+        let ctx = &mut Ctx::default();
         let mut x = Extmem::new();
         x.latch_mmu_fault(0x3C03_0010, 0x100);
         assert_eq!(
-            x.read(reg("CACHE_ILG_INT_ST")),
+            x.read(ctx, reg("CACHE_ILG_INT_ST")),
             Some(1 << 5),
             "MMU_ENTRY_FAULT_ST (CM §6.1)"
         );
-        assert_eq!(x.read(reg("CACHE_MMU_FAULT_VADDR")), Some(0x3C03_0010));
+        assert_eq!(x.read(ctx, reg("CACHE_MMU_FAULT_VADDR")), Some(0x3C03_0010));
         assert_eq!(
-            x.read(reg("CACHE_MMU_FAULT_CONTENT")),
+            x.read(ctx, reg("CACHE_MMU_FAULT_CONTENT")),
             Some(0x100 | (1 << 10)),
             "content, code 1 = CPU miss"
         );
         assert!(
-            x.write(reg("CACHE_ILG_INT_CLR"), 0xFFFF_FFFF),
+            x.write(ctx, reg("CACHE_ILG_INT_CLR"), 0xFFFF_FFFF),
             "Cache_Set_Default_Mode (FB §B.3)"
         );
-        assert_eq!(x.read(reg("CACHE_ILG_INT_ST")), Some(0));
-        assert!(!x.write(reg("CACHE_ILG_INT_ST"), 1), "status is read-only");
+        assert_eq!(x.read(ctx, reg("CACHE_ILG_INT_ST")), Some(0));
+        assert!(
+            !x.write(ctx, reg("CACHE_ILG_INT_ST"), 1),
+            "status is read-only"
+        );
     }
 
     #[test]
     fn a_store_to_a_window_is_latched_per_bus() {
+        let ctx = &mut Ctx::default();
         let mut x = Extmem::new();
         x.latch_store(false);
         assert_eq!(
-            x.read(reg("CORE0_ACS_CACHE_INT_ST")),
+            x.read(ctx, reg("CORE0_ACS_CACHE_INT_ST")),
             Some(1 << 5),
             "DBUS_WR_ICACHE_ST"
         );
         x.latch_store(true);
         assert_eq!(
-            x.read(reg("CORE0_ACS_CACHE_INT_ST")),
+            x.read(ctx, reg("CORE0_ACS_CACHE_INT_ST")),
             Some((1 << 5) | (1 << 1)),
             "IBUS_WR_ICACHE_ST"
         );
-        x.write(reg("CORE0_ACS_CACHE_INT_CLR"), 0x3F);
-        assert_eq!(x.read(reg("CORE0_ACS_CACHE_INT_ST")), Some(0));
+        x.write(ctx, reg("CORE0_ACS_CACHE_INT_CLR"), 0x3F);
+        assert_eq!(x.read(ctx, reg("CORE0_ACS_CACHE_INT_ST")), Some(0));
     }
 
     #[test]
     fn registers_no_measured_path_touches_stay_unmodelled() {
+        let ctx = &mut Ctx::default();
         let mut x = Extmem::new();
         for name in [
             "ICACHE_LOCK_CTRL",
@@ -399,8 +417,8 @@ mod tests {
             "CACHE_CONF_MISC",
             "REG_DATE",
         ] {
-            assert_eq!(x.read(reg(name)), None, "{name}");
-            assert!(!x.write(reg(name), 1), "{name}");
+            assert_eq!(x.read(ctx, reg(name)), None, "{name}");
+            assert!(!x.write(ctx, reg(name), 1), "{name}");
         }
     }
 }

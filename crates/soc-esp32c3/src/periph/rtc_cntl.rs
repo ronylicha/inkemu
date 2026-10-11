@@ -1,10 +1,10 @@
 //! `RTC_CNTL`: reset cause, retention registers, pad, clock, analog and power configuration.
 //! Source: report §E.2. The watchdogs are stored and never expire (decision D11); the RTC timer and
 //! resets arrive in SP1b-3.
+use crate::ctx::Ctx;
 use crate::diag::Unsupported;
 use crate::periph::{Accepted, RTC_CNTL_BASE, Storage};
 use emu_core::Peripheral;
-use std::collections::VecDeque;
 use svd_regs::esp32c3::addr;
 
 const OPTIONS0: u32 = addr("RTC_CNTL", "OPTIONS0") - RTC_CNTL_BASE;
@@ -153,8 +153,6 @@ pub struct RtcCntl {
     reset_state_other: u32,
     store: [u32; STORE_COUNT],
     config: Storage,
-    /// Refused requests not taken yet, oldest first: none may be lost between two relays.
-    unsupported: VecDeque<Unsupported>,
 }
 
 impl RtcCntl {
@@ -167,13 +165,7 @@ impl RtcCntl {
             reset_state_other: documented & !RESET_CAUSE_MASK,
             store: [0; STORE_COUNT],
             config: Storage::accepted(RTC_CNTL_BASE, &ACCEPTED),
-            unsupported: VecDeque::new(),
         }
-    }
-
-    /// The oldest request this block refused and nobody took yet.
-    pub(crate) fn take_unsupported(&mut self) -> Option<Unsupported> {
-        self.unsupported.pop_front()
     }
 }
 
@@ -183,8 +175,8 @@ impl Default for RtcCntl {
     }
 }
 
-impl Peripheral for RtcCntl {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for RtcCntl {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
         if offset == RESET_STATE {
             return Some(self.reset_state_other | self.reset_cause);
         }
@@ -194,12 +186,11 @@ impl Peripheral for RtcCntl {
         self.config.read(offset)
     }
 
-    fn write(&mut self, offset: u32, value: u32) -> bool {
+    fn write(&mut self, ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         // Decision D27: a software reset is not emulated yet (SP1b-3). Storing the bit would be a
         // reset that silently never happens: the request is reported and dropped instead.
         if offset == OPTIONS0 && value & (SW_SYS_RST | SW_PROCPU_RST) != 0 {
-            self.unsupported
-                .push_back(Unsupported::SoftwareReset { options0: value });
+            ctx.unsupported(Unsupported::SoftwareReset { options0: value });
             return true;
         }
         if let Some(i) = STORE.iter().position(|&o| o == offset) {
@@ -217,8 +208,9 @@ mod tests {
 
     #[test]
     fn power_on_reset_cause_is_reported() {
+        let ctx = &mut Ctx::default();
         let mut rtc = RtcCntl::new();
-        let state = rtc.read(0x38).unwrap();
+        let state = rtc.read(ctx, 0x38).unwrap();
         assert_eq!(state & 0x3F, 1, "RESET_CAUSE_PROCPU = POWERON");
         assert_eq!(state & (1 << 20), 0, "no JTAG reset flag");
         assert_eq!(
@@ -230,31 +222,33 @@ mod tests {
 
     #[test]
     fn store_registers_keep_what_the_rom_writes() {
+        let ctx = &mut Ctx::default();
         let mut rtc = RtcCntl::new();
         for (i, offset) in [0x50, 0x54, 0x58, 0x5C, 0xB8, 0xBC, 0xC0, 0xC4]
             .into_iter()
             .enumerate()
         {
             let value = 0x1000 + u32::try_from(i).unwrap();
-            assert_eq!(rtc.read(offset), Some(0));
-            assert!(rtc.write(offset, value));
-            assert_eq!(rtc.read(offset), Some(value));
+            assert_eq!(rtc.read(ctx, offset), Some(0));
+            assert!(rtc.write(ctx, offset, value));
+            assert_eq!(rtc.read(ctx, offset), Some(value));
         }
     }
 
     #[test]
     fn pad_and_power_configuration_is_plain_storage_from_its_reset_value() {
+        let ctx = &mut Ctx::default();
         let mut rtc = RtcCntl::new();
         for offset in [0x84, 0x8C, 0xAC, 0xD0, 0xD4] {
             let reset = svd_regs::esp32c3::lookup(0x6000_8000 + offset)
                 .unwrap()
                 .reset_value;
-            assert_eq!(rtc.read(offset), Some(reset), "{offset:#x}");
-            assert!(rtc.write(offset, 0x55AA));
-            assert_eq!(rtc.read(offset), Some(0x55AA));
+            assert_eq!(rtc.read(ctx, offset), Some(reset), "{offset:#x}");
+            assert!(rtc.write(ctx, offset, 0x55AA));
+            assert_eq!(rtc.read(ctx, offset), Some(0x55AA));
         }
         assert_eq!(
-            rtc.read(0xAC).map(|v| v & 1),
+            rtc.read(ctx, 0xAC).map(|v| v & 1),
             Some(0),
             "super watchdog reset flag clear"
         );
@@ -266,6 +260,7 @@ mod tests {
 
     #[test]
     fn clock_analog_and_watchdog_configuration_is_stored_from_its_reset_value() {
+        let ctx = &mut Ctx::default();
         let mut rtc = RtcCntl::new();
         for (name, reset) in [
             ("OPTIONS0", 0x1C00_A000),
@@ -279,9 +274,9 @@ mod tests {
             ("BROWN_OUT", 0x43FF_0010),
             ("FIB_SEL", 0x0000_0007),
         ] {
-            assert_eq!(rtc.read(reg(name)), Some(reset), "{name}");
-            assert!(rtc.write(reg(name), 0x0000_0140));
-            assert_eq!(rtc.read(reg(name)), Some(0x0000_0140), "{name}");
+            assert_eq!(rtc.read(ctx, reg(name)), Some(reset), "{name}");
+            assert!(rtc.write(ctx, reg(name), 0x0000_0140));
+            assert_eq!(rtc.read(ctx, reg(name)), Some(0x0000_0140), "{name}");
         }
         for name in [
             "TIMER3",
@@ -296,51 +291,53 @@ mod tests {
             "SWD_WPROTECT",
             "SENSOR_CTRL",
         ] {
-            assert!(rtc.write(reg(name), 0x8F1D_312A), "{name}");
-            assert_eq!(rtc.read(reg(name)), Some(0x8F1D_312A), "{name}");
+            assert!(rtc.write(ctx, reg(name), 0x8F1D_312A), "{name}");
+            assert_eq!(rtc.read(ctx, reg(name)), Some(0x8F1D_312A), "{name}");
         }
     }
 
     #[test]
     fn the_bootloader_watchdog_sequence_is_stored_as_written_and_changes_no_reset_cause() {
         // BA §6: unlock, clear FLASHBOOT_MOD_EN, stage 0 = 0x956A0, feed, enable, lock.
+        let ctx = &mut Ctx::default();
         let mut rtc = RtcCntl::new();
-        rtc.write(reg("WDTWPROTECT"), 0x50D8_3AA1);
-        rtc.write(reg("WDTCONFIG1"), 0x0009_56A0);
-        rtc.write(reg("WDTFEED"), 1 << 31);
-        rtc.write(reg("WDTCONFIG0"), 0xC007_EA00);
-        rtc.write(reg("WDTWPROTECT"), 0);
-        assert_eq!(rtc.read(reg("WDTCONFIG0")), Some(0xC007_EA00));
-        assert_eq!(rtc.read(reg("WDTCONFIG1")), Some(0x0009_56A0));
+        rtc.write(ctx, reg("WDTWPROTECT"), 0x50D8_3AA1);
+        rtc.write(ctx, reg("WDTCONFIG1"), 0x0009_56A0);
+        rtc.write(ctx, reg("WDTFEED"), 1 << 31);
+        rtc.write(ctx, reg("WDTCONFIG0"), 0xC007_EA00);
+        rtc.write(ctx, reg("WDTWPROTECT"), 0);
+        assert_eq!(rtc.read(ctx, reg("WDTCONFIG0")), Some(0xC007_EA00));
+        assert_eq!(rtc.read(ctx, reg("WDTCONFIG1")), Some(0x0009_56A0));
         assert_eq!(
-            rtc.read(RESET_STATE).map(|v| v & 0x3F),
+            rtc.read(ctx, RESET_STATE).map(|v| v & 0x3F),
             Some(1),
             "still a power-on reset: decision D11"
         );
-        assert_eq!(rtc.take_unsupported(), None);
+        assert_eq!(ctx.take_unsupported(), None);
     }
 
     #[test]
     fn a_software_reset_request_is_reported_and_not_stored() {
         // BC §E.2: OPTIONS0 bit 31 SW_SYS_RST, bit 5 SW_PROCPU_RST.
+        let ctx = &mut Ctx::default();
         for value in [1u32 << 31, 1 << 5, 0x1C00_A000 | (1 << 5)] {
             let mut rtc = RtcCntl::new();
-            assert!(rtc.write(reg("OPTIONS0"), value));
+            assert!(rtc.write(ctx, reg("OPTIONS0"), value));
             assert_eq!(
-                rtc.take_unsupported(),
+                ctx.take_unsupported(),
                 Some(Unsupported::SoftwareReset { options0: value })
             );
-            assert_eq!(rtc.take_unsupported(), None);
+            assert_eq!(ctx.take_unsupported(), None);
             assert_eq!(
-                rtc.read(reg("OPTIONS0")),
+                rtc.read(ctx, reg("OPTIONS0")),
                 Some(0x1C00_A000),
                 "not stored: decision D27"
             );
         }
         let mut rtc = RtcCntl::new();
-        rtc.write(reg("OPTIONS0"), 0x1C00_A000 & !(1 << 13));
+        rtc.write(ctx, reg("OPTIONS0"), 0x1C00_A000 & !(1 << 13));
         assert_eq!(
-            rtc.take_unsupported(),
+            ctx.take_unsupported(),
             None,
             "BBPLL power bits are plain configuration (BA §5 step 9)"
         );
@@ -348,25 +345,27 @@ mod tests {
 
     #[test]
     fn two_software_reset_requests_before_a_relay_are_both_reported_in_order() {
+        let ctx = &mut Ctx::default();
         let mut rtc = RtcCntl::new();
-        rtc.write(reg("OPTIONS0"), 1 << 31);
-        rtc.write(reg("OPTIONS0"), 1 << 5);
+        rtc.write(ctx, reg("OPTIONS0"), 1 << 31);
+        rtc.write(ctx, reg("OPTIONS0"), 1 << 5);
         assert_eq!(
-            rtc.take_unsupported(),
+            ctx.take_unsupported(),
             Some(Unsupported::SoftwareReset { options0: 1 << 31 })
         );
         assert_eq!(
-            rtc.take_unsupported(),
+            ctx.take_unsupported(),
             Some(Unsupported::SoftwareReset { options0: 1 << 5 })
         );
-        assert_eq!(rtc.take_unsupported(), None);
+        assert_eq!(ctx.take_unsupported(), None);
     }
 
     #[test]
     fn everything_else_is_left_to_the_unmodeled_path() {
+        let ctx = &mut Ctx::default();
         let mut rtc = RtcCntl::new();
         assert!(
-            !rtc.write(RESET_STATE, 0),
+            !rtc.write(ctx, RESET_STATE, 0),
             "RESET_STATE is not writable here"
         );
         for name in [
@@ -377,7 +376,7 @@ mod tests {
             "WDTCONFIG2",
         ] {
             assert_eq!(
-                rtc.read(reg(name)),
+                rtc.read(ctx, reg(name)),
                 None,
                 "{name}: the RTC timer, sleep and watchdog stages are SP1b-3"
             );

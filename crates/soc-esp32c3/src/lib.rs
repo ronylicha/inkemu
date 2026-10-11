@@ -14,6 +14,7 @@ pub mod bus;
 pub mod chip;
 pub mod clock;
 pub mod config;
+pub mod ctx;
 pub mod diag;
 pub mod flash;
 pub mod machine;

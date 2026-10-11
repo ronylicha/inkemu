@@ -5,6 +5,7 @@
 //! The content is that of a production chip (decision D9); programming registers stay unmodelled
 //! until a firmware needs them (SP1b-3).
 use crate::chip::ChipRevision;
+use crate::ctx::Ctx;
 use crate::periph::EFUSE_BASE;
 use emu_core::Peripheral;
 
@@ -102,15 +103,15 @@ impl Efuse {
     }
 }
 
-impl Peripheral for Efuse {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for Efuse {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
         self.read_mirror
             .binary_search_by_key(&offset, |&(o, _)| o)
             .ok()
             .map(|i| self.read_mirror[i].1)
     }
 
-    fn write(&mut self, _offset: u32, _value: u32) -> bool {
+    fn write(&mut self, _ctx: &mut Ctx, _offset: u32, _value: u32) -> bool {
         false
     }
 }
@@ -120,9 +121,9 @@ mod tests {
     use super::*;
     use emu_core::Peripheral;
 
-    fn revision(efuse: &mut Efuse) -> (u32, u32) {
-        let sys3 = efuse.read(0x50).unwrap();
-        let sys5 = efuse.read(0x58).unwrap();
+    fn revision(ctx: &mut Ctx, efuse: &mut Efuse) -> (u32, u32) {
+        let sys3 = efuse.read(ctx, 0x50).unwrap();
+        let sys5 = efuse.read(ctx, 0x58).unwrap();
         let minor = (((sys5 >> 23) & 1) << 3) | ((sys3 >> 18) & 7);
         ((sys5 >> 24) & 3, minor)
     }
@@ -138,15 +139,16 @@ mod tests {
             .collect()
     }
 
-    fn word(efuse: &mut Efuse, name: &str) -> u32 {
+    fn word(ctx: &mut Ctx, efuse: &mut Efuse, name: &str) -> u32 {
         efuse
-            .read(svd_regs::esp32c3::addr("EFUSE", name) - EFUSE_BASE)
+            .read(ctx, svd_regs::esp32c3::addr("EFUSE", name) - EFUSE_BASE)
             .unwrap()
     }
 
     #[test]
     fn the_mirror_holds_the_dump_of_a_production_v0_3_chip() {
         // BA §8, raw words of the three blocks.
+        let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::V0_3);
         let expected = [
             ("RD_WR_DIS", 0),
@@ -171,7 +173,7 @@ mod tests {
             ("RD_SYS_PART1_DATA7", 0x0000_0009),
         ];
         for (name, value) in expected {
-            assert_eq!(word(&mut efuse, name), value, "{name}");
+            assert_eq!(word(ctx, &mut efuse, name), value, "{name}");
         }
         let listed: Vec<u32> = expected
             .iter()
@@ -182,7 +184,7 @@ mod tests {
             .filter(|o| !listed.contains(o))
         {
             assert_eq!(
-                efuse.read(offset),
+                efuse.read(ctx, offset),
                 Some(0),
                 "{offset:#x}: keys, user data and error flags are blank"
             );
@@ -191,21 +193,22 @@ mod tests {
 
     #[test]
     fn the_fields_the_boot_chain_decodes_have_the_values_it_needs() {
+        let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::V0_3);
         assert_eq!(
-            revision(&mut efuse),
+            revision(ctx, &mut efuse),
             (0, 3),
             "chip revision v0.3: the image headers require at least v0.3"
         );
-        let sys3 = word(&mut efuse, "RD_MAC_SPI_SYS_3");
-        let part1_4 = word(&mut efuse, "RD_SYS_PART1_DATA4");
+        let sys3 = word(ctx, &mut efuse, "RD_MAC_SPI_SYS_3");
+        let part1_4 = word(ctx, &mut efuse, "RD_SYS_PART1_DATA4");
         assert_eq!(
             (part1_4 & 3, (sys3 >> 24) & 7),
             (1, 2),
             "eFuse block revision v1.2"
         );
-        let mac_low = word(&mut efuse, "RD_MAC_SPI_SYS_0").to_be_bytes();
-        let mac_high = word(&mut efuse, "RD_MAC_SPI_SYS_1").to_be_bytes();
+        let mac_low = word(ctx, &mut efuse, "RD_MAC_SPI_SYS_0").to_be_bytes();
+        let mac_high = word(ctx, &mut efuse, "RD_MAC_SPI_SYS_1").to_be_bytes();
         assert_eq!(
             [
                 mac_high[2],
@@ -219,12 +222,12 @@ mod tests {
         );
         // What the ROM decides on (FB §C rows 2 to 4): default SPI pads, no secure boot, no flash
         // power-up delay, no forced resume, direct boot not disabled.
-        assert_eq!(word(&mut efuse, "RD_MAC_SPI_SYS_1") >> 16, 0);
-        assert_eq!(word(&mut efuse, "RD_MAC_SPI_SYS_2"), 0);
-        let data2 = word(&mut efuse, "RD_REPEAT_DATA2");
+        assert_eq!(word(ctx, &mut efuse, "RD_MAC_SPI_SYS_1") >> 16, 0);
+        assert_eq!(word(ctx, &mut efuse, "RD_MAC_SPI_SYS_2"), 0);
+        let data2 = word(ctx, &mut efuse, "RD_REPEAT_DATA2");
         assert_eq!((data2 >> 20) & 1, 0, "SECURE_BOOT_EN");
         assert_eq!(data2 >> 28, 0, "FLASH_TPUW");
-        let data3 = word(&mut efuse, "RD_REPEAT_DATA3");
+        let data3 = word(ctx, &mut efuse, "RD_REPEAT_DATA3");
         assert_eq!(
             data3 & ((1 << 13) | (1 << 1)),
             0,
@@ -232,7 +235,7 @@ mod tests {
         );
         assert_eq!(data3 >> 31, 1, "ERR_RST_ENABLE (BA §11)");
         assert_eq!(
-            (word(&mut efuse, "RD_REPEAT_DATA1") >> 16) & 3,
+            (word(ctx, &mut efuse, "RD_REPEAT_DATA1") >> 16) & 3,
             0,
             "WDT_DELAY_SEL"
         );
@@ -240,21 +243,22 @@ mod tests {
 
     #[test]
     fn the_profile_revision_replaces_the_wafer_version_and_nothing_else() {
+        let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::new(1, 9).unwrap());
-        assert_eq!(revision(&mut efuse), (1, 9));
+        assert_eq!(revision(ctx, &mut efuse), (1, 9));
         let untouched_3 = !(0x7 << 18);
         let untouched_5 = !((0x3 << 24) | (1 << 23));
         assert_eq!(
-            word(&mut efuse, "RD_MAC_SPI_SYS_3") & untouched_3,
+            word(ctx, &mut efuse, "RD_MAC_SPI_SYS_3") & untouched_3,
             0x020C_0000 & untouched_3
         );
         assert_eq!(
-            word(&mut efuse, "RD_MAC_SPI_SYS_5") & untouched_5,
+            word(ctx, &mut efuse, "RD_MAC_SPI_SYS_5") & untouched_5,
             0x0047_D2F2 & untouched_5
         );
         let mut v0_0 = Efuse::new(ChipRevision::new(0, 0).unwrap());
         assert_eq!(
-            revision(&mut v0_0),
+            revision(ctx, &mut v0_0),
             (0, 0),
             "the rev0 ROM tests boot a v0.0 chip"
         );
@@ -262,12 +266,13 @@ mod tests {
 
     #[test]
     fn reserved_holes_between_documented_registers_are_unmodeled() {
+        let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::V0_3);
-        assert_eq!(efuse.read(0x18C), None, "hole");
-        assert_eq!(efuse.read(0x194), None, "hole");
+        assert_eq!(efuse.read(ctx, 0x18C), None, "hole");
+        assert_eq!(efuse.read(ctx, 0x194), None, "hole");
         let answered = (0x2C..=0x1C4)
             .step_by(4)
-            .filter(|&o| efuse.read(o).is_some())
+            .filter(|&o| efuse.read(ctx, o).is_some())
             .count();
         assert_eq!(
             answered,
@@ -282,10 +287,11 @@ mod tests {
 
     #[test]
     fn programming_registers_and_writes_are_not_modelled() {
+        let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::V0_3);
-        assert_eq!(efuse.read(0x00), None, "PGM_DATA0");
-        assert_eq!(efuse.read(0x1C8), None, "CLK");
-        assert_eq!(efuse.read(0x1D4), None, "CMD");
-        assert!(!efuse.write(0x30, 1), "the read mirror is read-only");
+        assert_eq!(efuse.read(ctx, 0x00), None, "PGM_DATA0");
+        assert_eq!(efuse.read(ctx, 0x1C8), None, "CLK");
+        assert_eq!(efuse.read(ctx, 0x1D4), None, "CMD");
+        assert!(!efuse.write(ctx, 0x30, 1), "the read mirror is read-only");
     }
 }

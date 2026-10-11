@@ -1,5 +1,6 @@
 //! IO MUX block: pad configuration registers.
 use super::{Accepted, IO_MUX_BASE, Storage};
+use crate::ctx::Ctx;
 use emu_core::Peripheral;
 
 /// Every IO MUX register of the SVD is stored (report BC §A.2), one row per run of consecutive
@@ -54,12 +55,12 @@ impl Default for IoMux {
     }
 }
 
-impl Peripheral for IoMux {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for IoMux {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
         self.pads.read(offset)
     }
 
-    fn write(&mut self, offset: u32, value: u32) -> bool {
+    fn write(&mut self, _ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         self.pads.write(offset, value)
     }
 }

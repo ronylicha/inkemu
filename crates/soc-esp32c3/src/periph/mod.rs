@@ -1,6 +1,6 @@
 //! The modelled peripherals of the ESP32-C3 and their place in the address space.
 use crate::config::SocConfig;
-use crate::diag::Unsupported;
+use crate::ctx::Ctx;
 use crate::flash::FlashDevice;
 use emu_core::Peripheral;
 
@@ -184,12 +184,12 @@ impl AcceptedBlock {
     }
 }
 
-impl Peripheral for AcceptedBlock {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for AcceptedBlock {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
         self.registers.read(offset)
     }
 
-    fn write(&mut self, offset: u32, value: u32) -> bool {
+    fn write(&mut self, _ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         self.registers.write(offset, value)
     }
 }
@@ -396,7 +396,7 @@ impl Peripherals {
     }
 
     /// The device that owns the register at `addr`, with its base address.
-    pub(crate) fn device(&mut self, addr: u32) -> Option<(&mut dyn Peripheral, u32)> {
+    pub(crate) fn device(&mut self, addr: u32) -> Option<(&mut dyn Peripheral<Ctx>, u32)> {
         let within = |block: (u32, u32)| (block.0..block.1).contains(&addr);
         if within(GPIO) {
             Some((&mut self.gpio, GPIO_BASE))
@@ -444,20 +444,12 @@ impl Peripherals {
             None
         }
     }
-
-    /// The oldest thing a device was asked to do and cannot do faithfully, not taken yet: call until
-    /// `None` to get all of them, in order.
-    pub(crate) fn take_unsupported(&mut self) -> Option<Unsupported> {
-        self.spi1
-            .take_unsupported()
-            .or_else(|| self.sha.take_unsupported())
-            .or_else(|| self.rtc_cntl.take_unsupported())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diag::Unsupported;
 
     #[test]
     fn storage_starts_at_the_svd_reset_values_and_only_answers_its_own_registers() {
@@ -520,16 +512,17 @@ mod tests {
             "SRAM0 given to the cache",
             "SP8",
         )];
+        let ctx = &mut Ctx::default();
         let mut block = AcceptedBlock::new(BASE, &LIST);
-        assert_eq!(block.read(USAGE_1), Some(0xF), "CM §2.1");
-        assert!(block.write(USAGE_1, 0xE));
-        assert_eq!(block.read(USAGE_1), Some(0xE));
+        assert_eq!(block.read(ctx, USAGE_1), Some(0xF), "CM §2.1");
+        assert!(block.write(ctx, USAGE_1, 0xE));
+        assert_eq!(block.read(ctx, USAGE_1), Some(0xE));
         assert_eq!(
-            block.read(USAGE_1 + 4),
+            block.read(ctx, USAGE_1 + 4),
             None,
             "the next register is not in the list"
         );
-        assert!(!block.write(USAGE_1 + 4, 0));
+        assert!(!block.write(ctx, USAGE_1 + 4, 0));
     }
 
     #[test]
@@ -583,6 +576,7 @@ mod tests {
     /// a register the real device tree routes and accepts a write to, without reporting anything.
     #[test]
     fn every_row_of_the_table_is_routed_to_a_model_that_accepts_a_write_there() {
+        let ctx = &mut Ctx::default();
         let mut p = peripherals();
         let rows = accepted_without_effect();
         assert_ne!(rows, Vec::new(), "the table is not empty");
@@ -596,9 +590,9 @@ mod tests {
                 let (device, base) = p
                     .device(addr)
                     .unwrap_or_else(|| panic!("{name} is routed to no model"));
-                assert!(device.write(addr - base, 0), "{name} refuses a write");
+                assert!(device.write(ctx, addr - base, 0), "{name} refuses a write");
                 assert_eq!(
-                    p.take_unsupported(),
+                    ctx.take_unsupported(),
                     None,
                     "{name}: accepted means nothing is reported"
                 );
@@ -643,6 +637,7 @@ mod tests {
 
     #[test]
     fn the_sha_block_is_routed_and_its_refusals_reach_the_relay() {
+        let ctx = &mut Ctx::default();
         let mut p = Peripherals::new(
             &SocConfig::default(),
             Box::new(crate::flash::NorFlash::blank(
@@ -652,14 +647,15 @@ mod tests {
         let dma_start = svd_regs::esp32c3::addr("SHA", "DMA_START");
         let (device, base) = p.device(dma_start).expect("SHA is routed");
         assert_eq!(base, SHA_BASE);
-        assert!(device.write(dma_start - base, 1));
-        assert_eq!(p.take_unsupported(), Some(Unsupported::ShaDma));
-        assert_eq!(p.take_unsupported(), None);
+        assert!(device.write(ctx, dma_start - base, 1));
+        assert_eq!(ctx.take_unsupported(), Some(Unsupported::ShaDma));
+        assert_eq!(ctx.take_unsupported(), None);
         assert!(p.device(SHA.1).is_none(), "the page after SHA is not SHA");
     }
 
     #[test]
     fn storage_only_blocks_answer_exactly_their_listed_registers() {
+        let ctx = &mut Ctx::default();
         let mut p = Peripherals::new(
             &SocConfig::default(),
             Box::new(crate::flash::NorFlash::blank(
@@ -668,7 +664,7 @@ mod tests {
         );
         let mut read = |addr: u32| {
             p.device(addr)
-                .and_then(|(device, base)| device.read(addr - base))
+                .and_then(|(device, base)| device.read(ctx, addr - base))
         };
         let svd = svd_regs::esp32c3::addr;
         assert_eq!(
@@ -708,6 +704,7 @@ mod tests {
 
     #[test]
     fn storage_only_blocks_read_back_what_was_written_through_the_device_tree() {
+        let ctx = &mut Ctx::default();
         let mut p = peripherals();
         let svd = svd_regs::esp32c3::addr;
         for (addr, value) in [
@@ -718,14 +715,15 @@ mod tests {
             (svd("SENSITIVE", "INTERNAL_SRAM_USAGE_1"), 0xE),
         ] {
             let (device, base) = p.device(addr).expect("routed");
-            assert!(device.write(addr - base, value), "{addr:#010x}");
-            assert_eq!(device.read(addr - base), Some(value), "{addr:#010x}");
+            assert!(device.write(ctx, addr - base, value), "{addr:#010x}");
+            assert_eq!(device.read(ctx, addr - base), Some(value), "{addr:#010x}");
         }
-        assert_eq!(p.take_unsupported(), None);
+        assert_eq!(ctx.take_unsupported(), None);
     }
 
     #[test]
     fn a_software_reset_request_reaches_the_relay() {
+        let ctx = &mut Ctx::default();
         let mut p = Peripherals::new(
             &SocConfig::default(),
             Box::new(crate::flash::NorFlash::blank(
@@ -734,17 +732,17 @@ mod tests {
         );
         let options0 = svd_regs::esp32c3::addr("RTC_CNTL", "OPTIONS0");
         let (device, base) = p.device(options0).expect("RTC_CNTL is routed");
-        assert!(device.write(options0 - base, 1 << 31));
-        assert!(device.write(options0 - base, 1 << 5));
+        assert!(device.write(ctx, options0 - base, 1 << 31));
+        assert!(device.write(ctx, options0 - base, 1 << 5));
         assert_eq!(
-            p.take_unsupported(),
+            ctx.take_unsupported(),
             Some(Unsupported::SoftwareReset { options0: 1 << 31 })
         );
         assert_eq!(
-            p.take_unsupported(),
+            ctx.take_unsupported(),
             Some(Unsupported::SoftwareReset { options0: 1 << 5 })
         );
-        assert_eq!(p.take_unsupported(), None);
+        assert_eq!(ctx.take_unsupported(), None);
     }
 
     #[test]

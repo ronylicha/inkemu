@@ -1,6 +1,7 @@
 //! The ESP32-C3 address space. Memory map: `docs/research/esp32c3-boot-chain.md`, §A.1.
 use crate::config::SocConfig;
-use crate::diag::{Diagnostic, Diagnostics, Direction, MappingFault};
+use crate::ctx::Ctx;
+use crate::diag::{Diagnostic, Direction, MappingFault};
 use crate::flash::FlashDevice;
 use crate::memmap::{
     DROM_BASE, DROM_ROM_OFFSET, DROM_SIZE, FLASH_DBUS_BASE, FLASH_IBUS_BASE, FLASH_WINDOW_SIZE,
@@ -20,12 +21,11 @@ pub struct SocBus {
     sram: Ram,
     sram0: Ram,
     rtc: Ram,
-    /// Reached from outside the crate only through the bus: a direct write would bypass the relay
-    /// of what a device refuses, and so the diagnostics.
+    /// Reached from outside the crate only through the bus: a direct write would bypass the
+    /// diagnostics the bus records for an unmodelled or sub-word access.
     pub(crate) periph: Peripherals,
-    pub(crate) diag: Diagnostics,
-    /// PC of the instruction being executed, for diagnostics.
-    pc: u32,
+    /// The context handed to every peripheral access; it holds the diagnostics of the run.
+    pub(crate) ctx: Ctx,
 }
 
 #[derive(Clone, Copy)]
@@ -107,14 +107,13 @@ impl SocBus {
             sram0: Ram::new(SRAM0_BASE, SRAM0_SIZE as usize),
             rtc: Ram::new(RTC_RAM_BASE, RTC_RAM_SIZE as usize),
             periph: Peripherals::new(config, flash),
-            diag: Diagnostics::new(config.strict_mmio),
-            pc: 0,
+            ctx: Ctx::new(config.strict_mmio),
         }
     }
 
     /// Tells the bus which instruction is running, so diagnostics can name it.
     pub fn set_pc(&mut self, pc: u32) {
-        self.pc = pc;
+        self.ctx.set_pc(pc);
     }
 
     fn rom_read(&self, offset: u32, size: AccessSize) -> u32 {
@@ -130,10 +129,10 @@ impl SocBus {
     fn unmodeled(&mut self, reg_addr: u32, direction: Direction, written: u32) -> u32 {
         let info = svd_regs::esp32c3::lookup(reg_addr);
         let reset = info.map_or(0, |r| r.reset_value);
-        self.diag.record(Diagnostic::UnmodeledMmio {
+        self.ctx.diag.record(Diagnostic::UnmodeledMmio {
             addr: reg_addr,
             direction,
-            pc: self.pc,
+            pc: self.ctx.pc(),
             register: info.map(|r| (r.peripheral, r.name)),
             value: if direction == Direction::Read {
                 reset
@@ -191,12 +190,12 @@ impl SocBus {
                 Err(unbacked) => {
                     // The fault registers and the diagnostic name the address of the access.
                     self.periph.extmem.latch_mmu_fault(vaddr, unbacked.content);
-                    self.diag.record(Diagnostic::FlashMapping {
+                    self.ctx.diag.record(Diagnostic::FlashMapping {
                         vaddr,
                         entry: unbacked.entry,
                         content: unbacked.content,
                         fault: unbacked.fault,
-                        pc: self.pc,
+                        pc: self.ctx.pc(),
                     });
                     reported = Some(unbacked);
                 }
@@ -208,14 +207,6 @@ impl SocBus {
         }
     }
 
-    /// Turns everything a device could not do into diagnostics that name the instruction.
-    fn relay_unsupported(&mut self) {
-        while let Some(what) = self.periph.take_unsupported() {
-            self.diag
-                .record(Diagnostic::Unsupported { what, pc: self.pc });
-        }
-    }
-
     fn mmio_read(&mut self, addr: u32, size: AccessSize) -> Result<ReadOutcome, BusError> {
         if !addr.is_multiple_of(size.bytes()) {
             return Err(BusError::Misaligned { addr, size });
@@ -224,8 +215,7 @@ impl SocBus {
         let modelled = self
             .periph
             .device(reg_addr)
-            .and_then(|(device, base)| device.read(reg_addr - base));
-        self.relay_unsupported();
+            .and_then(|(device, base)| device.read(&mut self.ctx, reg_addr - base));
         let word = match modelled {
             Some(word) => word,
             None => self.unmodeled(reg_addr, Direction::Read, 0),
@@ -244,17 +234,16 @@ impl SocBus {
         let reg_addr = addr & !(REGISTER_BYTES - 1);
         let word = (value & size_mask(size)) << (8 * (addr - reg_addr));
         if size != AccessSize::Word {
-            self.diag.record(Diagnostic::SubWordWrite {
+            self.ctx.diag.record(Diagnostic::SubWordWrite {
                 addr,
                 bytes: size.bytes(),
-                pc: self.pc,
+                pc: self.ctx.pc(),
             });
         }
         let handled = self
             .periph
             .device(reg_addr)
-            .is_some_and(|(device, base)| device.write(reg_addr - base, word));
-        self.relay_unsupported();
+            .is_some_and(|(device, base)| device.write(&mut self.ctx, reg_addr - base, word));
         if !handled {
             self.unmodeled(reg_addr, Direction::Write, word);
         }
@@ -513,7 +502,7 @@ mod tests {
         );
         b.write(0x6000_9054, Word, 0x1234).unwrap(); // IO_MUX.GPIO20
         assert_eq!(load(&mut b, 0x6000_9054), 0x1234);
-        assert_eq!(b.diag.drain(), []);
+        assert_eq!(b.ctx.diag.drain(), []);
     }
 
     #[test]
@@ -524,7 +513,7 @@ mod tests {
         for _ in 0..1000 {
             assert_eq!(load(&mut b, reg.addr), reg.reset_value);
         }
-        let listed = b.diag.drain();
+        let listed = b.ctx.diag.drain();
         assert_eq!(
             listed,
             [Diagnostic::UnmodeledMmio {
@@ -536,7 +525,7 @@ mod tests {
                 reset_explicit: true,
             }]
         );
-        assert_eq!(b.diag.occurrences(&listed[0]), 1000);
+        assert_eq!(b.ctx.diag.occurrences(&listed[0]), 1000);
     }
 
     #[test]
@@ -550,7 +539,7 @@ mod tests {
             "the write did not stick"
         );
         assert_eq!(
-            b.diag.drain().len(),
+            b.ctx.diag.drain().len(),
             2,
             "one diagnostic for the write, one for the read"
         );
@@ -561,7 +550,7 @@ mod tests {
         let mut b = bus();
         assert_eq!(load(&mut b, 0x600C_5200), 0); // right after the MMU table: nothing is documented there
         assert!(matches!(
-            b.diag.drain()[..],
+            b.ctx.diag.drain()[..],
             [Diagnostic::UnmodeledMmio {
                 register: None,
                 value: 0,
@@ -591,7 +580,7 @@ mod tests {
             "the whole register is written, other bytes as zero"
         );
         assert_eq!(
-            b.diag.drain(),
+            b.ctx.diag.drain(),
             [Diagnostic::SubWordWrite {
                 addr: 0x6000_9055,
                 bytes: 1,
@@ -627,7 +616,7 @@ mod tests {
         });
         let _ = load(&mut b, unmodeled().addr);
         assert!(matches!(
-            b.diag.take_violation(),
+            b.ctx.diag.take_violation(),
             Some(Diagnostic::UnmodeledMmio { .. })
         ));
     }
@@ -640,7 +629,7 @@ mod tests {
         });
         b.write(unmodeled().addr, Word, 1).unwrap();
         assert!(matches!(
-            b.diag.take_violation(),
+            b.ctx.diag.take_violation(),
             Some(Diagnostic::UnmodeledMmio {
                 direction: Direction::Write,
                 ..
@@ -668,14 +657,14 @@ mod tests {
             0,
             "ASSIST_DEBUG.CORE_0_RCD_PDEBUGPC"
         );
-        assert_eq!(b.diag.drain(), []);
+        assert_eq!(b.ctx.diag.drain(), []);
     }
 
     #[test]
     fn efuse_reserved_hole_is_reported_as_unmodeled() {
         let mut b = bus();
         assert_eq!(load(&mut b, 0x6000_8800 + 0x194), 0);
-        let reported = b.diag.drain();
+        let reported = b.ctx.diag.drain();
         assert!(
             matches!(
                 reported[..],
@@ -703,8 +692,8 @@ mod tests {
             what: crate::diag::Unsupported::FlashCommand { opcode: 0x20 },
             pc: 0x4038_0010,
         };
-        assert_eq!(b.diag.drain(), vec![expected.clone()]);
-        assert_eq!(b.diag.take_violation(), Some(expected));
+        assert_eq!(b.ctx.diag.drain(), vec![expected.clone()]);
+        assert_eq!(b.ctx.diag.take_violation(), Some(expected));
         assert_eq!(load(&mut b, cmd), 0);
     }
 
@@ -721,8 +710,8 @@ mod tests {
             what: crate::diag::Unsupported::FlashCommand { opcode },
             pc: 0x4038_0020,
         };
-        assert_eq!(b.diag.drain(), vec![refused(0x02), refused(0x20)]);
-        assert_eq!(b.diag.take_violation(), Some(refused(0x02)));
+        assert_eq!(b.ctx.diag.drain(), vec![refused(0x02), refused(0x20)]);
+        assert_eq!(b.ctx.diag.take_violation(), Some(refused(0x02)));
     }
 
     #[test]
@@ -734,7 +723,7 @@ mod tests {
         b.write(0x6001_0010, Word, 1).unwrap(); // UART1.INT_CLR, written by the ROM's uartAttach
         assert_eq!(b.periph.uart0.take_tx(), b"U");
         assert_eq!(b.periph.usb_serial_jtag.take_tx(), b"J");
-        assert_eq!(b.diag.drain(), []);
+        assert_eq!(b.ctx.diag.drain(), []);
     }
 
     /// A bus whose flash holds 0x11 at offset 0, then `page << 4 | n` patterns at the start of pages 1 and 2.
@@ -775,7 +764,7 @@ mod tests {
                 .value,
             0x4F
         );
-        assert_eq!(b.diag.drain(), Vec::new());
+        assert_eq!(b.ctx.diag.drain(), Vec::new());
     }
 
     #[test]
@@ -815,8 +804,8 @@ mod tests {
             fault: crate::diag::MappingFault::InvalidEntry,
             pc: 0x4004_a186,
         };
-        assert_eq!(b.diag.drain(), vec![expected.clone()]);
-        assert_eq!(b.diag.take_violation(), Some(expected));
+        assert_eq!(b.ctx.diag.drain(), vec![expected.clone()]);
+        assert_eq!(b.ctx.diag.take_violation(), Some(expected));
         let st = svd_regs::esp32c3::addr("EXTMEM", "CACHE_ILG_INT_ST");
         assert_eq!(load(&mut b, st), 1 << 5);
         assert_eq!(
@@ -842,11 +831,11 @@ mod tests {
             let mut b = bus_with_flash(SocConfig::default());
             let vaddr = FLASH_DBUS_BASE + 0x5_0010;
             assert_eq!(b.read(vaddr, size, Load).unwrap().value, 0);
-            let listed = b.diag.drain();
+            let listed = b.ctx.diag.drain();
             assert_eq!(listed.len(), 1, "{bytes}-byte load: {listed:?}");
-            assert_eq!(b.diag.occurrences(&listed[0]), 1, "{bytes}-byte load");
+            assert_eq!(b.ctx.diag.occurrences(&listed[0]), 1, "{bytes}-byte load");
             assert_eq!(b.read(vaddr, size, Load).unwrap().value, 0);
-            assert_eq!(b.diag.occurrences(&listed[0]), 2, "the second access");
+            assert_eq!(b.ctx.diag.occurrences(&listed[0]), 2, "the second access");
         }
     }
 
@@ -863,15 +852,15 @@ mod tests {
             fault: MappingFault::InvalidEntry,
             pc: 0x4038_0040,
         };
-        assert_eq!(b.diag.drain(), vec![fault(5), fault(6)]);
-        assert_eq!(b.diag.occurrences(&fault(5)), 1);
-        assert_eq!(b.diag.occurrences(&fault(6)), 1);
+        assert_eq!(b.ctx.diag.drain(), vec![fault(5), fault(6)]);
+        assert_eq!(b.ctx.diag.occurrences(&fault(5)), 1);
+        assert_eq!(b.ctx.diag.occurrences(&fault(6)), 1);
         // One valid half, one faulting half: the valid bytes are read, the fault is one occurrence.
         map(&mut b, 5, 1); // window page 5 -> flash page 1, which ends with A0 A1 A2 A3
         assert_eq!(load(&mut b, vaddr), 0x0000_A3A2);
-        assert_eq!(b.diag.drain(), Vec::new(), "entry 6 is already listed");
-        assert_eq!(b.diag.occurrences(&fault(5)), 1);
-        assert_eq!(b.diag.occurrences(&fault(6)), 2);
+        assert_eq!(b.ctx.diag.drain(), Vec::new(), "entry 6 is already listed");
+        assert_eq!(b.ctx.diag.occurrences(&fault(5)), 1);
+        assert_eq!(b.ctx.diag.occurrences(&fault(6)), 2);
     }
 
     #[test]
@@ -894,7 +883,7 @@ mod tests {
         map(&mut b, 0, 0x10); // 1 MiB: the first page past a 1 MiB chip
         assert_eq!(load(&mut b, FLASH_DBUS_BASE), 0);
         assert!(matches!(
-            b.diag.drain().as_slice(),
+            b.ctx.diag.drain().as_slice(),
             [Diagnostic::FlashMapping {
                 entry: 0,
                 content: 0x10,
@@ -947,7 +936,7 @@ mod tests {
             }),
             "a fetch that runs past the window"
         );
-        assert_eq!(b.diag.drain(), Vec::new());
+        assert_eq!(b.ctx.diag.drain(), Vec::new());
     }
 
     #[test]

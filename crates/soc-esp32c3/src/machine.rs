@@ -104,7 +104,7 @@ impl Esp32C3 {
                 StepOutcome::Waiting => return StopReason::Idle,
                 // An `ecall` is a request to the trap handler, not a fault worth reporting.
                 StepOutcome::Trapped { trap, .. } if trap.cause != Exception::EcallM => {
-                    self.bus.diag.record(Diagnostic::Exception {
+                    self.bus.ctx.diag.record(Diagnostic::Exception {
                         cause: trap.cause,
                         tval: trap.tval,
                         pc,
@@ -118,7 +118,7 @@ impl Esp32C3 {
             if let Some(trace) = &mut self.trace {
                 trace.mix_u32(pc);
             }
-            if let Some(violation) = self.bus.diag.take_violation() {
+            if let Some(violation) = self.bus.ctx.diag.take_violation() {
                 return StopReason::StrictMmio(violation);
             }
         }
@@ -132,7 +132,7 @@ impl Esp32C3 {
         match clock::cpu_frequency(sysclk_conf, cpu_per_conf) {
             Some(frequency) => self.clock.set_frequency(self.hart.cycles, frequency),
             // Decision D22: the previous frequency stays, and the selection is reported.
-            None => self.bus.diag.record(Diagnostic::Unsupported {
+            None => self.bus.ctx.diag.record(Diagnostic::Unsupported {
                 what: Unsupported::ClockSource {
                     sysclk_conf,
                     cpu_per_conf,
@@ -182,21 +182,21 @@ impl Esp32C3 {
 
     /// Diagnostics seen for the first time since the last call.
     pub fn drain_diagnostics(&mut self) -> Vec<Diagnostic> {
-        self.bus.diag.drain()
+        self.bus.ctx.diag.drain()
     }
 
     /// At most `limit` diagnostics that occurred more than once, the most frequent first, with their
     /// number of occurrences: what the firmware keeps doing, such as polling one register.
     #[must_use]
     pub fn most_repeated_diagnostics(&self, limit: usize) -> Vec<(Diagnostic, u64)> {
-        self.bus.diag.most_repeated(limit)
+        self.bus.ctx.diag.most_repeated(limit)
     }
 
     /// Occurrences dropped because more than [`MAX_DISTINCT_DIAGNOSTICS`](crate::diag::MAX_DISTINCT_DIAGNOSTICS) distinct diagnostics were
     /// known: they are counted but never listed.
     #[must_use]
     pub const fn suppressed_diagnostics(&self) -> u64 {
-        self.bus.diag.suppressed()
+        self.bus.ctx.diag.suppressed()
     }
 
     /// The model that prices each instruction, so a front end can say whether timing is calibrated.

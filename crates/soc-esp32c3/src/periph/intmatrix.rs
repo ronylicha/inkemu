@@ -3,6 +3,7 @@
 //! This plan keeps the configuration the software writes; no source is modelled yet, so nothing is
 //! ever pending. Delivery to the CPU arrives in SP1b-3.
 use super::Accepted;
+use crate::ctx::Ctx;
 use emu_core::Peripheral;
 
 /// `<SRC>_MAP` registers: `UART_INTR_MAP` ... `CACHE_CORE0_ACS_INT_MAP` @0xF4 (report §B.3).
@@ -85,8 +86,8 @@ impl Default for IntMatrix {
     }
 }
 
-impl Peripheral for IntMatrix {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for IntMatrix {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
         if let Some(source) = index_in(offset, 0, SOURCE_COUNT) {
             return Some(self.map[source]);
         }
@@ -104,7 +105,7 @@ impl Peripheral for IntMatrix {
         })
     }
 
-    fn write(&mut self, offset: u32, value: u32) -> bool {
+    fn write(&mut self, _ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         if let Some(source) = index_in(offset, 0, SOURCE_COUNT) {
             self.map[source] = value & MAP_MASK;
             return true;
@@ -133,47 +134,63 @@ mod tests {
 
     #[test]
     fn reset_state_gates_the_clock_on_and_routes_nothing() {
+        let ctx = &mut Ctx::default();
         let mut m = IntMatrix::new();
-        assert_eq!(m.read(0x100), Some(1), "CLOCK_GATE");
+        assert_eq!(m.read(ctx, 0x100), Some(1), "CLOCK_GATE");
         for offset in [0x54, 0x104, 0x108, 0x114, 0x128, 0x194] {
-            assert_eq!(m.read(offset), Some(0), "{offset:#x}");
+            assert_eq!(m.read(ctx, offset), Some(0), "{offset:#x}");
         }
     }
 
     #[test]
     fn rom_setup_sequence_is_remembered() {
+        let ctx = &mut Ctx::default();
         let mut m = IntMatrix::new();
-        assert!(m.write(0x54, 5)); // UART_INTR_MAP = CPU line 5
-        assert!(m.write(0x128, 1)); // CPU_INT_PRI_5
-        assert!(m.write(0x194, 1)); // CPU_INT_THRESH
-        assert!(m.write(0x104, 1 << 5)); // CPU_INT_ENABLE
+        assert!(m.write(ctx, 0x54, 5)); // UART_INTR_MAP = CPU line 5
+        assert!(m.write(ctx, 0x128, 1)); // CPU_INT_PRI_5
+        assert!(m.write(ctx, 0x194, 1)); // CPU_INT_THRESH
+        assert!(m.write(ctx, 0x104, 1 << 5)); // CPU_INT_ENABLE
         assert_eq!(
-            (m.read(0x54), m.read(0x128), m.read(0x194), m.read(0x104)),
+            (
+                m.read(ctx, 0x54),
+                m.read(ctx, 0x128),
+                m.read(ctx, 0x194),
+                m.read(ctx, 0x104)
+            ),
             (Some(5), Some(1), Some(1), Some(1 << 5))
         );
     }
 
     #[test]
     fn fields_keep_only_their_defined_bits() {
+        let ctx = &mut Ctx::default();
         let mut m = IntMatrix::new();
-        m.write(0xF4, 0xFFFF_FFFF); // last source map
-        m.write(0x114 + 4 * 31, 0xFFFF_FFFF); // CPU_INT_PRI_31
-        m.write(0x194, 0xFFFF_FFFF);
+        m.write(ctx, 0xF4, 0xFFFF_FFFF); // last source map
+        m.write(ctx, 0x114 + 4 * 31, 0xFFFF_FFFF); // CPU_INT_PRI_31
+        m.write(ctx, 0x194, 0xFFFF_FFFF);
         assert_eq!(
-            (m.read(0xF4), m.read(0x114 + 4 * 31), m.read(0x194)),
+            (
+                m.read(ctx, 0xF4),
+                m.read(ctx, 0x114 + 4 * 31),
+                m.read(ctx, 0x194)
+            ),
             (Some(0x1F), Some(0xF), Some(0xF))
         );
     }
 
     #[test]
     fn status_registers_read_zero_while_no_source_exists_and_the_rest_is_unmodeled() {
+        let ctx = &mut Ctx::default();
         let mut m = IntMatrix::new();
         assert_eq!(
-            (m.read(0xF8), m.read(0xFC), m.read(0x110)),
+            (m.read(ctx, 0xF8), m.read(ctx, 0xFC), m.read(ctx, 0x110)),
             (Some(0), Some(0), Some(0))
         );
-        assert!(m.write(0x10C, 0xFFFF_FFFF), "CPU_INT_CLEAR accepts a write");
-        assert_eq!(m.read(0x7FC), None, "INTERRUPT_DATE is not modelled");
-        assert!(!m.write(0xF8, 1), "status registers are read-only");
+        assert!(
+            m.write(ctx, 0x10C, 0xFFFF_FFFF),
+            "CPU_INT_CLEAR accepts a write"
+        );
+        assert_eq!(m.read(ctx, 0x7FC), None, "INTERRUPT_DATE is not modelled");
+        assert!(!m.write(ctx, 0xF8, 1), "status registers are read-only");
     }
 }

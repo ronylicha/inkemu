@@ -1,5 +1,6 @@
 //! The flash MMU table: 128 entries that map 64 KiB pages of the two flash windows to flash pages.
 //! Source: report CM §1 (ESP-IDF `ext_mem_defs.h`, `mmu_ll.h`; ROM `Cache_MMU_Init`).
+use crate::ctx::Ctx;
 use emu_core::Peripheral;
 
 /// `DR_REG_MMU_TABLE` (ESP-IDF `reg_base.h`). The SVD does not describe this block (decision D17).
@@ -84,12 +85,12 @@ impl Default for MmuTable {
     }
 }
 
-impl Peripheral for MmuTable {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for MmuTable {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
         Self::index(offset).and_then(|index| self.entry(index))
     }
 
-    fn write(&mut self, offset: u32, value: u32) -> bool {
+    fn write(&mut self, _ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         let Some(slot) = Self::index(offset).and_then(|index| self.entries.get_mut(index)) else {
             return false;
         };
@@ -106,12 +107,17 @@ mod tests {
 
     #[test]
     fn every_entry_starts_invalid() {
+        let ctx = &mut Ctx::default();
         let mut mmu = MmuTable::new();
         for offset in (0..0x200).step_by(4) {
-            assert_eq!(mmu.read(offset), Some(0x100), "{offset:#x}");
+            assert_eq!(mmu.read(ctx, offset), Some(0x100), "{offset:#x}");
         }
-        assert_eq!(mmu.read(0x200), None, "128 entries, 0x200 bytes (CM §1)");
-        assert!(!mmu.write(0x200, 0));
+        assert_eq!(
+            mmu.read(ctx, 0x200),
+            None,
+            "128 entries, 0x200 bytes (CM §1)"
+        );
+        assert!(!mmu.write(ctx, 0x200, 0));
         assert_eq!(
             mmu.translate(0),
             Err(MmuMiss {
@@ -123,10 +129,11 @@ mod tests {
 
     #[test]
     fn an_entry_keeps_nine_bits_and_reads_back() {
+        let ctx = &mut Ctx::default();
         let mut mmu = MmuTable::new();
-        assert!(mmu.write(4 * 85, 0xFFFF_FFFF));
+        assert!(mmu.write(ctx, 4 * 85, 0xFFFF_FFFF));
         assert_eq!(
-            mmu.read(4 * 85),
+            mmu.read(ctx, 4 * 85),
             Some(0x1FF),
             "CM §1: 0x1FF kept after writing 0xFFFFFFFF"
         );
@@ -137,8 +144,9 @@ mod tests {
     #[test]
     fn translation_uses_the_page_number_and_keeps_the_offset_in_the_page() {
         // CM §1: entry_id = (vaddr & 0x7FFFFF) >> 16; paddr = (entry & 0xFF) << 16 | (vaddr & 0xFFFF).
+        let ctx = &mut Ctx::default();
         let mut mmu = MmuTable::new();
-        mmu.write(4 * 3, 1);
+        mmu.write(ctx, 4 * 3, 1);
         assert_eq!(mmu.translate(0x03_0000), Ok(0x1_0000));
         assert_eq!(mmu.translate(0x03_FFFF), Ok(0x1_FFFF));
         assert_eq!(
@@ -148,7 +156,7 @@ mod tests {
                 content: 0x100
             })
         );
-        mmu.write(4 * 127, 0x35);
+        mmu.write(ctx, 4 * 127, 0x35);
         assert_eq!(
             mmu.translate(0x7F_0020),
             Ok(0x35_0020),
@@ -160,9 +168,10 @@ mod tests {
     fn offsets_and_indexes_past_the_table_miss_instead_of_wrapping() {
         /// The last word-aligned register offset a 32-bit address can form.
         const LAST_WORD: u32 = 0xFFFF_FFFC;
+        let ctx = &mut Ctx::default();
         let mut mmu = MmuTable::new();
         for entry in 0..128 {
-            mmu.write(4 * entry, 0); // every entry valid: a hit would be a wrong index
+            mmu.write(ctx, 4 * entry, 0); // every entry valid: a hit would be a wrong index
         }
         assert_eq!(mmu.translate(0x7F_FFFF), Ok(0xFFFF), "the last byte");
         for window_offset in [0x80_0000, 0xFFFF_0000, u32::MAX] {
@@ -178,17 +187,18 @@ mod tests {
         assert_eq!(mmu.entry(127), Some(0));
         assert_eq!(mmu.entry(128), None);
         assert_eq!(mmu.entry(usize::MAX), None);
-        assert_eq!(mmu.read(LAST_WORD), None);
-        assert!(!mmu.write(LAST_WORD, 0));
+        assert_eq!(mmu.read(ctx, LAST_WORD), None);
+        assert!(!mmu.write(ctx, LAST_WORD, 0));
     }
 
     #[test]
     fn every_write_changes_the_generation() {
+        let ctx = &mut Ctx::default();
         let mut mmu = MmuTable::new();
         let first = mmu.generation();
-        mmu.write(0, 0);
+        mmu.write(ctx, 0, 0);
         let second = mmu.generation();
-        mmu.write(0, 0);
+        mmu.write(ctx, 0, 0);
         assert!(
             first != second && second != mmu.generation(),
             "even an identical value: the cost is one re-decode"
