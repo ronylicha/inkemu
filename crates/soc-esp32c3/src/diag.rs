@@ -132,11 +132,15 @@ pub enum Diagnostic {
         fault: MappingFault,
         pc: u32,
     },
+    /// A synchronous exception the CPU took. It is no error of the emulator: the firmware's trap
+    /// handler runs, as on the device.
     Exception {
         cause: Exception,
         tval: u32,
         pc: u32,
-        /// The stack pointer when the instruction started.
+        /// The stack pointer when the instruction started. An exception is listed once per cause
+        /// and PC: when the same instruction faults again with another stack pointer, the entry
+        /// that is shown keeps the stack pointer of the first occurrence.
         sp: u32,
     },
     /// Emitted once when [`MAX_DISTINCT_DIAGNOSTICS`] is reached.
@@ -257,7 +261,7 @@ impl fmt::Display for Diagnostic {
                 sp,
             } => write!(
                 f,
-                "CPU exception {cause:?} at pc {pc:#010x} (tval {tval:#010x}, sp {sp:#010x})"
+                "CPU exception: {cause} at pc {pc:#010x} (tval {tval:#010x}, sp {sp:#010x}); the firmware's trap handler takes it, as on the device"
             ),
             Diagnostic::Suppressed => write!(
                 f,
@@ -759,7 +763,11 @@ mod tests {
         .to_string();
         assert_eq!(
             text,
-            "CPU exception LoadAccessFault at pc 0x42001234 (tval 0x00000010, sp 0x3fc90000)"
+            "CPU exception: load access fault at pc 0x42001234 (tval 0x00000010, sp 0x3fc90000); the firmware's trap handler takes it, as on the device"
+        );
+        assert!(
+            !text.contains("LoadAccessFault"),
+            "words for the user, not the identifier of the code"
         );
     }
 
@@ -774,10 +782,19 @@ mod tests {
                 sp,
             });
         }
-        assert_eq!(
-            d.drain().len(),
-            1,
-            "one line per cause and PC (decision E12)"
+        let listed = d.drain();
+        assert_eq!(listed.len(), 1, "one line per cause and PC (decision E12)");
+        assert!(
+            matches!(
+                listed[0],
+                Diagnostic::Exception {
+                    sp: 0x3FC9_0000,
+                    ..
+                }
+            ),
+            "the entry shown is the first occurrence, with its stack pointer: {:?}",
+            listed[0]
         );
+        assert_eq!(d.occurrences(&listed[0]), 2, "the second one is counted");
     }
 }

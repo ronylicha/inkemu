@@ -29,6 +29,23 @@ impl Exception {
     }
 }
 
+impl std::fmt::Display for Exception {
+    /// The exception in the words of the privileged specification (table "Machine cause
+    /// register values"), for a message a user reads.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Exception::InstrAccessFault => "instruction access fault",
+            Exception::IllegalInstr => "illegal instruction",
+            Exception::Breakpoint => "breakpoint",
+            Exception::LoadMisaligned => "load address misaligned",
+            Exception::LoadAccessFault => "load access fault",
+            Exception::StoreMisaligned => "store address misaligned",
+            Exception::StoreAccessFault => "store access fault",
+            Exception::EcallM => "environment call from machine mode",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Trap {
     pub cause: Exception,
@@ -53,6 +70,27 @@ mod tests {
         ];
         for (exception, code) in codes {
             assert_eq!(exception.code(), code);
+        }
+    }
+
+    #[test]
+    fn an_exception_is_displayed_in_words_not_as_an_identifier() {
+        let names = [
+            (Exception::InstrAccessFault, "instruction access fault"),
+            (Exception::IllegalInstr, "illegal instruction"),
+            (Exception::Breakpoint, "breakpoint"),
+            (Exception::LoadMisaligned, "load address misaligned"),
+            (Exception::LoadAccessFault, "load access fault"),
+            (Exception::StoreMisaligned, "store address misaligned"),
+            (Exception::StoreAccessFault, "store access fault"),
+            (Exception::EcallM, "environment call from machine mode"),
+        ];
+        for (exception, name) in names {
+            assert_eq!(exception.to_string(), name);
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == ' '),
+                "{name}"
+            );
         }
     }
 }
