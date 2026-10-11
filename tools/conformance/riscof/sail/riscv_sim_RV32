@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Adapter between riscv-arch-test 3.x's sail_cSim plugin (written for the pre-0.14 Sail CLI:
+# `riscv_sim_RV32 -i -v --trace=step --pmp-count=N --pmp-grain=N --test-signature=FILE ELF`)
+# and Sail RISC-V >= 0.14, which ships one `sail_riscv_sim` binary configured by flags.
+# The reference is configured as the same machine as the DUT (see inkemu_rv32imc.json).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    -i | -v | --trace=step | --pmp-count=* | --pmp-grain=*) ;; # removed or defaulted in new Sail
+    --test-signature=*) args+=(--test-signature "${arg#*=}") ;;
+    *) args+=("$arg") ;;
+  esac
+done
+exec sail_riscv_sim --rv32 --config-override "$here/inkemu_rv32imc.json" "${args[@]}"

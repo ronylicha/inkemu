@@ -24,3 +24,26 @@ jobs:
         with: { toolchain: "1.99.0", components: "llvm-tools-preview" }
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --workspace --fail-under-lines 80
+  arch-test:
+    # riscv-arch-test through RISCOF against Sail. On PRs it only runs when the core, the CLI that
+    # drives it or the conformance tooling changed; on pushes to main it always runs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Detect relevant changes
+        id: scope
+        run: |
+          run=true
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git diff --name-only "origin/$GITHUB_BASE_REF...HEAD" \
+              | grep -qE '^(crates/cpu-rv32/|crates/emu-cli/|tools/conformance/|tools/docker/riscof/)' || run=false
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      - if: steps.scope.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.99.0" }
+      - if: steps.scope.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+      - if: steps.scope.outputs.run == 'true'
+        run: tools/conformance/run-arch-test.sh
