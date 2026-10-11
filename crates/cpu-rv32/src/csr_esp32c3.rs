@@ -25,6 +25,19 @@ pub const PCER_INSTRUCTIONS: u32 = 1 << 1;
 /// Mode register: global count enable.
 pub const PCMR_ENABLE: u32 = 1 << 0;
 
+/// Physical memory protection: 16 entries (ESP-IDF `SOC_CPU_PMP_REGION_GRANULARITY`, `cpu_region_protect.c`;
+/// report BC §B.2). The registers are stored and the lock bit is honoured; **the protection is not
+/// enforced** (decision D18): enforcement arrives with the application's memory protection in SP1b-3.
+pub const PMPCFG0: u16 = 0x3A0;
+pub const PMPADDR0: u16 = 0x3B0;
+pub const PMP_ENTRIES: usize = 16;
+const PMPCFG_REGISTERS: u16 = 4;
+const ENTRIES_PER_CFG: usize = 4;
+/// `pmpcfg` byte: lock bit, and the address-matching field with its top-of-range value.
+const PMP_LOCK: u8 = 0x80;
+const PMP_MATCH_MASK: u8 = 0x18;
+const PMP_MATCH_TOR: u8 = 0x08;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Esp32C3Csrs {
     ustatus: u32,
@@ -34,6 +47,8 @@ pub(crate) struct Esp32C3Csrs {
     count: u32,
     snapshot_cycles: u64,
     snapshot_instret: u64,
+    pmpcfg: [u8; PMP_ENTRIES],
+    pmpaddr: [u32; PMP_ENTRIES],
 }
 
 #[allow(clippy::cast_possible_truncation)] // deliberate: the counter is 32 bits wide and wraps
@@ -66,13 +81,65 @@ impl Esp32C3Csrs {
         self.snapshot_instret = instret;
     }
 
+    fn pmp_locked(&self, entry: usize) -> bool {
+        self.pmpcfg
+            .get(entry)
+            .is_some_and(|cfg| cfg & PMP_LOCK != 0)
+    }
+
+    /// A locked entry freezes its own address; a locked top-of-range entry also freezes the address
+    /// of the entry below, which is its lower bound.
+    fn pmpaddr_locked(&self, entry: usize) -> bool {
+        self.pmp_locked(entry)
+            || self
+                .pmpcfg
+                .get(entry + 1)
+                .is_some_and(|next| next & PMP_LOCK != 0 && next & PMP_MATCH_MASK == PMP_MATCH_TOR)
+    }
+
+    fn read_pmp(&self, addr: u16) -> Option<u32> {
+        if let Some(index) = addr.checked_sub(PMPCFG0).filter(|i| *i < PMPCFG_REGISTERS) {
+            let first = usize::from(index) * ENTRIES_PER_CFG;
+            let bytes = self.pmpcfg.get(first..first + ENTRIES_PER_CFG)?;
+            return Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        let entry = usize::from(addr.checked_sub(PMPADDR0)?);
+        self.pmpaddr.get(entry).copied()
+    }
+
+    fn write_pmp(&mut self, addr: u16, value: u32) -> bool {
+        if let Some(index) = addr.checked_sub(PMPCFG0).filter(|i| *i < PMPCFG_REGISTERS) {
+            let first = usize::from(index) * ENTRIES_PER_CFG;
+            for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
+                if !self.pmp_locked(first + i)
+                    && let Some(cfg) = self.pmpcfg.get_mut(first + i)
+                {
+                    *cfg = byte;
+                }
+            }
+            return true;
+        }
+        let Some(entry) = addr
+            .checked_sub(PMPADDR0)
+            .map(usize::from)
+            .filter(|e| *e < PMP_ENTRIES)
+        else {
+            return false;
+        };
+        if !self.pmpaddr_locked(entry) {
+            // INVARIANT: `entry < PMP_ENTRIES` was checked just above.
+            self.pmpaddr[entry] = value;
+        }
+        true
+    }
+
     pub(crate) fn read(&self, addr: u16, cycles: Cycles, instret: u64) -> Option<u32> {
         Some(match addr {
             USTATUS => self.ustatus,
             PCER_MACHINE | PCER_USER => self.pcer,
             PCMR_MACHINE | PCMR_USER => self.pcmr,
             PCCR_MACHINE | PCCR_USER => self.counted(cycles, instret),
-            _ => return None,
+            _ => return self.read_pmp(addr),
         })
     }
 
@@ -91,7 +158,7 @@ impl Esp32C3Csrs {
                 self.resnapshot(cycles, instret);
                 self.count = value;
             }
-            _ => return false,
+            _ => return self.write_pmp(addr, value),
         }
         true
     }
@@ -188,5 +255,82 @@ mod tests {
         let mut c = Esp32C3Csrs::default();
         assert_eq!(c.read(0x7E3, Cycles(0), 0), None);
         assert!(!c.write(0x803, 1, Cycles(0), 0));
+    }
+
+    fn csrs() -> Esp32C3Csrs {
+        Esp32C3Csrs::default()
+    }
+    const L: u32 = 0x80;
+    const TOR: u32 = 0x08;
+
+    #[test]
+    fn pmp_registers_read_back_what_was_written() {
+        let mut c = csrs();
+        for i in 0..16u16 {
+            assert_eq!(c.read(PMPADDR0 + i, Cycles(0), 0), Some(0));
+            assert!(c.write(PMPADDR0 + i, 0x1000_0000 + u32::from(i), Cycles(0), 0));
+            assert_eq!(
+                c.read(PMPADDR0 + i, Cycles(0), 0),
+                Some(0x1000_0000 + u32::from(i))
+            );
+        }
+        for i in 0..4u16 {
+            assert!(c.write(PMPCFG0 + i, 0x0F0B_0907, Cycles(0), 0));
+            assert_eq!(c.read(PMPCFG0 + i, Cycles(0), 0), Some(0x0F0B_0907));
+        }
+        assert_eq!(
+            c.read(0x3A4, Cycles(0), 0),
+            None,
+            "pmpcfg4 does not exist on a 16-entry PMP"
+        );
+        assert_eq!(
+            c.read(0x3C0, Cycles(0), 0),
+            None,
+            "pmpaddr16 does not exist"
+        );
+    }
+
+    #[test]
+    fn a_locked_entry_ignores_later_writes_to_its_configuration_and_address() {
+        let mut c = csrs();
+        c.write(PMPADDR0 + 1, 0x111, Cycles(0), 0);
+        // Entry 1 is byte 1 of pmpcfg0: lock it with R+W.
+        c.write(PMPCFG0, (L | 0x03) << 8, Cycles(0), 0);
+        // 0x7F in the three other bytes: every bit but the lock, so entries 0, 2 and 3 stay unlocked.
+        c.write(PMPCFG0, 0x7F7F_7F7F, Cycles(0), 0);
+        assert_eq!(
+            c.read(PMPCFG0, Cycles(0), 0),
+            Some(0x7F7F_007F | ((L | 0x03) << 8)),
+            "byte 1 kept"
+        );
+        c.write(PMPADDR0 + 1, 0x222, Cycles(0), 0);
+        assert_eq!(c.read(PMPADDR0 + 1, Cycles(0), 0), Some(0x111));
+        c.write(PMPADDR0, 0x333, Cycles(0), 0);
+        assert_eq!(
+            c.read(PMPADDR0, Cycles(0), 0),
+            Some(0x333),
+            "entry 1 is not TOR: pmpaddr0 stays writable"
+        );
+    }
+
+    #[test]
+    fn a_locked_top_of_range_entry_also_locks_the_address_below_it() {
+        let mut c = csrs();
+        c.write(PMPADDR0 + 4, 0x444, Cycles(0), 0);
+        // Entry 5 is byte 1 of pmpcfg1.
+        c.write(PMPCFG0 + 1, (L | TOR | 0x01) << 8, Cycles(0), 0);
+        c.write(PMPADDR0 + 4, 0x555, Cycles(0), 0);
+        assert_eq!(c.read(PMPADDR0 + 4, Cycles(0), 0), Some(0x444));
+    }
+
+    #[test]
+    fn pmp_csrs_exist_only_on_the_esp32c3_hart() {
+        use crate::csr::{CsrFile, VendorCsrs};
+        let mut generic = CsrFile::new(VendorCsrs::None);
+        assert_eq!(generic.read(PMPADDR0, Cycles(0), 0), None);
+        assert!(!generic.write(PMPCFG0, 0));
+        let mut c3 = CsrFile::new(VendorCsrs::Esp32C3);
+        assert!(c3.write(PMPADDR0 + 15, 0x2000_0000));
+        assert_eq!(c3.read(PMPADDR0 + 15, Cycles(0), 0), Some(0x2000_0000));
     }
 }
