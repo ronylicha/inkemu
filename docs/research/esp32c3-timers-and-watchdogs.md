@@ -612,3 +612,11 @@ Container: `docker run -d --name inkemu-timers --network none --entrypoint sleep
 | Issue logs | host: `gh api repos/<owner>/<repo>/issues/<n>` and `…/comments` → `dl/issues/*.txt` |
 
 Licence hygiene: QEMU sources (GPL) were read for behaviour only; no code or comment was copied, and the facts taken from them are restated in original wording. Register names, bit positions and reset values come from the Apache-2.0 ESP-IDF headers and the vendored SVD; ROM facts from the Apache-2.0 `esp-rom-elfs` ELF; the TRM is cited by section.
+
+## M. Corrections found while planning SP1b-3a (2026-10-11)
+
+- §B.3 says the configuration registers of a main watchdog take effect when `WDTCONFIG0.CONF_UPDATE_EN` is written. `_timer_ll_reset_register` (`IDF:hal/esp32c3/include/hal/timer_ll.h:50-66`) clears `FLASHBOOT_MOD_EN` with a plain read-modify-write right after a peripheral reset, without that bit, "to prevent the system from being reset unexpectedly": the flash-boot bit at least acts when it is written. The model applies every write at once and reads `CONF_UPDATE_EN` as 0; which registers really wait for the bit is open (list of SP1b-4).
+- The SVD gives 0 as the reset value of `RTC_CNTL.WDTWPROTECT` and `RTC_CNTL.SWD_WPROTECT`. ESP-IDF's header gives the keys, `0x50D83AA1` and `0x8F1D312A` (`IDF:soc/esp32c3/register/soc/rtc_cntl_reg.h:1700`, `:1758`): both watchdogs are unlocked at reset, which is why the bootloader can stop the RTC watchdog. The model uses the header's values.
+- §H.1 lists `0x4004c0d4` among the saved PCs of blank-chip reset loops. The model reproduces it: with the UART transmit time modelled, the watchdog catches the ROM in `uart_tx_one_char_uart.part.0`, waiting for room in the FIFO.
+- The reference application reads `EFUSE + 0x18C` at every start (`esp_efuse_utility_check_errors`, the load at `0x4200045c`), a word between `RD_REPEAT_ERR3` and `RD_REPEAT_ERR4` that neither the SVD nor `efuse_reg.h` documents. The trace on QEMU did not show it as unmodelled because QEMU answers the whole block. The model answers 0.
+- The golden log of `sp1b-test-oracle.md` §2 ends at `Minimum free heap size`: the capture was cut before the countdown. The life-cycle test of SP1b-3a pins the rest from the model, not from the oracle.

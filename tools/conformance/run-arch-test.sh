@@ -26,7 +26,7 @@ docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1
   # RISCOF selects pmp32/ anyway, so it is left out of the suite directory itself.
   groups=""
   for entry in $ARCH_TEST_EXPECTED; do groups="$groups ${entry%%=*}"; done
-  echo "arch-test groups:$groups (pmp32 excluded: PMP is stored on the ESP32-C3 hart and not enforced; SP1b-3 enforces it and re-enables pmp32 by adding it back to ARCH_TEST_EXPECTED)"
+  echo "arch-test groups:$groups (pmp32 excluded: PMP is stored on the ESP32-C3 hart and not enforced; SP1b-4 enforces it and re-enables pmp32 by adding it back to ARCH_TEST_EXPECTED)"
   # RISCOF deletes and recreates its work dir, so a kept copy is made on exit instead of a mount.
   trap "[[ -d /keep ]] && cp -r /tmp/riscof_work/. /tmp/riscof.log /keep/ || true" EXIT
   src=/opt/riscv-arch-test/riscv-test-suite

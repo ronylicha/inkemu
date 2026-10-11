@@ -17,7 +17,7 @@ No other memory-mapped register is silent: it is either modelled or reported by 
 The PMP CSRs (`pmpcfg0` to `pmpcfg3`, `pmpaddr0` to `pmpaddr15`) are accepted without effect too,
 and are not in the table because they are CSRs, not memory-mapped registers: on the ESP32-C3 core
 they are stored with their lock rules and **never enforced** — no access is refused because of them
-(decision D18 of plan SP1b-2). Plan SP1b-3 enforces them.
+(decision D18 of plan SP1b-2). Plan SP1b-4 enforces them (decision E31 of plan SP1b-3a).
 
 The table is generated: the lists live next to each peripheral model (`accepted()` in
 `crates/soc-esp32c3/src/periph/*.rs`). A model that is plain storage is built from its list; a model
@@ -31,9 +31,8 @@ then rewrites the table below, and nothing else; review the diff before committi
 
 "Count" is 1 for a single register, or the number of consecutive registers the row stands for.
 "Made real by" names the plan that gives the register its effect. Each plan inherits the rows that
-name it: the carry-over note `docs/superpowers/notes/2026-10-11-sp1b-2-carryover.md` says so under
-SP1b-3, SP1b-4, SP2, SP5a and SP8; the rows that name SP1b-3b are the second part of the SP1b-3
-rows, and that plan inherits them too.
+name it: the carry-over note `docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` says so under
+SP1b-3b, SP1b-4, SP2, SP5a, SP5b and SP8.
 
 <!-- generated table -->
 | Address | Register | Count | Hardware effect not modelled | Made real by |

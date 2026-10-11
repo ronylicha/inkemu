@@ -742,7 +742,7 @@ mod tests {
     #[should_panic(expected = "stores single registers only")]
     fn a_block_row_given_to_plain_storage_is_a_programming_error() {
         const BLOCK: [Accepted; 1] =
-            [Accepted::svd("INTERRUPT_CORE0", "MAC_INTR_MAP", "routing", "SP1b-3").block(62)];
+            [Accepted::svd("INTERRUPT_CORE0", "MAC_INTR_MAP", "routing", "SP8").block(62)];
         let _ = Storage::accepted(INTMATRIX_BASE, &BLOCK);
     }
 

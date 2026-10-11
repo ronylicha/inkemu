@@ -479,3 +479,17 @@ What the application touches between its first log line and the scheduler start,
 
 `<scratch>/btlacc/tools/`: `filter.py` (reduces the QEMU stream to events + pc list), `analyze.py` (per-phase first-access and full-access tables, UART line index), `groups.py`, `mktable.py`, `romcalls.py` (ROM functions entered, `ets_delay_us` accounting), `nointr.py` (gdbstub experiment).
 `<scratch>/btlacc/out/`: `t1_events.txt` (100,782 events), `t1_pcs.bin` (3,000,001 pcs), `a_first_{rom,btl,app1,app2}.tsv`, `a_all_*.tsv`, `a_uart_lines.txt`, `a_other_events.txt` (interrupts, QEMU warnings), `dis_{btl,app,rom}.txt`, `nm_*.txt`, `nointr_pcs.txt`, `nointr_uart.log`.
+
+## Corrections (2026-10-11)
+
+Established after this report was written, by `esp32c3-interrupts-and-reset.md` (§9) and `esp32c3-timers-and-watchdogs.md` (§K). The text above is left as it was; where it disagrees with an entry below, the entry is right.
+
+- BA §1 and §9 give insn 2,369,140 for `xPortStartScheduler`: that is the threshold write inside it; the function is entered at 2,359,524.
+- BA §10 item 9: the 20260417 build was measured here; it is identical to 20250817 for the first 2,472,463 instructions (§6 row 21).
+
+| Place | Statement there | Established here |
+|---|---|---|
+| `esp32c3-boot-chain.md` §E.3, §K.4; `esp32c3-rom-flash-boot.md` §L.2; `esp32c3-bootloader-accesses.md` §10.8 | "Exact hardware timeout/stage action of the auto-armed WDT: unknown" | MWDT0: 26,000,000 APB cycles, core reset, cause `0x07`; RWDT: 400,000 slow-clock cycles, system reset, cause `0x10`; proven absent from the ROM; both seen on real chips (§D.4, §H) |
+| `esp32c3-bootloader-accesses.md` §10.1 | CPU frequency during the ROM (20 or 40 MHz) "not established" | `TRM:` v1.4 §6.2.4.1: 20 MHz by default; a reset-loop log excludes 40 MHz for APB (§H.2). After an `esp_restart` the ROM runs at 40 MHz (`PRE_DIV_CNT` = 0 survives the CPU reset) |
+| `esp32c3-bootloader-accesses.md` §6 | interrupt watchdog "prescaler 20000 (a 500 µs tick according to `int_wdt.c`)" | 500 µs because ESP-IDF clocks the MWDT from the 40 MHz crystal (`USE_XTAL` = 1), not from APB |
+| `esp32c3-bootloader-accesses.md` §9, row 2 | a calibration stub with `RDY` = 1 and `SYSTIMER.UNIT0_OP` valid is enough up to the scheduler | still true; add that the tick ISR needs counter 1 to advance by one period per interrupt (§A.4), and that QEMU's own counter 1 starts 1.93 periods ahead (§G.9) |

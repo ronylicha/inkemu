@@ -430,3 +430,10 @@ If a committed fixture is wanted anyway, add Apache-2.0 text + EEMBC copyright n
 `r1/` canonical artefacts (+ elf), `r2/ r3/` repro rebuilds (same hashes), `out1/ out2/` non-reproducible builds, `r_ota/` OTA-layout build, `cm1/` CoreMark build, `flash_hello.bin`, `flash_hello_ota.bin`, `flash_coremark.bin`,
 `golden_hello_boot.log`, `golden_hello_ota_boot.log`, `coremark_run.log`, `trace_a.sample` (3 MB sample of `-d cpu`), `gdbtrace.py` (RSP stepper), `cmp_cpu.py` (validator), `det_A1.txt`/`det_B1.txt` (3 M pc traces of both QEMU builds),
 `mtree.txt`, `dl_qemu_latest/` (downloaded QEMU 20260417), `dl_datasheet/`, `dl_license/`, helper scripts `rebuild.sh gdbrun.sh dettest.sh thr.sh qrun.sh`.
+
+## Corrections (2026-10-11)
+
+Established after this report was written, by `esp32c3-interrupts-and-reset.md` (§9) and `esp32c3-timers-and-watchdogs.md` (§K). The text above is left as it was; where it disagrees with an entry below, the entry is right.
+
+- TO §1c pitfall 2 ("they first differ at the interrupt handler where the new build logs an extra re-entry"): with duplicate entries removed, the first real divergence is at insn 2,472,464, in the tick handler.
+- TO §1d "restart path via RTC SW reset works": it works because QEMU resets the whole machine; on hardware only the CPU is reset and the second boot differs (§4.3, §4.4).

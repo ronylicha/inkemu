@@ -2,7 +2,7 @@
 
 **A binary-level emulator for embedded e-ink devices.** inkemu runs the real, unmodified firmware image of a device on a virtual replica of its hardware. You can check how a firmware renders and behaves before you flash it.
 
-> **Status: early development.** inkemu boots the real ESP32-C3 mask ROM from its reset vector. From a full flash image, the ROM loads the stock ESP-IDF second-stage bootloader, which runs and starts the application up to its first log line. The RV32IMC core is validated against riscv-tests and, through RISCOF, against the Sail reference model. Interrupts, timers, watchdogs and reset come next (sub-projects 1b-3 and 1b-4). See the [design spec](docs/superpowers/specs/2026-10-11-inkemu-design.md) and the [roadmap](#roadmap).
+> **Status: early development.** inkemu boots the real ESP32-C3 mask ROM from its reset vector. From a full flash image, the ROM loads the stock ESP-IDF second-stage bootloader, which starts the application; the application runs its whole life — FreeRTOS scheduler, tick interrupt, timers, watchdogs — and when it restarts, the chip boots again. The RV32IMC core is validated against riscv-tests and, through RISCOF, against the Sail reference model. Flash writes and a firmware given on its own come next (sub-project 1b-3b), then the lockstep against QEMU (1b-4). See the [design spec](docs/superpowers/specs/2026-10-11-inkemu-design.md) and the [roadmap](#roadmap).
 
 ## Build & try
 
@@ -25,16 +25,17 @@ load:0x3fcd5820,len:0x15a4
 load:0x403cbf10,len:0xc64
 load:0x403ce710,len:0x2fd0
 entry 0x403cbf1a
-I (10) boot: ESP-IDF v5.5.2 2nd stage bootloader
-I (10) boot: chip revision: v0.3
-I (11) boot: efuse block revision: v1.2
+I (21) boot: ESP-IDF v5.5.2 2nd stage bootloader
+I (21) boot: chip revision: v0.3
+I (21) boot: efuse block revision: v1.2
 …
-I (12) boot: End of partition table
-I (12) esp_image: segment 0: paddr=00010020 vaddr=3c010020 size=0656ch ( 25964) map
+I (65) boot: End of partition table
+I (68) esp_image: segment 0: paddr=00010020 vaddr=3c010020 size=0656ch ( 25964) map
 …
-I (31) boot: Loaded app from partition at offset 0x10000
-I (31) boot: Disabling RNG early entropy source...
-I (31) cpu_start: Unicore app
+I (116) boot: Loaded app from partition at offset 0x10000
+I (118) boot: Disabling RNG early entropy source...
+I (134) cpu_start: Unicore app
+…
 ```
 
 `--flash` takes a **full flash image**: a dump of a device (`esptool.py read_flash 0 ALL flash.bin`), or the output of `esptool.py merge_bin` (bootloader at offset 0, partition table at `0x8000`, application). The file may be shorter than the flash of the device; the rest reads as erased. inkemu refuses, before anything runs, a file that cannot be the flash of the device (exit code 2, with the cause and the remedy): an encrypted `.xota`, an application image alone, an image for another chip, an image that declares more flash than the device has, a file longer than the flash, an empty file. For example:
@@ -44,37 +45,29 @@ $ target/release/inkemu run --device x4 --flash app.bin
 error: app.bin: the file starts with an image but holds no partition table at offset 0x8000, so it is an application or a bootloader alone, not a full flash image; use a flash dump or the output of `esptool.py merge_bin` (bootloader, partition table and application)
 ```
 
-Without `--flash` the flash is erased and the ROM prints `invalid header: 0xffffffff` in a loop, as a blank chip does. There is no option yet to boot an application `.bin` on its own: inkemu does not compose a flash from one (planned for sub-project 1b-3).
+Without `--flash` the flash is erased and the ROM prints `invalid header: 0xffffffff` in a loop, as a blank chip does. There is no option yet to boot an application `.bin` on its own: inkemu does not compose a flash from one (planned for sub-project 1b-3b).
 
-Today the run goes as far as the first log line of the application. The application then waits for the calibration of the slow RTC clock, which needs a timer block inkemu does not emulate yet (`TIMG0.RTCCALICFG`). The wait shows as named warnings and the run only ends at `--max-cycles`. For the reference image, saved as `flash_hello.bin`, standard error reads:
+The reference image (`hello_world` of ESP-IDF v5.5.2, saved as `flash_hello.bin`) runs its whole life: it prints `Hello world!`, counts down eleven seconds, calls `esp_restart()`, and the ROM boots again, announcing `rst:0xc (RTC_SW_CPU_RST)`. The seconds the application spends waiting are not executed: the CPU sleeps in `wfi` and device time jumps to the next timer event, so the eleven seconds take about one second of host time. With `--max-cycles 50000000`, standard error reads:
 
 ```text
 inkemu: Xteink X4 (ESP32-C3 v0.3, mask ROM rev3); timing model datasheet-uncalibrated (not calibrated); flash: flash_hello.bin (16777216 bytes in 16 MiB)
-warning: unmodeled register read: TIMG0.RTCCALICFG at 0x6001f068 (pc 0x403829fa); returning its documented reset value 0x00013000
-warning: unmodeled register read: TIMG0.RTCCALICFG2 at 0x6001f080 (pc 0x40382a08); returning its documented reset value 0xffffff98
-warning: unmodeled register write: TIMG0.RTCCALICFG2 at 0x6001f080 (pc 0x40382a14); value 0x00000098 ignored
 inkemu: cycle limit reached; raise --max-cycles to run longer
-inkemu: stopped at pc 0x40382a1c after 50000000 cycles (39808633 instructions)
-inkemu: 632854 us of device time; CPU clock at 80 MHz
-inkemu: repeated 4806293 times: unmodeled register read: TIMG0.RTCCALICFG at 0x6001f068 (pc 0x403829fa); returning its documented reset value 0x00013000
-inkemu: repeated 4806293 times: unmodeled register read: TIMG0.RTCCALICFG2 at 0x6001f080 (pc 0x40382a08); returning its documented reset value 0xffffff98
+inkemu: stopped at pc 0x4004c0d4 after 50000000 cycles (33222007 instructions)
+inkemu: 11459206 us of device time; CPU clock at 160 MHz
 ```
 
-Until resets, watchdogs and flash writes are emulated (sub-project 1b-3), three things are worth knowing:
+With `--strict-mmio` the same run touches no register inkemu does not model and takes no CPU exception, across the restart.
 
-- **A boot that fails does not end by itself.** When the ROM refuses the bootloader (a corrupted image, for instance) it prints its error and `ets_main.c 333`, then parks in an endless loop, where the watchdog of a real device would reset it. The watchdogs of inkemu never expire: the run goes on in silence, without a single warning, until `--max-cycles`. Always pass that option.
-- **A software reset is refused.** Firmware that asks for one — the bootloader does when it finds no bootable application — gets one warning (`a software reset was requested … but resets are not emulated yet`), then idles in its own loop until `--max-cycles`.
-- **The flash is read-only.** On the first boot of a layout with OTA slots and a blank `otadata` partition, which is the layout of the Xteink X4, the bootloader records the slot it chose. inkemu reports the refused sector erase and page program (`flash command 0x20 is not modeled`, then `0x02`) and the boot goes on to the application; with `--strict-mmio` the run stops at the first of the two.
+Things worth knowing:
 
-With `--strict-mmio` the run of the reference image stops on the first of its warnings, with exit code 3. It is the first unmodelled access since the reset, and no CPU exception came before it:
+- **`--max-cycles` counts CPU cycles, and a sleeping CPU executes none.** A firmware that sleeps for ever while a timer keeps counting never reaches the limit: stop it with Ctrl-C, which ends the run with the same summary as the limit, with exit code 0. A second Ctrl-C before the run has stopped exits at once, with code 130 and no summary; a plain `kill` is not handled and ends the process without a summary either. With `--trace-hash`, the hash of an interrupted run covers what ran up to the cut, which depends on host timing: it is not reproducible. A firmware that waits for an interrupt nothing can raise ends the run by itself, with exit code 4.
+- **The watchdogs are real.** Without `--flash`, the ROM prints `invalid header: 0xffffffff` until the watchdog the chip arms at reset expires, 1.3 s later, and boots again with `rst:0x7 (TG0WDT_SYS_RST)`, as a blank chip does. A firmware that stops feeding its watchdogs is reset the same way, and the next boot names the watchdog and the address it was caught at (`Saved PC`).
+- **The console is as slow as the UART.** A byte leaves at the baud rate the firmware programmed; when a run stops, what was still in the UART is printed too. If that last write fails, the run ends with exit code 2 (a closed pipe ends it with code 0); a `--strict-mmio` stop keeps its code.
+- **The flash is read-only.** On the first boot of a layout with OTA slots and a blank `otadata` partition, which is the layout of the Xteink X4, the bootloader records the slot it chose. inkemu reports the refused sector erase and page program (`flash command 0x20 is not modeled`, then `0x02`) and the boot goes on to the application; with `--strict-mmio` the run stops at the first of the two. Flash writes arrive with sub-project 1b-3b.
+- **Memory protection is not enforced.** The PMP entries, the permission registers and the stack guard are stored and never raise a fault (sub-project 1b-4).
+- **Exit codes**, as `inkemu run --help` prints them: 0 when the run ended normally (the cycle limit was reached, Ctrl-C was pressed, or the reader of standard output went away); 2 for an error (unknown device, missing or invalid ROM, refused flash image, or standard output that cannot be written); 3 for a stop by `--strict-mmio`; 4 when the CPU waits for an interrupt and none can come; 130 for a second Ctrl-C.
 
-```text
-inkemu: stopped by --strict-mmio: unmodeled register read: TIMG0.RTCCALICFG at 0x6001f068 (pc 0x403829fa); returning its documented reset value 0x00013000
-inkemu: stopped at pc 0x403829fc after 1937072 cycles (1358289 instructions)
-inkemu: 32068 us of device time; CPU clock at 80 MHz
-```
-
-The device console goes to standard output. Everything inkemu has to say goes to standard error: the device, the timing model and the flash in use, then one `warning:` line for each thing it cannot do faithfully — an unmodelled register read or write (with the peripheral, the register, its address and the program counter), an 8- or 16-bit write to a peripheral register, an operation it cannot perform faithfully (a flash command other than identification and status: a program, an erase, a data read; an SPI flash transfer whose command is not 8 bits long; SHA through DMA; a SHA mode the chip does not have; a clock source it cannot turn into a frequency; a software reset), an access to flash that no MMU entry maps, a CPU exception — and, at the end, the most repeated ones, the device time elapsed and the CPU clock. `--strict-mmio` turns the first of these (CPU exceptions excepted) into a stop with exit code 3, for CI. Registers that inkemu stores without modelling their effect are listed in [docs/registers-accepted-without-effect.md](docs/registers-accepted-without-effect.md).
+The device console goes to standard output. Everything inkemu has to say goes to standard error: the device, the timing model and the flash in use, then one `warning:` line for each thing it cannot do faithfully — an unmodelled register read or write (with the peripheral, the register, its address and the program counter), an 8- or 16-bit write to a peripheral register, an operation it cannot perform faithfully (a flash command other than identification and status: a program, an erase, a data read; an SPI flash transfer whose command is not 8 bits long; SHA through DMA; a SHA mode the chip does not have; a clock source it cannot turn into a frequency; an RTC slow clock other than the RC oscillator; a byte written to a UART whose transmit FIFO is full), an access to flash that no MMU entry maps, a CPU exception — and, at the end, the most repeated ones, the device time elapsed and the CPU clock. `--strict-mmio` turns the first of these (CPU exceptions excepted) into a stop with exit code 3, for CI. Registers that inkemu stores without modelling their effect are listed in [docs/registers-accepted-without-effect.md](docs/registers-accepted-without-effect.md).
 
 To build the reference image yourself (it needs Docker; nothing is executed on the host), see [tools/reference-firmware/README.md](tools/reference-firmware/README.md).
 
@@ -108,7 +101,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 
 ## Roadmap
 
-1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3, interrupts, timers, watchdogs and reset, is next.*
+1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3a, interrupts, timers, watchdogs and reset, done; 1b-3b, flash writes and a firmware on its own, is next.*
 2. X4 peripherals, desktop UI, e-ink rendering: **first visual milestone**
 3. X3 support (UC8253 panel, I2C sensors)
 4. Debugging, resource monitor, headless test runner
@@ -129,7 +122,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 
 inkemu est un émulateur **au niveau binaire** d'appareils embarqués à écran e-ink. Il exécute le firmware réel, sans recompilation, sur une réplique virtuelle du matériel : mémoire exacte, modèle de cycles, rendu e-ink fidèle (ghosting, niveaux de gris, durées de rafraîchissement), Wi-Fi avec accès Internet réel, BLE, débogage GDB et tests automatisés. Il tourne sur Linux, macOS, Windows et dans le navigateur. Les liseuses Xteink sont les premières cibles ; d'autres appareils suivront.
 
-**État :** inkemu démarre la vraie ROM masquée de l'ESP32-C3 depuis son vecteur de reset et affiche sa bannière (`inkemu run --device x4`). Le cœur RV32IMC est validé contre riscv-tests puis, avec RISCOF, contre le modèle de référence Sail ; les commandes `inkemu inspect` et `inkemu rvtest` sont en place. À partir d'une image flash complète (`--flash`), la ROM charge le bootloader de second niveau, qui s'exécute et lance l'application jusqu'à sa première ligne de journal ; les interruptions, les timers et les watchdogs sont la prochaine étape (sous-projets 1b-3 et 1b-4).
+**État :** inkemu démarre la vraie ROM masquée de l'ESP32-C3 depuis son vecteur de reset. À partir d'une image flash complète (`--flash`), la ROM charge le bootloader de second niveau, qui lance l'application ; celle-ci vit toute sa vie — ordonnanceur FreeRTOS, interruption de tick, timers, watchdogs — et, quand elle redémarre, la puce démarre de nouveau. Le cœur RV32IMC est validé contre riscv-tests puis, avec RISCOF, contre le modèle de référence Sail ; les commandes `inkemu inspect` et `inkemu rvtest` sont en place. Les écritures en flash et le démarrage d'un firmware fourni seul sont la prochaine étape (sous-projet 1b-3b), puis le lockstep avec QEMU (1b-4).
 
 ## Third-party material
 

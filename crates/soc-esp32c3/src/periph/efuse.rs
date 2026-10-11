@@ -4,7 +4,7 @@
 //! `RD_REPEAT_ERR_GAP`): the other reserved holes (such as 0x194..=0x1BC) are not registers, so they
 //! stay unmodelled and surface as diagnostics (spec §5.2).
 //! The content is that of a production chip (decision D9); programming registers stay unmodelled
-//! until a firmware needs them (SP1b-3).
+//! until a firmware needs them (SP1b-3b).
 use crate::chip::ChipRevision;
 use crate::ctx::Ctx;
 use crate::periph::EFUSE_BASE;
