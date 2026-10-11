@@ -1,5 +1,5 @@
 //! A single machine-mode RV32IMC hart.
-use crate::csr::{CsrFile, MSTATUS_MIE, MSTATUS_MPIE};
+use crate::csr::{CsrFile, MSTATUS_MIE, MSTATUS_MPIE, VendorCsrs};
 use crate::dcache::DecodeCache;
 use crate::decode::decode;
 use crate::instr::Decoded;
@@ -29,6 +29,8 @@ pub enum MisalignedPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct HartConfig {
     pub misaligned: MisalignedPolicy,
+    /// Which vendor's CSRs the hart implements besides the machine-mode ones.
+    pub vendor_csrs: VendorCsrs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +63,7 @@ impl Hart {
         Hart {
             x: [0; 32],
             pc: reset_pc,
-            csr: CsrFile::default(),
+            csr: CsrFile::new(config.vendor_csrs),
             cycles: Cycles::ZERO,
             instret: 0,
             config,
@@ -76,8 +78,9 @@ impl Hart {
         self.dcache.stats()
     }
 
-    /// Drives one `mip` bit; `line` is taken modulo 32.
+    /// Drives one `mip` bit; `line` must be lower than 32.
     pub fn set_interrupt_pending(&mut self, line: u32, pending: bool) {
+        debug_assert!(line < 32, "interrupt line {line} out of range");
         let bit = 1u32 << (line & 31);
         if pending {
             self.csr.mip |= bit;
@@ -116,7 +119,7 @@ impl Hart {
                 let cycles = timing.instr_cycles(done.class) + fetch_stall + done.stall;
                 self.cycles = self.cycles + u64::from(cycles);
                 self.instret += 1;
-                self.csr.on_instruction_retired();
+                self.csr.on_instruction_retired(cycles);
                 self.pc = done.next_pc;
                 self.waiting = done.wait;
                 StepOutcome::Retired { cycles }
@@ -227,7 +230,13 @@ mod tests {
         let mut ram = Ram::new(0, 64 * 1024);
         let bytes: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
         ram.load(0, &bytes).unwrap();
-        let mut hart = Hart::new(0, HartConfig { misaligned: policy });
+        let mut hart = Hart::new(
+            0,
+            HartConfig {
+                misaligned: policy,
+                ..HartConfig::default()
+            },
+        );
         assert!(hart.csr.write(MTVEC, TRAP_VECTOR));
         (hart, ram)
     }
@@ -879,5 +888,57 @@ mod tests {
         assert_eq!(h.x[1], 1);
         h.set_interrupt_pending(3, false);
         assert_eq!(h.csr.mip, 0);
+    }
+
+    fn c3_machine(program: &[u32]) -> (Hart, Ram) {
+        let mut ram = Ram::new(0, 0x1000);
+        for (i, word) in program.iter().enumerate() {
+            ram.load(4 * u32::try_from(i).unwrap(), &word.to_le_bytes())
+                .unwrap();
+        }
+        let config = HartConfig {
+            vendor_csrs: VendorCsrs::Esp32C3,
+            ..HartConfig::default()
+        };
+        (Hart::new(0, config), ram)
+    }
+
+    #[test]
+    fn esp32c3_cycle_counter_advances_between_two_reads() {
+        // The ROM's ets_delay_us enables the counter through 0x800/0x801 and polls 0x802.
+        let (mut hart, mut ram) = c3_machine(&[
+            csrrwi(0, 0x800, 1),
+            csrrwi(0, 0x801, 1),
+            csrrs(5, 0x802, 0),
+            addi(0, 0, 0),
+            csrrs(6, 0x802, 0),
+        ]);
+        run(&mut hart, &mut ram, 5);
+        assert_eq!(hart.x[6] - hart.x[5], 2);
+    }
+
+    #[test]
+    fn vendor_csrs_do_not_exist_on_a_generic_hart() {
+        let (mut hart, mut ram) = machine(&[csrrs(5, 0x802, 0)], MisalignedPolicy::Trap);
+        let outcome = run(&mut hart, &mut ram, 1);
+        assert!(
+            matches!(outcome[0], StepOutcome::Trapped { trap, .. } if trap.cause == Exception::IllegalInstr)
+        );
+    }
+
+    #[test]
+    fn mcycle_write_takes_precedence_over_the_cycles_of_the_writing_instruction() {
+        let (mut hart, mut ram) = machine(
+            &[
+                addi(5, 0, 100),
+                csrrw(0, MCYCLE, 5),
+                csrrs(6, MCYCLE, 0),
+                csrrs(7, MCYCLE, 0),
+            ],
+            MisalignedPolicy::Trap,
+        );
+        run(&mut hart, &mut ram, 4);
+        assert_eq!(hart.x[6], 100);
+        assert_eq!(hart.x[7], 101);
     }
 }

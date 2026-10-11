@@ -35,21 +35,27 @@ fn b(imm: i32, rs2: u8, rs1: u8, f3: u32) -> u32 {
 fn csr_insn(csr: u16, src: u8, f3: u32, rd: u8) -> u32 {
     (u32::from(csr) << 20) | (u32::from(src) << 15) | (f3 << 12) | (u32::from(rd) << 7) | 0x73
 }
+#[must_use]
 pub fn addi(rd: u8, rs1: u8, imm: i32) -> u32 {
     i(imm, rs1, 0, rd, 0x13)
 }
+#[must_use]
 pub fn add(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(0, rs2, rs1, 0, rd, 0x33)
 }
+#[must_use]
 pub fn sub(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(0x20, rs2, rs1, 0, rd, 0x33)
 }
+#[must_use]
 pub fn lui(rd: u8, imm: u32) -> u32 {
     (imm & 0xffff_f000) | (u32::from(rd) << 7) | 0x37
 }
+#[must_use]
 pub fn auipc(rd: u8, imm: u32) -> u32 {
     (imm & 0xffff_f000) | (u32::from(rd) << 7) | 0x17
 }
+#[must_use]
 pub fn jal(rd: u8, imm: i32) -> u32 {
     let imm = imm as u32;
     (((imm >> 20) & 1) << 31)
@@ -59,84 +65,111 @@ pub fn jal(rd: u8, imm: i32) -> u32 {
         | (u32::from(rd) << 7)
         | 0x6f
 }
+#[must_use]
 pub fn jalr(rd: u8, rs1: u8, imm: i32) -> u32 {
     i(imm, rs1, 0, rd, 0x67)
 }
+#[must_use]
 pub fn beq(rs1: u8, rs2: u8, imm: i32) -> u32 {
     b(imm, rs2, rs1, 0)
 }
+#[must_use]
 pub fn bne(rs1: u8, rs2: u8, imm: i32) -> u32 {
     b(imm, rs2, rs1, 1)
 }
+#[must_use]
 pub fn blt(rs1: u8, rs2: u8, imm: i32) -> u32 {
     b(imm, rs2, rs1, 4)
 }
+#[must_use]
 pub fn lb(rd: u8, rs1: u8, imm: i32) -> u32 {
     i(imm, rs1, 0, rd, 0x03)
 }
+#[must_use]
 pub fn lh(rd: u8, rs1: u8, imm: i32) -> u32 {
     i(imm, rs1, 1, rd, 0x03)
 }
+#[must_use]
 pub fn lw(rd: u8, rs1: u8, imm: i32) -> u32 {
     i(imm, rs1, 2, rd, 0x03)
 }
+#[must_use]
 pub fn lbu(rd: u8, rs1: u8, imm: i32) -> u32 {
     i(imm, rs1, 4, rd, 0x03)
 }
+#[must_use]
 pub fn lhu(rd: u8, rs1: u8, imm: i32) -> u32 {
     i(imm, rs1, 5, rd, 0x03)
 }
+#[must_use]
 pub fn sb(rs2: u8, rs1: u8, imm: i32) -> u32 {
     s(imm, rs2, rs1, 0, 0x23)
 }
+#[must_use]
 pub fn sh(rs2: u8, rs1: u8, imm: i32) -> u32 {
     s(imm, rs2, rs1, 1, 0x23)
 }
+#[must_use]
 pub fn sw(rs2: u8, rs1: u8, imm: i32) -> u32 {
     s(imm, rs2, rs1, 2, 0x23)
 }
+#[must_use]
 pub fn mul(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(1, rs2, rs1, 0, rd, 0x33)
 }
+#[must_use]
 pub fn mulh(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(1, rs2, rs1, 1, rd, 0x33)
 }
+#[must_use]
 pub fn mulhsu(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(1, rs2, rs1, 2, rd, 0x33)
 }
+#[must_use]
 pub fn mulhu(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(1, rs2, rs1, 3, rd, 0x33)
 }
+#[must_use]
 pub fn div(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(1, rs2, rs1, 4, rd, 0x33)
 }
+#[must_use]
 pub fn divu(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(1, rs2, rs1, 5, rd, 0x33)
 }
+#[must_use]
 pub fn rem(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(1, rs2, rs1, 6, rd, 0x33)
 }
+#[must_use]
 pub fn remu(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r(1, rs2, rs1, 7, rd, 0x33)
 }
+#[must_use]
 pub fn csrrw(rd: u8, csr: u16, rs1: u8) -> u32 {
     csr_insn(csr, rs1, 1, rd)
 }
+#[must_use]
 pub fn csrrs(rd: u8, csr: u16, rs1: u8) -> u32 {
     csr_insn(csr, rs1, 2, rd)
 }
+#[must_use]
 pub fn csrrwi(rd: u8, csr: u16, uimm: u8) -> u32 {
     csr_insn(csr, uimm, 5, rd)
 }
+#[must_use]
 pub const fn ecall() -> u32 {
     0x0000_0073
 }
+#[must_use]
 pub const fn ebreak() -> u32 {
     0x0010_0073
 }
+#[must_use]
 pub const fn mret() -> u32 {
     0x3020_0073
 }
+#[must_use]
 pub const fn wfi() -> u32 {
     0x1050_0073
 }

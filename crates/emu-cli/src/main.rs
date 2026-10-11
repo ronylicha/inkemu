@@ -98,6 +98,7 @@ fn run_rvtest(
         } else {
             MisalignedPolicy::Trap
         },
+        ..HartConfig::default()
     };
     let machine = std::fs::read(elf)
         .map_err(|e| {
