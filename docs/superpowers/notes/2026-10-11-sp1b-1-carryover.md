@@ -17,6 +17,8 @@ Bilan de l'exécution du plan `docs/superpowers/plans/2026-10-11-sp1b-1-rom-bann
 | R5 | **La machine ESP32-C3 exécute les accès mémoire non alignés** au lieu de lever une exception. | La ROM rev0 fait une lecture non alignée dans `_init` avant qu'un gestionnaire d'exception puisse l'émuler : le silicium les exécute. Détail et source : `docs/research/esp32c3-boot-chain.md`, §M.1. | Un firmware qui compterait sur cette exception ne serait pas reproduit ; le lockstep de SP1b-4 le montrerait. Le banc de conformité (`inkemu rvtest`) continue de lever l'exception par défaut. |
 | R6 | Le répertoire de données de l'utilisateur est résolu par `etcetera` (MIT/Apache) et non `directories`. | `directories` tire une dépendance sous MPL-2.0 ; la politique de licences reste « permissives uniquement ». | Le chemin du cache suit les conventions d'`etcetera` : à vérifier sur macOS et Windows au sous-projet 9. |
 | R7 | Le tri de la revue finale est accepté tel quel : 48 remarques mineures corrigées avant fusion, 2 reportées, 4 écartées. | Tout ce qui rendait une affirmation fausse, un échec silencieux ou une entrée dangereuse a été corrigé. | Les 4 remarques écartées sont cosmétiques. |
+| R8 | Après la relecture finale, un correctif supplémentaire a rendu vrais quatre messages : remèdes `rom fetch` exécutables, annonce « downloading » émise seulement quand un téléchargement démarre, cause ajoutée au message `--device`/`--all`, README corrigé. | La règle « une seule vague de corrections » cède devant un message faux montré à l'utilisateur. | Nul. |
+| R9 | La commande imprimée dans un remède nomme le répertoire que l'utilisateur a choisi (y compris pour `rom fetch --rom-dir`), et l'écrit nu, entre guillemets doubles, ou sous la forme `<directory>` quand aucun échappement n'est valable à la fois dans un shell POSIX, cmd.exe et PowerShell. | Une commande qui télécharge ailleurs que promis, ou qu'un espace coupe en deux, n'est pas un remède. | Un chemin au caractère exotique reçoit `<directory>` au lieu d'une commande à coller ; le message nomme toujours le chemin. |
 
 Les décisions de conception D1 à D12 du plan restent valables, sauf D10 complétée par R5 et le choix de `directories` (Tech Stack) remplacé par R6.
 
@@ -28,6 +30,8 @@ Les décisions de conception D1 à D12 du plan restent valables, sauf D10 compl�
 - `SYSTEM.CPU_PER_CONF` et l'arbre d'horloges (passage du CPU à 80 puis 160 MHz).
 - Profils d'appareil : taille de flash, tables de partitions, puis validation d'un profil fourni par l'utilisateur (identifiant vide, cohérence de l'identifiant). Si `--device <fichier.toml>` voit le jour, nettoyer le message d'erreur de `toml` avant de l'afficher (il cite la ligne du fichier).
 - Points de SP1a toujours ouverts : `fetch_stall` et le cache flash, l'heuristique de dump flash, le message de `BadFlashSize`, le `Display` de `SpiMode`.
+- `rom_store` décompresse l'archive une fois par ELF manquant (trois fois pour `rom fetch --all` à froid) : une seule passe suffirait.
+- Trois modules de tests écrivent des adresses de base en clair au lieu de les prendre dans `svd-regs`.
 
 ## Reporté au plan SP1b-3 (interruptions, timers, watchdogs, reset)
 
