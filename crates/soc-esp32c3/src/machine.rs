@@ -211,6 +211,11 @@ impl Esp32C3 {
     ///   not moved to it.
     /// - The cycle limit is tested first: at a boundary where both limits are reached the call
     ///   returns [`StopReason::CycleBudget`].
+    /// - The limit is looked at before an instruction and before a sleep. A call that has reached
+    ///   one of the bounds of [`StopReason::Asleep`] returns that reason even when its last sleep
+    ///   ended on the instant of the limit: the next call returns [`StopReason::TimeBudget`]
+    ///   without running anything. A caller goes on after `Asleep` and `CycleBudget` and passes
+    ///   the same limit to every call.
     pub fn run_within(&mut self, cycles: Cycles, device_time_nanos: Option<u64>) -> StopReason {
         let deadline = device_time_nanos.map(limit_instant);
         let mut slept: u64 = 0;
@@ -457,7 +462,7 @@ impl Esp32C3 {
     ///
     /// A device keeps the bytes that left until they are taken here, and firmware decides how
     /// many there are. A caller must therefore take **every** channel ([`ConsoleChannel::ALL`]),
-    /// the ones it does not show included, at least once per call of [`Esp32C3::run_until`], and
+    /// the ones it does not show included, at least once per call of [`Esp32C3::run_within`], and
     /// keep each call short enough for what it is ready to hold: nothing else bounds the memory
     /// of a run whose firmware writes without end.
     pub fn take_console(&mut self, channel: ConsoleChannel) -> Vec<u8> {
@@ -1696,6 +1701,8 @@ mod tests {
     #[test]
     fn a_device_time_limit_past_a_watchdog_reset_is_reached_the_same_whole_or_in_slices() {
         const LIMIT_NS: u64 = 2 * SECOND_NS;
+        /// The instant main watchdog 0 resets the chip at.
+        const RESET_NS: u64 = 1_300 * MILLISECOND_NS;
         let mut whole = a_sleep_under_the_flash_boot_watchdog();
         run_to_the_time_limit(&mut whole, LIMIT_NS, |_| NO_CYCLE_LIMIT);
         assert_eq!(whole.device_time_nanos(), LIMIT_NS, "exactly the limit");
@@ -1719,6 +1726,27 @@ mod tests {
             assert_eq!(stepped.resets(), u64::from(nanos >= 1_300 * MILLISECOND_NS));
         }
         assert_eq!(state(&stepped), state(&whole));
+        // A limit on the instant of the reset, reached by one sleep of more than a second: the
+        // call says it slept, and the next one that the limit is reached, without running
+        // anything of the second life.
+        let mut at_the_reset = a_sleep_under_the_flash_boot_watchdog();
+        assert_eq!(
+            at_the_reset.run_within(NO_CYCLE_LIMIT, Some(RESET_NS)),
+            StopReason::Asleep
+        );
+        assert_eq!(
+            (at_the_reset.device_time_nanos(), at_the_reset.resets()),
+            (RESET_NS, 1)
+        );
+        let executed = at_the_reset.cycles();
+        assert_eq!(
+            at_the_reset.run_within(NO_CYCLE_LIMIT, Some(RESET_NS)),
+            StopReason::TimeBudget
+        );
+        assert_eq!(
+            (at_the_reset.cycles(), at_the_reset.pc()),
+            (executed, ROM_BASE)
+        );
     }
 
     #[test]
