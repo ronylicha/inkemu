@@ -1,0 +1,15 @@
+[package]
+name = "svd-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+roxmltree.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
