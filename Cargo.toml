@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/emu-core", "crates/cpu-rv32", "crates/firmware", "crates/emu-cli", "crates/svd-gen"]
+members = ["crates/emu-core", "crates/cpu-rv32", "crates/firmware", "crates/emu-cli", "crates/svd-gen", "crates/svd-regs"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ repository = "https://github.com/ronylicha/inkemu"
 emu-core = { path = "crates/emu-core", version = "0.1.0" }
 cpu-rv32 = { path = "crates/cpu-rv32", version = "0.1.0" }
 firmware = { path = "crates/firmware", version = "0.1.0" }
+svd-regs = { path = "crates/svd-regs", version = "0.1.0" }
 thiserror = "2"
 sha2 = "0.10"
 md-5 = "0.10"
