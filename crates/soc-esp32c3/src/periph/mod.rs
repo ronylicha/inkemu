@@ -7,6 +7,7 @@ use emu_core::Peripheral;
 pub mod ana_i2c;
 pub mod apb_ctrl;
 pub mod assist_debug;
+pub mod counter;
 pub mod efuse;
 pub mod extmem;
 pub mod gpio;
@@ -17,6 +18,7 @@ pub mod rtc_cntl;
 pub mod sha;
 pub mod spi_mem;
 pub mod system;
+pub mod systimer;
 pub mod uart;
 pub mod usb_serial_jtag;
 
@@ -33,6 +35,7 @@ pub use rtc_cntl::RtcCntl;
 pub use sha::Sha;
 pub use spi_mem::{Spi0, Spi1};
 pub use system::System;
+pub use systimer::Systimer;
 pub use uart::Uart;
 pub use usb_serial_jtag::UsbSerialJtag;
 
@@ -312,6 +315,9 @@ const ANA_I2C: (u32, u32) = (ana_i2c::ANA_I2C_BASE, ana_i2c::ANA_I2C_BASE + 0x10
 /// `DR_REG_TIMERGROUP0_BASE` (ESP-IDF `reg_base.h`; report BC §A.2).
 pub(crate) const TIMG0_BASE: u32 = 0x6001_F000;
 const TIMG0: (u32, u32) = (TIMG0_BASE, 0x6002_0000);
+/// `DR_REG_SYSTIMER_BASE` (ESP-IDF `reg_base.h`; report TW §A.1).
+pub(crate) const SYSTIMER_BASE: u32 = 0x6002_3000;
+const SYSTIMER: (u32, u32) = (SYSTIMER_BASE, 0x6002_4000);
 /// `DR_REG_APB_SARADC_BASE` (ESP-IDF `reg_base.h`; report BC §A.2).
 pub(crate) const APB_SARADC_BASE: u32 = 0x6004_0000;
 const APB_SARADC: (u32, u32) = (APB_SARADC_BASE, 0x6004_1000);
@@ -381,6 +387,7 @@ pub struct Peripherals {
     pub apb_ctrl: ApbCtrl,
     pub ana_i2c: AnaI2c,
     pub timg0: AcceptedBlock,
+    pub systimer: Systimer,
     pub apb_saradc: AcceptedBlock,
     /// Four isolated words: its base is 0, so its offsets are absolute addresses.
     pub radio_power: AcceptedBlock,
@@ -390,9 +397,11 @@ pub struct Peripherals {
 }
 
 impl Peripherals {
+    /// The peripherals after a power-on, at the device time of `ctx`: a device that has a first
+    /// deadline schedules it there.
     #[must_use]
-    pub fn new(config: &SocConfig, flash: Box<dyn FlashDevice>) -> Peripherals {
-        Peripherals {
+    pub fn new(config: &SocConfig, flash: Box<dyn FlashDevice>, ctx: &mut Ctx) -> Peripherals {
+        let mut periph = Peripherals {
             gpio: Gpio::new(config.strapping),
             io_mux: IoMux::new(),
             intmatrix: IntMatrix::new(),
@@ -409,12 +418,15 @@ impl Peripherals {
             apb_ctrl: ApbCtrl::new(config.rng_seed),
             ana_i2c: AnaI2c::new(),
             timg0: AcceptedBlock::new(TIMG0_BASE, &TIMG0_ACCEPTED),
+            systimer: Systimer::new(ctx.now()),
             apb_saradc: AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED),
             radio_power: AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED),
             uart0: Uart::new(UART0_BASE),
             uart1: Uart::new(UART1_BASE),
             usb_serial_jtag: UsbSerialJtag::new(),
-        }
+        };
+        periph.systimer.wake(ctx);
+        periph
     }
 
     /// Calls the device an event is for: a wake-up whose time has come, or what another part of the
@@ -425,6 +437,7 @@ impl Peripherals {
             Event::FlashWindowStore { instruction_bus } => {
                 self.extmem.latch_store(ctx, instruction_bus);
             }
+            Event::Systimer => self.systimer.wake(ctx),
         }
     }
 
@@ -463,6 +476,8 @@ impl Peripherals {
             Some((&mut self.ana_i2c, ana_i2c::ANA_I2C_BASE))
         } else if within(TIMG0) {
             Some((&mut self.timg0, TIMG0_BASE))
+        } else if within(SYSTIMER) {
+            Some((&mut self.systimer, SYSTIMER_BASE))
         } else if within(APB_SARADC) {
             Some((&mut self.apb_saradc, APB_SARADC_BASE))
         } else if within(UART0) {
@@ -595,12 +610,13 @@ mod tests {
         assert_eq!(table.lines().count(), rows.len() + 2);
     }
 
-    fn peripherals() -> Peripherals {
+    fn peripherals(ctx: &mut Ctx) -> Peripherals {
         Peripherals::new(
             &SocConfig::default(),
             Box::new(crate::flash::NorFlash::blank(
                 crate::flash::FlashConfig::default(),
             )),
+            ctx,
         )
     }
 
@@ -610,7 +626,7 @@ mod tests {
     #[test]
     fn every_row_of_the_table_is_routed_to_a_model_that_accepts_a_write_there() {
         let ctx = &mut Ctx::default();
-        let mut p = peripherals();
+        let mut p = peripherals(ctx);
         let rows = accepted_without_effect();
         assert_ne!(rows, Vec::new(), "the table is not empty");
         for row in rows {
@@ -644,12 +660,8 @@ mod tests {
 
     #[test]
     fn the_mmu_table_sits_right_after_the_cache_registers() {
-        let mut p = Peripherals::new(
-            &SocConfig::default(),
-            Box::new(crate::flash::NorFlash::blank(
-                crate::flash::FlashConfig::default(),
-            )),
-        );
+        let ctx = &mut Ctx::default();
+        let mut p = peripherals(ctx);
         let base_of = |p: &mut Peripherals, addr: u32| p.device(addr).map(|(_, base)| base);
         assert_eq!(base_of(&mut p, 0x600C_4FFC), Some(EXTMEM_BASE));
         assert_eq!(base_of(&mut p, 0x600C_5000), Some(mmu::MMU_TABLE_BASE));
@@ -671,12 +683,7 @@ mod tests {
     #[test]
     fn the_sha_block_is_routed_and_its_refusals_reach_the_relay() {
         let ctx = &mut Ctx::default();
-        let mut p = Peripherals::new(
-            &SocConfig::default(),
-            Box::new(crate::flash::NorFlash::blank(
-                crate::flash::FlashConfig::default(),
-            )),
-        );
+        let mut p = peripherals(ctx);
         let dma_start = svd_regs::esp32c3::addr("SHA", "DMA_START");
         let (device, base) = p.device(dma_start).expect("SHA is routed");
         assert_eq!(base, SHA_BASE);
@@ -689,12 +696,7 @@ mod tests {
     #[test]
     fn storage_only_blocks_answer_exactly_their_listed_registers() {
         let ctx = &mut Ctx::default();
-        let mut p = Peripherals::new(
-            &SocConfig::default(),
-            Box::new(crate::flash::NorFlash::blank(
-                crate::flash::FlashConfig::default(),
-            )),
-        );
+        let mut p = peripherals(ctx);
         let mut read = |addr: u32| {
             p.device(addr)
                 .and_then(|(device, base)| device.read(ctx, addr - base))
@@ -738,7 +740,7 @@ mod tests {
     #[test]
     fn storage_only_blocks_read_back_what_was_written_through_the_device_tree() {
         let ctx = &mut Ctx::default();
-        let mut p = peripherals();
+        let mut p = peripherals(ctx);
         let svd = svd_regs::esp32c3::addr;
         for (addr, value) in [
             (svd("TIMG0", "WDTCONFIG0"), 0x8000_0000),
@@ -757,12 +759,7 @@ mod tests {
     #[test]
     fn a_software_reset_request_reaches_the_relay() {
         let ctx = &mut Ctx::default();
-        let mut p = Peripherals::new(
-            &SocConfig::default(),
-            Box::new(crate::flash::NorFlash::blank(
-                crate::flash::FlashConfig::default(),
-            )),
-        );
+        let mut p = peripherals(ctx);
         let options0 = svd_regs::esp32c3::addr("RTC_CNTL", "OPTIONS0");
         let (device, base) = p.device(options0).expect("RTC_CNTL is routed");
         assert!(device.write(ctx, options0 - base, 1 << 31));
@@ -780,12 +777,8 @@ mod tests {
 
     #[test]
     fn the_page_shared_by_rtc_cntl_and_the_efuse_splits_at_the_last_two_kib() {
-        let mut p = Peripherals::new(
-            &SocConfig::default(),
-            Box::new(crate::flash::NorFlash::blank(
-                crate::flash::FlashConfig::default(),
-            )),
-        );
+        let ctx = &mut Ctx::default();
+        let mut p = peripherals(ctx);
         let base_of = |p: &mut Peripherals, addr: u32| p.device(addr).map(|(_, base)| base);
         assert_eq!(base_of(&mut p, 0x6000_8000), Some(RTC_CNTL_BASE));
         assert_eq!(base_of(&mut p, 0x6000_87FC), Some(RTC_CNTL_BASE));

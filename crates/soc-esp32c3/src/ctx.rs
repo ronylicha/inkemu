@@ -66,6 +66,8 @@ pub enum Event {
     MmuFault { vaddr: u32, content: u32 },
     /// To `EXTMEM`: a store reached a flash window.
     FlashWindowStore { instruction_bus: bool },
+    /// Wake-up of the SYSTIMER: one of its comparators may have an alarm due.
+    Systimer,
 }
 
 /// The wake-up a device keeps for its next deadline.

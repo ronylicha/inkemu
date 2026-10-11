@@ -101,13 +101,15 @@ const fn size_mask(size: AccessSize) -> u32 {
 impl SocBus {
     #[must_use]
     pub fn new(rom: RomImage, flash: Box<dyn FlashDevice>, config: &SocConfig) -> SocBus {
+        let mut ctx = Ctx::new(config.strict_mmio);
+        let periph = Peripherals::new(config, flash, &mut ctx);
         SocBus {
             rom,
             sram: Ram::new(SRAM_DBUS_BASE, SRAM_SIZE as usize),
             sram0: Ram::new(SRAM0_BASE, SRAM0_SIZE as usize),
             rtc: Ram::new(RTC_RAM_BASE, RTC_RAM_SIZE as usize),
-            periph: Peripherals::new(config, flash),
-            ctx: Ctx::new(config.strict_mmio),
+            periph,
+            ctx,
         }
     }
 
