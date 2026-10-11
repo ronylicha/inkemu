@@ -2,6 +2,7 @@
 pub mod exit;
 pub mod flash_file;
 pub mod inspect;
+pub mod reader;
 pub mod rom_store;
 pub mod run;
 pub mod rvtest;

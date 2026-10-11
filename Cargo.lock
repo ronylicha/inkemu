@@ -308,6 +308,7 @@ dependencies = [
  "firmware",
  "flate2",
  "goblin",
+ "nix",
  "predicates",
  "sha2",
  "soc-esp32c3",

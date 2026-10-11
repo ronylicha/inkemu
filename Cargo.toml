@@ -23,6 +23,7 @@ md-5 = "0.11"
 roxmltree = "0.21"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3.5"
+nix = { version = "0.31", default-features = false, features = ["poll"] }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 goblin = { version = "0.10", default-features = false, features = ["std", "elf32", "elf64", "endian_fd"] }

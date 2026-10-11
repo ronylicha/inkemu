@@ -28,6 +28,10 @@ flate2.workspace = true
 tar.workspace = true
 etcetera.workspace = true
 
+# `poll`, to learn that the reader of standard output went away while a run prints nothing.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true

@@ -678,6 +678,150 @@ fn a_device_time_limit_ends_the_run_of_a_firmware_that_sleeps() {
     assert!(console.ends_with("entry 0x40380000\n"), "{console}");
 }
 
+/// A run of the binary whose output is read while it goes on, for the tests that act on a run in
+/// progress. Every wait has a limit, and a run still going when its test ends is killed.
+#[cfg(unix)]
+mod live {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    pub struct Live {
+        child: Child,
+        /// The lines of standard output, as they come.
+        lines: Receiver<String>,
+        stderr: Option<JoinHandle<String>>,
+    }
+
+    /// Starts `command`. Its standard output is read line by line on a thread of its own; the
+    /// thread stops reading, and closes its end of the pipe, after the first line for which
+    /// `reader_leaves_after` says yes: from then on the run has no reader.
+    pub fn start(
+        mut command: Command,
+        reader_leaves_after: impl Fn(&str) -> bool + Send + 'static,
+    ) -> Live {
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, lines) = channel();
+        std::thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let mut line = Vec::new();
+                if stdout.read_until(b'\n', &mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let line = String::from_utf8_lossy(&line).into_owned();
+                let leaves = reader_leaves_after(&line);
+                // A test that stopped listening does not need the line.
+                let _ = sender.send(line);
+                if leaves {
+                    return;
+                }
+            }
+        });
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr = std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = stderr.read_to_end(&mut text);
+            String::from_utf8_lossy(&text).into_owned()
+        });
+        Live {
+            child,
+            lines,
+            stderr: Some(stderr),
+        }
+    }
+
+    impl Live {
+        /// Waits until a line of standard output contains `text`.
+        pub fn wait_for_line(&self, text: &str, limit: Duration) {
+            let deadline = Instant::now() + limit;
+            let mut seen = String::new();
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.lines.recv_timeout(left) {
+                    Ok(line) if line.contains(text) => return,
+                    Ok(line) => seen.push_str(&line),
+                    Err(RecvTimeoutError::Timeout) => {
+                        panic!("no line with `{text}` within {limit:?}; standard output:\n{seen}")
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        panic!("standard output ended without a line with `{text}`:\n{seen}")
+                    }
+                }
+            }
+        }
+
+        /// Waits for the run to end by itself: its exit code and what it wrote on standard error.
+        pub fn finish(mut self, limit: Duration) -> (Option<i32>, String) {
+            let deadline = Instant::now() + limit;
+            let status = loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the run did not end within {limit:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let log = self.stderr.take().unwrap().join().unwrap();
+            (status.code(), log)
+        }
+    }
+
+    impl Drop for Live {
+        fn drop(&mut self) {
+            // Nothing to do for a run that has ended; one that has not must not outlive its test.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// `inkemu run --device x4` on `flash` with the real ROM, to be started by [`live::start`].
+#[cfg(unix)]
+fn run_of(rom_dir: &str, flash: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_inkemu"));
+    command
+        .args(["run", "--device", "x4", "--rom-dir", rom_dir, "--flash"])
+        .arg(flash);
+    command
+}
+
+/// `inkemu run firmware.bin | head`, with a firmware that prints nothing: no write ever fails,
+/// and the run must still end once nobody reads it. No limit is given: only the reader that
+/// went away can end this run.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_run_that_prints_nothing_more_ends_when_the_reader_of_its_output_goes_away() {
+    const LAST_ROM_LINE: &str = "entry 0x40380000";
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    // A second stage that stops the watchdogs and spins: silent and busy for ever.
+    let mut program = stop_watchdogs();
+    program.push(HANG);
+    let (_dir, flash) = flash_image_of(&program);
+    let run = live::start(run_of(&rom_dir, &flash), |line| {
+        line.contains(LAST_ROM_LINE)
+    });
+    let limit = std::time::Duration::from_secs(60);
+    run.wait_for_line(LAST_ROM_LINE, limit);
+    let (code, log) = run.finish(limit);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("inkemu: the reader of standard output went away\ninkemu: stopped at pc "),
+        "{log}"
+    );
+}
+
 /// The milestone through the real command: ROM, bootloader, the whole life of the application,
 /// its restart and the first line of the second boot, with nothing unmodelled.
 #[test]

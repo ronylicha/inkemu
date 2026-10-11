@@ -80,7 +80,7 @@ jobs:
         # un-ignored test would otherwise leave this job green with nothing proven.
         run: |
           tools/ci/run-ignored-tests.sh 18 --release -p soc-esp32c3 --test real_rom -- --ignored
-          tools/ci/run-ignored-tests.sh 6 --release -p emu-cli --test run_cli -- --ignored --skip x4_boots_the_reference_firmware
+          tools/ci/run-ignored-tests.sh 7 --release -p emu-cli --test run_cli -- --ignored --skip x4_boots_the_reference_firmware
   reference-boot:
     # Boots the reference firmware (stock ESP-IDF bootloader + hello_world) from the real mask ROM to
     # the first line of the application. The firmware is built here, inside the pinned ESP-IDF image,

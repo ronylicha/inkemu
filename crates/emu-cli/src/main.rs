@@ -288,10 +288,28 @@ fn run_device(
         &mut machine,
         run_options,
         &interrupt,
+        &stdout_reader_gone,
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     );
     ExitCode::from(end.exit_code())
+}
+
+/// Whether whoever was reading standard output went away (`inkemu run | head`, once `head` has
+/// what it wanted). A run that prints learns it from the write that fails; this is for the run
+/// whose firmware prints nothing, which would otherwise go on for nobody.
+#[cfg(unix)]
+fn stdout_reader_gone() -> bool {
+    use std::os::fd::AsFd as _;
+    emu_cli::reader::is_gone(io::stdout().as_fd())
+}
+
+/// On the systems where the question cannot be asked without writing, the answer is always no: a
+/// run that prints nothing and whose reader left goes on until `--max-cycles`, `--max-time` or
+/// Ctrl-C ends it.
+#[cfg(not(unix))]
+fn stdout_reader_gone() -> bool {
+    false
 }
 
 /// Makes Ctrl-C end the run at the next slice, with its summary. A second Ctrl-C ends the process
