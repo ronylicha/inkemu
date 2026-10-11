@@ -1,10 +1,14 @@
 //! Device profiles: what a board is made of, as data.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 use serde::Deserialize;
-use soc_esp32c3::flash::{FlashConfig, FlashImageError, JedecId};
+use soc_esp32c3::flash::{
+    FlashConfig, FlashConfigError, FlashImageError, JedecId, MAX_FLASH_BYTES, MIB, MIN_FLASH_BYTES,
+};
 use soc_esp32c3::{ChipRevision, Esp32C3, RomImage, SocConfig};
+use std::fmt;
 
-const MIB: u32 = 1 << 20;
+/// How to write the `jedec_id` key, for the messages that refuse one.
+const JEDEC_ID_FORM: &str = "write jedec_id as 0xMMTTCC (manufacturer, type, capacity)";
 
 const BUILTIN: [(&str, &str); 2] = [
     ("x3", include_str!("../profiles/x3.toml")),
@@ -47,6 +51,11 @@ pub struct MachineOptions {
 pub enum ProfileError {
     #[error("{origin}: {detail}; correct the device profile")]
     Parse { origin: String, detail: String },
+    #[error(
+        "{origin}: the profile has no [flash] table; add one with its two keys: size_mib ({sizes}) and jedec_id (0xMMTTCC, the three bytes the chip answers to a read-id command)",
+        sizes = flash_sizes_mib()
+    )]
+    MissingFlash { origin: String },
     #[error("no device named `{id}`; choose one of: {known}")]
     UnknownDevice { id: String, known: String },
     #[error(
@@ -66,7 +75,8 @@ struct RawProfile {
     id: String,
     name: String,
     soc: RawSoc,
-    flash: RawFlash,
+    /// Optional here so that its absence gets a message that names the table and its keys.
+    flash: Option<RawFlash>,
 }
 
 #[derive(Deserialize)]
@@ -86,23 +96,68 @@ struct RawFlash(FlashConfig);
 impl TryFrom<UncheckedFlash> for RawFlash {
     type Error = String;
 
+    /// [`FlashConfig::new`] owns the rules; this turns its refusals into messages that name the
+    /// keys of the profile. A size is refused earlier, by `flash_size`, with its own line.
     fn try_from(raw: UncheckedFlash) -> Result<RawFlash, String> {
-        // INVARIANT: `flash_size` accepted at most 16, so the product fits a `u32`.
-        let config = FlashConfig {
-            size: raw.size_mib * MIB,
-            jedec_id: raw.jedec_id,
-        };
-        // The third JEDEC byte is log2 of the capacity: a profile that contradicts itself would make
-        // the bootloader and the flash driver disagree about the size.
-        if raw.jedec_id.capacity_bytes() != Some(config.size) {
-            return Err(format!(
-                "the flash is {} MiB but the JEDEC id {:#08x} ends with capacity byte {:#04x}, which stands for another size; make size_mib and the last byte of jedec_id agree (0x14 = 1 MiB … 0x18 = 16 MiB)",
-                raw.size_mib,
-                raw.jedec_id.to_u24(),
-                raw.jedec_id.capacity
-            ));
-        }
-        Ok(RawFlash(config))
+        let size = raw
+            .size_mib
+            .checked_mul(MIB)
+            .ok_or_else(|| unmodelable_size(i64::from(raw.size_mib)))?;
+        FlashConfig::new(size, raw.jedec_id)
+            .map(RawFlash)
+            .map_err(|refusal| match refusal {
+                FlashConfigError::BadSize { .. } => unmodelable_size(i64::from(raw.size_mib)),
+                // The third JEDEC byte is log2 of the capacity: a profile that contradicts itself
+                // would make the bootloader and the flash driver disagree about the size.
+                FlashConfigError::CapacityMismatch { id, capacity, .. } => format!(
+                    "the flash is {} MiB but the JEDEC id {id:#08x} ends with capacity byte {capacity:#04x}, which stands for another size; make size_mib and the last byte of jedec_id agree (0x14 = 1 MiB … 0x18 = 16 MiB)",
+                    raw.size_mib
+                ),
+            })
+    }
+}
+
+/// The flash sizes the machine models, in MiB, as a message lists them: "1, 2, 4, 8 or 16".
+fn flash_sizes_mib() -> String {
+    let sizes: Vec<String> =
+        std::iter::successors(Some(MIN_FLASH_BYTES), |size| size.checked_mul(2))
+            .take_while(|&size| size <= MAX_FLASH_BYTES)
+            .filter(|&size| FlashConfig::size_is_valid(size))
+            .map(|size| (size / MIB).to_string())
+            .collect();
+    match sizes.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        Some((only, _)) => only.clone(),
+        None => String::new(),
+    }
+}
+
+fn unmodelable_size(mib: i64) -> String {
+    format!(
+        "a flash of {mib} MiB cannot be modelled; write size_mib as {}",
+        flash_sizes_mib()
+    )
+}
+
+/// A TOML integer. Any other type is refused with `how`, the way to write the key, as the remedy.
+struct WholeNumber {
+    how: String,
+}
+
+impl serde::de::Visitor<'_> for WholeNumber {
+    type Value = i64;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "a whole number; {}", self.how)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<i64, E> {
+        Ok(value)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<i64, E> {
+        // Past `i64::MAX` the exact value no longer matters: no key accepts it.
+        Ok(i64::try_from(value).unwrap_or(i64::MAX))
     }
 }
 
@@ -125,31 +180,33 @@ fn profile_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Strin
 
 /// `size_mib`, validated where the TOML error can still carry its line. The result is in MiB.
 fn flash_size<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
-    let mib = u32::deserialize(deserializer)?;
-    let valid = mib.checked_mul(MIB).is_some_and(|size| {
-        FlashConfig {
-            size,
-            jedec_id: JedecId::QEMU_ORACLE,
-        }
-        .validate()
-        .is_ok()
-    });
-    if valid {
-        Ok(mib)
-    } else {
-        Err(serde::de::Error::custom(format!(
-            "a flash of {mib} MiB cannot be modelled; write size_mib as 1, 2, 4, 8 or 16"
-        )))
-    }
+    let written = deserializer.deserialize_any(WholeNumber {
+        how: format!("write size_mib as {}", flash_sizes_mib()),
+    })?;
+    u32::try_from(written)
+        .ok()
+        .filter(|mib| mib.checked_mul(MIB).is_some_and(FlashConfig::size_is_valid))
+        .ok_or_else(|| serde::de::Error::custom(unmodelable_size(written)))
 }
 
 fn jedec_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<JedecId, D::Error> {
-    let raw = u32::deserialize(deserializer)?;
-    JedecId::from_u24(raw).ok_or_else(|| {
-        serde::de::Error::custom(format!(
-            "the JEDEC id {raw:#x} does not fit three bytes; write it as 0xMMTTCC (manufacturer, type, capacity)"
-        ))
-    })
+    let written = deserializer.deserialize_any(WholeNumber {
+        how: JEDEC_ID_FORM.to_owned(),
+    })?;
+    u32::try_from(written)
+        .ok()
+        .and_then(JedecId::from_u24)
+        .ok_or_else(|| {
+            // A negative id is shown in decimal, as it was most likely written.
+            let shown = if written < 0 {
+                written.to_string()
+            } else {
+                format!("{written:#x}")
+            };
+            serde::de::Error::custom(format!(
+                "the JEDEC id {shown} does not fit three bytes; {JEDEC_ID_FORM}"
+            ))
+        })
 }
 
 #[derive(Deserialize)]
@@ -189,18 +246,22 @@ pub fn builtin(id: &str) -> Result<DeviceProfile, ProfileError> {
 
 impl DeviceProfile {
     /// # Errors
-    /// [`ProfileError::Parse`] with the line of the first problem.
+    /// [`ProfileError::Parse`] with the line of the first problem, or
+    /// [`ProfileError::MissingFlash`] when the profile has no `[flash]` table.
     pub fn from_toml(origin: &str, text: &str) -> Result<DeviceProfile, ProfileError> {
         let raw: RawProfile = toml::from_str(text).map_err(|e| ProfileError::Parse {
             origin: origin.to_owned(),
             detail: e.to_string().trim_end().to_owned(),
+        })?;
+        let RawFlash(flash) = raw.flash.ok_or_else(|| ProfileError::MissingFlash {
+            origin: origin.to_owned(),
         })?;
         Ok(DeviceProfile {
             id: raw.id,
             name: raw.name,
             soc: raw.soc.family,
             chip_revision: raw.soc.revision,
-            flash: raw.flash.0,
+            flash,
         })
     }
 
@@ -281,9 +342,9 @@ mod tests {
             assert_eq!(profile.soc, SocFamily::Esp32C3);
             assert_eq!(profile.chip_revision, ChipRevision::V0_3);
             assert!(profile.name.starts_with("Xteink"));
-            assert_eq!(profile.flash.size, 16 << 20, "spec §2: 16 MB of flash");
+            assert_eq!(profile.flash.size(), 16 << 20, "spec §2: 16 MB of flash");
             assert_eq!(
-                profile.flash.jedec_id,
+                profile.flash.jedec_id(),
                 soc_esp32c3::JedecId::QEMU_ORACLE,
                 "decision D2"
             );
@@ -390,40 +451,101 @@ mod tests {
     #[test]
     fn valid_profile_carries_its_flash() {
         let profile = DeviceProfile::from_toml("demo.toml", VALID).unwrap();
-        assert_eq!(profile.flash.size, 4 << 20);
-        assert_eq!(profile.flash.jedec_id.bytes(), [0xEF, 0x40, 0x16]);
+        assert_eq!(profile.flash.size(), 4 << 20);
+        assert_eq!(profile.flash.jedec_id().bytes(), [0xEF, 0x40, 0x16]);
     }
 
     #[test]
     fn flash_size_must_be_a_power_of_two_up_to_16_mib() {
-        for bad in ["0", "3", "32", "-4", "\"16MB\""] {
+        for bad in ["0", "3", "32", "-4", "4.0", "\"16MB\"", "4294967296"] {
             let err = error_for(&with_line(9, &format!("size_mib = {bad}")));
-            assert!(err.contains("line 9"), "{bad}: {err}");
+            assert!(
+                err.contains("line 9") && err.contains("; write size_mib as 1, 2, 4, 8 or 16"),
+                "{bad}: {err}"
+            );
         }
-        let err = error_for(&with_line(9, "size_mib = 3"));
-        assert!(err.contains("1, 2, 4, 8 or 16"), "{err}");
+        // The cause names what was written.
+        for (bad, cause) in [
+            ("3", "a flash of 3 MiB cannot be modelled"),
+            ("-4", "a flash of -4 MiB cannot be modelled"),
+            ("4.0", "floating point `4.0`"),
+            ("\"16MB\"", "string \"16MB\""),
+        ] {
+            let err = error_for(&with_line(9, &format!("size_mib = {bad}")));
+            assert!(err.contains(cause), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_list_of_sizes_in_the_remedy_is_every_size_the_machine_models() {
+        let listed = flash_sizes_mib();
+        assert_eq!(listed, "1, 2, 4, 8 or 16");
+        for mib in 0..=64u32 {
+            let named = listed
+                .replace(" or ", ", ")
+                .split(", ")
+                .any(|size| size == mib.to_string());
+            assert_eq!(named, FlashConfig::size_is_valid(mib * MIB), "{mib} MiB");
+        }
     }
 
     #[test]
     fn jedec_id_must_be_three_bytes() {
-        let err = error_for(&with_line(10, "jedec_id = 0x1EF4016"));
-        assert!(err.contains("line 10") && err.contains("0xMMTTCC"), "{err}");
+        for bad in ["0x1EF4016", "-1", "9.5", "\"0x9D6018\""] {
+            let err = error_for(&with_line(10, &format!("jedec_id = {bad}")));
+            assert!(
+                err.contains("line 10")
+                    && err.contains("; write jedec_id as 0xMMTTCC (manufacturer, type, capacity)"),
+                "{bad}: {err}"
+            );
+        }
+        for (bad, cause) in [
+            (
+                "0x1EF4016",
+                "the JEDEC id 0x1ef4016 does not fit three bytes",
+            ),
+            ("-1", "the JEDEC id -1 does not fit three bytes"),
+            ("\"0x9D6018\"", "string \"0x9D6018\""),
+        ] {
+            let err = error_for(&with_line(10, &format!("jedec_id = {bad}")));
+            assert!(err.contains(cause), "{bad}: {err}");
+        }
     }
 
     #[test]
     fn jedec_capacity_must_match_the_flash_size() {
-        // 0x16 is 4 MiB; the profile says 8.
+        // 0x16 is 4 MiB; the profile says 8. The two keys disagree with each other, so the error
+        // points at the table that holds both: `[flash]` is line 8 of `VALID`.
         let err = error_for(&with_line(9, "size_mib = 8"));
         assert!(
-            err.contains("line ") && err.contains("capacity byte 0x16") && err.contains("8 MiB"),
+            err.contains("line 8")
+                && err.contains(
+                    "the flash is 8 MiB but the JEDEC id 0xef4016 ends with capacity byte 0x16"
+                )
+                && err.contains("; make size_mib and the last byte of jedec_id agree"),
             "{err}"
         );
     }
 
     #[test]
-    fn the_flash_table_is_required() {
+    fn the_flash_table_is_required_and_the_error_names_it_with_its_keys() {
         let without = VALID.split("\n[flash]").next().unwrap();
-        assert!(error_for(without).contains("flash"));
+        let err = DeviceProfile::from_toml("demo.toml", without).unwrap_err();
+        assert_eq!(
+            err,
+            ProfileError::MissingFlash {
+                origin: "demo.toml".into()
+            }
+        );
+        let text = err.to_string();
+        assert!(
+            text.starts_with("demo.toml: the profile has no [flash] table; add one")
+                && text.contains("size_mib")
+                && text.contains("1, 2, 4, 8 or 16")
+                && text.contains("jedec_id")
+                && text.contains("0xMMTTCC"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -506,13 +628,23 @@ mod tests {
             for id in ids {
                 let text = with_line(9, &format!("size_mib = {size}"))
                     .replace("jedec_id = 0xEF4016", &format!("jedec_id = {id}"));
-                if let Ok(profile) = DeviceProfile::from_toml("demo.toml", &text) {
-                    assert!(profile.flash.validate().is_ok(), "{size} MiB {id}");
-                    assert_eq!(
-                        profile.flash.jedec_id.capacity_bytes(),
-                        Some(profile.flash.size),
-                        "{size} MiB {id}"
-                    );
+                // The oracle is computed from the text alone, independently of the loader.
+                let jedec = u32::from_str_radix(&id[2..], 16).unwrap();
+                let consistent = size.parse::<u32>().is_ok_and(|mib| {
+                    mib.is_power_of_two()
+                        && mib <= 16
+                        && 1u32.checked_shl(jedec & 0xFF) == Some(mib << 20)
+                });
+                let loaded = DeviceProfile::from_toml("demo.toml", &text);
+                assert_eq!(
+                    loaded.is_ok(),
+                    consistent,
+                    "{size} MiB {id}: the loader and the oracle disagree ({loaded:?})"
+                );
+                if let Ok(profile) = loaded {
+                    let mib: u32 = size.parse().unwrap();
+                    assert_eq!(profile.flash.size(), mib << 20, "{size} MiB {id}");
+                    assert_eq!(profile.flash.jedec_id().to_u24(), jedec, "{size} MiB {id}");
                     // The machine accepts it, with a smaller image and through both entry points.
                     let options = MachineOptions::default();
                     let machine = profile.instantiate(flat_rom(&[HANG]), options);
@@ -522,14 +654,6 @@ mod tests {
                             .instantiate_with_flash(flat_rom(&[HANG]), vec![0xE9; 8], options)
                             .is_ok()
                     );
-                } else {
-                    let consistent = size.parse::<u32>().is_ok_and(|mib| {
-                        let jedec = u32::from_str_radix(&id[2..], 16).unwrap();
-                        mib.is_power_of_two()
-                            && mib <= 16
-                            && 1u32.checked_shl(jedec & 0xFF) == Some(mib << 20)
-                    });
-                    assert!(!consistent, "{size} MiB {id} is valid yet was refused");
                 }
             }
         }

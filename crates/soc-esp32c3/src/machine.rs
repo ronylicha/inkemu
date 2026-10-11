@@ -53,7 +53,7 @@ impl Esp32C3 {
     /// A machine whose flash holds `image` from offset 0; what the image does not cover is erased.
     ///
     /// # Errors
-    /// [`FlashImageError`] when the image is longer than the flash or the flash size is not valid.
+    /// [`FlashImageError`] when the image is longer than the flash.
     pub fn with_flash(
         rom: RomImage,
         image: Vec<u8>,
@@ -250,7 +250,7 @@ mod tests {
     fn a_machine_can_be_built_around_a_flash_image_and_refuses_one_that_is_too_long() {
         let config = SocConfig::default();
         assert!(Esp32C3::with_flash(flat_rom(&[HANG]), vec![0xE9; 64], &config).is_ok());
-        let too_long = vec![0u8; config.flash.size as usize + 1];
+        let too_long = vec![0u8; config.flash.size() as usize + 1];
         let err = Esp32C3::with_flash(flat_rom(&[HANG]), too_long, &config).unwrap_err();
         assert!(
             matches!(err, crate::flash::FlashImageError::TooLong { .. }),

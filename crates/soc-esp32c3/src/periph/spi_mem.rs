@@ -522,7 +522,7 @@ mod tests {
 
     impl FlashDevice for Recorder {
         fn size(&self) -> u32 {
-            FlashConfig::default().size
+            FlashConfig::default().size()
         }
         fn read(&self, _offset: u32, out: &mut [u8]) {
             out.fill(0xFF);

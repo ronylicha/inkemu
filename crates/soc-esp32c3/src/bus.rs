@@ -812,11 +812,13 @@ mod tests {
 
     #[test]
     fn page_beyond_the_flash_is_reported() {
+        // A 1 MiB chip answers capacity byte 0x14: the config type refuses any other pairing.
+        let one_mib = crate::flash::JedecId {
+            capacity: 0x14,
+            ..crate::flash::JedecId::QEMU_ORACLE
+        };
         let small = SocConfig {
-            flash: crate::flash::FlashConfig {
-                size: 1 << 20,
-                ..crate::flash::FlashConfig::default()
-            },
+            flash: crate::flash::FlashConfig::new(1 << 20, one_mib).unwrap(),
             ..SocConfig::default()
         };
         let flash = NorFlash::with_image(vec![0xAB; 16], small.flash).unwrap();

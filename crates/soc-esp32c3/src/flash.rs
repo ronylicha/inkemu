@@ -4,9 +4,11 @@ use std::fmt;
 
 /// An erased NOR flash byte.
 pub const ERASED: u8 = 0xFF;
-pub const MIN_FLASH_BYTES: u32 = 1 << 20;
+/// One mebibyte, the unit device profiles write flash sizes in.
+pub const MIB: u32 = 1 << 20;
+pub const MIN_FLASH_BYTES: u32 = MIB;
 /// The MMU names flash pages of 64 KiB with 8 bits (report CM §1): 16 MiB at most.
-pub const MAX_FLASH_BYTES: u32 = 16 << 20;
+pub const MAX_FLASH_BYTES: u32 = 16 * MIB;
 
 /// Release from power-down: the first command of the ROM (`SPI_WakeUp`, FB §B.4).
 const OP_RES: u8 = 0xAB;
@@ -79,20 +81,85 @@ impl JedecId {
     }
 }
 
+/// The flash chip of a device: its size and the id it answers. A value of this type always
+/// describes a chip the machine can model and whose two fields agree, because
+/// [`FlashConfig::new`] is the only way to build one:
+///
+/// - the size is a power of two from 1 MiB to 16 MiB;
+/// - the capacity byte of the JEDEC id is `log2` of the size.
+///
+/// Known limit of the second rule: it is the one ESP-IDF's generic flash driver assumes
+/// (`1 << (id & 0xFF)`), and some real parts do not follow it (Macronix MX25U encodes its capacity
+/// as `0x37`, `0x38`). A profile for such a part needs a rule of its own here. The part of a
+/// retail Xteink X4 is not established.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlashConfig {
+    size: u32,
+    jedec_id: JedecId,
+}
+
+/// Why a size and a JEDEC id do not describe a flash chip this model can have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FlashConfigError {
+    #[error(
+        "a flash of {size} bytes cannot be modelled: the size must be a power of two from 1 MiB to 16 MiB; correct the flash size of the device profile"
+    )]
+    BadSize { size: u32 },
+    #[error(
+        "the flash is {size} bytes but the JEDEC id {id:#08x} ends with capacity byte {capacity:#04x}, which stands for another size; make the size and the last byte of the id agree (0x14 = 1 MiB … 0x18 = 16 MiB)"
+    )]
+    CapacityMismatch { size: u32, id: u32, capacity: u8 },
+}
+
+impl FlashConfig {
+    /// 16 MiB (spec §2: every Xteink device) with the id of the QEMU oracle.
+    pub const QEMU_ORACLE_16_MIB: FlashConfig =
+        match FlashConfig::new(MAX_FLASH_BYTES, JedecId::QEMU_ORACLE) {
+            Ok(config) => config,
+            // INVARIANT: evaluated at compile time; capacity byte 0x18 is log2 of 16 MiB.
+            Err(_) => panic!("the default flash configuration is valid"),
+        };
+
+    /// # Errors
+    /// [`FlashConfigError::BadSize`] when `size` is not a power of two from 1 MiB to 16 MiB;
+    /// otherwise [`FlashConfigError::CapacityMismatch`] when the capacity byte of `jedec_id` is not
+    /// `log2(size)`.
+    pub const fn new(size: u32, jedec_id: JedecId) -> Result<FlashConfig, FlashConfigError> {
+        if !FlashConfig::size_is_valid(size) {
+            return Err(FlashConfigError::BadSize { size });
+        }
+        match jedec_id.capacity_bytes() {
+            Some(capacity) if capacity == size => Ok(FlashConfig { size, jedec_id }),
+            _ => Err(FlashConfigError::CapacityMismatch {
+                size,
+                id: jedec_id.to_u24(),
+                capacity: jedec_id.capacity,
+            }),
+        }
+    }
+
+    /// Whether a chip of `size` bytes can be modelled: a power of two from 1 MiB to 16 MiB. For
+    /// callers that judge a size before they have an id to go with it.
+    #[must_use]
+    pub const fn size_is_valid(size: u32) -> bool {
+        size.is_power_of_two() && size >= MIN_FLASH_BYTES && size <= MAX_FLASH_BYTES
+    }
+
     /// Size of the chip in bytes.
-    pub size: u32,
-    pub jedec_id: JedecId,
+    #[must_use]
+    pub const fn size(&self) -> u32 {
+        self.size
+    }
+
+    #[must_use]
+    pub const fn jedec_id(&self) -> JedecId {
+        self.jedec_id
+    }
 }
 
 impl Default for FlashConfig {
-    /// 16 MiB (spec §2: every Xteink device) with the id of the QEMU oracle.
     fn default() -> FlashConfig {
-        FlashConfig {
-            size: MAX_FLASH_BYTES,
-            jedec_id: JedecId::QEMU_ORACLE,
-        }
+        FlashConfig::QEMU_ORACLE_16_MIB
     }
 }
 
@@ -102,24 +169,6 @@ pub enum FlashImageError {
         "the flash image is {len} bytes, longer than the {size} byte flash of the device; use an image built for this flash size, or a device whose flash is large enough"
     )]
     TooLong { len: usize, size: u32 },
-    #[error(
-        "a flash of {size} bytes cannot be modelled: the size must be a power of two from 1 MiB to 16 MiB; correct the flash size of the device profile"
-    )]
-    BadSize { size: u32 },
-}
-
-impl FlashConfig {
-    /// # Errors
-    /// [`FlashImageError::BadSize`] when the size is not a power of two from 1 MiB to 16 MiB.
-    pub fn validate(&self) -> Result<(), FlashImageError> {
-        let valid =
-            self.size.is_power_of_two() && (MIN_FLASH_BYTES..=MAX_FLASH_BYTES).contains(&self.size);
-        if valid {
-            Ok(())
-        } else {
-            Err(FlashImageError::BadSize { size: self.size })
-        }
-    }
 }
 
 /// One SPI transaction as the chip sees it.
@@ -183,11 +232,11 @@ impl NorFlash {
         }
     }
 
+    /// A chip holding `image` from offset 0.
+    ///
     /// # Errors
-    /// [`FlashImageError::BadSize`] for a size the chip cannot have, [`FlashImageError::TooLong`]
-    /// when the image does not fit.
+    /// [`FlashImageError::TooLong`] when the image does not fit.
     pub fn with_image(image: Vec<u8>, config: FlashConfig) -> Result<NorFlash, FlashImageError> {
-        config.validate()?;
         if u64::try_from(image.len()).unwrap_or(u64::MAX) > u64::from(config.size) {
             return Err(FlashImageError::TooLong {
                 len: image.len(),
@@ -287,10 +336,7 @@ mod tests {
 
     #[test]
     fn an_image_longer_than_the_flash_is_refused_and_one_that_fits_exactly_is_not() {
-        let small = FlashConfig {
-            size: MIN_FLASH_BYTES,
-            ..FlashConfig::default()
-        };
+        let small = FlashConfig::new(MIN_FLASH_BYTES, id_with(0x14)).unwrap();
         assert!(NorFlash::with_image(vec![0; MIB], small).is_ok());
         let err = NorFlash::with_image(vec![0; MIB + 1], small).unwrap_err();
         assert_eq!(
@@ -307,27 +353,96 @@ mod tests {
         );
     }
 
+    /// A JEDEC id whose capacity byte is `capacity`.
+    fn id_with(capacity: u8) -> JedecId {
+        JedecId {
+            capacity,
+            ..JedecId::QEMU_ORACLE
+        }
+    }
+
     #[test]
-    fn only_power_of_two_sizes_from_1_to_16_mib_are_valid() {
-        let with = |size| FlashConfig {
-            size,
-            ..FlashConfig::default()
-        };
-        for size in [1u32 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20] {
-            assert_eq!(with(size).validate(), Ok(()));
-        }
-        for size in [0, 512 << 10, 3 << 20, 32 << 20] {
+    fn a_config_exists_only_for_a_power_of_two_size_from_1_to_16_mib() {
+        for (size, capacity) in [
+            (1u32 << 20, 0x14),
+            (2 << 20, 0x15),
+            (4 << 20, 0x16),
+            (8 << 20, 0x17),
+            (16 << 20, 0x18),
+        ] {
+            assert!(FlashConfig::size_is_valid(size), "{size}");
+            let config = FlashConfig::new(size, id_with(capacity)).unwrap();
             assert_eq!(
-                with(size).validate(),
-                Err(FlashImageError::BadSize { size }),
-                "{size}"
+                (config.size(), config.jedec_id()),
+                (size, id_with(capacity))
             );
-            assert!(NorFlash::with_image(Vec::new(), with(size)).is_err());
         }
+        for size in [0, 1, 512 << 10, 3 << 20, (16 << 20) + 1, 32 << 20, u32::MAX] {
+            assert!(!FlashConfig::size_is_valid(size), "{size}");
+            // The size is judged first: an id that agrees with no valid size changes nothing.
+            for capacity in [0x14, 0x18, 0x19, 0xFF] {
+                assert_eq!(
+                    FlashConfig::new(size, id_with(capacity)),
+                    Err(FlashConfigError::BadSize { size }),
+                    "{size} with capacity byte {capacity:#04x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_config_whose_jedec_capacity_byte_contradicts_its_size_cannot_be_built() {
+        // 0x18 stands for 16 MiB; 0x13 and 0x19 for sizes no chip of this model has; 0x20 and 0xFF
+        // for sizes a `u32` cannot hold.
+        for (size, capacity) in [
+            (8u32 << 20, 0x18u8),
+            (16 << 20, 0x17),
+            (1 << 20, 0x13),
+            (16 << 20, 0x19),
+            (16 << 20, 0x20),
+            (4 << 20, 0xFF),
+            (4 << 20, 0x00),
+        ] {
+            assert_eq!(
+                FlashConfig::new(size, id_with(capacity)),
+                Err(FlashConfigError::CapacityMismatch {
+                    size,
+                    id: id_with(capacity).to_u24(),
+                    capacity
+                }),
+                "{size} with capacity byte {capacity:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_config_is_the_16_mib_chip_of_the_qemu_oracle() {
+        let config = FlashConfig::default();
+        assert_eq!(config, FlashConfig::QEMU_ORACLE_16_MIB);
+        assert_eq!(
+            Ok(config),
+            FlashConfig::new(MAX_FLASH_BYTES, JedecId::QEMU_ORACLE)
+        );
+        assert_eq!(config.jedec_id().capacity_bytes(), Some(config.size()));
+    }
+
+    #[test]
+    fn config_errors_state_the_cause_then_the_remedy() {
+        let bad_size = FlashConfigError::BadSize { size: 3 << 20 }.to_string();
         assert!(
-            FlashImageError::BadSize { size: 0 }
-                .to_string()
-                .contains("; correct the flash size")
+            bad_size.contains("3145728 bytes")
+                && bad_size.contains("; correct the flash size of the device profile"),
+            "{bad_size}"
+        );
+        let mismatch = FlashConfig::new(8 << 20, JedecId::QEMU_ORACLE)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            mismatch.contains("8388608 bytes")
+                && mismatch.contains("JEDEC id 0x9d6018")
+                && mismatch.contains("capacity byte 0x18")
+                && mismatch.contains("; make "),
+            "{mismatch}"
         );
     }
 

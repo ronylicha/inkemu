@@ -25,6 +25,6 @@ pub mod test_support;
 pub use chip::ChipRevision;
 pub use config::SocConfig;
 pub use diag::Diagnostic;
-pub use flash::{FlashConfig, FlashDevice, FlashImageError, JedecId, NorFlash};
+pub use flash::{FlashConfig, FlashConfigError, FlashDevice, FlashImageError, JedecId, NorFlash};
 pub use machine::{ConsoleChannel, Esp32C3, StopReason};
 pub use rom::{RomError, RomImage};

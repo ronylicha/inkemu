@@ -188,9 +188,9 @@ fn profile_for(id: &str) -> Result<DeviceProfile, boards::ProfileError> {
             id: sanitize(&id),
             known,
         },
-        other @ (boards::ProfileError::Parse { .. } | boards::ProfileError::IdMismatch { .. }) => {
-            other
-        }
+        other @ (boards::ProfileError::Parse { .. }
+        | boards::ProfileError::MissingFlash { .. }
+        | boards::ProfileError::IdMismatch { .. }) => other,
     })
 }
 
@@ -208,7 +208,7 @@ fn run_device(
     // The flash file is checked first: refusing it needs no ROM, and no download should start for a
     // run that cannot happen.
     let flash_image = match flash {
-        Some(path) => match flash_file::load(path, profile.flash.size) {
+        Some(path) => match flash_file::load(path, profile.flash.size()) {
             Ok(bytes) => Some((path, bytes)),
             Err(e) => return fail(&e),
         },
@@ -245,9 +245,9 @@ fn run_device(
                 |name| name.to_string_lossy().into_owned()
             )),
             bytes.len(),
-            profile.flash.size >> 20
+            profile.flash.size() >> 20
         ),
-        None => format!("flash: erased ({} MiB)", profile.flash.size >> 20),
+        None => format!("flash: erased ({} MiB)", profile.flash.size() >> 20),
     };
     let mut machine = match flash_image {
         Some((_, bytes)) => match profile.instantiate_with_flash(rom, bytes, machine_options) {
