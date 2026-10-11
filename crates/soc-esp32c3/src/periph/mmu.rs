@@ -157,6 +157,32 @@ mod tests {
     }
 
     #[test]
+    fn offsets_and_indexes_past_the_table_miss_instead_of_wrapping() {
+        /// The last word-aligned register offset a 32-bit address can form.
+        const LAST_WORD: u32 = 0xFFFF_FFFC;
+        let mut mmu = MmuTable::new();
+        for entry in 0..128 {
+            mmu.write(4 * entry, 0); // every entry valid: a hit would be a wrong index
+        }
+        assert_eq!(mmu.translate(0x7F_FFFF), Ok(0xFFFF), "the last byte");
+        for window_offset in [0x80_0000, 0xFFFF_0000, u32::MAX] {
+            assert_eq!(
+                mmu.translate(window_offset),
+                Err(MmuMiss {
+                    entry: window_offset >> 16,
+                    content: MMU_ENTRY_INVALID
+                }),
+                "{window_offset:#x}"
+            );
+        }
+        assert_eq!(mmu.entry(127), Some(0));
+        assert_eq!(mmu.entry(128), None);
+        assert_eq!(mmu.entry(usize::MAX), None);
+        assert_eq!(mmu.read(LAST_WORD), None);
+        assert!(!mmu.write(LAST_WORD, 0));
+    }
+
+    #[test]
     fn every_write_changes_the_generation() {
         let mut mmu = MmuTable::new();
         let first = mmu.generation();

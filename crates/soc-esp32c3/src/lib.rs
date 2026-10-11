@@ -1,8 +1,9 @@
 //! ESP32-C3 system-on-chip model for inkemu.
 //!
-//! It holds the memory map ([`memmap`]), the chip revision ([`chip`]), the CPU clock tree ([`clock`]) and run-time configuration
-//! ([`config`]), the flash chip ([`flash`]), the mask-ROM image built from an Espressif ROM ELF ([`rom`]), the address space that
-//! routes each access to the ROM, the RAMs or a peripheral ([`bus`]), the modelled peripherals
+//! It holds the memory map ([`memmap`]), the chip revision ([`chip`]), the CPU clock tree
+//! ([`clock`]) and run-time configuration ([`config`]), the flash chip ([`flash`]), the mask-ROM
+//! image built from an Espressif ROM ELF ([`rom`]), the address space that routes each access to
+//! the ROM, the RAMs, the flash windows or a peripheral ([`bus`]), the modelled peripherals
 //! ([`periph`]), the diagnostics that report what is not modelled ([`diag`]) and the machine that
 //! runs one hart on all of it ([`machine`]).
 //!

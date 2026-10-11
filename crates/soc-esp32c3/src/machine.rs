@@ -3,7 +3,7 @@ use crate::bus::SocBus;
 use crate::clock;
 use crate::config::SocConfig;
 use crate::diag::{Diagnostic, Unsupported};
-use crate::flash::{FlashImageError, NorFlash};
+use crate::flash::{FlashDevice, FlashImageError, NorFlash};
 use crate::memmap::RESET_PC;
 use crate::rom::RomImage;
 use cpu_rv32::{
@@ -47,7 +47,7 @@ impl Esp32C3 {
     /// instruction.
     #[must_use]
     pub fn new(rom: RomImage, config: &SocConfig) -> Esp32C3 {
-        Esp32C3::build(rom, NorFlash::blank(config.flash), config)
+        Esp32C3::build(rom, Box::new(NorFlash::blank(config.flash)), config)
     }
 
     /// A machine whose flash holds `image` from offset 0; what the image does not cover is erased.
@@ -61,12 +61,12 @@ impl Esp32C3 {
     ) -> Result<Esp32C3, FlashImageError> {
         Ok(Esp32C3::build(
             rom,
-            NorFlash::with_image(image, config.flash)?,
+            Box::new(NorFlash::with_image(image, config.flash)?),
             config,
         ))
     }
 
-    fn build(rom: RomImage, flash: NorFlash, config: &SocConfig) -> Esp32C3 {
+    fn build(rom: RomImage, flash: Box<dyn FlashDevice>, config: &SocConfig) -> Esp32C3 {
         // Misaligned loads and stores are performed, not trapped. Evidence: the rev0 mask ROM's `_init`
         // executes `lw t0,0(a5)` at pc 0x40001e00 from address 0x40058c3e (2 mod 4), the first byte
         // after `.wifi0iram.3` where the linker placed the initial `.data` image, so real silicon
@@ -79,9 +79,11 @@ impl Esp32C3 {
             misaligned: MisalignedPolicy::Allow,
             vendor_csrs: VendorCsrs::Esp32C3,
         };
-        let bus = SocBus::new(rom, Box::new(flash), config);
+        let bus = SocBus::new(rom, flash, config);
         let (sysclk_conf, cpu_per_conf) = bus.periph.system.clock_registers();
-        // The reset values select the crystal, for which a frequency always exists.
+        // INVARIANT: the reset values of the two clock registers select the crystal with a divider
+        // of 2 (decision D21), for which a frequency always exists: 20 MHz. The fallback is never
+        // taken; it is the undivided crystal, 40 MHz, and not the reset frequency.
         let frequency = clock::cpu_frequency(sysclk_conf, cpu_per_conf).unwrap_or(clock::XTAL);
         Esp32C3 {
             hart: Hart::new(RESET_PC, hart_config),
@@ -544,6 +546,84 @@ mod tests {
             }
         );
         assert_eq!(m.cpu_frequency().hz(), 20_000_000);
+    }
+
+    /// A flash chip whose content the test can change behind the machine's back, which the real
+    /// read-only chip never does: the only way to see decoded code being dropped.
+    #[derive(Debug)]
+    struct SharedFlash(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl FlashDevice for SharedFlash {
+        fn size(&self) -> u32 {
+            SocConfig::default().flash.size()
+        }
+        fn read(&self, offset: u32, out: &mut [u8]) {
+            let content = self.0.borrow();
+            for (byte, index) in out.iter_mut().zip(offset as usize..) {
+                *byte = content.get(index).copied().unwrap_or(crate::flash::ERASED);
+            }
+        }
+        fn execute(
+            &mut self,
+            command: &crate::flash::FlashCommand<'_>,
+            _data_in: &mut [u8],
+        ) -> Result<(), crate::flash::UnmodeledCommand> {
+            Err(crate::flash::UnmodeledCommand {
+                opcode: command.opcode,
+            })
+        }
+    }
+
+    #[test]
+    fn a_write_to_either_cache_control_register_drops_the_code_decoded_from_the_flash_window() {
+        use cpu_rv32::asm::jalr;
+        const A0: u8 = 10;
+        const RA: u8 = 1;
+        const T2: u8 = 7;
+        const S0: u8 = 8;
+        // The flash holds `li a0, <value>; ret` at offset 0.
+        let function = |value: i32| -> Vec<u8> {
+            [addi(A0, 0, value), jalr(0, RA, 0)]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect()
+        };
+        for register in ["ICACHE_CTRL", "ICACHE_CTRL1"] {
+            let cache_control = svd_regs::esp32c3::addr("EXTMEM", register);
+            let mut program = vec![
+                lui(T0, crate::periph::mmu::MMU_TABLE_BASE),
+                lui(T2, crate::memmap::FLASH_IBUS_BASE),
+                lui(S0, SRAM_DBUS_BASE),
+                sw(0, T0, 0),    // entry 0 = flash page 0
+                jalr(RA, T2, 0), // decodes the function: a0 = 1
+                sw(A0, S0, 0),
+                HANG,
+            ];
+            let second_part = u32::try_from(4 * program.len()).unwrap();
+            program.extend([jalr(RA, T2, 0), sw(A0, S0, 4)]);
+            program.extend(store(cache_control, 1));
+            program.extend([jalr(RA, T2, 0), sw(A0, S0, 8), HANG]);
+
+            let content = std::rc::Rc::new(std::cell::RefCell::new(function(1)));
+            let flash = SharedFlash(std::rc::Rc::clone(&content));
+            let mut m = Esp32C3::build(flat_rom(&program), Box::new(flash), &SocConfig::default());
+            m.run_until(Cycles(200));
+            // The content changes without the bus knowing; the machine resumes after the first part.
+            *content.borrow_mut() = function(2);
+            m.hart.pc = ROM_BASE + second_part;
+            m.run_until(Cycles(m.cycles().get() + 200));
+            assert_eq!(m.drain_diagnostics(), Vec::new(), "{register}");
+            assert_eq!(
+                (
+                    bus_word(&mut m, SRAM_DBUS_BASE),
+                    // The control of the experiment: nothing has invalidated the decoded code yet.
+                    bus_word(&mut m, SRAM_DBUS_BASE + 4),
+                    bus_word(&mut m, SRAM_DBUS_BASE + 8)
+                ),
+                (1, 1, 2),
+                "the write to {register} must make the next call decode the flash again"
+            );
+        }
     }
 
     #[test]

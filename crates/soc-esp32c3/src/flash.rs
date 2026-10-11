@@ -286,8 +286,9 @@ impl FlashDevice for NorFlash {
             }
             OP_RDSR => data_in.fill(if self.write_enabled { STATUS_WEL } else { 0 }),
             // ASSUMPTION: the modelled part exposes no SFDP table and answers erased bytes. The
-            // bootloader only checks that byte 0x10 is not the XMC manufacturer id (BA §2.2). What
-            // the QEMU oracle answers is not recorded: the SP1b-4 lockstep settles it.
+            // bootloader only checks that byte 0x10 is not the XMC manufacturer id (BA §2.2). The
+            // flash of the QEMU oracle rejects the command (`Unknown cmd 5a`), so the lockstep must
+            // mask this read; the SFDP table of the real part, read on a device, settles the bytes.
             OP_SFDP => data_in.fill(ERASED),
             OP_WREN => self.write_enabled = true,
             OP_WRDI => self.write_enabled = false,
@@ -510,6 +511,36 @@ mod tests {
         let mut bytes = [0u8; 4];
         flash.read(0, &mut bytes);
         assert_eq!(bytes, [1, 2, 3, 4], "the content did not change");
+    }
+
+    #[test]
+    fn a_refused_command_leaves_the_receive_buffer_as_it_was() {
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        let mut data_in = [0x5A, 0xA5, 0x3C];
+        assert_eq!(
+            run(&mut flash, 0x03, &mut data_in),
+            Err(UnmodeledCommand { opcode: 0x03 })
+        );
+        assert_eq!(data_in, [0x5A, 0xA5, 0x3C], "nothing was clocked in");
+    }
+
+    #[test]
+    fn a_read_of_no_byte_is_accepted_and_does_nothing() {
+        let flash = NorFlash::with_image(vec![1, 2, 3], FlashConfig::default()).unwrap();
+        flash.read(1, &mut []);
+        flash.read(u32::MAX, &mut []);
+        let mut none: [u8; 0] = [];
+        let mut chip = flash;
+        run(&mut chip, 0x9F, &mut none).unwrap();
+        run(&mut chip, 0x05, &mut none).unwrap();
+    }
+
+    #[test]
+    fn a_read_id_longer_than_the_id_repeats_it() {
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        let mut id = [0u8; 8];
+        run(&mut flash, 0x9F, &mut id).unwrap();
+        assert_eq!(id, [0x9D, 0x60, 0x18, 0x9D, 0x60, 0x18, 0x9D, 0x60]);
     }
 
     #[test]

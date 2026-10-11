@@ -86,12 +86,12 @@ pub mod esp32c3 {
     }
 
     /// The register `peripheral.name`, if the SVD documents it.
+    ///
+    /// A linear scan of the whole table by name: for construction and tests, not for the path of an
+    /// emulated access (that one goes by address, through `lookup`).
     #[must_use]
     pub fn find(peripheral: &str, name: &str) -> Option<&'static RegisterInfo> {
-        match position(peripheral, name) {
-            Some(i) => REGISTERS.get(i),
-            None => None,
-        }
+        position(peripheral, name).and_then(|i| REGISTERS.get(i))
     }
 }
 

@@ -22,8 +22,14 @@ pub struct FlashImageInfo {
     pub entry: u32,
 }
 
-/// Whether `bytes` holds a partition table at offset 0x8000: entries with the entry magic, ended by
-/// an MD5 entry that matches them or by erased bytes. A dump cut inside the table sector counts.
+/// Whether `bytes` holds a partition table at offset 0x8000: at least one whole 32-byte entry with
+/// the entry magic, the entries being ended by an MD5 entry that matches them, by erased bytes, or
+/// by the end of the slice.
+///
+/// A dump cut inside the table sector counts. A slice that ends after N whole entries is a table of
+/// N entries; one that ends inside an entry is judged on the whole entries before it, so a cut
+/// inside the MD5 entry is accepted **without** the MD5 check. The bootloader, which reads the
+/// table from the flash when it runs, is what judges the missing part.
 #[must_use]
 pub fn has_partition_table(bytes: &[u8]) -> bool {
     let start = PARTITION_TABLE_OFFSET as usize;
@@ -197,6 +203,55 @@ mod tests {
     }
 
     #[test]
+    fn every_cut_of_a_full_image_is_judged_by_one_rule_and_none_panics() {
+        // The table starts at 0x8000: six 32-byte entries, then the MD5 entry from 0x80C0 to 0x80E0.
+        const FIRST_WHOLE_ENTRY: usize = 0x8020;
+        let full = build_flash_image(&ImageSpec::default());
+        assert_eq!(full[0x80C0..0x80C2], [0xEB, 0xEB], "the MD5 entry");
+        for len in [
+            0,
+            1,
+            HEADER_LEN - 1,
+            HEADER_LEN, // the header alone
+            HEADER_LEN + 1,
+            0x7FFF,
+            0x8000,
+            0x8001,
+            0x801F,
+            FIRST_WHOLE_ENTRY,
+            0x8021,
+            0x80BF,
+            0x80C0, // the six entries, no MD5 entry
+            0x80D0, // cut inside the MD5 entry: accepted, the MD5 is not checked
+            0x80E0,
+            0x8BFF, // 0xBFF bytes past the start of the table
+            0x8C00,
+        ] {
+            let cut = &full[..len];
+            let table = len >= FIRST_WHOLE_ENTRY;
+            assert_eq!(has_partition_table(cut), table, "{len:#x}");
+            let expected = if len < HEADER_LEN {
+                Err(FirmwareError::FlashImageTooShort { len })
+            } else if table {
+                Ok(())
+            } else {
+                Err(FirmwareError::NoPartitionTable)
+            };
+            assert_eq!(
+                check_flash_image(cut, ChipId::Esp32C3, MIB16).map(|_| ()),
+                expected,
+                "{len:#x}"
+            );
+        }
+        // A corrupted entry is still caught on a cut that holds it whole, MD5 entry or not.
+        let mut corrupted = full.clone();
+        corrupted[0x8000] = 0x00;
+        for len in [FIRST_WHOLE_ENTRY, 0x80C0, 0x80D0, 0x8C00] {
+            assert!(!has_partition_table(&corrupted[..len]), "{len:#x}");
+        }
+    }
+
+    #[test]
     fn a_table_is_recognised_by_its_content_not_by_two_bytes() {
         let full = build_flash_image(&ImageSpec::default());
         assert!(has_partition_table(&full));
@@ -207,8 +262,9 @@ mod tests {
         coincidence[0x8001] = 0x50;
         assert!(!has_partition_table(&coincidence));
         // `full` is 0x8C00 bytes (0x8000 + the 0xC00 bytes `to_bytes` returns): it already ends inside
-        // the table sector, which SP1a's length rule refused below 0x9000. A dump cut right after the
-        // six entries and their MD5 entry (0x80E0) is recognised too.
+        // the table sector, which SP1a's length rule refused below 0x9000. A dump cut at 0x8100, one
+        // erased entry after the six entries and their MD5 entry (which ends at 0x80E0), is
+        // recognised too; the test below walks the other cuts.
         assert_eq!(full.len(), 0x8C00);
         let mut cut = full.clone();
         cut.truncate(0x8100);

@@ -246,6 +246,40 @@ mod tests {
     }
 
     #[test]
+    fn operation_registers_keep_their_configuration_bits_and_answer_done_whatever_is_written() {
+        // (register, value written, value read back): the enable and done bits written together,
+        // then every bit set. A `DONE` bit is the model's answer, never what software wrote.
+        for (name, written, read) in [
+            ("ICACHE_SYNC_CTRL", 0x3, SYNC_DONE),
+            ("ICACHE_SYNC_CTRL", u32::MAX, SYNC_DONE),
+            ("ICACHE_SYNC_CTRL", 0, SYNC_DONE),
+            ("ICACHE_PRELOAD_CTRL", 0x3, PRELOAD_DONE),
+            (
+                "ICACHE_PRELOAD_CTRL",
+                u32::MAX,
+                PRELOAD_DONE | PRELOAD_ORDER,
+            ),
+            ("ICACHE_PRELOAD_CTRL", 0, PRELOAD_DONE),
+            (
+                "ICACHE_FREEZE",
+                FREEZE_ENA | FREEZE_DONE,
+                FREEZE_ENA | FREEZE_DONE,
+            ),
+            (
+                "ICACHE_FREEZE",
+                u32::MAX,
+                FREEZE_ENA | FREEZE_MODE | FREEZE_DONE,
+            ),
+            ("ICACHE_FREEZE", FREEZE_MODE | FREEZE_DONE, FREEZE_MODE),
+            ("ICACHE_FREEZE", 0, 0),
+        ] {
+            let mut x = Extmem::new();
+            assert!(x.write(reg(name), written), "{name} <- {written:#x}");
+            assert_eq!(x.read(reg(name)), Some(read), "{name} <- {written:#x}");
+        }
+    }
+
+    #[test]
     fn freeze_done_follows_enable() {
         // FB §B.5: enable, poll DONE set; then the ROM writes back the value without bit 0, poll DONE clear.
         let mut x = Extmem::new();

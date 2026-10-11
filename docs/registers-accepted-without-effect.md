@@ -1,17 +1,38 @@
 # Registers accepted without effect
 
-A register listed here **stores what the firmware writes and reads it back**, but the emulator does
-not model what the hardware does with the value. Nothing else is silent: any other register is either
-modelled or reported by name as unmodelled (spec §5.2), and `--strict-mmio` stops on it.
+A register listed here **accepts a write without a diagnostic**, but the emulator does not model
+what the hardware does with the value. Most of them store what the firmware writes and read it back;
+some keep only their configuration bits, beside a status bit the model answers
+(`EXTMEM.ICACHE_PRELOAD_CTRL`, `ICACHE_AUTOLOAD_CTRL`, `ICACHE_FREEZE`, the masked fields of
+`INTERRUPT_CORE0`). Two kinds do not store anything:
+
+- the write-only strobes `UART0.INT_CLR`, `UART1.INT_CLR` and `INTERRUPT_CORE0.CPU_INT_CLEAR`: the
+  write is accepted and dropped, since nothing is pending; **reading** one is reported as unmodelled;
+- `EXTMEM.ICACHE_SYNC_CTRL`: the write is accepted and the register always reads its `SYNC_DONE`
+  bit, because the operation it starts completes at once.
+
+No other memory-mapped register is silent: it is either modelled or reported by name as unmodelled
+(spec §5.2), and `--strict-mmio` stops on it.
+
+The PMP CSRs (`pmpcfg0` to `pmpcfg3`, `pmpaddr0` to `pmpaddr15`) are accepted without effect too,
+and are not in the table because they are CSRs, not memory-mapped registers: on the ESP32-C3 core
+they are stored with their lock rules and **never enforced** — no access is refused because of them
+(decision D18 of plan SP1b-2). Plan SP1b-3 enforces them.
 
 The table is generated: the lists live next to each peripheral model (`accepted()` in
-`crates/soc-esp32c3/src/periph/*.rs`), the storage of each model is built from them, and the test
+`crates/soc-esp32c3/src/periph/*.rs`). A model that is plain storage is built from its list; a model
+that keeps its registers in fields has its list beside it. In both cases the test
+`every_row_of_the_table_is_routed_to_a_model_that_accepts_a_write_there`
+(`crates/soc-esp32c3/src/periph/mod.rs`) writes the first and the last register of every row through
+the real peripherals, so a list cannot name a register its model refuses. The test
 `crates/soc-esp32c3/tests/accepted_without_effect.rs` fails when this file and the code differ. To
 update it, run `INKEMU_BLESS=1 cargo test -p soc-esp32c3 --test accepted_without_effect`: the test
 then rewrites the table below, and nothing else; review the diff before committing it.
 
 "Count" is 1 for a single register, or the number of consecutive registers the row stands for.
-"Made real by" names the plan that gives the register its effect.
+"Made real by" names the plan that gives the register its effect. Each plan inherits the rows that
+name it: the carry-over note `docs/superpowers/notes/2026-10-11-sp1b-2-carryover.md` says so under
+SP1b-3, SP1b-4, SP2, SP5a and SP8.
 
 <!-- generated table -->
 | Address | Register | Count | Hardware effect not modelled | Made real by |
@@ -70,7 +91,8 @@ then rewrites the table below, and nothing else; review the diff before committi
 | `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector | SP1b-3 |
 | `0x6000810c` | `RTC_CNTL.FIB_SEL` | 1 | brown-out and glitch reset selection | SP1b-3 |
 | `0x6000811c` | `RTC_CNTL.SENSOR_CTRL` | 1 | SAR ADC power forcing | SP2 |
-| `0x60009000` | `IO_MUX.PIN_CTRL` | 24 | pad function, pulls, drive strength, input enable | SP2 |
+| `0x60009000` | `IO_MUX.PIN_CTRL` | 23 | pad function, pulls, drive strength, input enable | SP2 |
+| `0x600090fc` | `IO_MUX.DATE` | 1 | none: the version date of the block, stored as written | SP2 |
 | `0x6000e000` | `ANA_I2C.HOST0_CMD` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6000e004` | `ANA_I2C.HOST1_CMD` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6000e040` | `ANA_I2C.I2C_MST_ANA_CONF0` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |

@@ -141,6 +141,7 @@ const ACCEPTED: [Accepted; 26] = [
 pub(crate) fn accepted() -> Vec<Accepted> {
     ACCEPTED.to_vec()
 }
+
 /// `RESET_CAUSE_PROCPU`, bits [5:0] of `RESET_STATE` (`soc/reset_reasons.h`).
 const RESET_CAUSE_MASK: u32 = 0x3F;
 const RESET_CAUSE_POWERON: u32 = 0x01;
@@ -301,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bootloader_watchdog_sequence_leaves_the_registers_as_written_and_nothing_expires() {
+    fn the_bootloader_watchdog_sequence_is_stored_as_written_and_changes_no_reset_cause() {
         // BA §6: unlock, clear FLASHBOOT_MOD_EN, stage 0 = 0x956A0, feed, enable, lock.
         let mut rtc = RtcCntl::new();
         rtc.write(reg("WDTWPROTECT"), 0x50D8_3AA1);

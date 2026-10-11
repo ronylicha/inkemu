@@ -25,6 +25,9 @@ pub(crate) fn accepted() -> Vec<Accepted> {
     ACCEPTED.to_vec()
 }
 
+/// The `APB_CTRL` block as far as the boot uses it: the random number register, which answers the
+/// next value of a seeded sequence on every read, and the two radio memory power registers, which
+/// are storage.
 #[derive(Clone, Debug)]
 pub struct ApbCtrl {
     /// State of the generator; never zero.
@@ -64,6 +67,8 @@ impl Peripheral for ApbCtrl {
     }
 
     fn write(&mut self, offset: u32, value: u32) -> bool {
+        // `RND_DATA` is read-only: it is deliberately not handled here, so a write to it is refused
+        // and the bus reports it as unmodelled instead of pretending the generator was seeded.
         self.power.write(offset, value)
     }
 }

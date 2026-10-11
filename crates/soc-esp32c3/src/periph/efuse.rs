@@ -33,6 +33,11 @@ const WAFER_FIELDS_SYS_5: u32 = (0x3 << WAFER_MAJOR_SHIFT) | (1 << WAFER_MINOR_H
 /// The eFuse content of a production ESP32-C3 v0.3: Espressif's own `espefuse` dump, quoted in
 /// report BA §8 (decision D9). MAC `58:cf:79:0f:96:8c`, eFuse block version 1.2, calibration words,
 /// `ERR_RST_ENABLE` set; no key, no secure boot, no flash encryption. Registers not listed read 0.
+///
+/// Source of the words: the `idf.py efuse-dump` sample of the ESP-IDF documentation,
+/// `docs/en/api-reference/system/inc/espefuse_summary_ESP32-C3_dump.rst` (ESP-IDF v5.5.2,
+/// Apache-2.0). It is the dump of one sample chip: the MAC address is that chip's, so every
+/// emulated device shares it until profiles carry their own (carry-over note, sub-project 5a).
 /// ASSUMPTION: the eFuse content of a real Xteink X4 is unknown; this is a real chip of the same
 /// revision. An `espefuse.py summary` of a unit settles it.
 const PRODUCTION_V0_3: [(u32, u32); 14] = [

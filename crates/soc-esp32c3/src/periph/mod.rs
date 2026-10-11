@@ -132,9 +132,15 @@ impl Storage {
         Storage { regs }
     }
 
-    /// The single registers of `list` (rows with `count == 1`), at their SVD reset value, 0 without one.
+    /// The registers of `list`, at their SVD reset value, 0 without one. Every row must stand for a
+    /// single register: a row of `count > 1` registers belongs to a model that keeps them elsewhere
+    /// (`IoMux`, `IntMatrix`), and is not stored here.
     #[must_use]
     pub fn accepted(base: u32, list: &[Accepted]) -> Storage {
+        debug_assert!(
+            list.iter().all(|a| a.count == 1),
+            "`Storage::accepted` stores single registers only: a block row would be dropped"
+        );
         let offsets: Vec<u32> = list
             .iter()
             .filter(|a| a.count == 1)
@@ -281,8 +287,10 @@ const SHA: (u32, u32) = (SHA_BASE, 0x6003_C000);
 pub(crate) const APB_CTRL_BASE: u32 = 0x6002_6000;
 const APB_CTRL: (u32, u32) = (APB_CTRL_BASE, 0x6002_7000);
 const ANA_I2C: (u32, u32) = (ana_i2c::ANA_I2C_BASE, ana_i2c::ANA_I2C_BASE + 0x100);
+/// `DR_REG_TIMERGROUP0_BASE` (ESP-IDF `reg_base.h`; report BC §A.2).
 pub(crate) const TIMG0_BASE: u32 = 0x6001_F000;
 const TIMG0: (u32, u32) = (TIMG0_BASE, 0x6002_0000);
+/// `DR_REG_APB_SARADC_BASE` (ESP-IDF `reg_base.h`; report BC §A.2).
 pub(crate) const APB_SARADC_BASE: u32 = 0x6004_0000;
 const APB_SARADC: (u32, u32) = (APB_SARADC_BASE, 0x6004_1000);
 
@@ -527,21 +535,84 @@ mod tests {
     #[test]
     fn the_table_lists_every_register_once_in_address_order() {
         let rows = accepted_without_effect();
-        assert!(
-            rows.windows(2).all(|w| w[0].addr < w[1].addr),
-            "sorted, no duplicate address"
-        );
+        for pair in rows.windows(2) {
+            // A row covers `count` registers: the next row must start after the last of them.
+            let end = pair[0].addr + svd_regs::REGISTER_BYTES * pair[0].count;
+            assert!(
+                end <= pair[1].addr,
+                "{}.{} ({} registers from {:#010x}) overlaps {}.{} at {:#010x}, or the rows are not sorted",
+                pair[0].peripheral,
+                pair[0].register,
+                pair[0].count,
+                pair[0].addr,
+                pair[1].peripheral,
+                pair[1].register,
+                pair[1].addr
+            );
+        }
         assert!(
             rows.iter()
                 .all(|r| r.count >= 1 && !r.not_modeled.is_empty() && r.heir.starts_with("SP"))
         );
-        let io_mux = rows.iter().find(|r| r.peripheral == "IO_MUX").unwrap();
-        assert_eq!(io_mux.count, 24, "every IO_MUX register of the SVD");
+        // Rows stand for consecutive registers, and `IO_MUX.DATE` sits apart from the pads: the block
+        // is two rows that together hold every IO_MUX register of the SVD.
+        let io_mux: u32 = rows
+            .iter()
+            .filter(|r| r.peripheral == "IO_MUX")
+            .map(|r| r.count)
+            .sum();
+        assert_eq!(io_mux, 24, "every IO_MUX register of the SVD");
         let table = render_accepted_table(&rows);
         assert!(table.starts_with(
             "| Address | Register | Count | Hardware effect not modelled | Made real by |\n|---|---|---|---|---|\n"
         ));
         assert_eq!(table.lines().count(), rows.len() + 2);
+    }
+
+    fn peripherals() -> Peripherals {
+        Peripherals::new(
+            &SocConfig::default(),
+            Box::new(crate::flash::NorFlash::blank(
+                crate::flash::FlashConfig::default(),
+            )),
+        )
+    }
+
+    /// The table is documentation only if a model can drift away from it. Whatever a list names —
+    /// through `Storage::accepted`, or next to a model that keeps its registers in fields — must be
+    /// a register the real device tree routes and accepts a write to, without reporting anything.
+    #[test]
+    fn every_row_of_the_table_is_routed_to_a_model_that_accepts_a_write_there() {
+        let mut p = peripherals();
+        let rows = accepted_without_effect();
+        assert_ne!(rows, Vec::new(), "the table is not empty");
+        for row in rows {
+            let last = row.addr + svd_regs::REGISTER_BYTES * (row.count - 1);
+            for addr in [row.addr, last] {
+                let name = format!(
+                    "{}.{} (row of {}) at {addr:#010x}",
+                    row.peripheral, row.register, row.count
+                );
+                let (device, base) = p
+                    .device(addr)
+                    .unwrap_or_else(|| panic!("{name} is routed to no model"));
+                assert!(device.write(addr - base, 0), "{name} refuses a write");
+                assert_eq!(
+                    p.take_unsupported(),
+                    None,
+                    "{name}: accepted means nothing is reported"
+                );
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "stores single registers only")]
+    fn a_block_row_given_to_plain_storage_is_a_programming_error() {
+        const BLOCK: [Accepted; 1] =
+            [Accepted::svd("INTERRUPT_CORE0", "MAC_INTR_MAP", "routing", "SP1b-3").block(62)];
+        let _ = Storage::accepted(INTMATRIX_BASE, &BLOCK);
     }
 
     #[test]
@@ -633,6 +704,24 @@ mod tests {
             "the register before BBPD_CTRL is not listed"
         );
         assert_eq!(read(ana_i2c::ANA_I2C_BASE + 0x44), Some(0), "ANA_CONFIG");
+    }
+
+    #[test]
+    fn storage_only_blocks_read_back_what_was_written_through_the_device_tree() {
+        let mut p = peripherals();
+        let svd = svd_regs::esp32c3::addr;
+        for (addr, value) in [
+            (svd("TIMG0", "WDTCONFIG0"), 0x8000_0000),
+            (svd("APB_SARADC", "CTRL2"), 0x0000_A5A5),
+            (svd("BB", "BBPD_CTRL"), 0x0000_000F),
+            (NRX_NRXPD_CTRL, 0x1234_5678),
+            (svd("SENSITIVE", "INTERNAL_SRAM_USAGE_1"), 0xE),
+        ] {
+            let (device, base) = p.device(addr).expect("routed");
+            assert!(device.write(addr - base, value), "{addr:#010x}");
+            assert_eq!(device.read(addr - base), Some(value), "{addr:#010x}");
+        }
+        assert_eq!(p.take_unsupported(), None);
     }
 
     #[test]

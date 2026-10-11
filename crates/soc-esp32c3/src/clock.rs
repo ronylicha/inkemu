@@ -3,16 +3,19 @@
 use emu_core::Frequency;
 use std::num::NonZeroU64;
 
-const fn megahertz(mhz: u64) -> Frequency {
-    match NonZeroU64::new(mhz * 1_000_000) {
+const fn megahertz(mhz: u32) -> Frequency {
+    // A widening cast: `u64::from` is not callable in a `const fn`.
+    match NonZeroU64::new(mhz as u64 * 1_000_000) {
         Some(hz) => Frequency::new(hz),
-        // INVARIANT: only called below with non-zero literals, at compile time.
+        // INVARIANT: only called below with non-zero constants, at compile time.
         None => panic!("a clock frequency is never zero"),
     }
 }
 
-/// The Xteink boards carry a 40 MHz crystal (`SYSCLK_CONF.CLK_XTAL_FREQ` reads 40).
-pub const XTAL: Frequency = megahertz(40);
+/// The Xteink boards carry a 40 MHz crystal. This is the one definition of it: the frequency
+/// below, and the value `SYSCLK_CONF.CLK_XTAL_FREQ` reads (`periph/system.rs`), both come from it.
+pub const XTAL_MHZ: u32 = 40;
+pub const XTAL: Frequency = megahertz(XTAL_MHZ);
 const PLL_CPU_80: Frequency = megahertz(80);
 const PLL_CPU_160: Frequency = megahertz(160);
 

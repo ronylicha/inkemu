@@ -69,15 +69,16 @@ const ACCEPTED: [Accepted; 9] = [
 pub(crate) fn accepted() -> Vec<Accepted> {
     ACCEPTED.to_vec()
 }
+
 /// `SYSCLK_CONF`: bits [9:0] `PRE_DIV_CNT` and [11:10] `SOC_CLK_SEL` are writable; a write keeps
 /// bits [11:0] only, because `CLK_XTAL_FREQ` [18:12] and `CLK_DIV_EN` [19] are read-only (report §E.1).
 const SYSCLK_WRITABLE: u32 = 0xFFF;
 /// Reset: `PRE_DIV_CNT` = 1, `SOC_CLK_SEL` = 0 (the crystal drives the CPU).
 const SYSCLK_RESET: u32 = 1;
 /// `CLK_XTAL_FREQ`, bits [18:12], read-only: the ROM derives its UART divider from it
-/// (`ROM3:ets_get_apb_freq@0x40049866`). The Xteink boards carry a 40 MHz crystal.
+/// (`ROM3:ets_get_apb_freq@0x40049866`). Its value is the crystal of the clock tree, in MHz.
 const XTAL_FREQ_SHIFT: u32 = 12;
-const XTAL_FREQ_MHZ: u32 = 40;
+const XTAL_FREQ_MHZ: u32 = crate::clock::XTAL_MHZ;
 
 #[derive(Clone, Debug)]
 pub struct System {
@@ -101,6 +102,8 @@ impl System {
     pub fn clock_registers(&self) -> (u32, u32) {
         (
             self.sysclk_writable | (XTAL_FREQ_MHZ << XTAL_FREQ_SHIFT),
+            // INVARIANT: `CPU_PER_CONF` is in `ACCEPTED`, which `registers` is built from, so the
+            // read always answers and the fallback is never taken.
             self.registers.read(CPU_PER_CONF).unwrap_or(0),
         )
     }

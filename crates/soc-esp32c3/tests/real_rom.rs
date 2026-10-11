@@ -5,16 +5,27 @@
 mod common;
 
 use emu_core::Cycles;
+use firmware::builder::{ImageSpec, build_image};
 use sha2::{Digest, Sha256};
 use soc_esp32c3::{
     ChipRevision, ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason,
 };
 
+/// The ROM ELF of `revision` in the directory `INKEMU_ROM_ELF_DIR` names; a failure says why and
+/// what to do.
 fn elf(revision: u16) -> Vec<u8> {
-    let dir = std::env::var("INKEMU_ROM_ELF_DIR")
-        .expect("set INKEMU_ROM_ELF_DIR to the directory holding the ROM ELF files");
+    let dir = std::env::var("INKEMU_ROM_ELF_DIR").unwrap_or_else(|e| {
+        panic!(
+            "INKEMU_ROM_ELF_DIR is not usable ({e}); fetch the ROMs with `inkemu rom fetch --all --rom-dir <dir>` and set the variable to <dir>"
+        )
+    });
     let path = std::path::Path::new(&dir).join(format!("esp32c3_rev{revision}_rom.elf"));
-    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read the ROM ELF {} ({e}); fetch the ROMs with `inkemu rom fetch --all --rom-dir {dir}`",
+            path.display()
+        )
+    })
 }
 
 fn image_sha256(revision: u16) -> String {
@@ -211,8 +222,6 @@ fn two_boots_are_identical_down_to_the_trace_hash() {
     );
 }
 
-use firmware::builder::{ImageSpec, build_image};
-
 /// Where the synthetic bootloader is loaded and entered: the start of the SRAM seen from the instruction bus.
 const STUB_ENTRY: u32 = 0x4038_0000;
 /// `j .`
@@ -355,6 +364,7 @@ fn a_header_that_is_not_an_image_is_printed_byte_by_byte() {
         "{:?}",
         zeros.after_banner
     );
+    assert_eq!(zeros.diagnostics, Vec::new());
     let mut image = build_image(&stub_spec());
     image[0] = 0x00;
     let no_magic = flash_boot(Some(image), strict(), |text| text.contains('\n'));
@@ -365,6 +375,7 @@ fn a_header_that_is_not_an_image_is_printed_byte_by_byte() {
         "{:?}",
         no_magic.after_banner
     );
+    assert_eq!(no_magic.diagnostics, Vec::new());
 }
 
 #[test]
@@ -410,6 +421,7 @@ fn a_flipped_data_bit_is_a_checksum_failure() {
     );
     assert!(!boot.after_banner.contains("entry"));
     assert_eq!(boot.pc, ROM_HANG_PC);
+    assert_eq!(boot.diagnostics, Vec::new());
 }
 
 #[test]
@@ -424,10 +436,10 @@ fn a_wrong_digest_is_reported_and_the_rom_boots_anyway() {
     image[last] ^= 0xFF;
     let expected = common::hex(&image[hashed..]);
     let boot = flash_boot(Some(image), strict(), |text| text.contains("entry 0x"));
-    let text = boot.after_banner.to_lowercase();
+    // The text of the ROM as it prints it (FB §H, "digest byte flipped"), digests in lower case.
     assert!(
-        text.contains(&format!(
-            "sha-256 comparison failed:\ncalculated: {calculated}\nexpected: {expected}\nattempting to boot anyway...\nentry 0x40380000\n"
+        boot.after_banner.contains(&format!(
+            "SHA-256 comparison failed:\nCalculated: {calculated}\nExpected: {expected}\nAttempting to boot anyway...\nentry 0x40380000\n"
         )),
         "{:?}",
         boot.after_banner
@@ -449,6 +461,12 @@ fn two_flash_boots_are_identical_down_to_the_trace_hash() {
         })
     };
     let (first, second) = (run(), run());
+    // Two runs that both stopped short of the bootloader would compare equal too.
+    assert!(
+        first.after_banner.contains("entry 0x40380000\n"),
+        "{:?}",
+        first.after_banner
+    );
     assert!(first.trace_hash.is_some());
     assert_eq!(first.trace_hash, second.trace_hash);
     assert_eq!(first.after_banner, second.after_banner);

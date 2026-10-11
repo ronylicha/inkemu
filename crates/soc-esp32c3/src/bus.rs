@@ -922,6 +922,35 @@ mod tests {
     }
 
     #[test]
+    fn the_instruction_window_serves_a_straddling_fetch_and_its_last_bytes() {
+        // The same read path as the data window, reached through the other base and as a fetch.
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 0, 1); // window page 0 -> flash page 1, which ends with A0 A1 A2 A3
+        map(&mut b, 1, 2); // window page 1 -> flash page 2, which starts with B0 B1 B2 B3
+        let straddling = FLASH_IBUS_BASE + 0xFFFE;
+        assert_eq!(
+            b.read(straddling, Word, Fetch).unwrap().value,
+            0xB1B0_A3A2,
+            "a 32-bit instruction across two 64 KiB pages"
+        );
+        assert_eq!(b.read(straddling, Half, Fetch).unwrap().value, 0xA3A2);
+        map(&mut b, 127, 1);
+        let last = FLASH_IBUS_BASE + FLASH_WINDOW_SIZE - 4;
+        assert_eq!(b.read(last, Word, Fetch).unwrap().value, 0xA3A2_A1A0);
+        assert_eq!(b.read(last + 2, Half, Fetch).unwrap().value, 0xA3A2);
+        assert_eq!(b.read(last + 3, Byte, Fetch).unwrap().value, 0xA3);
+        assert_eq!(
+            b.read(last + 2, Word, Fetch),
+            Err(BusError::Unmapped {
+                addr: last + 2,
+                kind: Fetch
+            }),
+            "a fetch that runs past the window"
+        );
+        assert_eq!(b.diag.drain(), Vec::new());
+    }
+
+    #[test]
     fn access_straddling_the_end_of_the_window_is_unmapped() {
         let mut b = bus_with_flash(SocConfig::default());
         map(&mut b, 127, 0);

@@ -366,6 +366,9 @@ pub fn ensure_elfs(
         .map(|(entry, _)| *entry)
         .collect();
     // One decompression of the archive, however many ELF files are missing.
+    // INVARIANT: `extract_entries` returns exactly `missing.len()` ELF files, in the order of
+    // `missing`, or an error. Every empty slot therefore receives one below, and the final `flatten`
+    // drops nothing: the result has one ELF per entry.
     let mut extracted = extract_entries(&body, archive, &missing)?.into_iter();
     for (slot, entry) in elfs.iter_mut().zip(entries) {
         if slot.is_none()
@@ -1256,6 +1259,44 @@ mod tests {
                 }
             ),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn an_archive_that_lacks_a_wanted_rom_names_it_and_leaves_the_cache_empty() {
+        // The archive is the pinned one, yet holds only two of the three ELF files: the absence is
+        // known before anything is stored, so no ROM of a batch that cannot complete is written.
+        let (_, _, entries, elfs) = trio();
+        let body = archive_of(&[
+            (entries[0].elf_name, elfs[0].as_slice()),
+            (entries[2].elf_name, elfs[2].as_slice()),
+        ]);
+        let archive = RomArchive {
+            release: "test",
+            url: "https://example.invalid/partial.tar.gz",
+            sha256: leak(sha(&body)),
+            size: body.len() as u64,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = FakeFetch::serving(body);
+        let all: Vec<&RomEntry> = entries.iter().collect();
+        let err = ensure_elfs(&cache_of(dir.path(), &fetch), &archive, &all).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RomStoreError::MissingInArchive {
+                    elf_name: "esp32c3_rev3_rom.elf",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("esp32c3_rev3_rom.elf"), "{err}");
+        assert_eq!(fetch.calls.get(), 1);
+        assert_eq!(
+            files_in(dir.path()),
+            Vec::<String>::new(),
+            "neither of the two ELF files the archive does hold was stored"
         );
     }
 

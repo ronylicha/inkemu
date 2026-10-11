@@ -94,7 +94,12 @@ impl VirtualClock {
     }
 
     /// From cycle `now` on, a cycle lasts `1 / frequency`.
+    ///
+    /// The cycle counter only grows, so `now` is never before the previous change. Should a caller
+    /// pass an earlier one, it is taken as the previous change itself: moving the anchor back would
+    /// count the cycles in between a second time.
     pub fn set_frequency(&mut self, now: Cycles, frequency: Frequency) {
+        let now = Cycles(now.0.max(self.since.0));
         self.elapsed_attos = self.attos_at(now);
         self.since = now;
         self.frequency = frequency;
@@ -168,6 +173,40 @@ mod tests {
             clock.nanos_at(Cycles(1)),
             18,
             "time does not run backwards before the last switch"
+        );
+    }
+
+    #[test]
+    fn a_frequency_change_dated_before_the_last_one_does_not_count_cycles_twice() {
+        // 1 µs per cycle up to cycle 100, then 2 MHz. A change dated at cycle 50 cannot move the
+        // anchor back: the 50 cycles from 50 to 100 are already in the elapsed time.
+        let mut clock = VirtualClock::new(mhz(1));
+        clock.set_frequency(Cycles(100), mhz(2));
+        clock.set_frequency(Cycles(50), mhz(1));
+        assert_eq!(clock.frequency(), mhz(1), "the new frequency applies");
+        assert_eq!(clock.nanos_at(Cycles(100)), 100_000, "from the last change");
+        assert_eq!(clock.nanos_at(Cycles(110)), 110_000);
+    }
+
+    #[test]
+    fn a_period_that_is_not_a_whole_number_of_attoseconds_loses_less_than_one_per_switch() {
+        // 40 MHz / 1024, the slowest crystal division, rounded down to 39 062 Hz: one cycle lasts
+        // 25 600 327 684 194.357… attoseconds. Each switch floors the time elapsed so far, so 1 000
+        // switches lose less than 1 000 attoseconds: far below a nanosecond after a whole second.
+        let slow = Frequency::from_hz(39_062).unwrap();
+        let mut clock = VirtualClock::new(slow);
+        for cycle in 1..=1_000 {
+            clock.set_frequency(Cycles(cycle), slow);
+        }
+        let nanos = clock.nanos_at(Cycles(39_062));
+        assert!(
+            (999_999_999..=1_000_000_000).contains(&nanos),
+            "one second of cycles: {nanos} ns"
+        );
+        assert_eq!(
+            VirtualClock::new(slow).nanos_at(Cycles(39_062)),
+            1_000_000_000,
+            "without a switch the second is exact"
         );
     }
 

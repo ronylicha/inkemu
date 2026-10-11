@@ -28,6 +28,12 @@ pub const PCMR_ENABLE: u32 = 1 << 0;
 /// Physical memory protection: 16 entries (ESP-IDF `SOC_CPU_PMP_REGION_GRANULARITY`, `cpu_region_protect.c`;
 /// report BC §B.2). The registers are stored and the lock bit is honoured; **the protection is not
 /// enforced** (decision D18): enforcement arrives with the application's memory protection in SP1b-3.
+///
+/// ASSUMPTION: a `pmpcfg` byte is stored verbatim. The privileged specification makes its fields
+/// WARL — bits 5 and 6 are reserved, and so is the combination R = 0 with W = 1 — and what this core
+/// keeps of them is not established; nothing reads them back on the measured paths. A readback on a
+/// real chip, or the SP1b-4 lockstep, settles it. A lock is also never cleared, because no hart
+/// reset exists yet: the reset of SP1b-3 must clear the whole PMP state.
 pub const PMPCFG0: u16 = 0x3A0;
 pub const PMPADDR0: u16 = 0x3B0;
 pub const PMP_ENTRIES: usize = 16;
@@ -321,6 +327,99 @@ mod tests {
         c.write(PMPCFG0 + 1, (L | TOR | 0x01) << 8, Cycles(0), 0);
         c.write(PMPADDR0 + 4, 0x555, Cycles(0), 0);
         assert_eq!(c.read(PMPADDR0 + 4, Cycles(0), 0), Some(0x444));
+    }
+
+    /// Writes `cfg` as the configuration byte of `entry`, leaving the three other bytes of its
+    /// `pmpcfg` register at 0.
+    fn configure(c: &mut Esp32C3Csrs, entry: u16, cfg: u32) {
+        assert!(c.write(PMPCFG0 + entry / 4, cfg << (8 * (entry % 4)), Cycles(0), 0));
+    }
+    fn addr(c: &Esp32C3Csrs, entry: u16) -> Option<u32> {
+        c.read(PMPADDR0 + entry, Cycles(0), 0)
+    }
+    fn set_addr(c: &mut Esp32C3Csrs, entry: u16, value: u32) {
+        assert!(c.write(PMPADDR0 + entry, value, Cycles(0), 0));
+    }
+
+    #[test]
+    fn an_unlocked_top_of_range_entry_leaves_the_address_below_it_writable() {
+        let mut c = csrs();
+        set_addr(&mut c, 4, 0x444);
+        configure(&mut c, 5, TOR | 0x01);
+        set_addr(&mut c, 4, 0x555);
+        assert_eq!(
+            addr(&c, 4),
+            Some(0x555),
+            "only a *locked* TOR entry freezes it"
+        );
+        set_addr(&mut c, 5, 0x666);
+        assert_eq!(addr(&c, 5), Some(0x666));
+    }
+
+    #[test]
+    fn a_locked_top_of_range_entry_freezes_its_own_address_too() {
+        let mut c = csrs();
+        set_addr(&mut c, 5, 0x500);
+        configure(&mut c, 5, L | TOR | 0x01);
+        set_addr(&mut c, 5, 0x999);
+        assert_eq!(addr(&c, 5), Some(0x500));
+        set_addr(&mut c, 6, 0x600);
+        assert_eq!(addr(&c, 6), Some(0x600), "the entry above is not concerned");
+    }
+
+    #[test]
+    fn the_first_and_the_last_entry_follow_the_same_lock_rules() {
+        // Entry 0, locked top-of-range: its lower bound is address 0, there is no entry below.
+        let mut first = csrs();
+        set_addr(&mut first, 0, 0x100);
+        configure(&mut first, 0, L | TOR);
+        set_addr(&mut first, 0, 0x200);
+        assert_eq!(addr(&first, 0), Some(0x100));
+        set_addr(&mut first, 1, 0x300);
+        assert_eq!(addr(&first, 1), Some(0x300));
+        // Entry 15, locked top-of-range: it freezes pmpaddr14 and pmpaddr15; no entry 16 exists
+        // that could freeze pmpaddr15 from above.
+        let mut last = csrs();
+        set_addr(&mut last, 14, 0xE00);
+        set_addr(&mut last, 15, 0xF00);
+        configure(&mut last, 15, L | TOR);
+        set_addr(&mut last, 14, 0x1);
+        set_addr(&mut last, 15, 0x2);
+        assert_eq!(
+            (addr(&last, 14), addr(&last, 15)),
+            (Some(0xE00), Some(0xF00))
+        );
+        // Entry 15 locked but not top-of-range: pmpaddr14 stays writable.
+        let mut plain = csrs();
+        configure(&mut plain, 15, L | 0x18); // NAPOT
+        set_addr(&mut plain, 14, 0x3);
+        set_addr(&mut plain, 15, 0x4);
+        assert_eq!((addr(&plain, 14), addr(&plain, 15)), (Some(0x3), Some(0)));
+    }
+
+    #[test]
+    fn a_word_write_changes_the_unlocked_bytes_and_leaves_the_locked_ones() {
+        let mut c = csrs();
+        // Lock entries 0 and 2 of pmpcfg0 (bytes 0 and 2); entries 1 and 3 stay unlocked.
+        assert!(c.write(PMPCFG0, ((L | 0x01) << 16) | (L | 0x02), Cycles(0), 0));
+        assert!(c.write(PMPCFG0, 0x1F1D_1B19, Cycles(0), 0));
+        assert_eq!(
+            c.read(PMPCFG0, Cycles(0), 0),
+            Some(0x1F81_1B82),
+            "bytes 3 and 1 written, bytes 2 and 0 kept"
+        );
+        // A byte written with its lock bit locks from the next write on.
+        assert!(c.write(PMPCFG0, 0x0000_9B00, Cycles(0), 0));
+        assert!(c.write(PMPCFG0, 0, Cycles(0), 0));
+        assert_eq!(c.read(PMPCFG0, Cycles(0), 0), Some(0x0081_9B82));
+    }
+
+    #[test]
+    fn a_configuration_byte_is_stored_verbatim_reserved_bits_included() {
+        // Pins the ASSUMPTION documented on `PMPCFG0`: bits 5 and 6, and R = 0 with W = 1.
+        let mut c = csrs();
+        assert!(c.write(PMPCFG0, 0x0000_0062, Cycles(0), 0));
+        assert_eq!(c.read(PMPCFG0, Cycles(0), 0), Some(0x62));
     }
 
     #[test]

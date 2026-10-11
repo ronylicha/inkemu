@@ -53,8 +53,11 @@ const SHA256_INITIAL: [u32; STATE_WORDS] = [
     0x5BE0_CD19,
 ];
 
-/// `SHA.MODE`. 2 is measured (FB §B.7). ASSUMPTION: 0 and 1 follow the `SHA_TYPE` enum of ESP-IDF
-/// `esp32c3/rom/sha.h` (`SHA1`, `SHA2_224`, `SHA2_256`); no measured boot uses them.
+/// `SHA.MODE` holds the `SHA_TYPE` software selects: `typedef enum { SHA1 = 0, SHA2_224, SHA2_256,
+/// SHA_TYPE_MAX } SHA_TYPE;` (ESP-IDF v5.5.2
+/// `components/esp_rom/esp32c3/include/esp32c3/rom/sha.h:17-22`), written as it is by
+/// `sha_ll_set_mode`: `REG_WRITE(SHA_MODE_REG, sha_type)`
+/// (`components/hal/esp32c3/include/hal/sha_ll.h:55`). The value 2 is also measured (FB §B.7).
 #[derive(Clone, Copy)]
 enum Algorithm {
     Sha1,
@@ -101,6 +104,12 @@ impl Sha {
     }
 
     /// Compresses the block in `M_MEM`; `fresh` starts from the algorithm's initial value.
+    ///
+    /// ASSUMPTION: `CONTINUE` under a `MODE` other than the one the hash was started with compresses
+    /// the block with the algorithm `MODE` now selects, from whatever `H_MEM` holds (its first five
+    /// words for SHA-1, the three others being left as they are). The ROM writes the mode before
+    /// every block, and the same one for a whole hash (FB §B.7), so no measured path decides it;
+    /// the SP1b-4 lockstep, or a device, settles it.
     fn compress(&mut self, fresh: bool) {
         let Some(algorithm) = Algorithm::from_mode(self.mode) else {
             self.unsupported
@@ -306,6 +315,78 @@ mod tests {
             .flat_map(|i| resumed.read(H_MEM0 + 4 * i).unwrap().to_le_bytes())
             .collect();
         assert_eq!(digest, sha2::Sha256::digest(&message).to_vec());
+    }
+
+    fn state(sha: &mut Sha) -> [u32; STATE_WORDS] {
+        std::array::from_fn(|i| sha.read(H_MEM0 + 4 * u32::try_from(i).unwrap()).unwrap())
+    }
+
+    #[test]
+    fn a_restored_sha1_state_continues_and_leaves_the_three_last_state_words_alone() {
+        // SHA-1 has five state words; `H_MEM5..7` are not part of it (FB §B.7).
+        const MARKERS: [u32; 3] = [0xAAAA_0005, 0xBBBB_0006, 0xCCCC_0007];
+        let message: Vec<u8> = (0..100u8).collect();
+        let blocks = padded(&message);
+        let mut first = Sha::new();
+        first.write(MODE, MODE_SHA1);
+        write_block(&mut first, &blocks[..64]);
+        first.write(START, 1);
+        let saved = state(&mut first);
+
+        let mut resumed = Sha::new();
+        resumed.write(MODE, MODE_SHA1);
+        for (i, word) in (0u32..).zip(saved.iter().take(SHA1_WORDS).chain(&MARKERS)) {
+            assert!(resumed.write(H_MEM0 + 4 * i, *word));
+        }
+        write_block(&mut resumed, &blocks[64..128]);
+        resumed.write(CONTINUE, 1);
+        let after = state(&mut resumed);
+        let digest: Vec<u8> = after[..SHA1_WORDS]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        assert_eq!(digest, sha1::Sha1::digest(&message).to_vec());
+        assert_eq!(after[SHA1_WORDS..], MARKERS, "not SHA-1 state: untouched");
+        assert_eq!(resumed.take_unsupported(), None);
+    }
+
+    #[test]
+    fn continue_under_another_mode_uses_the_new_algorithm_on_the_stored_state() {
+        // Pins the ASSUMPTION documented on `Sha::compress`.
+        let block: [u8; 64] = padded(b"abc").try_into().unwrap();
+        let mut sha = Sha::new();
+        sha.write(MODE, MODE_SHA256);
+        write_block(&mut sha, &block);
+        sha.write(START, 1);
+        let started = state(&mut sha);
+
+        // SHA-256 to SHA-224: the same compression function, from the stored state, not from the
+        // SHA-224 initial value.
+        sha.write(MODE, MODE_SHA224);
+        sha.write(CONTINUE, 1);
+        let mut expected = started.map(u32::swap_bytes);
+        sha2::block_api::compress256(&mut expected, &[block]);
+        assert_eq!(state(&mut sha), expected.map(u32::swap_bytes));
+        let mut restarted = Sha::new();
+        restarted.write(MODE, MODE_SHA224);
+        write_block(&mut restarted, &block);
+        restarted.write(START, 1);
+        assert_ne!(state(&mut sha), state(&mut restarted));
+
+        // To SHA-1: its compression function on the first five words; the others stay.
+        let before = state(&mut sha);
+        sha.write(MODE, MODE_SHA1);
+        sha.write(CONTINUE, 1);
+        let mut five: [u32; SHA1_WORDS] = std::array::from_fn(|i| before[i].swap_bytes());
+        sha1::block_api::compress(&mut five, &[block]);
+        let after = state(&mut sha);
+        assert_eq!(after[..SHA1_WORDS], five.map(u32::swap_bytes));
+        assert_eq!(after[SHA1_WORDS..], before[SHA1_WORDS..]);
+        assert_eq!(
+            sha.take_unsupported(),
+            None,
+            "a known mode is never refused"
+        );
     }
 
     #[test]
