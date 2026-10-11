@@ -186,7 +186,7 @@ pub const fn half_of(value: u64, hi: bool) -> u32 {
 
 /// `value` with one half replaced by `half`; `hi_mask` keeps the bits the high register has.
 #[must_use]
-pub fn replace_half(value: u64, hi: bool, half: u32, hi_mask: u32) -> u64 {
+fn replace_half(value: u64, hi: bool, half: u32, hi_mask: u32) -> u64 {
     if hi {
         (value & 0xFFFF_FFFF) | (u64::from(half & hi_mask) << 32)
     } else {

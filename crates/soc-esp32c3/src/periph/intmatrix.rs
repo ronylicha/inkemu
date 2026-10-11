@@ -13,6 +13,14 @@
 //!
 //! `mie` and `mip` play no part: "the ESP32-C3 implements its interrupt mechanism using an
 //! interrupt controller instead of RISC-V Privileged ISA specification" (TRM §8.3.2).
+//!
+//! Sampling contract (report IR §1.3, controller ruling Q13): the context carries the LEVELS of
+//! the sources, and the controller samples them when it is evaluated (`resolve`, a register read
+//! or a register write). A source raised and lowered again between two evaluations is not seen,
+//! so an edge-type line does not latch it. That matches the chip, where a source into the
+//! interrupt matrix is a level its peripheral holds until software acknowledges it; a device model
+//! must do the same (see `Ctx::irq`). The measured application only ever writes 0 to
+//! `CPU_INT_TYPE`.
 use super::{Accepted, INTMATRIX_BASE, half_of};
 use crate::ctx::{Ctx, MAP_REGISTERS};
 use emu_core::Peripheral;
@@ -30,23 +38,30 @@ const fn reg(name: &str) -> u32 {
     addr("INTERRUPT_CORE0", name) - INTMATRIX_BASE
 }
 
+/// The first `<SRC>_MAP` register. A map register is written by
+/// `ROM3:intr_matrix_set@0x40047a6a`, which ESP-IDF calls as `esp_rom_route_intr_matrix`
+/// (`IDF:esp_hw_support/intr_alloc.c:663`).
 const MAP_0: u32 = reg("MAC_INTR_MAP");
-/// Raw status of sources 0..31 and 32..61, whatever their routing and masking (IR §1.1).
+/// Raw status of sources 0..31 and 32..61, whatever their routing and masking (IR §1.1). No ROM
+/// or ESP-IDF code reads them on the measured paths (IR §1.5); the meaning is the TRM's.
 const STATUS_0: u32 = reg("INTR_STATUS_REG_0");
 const STATUS_1: u32 = reg("INTR_STATUS_REG_1");
 const CLOCK_GATE: u32 = reg("CLOCK_GATE");
-/// Who writes the per-line registers: `CPU_INT_ENABLE` bit n is set by
-/// `ROM3:esprv_intc_int_enable@0x4005294e`, `CPU_INT_TYPE` bit n (1: edge) by
-/// `ROM3:esprv_intc_int_set_type@0x40052972`, `CPU_INT_PRI_n` by
-/// `ROM3:esprv_intc_int_set_priority@0x40052992`, `CPU_INT_THRESH` by
-/// `ROM3:esprv_intc_int_set_threshold@0x400529a2`, and a `<SRC>_MAP` register by
-/// `ROM3:intr_matrix_set@0x40047a6a`, which ESP-IDF calls as `esp_rom_route_intr_matrix`
-/// (`IDF:esp_hw_support/intr_alloc.c:663`).
+/// Bit n is set or cleared by `ROM3:esprv_intc_int_enable@0x4005294e` and
+/// `ROM3:esprv_intc_int_disable@0x4005295e`.
 const CPU_INT_ENABLE: u32 = reg("CPU_INT_ENABLE");
+/// Bit n (1: edge) is set by `ROM3:esprv_intc_int_set_type@0x40052972`.
 const CPU_INT_TYPE: u32 = reg("CPU_INT_TYPE");
+/// Bit n is set by `rv_utils_intr_edge_ack` (`IDF:riscv/include/esp_private/interrupt_intc.h:62-65`,
+/// `REG_SET_BIT(INTERRUPT_CORE0_CPU_INT_CLEAR_REG, intr_num)`), never written back to 0 there.
 const CPU_INT_CLEAR: u32 = reg("CPU_INT_CLEAR");
+/// Read-only view of `pending(n)` (TRM register 8.60); no ROM or ESP-IDF code reads it on the
+/// measured paths (IR §1.5).
 const CPU_INT_EIP_STATUS: u32 = reg("CPU_INT_EIP_STATUS");
+/// `CPU_INT_PRI_n` is set by `ROM3:esprv_intc_int_set_priority@0x40052992`.
 const CPU_INT_PRI_0: u32 = reg("CPU_INT_PRI_0");
+/// Set by `ROM3:esprv_intc_int_set_threshold@0x400529a2` (`xPortStartScheduler`), and by the
+/// critical sections and `_interrupt_handler` of ESP-IDF (IR §1.5).
 const CPU_INT_THRESH: u32 = reg("CPU_INT_THRESH");
 // The two blocks are consecutive registers: the index arithmetic below relies on it.
 const _: () = assert!(
@@ -126,7 +141,8 @@ impl IntMatrix {
         levels & LINES_MASK
     }
 
-    /// Brings the lines up to date with the source levels, latching the rising edges.
+    /// Brings the lines up to date with the source levels, latching the rising edges. Only the
+    /// levels present now are seen: see the sampling contract in the module documentation.
     ///
     /// ASSUMPTION: an edge is latched only while its line is enabled: TRM §1.5.2 property 4 speaks
     /// of "an enabled and unmasked interrupt signal" and says no more (report IR §1.3, open
@@ -174,13 +190,27 @@ impl IntMatrix {
         self.claimed |= self.latched & (1 << (line & 31));
     }
 
+    /// A write to `CPU_INT_TYPE`: the lines whose type bit falls (edge to level) lose their latch
+    /// and their claim.
+    ///
+    /// ASSUMPTION: the hardware behaviour is not documented (TRM §1.5.2 is silent). Keeping the
+    /// latch would show a stale edge when the line goes back to the edge type, so it is dropped.
+    /// A probe on a real chip settles it: latch an edge, switch the line to level and back, read
+    /// `CPU_INT_EIP_STATUS`.
+    fn retype(&mut self, value: u32) {
+        let fallen = self.edge_type & !value;
+        self.latched &= !fallen;
+        self.claimed &= !fallen;
+        self.edge_type = value & LINES_MASK;
+    }
+
     /// A write to `CPU_INT_CLEAR`: "first setting and then clearing the corresponding bit" clears
     /// the edge latch of a line the CPU has taken; a latched edge that was never taken can only be
     /// flushed once its line is disabled (TRM §1.5.2, properties 4 and 5).
     ///
     /// ASSUMPTION: the latch is cleared when the bit goes from 1 to 0, the end of the toggle. What
     /// a write of 1 alone does is not stated. ESP-IDF's own helper only ever sets the bit
-    /// (`rv_utils_intr_edge_ack`, `IDF:riscv/include/esp_private/interrupt_intc.h`; report IR
+    /// (`rv_utils_intr_edge_ack`, `IDF:riscv/include/esp_private/interrupt_intc.h:62-65`; report IR
     /// §1.3), so the firmware does not settle it; a probe on a real chip does.
     fn acknowledge(&mut self, value: u32) {
         let released = self.clear & !value & LINES_MASK;
@@ -235,7 +265,7 @@ impl Peripheral<Ctx> for IntMatrix {
             match offset {
                 CLOCK_GATE => self.clock_gate = value & CLOCK_GATE_MASK,
                 CPU_INT_ENABLE => self.enable = value & LINES_MASK,
-                CPU_INT_TYPE => self.edge_type = value & LINES_MASK,
+                CPU_INT_TYPE => self.retype(value),
                 CPU_INT_CLEAR => self.acknowledge(value),
                 CPU_INT_THRESH => self.threshold = value & PRIORITY_MASK,
                 _ => return false,
@@ -461,6 +491,7 @@ mod tests {
     fn a_source_mapped_to_line_zero_goes_nowhere() {
         let ctx = &mut Ctx::default();
         let mut m = IntMatrix::new();
+        assert!(m.write(ctx, TICK_MAP, 0), "routed to line 0 on purpose");
         m.write(ctx, CPU_INT_ENABLE, 0xFFFF_FFFF);
         m.write(ctx, CPU_INT_PRI_0, 15);
         ctx.irq(TICK, true);
@@ -536,6 +567,62 @@ mod tests {
             m.resolve(ctx.sources()),
             None,
             "the edge passed while the line was disabled"
+        );
+    }
+
+    #[test]
+    fn a_pulse_shorter_than_one_evaluation_is_lost_to_an_edge_line() {
+        // The sampling contract (report IR §1.3, controller ruling Q13): the context carries
+        // levels and the controller samples them when it is evaluated.
+        let ctx = &mut Ctx::default();
+        let mut m = application_setup(ctx);
+        m.write(ctx, CPU_INT_TYPE, 1 << 4);
+        ctx.irq(TICK, true);
+        ctx.irq(TICK, false);
+        assert_eq!(
+            m.resolve(ctx.sources()),
+            None,
+            "raised and lowered between two evaluations: never seen"
+        );
+        // A source held up across one evaluation is an edge, and the latch outlives it.
+        ctx.irq(TICK, true);
+        assert_eq!(m.resolve(ctx.sources()), Some(4));
+        ctx.irq(TICK, false);
+        assert_eq!(m.resolve(ctx.sources()), Some(4));
+        m.claim(4);
+        m.write(ctx, CPU_INT_CLEAR, 1 << 4);
+        m.write(ctx, CPU_INT_CLEAR, 0);
+        assert_eq!(m.resolve(ctx.sources()), None);
+    }
+
+    #[test]
+    fn a_latch_does_not_survive_the_line_becoming_level_type() {
+        // Pins the ASSUMPTION of `retype`.
+        let ctx = &mut Ctx::default();
+        let mut m = application_setup(ctx);
+        m.write(ctx, CPU_INT_TYPE, 1 << 4);
+        ctx.irq(TICK, true);
+        assert_eq!(m.resolve(ctx.sources()), Some(4));
+        ctx.irq(TICK, false);
+        m.claim(4);
+        m.write(ctx, CPU_INT_TYPE, 0);
+        assert_eq!(m.resolve(ctx.sources()), None);
+        m.write(ctx, CPU_INT_TYPE, 1 << 4);
+        assert_eq!(
+            m.resolve(ctx.sources()),
+            None,
+            "the old latch is not back with the edge type"
+        );
+        // The claim went with the latch: a new edge is not yet acknowledgeable.
+        ctx.irq(TICK, true);
+        assert_eq!(m.resolve(ctx.sources()), Some(4));
+        ctx.irq(TICK, false);
+        m.write(ctx, CPU_INT_CLEAR, 1 << 4);
+        m.write(ctx, CPU_INT_CLEAR, 0);
+        assert_eq!(
+            m.resolve(ctx.sources()),
+            Some(4),
+            "never taken: the toggle does not clear it"
         );
     }
 

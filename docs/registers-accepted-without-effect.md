@@ -3,8 +3,8 @@
 A register listed here **accepts a write without a diagnostic**, but the emulator does not model
 what the hardware does with the value. Most of them store what the firmware writes and read it back;
 some keep only their configuration bits, beside a status bit the model answers
-(`EXTMEM.ICACHE_PRELOAD_CTRL`, `ICACHE_AUTOLOAD_CTRL`, `ICACHE_FREEZE`, the masked fields of
-`INTERRUPT_CORE0`). Two kinds do not store anything:
+(`EXTMEM.ICACHE_PRELOAD_CTRL`, `ICACHE_AUTOLOAD_CTRL`, `ICACHE_FREEZE`). Two kinds do not store
+anything:
 
 - the write-only strobes `UART0.INT_CLR` and `UART1.INT_CLR`: the write is accepted and dropped,
   since nothing is pending; **reading** one is reported as unmodelled;
