@@ -10,6 +10,7 @@ use crate::memmap::{
 };
 use crate::periph::Peripherals;
 use crate::periph::mmu::{MMU_PAGE_BYTES, MmuMiss};
+use crate::reset::ResetCause;
 use crate::rom::RomImage;
 use emu_core::{AccessKind, AccessSize, Bus, BusError, Ram, ReadOutcome};
 use svd_regs::REGISTER_BYTES;
@@ -116,6 +117,12 @@ impl SocBus {
     /// Calls the device `event` is for, then every device the call had something to tell.
     pub(crate) fn deliver(&mut self, event: Event) {
         self.periph.deliver(&mut self.ctx, event);
+        self.settle();
+    }
+
+    /// Applies a reset to the peripherals. The memories keep their content (TRM §6.1.1).
+    pub(crate) fn reset(&mut self, cause: ResetCause, pc: u32, sp: u32) {
+        self.periph.reset(&mut self.ctx, cause, pc, sp);
         self.settle();
     }
 

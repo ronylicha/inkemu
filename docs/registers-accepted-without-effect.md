@@ -64,7 +64,7 @@ rows, and that plan inherits them too.
 | `0x60004158` | `GPIO.FUNC1_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x600050f0` | `FE2.FE2_TX_INTERP_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60006090` | `FE.FE_GEN_CTRL` | 1 | radio memory power: there is no radio | SP5a |
-| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits are reported) | SP1b-3b |
+| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits act) | SP1b-3b |
 | `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays | SP1b-3b |
 | `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP1b-3b |
 | `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing | SP1b-3b |
@@ -106,16 +106,16 @@ rows, and that plan inherits them too.
 | `0x6004001c` | `APB_SARADC.SAR_PATT_TAB2` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
 | `0x60040050` | `APB_SARADC.DMA_CONF` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
 | `0x60040054` | `APB_SARADC.CLKM_CONF` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
-| `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals | SP1b-3 |
-| `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals | SP1b-3 |
+| `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals: a gated module keeps answering | SP8 |
+| `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals (the debug assistant) | SP1b-4 |
 | `0x600c0008` | `SYSTEM.CPU_PER_CONF` | 1 | PLL_FREQ_SEL and the CPU wait-mode bits (CPUPERIOD_SEL is used by the clock model) | SP8 |
-| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep | SP1b-3 |
-| `0x600c0010` | `SYSTEM.PERIP_CLK_EN0` | 1 | peripheral clock gates | SP1b-3 |
-| `0x600c0014` | `SYSTEM.PERIP_CLK_EN1` | 1 | peripheral clock gates | SP1b-3 |
-| `0x600c0018` | `SYSTEM.PERIP_RST_EN0` | 1 | peripheral reset pulses | SP1b-3 |
-| `0x600c001c` | `SYSTEM.PERIP_RST_EN1` | 1 | peripheral reset pulses | SP1b-3 |
+| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep | SP1b-3b |
+| `0x600c0010` | `SYSTEM.PERIP_CLK_EN0` | 1 | peripheral clock gates: a gated module keeps answering | SP8 |
+| `0x600c0014` | `SYSTEM.PERIP_CLK_EN1` | 1 | peripheral clock gates: a gated module keeps answering | SP8 |
+| `0x600c0020` | `SYSTEM.BT_LPCK_DIV_INT` | 1 | Bluetooth low-power clock divider: there is no radio | SP5b |
+| `0x600c0024` | `SYSTEM.BT_LPCK_DIV_FRAC` | 1 | Bluetooth low-power clock source: there is no radio | SP5b |
 | `0x600c0040` | `SYSTEM.CACHE_CONTROL` | 1 | cache clock enable and reset | SP1b-4 |
-| `0x600c101c` | `SENSITIVE.INTERNAL_SRAM_USAGE_1` | 1 | SRAM0 handed to the cache as line storage | SP1b-4 |
+| `0x600c1000` | `SENSITIVE.ROM_TABLE_LOCK` | 93 | permission management: no access is checked, no violation is raised | SP1b-4 |
 | `0x600c2100` | `INTERRUPT_CORE0.CLOCK_GATE` | 1 | clock gate of the controller's registers: they always answer | SP8 |
 | `0x600c4000` | `EXTMEM.ICACHE_CTRL` | 1 | cache enable: the flash windows are always readable (D5) | SP1b-4 |
 | `0x600c4004` | `EXTMEM.ICACHE_CTRL1` | 1 | bus gating of the flash windows (SHUT_IBUS, SHUT_DBUS; D5) | SP1b-4 |
@@ -129,4 +129,8 @@ rows, and that plan inherits them too.
 | `0x600c40ac` | `EXTMEM.CACHE_MMU_POWER_CTRL` | 1 | MMU memory power | SP8 |
 | `0x600c40c4` | `EXTMEM.CACHE_MMU_OWNER` | 1 | MMU ownership bits | SP1b-4 |
 | `0x600c40cc` | `EXTMEM.ICACHE_FREEZE` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
-| `0x600ce044` | `ASSIST_DEBUG.CORE_0_RCD_EN` | 1 | PC/SP recording at reset | SP1b-3 |
+| `0x600ce000` | `ASSIST_DEBUG.CORE_0_MONTR_ENA` | 1 | stack guard: the stack pointer is not compared with the bounds | SP1b-4 |
+| `0x600ce008` | `ASSIST_DEBUG.CORE_0_INTR_ENA` | 1 | stack guard: the stack pointer is not compared with the bounds | SP1b-4 |
+| `0x600ce00c` | `ASSIST_DEBUG.CORE_0_INTR_CLR` | 1 | stack guard: the stack pointer is not compared with the bounds | SP1b-4 |
+| `0x600ce038` | `ASSIST_DEBUG.CORE_0_SP_MIN` | 1 | stack guard: the stack pointer is not compared with the bounds | SP1b-4 |
+| `0x600ce03c` | `ASSIST_DEBUG.CORE_0_SP_MAX` | 1 | stack guard: the stack pointer is not compared with the bounds | SP1b-4 |

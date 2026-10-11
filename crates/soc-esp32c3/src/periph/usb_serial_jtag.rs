@@ -33,6 +33,11 @@ impl UsbSerialJtag {
         }
     }
 
+    /// A core reset empties the packet being filled; what was sent stays for the console.
+    pub(crate) fn reset(&mut self) {
+        self.packet.clear();
+    }
+
     /// The bytes sent to the host since the last call.
     pub fn take_tx(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.tx)

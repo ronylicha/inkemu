@@ -164,13 +164,23 @@ pub struct Spi1 {
 impl Spi1 {
     #[must_use]
     pub fn new(flash: Box<dyn FlashDevice>) -> Spi1 {
+        Spi1 {
+            registers: Spi1::reset_registers(),
+            flash,
+        }
+    }
+
+    fn reset_registers() -> Storage {
         let mut offsets: Vec<u32> = SPI1_ACCEPTED.iter().map(|a| a.addr - SPI1_BASE).collect();
         offsets.extend([ADDR, USER, USER1, USER2, MOSI_DLEN, MISO_DLEN, RD_STATUS]);
         offsets.extend((0..DATA_WORDS).map(|word| W0 + 4 * word));
-        Spi1 {
-            registers: Storage::for_offsets(SPI1_BASE, &offsets),
-            flash,
-        }
+        Storage::for_offsets(SPI1_BASE, &offsets)
+    }
+
+    /// The controller is reset (`SYSTEM.PERIP_RST_EN0` bit 1, or a core reset): its registers
+    /// return to their reset values. The flash chip is another component: it keeps its content.
+    pub(crate) fn reset(&mut self) {
+        self.registers = Spi1::reset_registers();
     }
 
     /// The chip, for the cache windows of the bus.

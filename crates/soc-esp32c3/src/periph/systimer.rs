@@ -160,6 +160,16 @@ impl Systimer {
         }
     }
 
+    /// The block is reset (`SYSTEM.PERIP_RST_EN0` bit 29, or a core reset): it is built again at
+    /// the present time. Its wake-up is withdrawn first, so that a firmware resetting the block over
+    /// and over leaves no call behind in the scheduler.
+    pub(crate) fn reset(&mut self, ctx: &mut Ctx) {
+        self.wake.cancel(ctx);
+        *self = Systimer::new(ctx.now());
+        // The rebuilt block drives its interrupt sources low.
+        self.wake(ctx);
+    }
+
     const fn comparator_works(&self, comparator: usize) -> bool {
         self.conf & (TARGET0_WORK_EN >> comparator) != 0
     }
@@ -617,5 +627,25 @@ mod tests {
         pump(ctx, &mut timer);
         assert_eq!(timer.read(ctx, INT_RAW), Some(0));
         assert_eq!(ctx.next_wake(), None);
+    }
+
+    #[test]
+    fn a_reset_withdraws_the_wake_up_and_lowers_the_sources() {
+        let ctx = &mut Ctx::default();
+        let mut timer = Systimer::new(ctx.now());
+        program_the_tick(ctx, &mut timer);
+        assert!(ctx.next_wake().is_some());
+        timer.reset(ctx);
+        assert_eq!(ctx.next_wake(), None, "no call is left for the old state");
+        assert_eq!(timer.read(ctx, INT_RAW), Some(0));
+        assert_eq!(timer.read(ctx, INT_ENA), Some(0));
+        assert_eq!(ctx.sources(), 0);
+        // Reset again and again: the scheduler holds a bounded number of withdrawn calls, not one
+        // per reset (without the withdrawal it would hold 1 000 live ones).
+        for _ in 0..1_000 {
+            program_the_tick(ctx, &mut timer);
+            timer.reset(ctx);
+        }
+        assert!(ctx.scheduled_entries() <= 40, "{}", ctx.scheduled_entries());
     }
 }

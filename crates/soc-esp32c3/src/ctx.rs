@@ -54,6 +54,16 @@ impl Source {
     }
 }
 
+/// A hardware module that `SYSTEM.PERIP_RST_EN0` or `PERIP_RST_EN1` resets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Module {
+    Spi01,
+    Uart0,
+    Uart1,
+    Systimer,
+    Sha,
+}
+
 /// What a device is called for, besides register accesses: at the instant it asked for (a wake-up),
 /// or because another part of the machine has something to tell it.
 ///
@@ -72,6 +82,8 @@ pub enum Event {
     Uart(u8),
     /// Wake-up of `RTC_CNTL`: the RTC watchdog may have reached a stage timeout.
     RtcWatchdog,
+    /// To the named module: `SYSTEM.PERIP_RST_EN0/1` put it in reset.
+    ModuleReset(Module),
 }
 
 /// The wake-up a device keeps for its next deadline.
@@ -137,7 +149,7 @@ pub struct Ctx {
     sources: u64,
     /// A source level or a register of the interrupt controller changed since the machine last looked.
     interrupts_changed: bool,
-    /// The reset a device asked for, if any: the first request of an instruction wins.
+    /// The reset a device asked for, if any: see [`Ctx::request_reset`] for which request is kept.
     reset: Option<ResetCause>,
     /// Every refusal in the order it was reported, for the tests of the device models: the
     /// diagnostics list a repeated refusal once, and a device test wants to see each one.
@@ -309,10 +321,23 @@ impl Ctx {
         self.clock_written || self.interrupts_changed || self.reset.is_some()
     }
 
-    /// Asks for a reset. It takes place when the current instruction ends; the first request of an
-    /// instruction wins.
+    /// Every source is released at once: what a reset of the digital peripherals does.
+    pub(crate) fn clear_sources(&mut self) {
+        self.sources = 0;
+        self.interrupts_changed = true;
+    }
+
+    /// Asks for a reset. It takes place when the current instruction ends.
+    ///
+    /// Of the requests posted within one instruction, the one of the deepest level wins (system
+    /// over core over CPU), and between two requests of the same level the first wins. Two
+    /// requests of one instruction are simultaneous for the model, and a reset of a deeper level
+    /// includes the shallower one: the chip cannot do a CPU reset "instead of" a system reset that
+    /// was asked for at the same time (TRM §6.1.3).
     pub fn request_reset(&mut self, cause: ResetCause) {
-        self.reset.get_or_insert(cause);
+        if self.reset.is_none_or(|held| cause.level() > held.level()) {
+            self.reset = Some(cause);
+        }
     }
 
     /// The reset asked for since the last call.
@@ -554,12 +579,37 @@ mod tests {
     }
 
     #[test]
-    fn the_first_reset_request_of_an_instruction_wins() {
+    fn a_system_reset_requested_after_a_cpu_reset_wins() {
         let mut ctx = Ctx::default();
         assert_eq!(ctx.take_reset(), None);
         ctx.request_reset(ResetCause::SoftwareCpu);
+        ctx.request_reset(ResetCause::RtcWatchdogSystem);
+        assert_eq!(ctx.take_reset(), Some(ResetCause::RtcWatchdogSystem));
+        assert_eq!(ctx.take_reset(), None);
+    }
+
+    #[test]
+    fn a_cpu_reset_requested_after_a_system_reset_does_not_replace_it() {
+        let mut ctx = Ctx::default();
+        ctx.request_reset(ResetCause::RtcWatchdogSystem);
+        ctx.request_reset(ResetCause::SoftwareCpu);
         ctx.request_reset(ResetCause::Mwdt0Core);
+        assert_eq!(ctx.take_reset(), Some(ResetCause::RtcWatchdogSystem));
+        assert_eq!(ctx.take_reset(), None);
+    }
+
+    #[test]
+    fn of_two_resets_of_the_same_level_the_first_wins() {
+        let mut ctx = Ctx::default();
+        ctx.request_reset(ResetCause::SoftwareCpu);
+        ctx.request_reset(ResetCause::Mwdt0Cpu);
         assert_eq!(ctx.take_reset(), Some(ResetCause::SoftwareCpu));
+        ctx.request_reset(ResetCause::Mwdt0Core);
+        ctx.request_reset(ResetCause::SoftwareSystem);
+        assert_eq!(ctx.take_reset(), Some(ResetCause::Mwdt0Core));
+        ctx.request_reset(ResetCause::SuperWatchdog);
+        ctx.request_reset(ResetCause::RtcWatchdogSystem);
+        assert_eq!(ctx.take_reset(), Some(ResetCause::SuperWatchdog));
         assert_eq!(ctx.take_reset(), None);
     }
 

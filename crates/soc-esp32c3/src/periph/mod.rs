@@ -1,7 +1,8 @@
 //! The modelled peripherals of the ESP32-C3 and their place in the address space.
 use crate::config::{STRAP_SPI_FAST_FLASH_BOOT, SocConfig};
-use crate::ctx::{Ctx, Event};
+use crate::ctx::{Ctx, Event, Module};
 use crate::flash::FlashDevice;
+use crate::reset::{ResetCause, ResetLevel};
 use emu_core::Peripheral;
 
 pub mod ana_i2c;
@@ -15,6 +16,7 @@ pub mod intmatrix;
 pub mod io_mux;
 pub mod mmu;
 pub mod rtc_cntl;
+pub mod sensitive;
 pub mod sha;
 pub mod spi_mem;
 pub mod system;
@@ -32,6 +34,7 @@ pub use intmatrix::IntMatrix;
 pub use io_mux::IoMux;
 pub use mmu::MmuTable;
 pub use rtc_cntl::RtcCntl;
+pub use sensitive::Sensitive;
 pub use sha::Sha;
 pub use spi_mem::{Spi0, Spi1};
 pub use system::System;
@@ -226,7 +229,7 @@ pub fn accepted_without_effect() -> Vec<Accepted> {
         io_mux::accepted(),
         rtc_cntl::accepted(),
         gpio::accepted(),
-        SENSITIVE_ACCEPTED.to_vec(),
+        sensitive::accepted(),
         system::accepted(),
         uart::accepted(),
         intmatrix::accepted(),
@@ -283,14 +286,6 @@ pub(crate) const SYSTEM_BASE: u32 = 0x600C_0000;
 const SYSTEM: (u32, u32) = (SYSTEM_BASE, 0x600C_1000);
 pub(crate) const SENSITIVE_BASE: u32 = 0x600C_1000;
 const SENSITIVE: (u32, u32) = (SENSITIVE_BASE, 0x600C_2000);
-/// `Cache_Occupy_ICache_MEMORY` gives SRAM0 to the cache by clearing bit 0 (CM §2.1). SRAM0 stays
-/// plain RAM here: nothing uses it once the cache is on (CM §9 item 9).
-const SENSITIVE_ACCEPTED: [Accepted; 1] = [Accepted::svd(
-    "SENSITIVE",
-    "INTERNAL_SRAM_USAGE_1",
-    "SRAM0 handed to the cache as line storage",
-    "SP1b-4",
-)];
 pub(crate) const INTMATRIX_BASE: u32 = 0x600C_2000;
 const INTMATRIX: (u32, u32) = (INTMATRIX_BASE, 0x600C_3000);
 pub(crate) const EXTMEM_BASE: u32 = 0x600C_4000;
@@ -371,6 +366,8 @@ const RADIO_POWER_ACCEPTED: [Accepted; 4] = [
 
 #[derive(Debug)]
 pub struct Peripherals {
+    /// The strapping pins of the device, latched at power-on: what a reset rebuilds from.
+    strapping: u32,
     pub gpio: Gpio,
     pub io_mux: IoMux,
     pub intmatrix: IntMatrix,
@@ -379,7 +376,7 @@ pub struct Peripherals {
     pub efuse: Efuse,
     pub extmem: Extmem,
     pub mmu: MmuTable,
-    pub sensitive: AcceptedBlock,
+    pub sensitive: Sensitive,
     pub assist_debug: AssistDebug,
     pub spi0: Spi0,
     pub spi1: Spi1,
@@ -405,6 +402,7 @@ impl Peripherals {
         let flash_boot = config.strapping & STRAP_SPI_FAST_FLASH_BOOT != 0;
         let efuse = Efuse::new(config.chip_revision);
         let mut periph = Peripherals {
+            strapping: config.strapping,
             gpio: Gpio::new(config.strapping),
             io_mux: IoMux::new(),
             intmatrix: IntMatrix::new(),
@@ -413,7 +411,7 @@ impl Peripherals {
             efuse,
             extmem: Extmem::new(),
             mmu: MmuTable::new(),
-            sensitive: AcceptedBlock::new(SENSITIVE_BASE, &SENSITIVE_ACCEPTED),
+            sensitive: Sensitive::new(),
             assist_debug: AssistDebug::new(),
             spi0: Spi0::new(),
             spi1: Spi1::new(flash),
@@ -445,7 +443,79 @@ impl Peripherals {
             Event::RtcWatchdog => self.rtc_cntl.wake(ctx),
             Event::Uart(0) => self.uart0.wake(ctx),
             Event::Uart(_) => self.uart1.wake(ctx),
+            Event::ModuleReset(module) => self.reset_module(ctx, module),
         }
+    }
+
+    /// `SYSTEM.PERIP_RST_EN0/1` put a module in reset: its registers return to their reset values.
+    /// What `esp_system_reset_modules_on_exit` does to the UARTs, the SPI controllers and the
+    /// SYSTIMER before `esp_restart_noos` resets the CPU
+    /// (`IDF:components/esp_system/port/soc/esp32c3/system_internal.c:52-60`; report IR §4.1).
+    fn reset_module(&mut self, ctx: &mut Ctx, module: Module) {
+        match module {
+            Module::Spi01 => {
+                self.spi0 = Spi0::new();
+                self.spi1.reset();
+            }
+            Module::Uart0 => self.uart0.reset(ctx.now()),
+            Module::Uart1 => self.uart1.reset(ctx.now()),
+            Module::Systimer => self.systimer.reset(ctx),
+            Module::Sha => self.sha = Sha::new(),
+        }
+    }
+
+    /// Applies a reset to the peripherals (TRM §6.1.3; report TW §D.2). `pc` and `sp` are those of
+    /// the CPU when the reset caught it.
+    ///
+    /// - Every level resets the CPU: the debug assistant records its PC, the permission registers
+    ///   return to their reset values.
+    /// - A core reset rebuilds every digital peripheral. The flash chip, the random sequence and
+    ///   the console bytes that already left are no register: they stay.
+    /// - A system reset also returns `RTC_CNTL` to its reset values and clears the recorded PC.
+    ///
+    /// ASSUMPTION: a CPU reset leaves the interrupt controller as it is. The TRM lists only the PMS
+    /// registers as reset with the CPU (§6.1.3); the ROM clears `CPU_INT_ENABLE` itself at every
+    /// boot (`ROM3:boot_prepare`, trace F1), which hides the difference (TW §D.2). A read of
+    /// `INTERRUPT_CORE0` registers on a chip right after `esp_restart`, before the ROM touches
+    /// them, settles it.
+    pub(crate) fn reset(&mut self, ctx: &mut Ctx, cause: ResetCause, pc: u32, sp: u32) {
+        let level = cause.level();
+        self.assist_debug.cpu_reset(pc, sp);
+        self.sensitive = Sensitive::new();
+        if level >= ResetLevel::Core {
+            self.core_reset(ctx);
+        }
+        if level == ResetLevel::System {
+            self.assist_debug.system_reset();
+        }
+        // Last: it drives the RTC interrupt source again, after a core reset cleared them all.
+        self.rtc_cntl.reset(ctx, cause, level == ResetLevel::System);
+    }
+
+    fn core_reset(&mut self, ctx: &mut Ctx) {
+        self.gpio = Gpio::new(self.strapping);
+        self.io_mux = IoMux::new();
+        self.intmatrix = IntMatrix::new();
+        self.system = System::new();
+        self.extmem = Extmem::new();
+        self.mmu = MmuTable::new();
+        self.assist_debug.core_reset();
+        self.spi0 = Spi0::new();
+        self.spi1.reset();
+        self.sha = Sha::new();
+        self.apb_ctrl.reset();
+        self.ana_i2c = AnaI2c::new();
+        self.timg0 = AcceptedBlock::new(TIMG0_BASE, &TIMG0_ACCEPTED);
+        self.apb_saradc = AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED);
+        self.radio_power = AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED);
+        self.uart0.reset(ctx.now());
+        self.uart1.reset(ctx.now());
+        self.usb_serial_jtag.reset();
+        // No rebuilt device asserts an interrupt source, and `SYSTEM` selects the reset clock again.
+        // The SYSTIMER goes last: it withdraws its wake-up and drives its sources low.
+        ctx.clear_sources();
+        ctx.clock_written();
+        self.systimer.reset(ctx);
     }
 
     /// The device that owns the register at `addr`, with its base address.
@@ -788,5 +858,162 @@ mod tests {
             replace_half(0x000F_FFFF_0000_0000, false, 0x1234_5678, 0x000F_FFFF),
             0x000F_FFFF_1234_5678
         );
+    }
+
+    /// Reads and writes through the device tree, as the bus does.
+    fn read(p: &mut Peripherals, ctx: &mut Ctx, addr: u32) -> Option<u32> {
+        let (device, base) = p.device(addr)?;
+        device.read(ctx, addr - base)
+    }
+    fn write(p: &mut Peripherals, ctx: &mut Ctx, addr: u32, value: u32) {
+        let (device, base) = p.device(addr).expect("routed");
+        assert!(device.write(ctx, addr - base, value), "{addr:#010x}");
+    }
+    /// The state the reset tests start from: registers of four blocks away from their reset values.
+    fn running(ctx: &mut Ctx) -> Peripherals {
+        let svd = svd_regs::esp32c3::addr;
+        let mut p = peripherals(ctx);
+        // The clock selection `esp_restart_noos` leaves, through `rtc_clk_cpu_set_to_default_config`
+        // (`IDF:components/esp_system/port/soc/esp32c3/system_internal.c:109`): the crystal
+        // undivided (report IR §4.1).
+        write(&mut p, ctx, svd("SYSTEM", "SYSCLK_CONF"), 0x0000_0400);
+        write(&mut p, ctx, svd("RTC_CNTL", "STORE4"), 0x0028_0028);
+        write(&mut p, ctx, svd("SENSITIVE", "INTERNAL_SRAM_USAGE_1"), 0xE);
+        write(&mut p, ctx, svd("ASSIST_DEBUG", "CORE_0_RCD_EN"), 3);
+        write(&mut p, ctx, svd("SPI1", "USER1"), 0x1234_5678);
+        write(&mut p, ctx, svd("SYSTEM", "CPU_INTR_FROM_CPU_0"), 1);
+        assert_ne!(ctx.sources(), 0);
+        p
+    }
+
+    #[test]
+    fn a_cpu_reset_records_the_pc_resets_the_permissions_and_leaves_the_rest() {
+        // TRM §6.1.3; IR §4.2: what survives `esp_restart`.
+        let svd = svd_regs::esp32c3::addr;
+        let ctx = &mut Ctx::default();
+        let mut p = running(ctx);
+        p.reset(ctx, ResetCause::SoftwareCpu, 0x4004_8b92, 0x3FC9_0000);
+        let mut read = |addr| read(&mut p, ctx, addr);
+        assert_eq!(
+            read(svd("RTC_CNTL", "RESET_STATE")).map(|v| v & 0x3F),
+            Some(0x0C)
+        );
+        assert_eq!(
+            read(svd("ASSIST_DEBUG", "CORE_0_RCD_PDEBUGPC")),
+            Some(0x4004_8b92)
+        );
+        assert_eq!(read(svd("ASSIST_DEBUG", "CORE_0_RCD_EN")), Some(0));
+        assert_eq!(read(svd("SENSITIVE", "INTERNAL_SRAM_USAGE_1")), Some(0xF));
+        assert_eq!(
+            read(svd("SYSTEM", "SYSCLK_CONF")).map(|v| v & 0xFFF),
+            Some(0x400)
+        );
+        assert_eq!(read(svd("RTC_CNTL", "STORE4")), Some(0x0028_0028));
+        assert_eq!(read(svd("SPI1", "USER1")), Some(0x1234_5678));
+        assert_eq!(read(svd("SYSTEM", "CPU_INTR_FROM_CPU_0")), Some(1));
+    }
+
+    #[test]
+    fn a_core_reset_rebuilds_the_digital_peripherals_and_keeps_rtc_cntl() {
+        // TW §D.2: after `TG0WDT_SYS_RST` the retention registers and the saved PC are still there.
+        let svd = svd_regs::esp32c3::addr;
+        let ctx = &mut Ctx::default();
+        let mut p = running(ctx);
+        assert!(ctx.take_clock_written());
+        p.reset(ctx, ResetCause::Mwdt0Core, 0x4004_c0d4, 0);
+        assert_eq!(ctx.sources(), 0, "no rebuilt device asserts a source");
+        assert!(
+            ctx.take_clock_written(),
+            "the clock selection is the reset one again"
+        );
+        let mut read = |addr| read(&mut p, ctx, addr);
+        assert_eq!(
+            read(svd("RTC_CNTL", "RESET_STATE")).map(|v| v & 0x3F),
+            Some(0x07)
+        );
+        assert_eq!(read(svd("RTC_CNTL", "STORE4")), Some(0x0028_0028));
+        assert_eq!(
+            read(svd("ASSIST_DEBUG", "CORE_0_RCD_PDEBUGPC")),
+            Some(0x4004_c0d4)
+        );
+        assert_eq!(
+            read(svd("SYSTEM", "SYSCLK_CONF")).map(|v| v & 0xFFF),
+            Some(1),
+            "`PRE_DIV_CNT` 1 and the crystal selected, as after power-on"
+        );
+        assert_eq!(
+            read(svd("SPI1", "USER1")),
+            Some(0x5C00_0007),
+            "its reset value"
+        );
+        assert_eq!(read(svd("SYSTEM", "CPU_INTR_FROM_CPU_0")), Some(0));
+        assert_eq!(
+            read(svd("TIMG0", "WDTCONFIG0")),
+            Some(0x0004_C000),
+            "its reset value, `FLASHBOOT_MOD_EN` set"
+        );
+    }
+
+    #[test]
+    fn a_system_reset_also_resets_rtc_cntl_and_forgets_the_recorded_pc() {
+        // TW §D.2, §H.1: no `Saved PC` after `RTCWDT_RTC_RST`.
+        let svd = svd_regs::esp32c3::addr;
+        let ctx = &mut Ctx::default();
+        let mut p = running(ctx);
+        p.reset(ctx, ResetCause::RtcWatchdogSystem, 0x4004_c0d4, 0);
+        let mut read = |addr| read(&mut p, ctx, addr);
+        assert_eq!(
+            read(svd("RTC_CNTL", "RESET_STATE")).map(|v| v & 0x3F),
+            Some(0x10)
+        );
+        assert_eq!(read(svd("RTC_CNTL", "STORE4")), Some(0));
+        assert_eq!(read(svd("ASSIST_DEBUG", "CORE_0_RCD_PDEBUGPC")), Some(0));
+    }
+
+    #[test]
+    fn a_module_reset_returns_that_module_alone_to_its_reset_values() {
+        // IR §4.1: `esp_system_reset_modules_on_exit` resets the SPI controllers through
+        // `PERIP_RST_EN0` bit 1.
+        let svd = svd_regs::esp32c3::addr;
+        let ctx = &mut Ctx::default();
+        let mut p = running(ctx);
+        p.deliver(ctx, Event::ModuleReset(Module::Spi01));
+        assert_eq!(read(&mut p, ctx, svd("SPI1", "USER1")), Some(0x5C00_0007));
+        assert_eq!(
+            read(&mut p, ctx, svd("RTC_CNTL", "STORE4")),
+            Some(0x0028_0028)
+        );
+        assert_eq!(
+            p.spi1.flash().size(),
+            crate::flash::FlashConfig::default().size(),
+            "the flash chip is not part of the controller"
+        );
+    }
+
+    #[test]
+    fn a_wake_up_is_delivered_to_the_device_it_names() {
+        // A one-shot alarm of the SYSTIMER 1 600 counts ahead: 100 us, 16 000 cycles of the time base.
+        let svd = svd_regs::esp32c3::addr;
+        let ctx = &mut Ctx::default();
+        let mut p = peripherals(ctx);
+        write(&mut p, ctx, svd("SYSTIMER", "TARGET0_LO"), 1_600);
+        write(&mut p, ctx, svd("SYSTIMER", "COMP0_LOAD"), 1);
+        write(
+            &mut p,
+            ctx,
+            svd("SYSTIMER", "CONF"),
+            0x4600_0000 | (1 << 24),
+        );
+        assert_eq!(ctx.next_wake(), Some(emu_core::Cycles(16_000)));
+        ctx.sleep_until(emu_core::Cycles(16_000));
+        assert_eq!(
+            read(&mut p, ctx, svd("SYSTIMER", "INT_RAW")),
+            Some(0),
+            "not called yet"
+        );
+        while let Some(event) = ctx.take_due() {
+            p.deliver(ctx, event);
+        }
+        assert_eq!(read(&mut p, ctx, svd("SYSTIMER", "INT_RAW")), Some(1));
     }
 }

@@ -5,12 +5,16 @@ use crate::config::SocConfig;
 use crate::diag::{Diagnostic, Unsupported};
 use crate::flash::{FlashDevice, FlashImageError, NorFlash};
 use crate::memmap::RESET_PC;
+use crate::reset::ResetCause;
 use crate::rom::RomImage;
 use cpu_rv32::{
     DatasheetTiming, Exception, Hart, HartConfig, InterruptModel, MisalignedPolicy, StepOutcome,
     VendorCsrs,
 };
 use emu_core::{Cycles, Frequency, TimingModel, TraceHash};
+
+/// `x2`, the stack pointer of the RISC-V calling convention.
+const STACK_POINTER: usize = 2;
 
 /// The two serial consoles the mask ROM prints on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +64,8 @@ pub struct Esp32C3 {
     trace: Option<TraceHash>,
     /// The line the interrupt controller selects, and the device time from which the CPU sees it.
     selected: Option<(u32, Cycles)>,
+    /// Resets since power-on.
+    resets: u64,
 }
 
 impl Esp32C3 {
@@ -114,6 +120,7 @@ impl Esp32C3 {
             timing: DatasheetTiming,
             trace: config.trace_hash.then(TraceHash::new),
             selected: None,
+            resets: 0,
         }
     }
 
@@ -186,15 +193,13 @@ impl Esp32C3 {
     }
 
     /// Acts on what the last instruction, or the passing of time, left in the context: wake-ups
-    /// that are due, a clock change, a change of the interrupt lines.
+    /// that are due, a reset, a clock change, a change of the interrupt lines.
     fn service(&mut self, pc: u32) {
         while let Some(event) = self.bus.ctx.take_due() {
             self.bus.deliver(event);
         }
-        // The machine does not reset yet: a request, from a software reset bit or from a watchdog,
-        // is reported by name, and stops a strict run, instead of vanishing.
         if let Some(cause) = self.bus.ctx.take_reset() {
-            self.bus.ctx.unsupported(Unsupported::Reset { cause });
+            self.reset(cause);
         }
         if self.bus.ctx.take_clock_written() {
             self.retune(pc);
@@ -251,6 +256,20 @@ impl Esp32C3 {
         Some(target.get() - now.get())
     }
 
+    /// Applies a reset (TRM §6.1): the peripherals of its level return to their reset state, the
+    /// CPU restarts in the ROM. The memories keep their content and device time goes on.
+    ///
+    /// A watchdog that is still expired after the reset asks for the next one at the end of the
+    /// next instruction: at most one reset per instruction, and every instruction costs cycles,
+    /// so a run still reaches its cycle limit.
+    fn reset(&mut self, cause: ResetCause) {
+        let (pc, sp) = (self.hart.pc, self.hart.x[STACK_POINTER]);
+        self.bus.reset(cause, pc, sp);
+        self.hart.reset(RESET_PC);
+        self.selected = None;
+        self.resets += 1;
+    }
+
     /// Applies a write to the clock registers: from the end of the instruction that wrote them,
     /// cycles last what the new selection says.
     fn retune(&mut self, pc: u32) {
@@ -266,6 +285,12 @@ impl Esp32C3 {
                 pc,
             }),
         }
+    }
+
+    /// Resets since power-on: software resets and watchdog resets alike.
+    #[must_use]
+    pub const fn resets(&self) -> u64 {
+        self.resets
     }
 
     /// The CPU clock frequency the firmware selected.
@@ -1054,47 +1079,51 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_request_is_reported_by_name_and_stops_a_strict_run() {
-        use crate::reset::ResetCause;
-        let reported = |m: &mut Esp32C3, cause: ResetCause| {
-            m.drain_diagnostics().into_iter().any(|diagnostic| {
-                matches!(
-                    diagnostic,
-                    Diagnostic::Unsupported { what: Unsupported::Reset { cause: seen }, .. }
-                        if seen == cause
-                )
-            })
-        };
-        // What `esp_restart` ends with: `RTC_CNTL.OPTIONS0` bit 5 (IR §4.1).
-        let mut restart = stop_watchdogs();
-        restart.extend(store_register(reg("RTC_CNTL", "OPTIONS0"), 1 << 5));
-        restart.push(HANG);
-        let mut m = machine(&restart);
+    fn a_software_cpu_reset_restarts_at_the_reset_vector_and_keeps_memory_and_time() {
+        // What `esp_restart` ends with: `RTC_CNTL.OPTIONS0` bit 5 (IR §4.1). The second pass
+        // finds the cause and parks.
+        const MARKER: u32 = SRAM_DBUS_BASE + 0x100;
+        let marker = load_register(MARKER);
+        // The RAM is zero after power-on: the first pass skips the park of the second.
+        let mut body = vec![marker[0], marker[1], cpu_rv32::asm::beq(T1, 0, 8), HANG];
+        body.extend(stop_watchdogs());
+        body.extend(store_register(MARKER, 0x5AFE_C0DE));
+        body.extend(store_register(reg("ASSIST_DEBUG", "CORE_0_RCD_EN"), 3));
+        body.extend(store_register(reg("RTC_CNTL", "OPTIONS0"), 1 << 5));
+        let after_store = ROM_BASE + 4 * u32::try_from(body.len()).unwrap();
+        body.push(HANG);
+        let mut m = machine(&body);
         assert_eq!(m.run_until(Cycles(1_000)), StopReason::CycleBudget);
-        assert!(reported(&mut m, ResetCause::SoftwareCpu));
-        let mut strict = machine_with(
-            &restart,
-            SocConfig {
-                strict_mmio: true,
-                ..SocConfig::default()
-            },
+        assert_eq!(m.resets(), 1);
+        assert_eq!(m.pc(), ROM_BASE + 4 * 3, "the second pass parked");
+        assert_eq!(
+            bus_word(&mut m, reg("RTC_CNTL", "RESET_STATE")) & 0x3F,
+            0x0C,
+            "RTC_SW_CPU_RST"
         );
-        assert!(matches!(
-            strict.run_until(Cycles(1_000)),
-            StopReason::StrictMmio(Diagnostic::Unsupported {
-                what: Unsupported::Reset {
-                    cause: ResetCause::SoftwareCpu
-                },
-                ..
-            })
-        ));
-        // A CPU that only sleeps: the RTC watchdog the reset values arm expires after 400 000
-        // cycles of the 136 kHz slow clock, 2.941 s (TW §D.4).
-        let mut asleep = machine(&[wfi(), HANG]);
-        for _ in 0..3 {
-            assert_eq!(asleep.run_until(Cycles(10_000)), StopReason::Asleep);
-        }
-        assert!(asleep.device_time_nanos() >= 2_941_176_470);
-        assert!(reported(&mut asleep, ResetCause::RtcWatchdogSystem));
+        assert_eq!(
+            bus_word(&mut m, MARKER),
+            0x5AFE_C0DE,
+            "the RAM keeps its content"
+        );
+        assert_eq!(
+            bus_word(&mut m, reg("ASSIST_DEBUG", "CORE_0_RCD_PDEBUGPC")),
+            after_store,
+            "the PC the reset kept from executing"
+        );
+        assert_eq!(
+            bus_word(&mut m, reg("TIMG0", "WDTCONFIG0")),
+            0,
+            "a CPU reset leaves the peripherals as they are"
+        );
+        assert_eq!(
+            m.cycles().get(),
+            1_000,
+            "the cycle total goes on across the reset"
+        );
+        assert!(
+            m.device_time_nanos() >= 1_000 * 50,
+            "and so does device time"
+        );
     }
 }

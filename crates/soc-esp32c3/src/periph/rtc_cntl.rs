@@ -145,7 +145,7 @@ const ACCEPTED: [Accepted; 18] = [
     Accepted::svd(
         "RTC_CNTL",
         "OPTIONS0",
-        "BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits are reported)",
+        "BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits act)",
         "SP1b-3b",
     ),
     Accepted::svd(

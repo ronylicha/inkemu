@@ -48,6 +48,12 @@ impl ApbCtrl {
         }
     }
 
+    /// A core reset returns the registers to their reset values. The generator is no register: its
+    /// sequence goes on, so a boot after a reset does not replay the numbers of the one before.
+    pub(crate) fn reset(&mut self) {
+        self.power = Storage::accepted(APB_CTRL_BASE, &ACCEPTED);
+    }
+
     fn next_random(&mut self) -> u32 {
         let mut state = self.rng;
         state ^= state >> 12;
