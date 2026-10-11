@@ -12,8 +12,15 @@ const ENTRY_MAGIC: [u8; 2] = [0xAA, 0x50];
 const MD5_MAGIC: [u8; 2] = [0xEB, 0xEB];
 const ERASED: u8 = 0xFF;
 const NAME_LEN: usize = 16;
-/// One slot is reserved for the MD5 entry.
-const MAX_ENTRIES: usize = PARTITION_TABLE_LEN / ENTRY_LEN - 1;
+/// Entries plus the MD5 entry must stay strictly below [`PARTITION_TABLE_LEN`]
+/// (`gen_esp32part.py` `to_binary`: `len(result) >= MAX_PARTITION_LENGTH` is an error, so the
+/// table is at most 95 entries long including the MD5 entry, i.e. 94 user partitions).
+const MAX_ENTRIES: usize = PARTITION_TABLE_LEN / ENTRY_LEN - 2;
+/// Size of the sector holding the partition table (`gen_esp32part.py` `PARTITION_TABLE_SIZE`).
+const PARTITION_TABLE_SECTOR: u32 = 0x1000;
+/// Lowest offset a partition may start at: the end of the partition-table sector
+/// (`gen_esp32part.py` `verify`: `p.offset < offset_part_table + PARTITION_TABLE_SIZE` is an error).
+pub const FIRST_PARTITION_OFFSET: u32 = PARTITION_TABLE_OFFSET + PARTITION_TABLE_SECTOR;
 const APP_ALIGN: u32 = 0x10000;
 const DATA_ALIGN: u32 = 0x1000;
 
@@ -73,6 +80,16 @@ pub enum PartitionError {
         flash_bytes: u64,
     },
     #[error(
+        "partition `{name}` starts at {offset:#x}, inside the bootloader and partition-table area; move it to {minimum:#x} or above"
+    )]
+    BelowTableEnd {
+        name: String,
+        offset: u32,
+        minimum: u32,
+    },
+    #[error("two partitions are named `{name}`; rename one of them so every name is unique")]
+    DuplicateName { name: String },
+    #[error(
         "partitions `{first}` and `{second}` overlap; move one of them so their ranges no longer intersect"
     )]
     Overlap { first: String, second: String },
@@ -102,6 +119,13 @@ impl PartitionTable {
                     name: p.name.clone(),
                 });
             }
+            if p.offset < FIRST_PARTITION_OFFSET {
+                return Err(PartitionError::BelowTableEnd {
+                    name: p.name.clone(),
+                    offset: p.offset,
+                    minimum: FIRST_PARTITION_OFFSET,
+                });
+            }
             let required = if p.ptype == TYPE_APP {
                 APP_ALIGN
             } else {
@@ -122,6 +146,13 @@ impl PartitionTable {
                     flash_bytes: flash.bytes(),
                 });
             }
+        }
+        let mut names: Vec<&str> = self.entries.iter().map(|p| p.name.as_str()).collect();
+        names.sort_unstable();
+        if let Some(pair) = names.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(PartitionError::DuplicateName {
+                name: pair[0].to_owned(),
+            });
         }
         let mut sorted: Vec<&Partition> = self.entries.iter().collect();
         sorted.sort_by_key(|p| p.offset);
@@ -323,7 +354,9 @@ mod tests {
     }
 
     /// Imperatives that open the remedy clause of a message (`"; <verb> ..."`).
-    const REMEDY_VERBS: [&str; 6] = ["add", "remove", "shorten", "move", "shrink", "use"];
+    const REMEDY_VERBS: [&str; 7] = [
+        "add", "remove", "shorten", "move", "shrink", "use", "rename",
+    ];
 
     #[test]
     fn every_variant_message_states_a_remedy() {
@@ -341,6 +374,12 @@ mod tests {
                 end: 2,
                 flash_bytes: 1,
             },
+            PartitionError::BelowTableEnd {
+                name: "n".into(),
+                offset: 0,
+                minimum: 0x9000,
+            },
+            PartitionError::DuplicateName { name: "n".into() },
             PartitionError::Overlap {
                 first: "a".into(),
                 second: "b".into(),
@@ -358,30 +397,80 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_too_many_entries_and_non_ascii_names() {
-        let many = PartitionTable {
-            entries: (0..=MAX_ENTRIES)
+    /// `count` adjacent 4 KiB data partitions starting at the first legal offset.
+    fn data_partitions(count: usize) -> PartitionTable {
+        PartitionTable {
+            entries: (0..count)
                 .map(|i| Partition {
                     name: format!("p{i}"),
                     ptype: TYPE_DATA,
                     subtype: 0,
-                    offset: 0x1000 * u32::try_from(i).unwrap(),
+                    offset: FIRST_PARTITION_OFFSET + 0x1000 * u32::try_from(i).unwrap(),
                     size: 0x1000,
                     flags: 0,
                 })
                 .collect(),
-        };
+        }
+    }
+
+    #[test]
+    fn entry_limit_matches_gen_esp32part() {
+        // gen_esp32part.py to_binary rejects `len(result) >= 0xC00` with the MD5 entry included:
+        // 94 partitions + MD5 = 95 * 32 = 0xBE0 bytes is the longest accepted table.
+        assert_eq!(MAX_ENTRIES, 94);
+        let at_limit = data_partitions(MAX_ENTRIES);
+        let bytes = at_limit.to_bytes(FlashSize::Mb16).unwrap();
+        assert_eq!(bytes.len(), PARTITION_TABLE_LEN);
+        assert_eq!(PartitionTable::parse(&bytes).unwrap(), at_limit);
         assert_eq!(
-            many.to_bytes(FlashSize::Mb16),
+            data_partitions(MAX_ENTRIES + 1).to_bytes(FlashSize::Mb16),
             Err(PartitionError::TooManyEntries {
                 count: MAX_ENTRIES + 1
             })
         );
+    }
+
+    #[test]
+    fn rejects_non_ascii_names() {
         assert!(matches!(
             table(vec![("caf\u{e9}", TYPE_DATA, 0x9000, 0x1000)]).to_bytes(FlashSize::Mb4),
             Err(PartitionError::NameTooLong { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_partitions_below_the_end_of_the_table_sector() {
+        // gen_esp32part.py verify: offsets below 0x8000 + 0x1000 are an error.
+        assert_eq!(FIRST_PARTITION_OFFSET, 0x9000);
+        for offset in [0x0, 0x8000] {
+            assert_eq!(
+                table(vec![("early", TYPE_DATA, offset, 0x1000)]).to_bytes(FlashSize::Mb4),
+                Err(PartitionError::BelowTableEnd {
+                    name: "early".into(),
+                    offset,
+                    minimum: 0x9000
+                })
+            );
+        }
+        assert!(
+            table(vec![("first", TYPE_DATA, 0x9000, 0x1000)])
+                .to_bytes(FlashSize::Mb4)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_names() {
+        // gen_esp32part.py verify: "Partition names must be unique".
+        assert_eq!(
+            table(vec![
+                ("nvs", TYPE_DATA, 0x9000, 0x1000),
+                ("other", TYPE_DATA, 0xA000, 0x1000),
+                ("nvs", TYPE_DATA, 0xB000, 0x1000),
+            ])
+            .to_bytes(FlashSize::Mb4),
+            Err(PartitionError::DuplicateName { name: "nvs".into() })
+        );
     }
 
     #[test]
