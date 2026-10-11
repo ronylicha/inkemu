@@ -5,6 +5,7 @@ use super::{Accepted, SPI0_BASE, SPI1_BASE, Storage};
 use crate::diag::Unsupported;
 use crate::flash::{FlashCommand, FlashDevice};
 use emu_core::Peripheral;
+use std::collections::VecDeque;
 use svd_regs::esp32c3::addr;
 
 const CMD: u32 = addr("SPI1", "CMD") - SPI1_BASE;
@@ -152,7 +153,10 @@ impl Peripheral for Spi0 {
 pub struct Spi1 {
     registers: Storage,
     flash: Box<dyn FlashDevice>,
-    unsupported: Option<Unsupported>,
+    /// The commands the chip refused, oldest first. One `CMD` write runs at most one command per
+    /// `CMD` bit, so a write adds at most `HARD_WIRED.len() + 2` entries; the bus drains them after
+    /// every access.
+    unsupported: VecDeque<Unsupported>,
 }
 
 impl Spi1 {
@@ -164,7 +168,7 @@ impl Spi1 {
         Spi1 {
             registers: Storage::for_offsets(SPI1_BASE, &offsets),
             flash,
-            unsupported: None,
+            unsupported: VecDeque::new(),
         }
     }
 
@@ -174,9 +178,10 @@ impl Spi1 {
         self.flash.as_ref()
     }
 
-    /// The command the flash model refused since the last call, if any.
+    /// The oldest command the flash model refused and that was not taken yet: call until `None`
+    /// to get every refusal, in the order the commands ran.
     pub(crate) fn take_unsupported(&mut self) -> Option<Unsupported> {
-        self.unsupported.take()
+        self.unsupported.pop_front()
     }
 
     fn register(&self, offset: u32) -> u32 {
@@ -190,7 +195,7 @@ impl Spi1 {
         match self.flash.execute(command, &mut data_in) {
             Ok(()) => Some(data_in),
             Err(refused) => {
-                self.unsupported = Some(Unsupported::FlashCommand {
+                self.unsupported.push_back(Unsupported::FlashCommand {
                     opcode: refused.opcode,
                 });
                 None
@@ -331,7 +336,8 @@ impl Peripheral for Spi1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flash::{FlashConfig, NorFlash};
+    use crate::flash::{FlashConfig, NorFlash, UnmodeledCommand};
+    use std::{cell::RefCell, rc::Rc};
 
     /// `USER` bit 31: the transfer has a command phase (every measured one does, so the model never
     /// tests the bit and the constant lives with the tests that build `USER` values).
@@ -496,6 +502,132 @@ mod tests {
         spi.write(W0, 0xFFFF_FFFF);
         user_read(&mut spi, 0x9F, 16);
         assert_eq!(spi.read(W0), Some(0x0000_609D));
+    }
+
+    /// What a flash saw: `(opcode, address, dummy cycles, bytes sent)`.
+    type Seen = (u8, Option<u32>, u32, Vec<u8>);
+
+    /// A chip that accepts every command and remembers it, to look at what the controller sends.
+    #[derive(Debug)]
+    struct Recorder(Rc<RefCell<Vec<Seen>>>);
+
+    impl FlashDevice for Recorder {
+        fn size(&self) -> u32 {
+            FlashConfig::default().size
+        }
+        fn read(&self, _offset: u32, out: &mut [u8]) {
+            out.fill(0xFF);
+        }
+        fn execute(
+            &mut self,
+            command: &FlashCommand<'_>,
+            _data_in: &mut [u8],
+        ) -> Result<(), UnmodeledCommand> {
+            self.0.borrow_mut().push((
+                command.opcode,
+                command.address,
+                command.dummy_cycles,
+                command.data_out.to_vec(),
+            ));
+            Ok(())
+        }
+    }
+
+    fn recording_spi1() -> (Spi1, Rc<RefCell<Vec<Seen>>>) {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        (Spi1::new(Box::new(Recorder(Rc::clone(&seen)))), seen)
+    }
+
+    #[test]
+    fn several_refused_commands_in_one_write_are_all_reported_in_the_order_they_ran() {
+        let mut spi = spi1();
+        assert!(spi.write(CMD, (1 << 25) | (1 << 24))); // PP and SE
+        assert_eq!(
+            spi.take_unsupported(),
+            Some(Unsupported::FlashCommand { opcode: 0x02 })
+        );
+        assert_eq!(
+            spi.take_unsupported(),
+            Some(Unsupported::FlashCommand { opcode: 0x20 })
+        );
+        assert_eq!(spi.take_unsupported(), None, "drained");
+        // A refused hard-wired command and a refused user command in the same write.
+        spi.write(USER, USR_COMMAND);
+        spi.write(USER2, 0x7000_00D7);
+        spi.write(CMD, (1 << 23) | CMD_USR);
+        assert_eq!(
+            spi.take_unsupported(),
+            Some(Unsupported::FlashCommand { opcode: 0xD8 })
+        );
+        assert_eq!(
+            spi.take_unsupported(),
+            Some(Unsupported::FlashCommand { opcode: 0xD7 })
+        );
+        assert_eq!(spi.take_unsupported(), None);
+    }
+
+    #[test]
+    fn a_mosi_length_past_the_buffer_sends_the_sixty_four_bytes_of_w0_to_w15() {
+        let (mut spi, seen) = recording_spi1();
+        for word in 0..DATA_WORDS {
+            spi.write(W0 + 4 * word, 0x0403_0201 + 0x0404_0404 * word);
+        }
+        spi.write(USER, USR_COMMAND | USR_MOSI);
+        spi.write(USER2, 0x7000_0002);
+        spi.write(MOSI_DLEN, 1023);
+        spi.write(CMD, CMD_USR);
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        let sent = &seen[0].3;
+        assert_eq!(sent.len(), DATA_BYTES, "1024 bits asked, 64 bytes exist");
+        assert_eq!(
+            sent[..4],
+            [1, 2, 3, 4],
+            "W0 first, least significant byte first"
+        );
+        assert_eq!(sent[60..], [0x3D, 0x3E, 0x3F, 0x40], "W15 last");
+    }
+
+    #[test]
+    fn the_address_is_the_low_bits_of_addr_as_wide_as_user1_says() {
+        let (mut spi, seen) = recording_spi1();
+        spi.write(USER, USR_COMMAND | USR_ADDR);
+        spi.write(USER2, 0x7000_005A);
+        spi.write(ADDR, 0xDEAD_BEEF);
+        // (field value, address the flash must see): the field is the bit length minus one.
+        for (field, expected) in [
+            (0, 0x1),
+            (7, 0xEF),
+            (23, 0xAD_BEEF),
+            (31, 0xDEAD_BEEF),
+            (63, 0xDEAD_BEEF), // 64 bits asked, the register holds 32
+        ] {
+            spi.write(USER1, field << 26);
+            spi.write(CMD, CMD_USR);
+            let last = seen.borrow().last().cloned();
+            assert_eq!(
+                last.map(|s| s.1),
+                Some(Some(expected)),
+                "address field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_program_erase_bit_sends_the_opcode_found_in_user2() {
+        let (mut spi, seen) = recording_spi1();
+        spi.write(USER2, 0x7000_0020);
+        assert!(spi.write(CMD, CMD_PE));
+        assert_eq!(seen.borrow().as_slice(), [(0x20, None, 0, Vec::new())]);
+        assert_eq!(spi.read(CMD), Some(0), "self-clears");
+        // On the read-only chip the same bit is refused by name.
+        let mut refused = spi1();
+        refused.write(USER2, 0x7000_0020);
+        refused.write(CMD, CMD_PE);
+        assert_eq!(
+            refused.take_unsupported(),
+            Some(Unsupported::FlashCommand { opcode: 0x20 })
+        );
     }
 
     #[test]

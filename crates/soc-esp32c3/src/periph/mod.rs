@@ -343,7 +343,8 @@ impl Peripherals {
         }
     }
 
-    /// What a device was asked to do and cannot do faithfully, since the last call.
+    /// The oldest thing a device was asked to do and cannot do faithfully, not taken yet: call until
+    /// `None` to get all of them, in order.
     pub(crate) fn take_unsupported(&mut self) -> Option<Unsupported> {
         self.spi1.take_unsupported()
     }

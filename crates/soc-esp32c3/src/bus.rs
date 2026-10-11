@@ -117,9 +117,9 @@ impl SocBus {
         reset
     }
 
-    /// Turns what a device could not do into a diagnostic that names the instruction.
+    /// Turns everything a device could not do into diagnostics that name the instruction.
     fn relay_unsupported(&mut self) {
-        if let Some(what) = self.periph.take_unsupported() {
+        while let Some(what) = self.periph.take_unsupported() {
             self.diag
                 .record(Diagnostic::Unsupported { what, pc: self.pc });
         }
@@ -597,6 +597,23 @@ mod tests {
         assert_eq!(b.diag.drain(), vec![expected.clone()]);
         assert_eq!(b.diag.take_violation(), Some(expected));
         assert_eq!(load(&mut b, cmd), 0);
+    }
+
+    #[test]
+    fn every_refused_flash_command_of_one_write_is_reported_and_the_first_stops_a_strict_run() {
+        let cmd = svd_regs::esp32c3::addr("SPI1", "CMD");
+        let mut b = bus_with(SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        });
+        b.set_pc(0x4038_0020);
+        b.write(cmd, Word, (1 << 25) | (1 << 24)).unwrap(); // page program and sector erase
+        let refused = |opcode| Diagnostic::Unsupported {
+            what: crate::diag::Unsupported::FlashCommand { opcode },
+            pc: 0x4038_0020,
+        };
+        assert_eq!(b.diag.drain(), vec![refused(0x02), refused(0x20)]);
+        assert_eq!(b.diag.take_violation(), Some(refused(0x02)));
     }
 
     #[test]
