@@ -34,6 +34,8 @@ pub enum Unsupported {
     ClockSource { sysclk_conf: u32, cpu_per_conf: u32 },
     /// A reset requested through `RTC_CNTL.OPTIONS0` (D27).
     SoftwareReset { options0: u32 },
+    /// A byte written to a UART whose transmit FIFO was full: the hardware drops it too.
+    UartOverflow { uart: u8 },
 }
 
 impl Unsupported {
@@ -78,6 +80,10 @@ impl Unsupported {
             Unsupported::SoftwareReset { options0 } => write!(
                 f,
                 "a software reset was requested through RTC_CNTL.OPTIONS0 (value {options0:#010x}, pc {pc:#010x}) but resets are not emulated yet, so the write was ignored; restart inkemu to reset the device"
+            ),
+            Unsupported::UartOverflow { uart } => write!(
+                f,
+                "a byte was written to UART{uart} while its 128-byte transmit FIFO was full (pc {pc:#010x}), so the byte was dropped, as on the device; wait for room in the FIFO (UART.STATUS TXFIFO_CNT) before writing"
             ),
         }
     }
@@ -152,6 +158,7 @@ impl Diagnostic {
                     cpu_per_conf,
                 } => (8, sysclk_conf, cpu_per_conf),
                 Unsupported::SoftwareReset { .. } => (9, 0, 0),
+                Unsupported::UartOverflow { uart } => (12, u32::from(uart), 0),
                 // A command is 1 to 16 bits long, so 0 is free for "no command phase".
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
@@ -505,6 +512,7 @@ mod tests {
             unsupported(Unsupported::SoftwareReset {
                 options0: 0x8000_0000,
             }),
+            unsupported(Unsupported::UartOverflow { uart: 0 }),
             mapping(3, MappingFault::InvalidEntry),
             mapping(3, MappingFault::BeyondFlash),
         ] {

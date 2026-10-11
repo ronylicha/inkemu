@@ -754,7 +754,10 @@ mod tests {
         b.write(0x6004_3000, Word, u32::from(b'J')).unwrap();
         b.write(0x6004_3004, Word, 1).unwrap();
         b.write(0x6001_0010, Word, 1).unwrap(); // UART1.INT_CLR, written by the ROM's uartAttach
-        assert_eq!(b.periph.uart0.take_tx(), b"U");
+        // A byte takes 10 bit times to leave the UART: 347 us at the reset baud rate (55 520 cycles
+        // of the time base).
+        b.ctx.sleep_until(emu_core::Cycles(60_000));
+        assert_eq!(b.periph.uart0.take_tx(b.ctx.now()), b"U");
         assert_eq!(b.periph.usb_serial_jtag.take_tx(), b"J");
         assert_eq!(b.ctx.diag.drain(), []);
     }

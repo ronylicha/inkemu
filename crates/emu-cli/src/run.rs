@@ -159,6 +159,11 @@ pub fn execute(
             (Ok(true), StopReason::CycleBudget | StopReason::Asleep) => {}
         }
     };
+    // What the firmware had written and the device had not sent yet: without it the console
+    // would end before the place the run stopped at.
+    if !matches!(end, RunEnd::ConsoleClosed | RunEnd::ConsoleError) {
+        let _ = relay(console, &machine.flush_console(options.console));
+    }
     let _ = writeln!(
         log,
         "inkemu: stopped at pc {:#010x} after {} cycles ({} instructions)",
@@ -243,7 +248,8 @@ mod tests {
         );
         let (mut console, mut log) = (Vec::new(), Vec::new());
         assert_eq!(
-            execute(&mut m, &options(10_000), &mut console, &mut log),
+            // A byte takes 6 940 CPU cycles to leave the UART at the reset baud rate and clock.
+            execute(&mut m, &options(60_000), &mut console, &mut log),
             RunEnd::Budget
         );
         assert_eq!(console, b"hello\n");
@@ -497,5 +503,21 @@ mod tests {
         );
         assert_eq!((end, end.exit_code()), (RunEnd::ConsoleError, 2));
         assert!(text(&log).contains("disk full"), "{}", text(&log));
+    }
+
+    #[test]
+    fn the_console_shows_what_was_written_when_the_run_stopped() {
+        // Five bytes need 34 700 cycles to leave at the reset baud rate; the run stops long
+        // before, on the unmodelled register the firmware reads right after printing.
+        let mut program = printing(UART0, b"hello", &[]);
+        program.extend(reading_unmodeled_register());
+        let mut m = machine(&program, STRICT);
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        let end = execute(&mut m, &options(10_000), &mut console, &mut log);
+        assert_eq!(end, RunEnd::StrictMmio);
+        assert_eq!(
+            console, b"hello",
+            "the bytes still in the UART are not lost"
+        );
     }
 }

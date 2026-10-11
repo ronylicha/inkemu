@@ -149,6 +149,8 @@ fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic
         let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
         diagnostics.extend(machine.drain_diagnostics());
     }
+    // The run is over: what the firmware wrote and the UART had not sent yet belongs to its console.
+    uart0.extend(machine.flush_console(ConsoleChannel::Uart0));
     Run {
         console: text(&uart0),
         diagnostics,

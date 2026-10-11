@@ -68,6 +68,8 @@ pub enum Event {
     FlashWindowStore { instruction_bus: bool },
     /// Wake-up of the SYSTIMER: one of its comparators may have an alarm due.
     Systimer,
+    /// Wake-up of UART 0 or 1: its transmitter may have gone idle.
+    Uart(u8),
 }
 
 /// The wake-up a device keeps for its next deadline.

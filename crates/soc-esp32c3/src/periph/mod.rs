@@ -421,8 +421,8 @@ impl Peripherals {
             systimer: Systimer::new(ctx.now()),
             apb_saradc: AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED),
             radio_power: AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED),
-            uart0: Uart::new(UART0_BASE),
-            uart1: Uart::new(UART1_BASE),
+            uart0: Uart::new(0, UART0_BASE),
+            uart1: Uart::new(1, UART1_BASE),
             usb_serial_jtag: UsbSerialJtag::new(),
         };
         periph.systimer.wake(ctx);
@@ -438,6 +438,8 @@ impl Peripherals {
                 self.extmem.latch_store(ctx, instruction_bus);
             }
             Event::Systimer => self.systimer.wake(ctx),
+            Event::Uart(0) => self.uart0.wake(ctx),
+            Event::Uart(_) => self.uart1.wake(ctx),
         }
     }
 

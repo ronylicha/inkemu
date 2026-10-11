@@ -37,12 +37,10 @@ SP1b-3, SP1b-4, SP2, SP5a and SP8.
 <!-- generated table -->
 | Address | Register | Count | Hardware effect not modelled | Made real by |
 |---|---|---|---|---|
-| `0x6000000c` | `UART0.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3 |
-| `0x60000010` | `UART0.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3 |
-| `0x60000014` | `UART0.CLKDIV` | 1 | baud rate: bytes leave at once | SP1b-3 |
-| `0x60000020` | `UART0.CONF0` | 1 | frame format | SP1b-3 |
-| `0x60000024` | `UART0.CONF1` | 1 | FIFO thresholds | SP1b-3 |
-| `0x60000078` | `UART0.CLK_CONF` | 1 | clock source and divider | SP1b-3 |
+| `0x6000000c` | `UART0.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3b |
+| `0x60000010` | `UART0.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3b |
+| `0x60000020` | `UART0.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3b |
+| `0x60000024` | `UART0.CONF1` | 1 | FIFO thresholds | SP1b-3b |
 | `0x60002008` | `SPI1.CTRL` | 1 | read mode, dummy output, WP level | SP8 |
 | `0x6000200c` | `SPI1.CTRL1` | 1 | CS hold delay after a release-from-power-down | SP8 |
 | `0x60002010` | `SPI1.CTRL2` | 1 | CS setup and hold times | SP8 |
@@ -98,12 +96,10 @@ SP1b-3, SP1b-4, SP2, SP5a and SP8.
 | `0x6000e040` | `ANA_I2C.I2C_MST_ANA_CONF0` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6000e044` | `ANA_I2C.ANA_CONFIG` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6000e048` | `ANA_I2C.ANA_CONFIG2` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
-| `0x6001000c` | `UART1.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3 |
-| `0x60010010` | `UART1.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3 |
-| `0x60010014` | `UART1.CLKDIV` | 1 | baud rate: bytes leave at once | SP1b-3 |
-| `0x60010020` | `UART1.CONF0` | 1 | frame format | SP1b-3 |
-| `0x60010024` | `UART1.CONF1` | 1 | FIFO thresholds | SP1b-3 |
-| `0x60010078` | `UART1.CLK_CONF` | 1 | clock source and divider | SP1b-3 |
+| `0x6001000c` | `UART1.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3b |
+| `0x60010010` | `UART1.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3b |
+| `0x60010020` | `UART1.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3b |
+| `0x60010024` | `UART1.CONF1` | 1 | FIFO thresholds | SP1b-3b |
 | `0x6001ccd4` | `NRX.NRXPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x6001d054` | `BB.BBPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x6001f048` | `TIMG0.WDTCONFIG0` | 1 | main watchdog 0 enable and stages: it never expires (D11) | SP1b-3 |

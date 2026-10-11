@@ -293,10 +293,22 @@ impl Esp32C3 {
         self.hart.pc
     }
 
-    /// The bytes the firmware sent on `channel` since the last call.
+    /// The bytes that left the device on `channel` since the last call: a UART byte counts once
+    /// its last bit has gone.
     pub fn take_console(&mut self, channel: ConsoleChannel) -> Vec<u8> {
         match channel {
-            ConsoleChannel::Uart0 => self.bus.periph.uart0.take_tx(),
+            ConsoleChannel::Uart0 => self.bus.periph.uart0.take_tx(self.bus.ctx.now()),
+            ConsoleChannel::UsbSerialJtag => self.bus.periph.usb_serial_jtag.take_tx(),
+        }
+    }
+
+    /// Everything the firmware wrote on `channel` and no call has taken, the bytes that have not
+    /// left the device yet included. For the end of a run: without them the console would stop
+    /// short of the place the run stopped at. It ends the transmission: do not go on running a
+    /// machine whose console was flushed if the timing of its output matters.
+    pub fn flush_console(&mut self, channel: ConsoleChannel) -> Vec<u8> {
+        match channel {
+            ConsoleChannel::Uart0 => self.bus.periph.uart0.take_written(),
             ConsoleChannel::UsbSerialJtag => self.bus.periph.usb_serial_jtag.take_tx(),
         }
     }
@@ -394,6 +406,12 @@ mod tests {
         let mut m = machine(&program);
         assert_eq!(m.pc(), ROM_BASE);
         assert_eq!(m.run_until(Cycles(500)), StopReason::CycleBudget);
+        assert_eq!(
+            m.take_console(ConsoleChannel::Uart0),
+            b"",
+            "a byte takes 6 940 CPU cycles to leave at the reset baud rate and clock"
+        );
+        assert_eq!(m.run_until(Cycles(15_000)), StopReason::CycleBudget);
         assert_eq!(m.take_console(ConsoleChannel::Uart0), b"Hi");
         assert_eq!(
             m.take_console(ConsoleChannel::Uart0),
