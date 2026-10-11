@@ -25,3 +25,6 @@ dist/
 *.p12
 *.pem
 *.key
+
+# Subagent-driven development scratch (ledger, briefs, reviews)
+.superpowers/
