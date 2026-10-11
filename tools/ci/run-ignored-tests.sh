@@ -7,6 +7,9 @@
 # Usage: tools/ci/run-ignored-tests.sh <expected-passed> <cargo test arguments...>
 # Example: tools/ci/run-ignored-tests.sh 16 --release -p soc-esp32c3 --test real_rom -- --ignored
 set -euo pipefail
+# The result line is matched as plain text below: colour codes around it would defeat the match,
+# so colour is switched off here rather than left to the caller's environment.
+export CARGO_TERM_COLOR=never
 if [ "$#" -lt 2 ]; then
   echo "usage: $0 <expected-passed> <cargo test arguments...>" >&2
   exit 2
