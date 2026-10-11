@@ -49,7 +49,7 @@ Bilan de l'exécution du plan `docs/superpowers/plans/2026-10-11-sp1a-core-rv32-
   - Les actions GitHub ne sont pas épinglées par SHA.
   - `cargo` ne tourne pas avec `--locked` en CI.
 - Le job `arch-test` n'a pas de cache Docker. Il est déclenché par des chemins qui n'incluent pas `rust-toolchain.toml`, `deny.toml` ni `clippy.toml`.
-- **La CI n'a encore jamais tourné sur GitHub.** Ses jobs n'ont été vérifiés qu'en local (`actionlint`, Docker).
+- ~~La CI n'a encore jamais tourné sur GitHub.~~ **Levé le 2026-10-11** : le premier run sur `main` (commit `95ef0c6`) est vert sur ses trois jobs. Le journal confirme que les 92 tests d'architecture ont réellement tourné (39 I, 8 M, 29 C, 1 Zifencei, 15 privilege, 0 échec) et que la couverture atteint 98,77 % des lignes.
 
 ## Vérification restant à faire avec accord
 

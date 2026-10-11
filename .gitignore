@@ -8,6 +8,7 @@ dist/
 
 # Local tooling and editor state
 .remember/
+.serena/
 .idea/
 .vscode/
 *.swp
