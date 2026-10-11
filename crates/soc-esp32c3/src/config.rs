@@ -1,5 +1,10 @@
 //! Run-time configuration of the virtual `SoC`.
 use crate::chip::ChipRevision;
+use crate::flash::FlashConfig;
+
+/// Seed of the hardware random number generator model (decision D8): fixed, so two runs are identical.
+/// The bytes spell "inkemu"; any non-zero value would do.
+pub const DEFAULT_RNG_SEED: u64 = 0x696E_6B65_6D75_0001;
 
 /// `GPIO_STRAP_REG` value the ROM prints as `boot:0x8 (SPI_FAST_FLASH_BOOT)`: bit 3 selects SPI
 /// flash boot (report `docs/research/esp32c3-boot-chain.md`, §D.3).
@@ -15,6 +20,10 @@ pub struct SocConfig {
     pub strict_mmio: bool,
     /// Maintain the execution trace hash.
     pub trace_hash: bool,
+    /// The SPI flash chip.
+    pub flash: FlashConfig,
+    /// Seed of the random number generator (`APB_CTRL.RND_DATA`).
+    pub rng_seed: u64,
 }
 
 impl Default for SocConfig {
@@ -24,6 +33,8 @@ impl Default for SocConfig {
             strapping: STRAP_SPI_FAST_FLASH_BOOT,
             strict_mmio: false,
             trace_hash: false,
+            flash: FlashConfig::default(),
+            rng_seed: DEFAULT_RNG_SEED,
         }
     }
 }
@@ -38,5 +49,8 @@ mod tests {
         assert_eq!(config.chip_revision, ChipRevision::V0_3);
         assert_eq!(config.strapping, STRAP_SPI_FAST_FLASH_BOOT);
         assert!(!config.strict_mmio && !config.trace_hash);
+        assert_eq!(config.flash, crate::flash::FlashConfig::default());
+        assert_eq!(config.rng_seed, DEFAULT_RNG_SEED);
+        assert_ne!(DEFAULT_RNG_SEED, 0);
     }
 }
