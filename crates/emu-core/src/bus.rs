@@ -64,6 +64,13 @@ pub trait Bus {
     /// A counter that changes whenever the 4 KiB page containing `addr` may hold new bytes.
     /// Decode caches compare it to detect self-modifying code and DMA writes.
     fn page_version(&self, addr: u32) -> u64;
+
+    /// Timing-only hook called when an instruction is served from a decode cache:
+    /// the `SoC` charges what the fetch would have cost (e.g. flash-cache hit or miss) without moving data.
+    fn fetch_stall(&mut self, addr: u32, len: u32) -> u32 {
+        let _ = (addr, len);
+        0
+    }
 }
 
 #[cfg(test)]

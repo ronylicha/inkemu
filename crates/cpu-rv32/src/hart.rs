@@ -1,6 +1,8 @@
 //! A single machine-mode RV32IMC hart.
 use crate::csr::{CsrFile, MSTATUS_MIE, MSTATUS_MPIE};
+use crate::dcache::DecodeCache;
 use crate::decode::decode;
+use crate::instr::Decoded;
 use crate::trap::{Exception, Trap};
 use emu_core::{AccessKind, AccessSize, Bus, Cycles, InstrClass, TimingModel};
 
@@ -48,6 +50,7 @@ pub struct Hart {
     pub instret: u64,
     pub config: HartConfig,
     pub(crate) waiting: bool,
+    pub(crate) dcache: DecodeCache,
 }
 
 impl Hart {
@@ -61,7 +64,14 @@ impl Hart {
             instret: 0,
             config,
             waiting: false,
+            dcache: DecodeCache::new(),
         }
+    }
+
+    /// `(hits, misses)` of the decoded-instruction cache, for performance reporting.
+    #[must_use]
+    pub fn decode_cache_stats(&self) -> (u64, u64) {
+        self.dcache.stats()
     }
 
     /// Drives one `mip` bit; `line` is taken modulo 32.
@@ -95,11 +105,10 @@ impl Hart {
             self.enter_trap(MCAUSE_INTERRUPT | line, 0);
             return StepOutcome::Interrupted { cause: line };
         }
-        let (raw, fetch_stall) = match self.fetch(bus) {
+        let (decoded, fetch_stall) = match self.fetch_decoded(bus) {
             Ok(fetched) => fetched,
-            Err(trap) => return self.trap(trap, 1),
+            Err(trap) => return self.trap(trap, timing.instr_cycles(InstrClass::System)),
         };
-        let decoded = decode(raw);
         match self.execute(decoded, bus) {
             Ok(done) => {
                 let cycles = timing.instr_cycles(done.class) + fetch_stall + done.stall;
@@ -113,21 +122,35 @@ impl Hart {
         }
     }
 
+    /// Serves the instruction at `pc` from the decode cache or the bus; a hit still pays the fetch timing.
+    fn fetch_decoded(&mut self, bus: &mut dyn Bus) -> Result<(Decoded, u32), Trap> {
+        if let Some(decoded) = self.dcache.lookup(self.pc, &*bus) {
+            let stall = bus.fetch_stall(self.pc, u32::from(decoded.len));
+            return Ok((decoded, stall));
+        }
+        let (raw, stall) = self.fetch(bus)?;
+        let decoded = decode(raw);
+        self.dcache.insert(self.pc, decoded, &*bus);
+        Ok((decoded, stall))
+    }
+
     /// Fetches one parcel or two, so a 32-bit instruction may straddle a page or region boundary.
+    /// A fault on the second parcel reports that parcel's address in `tval`, as the privileged spec requires.
     fn fetch(&self, bus: &mut dyn Bus) -> Result<(u32, u32), Trap> {
-        let fault = |_| Trap {
+        let fault = |addr: u32| Trap {
             cause: Exception::InstrAccessFault,
-            tval: self.pc,
+            tval: addr,
         };
         let lo = bus
             .read(self.pc, AccessSize::Half, AccessKind::Fetch)
-            .map_err(fault)?;
+            .map_err(|_| fault(self.pc))?;
         if lo.value & COMPRESSED_MASK != COMPRESSED_MASK {
             return Ok((lo.value, lo.stall));
         }
+        let hi_addr = self.pc.wrapping_add(2);
         let hi = bus
-            .read(self.pc.wrapping_add(2), AccessSize::Half, AccessKind::Fetch)
-            .map_err(fault)?;
+            .read(hi_addr, AccessSize::Half, AccessKind::Fetch)
+            .map_err(|_| fault(hi_addr))?;
         Ok((lo.value | (hi.value << 16), lo.stall + hi.stall))
     }
 
@@ -529,6 +552,111 @@ mod tests {
             }
         );
         assert_eq!(h.csr.read(MEPC, h.cycles, h.instret), Some(0x8000_0000));
+    }
+
+    #[test]
+    fn second_parcel_fetch_fault_reports_the_faulting_parcel_in_mtval() {
+        // A 32-bit instruction whose low half is the last mapped halfword of RAM.
+        let mut ram = Ram::new(0, 4);
+        ram.load(2, &0x0093u16.to_le_bytes()).unwrap();
+        let mut h = Hart::new(2, HartConfig::default());
+        let out = h.step(&mut ram, &OneCycle);
+        assert_eq!(
+            out,
+            StepOutcome::Trapped {
+                trap: Trap {
+                    cause: Exception::InstrAccessFault,
+                    tval: 4
+                },
+                cycles: 1
+            }
+        );
+        assert_eq!(h.csr.read(MEPC, h.cycles, h.instret), Some(2));
+    }
+
+    #[test]
+    fn fetch_fault_costs_the_system_instruction_cycles() {
+        #[derive(Debug)]
+        struct CostlySystem;
+        impl TimingModel for CostlySystem {
+            fn name(&self) -> &'static str {
+                "costly-system"
+            }
+            fn is_calibrated(&self) -> bool {
+                false
+            }
+            fn instr_cycles(&self, class: InstrClass) -> u32 {
+                if class == InstrClass::System { 5 } else { 1 }
+            }
+        }
+        let (mut h, mut m) = machine(&[], MisalignedPolicy::Trap);
+        h.pc = 0x8000_0000;
+        let out = h.step(&mut m, &CostlySystem);
+        assert!(
+            matches!(out, StepOutcome::Trapped { cycles: 5, .. }),
+            "{out:?}"
+        );
+        assert_eq!(h.cycles, Cycles::ZERO + 5);
+    }
+
+    #[test]
+    fn store_into_decoded_page_invalidates() {
+        // The program runs the instruction at 16 once (caching it), overwrites it with
+        // `addi x5,x0,7`, then jumps back to it. Execution order: 0,4,8,12,16,20,24,16 = 8 steps.
+        let patched = addi(5, 0, 7);
+        let (mut h, mut m) = machine(
+            &[
+                addi(5, 0, 1),                                      // 0
+                lui(2, patched.wrapping_add(0x800) & 0xffff_f000),  // 4
+                addi(2, 2, ((patched & 0xfff) as i32) << 20 >> 20), // 8: x2 = patched word
+                jal(0, 4),                                          // 12: skip to 16
+                addi(5, 0, 1), // 16: original instruction (executed first)
+                sw(2, 0, 16),  // 20: overwrite instruction at 16
+                jal(0, -8),    // 24: back to 16
+            ],
+            MisalignedPolicy::Trap,
+        );
+        run(&mut h, &mut m, 8);
+        assert_eq!(
+            h.x[5], 7,
+            "the rewritten instruction must run, not the cached one"
+        );
+    }
+
+    #[test]
+    fn cache_hit_still_pays_fetch_stall() {
+        #[derive(Debug)]
+        struct SlowFetch(Ram);
+        impl Bus for SlowFetch {
+            fn read(
+                &mut self,
+                a: u32,
+                s: AccessSize,
+                k: AccessKind,
+            ) -> Result<emu_core::ReadOutcome, emu_core::BusError> {
+                let mut o = self.0.read(a, s, k)?;
+                if k == AccessKind::Fetch {
+                    o.stall = 3;
+                }
+                Ok(o)
+            }
+            fn write(&mut self, a: u32, s: AccessSize, v: u32) -> Result<u32, emu_core::BusError> {
+                self.0.write(a, s, v)
+            }
+            fn page_version(&self, a: u32) -> u64 {
+                self.0.page_version(a)
+            }
+            fn fetch_stall(&mut self, _a: u32, _len: u32) -> u32 {
+                3
+            }
+        }
+        let (mut h, m) = machine(&[jal(0, 0)], MisalignedPolicy::Trap); // infinite self-loop
+        let mut bus = SlowFetch(m);
+        let first = h.step(&mut bus, &OneCycle);
+        let second = h.step(&mut bus, &OneCycle);
+        assert_eq!(first, StepOutcome::Retired { cycles: 1 + 6 }); // two 16-bit fetch reads at 3 each
+        assert_eq!(second, StepOutcome::Retired { cycles: 1 + 3 }); // cached: one fetch_stall call
+        assert_eq!(h.dcache.stats(), (1, 1));
     }
 
     #[test]

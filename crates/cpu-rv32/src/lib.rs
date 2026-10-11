@@ -10,6 +10,7 @@ pub use instr::*;
 #[cfg(test)]
 pub(crate) mod asm;
 pub mod csr;
+mod dcache;
 mod exec;
 pub mod hart;
 pub mod trap;
