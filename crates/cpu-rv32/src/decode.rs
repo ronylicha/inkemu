@@ -257,12 +257,24 @@ fn decode_system(raw: u32, rd: Reg, rs1: Reg, funct3: u32) -> Instr {
 
 #[cfg(test)]
 mod tests {
+    // Encodings: GNU as, binutils 2.42-1ubuntu1+6 (riscv64-unknown-elf,
+    // -march=rv32imc_zicsr_zifencei -mabi=ilp32); see task-4-report.md for the objdump listing.
     use super::*;
     use crate::instr::*;
+
     fn d(raw: u32) -> Instr {
         let x = decode(raw);
         assert_eq!(x.len, 4);
         x.instr
+    }
+
+    fn check(cases: &[(u32, Instr)]) {
+        for &(raw, expected) in cases {
+            let got = decode(raw);
+            assert_eq!(got.len, 4, "{raw:#010x}");
+            assert_eq!(got.raw, raw, "{raw:#010x}");
+            assert_eq!(got.instr, expected, "{raw:#010x}");
+        }
     }
 
     #[test]
@@ -391,6 +403,621 @@ mod tests {
             0x0000_3003, /* load funct3=3 */
             0x0000_4073, /* system funct3=4 */
             0x0000_007F, /* reserved opcode */
+        ] {
+            assert_eq!(d(raw), Instr::Illegal(raw), "{raw:#010x}");
+        }
+    }
+
+    #[test]
+    fn decodes_auipc_and_jalr() {
+        check(&[
+            (
+                0x1234_5297,
+                Instr::Auipc {
+                    rd: 5,
+                    imm: 0x1234_5000,
+                },
+            ),
+            (
+                0xffff_ff97,
+                Instr::Auipc {
+                    rd: 31,
+                    imm: 0xffff_f000,
+                },
+            ),
+            (
+                0x0081_00e7,
+                Instr::Jalr {
+                    rd: 1,
+                    rs1: 2,
+                    offset: 8,
+                },
+            ),
+            (
+                0x8000_8067,
+                Instr::Jalr {
+                    rd: 0,
+                    rs1: 1,
+                    offset: -2048,
+                },
+            ),
+            (
+                0x7fff_03e7,
+                Instr::Jalr {
+                    rd: 7,
+                    rs1: 30,
+                    offset: 2047,
+                },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn branch_immediates_cover_extremes_and_asymmetric_values() {
+        check(&[
+            (
+                0x7e20_8fe3,
+                Instr::Branch {
+                    op: BranchOp::Eq,
+                    rs1: 1,
+                    rs2: 2,
+                    offset: 4094,
+                },
+            ),
+            (
+                0x8020_8063,
+                Instr::Branch {
+                    op: BranchOp::Eq,
+                    rs1: 1,
+                    rs2: 2,
+                    offset: -4096,
+                },
+            ),
+            (
+                0x7e41_9fe3,
+                Instr::Branch {
+                    op: BranchOp::Ne,
+                    rs1: 3,
+                    rs2: 4,
+                    offset: 4094,
+                },
+            ),
+            (
+                0x8041_9063,
+                Instr::Branch {
+                    op: BranchOp::Ne,
+                    rs1: 3,
+                    rs2: 4,
+                    offset: -4096,
+                },
+            ),
+            (
+                0x5a62_c163,
+                Instr::Branch {
+                    op: BranchOp::Lt,
+                    rs1: 5,
+                    rs2: 6,
+                    offset: 0x5a2,
+                },
+            ),
+            (
+                0xa462_cee3,
+                Instr::Branch {
+                    op: BranchOp::Lt,
+                    rs1: 5,
+                    rs2: 6,
+                    offset: -0x5a4,
+                },
+            ),
+            (
+                0x0e83_df63,
+                Instr::Branch {
+                    op: BranchOp::Ge,
+                    rs1: 7,
+                    rs2: 8,
+                    offset: 254,
+                },
+            ),
+            (
+                0xf083_d0e3,
+                Instr::Branch {
+                    op: BranchOp::Ge,
+                    rs1: 7,
+                    rs2: 8,
+                    offset: -256,
+                },
+            ),
+            (
+                0x02a4_ee63,
+                Instr::Branch {
+                    op: BranchOp::Ltu,
+                    rs1: 9,
+                    rs2: 10,
+                    offset: 0x3c,
+                },
+            ),
+            (
+                0xfca4_e0e3,
+                Instr::Branch {
+                    op: BranchOp::Ltu,
+                    rs1: 9,
+                    rs2: 10,
+                    offset: -0x40,
+                },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn branch_immediates_geu_and_remaining_offsets() {
+        check(&[
+            (
+                0x00c5_f263,
+                Instr::Branch {
+                    op: BranchOp::Geu,
+                    rs1: 11,
+                    rs2: 12,
+                    offset: 4,
+                },
+            ),
+            (
+                0x80c5_f163,
+                Instr::Branch {
+                    op: BranchOp::Geu,
+                    rs1: 11,
+                    rs2: 12,
+                    offset: -4094,
+                },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn jal_immediates_cover_extremes_and_asymmetric_values() {
+        check(&[
+            (
+                0x7fff_f0ef,
+                Instr::Jal {
+                    rd: 1,
+                    offset: 1_048_574,
+                },
+            ),
+            (
+                0x8000_006f,
+                Instr::Jal {
+                    rd: 0,
+                    offset: -1_048_576,
+                },
+            ),
+            (
+                0x5a40_04ef,
+                Instr::Jal {
+                    rd: 9,
+                    offset: 0x5a4,
+                },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn decodes_loads_and_stores_of_every_width() {
+        check(&[
+            (
+                0x8000_8283,
+                Instr::Load {
+                    op: LoadOp::B,
+                    rd: 5,
+                    rs1: 1,
+                    offset: -2048,
+                },
+            ),
+            (
+                0x7ff0_8283,
+                Instr::Load {
+                    op: LoadOp::B,
+                    rd: 5,
+                    rs1: 1,
+                    offset: 2047,
+                },
+            ),
+            (
+                0x5a41_1303,
+                Instr::Load {
+                    op: LoadOp::H,
+                    rd: 6,
+                    rs1: 2,
+                    offset: 1444,
+                },
+            ),
+            (
+                0xfff1_a383,
+                Instr::Load {
+                    op: LoadOp::W,
+                    rd: 7,
+                    rs1: 3,
+                    offset: -1,
+                },
+            ),
+            (
+                0x05a2_4403,
+                Instr::Load {
+                    op: LoadOp::Bu,
+                    rd: 8,
+                    rs1: 4,
+                    offset: 90,
+                },
+            ),
+            (
+                0xfa62_d483,
+                Instr::Load {
+                    op: LoadOp::Hu,
+                    rd: 9,
+                    rs1: 5,
+                    offset: -90,
+                },
+            ),
+            (
+                0x8050_8023,
+                Instr::Store {
+                    op: StoreOp::B,
+                    rs1: 1,
+                    rs2: 5,
+                    offset: -2048,
+                },
+            ),
+            (
+                0x7e50_8fa3,
+                Instr::Store {
+                    op: StoreOp::B,
+                    rs1: 1,
+                    rs2: 5,
+                    offset: 2047,
+                },
+            ),
+            (
+                0x5a61_1223,
+                Instr::Store {
+                    op: StoreOp::H,
+                    rs1: 2,
+                    rs2: 6,
+                    offset: 1444,
+                },
+            ),
+            (
+                0xfa61_1323,
+                Instr::Store {
+                    op: StoreOp::H,
+                    rs1: 2,
+                    rs2: 6,
+                    offset: -90,
+                },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn stores_word_and_halfword_offsets() {
+        check(&[(
+            0x5a71_a223,
+            Instr::Store {
+                op: StoreOp::W,
+                rs1: 3,
+                rs2: 7,
+                offset: 1444,
+            },
+        )]);
+    }
+
+    #[test]
+    fn decodes_op_imm_variants() {
+        check(&[
+            (
+                0x8003_2293,
+                Instr::OpImm {
+                    op: AluOp::Slt,
+                    rd: 5,
+                    rs1: 6,
+                    imm: -2048,
+                },
+            ),
+            (
+                0x7ff3_3293,
+                Instr::OpImm {
+                    op: AluOp::Sltu,
+                    rd: 5,
+                    rs1: 6,
+                    imm: 2047,
+                },
+            ),
+            (
+                0x5a43_4293,
+                Instr::OpImm {
+                    op: AluOp::Xor,
+                    rd: 5,
+                    rs1: 6,
+                    imm: 1444,
+                },
+            ),
+            (
+                0xfff3_6293,
+                Instr::OpImm {
+                    op: AluOp::Or,
+                    rd: 5,
+                    rs1: 6,
+                    imm: -1,
+                },
+            ),
+            (
+                0x05a3_7293,
+                Instr::OpImm {
+                    op: AluOp::And,
+                    rd: 5,
+                    rs1: 6,
+                    imm: 90,
+                },
+            ),
+            (
+                0x01f3_1293,
+                Instr::OpImm {
+                    op: AluOp::Sll,
+                    rd: 5,
+                    rs1: 6,
+                    imm: 31,
+                },
+            ),
+            (
+                0x0113_5293,
+                Instr::OpImm {
+                    op: AluOp::Srl,
+                    rd: 5,
+                    rs1: 6,
+                    imm: 17,
+                },
+            ),
+            (
+                0x4033_5293,
+                Instr::OpImm {
+                    op: AluOp::Sra,
+                    rd: 5,
+                    rs1: 6,
+                    imm: 3,
+                },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn decodes_op_register_variants() {
+        check(&[
+            (
+                0x0073_12b3,
+                Instr::Op {
+                    op: AluOp::Sll,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0073_22b3,
+                Instr::Op {
+                    op: AluOp::Slt,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0073_32b3,
+                Instr::Op {
+                    op: AluOp::Sltu,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0073_42b3,
+                Instr::Op {
+                    op: AluOp::Xor,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0073_52b3,
+                Instr::Op {
+                    op: AluOp::Srl,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x4073_52b3,
+                Instr::Op {
+                    op: AluOp::Sra,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0073_62b3,
+                Instr::Op {
+                    op: AluOp::Or,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0073_72b3,
+                Instr::Op {
+                    op: AluOp::And,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn decodes_all_m_extension_ops() {
+        check(&[
+            (
+                0x0273_02b3,
+                Instr::MulDiv {
+                    op: MulOp::Mul,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0273_12b3,
+                Instr::MulDiv {
+                    op: MulOp::Mulh,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0273_22b3,
+                Instr::MulDiv {
+                    op: MulOp::Mulhsu,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0273_32b3,
+                Instr::MulDiv {
+                    op: MulOp::Mulhu,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0273_42b3,
+                Instr::MulDiv {
+                    op: MulOp::Div,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0273_52b3,
+                Instr::MulDiv {
+                    op: MulOp::Divu,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0273_62b3,
+                Instr::MulDiv {
+                    op: MulOp::Rem,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+            (
+                0x0273_72b3,
+                Instr::MulDiv {
+                    op: MulOp::Remu,
+                    rd: 5,
+                    rs1: 6,
+                    rs2: 7,
+                },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn decodes_fences_and_csr_forms() {
+        check(&[
+            (0x0ff0_000f, Instr::Fence),
+            (0x0000_100f, Instr::FenceI),
+            (
+                0x3001_20f3,
+                Instr::Csr {
+                    op: CsrOp::Rs,
+                    rd: 1,
+                    src: 2,
+                    uimm: false,
+                    csr: 0x300,
+                },
+            ),
+            (
+                0x3412_31f3,
+                Instr::Csr {
+                    op: CsrOp::Rc,
+                    rd: 3,
+                    src: 4,
+                    uimm: false,
+                    csr: 0x341,
+                },
+            ),
+            (
+                0x3002_d0f3,
+                Instr::Csr {
+                    op: CsrOp::Rw,
+                    rd: 1,
+                    src: 5,
+                    uimm: true,
+                    csr: 0x300,
+                },
+            ),
+            (
+                0x3058_e173,
+                Instr::Csr {
+                    op: CsrOp::Rs,
+                    rd: 2,
+                    src: 17,
+                    uimm: true,
+                    csr: 0x305,
+                },
+            ),
+            (
+                0x344f_f1f3,
+                Instr::Csr {
+                    op: CsrOp::Rc,
+                    rd: 3,
+                    src: 31,
+                    uimm: true,
+                    csr: 0x344,
+                },
+            ),
+        ]);
+    }
+
+    #[test]
+    fn reserved_32bit_encodings_trap_with_raw_word() {
+        for raw in [
+            0x0000_3023, // store funct3=3
+            0x0000_200f,
+            0x0000_300f,
+            0x0000_400f,
+            0x0000_500f,
+            0x0000_600f,
+            0x0000_700f, // misc-mem funct3=2..7
+            0x4073_12b3, // OP funct3=1 with funct7=0x20 (only sub/sra take 0x20)
+            0x0473_12b3, // OP funct3=1 with funct7=0x02 (unknown funct7)
+            0x4000_1293, // OP-IMM funct3=1 (slli) with funct7=0x20
+            0x0400_5293, // OP-IMM funct3=5 with funct7=0x02
+            0x0000_1067, // JALR funct3=1
+            0x0000_6003, // load funct3=6
+            0x0000_7003, // load funct3=7
+            0x1200_0073, // SFENCE.VMA: funct3=0 system word that is not ecall/ebreak/mret/wfi
         ] {
             assert_eq!(d(raw), Instr::Illegal(raw), "{raw:#010x}");
         }
