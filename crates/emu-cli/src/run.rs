@@ -19,14 +19,70 @@ const CONSOLE_CHANNELS: [ConsoleChannel; 2] =
 
 #[derive(Clone, Copy, Debug)]
 pub struct RunOptions {
-    /// Stop when the CPU cycle counter reaches this value; `None` runs until the machine stops by itself.
+    /// Stop when the CPU cycle counter reaches this value; `None` is no limit. A sleeping CPU
+    /// executes no cycle: a firmware that sleeps never reaches it.
     pub max_cycles: Option<u64>,
+    /// Stop when this many nanoseconds of device time have elapsed since power-on; `None` is no
+    /// limit. Device time goes on while the CPU sleeps and across resets
+    /// ([`Esp32C3::run_within`] says what "reached" means, to the cycle of the time base).
+    pub max_device_nanos: Option<u64>,
     pub console: ConsoleChannel,
+}
+
+/// The value of `--max-time`: seconds of device time, as nanoseconds.
+///
+/// A decimal number, `DIGITS` optionally followed by `.` and one to nine `DIGITS`: ASCII digits
+/// only, no sign, exponent, suffix, separator or space. It is read without floating point, so
+/// that the limit of a run is the same number on every host: the whole part times 10⁹ plus the
+/// fraction padded to nine digits.
+///
+/// # Errors
+/// The text is not of that form, has a fraction finer than a nanosecond, or is more than a `u64`
+/// of nanoseconds (584 years); the message states the cause, then the remedy.
+pub fn parse_device_seconds(text: &str) -> Result<u64, String> {
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    const FRACTION_DIGITS: usize = 9;
+    /// The value of a string of ASCII digits, when a `u64` holds it.
+    fn number(digits: &str) -> Option<u64> {
+        digits.bytes().try_fold(0u64, |value, byte| {
+            value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))
+        })
+    }
+    let is_digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let (whole, fraction) = match text.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (text, None),
+    };
+    if !is_digits(whole) || fraction.is_some_and(|fraction| !is_digits(fraction)) {
+        return Err(format!(
+            "`{text}` is not a number of seconds; write digits with an optional fraction, like 30 or 0.25"
+        ));
+    }
+    let fraction = fraction.unwrap_or_default();
+    if fraction.len() > FRACTION_DIGITS {
+        return Err(format!(
+            "`{text}` has more than 9 digits after the point, which is finer than a nanosecond; give at most 9"
+        ));
+    }
+    // The fraction padded with zeros on its right to nine digits is a number of nanoseconds.
+    let nanos = number(&format!("{fraction:0<FRACTION_DIGITS$}"));
+    number(whole)
+        .and_then(|seconds| seconds.checked_mul(NANOS_PER_SECOND))
+        .zip(nanos)
+        .and_then(|(seconds, nanos)| seconds.checked_add(nanos))
+        .ok_or_else(|| {
+            format!(
+                "`{text}` seconds is more than device time can count (584 years); give a smaller number"
+            )
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunEnd {
+    /// The cycle limit (`--max-cycles`) was reached.
     Budget,
+    /// The device-time limit (`--max-time`) was reached.
+    TimeLimit,
     /// Whoever was reading the console went away (`inkemu run | head`): a normal way to end.
     ConsoleClosed,
     /// The console could not be written for any other reason.
@@ -42,7 +98,9 @@ impl RunEnd {
     #[must_use]
     pub const fn exit_code(self) -> u8 {
         match self {
-            RunEnd::Budget | RunEnd::ConsoleClosed | RunEnd::Interrupted => EXIT_OK,
+            RunEnd::Budget | RunEnd::TimeLimit | RunEnd::ConsoleClosed | RunEnd::Interrupted => {
+                EXIT_OK
+            }
             RunEnd::ConsoleError => EXIT_ERROR,
             RunEnd::StrictMmio => EXIT_STRICT_MMIO,
             RunEnd::Idle => EXIT_IDLE,
@@ -110,10 +168,14 @@ fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
 /// Runs `machine` until it stops, sending the firmware console to `console` and everything else
 /// (warnings, the reason the run ended, the summary) to `log`.
 ///
-/// Output is relayed every [`SLICE_CYCLES`] cycles so a long run shows progress. `interrupt` is
-/// read at the start of every pass of the loop, whatever the previous pass ended on (a sleeping
-/// CPU included, which can go on for ever without the cycle count advancing): once it is set
-/// (Ctrl-C), the run ends with the same summary as a run that reached its cycle limit. It is the
+/// Output is relayed every [`SLICE_CYCLES`] cycles so a long run shows progress. Both limits of
+/// `options` are given to every call of the machine: the cycle limit ends a run whose CPU
+/// executes, the device-time limit also ends one whose CPU sleeps, and the first one reached
+/// ends the run (the cycle limit when both are reached at the same instruction boundary).
+///
+/// `interrupt` is read at the start of every pass of the loop, whatever the previous pass ended
+/// on (a sleeping CPU included, which can go on for ever without the cycle count advancing): once
+/// it is set (Ctrl-C), the run ends with the same summary as a run that reached a limit. It is the
 /// only thing the run takes from the host, and nothing of it enters a trace.
 pub fn execute(
     machine: &mut Esp32C3,
@@ -132,7 +194,7 @@ pub fn execute(
         let limit = options
             .max_cycles
             .map_or(slice_end, |max| max.min(slice_end));
-        let stop = machine.run_until(Cycles(limit));
+        let stop = machine.run_within(Cycles(limit), options.max_device_nanos);
         let console_open = relay_selected_console(machine, options.console, console);
         // The stop line carries the violation: listing it as a warning too would print it twice.
         let violation = match &stop {
@@ -173,9 +235,17 @@ pub fn execute(
                 );
                 break RunEnd::Budget;
             }
-            // The CPU sleeps and device time goes on: the next slice continues. `run_until`
-            // passes no device-time limit, so `TimeBudget` cannot come back from it.
-            (Ok(true), StopReason::CycleBudget | StopReason::Asleep | StopReason::TimeBudget) => {}
+            (Ok(true), StopReason::TimeBudget) => {
+                let _ = writeln!(
+                    log,
+                    "inkemu: device-time limit reached; raise --max-time to run longer"
+                );
+                break RunEnd::TimeLimit;
+            }
+            // The end of a slice, or a CPU that sleeps while device time goes on: the next pass
+            // continues. A sleep that ended on the very instant of the device-time limit comes
+            // back as `Asleep` too; the next call then runs nothing and says `TimeBudget`.
+            (Ok(true), StopReason::CycleBudget | StopReason::Asleep) => {}
         }
     };
     // What the firmware had written and the device had not sent yet: without it the console
@@ -198,9 +268,16 @@ pub fn execute(
         machine.cycles().get(),
         machine.instructions()
     );
+    // After a limit, Ctrl-C or a reader that went away, the `pc` above is the instruction after
+    // a `wfi`, and nothing else says that the firmware was idle.
+    let asleep = if machine.is_asleep() {
+        "; the CPU is asleep, waiting for an interrupt"
+    } else {
+        ""
+    };
     let _ = writeln!(
         log,
-        "inkemu: {} us of device time; CPU clock at {}",
+        "inkemu: {} us of device time; CPU clock at {}{asleep}",
         machine.device_time_nanos() / 1_000,
         frequency_text(machine.cpu_frequency().hz())
     );
@@ -233,8 +310,9 @@ mod tests {
     use cpu_rv32::asm::{addi, jal, sw, wfi};
     use soc_esp32c3::test_support::{
         HANG, T0, T1, flat_rom, load_register, print_program, stop_watchdogs, store_register,
-        unmodeled_register,
+        unmodeled_register, within,
     };
+    use std::time::Duration;
     const UART0: u32 = svd_regs::esp32c3::addr("UART0", "FIFO");
     const USB: u32 = svd_regs::esp32c3::addr("USB_DEVICE", "EP1");
 
@@ -260,10 +338,18 @@ mod tests {
     };
     static NOT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+    /// A run on the UART0 console that no limit ends.
+    const UNLIMITED: RunOptions = RunOptions {
+        max_cycles: None,
+        max_device_nanos: None,
+        console: ConsoleChannel::Uart0,
+    };
+    const SECOND_NS: u64 = 1_000_000_000;
+
     fn options(max_cycles: u64) -> RunOptions {
         RunOptions {
             max_cycles: Some(max_cycles),
-            console: ConsoleChannel::Uart0,
+            ..UNLIMITED
         }
     }
     fn text(bytes: &[u8]) -> String {
@@ -344,8 +430,8 @@ mod tests {
         execute(
             &mut m,
             &RunOptions {
-                max_cycles: Some(10_000),
                 console: ConsoleChannel::UsbSerialJtag,
+                ..options(10_000)
             },
             &NOT_INTERRUPTED,
             &mut console,
@@ -482,16 +568,7 @@ mod tests {
         program.extend([wfi(), HANG]);
         let mut m = machine(&program, MachineOptions::default());
         let (mut console, mut log) = (Vec::new(), Vec::new());
-        let end = execute(
-            &mut m,
-            &RunOptions {
-                max_cycles: None,
-                console: ConsoleChannel::Uart0,
-            },
-            &NOT_INTERRUPTED,
-            &mut console,
-            &mut log,
-        );
+        let end = execute(&mut m, &UNLIMITED, &NOT_INTERRUPTED, &mut console, &mut log);
         assert_eq!((end, end.exit_code()), (RunEnd::Idle, 4));
         assert!(
             text(&log).contains("waits for an interrupt and none can come"),
@@ -546,16 +623,7 @@ mod tests {
             MachineOptions::default(),
         );
         let mut log = Vec::new();
-        let end = execute(
-            &mut m,
-            &RunOptions {
-                max_cycles: None,
-                console: ConsoleChannel::Uart0,
-            },
-            &NOT_INTERRUPTED,
-            &mut Closed,
-            &mut log,
-        );
+        let end = execute(&mut m, &UNLIMITED, &NOT_INTERRUPTED, &mut Closed, &mut log);
         assert_eq!((end, end.exit_code()), (RunEnd::ConsoleClosed, 0));
     }
 
@@ -576,16 +644,7 @@ mod tests {
             MachineOptions::default(),
         );
         let mut log = Vec::new();
-        let end = execute(
-            &mut m,
-            &RunOptions {
-                max_cycles: None,
-                console: ConsoleChannel::Uart0,
-            },
-            &NOT_INTERRUPTED,
-            &mut Failing,
-            &mut log,
-        );
+        let end = execute(&mut m, &UNLIMITED, &NOT_INTERRUPTED, &mut Failing, &mut log);
         assert_eq!((end, end.exit_code()), (RunEnd::ConsoleError, 2));
         assert!(text(&log).contains("disk full"), "{}", text(&log));
     }
@@ -710,16 +769,7 @@ mod tests {
         let mut m = machine(&[HANG], MachineOptions::default());
         let (mut console, mut log) = (Vec::new(), Vec::new());
         let interrupt = AtomicBool::new(true);
-        let end = execute(
-            &mut m,
-            &RunOptions {
-                max_cycles: None,
-                console: ConsoleChannel::Uart0,
-            },
-            &interrupt,
-            &mut console,
-            &mut log,
-        );
+        let end = execute(&mut m, &UNLIMITED, &interrupt, &mut console, &mut log);
         assert_eq!((end, end.exit_code()), (RunEnd::Interrupted, 0));
         let log = text(&log);
         assert!(log.contains("inkemu: interrupted by the user\n"), "{log}");
@@ -746,44 +796,305 @@ mod tests {
         }
     }
 
+    /// `SYSTIMER.CONF` as it resets (`0x4600_0000`: the clock gate and unit 0 at work) with
+    /// `TARGET0_WORK_EN`, bit 24: the comparator of alarm 0 is on.
+    const SYSTIMER_ALARM0_ON: u32 = 0x4600_0000 | (1 << 24);
+
+    fn systimer(register: &str) -> u32 {
+        svd_regs::esp32c3::addr("SYSTIMER", register)
+    }
+
+    /// Prints `x`, then sleeps under a period alarm every `period` counts of the 16 MHz counter
+    /// whose interrupt is not enabled (`TARGET0_CONF`: bit 30 `PERIOD_MODE`, and the period):
+    /// the CPU sleeps and wakes without an interrupt for ever, the machine returns `Asleep`
+    /// again and again, and the cycle count never reaches a limit. Its watchdogs are left as
+    /// they reset: main watchdog 0 resets the chip every 1.3 s of device time (TW §D.4), and the
+    /// program starts again.
+    fn sleeping_for_ever(period: u32) -> Vec<u32> {
+        let mut tail = Vec::new();
+        tail.extend(store_register(systimer("TARGET0_CONF"), (1 << 30) | period));
+        tail.extend(store_register(systimer("COMP0_LOAD"), 1));
+        tail.extend(store_register(systimer("CONF"), SYSTIMER_ALARM0_ON));
+        tail.extend([wfi(), HANG]);
+        printing(UART0, b"x", &tail)
+    }
+
+    /// What a run left, as plain data: a machine cannot leave the thread [`within`] runs it on.
+    #[derive(Debug)]
+    struct Outcome {
+        end: RunEnd,
+        console: Vec<u8>,
+        log: String,
+        cycles: u64,
+        device_nanos: u64,
+    }
+
+    /// Runs `program` to the end of its run on a thread of its own, and fails after 30 s of host
+    /// time. For the runs whose CPU sleeps: a sleep advances no cycle, so a run that lost its
+    /// bound would otherwise hang the suite instead of failing.
+    fn run_bounded(program: Vec<u32>, options: RunOptions) -> Outcome {
+        within(
+            Duration::from_secs(30),
+            "the run did not end within 30 s of host time: nothing bounds it any more",
+            move || {
+                let mut m = machine(&program, MachineOptions::default());
+                let (mut console, mut log) = (Vec::new(), Vec::new());
+                let end = execute(&mut m, &options, &NOT_INTERRUPTED, &mut console, &mut log);
+                Outcome {
+                    end,
+                    console,
+                    log: text(&log),
+                    cycles: m.cycles().get(),
+                    device_nanos: m.device_time_nanos(),
+                }
+            },
+        )
+    }
+
+    #[test]
+    fn a_device_time_limit_ends_a_run_whose_cpu_sleeps_for_ever() {
+        // An alarm every 64 counts (4 us): half a million wake-ups in the two seconds, a hundred
+        // thousand for each call of the machine, none of which can end the run.
+        let run = run_bounded(
+            sleeping_for_ever(64),
+            RunOptions {
+                max_device_nanos: Some(2 * SECOND_NS),
+                ..UNLIMITED
+            },
+        );
+        assert_eq!((run.end, run.end.exit_code()), (RunEnd::TimeLimit, 0));
+        assert!(
+            run.log
+                .contains("inkemu: device-time limit reached; raise --max-time to run longer\n"),
+            "{}",
+            run.log
+        );
+        assert!(
+            run.log.contains(
+                "inkemu: 2000000 us of device time; CPU clock at 20 MHz; the CPU is asleep, waiting for an interrupt\n"
+            ),
+            "the limit instant exactly, and the word that says the firmware was idle: {}",
+            run.log
+        );
+        assert_eq!(run.device_nanos, 2 * SECOND_NS);
+        assert!(
+            run.cycles < SLICE_CYCLES,
+            "the CPU slept: no slice of cycles was ever used up ({} cycles)",
+            run.cycles
+        );
+        // One life before the watchdog reset at 1.3 s, the start of a second one after it.
+        assert_eq!(run.console, b"xx");
+    }
+
+    #[test]
+    fn of_the_two_limits_the_first_one_reached_ends_the_run() {
+        // `j .` at the 20 MHz of the reset clock: one millisecond is 20 000 cycles.
+        let run = |max_cycles: Option<u64>, max_device_nanos: Option<u64>| {
+            let mut m = machine(
+                &[HANG],
+                MachineOptions {
+                    strict_mmio: false,
+                    trace_hash: true,
+                },
+            );
+            let (mut console, mut log) = (Vec::new(), Vec::new());
+            let end = execute(
+                &mut m,
+                &RunOptions {
+                    max_cycles,
+                    max_device_nanos,
+                    ..UNLIMITED
+                },
+                &NOT_INTERRUPTED,
+                &mut console,
+                &mut log,
+            );
+            let log = text(&log);
+            assert!(!log.contains("the CPU is asleep"), "{log}");
+            (end, m.cycles().get(), m.trace_hash(), log)
+        };
+        let (end, cycles, _, log) = run(Some(1_000), Some(SECOND_NS));
+        assert_eq!(end, RunEnd::Budget);
+        assert!((1_000..1_010).contains(&cycles), "{cycles} cycles");
+        assert!(
+            log.contains("cycle limit reached") && !log.contains("device-time limit"),
+            "{log}"
+        );
+        let (end, cycles, by_time, log) = run(Some(1_000_000_000), Some(SECOND_NS / 1_000));
+        assert_eq!((end, end.exit_code()), (RunEnd::TimeLimit, 0));
+        assert!(
+            (20_000..20_010).contains(&cycles),
+            "the first instruction boundary at or past the millisecond: {cycles} cycles"
+        );
+        assert!(
+            log.contains("device-time limit reached") && !log.contains("cycle limit"),
+            "{log}"
+        );
+        // The limit that ended the run is not part of its trace.
+        let (end, same, by_cycles, _) = run(Some(cycles), None);
+        assert_eq!((end, same), (RunEnd::Budget, cycles));
+        assert!(by_time.is_some());
+        assert_eq!(by_time, by_cycles);
+    }
+
+    #[test]
+    fn a_limit_of_no_time_at_all_stops_before_the_first_instruction() {
+        let run = run_bounded(
+            vec![HANG],
+            RunOptions {
+                max_device_nanos: Some(0),
+                ..UNLIMITED
+            },
+        );
+        assert_eq!(
+            (run.end, run.cycles, run.device_nanos),
+            (RunEnd::TimeLimit, 0, 0)
+        );
+    }
+
+    /// Its watchdogs stopped, a one-shot alarm at count 32 000 000 of the 16 MHz counter (two
+    /// seconds after power-on) whose interrupt is not enabled, then `wfi`.
+    fn sleeping_to_an_alarm_two_seconds_after_power_on() -> Vec<u32> {
+        let mut program = stop_watchdogs();
+        program.extend(store_register(systimer("TARGET0_LO"), 32_000_000));
+        program.extend(store_register(systimer("COMP0_LOAD"), 1));
+        program.extend(store_register(systimer("CONF"), SYSTIMER_ALARM0_ON));
+        program.extend([wfi(), HANG]);
+        program
+    }
+
+    #[test]
+    fn a_run_goes_on_through_a_long_sleep_and_ends_when_nothing_is_left_to_wake_the_cpu() {
+        // The machine gives control back after the sleep to the alarm (`Asleep`: more than a
+        // second slept), which is not an end; the alarm raises no interrupt and nothing else is
+        // scheduled, so the next call finds a CPU nothing can wake.
+        let run = run_bounded(sleeping_to_an_alarm_two_seconds_after_power_on(), UNLIMITED);
+        assert_eq!((run.end, run.end.exit_code()), (RunEnd::Idle, 4));
+        assert_eq!(
+            run.device_nanos,
+            2 * SECOND_NS,
+            "the sleep ended on the alarm, and time stopped there"
+        );
+        assert!(
+            run.log.contains("waits for an interrupt and none can come"),
+            "{}",
+            run.log
+        );
+        assert!(
+            run.log
+                .contains("inkemu: 2000000 us of device time; CPU clock at 20 MHz; the CPU is asleep, waiting for an interrupt\n"),
+            "{}",
+            run.log
+        );
+    }
+
+    #[test]
+    fn a_sleep_that_ends_on_the_instant_of_the_limit_is_followed_by_the_limit() {
+        // The machine says `Asleep` for the call whose sleep of two seconds ended exactly on the
+        // limit, and `TimeBudget` only for the next one, which runs nothing: the run must go
+        // round once more and end on the limit, not go on or end as idle.
+        let limit = Some(2 * SECOND_NS);
+        let mut twin = machine(
+            &sleeping_to_an_alarm_two_seconds_after_power_on(),
+            MachineOptions::default(),
+        );
+        let far = Cycles(SLICE_CYCLES);
+        assert_eq!(twin.run_within(far, limit), StopReason::Asleep);
+        assert_eq!(twin.device_time_nanos(), 2 * SECOND_NS);
+        assert_eq!(twin.run_within(far, limit), StopReason::TimeBudget);
+
+        let run = run_bounded(
+            sleeping_to_an_alarm_two_seconds_after_power_on(),
+            RunOptions {
+                max_device_nanos: limit,
+                ..UNLIMITED
+            },
+        );
+        assert_eq!((run.end, run.end.exit_code()), (RunEnd::TimeLimit, 0));
+        assert_eq!(run.device_nanos, 2 * SECOND_NS);
+        assert!(
+            run.log.contains("device-time limit reached")
+                && run.log.contains("the CPU is asleep")
+                && !run.log.contains("none can come"),
+            "{}",
+            run.log
+        );
+    }
+
+    #[test]
+    fn seconds_of_device_time_are_read_without_floating_point() {
+        for (text, nanos) in [
+            ("30", 30 * SECOND_NS),
+            ("2.5", 2_500_000_000),
+            ("0.001", 1_000_000),
+            ("0", 0),
+            ("0.000000001", 1),
+            ("007", 7 * SECOND_NS),
+            ("1.000000000", SECOND_NS),
+            ("0.1", 100_000_000),
+            ("18446744073.709551615", u64::MAX),
+        ] {
+            assert_eq!(parse_device_seconds(text), Ok(nanos), "`{text}`");
+        }
+    }
+
+    #[test]
+    fn a_time_that_is_not_digits_with_an_optional_fraction_is_refused() {
+        for text in [
+            "", "abc", "-1", "+1", "1e3", "1.", ".5", " 1", "1 ", "1s", "1_000", "1,5", "1.2.3",
+            "1.-5", "٣",
+        ] {
+            assert_eq!(
+                parse_device_seconds(text),
+                Err(format!(
+                    "`{text}` is not a number of seconds; write digits with an optional fraction, like 30 or 0.25"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_time_finer_than_a_nanosecond_is_refused() {
+        for text in ["1.0000000001", "0.0000000000"] {
+            assert_eq!(
+                parse_device_seconds(text),
+                Err(format!(
+                    "`{text}` has more than 9 digits after the point, which is finer than a nanosecond; give at most 9"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_time_device_time_cannot_count_is_refused() {
+        // One nanosecond past the largest `u64` of nanoseconds, the next whole second, and a
+        // number whose digits alone overflow.
+        for text in [
+            "18446744073.709551616",
+            "18446744074",
+            "99999999999999999999999999",
+        ] {
+            assert_eq!(
+                parse_device_seconds(text),
+                Err(format!(
+                    "`{text}` seconds is more than device time can count (584 years); give a smaller number"
+                ))
+            );
+        }
+    }
+
     #[test]
     fn an_interrupt_ends_a_run_whose_cpu_sleeps_for_ever() {
-        // A period alarm at every count of the 16 MHz counter whose interrupt is not enabled
-        // (`TARGET0_CONF`: bit 30 `PERIOD_MODE`, period 1): the CPU sleeps and wakes without an
-        // interrupt for ever, `run_until` returns `Asleep` again and again, and the cycle count
-        // never reaches a limit. The flag, raised once the byte printed before the sleep has
-        // reached the console, must be read on that path too.
-        let mut tail = Vec::new();
-        tail.extend(store_register(
-            svd_regs::esp32c3::addr("SYSTIMER", "TARGET0_CONF"),
-            (1 << 30) | 1,
-        ));
-        tail.extend(store_register(
-            svd_regs::esp32c3::addr("SYSTIMER", "COMP0_LOAD"),
-            1,
-        ));
-        tail.extend(store_register(
-            svd_regs::esp32c3::addr("SYSTIMER", "CONF"),
-            0x4600_0000 | (1 << 24),
-        ));
-        tail.extend([wfi(), HANG]);
-        let mut m = machine(&printing(UART0, b"x", &tail), MachineOptions::default());
+        // The flag, raised once the byte printed before the sleep has reached the console, must
+        // be read on the path of a sleeping CPU too.
+        let mut m = machine(&sleeping_for_ever(1), MachineOptions::default());
         let interrupt = AtomicBool::new(false);
         let mut console = RaisesInterrupt {
             interrupt: &interrupt,
             received: Vec::new(),
         };
         let mut log = Vec::new();
-        let end = execute(
-            &mut m,
-            &RunOptions {
-                max_cycles: None,
-                console: ConsoleChannel::Uart0,
-            },
-            &interrupt,
-            &mut console,
-            &mut log,
-        );
+        let end = execute(&mut m, &UNLIMITED, &interrupt, &mut console, &mut log);
         assert_eq!((end, end.exit_code()), (RunEnd::Interrupted, 0));
         assert_eq!(console.received, b"x");
         assert!(
@@ -840,7 +1151,7 @@ mod tests {
                 &mut m,
                 &RunOptions {
                     max_cycles,
-                    console: ConsoleChannel::Uart0,
+                    ..UNLIMITED
                 },
                 interrupt,
                 &mut console,

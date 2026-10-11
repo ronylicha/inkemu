@@ -7,7 +7,7 @@ use emu_cli::flash_file;
 use emu_cli::rom_store::{
     self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
 };
-use emu_cli::run::{RunOptions, execute, relay};
+use emu_cli::run::{RunOptions, execute, parse_device_seconds, relay};
 use emu_cli::rvtest::{RunResult, TestMachine};
 use emu_cli::term::sanitize;
 use firmware::ChipId;
@@ -62,9 +62,14 @@ enum Command {
         /// an invalid header, as a blank chip does.
         #[arg(long)]
         flash: Option<PathBuf>,
-        /// Stop when the CPU has executed this many clock cycles.
+        /// Stop when the CPU has executed this many cycles of its clock. A sleeping CPU executes
+        /// none: a firmware that sleeps never reaches this limit, use --max-time to bound it.
         #[arg(long)]
         max_cycles: Option<u64>,
+        /// Stop when this many seconds of device time have elapsed since power-on (a decimal
+        /// number: 30, 2.5, 0.001). Device time goes on while the CPU sleeps and across resets.
+        #[arg(long, value_name = "SECONDS", value_parser = parse_device_seconds)]
+        max_time: Option<u64>,
         /// Stop at the first access to a register the emulator does not model, 8/16-bit write to a
         /// peripheral register, operation the emulator cannot perform faithfully, or access to flash
         /// that is not mapped (exit code 3).
@@ -138,6 +143,7 @@ fn main() -> ExitCode {
             device,
             flash,
             max_cycles,
+            max_time,
             strict_mmio,
             console,
             rom_dir,
@@ -152,6 +158,7 @@ fn main() -> ExitCode {
             },
             &RunOptions {
                 max_cycles,
+                max_device_nanos: max_time,
                 console: console.into(),
             },
         ),
@@ -272,7 +279,7 @@ fn run_device(
     let interrupt = Arc::new(AtomicBool::new(false));
     if let Err(e) = watch_ctrl_c(&interrupt) {
         eprintln!(
-            "warning: cannot watch for Ctrl-C: {e}; the run is not affected, but interrupting it will not print its summary: use --max-cycles to bound it"
+            "warning: cannot watch for Ctrl-C: {e}; the run is not affected, but interrupting it will not print its summary: use --max-cycles or --max-time to bound it"
         );
     }
     let end = execute(

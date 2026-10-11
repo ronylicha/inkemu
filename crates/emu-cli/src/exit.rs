@@ -18,8 +18,8 @@ pub const EXIT_SECOND_INTERRUPT: u8 = 130;
 /// The exit codes of `inkemu run`, for its `--help`.
 pub const RUN_EXIT_CODES_HELP: &str = "\
 Exit codes:
-  0  the run ended normally: the cycle limit was reached, Ctrl-C was pressed, or the reader of
-     standard output went away
+  0  the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was
+     pressed, or the reader of standard output went away
   2  error: unknown device, missing or invalid ROM, refused flash image, or standard output cannot be written
   3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
      emulator cannot perform faithfully, or flash that is not mapped)
