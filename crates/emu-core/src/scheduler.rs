@@ -6,6 +6,9 @@ use std::collections::{BTreeSet, BinaryHeap};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventId(u64);
 
+/// How many more cancelled entries than live ones the queue tolerates before it removes them.
+const COMPACTION_SLACK: usize = 32;
+
 #[derive(Debug)]
 struct Entry<E> {
     at: Cycles,
@@ -42,9 +45,13 @@ impl<E> Ord for Entry<E> {
 /// A deterministic queue of future events.
 ///
 /// Events fire in cycle order; events due at the same cycle fire in the order they were scheduled.
-/// Cancellation is lazy: a cancelled entry stays in the heap until it reaches the head, and only
-/// live (scheduled, not yet fired, not cancelled) ids are tracked, so memory stays bounded by the
-/// number of pending events.
+/// Cancellation is lazy: a cancelled entry stays in the heap until it reaches the head, or until
+/// a cancel finds the cancelled entries outnumber the live ones (scheduled, not yet fired, not
+/// cancelled) by more than `COMPACTION_SLACK`, when the heap is rebuilt without them. So the
+/// cancelled entries never number more than the live ones plus the slack, the heap never holds
+/// more than twice the live entries plus the slack, and a cancel costs amortised O(log n): a
+/// rebuild is linear and follows at least `live + slack` cancels. A cancelled entry whose
+/// instant is far ahead does not stay until then.
 #[derive(Debug)]
 pub struct Scheduler<E> {
     heap: BinaryHeap<Reverse<Entry<E>>>,
@@ -88,7 +95,18 @@ impl<E> Scheduler<E> {
     pub fn cancel(&mut self, id: EventId) {
         if self.live.remove(&id) {
             self.cancelled.insert(id);
+            if self.cancelled.len() > self.live.len() + COMPACTION_SLACK {
+                self.compact();
+            }
         }
+    }
+
+    /// Rebuilds the heap without the cancelled entries. The order of the others is a total order
+    /// on (cycle, id), which compaction does not touch.
+    fn compact(&mut self) {
+        let cancelled = &self.cancelled;
+        self.heap.retain(|Reverse(e)| !cancelled.contains(&e.id));
+        self.cancelled.clear();
     }
 
     /// Removes cancelled entries sitting at the head of the heap.
@@ -123,6 +141,13 @@ impl<E> Scheduler<E> {
             }),
             _ => None,
         }
+    }
+
+    /// Number of entries the queue physically holds: the pending ones and the cancelled ones not
+    /// removed yet. A measure of memory, for the callers that must show it stays bounded.
+    #[must_use]
+    pub fn stored_entries(&self) -> usize {
+        self.heap.len()
     }
 
     /// Number of cancelled entries still awaiting removal from the heap.
@@ -212,6 +237,95 @@ mod tests {
         assert_eq!(s.tombstones(), 0);
         assert_eq!(s.next_due(), None);
     }
+    /// What the struct promises at every step: the heap holds at most twice the live entries plus
+    /// the slack, and so do the tombstones.
+    fn assert_bounded<E>(s: &Scheduler<E>) {
+        assert!(s.tombstones() <= s.live.len() + COMPACTION_SLACK);
+        assert!(
+            s.stored_entries() <= 2 * s.live.len() + COMPACTION_SLACK,
+            "{} entries for {} live",
+            s.stored_entries(),
+            s.live.len()
+        );
+    }
+
+    #[test]
+    fn scheduling_far_ahead_and_cancelling_forever_keeps_the_heap_bounded() {
+        let mut s: Scheduler<u32> = Scheduler::new();
+        for live in 0..3 {
+            s.schedule(Cycles(100 + u64::from(live)), live);
+        }
+        for round in 0..10_000u64 {
+            let id = s.schedule(Cycles(1_000_000_000 + round), 99);
+            s.cancel(id);
+            assert_bounded(&s);
+        }
+        assert_eq!(s.next_due(), Some(Cycles(100)));
+        let order: Vec<u32> =
+            std::iter::from_fn(|| s.pop_due(Cycles(u64::MAX)).map(|(_, e)| e)).collect();
+        assert_eq!(order, vec![0, 1, 2], "the cancelled ones never fire");
+    }
+
+    #[test]
+    fn compaction_keeps_the_live_events_in_cycle_then_scheduling_order() {
+        let mut s: Scheduler<u32> = Scheduler::new();
+        let mut expected: Vec<(u64, u32)> = Vec::new();
+        for round in 0..10_000u32 {
+            // A live event every 7th round, at an instant that repeats (so some share a cycle).
+            if round % 7 == 0 {
+                let at = 50 + u64::from(round % 5) * 10;
+                s.schedule(Cycles(at), round);
+                expected.push((at, round));
+            }
+            // A cancelled one, far ahead or early, at mixed instants.
+            let at = if round % 2 == 0 {
+                1_000_000 + u64::from(round)
+            } else {
+                55
+            };
+            let id = s.schedule(Cycles(at), u32::MAX);
+            s.cancel(id);
+            assert_bounded(&s);
+        }
+        // Stable on the cycle: equal cycles stay in the order they were scheduled.
+        expected.sort_by_key(|&(at, _)| at);
+        let order: Vec<(u64, u32)> =
+            std::iter::from_fn(|| s.pop_due(Cycles(u64::MAX)).map(|(at, e)| (at.get(), e)))
+                .collect();
+        assert_eq!(order, expected);
+        assert_eq!(s.tombstones(), 0);
+    }
+
+    #[test]
+    fn cancelling_stays_a_noop_for_an_id_fired_or_already_cancelled_across_a_compaction() {
+        let mut s: Scheduler<u32> = Scheduler::new();
+        let fired = s.schedule(Cycles(1), 1);
+        let early = s.schedule(Cycles(2_000_000), 2);
+        s.cancel(early);
+        assert_eq!(s.pop_due(Cycles(1)).map(|(_, e)| e), Some(1));
+        let keep = s.schedule(Cycles(500), 3);
+        // Enough cancels to compact, the heap rebuilt without `early`.
+        for round in 0..(COMPACTION_SLACK as u64 * 3) {
+            let id = s.schedule(Cycles(1_000_000 + round), 0);
+            s.cancel(id);
+        }
+        assert!(s.tombstones() <= 1 + COMPACTION_SLACK);
+        let tombstones = s.tombstones();
+        // Cancelled before the compaction, cancelled again after it: nothing is recorded.
+        s.cancel(early);
+        s.cancel(fired);
+        assert_eq!(
+            s.tombstones(),
+            tombstones,
+            "no id enters the set twice or after firing"
+        );
+        assert_eq!(s.next_due(), Some(Cycles(500)));
+        assert_eq!(s.pop_due(Cycles(u64::MAX)).map(|(_, e)| e), Some(3));
+        assert!(s.pop_due(Cycles(u64::MAX)).is_none());
+        s.cancel(keep);
+        assert_eq!(s.tombstones(), 0);
+    }
+
     #[test]
     fn cancelled_ids_never_accumulate_across_rearms() {
         let mut s: Scheduler<()> = Scheduler::new();

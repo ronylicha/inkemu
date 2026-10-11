@@ -381,9 +381,9 @@ impl RtcCntl {
     /// Raises what is due at the present time, then asks to be woken for the next deadline.
     fn evaluate(&mut self, ctx: &mut Ctx, from_register_write: bool) {
         let now = ctx.now();
-        // The deadline is worked out again at every call: a wake-up left by a timeout that was
-        // raised, a feed or a watchdog that was stopped would be a call for nothing, and one that
-        // is later than the new instant would not be replaced.
+        // The deadline is worked out again at every call and no earlier wake-up is kept: a register
+        // write can move the deadline later, and the instant `next_wake` gives the sleeping CPU
+        // must be the true one. The scheduler bounds the cancelled entries this leaves.
         self.wake.cancel(ctx);
 
         let enabled = self.wdt_config0 & WDT_EN != 0 || self.flash_boot_protection();
@@ -1202,6 +1202,44 @@ mod tests {
         assert!(ctx.next_wake().is_some());
         rtc.write(ctx, WDTCONFIG0, 0);
         assert_eq!(ctx.next_wake(), None);
+    }
+
+    #[test]
+    fn a_firmware_that_feeds_or_toggles_the_watchdog_forever_does_not_grow_the_scheduler() {
+        let ctx = &mut Ctx::default();
+        let mut rtc = RtcCntl::new(false, 0, ctx.now());
+        rtc.wake(ctx);
+        program_watchdog(ctx, &mut rtc, [0xFFFF_FFFF, 80_000, 0xFFF, 0xFFF], WDT_EN);
+        // Each write cancels a wake-up hours ahead and schedules another.
+        // One live wake-up, and the scheduler tolerates its slack of 32 cancelled ones.
+        let bound = 40;
+        for _ in 0..10_000 {
+            rtc.write(ctx, WDTFEED, WDT_FEED);
+            assert!(
+                ctx.scheduled_entries() <= bound,
+                "{}",
+                ctx.scheduled_entries()
+            );
+        }
+        for round in 0..10_000u64 {
+            ctx.sleep_until(ctx.now() + 1 + round % 3);
+            rtc.write(ctx, WDTFEED, WDT_FEED);
+            assert!(
+                ctx.scheduled_entries() <= bound,
+                "{}",
+                ctx.scheduled_entries()
+            );
+        }
+        for _ in 0..10_000 {
+            rtc.write(ctx, WDTCONFIG0, 0);
+            rtc.write(ctx, WDTCONFIG0, WDT_EN);
+            assert!(
+                ctx.scheduled_entries() <= bound,
+                "{}",
+                ctx.scheduled_entries()
+            );
+        }
+        assert!(ctx.next_wake().is_some(), "and the watchdog still runs");
     }
 
     #[test]

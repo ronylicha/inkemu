@@ -231,6 +231,12 @@ impl Ctx {
         self.next_wake = self.events.next_due().map_or(u64::MAX, Cycles::get);
     }
 
+    /// How many wake-ups the scheduler holds, the withdrawn ones not removed yet included.
+    #[cfg(test)]
+    pub(crate) fn scheduled_entries(&self) -> usize {
+        self.events.stored_entries()
+    }
+
     /// Device time of the earliest wake-up, if any.
     #[must_use]
     pub fn next_wake(&self) -> Option<Cycles> {
