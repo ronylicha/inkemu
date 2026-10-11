@@ -71,11 +71,20 @@ pub const SLEEP_SLICE: u64 = clock::SECOND;
 /// which would otherwise keep a call from returning for as long as [`SLEEP_SLICE`] takes them.
 pub const MAX_FRUITLESS_WAKES: u32 = 100_000;
 /// CPU clock cycles between the instant the controller selects a line and the instant the CPU
-/// can take it: "the interrupt controller ... takes 4 cycles" (TRM §1.6.1; report IR §2.7).
+/// can take it: "the Interrupt Controller has a fixed latency of 4 cycles" (TRM §1.5.3.1, as
+/// quoted in report IR §2.7).
 ///
-/// ASSUMPTION: only a line that becomes selectable waits; a line that is masked or released
-/// disappears at once. The TRM gives one figure and no direction; the SP1b-4 lockstep compares
-/// with an oracle that has no latency at all, and needs this to be configurable.
+/// ASSUMPTION: only a line that becomes selected waits; a line that is masked or released
+/// disappears at once. A change of the selected line is a line that becomes selected: when a
+/// line of higher priority takes the place of one the CPU could already see, the CPU is shown
+/// no line at all until the latency of the new one has elapsed, and the old one is not
+/// presented in the meantime. No interrupt is lost by it: the sources are levels, held until
+/// software clears them. The TRM gives one figure and no direction, and says of the 4 cycles
+/// that follow a write to the controller that "the ordering of interrupts may not be
+/// predictable" (same section). Raising a second, higher-priority source on a chip with `MIE`
+/// set and recording which handler runs in the following instructions settles it. The SP1b-4
+/// lockstep compares with an oracle that has no latency at all, and needs this to be
+/// configurable.
 pub const INTERRUPT_LATENCY_CYCLES: u64 = 4;
 
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -214,6 +223,9 @@ impl Esp32C3 {
             self.bus.set_pc(pc);
             let before = self.hart.cycles.get();
             // The stack pointer the instruction started with, for the report of an exception.
+            // It is read before the step and must stay there: after it the value would be the
+            // same only for as long as a faulting instruction leaves every register untouched,
+            // which is the hart's business, not this loop's.
             let sp = self.hart.x[STACK_POINTER];
             match self.hart.step(&mut self.bus, &self.timing) {
                 StepOutcome::Waiting => {
@@ -327,8 +339,9 @@ impl Esp32C3 {
     /// `deadline`, the device-time limit of the call, device time moves to the deadline and no
     /// further: the caller returns without delivering anything.
     ///
-    /// The CPU clock is gated while the CPU waits: its cycle counter does not move (TRM register
-    /// 1.12 `mpccr`, "the counter stops when the CPU is in WFI"; report TW §H.3).
+    /// The cycle counter does not move while the CPU waits: the cycle event of the performance
+    /// counter "does not increment during WFI mode" (TRM register 1.12, as quoted in report IR
+    /// §2.6).
     fn sleep(&mut self, deadline: Option<Cycles>) -> Sleep {
         let now = self.bus.ctx.now();
         let latency_end = self.selected.map(|(_, visible_at)| visible_at);
@@ -366,9 +379,10 @@ impl Esp32C3 {
         // the cache registers: a version can repeat with another mapping. That is safe only
         // because `Hart::reset` builds a new decode cache, at every level.
         self.hart.reset(RESET_PC);
-        // A CPU reset keeps the interrupt controller and the source levels (TRM §6.1.3), and the
-        // hart forgot the line it was shown: the next `service` selects again. The line becomes
-        // visible 4 CPU cycles after the reset, as one that has just become selectable does.
+        // A CPU reset is taken to leave the interrupt controller and the source levels as they
+        // are (the `ASSUMPTION:` of `Peripherals::reset`, with what settles it), and the hart
+        // forgot the line it was shown: the next `service` selects again. The line becomes
+        // visible 4 CPU cycles after the reset, as one that has just become selected does.
         self.selected = None;
         self.bus.ctx.interrupts_changed();
         self.resets += 1;
@@ -1086,7 +1100,8 @@ mod tests {
     #[test]
     fn a_software_interrupt_is_taken_four_cpu_cycles_after_it_becomes_pending() {
         // IR §3.3: the application raises `CPU_INTR_FROM_CPU_0` (source 50) routed to line 3;
-        // IR §2.7: "the interrupt controller ... takes 4 cycles".
+        // IR §2.7 (TRM §1.5.3.1): an interrupt "will take exactly 4 cycles before the CPU starts
+        // processing" it.
         let mut body = Vec::new();
         body.extend([lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)]);
         body.extend(route("CPU_INTR_FROM_CPU_0_MAP", 3));
@@ -1139,21 +1154,177 @@ mod tests {
     }
 
     #[test]
-    fn a_line_under_the_threshold_or_disabled_is_not_taken() {
-        let mut body = Vec::new();
-        body.extend([lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)]);
-        body.extend(route("CPU_INTR_FROM_CPU_0_MAP", 3));
-        // What a critical section does: `CPU_INT_THRESH` above the priority of the line (IR §3.3).
-        body.extend(store_register(reg("INTERRUPT_CORE0", "CPU_INT_THRESH"), 2));
-        body.push(csrrwi(0, MSTATUS, MSTATUS_MIE));
-        body.extend(store_register(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"), 1));
-        body.extend([NOP; 16]);
-        body.push(HANG);
-        let hang = ROM_BASE + 4 * u32::try_from(body.len() - 1).unwrap();
-        let mut m = machine(&with_vectors(&body));
+    fn a_cache_fault_cleared_by_its_handler_is_latched_again_by_the_next_faulty_fetch() {
+        // The same fault, served: the handler of line 6 counts its calls in RAM, clears the
+        // status (`CACHE_ILG_INT_CLR` bit 5), notes what the status and the pending lines read
+        // after that, and jumps into the unmapped window again. The second fetch must raise the
+        // source a second time; the handler parks at its second call.
+        const COUNT: i32 = 0x100;
+        const STATUS_AFTER_CLEAR: i32 = 0x104;
+        const PENDING_AFTER_CLEAR: i32 = 0x108;
+        const CAUSE: i32 = 0x10C;
+        const MCAUSE: u16 = 0x342;
+        let (ram, count, scratch, two) = (8, 9, 11, 12);
+        let mut body = vec![lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)];
+        body.extend(route("CACHE_IA_INT_MAP", 6));
+        body.extend(store_register(reg("EXTMEM", "CACHE_ILG_INT_ENA"), 1 << 5));
+        let into_the_window = [
+            lui(T1, crate::memmap::FLASH_IBUS_BASE),
+            cpu_rv32::asm::jalr(0, T1, 0),
+        ];
+        body.extend(into_the_window);
+        let mut program = with_vectors(&body);
+        let table = ((VECTORS - ROM_BASE) / 4) as usize;
+        // Exceptions enter at the base of the table and enable interrupts; the interrupt is
+        // taken in the instructions that follow, which never run on into the entry of line 6.
+        program[table] = csrrwi(0, MSTATUS, MSTATUS_MIE);
+        program[table + 1..table + 5].fill(NOP);
+        program[table + 5] = HANG;
+        let handler = i32::try_from(4 * (program.len() - (table + 6))).unwrap();
+        program[table + 6] = jal(0, handler);
+        program.extend([
+            lui(ram, SRAM_DBUS_BASE),
+            lw(count, ram, COUNT),
+            addi(count, count, 1),
+            sw(count, ram, COUNT),
+            csrrs(scratch, MCAUSE, 0),
+            sw(scratch, ram, CAUSE),
+        ]);
+        program.extend(store_register(reg("EXTMEM", "CACHE_ILG_INT_CLR"), 1 << 5));
+        program.extend(load_into(scratch, reg("EXTMEM", "CACHE_ILG_INT_ST")));
+        program.push(sw(scratch, ram, STATUS_AFTER_CLEAR));
+        program.extend(load_into(
+            scratch,
+            reg("INTERRUPT_CORE0", "CPU_INT_EIP_STATUS"),
+        ));
+        program.push(sw(scratch, ram, PENDING_AFTER_CLEAR));
+        program.extend([addi(two, 0, 2), cpu_rv32::asm::beq(count, two, 12)]);
+        program.extend(into_the_window);
+        let park = ROM_BASE + 4 * u32::try_from(program.len()).unwrap();
+        program.push(HANG);
+        let mut m = machine(&program);
         assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
-        assert_eq!(m.pc(), hang, "masked by the threshold");
-        assert_eq!(m.hart.csr.mcause, 0);
+        let word = |m: &mut Esp32C3, offset: i32| {
+            bus_word(m, SRAM_DBUS_BASE + u32::try_from(offset).unwrap())
+        };
+        assert_eq!(
+            word(&mut m, COUNT),
+            2,
+            "the handler ran twice: the second faulty fetch raised the source again"
+        );
+        assert_eq!(m.pc(), park);
+        assert_eq!(
+            word(&mut m, CAUSE),
+            0x8000_0006,
+            "each time as the interrupt of line 6"
+        );
+        assert_eq!(
+            (
+                word(&mut m, STATUS_AFTER_CLEAR),
+                word(&mut m, PENDING_AFTER_CLEAR)
+            ),
+            (0, 0),
+            "the clear lowered the status and the line: the second interrupt is a new fault, not the first one still standing"
+        );
+    }
+
+    #[test]
+    fn a_line_under_the_threshold_or_disabled_is_not_taken() {
+        for (what, register, value) in [
+            // What a critical section does: `CPU_INT_THRESH` above the priority of the line
+            // (IR §3.3).
+            ("masked by the threshold", "CPU_INT_THRESH", 2),
+            ("disabled", "CPU_INT_ENABLE", 0),
+        ] {
+            let mut body = Vec::new();
+            body.extend([lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)]);
+            body.extend(route("CPU_INTR_FROM_CPU_0_MAP", 3));
+            body.extend(store_register(reg("INTERRUPT_CORE0", register), value));
+            body.push(csrrwi(0, MSTATUS, MSTATUS_MIE));
+            body.extend(store_register(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"), 1));
+            body.extend([NOP; 16]);
+            body.push(HANG);
+            let hang = ROM_BASE + 4 * u32::try_from(body.len() - 1).unwrap();
+            let mut m = machine(&with_vectors(&body));
+            assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
+            assert_eq!(m.pc(), hang, "{what}");
+            assert_eq!(m.hart.csr.mcause, 0, "{what}");
+            assert_eq!(
+                bus_word(&mut m, reg("INTERRUPT_CORE0", "CPU_INT_EIP_STATUS")),
+                0,
+                "{what}: the line is not pending although its source is raised"
+            );
+            assert_eq!(
+                bus_word(&mut m, reg("SYSTEM", "CPU_INTR_FROM_CPU_0")),
+                1,
+                "{what}: the source"
+            );
+        }
+    }
+
+    /// Runs one instruction a call until the PC is `pc`, and fails if `limit` instructions do not
+    /// get there.
+    fn step_to(m: &mut Esp32C3, pc: u32, limit: u32) {
+        for _ in 0..limit {
+            if m.pc() == pc {
+                return;
+            }
+            let next = Cycles(m.cycles().get() + 1);
+            assert_eq!(m.run_until(next), StopReason::CycleBudget);
+        }
+        assert_eq!(
+            m.pc(),
+            pc,
+            "pc {pc:#010x} not reached in {limit} instructions"
+        );
+    }
+
+    #[test]
+    fn a_higher_priority_line_blanks_the_one_the_cpu_could_see_for_the_latency() {
+        // The `ASSUMPTION:` of `INTERRUPT_LATENCY_CYCLES`. Software interrupt 0 on line 3 at
+        // priority 1 is raised with the interrupts masked and becomes visible; software interrupt
+        // 1 on line 4 at priority 2 is raised next, and `MIE` is set by the instruction after.
+        let mut body = vec![lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)];
+        let controller = |register| reg("INTERRUPT_CORE0", register);
+        for (register, value) in [
+            ("CPU_INTR_FROM_CPU_0_MAP", 3),
+            ("CPU_INTR_FROM_CPU_1_MAP", 4),
+            ("CPU_INT_PRI_3", 1),
+            ("CPU_INT_PRI_4", 2),
+            ("CPU_INT_ENABLE", (1 << 3) | (1 << 4)),
+        ] {
+            body.extend(store_register(controller(register), value));
+        }
+        body.extend(store_register(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"), 1));
+        body.extend([NOP; 8]);
+        body.extend(store_register(reg("SYSTEM", "CPU_INTR_FROM_CPU_1"), 1));
+        let second_raised = ROM_BASE + 4 * u32::try_from(body.len()).unwrap();
+        body.push(csrrwi(0, MSTATUS, MSTATUS_MIE));
+        body.extend([NOP; 16]);
+        let mut m = machine(&with_vectors(&body));
+        let period = m.bus.ctx.clock().cpu_period();
+        // Before the store that raises the second source: line 3 is selected and visible.
+        step_to(&mut m, second_raised - 4, 200);
+        let (line, visible_at) = m.selected.unwrap();
+        assert_eq!(line, 3);
+        assert!(visible_at <= m.bus.ctx.now(), "its latency has elapsed");
+        // After it: line 4 is selected, and visible four CPU cycles later.
+        step_to(&mut m, second_raised, 1);
+        assert_eq!(
+            m.selected,
+            Some((4, m.bus.ctx.now() + INTERRUPT_LATENCY_CYCLES * period))
+        );
+        assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
+        assert_eq!(
+            m.hart.csr.mcause, 0x8000_0004,
+            "line 3 was not taken when `MIE` was set, one cycle after the change: the CPU saw no line"
+        );
+        assert_eq!(
+            m.hart.csr.mepc,
+            second_raised + 4 * 4,
+            "the instruction that sets `MIE` and three more ran before line 4 was taken"
+        );
+        assert_eq!(m.pc(), VECTORS + 4 * 4, "the entry of line 4 parks");
     }
 
     #[test]
@@ -1628,18 +1799,32 @@ mod tests {
         ]
     }
 
+    /// `RTC_CNTL.OPTIONS0` bit 5, `SW_PROCPU_RST`: the software reset of the CPU (IR §4.1).
+    const SOFTWARE_CPU_RESET: u32 = 1 << 5;
+    /// `RTC_CNTL.OPTIONS0` bit 31, `SW_SYS_RST`: the software reset of the core.
+    const SOFTWARE_CORE_RESET: u32 = 1 << 31;
+
     /// Two passes around a CPU reset. The first routes software interrupt 0 to line 3, raises it
     /// with the interrupts masked and asks for the reset; the controller and the source levels
-    /// survive a CPU reset, so the second pass finds the line still selected. It sets `MIE` when
-    /// `mie` is true and sleeps in `wfi`.
+    /// are taken to survive a CPU reset (the `ASSUMPTION:` of `Peripherals::reset`), so the
+    /// second pass finds the line still selected. It sets `MIE` when `mie` is true and sleeps in
+    /// `wfi`.
     fn a_line_pending_across_a_cpu_reset(mie: bool) -> Esp32C3 {
+        a_line_pending_across_a_reset(
+            store_register(reg("RTC_CNTL", "OPTIONS0"), SOFTWARE_CPU_RESET).to_vec(),
+            mie,
+        )
+    }
+
+    /// The same two passes around the reset `trigger` asks for.
+    fn a_line_pending_across_a_reset(trigger: Vec<u32>, mie: bool) -> Esp32C3 {
         const MARKER: u32 = SRAM_DBUS_BASE + 0x100;
         let marker = load_register(MARKER);
         let mut first = stop_watchdogs();
         first.extend(store_register(MARKER, 1));
         first.extend(route("CPU_INTR_FROM_CPU_0_MAP", 3));
         first.extend(store_register(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"), 1));
-        first.extend(store_register(reg("RTC_CNTL", "OPTIONS0"), 1 << 5));
+        first.extend(trigger);
         first.push(HANG);
         let mut second = vec![lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)];
         if mie {
@@ -1654,8 +1839,29 @@ mod tests {
     }
 
     #[test]
+    fn a_line_selected_before_a_cpu_reset_becomes_visible_four_cpu_cycles_after_it() {
+        let mut m = a_line_pending_across_a_cpu_reset(true);
+        // One instruction a call, to the boundary at which the reset has just taken place.
+        for _ in 0..200 {
+            if m.resets() == 1 {
+                break;
+            }
+            let next = Cycles(m.cycles().get() + 1);
+            assert_eq!(m.run_until(next), StopReason::CycleBudget);
+        }
+        assert_eq!((m.resets(), m.pc()), (1, ROM_BASE), "the reset, just now");
+        let period = m.bus.ctx.clock().cpu_period();
+        assert_eq!(
+            m.selected,
+            Some((3, m.bus.ctx.now() + INTERRUPT_LATENCY_CYCLES * period)),
+            "the hart forgot the line: it is selected anew, with the latency of a new line"
+        );
+    }
+
+    #[test]
     fn a_line_selected_before_a_cpu_reset_wakes_a_masked_wfi_after_it() {
-        // TRM §6.1.3: a CPU reset leaves the interrupt controller and the sources as they are.
+        // A CPU reset is taken to leave the interrupt controller and the sources as they are
+        // (the `ASSUMPTION:` of `Peripherals::reset`).
         let mut m = a_line_pending_across_a_cpu_reset(false);
         assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
         assert_eq!(m.resets(), 1);
@@ -1677,6 +1883,57 @@ mod tests {
         assert_eq!(m.resets(), 1);
         assert_eq!(m.hart.csr.mcause, 0x8000_0003);
         assert_eq!(m.pc(), VECTORS + 4 * 3, "the entry of line 3 parks");
+    }
+
+    #[test]
+    fn a_line_pending_before_a_core_or_a_system_reset_is_gone_after_it() {
+        // A core reset rebuilds the interrupt controller and the software interrupt registers
+        // (TRM §6.1.3): the source is low, nothing is routed, nothing is selected. The RTC
+        // watchdog's stage 0 resets the whole chip 100 cycles of the slow clock after it is
+        // started (735 us), while the first pass hangs.
+        let mut by_the_rtc_watchdog = store_register(reg("RTC_CNTL", "WDTCONFIG1"), 100).to_vec();
+        by_the_rtc_watchdog.extend(store_register(
+            reg("RTC_CNTL", "WDTCONFIG0"),
+            (1 << 31) | (4 << 28),
+        ));
+        for (cause, trigger) in [
+            (
+                0x03,
+                store_register(reg("RTC_CNTL", "OPTIONS0"), SOFTWARE_CORE_RESET).to_vec(),
+            ),
+            (0x10, by_the_rtc_watchdog),
+        ] {
+            let mut m = a_line_pending_across_a_reset(trigger, true);
+            // A tenth of a second: long after the reset, long before the watchdogs the reset
+            // values arm again.
+            assert_eq!(
+                m.run_within(Cycles(40_000), Some(100 * MILLISECOND_NS)),
+                StopReason::TimeBudget,
+                "{cause:#x}"
+            );
+            assert_eq!(m.resets(), 1, "{cause:#x}");
+            assert_eq!(
+                bus_word(&mut m, reg("RTC_CNTL", "RESET_STATE")) & 0x3F,
+                cause
+            );
+            assert_eq!(m.selected, None, "{cause:#x}: no line is selected");
+            assert_eq!(
+                (
+                    bus_word(&mut m, reg("SYSTEM", "CPU_INTR_FROM_CPU_0")),
+                    bus_word(&mut m, reg("INTERRUPT_CORE0", "CPU_INT_EIP_STATUS")),
+                ),
+                (0, 0),
+                "{cause:#x}: the source and the line"
+            );
+            assert_eq!(
+                m.hart.csr.mcause, 0,
+                "{cause:#x}: the second pass set `MIE` and took nothing"
+            );
+            assert!(
+                m.is_asleep(),
+                "{cause:#x}: its `wfi` waits, where the line would have ended it"
+            );
+        }
     }
 
     #[test]
@@ -1862,9 +2119,14 @@ mod tests {
         let end = whole.cycles().get();
         let mut sliced = a_console_line_cut_by_a_core_reset();
         let mut console = Vec::new();
-        while sliced.cycles().get() < end {
+        // A call runs to its limit or past it, so `end / 7 + 1` calls reach the end; one that
+        // stops for another reason fails the test here instead of keeping the loop going.
+        for _ in 0..=end / 7 {
+            if sliced.cycles().get() >= end {
+                break;
+            }
             let next = (sliced.cycles().get() + 7).min(end);
-            sliced.run_until(Cycles(next));
+            assert_eq!(sliced.run_until(Cycles(next)), StopReason::CycleBudget);
             console.extend(sliced.take_console(ConsoleChannel::Uart0));
         }
         assert_eq!(sliced.cycles(), whole.cycles());
@@ -1951,6 +2213,31 @@ mod tests {
                 pc: ROM_BASE + 4,
                 sp: 0x3FC9_0000,
             })
+        );
+    }
+
+    #[test]
+    fn the_stack_pointer_reported_is_the_one_before_a_load_into_it_that_faults() {
+        // `lw sp, 0(t0)` from an address nothing answers at: the one instruction whose report
+        // could show another stack pointer than the one it started with. It shows that one,
+        // and the handler finds it too: a faulting instruction writes no register.
+        const NOWHERE: u32 = 0x1000_0000;
+        const STACK: u32 = 0x3FC9_0000;
+        let mut m = machine(&[lui(2, STACK), lui(T0, NOWHERE), lw(2, T0, 0), HANG]);
+        // Three instructions, the trap of the third included: the handler address is `mtvec`, 0.
+        step_to(&mut m, 0, 3);
+        assert_eq!(
+            m.drain_diagnostics(),
+            [Diagnostic::Exception {
+                cause: Exception::LoadAccessFault,
+                tval: NOWHERE,
+                pc: ROM_BASE + 8,
+                sp: STACK,
+            }]
+        );
+        assert_eq!(
+            m.hart.x[2], STACK,
+            "the load did not happen: the register is as the instruction found it"
         );
     }
 
