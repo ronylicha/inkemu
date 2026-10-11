@@ -103,8 +103,6 @@ rows, and that plan inherits them too.
 | `0x60010024` | `UART1.CONF1` | 1 | FIFO thresholds | SP1b-3b |
 | `0x6001ccd4` | `NRX.NRXPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x6001d054` | `BB.BBPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
-| `0x6001f048` | `TIMG0.WDTCONFIG0` | 1 | main watchdog 0 enable and stages: it never expires (D11) | SP1b-3 |
-| `0x6001f064` | `TIMG0.WDTWPROTECT` | 1 | main watchdog 0 write protection | SP1b-3 |
 | `0x60026014` | `APB_CTRL.WIFI_CLK_EN` | 1 | radio clock gates: there is no radio | SP5a |
 | `0x60026018` | `APB_CTRL.WIFI_RST_EN` | 1 | radio resets: there is no radio | SP5a |
 | `0x6002609c` | `APB_CTRL.FRONT_END_MEM_PD` | 1 | radio front-end memory power | SP5a |

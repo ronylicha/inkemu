@@ -325,9 +325,9 @@ impl RtcCntl {
 
     /// Whether the flash-boot protection runs the watchdog (TRM §12.2.2.4; TW §D.4).
     ///
-    /// ASSUMPTION: as for the main watchdog, the protection is off when the chip is not strapped to
-    /// boot from flash (TW §I question 4). A boot of a chip strapped for download, with the RTC
-    /// watchdog counting, settles it.
+    /// ASSUMPTION: as for the main watchdog (`Timg::flash_boot_protection`), the protection is off
+    /// when the chip is not strapped to boot from flash (TW §I question 4). A boot of a chip
+    /// strapped for download, with the RTC watchdog counting, settles it.
     const fn flash_boot_protection(&self) -> bool {
         self.flash_boot && self.wdt_config0 & WDT_FLASHBOOT_MOD_EN != 0
     }

@@ -1,6 +1,6 @@
 //! The modelled peripherals of the ESP32-C3 and their place in the address space.
 use crate::config::{STRAP_SPI_FAST_FLASH_BOOT, SocConfig};
-use crate::ctx::{Ctx, Event, Module};
+use crate::ctx::{Ctx, Event, Group, Module};
 use crate::flash::FlashDevice;
 use crate::reset::{ResetCause, ResetLevel};
 use emu_core::Peripheral;
@@ -21,6 +21,7 @@ pub mod sha;
 pub mod spi_mem;
 pub mod system;
 pub mod systimer;
+pub mod timg;
 pub mod uart;
 pub mod usb_serial_jtag;
 
@@ -39,6 +40,7 @@ pub use sha::Sha;
 pub use spi_mem::{Spi0, Spi1};
 pub use system::System;
 pub use systimer::Systimer;
+pub use timg::Timg;
 pub use uart::Uart;
 pub use usb_serial_jtag::UsbSerialJtag;
 
@@ -238,7 +240,6 @@ pub fn accepted_without_effect() -> Vec<Accepted> {
         spi_mem::accepted(),
         apb_ctrl::accepted(),
         ana_i2c::accepted(),
-        TIMG0_ACCEPTED.to_vec(),
         APB_SARADC_ACCEPTED.to_vec(),
         RADIO_POWER_ACCEPTED.to_vec(),
     ]
@@ -310,6 +311,9 @@ const ANA_I2C: (u32, u32) = (ana_i2c::ANA_I2C_BASE, ana_i2c::ANA_I2C_BASE + 0x10
 /// `DR_REG_TIMERGROUP0_BASE` (ESP-IDF `reg_base.h`; report BC §A.2).
 pub(crate) const TIMG0_BASE: u32 = 0x6001_F000;
 const TIMG0: (u32, u32) = (TIMG0_BASE, 0x6002_0000);
+/// `DR_REG_TIMERGROUP1_BASE` (ESP-IDF `reg_base.h`; report TW §B.1).
+pub(crate) const TIMG1_BASE: u32 = 0x6002_0000;
+const TIMG1: (u32, u32) = (TIMG1_BASE, 0x6002_1000);
 /// `DR_REG_SYSTIMER_BASE` (ESP-IDF `reg_base.h`; report TW §A.1).
 pub(crate) const SYSTIMER_BASE: u32 = 0x6002_3000;
 const SYSTIMER: (u32, u32) = (SYSTIMER_BASE, 0x6002_4000);
@@ -317,22 +321,6 @@ const SYSTIMER: (u32, u32) = (SYSTIMER_BASE, 0x6002_4000);
 pub(crate) const APB_SARADC_BASE: u32 = 0x6004_0000;
 const APB_SARADC: (u32, u32) = (APB_SARADC_BASE, 0x6004_1000);
 
-/// Decision D11: the main watchdog of timer group 0 is stored and never expires. The timers and the
-/// RTC calibration of this block are not modelled here: they are the first thing SP1b-3 adds.
-const TIMG0_ACCEPTED: [Accepted; 2] = [
-    Accepted::svd(
-        "TIMG0",
-        "WDTCONFIG0",
-        "main watchdog 0 enable and stages: it never expires (D11)",
-        "SP1b-3",
-    ),
-    Accepted::svd(
-        "TIMG0",
-        "WDTWPROTECT",
-        "main watchdog 0 write protection",
-        "SP1b-3",
-    ),
-];
 /// The bootloader configures the SAR ADC as an entropy source for the RNG (BA §2 rows 79 to 85).
 const WHY_SARADC: &str = "SAR ADC configuration: no conversion is performed";
 const APB_SARADC_ACCEPTED: [Accepted; 7] = [
@@ -383,7 +371,8 @@ pub struct Peripherals {
     pub sha: Sha,
     pub apb_ctrl: ApbCtrl,
     pub ana_i2c: AnaI2c,
-    pub timg0: AcceptedBlock,
+    pub timg0: Timg,
+    pub timg1: Timg,
     pub systimer: Systimer,
     pub apb_saradc: AcceptedBlock,
     /// Four isolated words: its base is 0, so its offsets are absolute addresses.
@@ -395,8 +384,8 @@ pub struct Peripherals {
 
 impl Peripherals {
     /// The peripherals after a power-on, at the device time of `ctx`: a device that has a first
-    /// deadline schedules it there. The reset values arm the flash-boot protection of the RTC
-    /// watchdog when the chip is strapped to boot from flash.
+    /// deadline schedules it there. The reset values arm the flash-boot protection of main
+    /// watchdog 0 and of the RTC watchdog when the chip is strapped to boot from flash.
     #[must_use]
     pub fn new(config: &SocConfig, flash: Box<dyn FlashDevice>, ctx: &mut Ctx) -> Peripherals {
         let flash_boot = config.strapping & STRAP_SPI_FAST_FLASH_BOOT != 0;
@@ -418,7 +407,8 @@ impl Peripherals {
             sha: Sha::new(),
             apb_ctrl: ApbCtrl::new(config.rng_seed),
             ana_i2c: AnaI2c::new(),
-            timg0: AcceptedBlock::new(TIMG0_BASE, &TIMG0_ACCEPTED),
+            timg0: Timg::new(Group::Timg0, flash_boot, ctx),
+            timg1: Timg::new(Group::Timg1, flash_boot, ctx),
             systimer: Systimer::new(ctx.now()),
             apb_saradc: AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED),
             radio_power: AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED),
@@ -427,6 +417,8 @@ impl Peripherals {
             usb_serial_jtag: UsbSerialJtag::new(),
         };
         periph.rtc_cntl.wake(ctx);
+        periph.timg0.wake(ctx);
+        periph.timg1.wake(ctx);
         periph.systimer.wake(ctx);
         periph
     }
@@ -440,7 +432,13 @@ impl Peripherals {
                 self.extmem.latch_store(ctx, instruction_bus);
             }
             Event::Systimer => self.systimer.wake(ctx),
+            Event::Timg(Group::Timg0) => self.timg0.wake(ctx),
+            Event::Timg(Group::Timg1) => self.timg1.wake(ctx),
             Event::RtcWatchdog => self.rtc_cntl.wake(ctx),
+            Event::ClockChanged => {
+                self.timg0.clock_changed(ctx);
+                self.timg1.clock_changed(ctx);
+            }
             Event::Uart(0) => self.uart0.wake(ctx),
             Event::Uart(_) => self.uart1.wake(ctx),
             Event::ModuleReset(module) => self.reset_module(ctx, module),
@@ -448,8 +446,8 @@ impl Peripherals {
     }
 
     /// `SYSTEM.PERIP_RST_EN0/1` put a module in reset: its registers return to their reset values.
-    /// What `esp_system_reset_modules_on_exit` does to the UARTs, the SPI controllers and the
-    /// SYSTIMER before `esp_restart_noos` resets the CPU
+    /// What `esp_system_reset_modules_on_exit` does to the UARTs, the SPI controllers, the timer
+    /// groups and the SYSTIMER before `esp_restart_noos` resets the CPU
     /// (`IDF:components/esp_system/port/soc/esp32c3/system_internal.c:52-60`; report IR §4.1).
     fn reset_module(&mut self, ctx: &mut Ctx, module: Module) {
         match module {
@@ -459,6 +457,8 @@ impl Peripherals {
             }
             Module::Uart0 => self.uart0.reset(ctx.now()),
             Module::Uart1 => self.uart1.reset(ctx.now()),
+            Module::Timg0 => self.timg0.reset(ctx),
+            Module::Timg1 => self.timg1.reset(ctx),
             Module::Systimer => self.systimer.reset(ctx),
             Module::Sha => self.sha = Sha::new(),
         }
@@ -505,16 +505,18 @@ impl Peripherals {
         self.sha = Sha::new();
         self.apb_ctrl.reset();
         self.ana_i2c = AnaI2c::new();
-        self.timg0 = AcceptedBlock::new(TIMG0_BASE, &TIMG0_ACCEPTED);
         self.apb_saradc = AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED);
         self.radio_power = AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED);
         self.uart0.reset(ctx.now());
         self.uart1.reset(ctx.now());
         self.usb_serial_jtag.reset();
         // No rebuilt device asserts an interrupt source, and `SYSTEM` selects the reset clock again.
-        // The SYSTIMER goes last: it withdraws its wake-up and drives its sources low.
+        // The timer groups and the SYSTIMER go last: each withdraws its wake-up, so that none of
+        // the replaced devices leaves a call behind, and drives its sources low.
         ctx.clear_sources();
         ctx.clock_written();
+        self.timg0.reset(ctx);
+        self.timg1.reset(ctx);
         self.systimer.reset(ctx);
     }
 
@@ -553,6 +555,8 @@ impl Peripherals {
             Some((&mut self.ana_i2c, ana_i2c::ANA_I2C_BASE))
         } else if within(TIMG0) {
             Some((&mut self.timg0, TIMG0_BASE))
+        } else if within(TIMG1) {
+            Some((&mut self.timg1, TIMG1_BASE))
         } else if within(SYSTIMER) {
             Some((&mut self.systimer, SYSTIMER_BASE))
         } else if within(APB_SARADC) {
@@ -779,18 +783,6 @@ mod tests {
                 .and_then(|(device, base)| device.read(ctx, addr - base))
         };
         let svd = svd_regs::esp32c3::addr;
-        assert_eq!(
-            read(svd("TIMG0", "WDTCONFIG0")),
-            Some(0x0004_C000),
-            "FLASHBOOT_MOD_EN set at reset (BC §E.3)"
-        );
-        assert_eq!(read(svd("TIMG0", "WDTWPROTECT")), Some(0x50D8_3AA1));
-        assert_eq!(
-            read(svd("TIMG0", "RTCCALICFG")),
-            None,
-            "the RTC calibration is where SP1b-3 starts"
-        );
-        assert_eq!(read(svd("TIMG0", "T0CONFIG")), None);
         assert_eq!(read(svd("APB_SARADC", "CTRL")), Some(0x4003_8240));
         assert_eq!(read(svd("APB_SARADC", "CLKM_CONF")), Some(4));
         assert_eq!(
@@ -820,7 +812,6 @@ mod tests {
         let mut p = peripherals(ctx);
         let svd = svd_regs::esp32c3::addr;
         for (addr, value) in [
-            (svd("TIMG0", "WDTCONFIG0"), 0x8000_0000),
             (svd("APB_SARADC", "CTRL2"), 0x0000_A5A5),
             (svd("BB", "BBPD_CTRL"), 0x0000_000F),
             (NRX_NRXPD_CTRL, 0x1234_5678),
@@ -950,7 +941,7 @@ mod tests {
         assert_eq!(
             read(svd("TIMG0", "WDTCONFIG0")),
             Some(0x0004_C000),
-            "its reset value, `FLASHBOOT_MOD_EN` set"
+            "the flash-boot protection is armed again"
         );
     }
 
@@ -1015,5 +1006,31 @@ mod tests {
             p.deliver(ctx, event);
         }
         assert_eq!(read(&mut p, ctx, svd("SYSTIMER", "INT_RAW")), Some(1));
+    }
+
+    #[test]
+    fn a_timer_group_that_is_reset_leaves_one_wake_up_whichever_way_it_is_reset() {
+        // The flash-boot protection of group 0 is the one wake-up there is. A module reset
+        // (`PERIP_RST_EN0` bit 13, 15) and a core reset rebuild the groups: each rebuilt group
+        // withdraws the call of the one it replaces, however often the firmware does it.
+        let ctx = &mut Ctx::default();
+        let mut p = peripherals(ctx);
+        let protection = emu_core::Cycles(13 * 160_000_000 / 10);
+        assert_eq!(ctx.next_wake(), Some(protection), "before the RTC watchdog");
+        for _ in 0..10_000 {
+            p.deliver(ctx, Event::ModuleReset(Module::Timg0));
+            p.deliver(ctx, Event::ModuleReset(Module::Timg1));
+            assert!(ctx.scheduled_entries() <= 40, "{}", ctx.scheduled_entries());
+        }
+        for _ in 0..10_000 {
+            p.reset(ctx, ResetCause::Mwdt0Core, 0x4004_c0d4, 0);
+            assert!(ctx.scheduled_entries() <= 40, "{}", ctx.scheduled_entries());
+        }
+        assert_eq!(ctx.next_wake(), Some(protection));
+        assert_eq!(
+            read(&mut p, ctx, svd_regs::esp32c3::addr("TIMG0", "WDTCONFIG0")),
+            Some(0x0004_C000),
+            "the flash-boot protection is armed again"
+        );
     }
 }

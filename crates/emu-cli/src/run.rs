@@ -580,4 +580,29 @@ mod tests {
             "the bytes still in the UART are not lost"
         );
     }
+
+    #[test]
+    fn a_cpu_asleep_while_a_watchdog_counts_does_not_end_the_run() {
+        // Each life of this firmware is one byte and a `wfi`; main watchdog 0, armed by the reset
+        // values, resets the chip every 1.3 s of device time (TW §D.4). The run goes on through
+        // the sleeps and the resets until its cycle limit.
+        let mut m = machine(
+            &printing(UART0, b"a", &[wfi(), HANG]),
+            MachineOptions::default(),
+        );
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        let end = execute(&mut m, &options(300), &mut console, &mut log);
+        assert_eq!(end, RunEnd::Budget);
+        assert!(
+            console.len() > 5 && console.iter().all(|&byte| byte == b'a'),
+            "one `a` per life: {console:?}"
+        );
+        // The byte of the life the limit interrupted may not have left the UART yet.
+        let lives = u64::try_from(console.len()).unwrap();
+        assert!(
+            (m.resets()..=m.resets() + 1).contains(&lives),
+            "{lives} bytes"
+        );
+        assert!(m.device_time_nanos() > 5 * 1_300_000_000);
+    }
 }

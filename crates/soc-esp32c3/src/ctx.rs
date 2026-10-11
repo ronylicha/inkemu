@@ -54,12 +54,21 @@ impl Source {
     }
 }
 
+/// The two timer groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    Timg0,
+    Timg1,
+}
+
 /// A hardware module that `SYSTEM.PERIP_RST_EN0` or `PERIP_RST_EN1` resets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Module {
     Spi01,
     Uart0,
     Uart1,
+    Timg0,
+    Timg1,
     Systimer,
     Sha,
 }
@@ -80,8 +89,12 @@ pub enum Event {
     Systimer,
     /// Wake-up of UART 0 or 1: its transmitter may have gone idle.
     Uart(u8),
+    /// Wake-up of a timer group: its timer or its watchdog may have reached a deadline.
+    Timg(Group),
     /// Wake-up of `RTC_CNTL`: the RTC watchdog may have reached a stage timeout.
     RtcWatchdog,
+    /// To every device that counts APB clock cycles: the clock selection changed.
+    ClockChanged,
     /// To the named module: `SYSTEM.PERIP_RST_EN0/1` put it in reset.
     ModuleReset(Module),
 }

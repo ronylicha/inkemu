@@ -2,6 +2,7 @@
 use crate::bus::SocBus;
 use crate::clock;
 use crate::config::SocConfig;
+use crate::ctx::Event;
 use crate::diag::{Diagnostic, Unsupported};
 use crate::flash::{FlashDevice, FlashImageError, NorFlash};
 use crate::memmap::RESET_PC;
@@ -275,7 +276,11 @@ impl Esp32C3 {
     fn retune(&mut self, pc: u32) {
         let (sysclk_conf, cpu_per_conf) = self.bus.periph.system.clock_registers();
         match clock::cpu_clock(sysclk_conf, cpu_per_conf) {
-            Some(selected) => self.bus.ctx.set_clock(selected),
+            Some(selected) => {
+                self.bus.ctx.set_clock(selected);
+                // The devices that count APB cycles go on at the new rate.
+                self.bus.deliver(Event::ClockChanged);
+            }
             // Decision D22: the previous frequency stays, and the selection is reported.
             None => self.bus.ctx.diag.record(Diagnostic::Unsupported {
                 what: Unsupported::ClockSource {
@@ -1027,8 +1032,9 @@ mod tests {
     #[test]
     fn a_cpu_that_sleeps_while_a_device_counts_gives_control_back_after_a_second() {
         // A one-shot alarm two seconds ahead (32 000 000 counts at 16 MHz), its interrupt not
-        // enabled: nothing will wake the CPU, and time must still pass. The RTC watchdog the reset
-        // values arm is stopped first: it would reset the chip at 2.94 s.
+        // enabled: nothing will wake the CPU, and time must still pass. The watchdogs the reset
+        // values arm are stopped first: they would reset the chip at 1.3 s. A watchdog that is
+        // stopped withdraws its wake-up, so the first thing scheduled is the alarm.
         let mut body = stop_watchdogs();
         body.extend(store_register(reg("SYSTIMER", "TARGET0_LO"), 32_000_000));
         body.extend(store_register(reg("SYSTIMER", "COMP0_LOAD"), 1));
@@ -1125,5 +1131,25 @@ mod tests {
             m.device_time_nanos() >= 1_000 * 50,
             "and so does device time"
         );
+    }
+
+    #[test]
+    fn the_flash_boot_watchdog_resets_a_cpu_that_only_sleeps() {
+        // The reset values arm main watchdog 0 (TW §D.4): 26 000 000 cycles of the 20 MHz APB
+        // clock, 1.3 s. Its deadline is the first thing scheduled.
+        let mut m = machine(&[wfi(), HANG]);
+        assert_eq!(m.run_until(Cycles(10_000)), StopReason::Asleep);
+        assert_eq!(
+            m.device_time_nanos(),
+            1_300_000_000,
+            "slept to the watchdog deadline"
+        );
+        assert_eq!(m.resets(), 1, "which reset the chip");
+        assert_eq!(
+            bus_word(&mut m, svd_regs::esp32c3::addr("RTC_CNTL", "RESET_STATE")) & 0x3F,
+            0x07,
+            "TG0WDT_SYS_RST"
+        );
+        assert_eq!(m.cycles().get(), 3, "only `wfi` was executed");
     }
 }

@@ -12,7 +12,8 @@ const PERIP_RST_EN0: u32 = svd_regs::esp32c3::addr("SYSTEM", "PERIP_RST_EN0") - 
 const PERIP_RST_EN1: u32 = svd_regs::esp32c3::addr("SYSTEM", "PERIP_RST_EN1") - SYSTEM_BASE;
 /// The modules `PERIP_RST_EN0` resets, by bit (`IDF:components/soc/esp32c3/register/soc/system_reg.h`:
 /// `SYSTEM_SPI01_RST` line 497, `SYSTEM_UART_RST` 491, `SYSTEM_UART1_RST` 479,
-/// `SYSTEM_SYSTIMER_RST` 335). ESP-IDF resets a module by setting its bit and clearing it again:
+/// `SYSTEM_TIMERGROUP_RST` 431, `SYSTEM_TIMERGROUP1_RST` 419, `SYSTEM_SYSTIMER_RST` 335). ESP-IDF
+/// resets a module by setting its bit and clearing it again:
 /// `esp_system_reset_modules_on_exit`, which `esp_restart_noos` calls, sets `0x20000007` then
 /// writes 0 (`IDF:components/esp_system/port/soc/esp32c3/system_internal.c:52-54`; report IR
 /// §4.1); the timer groups do it through `_timer_ll_reset_register`
@@ -23,10 +24,12 @@ const PERIP_RST_EN1: u32 = svd_regs::esp32c3::addr("SYSTEM", "PERIP_RST_EN1") - 
 /// `esp_system_reset_modules_on_exit` pulses it, and what it resets is not documented: the timer
 /// groups have their own bits (IR §4.3, §7 question 1; TW §F.1). The other bits belong to modules
 /// this plan does not model.
-const RESETS_0: [(u32, Module); 4] = [
+const RESETS_0: [(u32, Module); 6] = [
     (1 << 1, Module::Spi01),
     (1 << 2, Module::Uart0),
     (1 << 5, Module::Uart1),
+    (1 << 13, Module::Timg0),
+    (1 << 15, Module::Timg1),
     (1 << 29, Module::Systimer),
 ];
 /// `PERIP_RST_EN1` bit 2, `SYSTEM_CRYPTO_SHA_RST` (`system_reg.h:553`): the only crypto module
@@ -340,7 +343,11 @@ mod tests {
         sys.write(ctx, PERIP_RST_EN0, reset0 | 0x2000_0007);
         sys.write(ctx, PERIP_RST_EN0, reset0);
         assert_eq!(ctx.take_signal(), None, "held, then released: no new reset");
-        sys.write(ctx, PERIP_RST_EN0, reset0 | (1 << 5));
+        sys.write(
+            ctx,
+            PERIP_RST_EN0,
+            reset0 | (1 << 13) | (1 << 15) | (1 << 5),
+        );
         // `PERIP_RST_EN1` holds the crypto modules in reset at power-on (reset value 0x1FE): the
         // bootloader released the SHA accelerator to use it.
         sys.write(ctx, PERIP_RST_EN1, 0);
@@ -353,6 +360,8 @@ mod tests {
             signalled,
             [
                 Event::ModuleReset(Module::Uart1),
+                Event::ModuleReset(Module::Timg0),
+                Event::ModuleReset(Module::Timg1),
                 Event::ModuleReset(Module::Sha)
             ]
         );

@@ -1,4 +1,5 @@
-//! The milestone of plan SP1b-2 on the reference firmware (ESP-IDF v5.5.2 bootloader + `hello_world`):
+//! The milestones of plans SP1b-2 and SP1b-3a on the reference firmware (ESP-IDF v5.5.2 bootloader +
+//! `hello_world`): the boot, then the whole life of the application, its restart and a second boot.
 //! `INKEMU_ROM_ELF_DIR=<dir> INKEMU_REF_FLASH=<flash_hello.bin> cargo test -p soc-esp32c3 --test reference_boot -- --ignored`
 //! Build the image with `tools/reference-firmware/build.sh`.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
@@ -49,15 +50,71 @@ const BOOTLOADER_LINES: [&str; 21] = [
     "I (#) boot: Disabling RNG early entropy source...",
 ];
 const FIRST_APPLICATION_LINE: &str = "I (#) cpu_start: Unicore app";
-/// `call_start_cpu0` of the application (BA §1).
-const APPLICATION_ENTRY: u32 = 0x4038_0330;
-/// The address ranges of the application's code, from the `esp_image` segment lines of the golden
-/// log: IRAM is segment 2 (`vaddr=40380000 size=088a4h`) followed contiguously by segment 4
-/// (`vaddr=403888a4 size=02c70h`), ending at 0x4038b514; the flash text window is segment 3
-/// (`vaddr=42000020 size=0e6fch`), ending at 0x4200e71c. The bootloader runs at `0x403c_xxxx` and the
-/// ROM below `0x4006_0000`, so neither is inside.
-const APPLICATION_CODE: [std::ops::Range<u32>; 2] =
-    [0x4038_0000..0x4038_b514, 0x4200_0020..0x4200_e71c];
+/// What the application prints from its first line to its restart, timestamps masked. Up to the
+/// heap size it is the QEMU capture of TO §2 line for line; the capture ends there. The eleven
+/// `Restarting in` lines are `hello_world_main.c`'s loop from 10 down to 0.
+const APPLICATION_LINES: [&str; 39] = [
+    FIRST_APPLICATION_LINE,
+    "I (#) cpu_start: GPIO 20 and 21 are used as console UART I/O pins",
+    "I (#) cpu_start: Pro cpu start user code",
+    "I (#) cpu_start: cpu freq: 160000000 Hz",
+    "I (#) app_init: Application information:",
+    "I (#) app_init: Project name:     hello_world",
+    "I (#) app_init: App version:      1",
+    "I (#) app_init: ELF file SHA256:  43d81da8d...",
+    "I (#) app_init: ESP-IDF:          v5.5.2",
+    "I (#) efuse_init: Min chip rev:     v0.3",
+    "I (#) efuse_init: Max chip rev:     v1.99 ",
+    "I (#) efuse_init: Chip rev:         v0.3",
+    "I (#) heap_init: Initializing. RAM available for dynamic allocation:",
+    "I (#) heap_init: At 3FC8D610 len 000329F0 (202 KiB): RAM",
+    "I (#) heap_init: At 3FCC0000 len 0001C710 (113 KiB): Retention RAM",
+    "I (#) heap_init: At 3FCDC710 len 00002950 (10 KiB): Retention RAM",
+    "I (#) heap_init: At 50000020 len 00001FC8 (7 KiB): RTCRAM",
+    "I (#) spi_flash: detected chip: issi",
+    "I (#) spi_flash: flash io: dio",
+    "I (#) sleep_gpio: Configure to isolate all GPIO pins in sleep state",
+    "I (#) sleep_gpio: Enable automatic switching of GPIO sleep configuration",
+    "I (#) main_task: Started on CPU0",
+    "I (#) main_task: Calling app_main()",
+    "Hello world!",
+    "This is esp32c3 chip with 1 CPU core(s), WiFi/BLE, silicon revision v0.3, 16MB external flash",
+    "Minimum free heap size: 332800 bytes",
+    "Restarting in 10 seconds...",
+    "Restarting in 9 seconds...",
+    "Restarting in 8 seconds...",
+    "Restarting in 7 seconds...",
+    "Restarting in 6 seconds...",
+    "Restarting in 5 seconds...",
+    "Restarting in 4 seconds...",
+    "Restarting in 3 seconds...",
+    "Restarting in 2 seconds...",
+    "Restarting in 1 seconds...",
+    "Restarting in 0 seconds...",
+    "Restarting now.",
+    // The second boot starts here: the banner of the ROM.
+    "ESP-ROM:esp32c3-api1-20210207",
+];
+/// The ROM lines of the boot that follows `esp_restart`. Two differences from the first boot: the
+/// cause, `RTC_SW_CPU_RST` (IR §4.3), and the `Saved PC` line a real chip prints after a CPU reset
+/// and the QEMU oracle never does (IR §4.4, §6 row 16).
+///
+/// The address is the instruction after the store that asked for the reset, in the ROM's
+/// `software_reset_cpu`: the model resets at the end of that instruction (`ASSUMPTION:` in
+/// `AssistDebug::cpu_reset`; a real chip shows an application address).
+const SECOND_BOOT_ROM_LINES: [&str; 9] = [
+    "Build:Feb  7 2021",
+    "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)",
+    "Saved PC:0x40048b92",
+    "SPIWP:0xee",
+    "mode:DIO, clock div:1",
+    "load:0x3fcd5820,len:0x15a4",
+    "load:0x403cbf10,len:0xc64",
+    "load:0x403ce710,len:0x2fd0",
+    "entry 0x403cbf1a",
+];
+/// One second of device time, in nanoseconds.
+const SECOND_NS: u64 = 1_000_000_000;
 /// The stock partition table of the Xteink X4 (repository fixture, built from `x4-stock.csv`):
 /// `nvs`, `otadata`, two OTA slots — `app0` at 0x10000, where the reference image has its
 /// application — `spiffs` and `coredump`; no factory application.
@@ -126,6 +183,14 @@ struct Run {
     diagnostics: Vec<Diagnostic>,
     stop: StopReason,
     trace_hash: Option<u64>,
+    resets: u64,
+    cycles: u64,
+    device_time_nanos: u64,
+}
+
+/// How many times the application printed its first line: once per boot that reached it.
+fn application_starts(console: &str) -> usize {
+    console.matches("cpu_start: Unicore app\n").count()
 }
 
 /// Runs the reference image until `done` accepts the console, the machine stops, or the budget ends.
@@ -140,7 +205,8 @@ fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic
     let (mut uart0, mut diagnostics) = (Vec::new(), Vec::new());
     let mut stop = StopReason::CycleBudget;
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
-    while stop == StopReason::CycleBudget
+    // `Asleep` is the CPU waiting for its next interrupt: device time goes on, the run too.
+    while matches!(stop, StopReason::CycleBudget | StopReason::Asleep)
         && machine.cycles().get() < BUDGET
         && !done(&text(&uart0), &diagnostics)
     {
@@ -156,6 +222,9 @@ fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic
         diagnostics,
         stop,
         trace_hash: machine.trace_hash(),
+        resets: machine.resets(),
+        cycles: machine.cycles().get(),
+        device_time_nanos: machine.device_time_nanos(),
     }
 }
 
@@ -196,114 +265,140 @@ fn rom_bootloader_and_application_print_the_golden_log() {
     );
 }
 
+/// Milestone point 1 of plan SP1b-3a: the application lives its whole life, restarts, and the
+/// chip boots a second time.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
-fn strict_run_reaches_the_application_and_ends_on_the_rtc_calibration() {
+fn the_whole_life_cycle_prints_the_golden_log_and_boots_a_second_time() {
+    let life = run(SocConfig::default(), |console| {
+        application_starts(console) == 2
+    });
+    assert!(
+        life.console.starts_with(ROM_LINES),
+        "ROM part:\n{}",
+        life.console
+    );
+    let after_rom: Vec<String> = life.console[ROM_LINES.len()..]
+        .lines()
+        .map(mask_timestamp)
+        .collect();
+    let mut expected: Vec<&str> = BOOTLOADER_LINES.to_vec();
+    expected.extend(APPLICATION_LINES);
+    expected.extend(SECOND_BOOT_ROM_LINES);
+    expected.extend(BOOTLOADER_LINES);
+    expected.push(FIRST_APPLICATION_LINE);
+    assert_eq!(
+        after_rom
+            .iter()
+            .map(String::as_str)
+            .take(expected.len())
+            .collect::<Vec<_>>(),
+        expected,
+        "diagnostics: {:#?}",
+        life.diagnostics
+    );
+    assert_eq!(life.resets, 1, "one reset: the restart");
+    assert_eq!(
+        life.diagnostics,
+        Vec::new(),
+        "nothing to report in a whole life"
+    );
+}
+
+/// Milestone point 3: in strict mode a whole life cycle, from power-on through `esp_restart` to
+/// the first line of the second boot, touches no unmodelled register and takes no CPU exception.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn a_strict_run_crosses_the_restart_without_anything_unmodelled() {
     let strict = SocConfig {
         strict_mmio: true,
         ..SocConfig::default()
     };
-    let boot = run(strict, |_| false);
-    // Milestone point 4: nothing unmodelled and no exception from reset to the application entry;
-    // then the run ends on a *named* register, the first one plan SP1b-3 has to model (BA §9).
-    let StopReason::StrictMmio(violation) = &boot.stop else {
-        panic!(
-            "expected a strict stop, got {:?}\nconsole:\n{}",
-            boot.stop, boot.console
-        );
-    };
+    let life = run(strict, |console| application_starts(console) == 2);
     assert!(
-        matches!(
-            violation,
-            Diagnostic::UnmodeledMmio {
-                register: Some(("TIMG0", "RTCCALICFG")),
-                ..
-            }
-        ),
-        "the run must end on TIMG0.RTCCALICFG, it ended on: {violation}\nconsole:\n{}",
-        boot.console
+        matches!(life.stop, StopReason::CycleBudget | StopReason::Asleep),
+        "nothing stops the run: {:?}\nconsole:\n{}",
+        life.stop,
+        life.console
     );
-    assert_eq!(
-        boot.diagnostics,
-        vec![violation.clone()],
-        "nothing else was reported before it"
-    );
-    // The first application line is printed by the application's own `system_early_init` (BA §3):
-    // seeing it means the bootloader jumped and the application ran from the flash window.
-    assert!(
-        boot.console
-            .lines()
-            .map(mask_timestamp)
-            .any(|line| line == FIRST_APPLICATION_LINE),
-        "{}",
-        boot.console
-    );
-    let Diagnostic::UnmodeledMmio { pc, .. } = violation else {
-        panic!("expected an unmodelled register access, got: {violation}");
-    };
-    assert!(
-        APPLICATION_CODE.iter().any(|code| code.contains(pc)),
-        "the access must come from the application's own code {APPLICATION_CODE:x?} (entry {APPLICATION_ENTRY:#010x}), not from the bootloader or the ROM: pc {pc:#010x}"
-    );
+    assert_eq!(life.diagnostics, Vec::new());
+    assert_eq!(application_starts(&life.console), 2, "{}", life.console);
+    assert_eq!(life.resets, 1);
 }
 
+/// Milestone point 2: the eleven seconds the application spends in `vTaskDelay` are slept, not
+/// executed. The lines of its countdown are one second of device time apart, and the CPU runs
+/// through its first life in a fraction of the cycles eleven seconds would take at 160 MHz
+/// (1 760 000 000).
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
-fn without_strict_mode_the_wait_on_the_rtc_calibration_is_a_named_warning_not_a_silent_hang() {
-    // Far past the first application line: the application then polls the calibration register.
+fn the_countdown_lines_are_one_device_second_apart_and_the_cpu_sleeps_between_them() {
+    /// CPU cycles between two looks at the console, and the device time they take at the
+    /// 160 MHz the application runs at: the resolution of the times read below.
+    const LOOK: u64 = 200;
+    const LOOK_NS: u64 = 1_250;
+    /// One tick of the application's scheduler (`CONFIG_FREERTOS_HZ` is 100).
+    const TICK_NS: u64 = SECOND_NS / 100;
     let mut machine = Esp32C3::with_flash(rom(), reference_flash(), &SocConfig::default()).unwrap();
-    let stop = machine.run_until(Cycles(60_000_000));
-    let diagnostics = machine.drain_diagnostics();
-    assert_eq!(stop, StopReason::CycleBudget);
+    let mut uart0 = Vec::new();
+    // Device time, read from the machine, at the first look that found each countdown line
+    // printed.
+    let mut seen_at: Vec<u64> = Vec::new();
+    let mut restarting = false;
+    while machine.cycles().get() < BUDGET && !restarting {
+        let stop = machine.run_until(Cycles(machine.cycles().get() + LOOK));
+        assert!(
+            matches!(stop, StopReason::CycleBudget | StopReason::Asleep),
+            "{stop:?}"
+        );
+        let fresh = machine.take_console(ConsoleChannel::Uart0);
+        if fresh.is_empty() {
+            continue;
+        }
+        uart0.extend(fresh);
+        let console = String::from_utf8_lossy(&uart0);
+        if console.matches("seconds...\r\n").count() > seen_at.len() {
+            seen_at.push(machine.device_time_nanos());
+        }
+        restarting = console.contains("Restarting now.");
+    }
+    assert_eq!(seen_at.len(), 11, "{}", String::from_utf8_lossy(&uart0));
+    // `vTaskDelay(1000 / portTICK_PERIOD_MS)` between two lines: one second, less the part of a
+    // tick already spent when the first delay starts. The tolerance is that one tick, plus the
+    // resolution of the reading.
+    for pair in seen_at.windows(2) {
+        let gap = pair[1] - pair[0];
+        assert!(
+            gap.abs_diff(SECOND_NS) <= TICK_NS + LOOK_NS,
+            "two countdown lines are {gap} ns apart: {seen_at:?}"
+        );
+    }
     assert!(
-        diagnostics.iter().any(|d| matches!(
-            d,
-            Diagnostic::UnmodeledMmio {
-                register: Some(("TIMG0", "RTCCALICFG")),
-                ..
-            }
-        )),
-        "{diagnostics:#?}"
+        machine.device_time_nanos() > 11 * SECOND_NS,
+        "{} ns",
+        machine.device_time_nanos()
     );
     assert!(
-        machine
-            .most_repeated_diagnostics(3)
-            .iter()
-            .any(|(d, count)| *count > 1
-                && matches!(
-                    d,
-                    Diagnostic::UnmodeledMmio {
-                        register: Some(("TIMG0", "RTCCALICFG")),
-                        ..
-                    }
-                )),
-        "the end-of-run summary must show TIMG0.RTCCALICFG as what the firmware keeps polling"
+        machine.cycles().get() < 60_000_000,
+        "the CPU executed {} cycles: it did not sleep",
+        machine.cycles().get()
     );
 }
 
 /// Spec §5.1: "Reset → ROM → bootloader → table de partitions → `otadata` → application". The
 /// reference image has a factory application; the target device has none. Behind the stock X4
 /// table the unmodified bootloader finds a blank `otadata`, falls back to OTA slot 0 and records
-/// that choice: the mask ROM's sector-erase and page-program functions run. The flash is read-only
-/// in this plan, so both are refused, each once and by its own opcode, and nothing else is
-/// reported before the application reaches the RTC calibration.
+/// that choice: the mask ROM's sector-erase and page-program functions run. The flash is still
+/// read-only (plan SP1b-3b makes it writable), so both are refused, each once and by its own
+/// opcode, and nothing else is reported before the application says hello.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
 fn the_stock_x4_ota_layout_boots_and_only_the_otadata_update_is_refused() {
     let mut image = reference_flash();
     image[PARTITION_TABLE_OFFSET..PARTITION_TABLE_OFFSET + X4_STOCK_TABLE.len()]
         .copy_from_slice(X4_STOCK_TABLE);
-    let is_rtc_calibration = |d: &Diagnostic| {
-        matches!(
-            d,
-            Diagnostic::UnmodeledMmio {
-                register: Some(("TIMG0", "RTCCALICFG")),
-                ..
-            }
-        )
-    };
-    let boot = run_image(image, SocConfig::default(), |_, diagnostics| {
-        diagnostics.iter().any(is_rtc_calibration)
+    let boot = run_image(image, SocConfig::default(), |console, _| {
+        console.contains("Hello world!\n")
     });
     assert!(
         boot.console.starts_with(ROM_LINES),
@@ -317,6 +412,7 @@ fn the_stock_x4_ota_layout_boots_and_only_the_otadata_update_is_refused() {
         "I (#) boot: Loaded app from partition at offset 0x10000",
         "I (#) boot: Set actual ota_seq=1 in otadata[0]",
         FIRST_APPLICATION_LINE,
+        "Hello world!",
     ] {
         let at = lines[from..]
             .iter()
@@ -324,64 +420,53 @@ fn the_stock_x4_ota_layout_boots_and_only_the_otadata_update_is_refused() {
             .unwrap_or_else(|| panic!("`{expected}` is missing, or out of order:\n{lines:#?}"));
         from += at + 1;
     }
-    let reached = boot
+    let reported: Vec<(Unsupported, bool)> = boot
         .diagnostics
-        .iter()
-        .position(is_rtc_calibration)
-        .unwrap_or_else(|| {
-            panic!(
-                "the application never reached TIMG0.RTCCALICFG: {:#?}\nconsole:\n{}",
-                boot.diagnostics, boot.console
-            )
-        });
-    let before: Vec<(Unsupported, bool)> = boot.diagnostics[..reached]
         .iter()
         .map(|diagnostic| match diagnostic {
             Diagnostic::Unsupported { what, pc } => (*what, MASK_ROM.contains(pc)),
-            other => panic!("unexpected diagnostic before the RTC calibration: {other}"),
+            other => panic!("unexpected diagnostic: {other}"),
         })
         .collect();
     assert_eq!(
-        before,
+        reported,
         [
             (Unsupported::FlashCommand { opcode: 0x20 }, true),
             (Unsupported::FlashCommand { opcode: 0x02 }, true),
         ],
         "exactly the sector erase and the page program of the otadata update, each run by the mask ROM"
     );
-    assert_eq!(
-        boot.stop,
-        StopReason::CycleBudget,
-        "nothing stops a lenient run"
+    assert!(
+        matches!(boot.stop, StopReason::CycleBudget | StopReason::Asleep),
+        "nothing stops a lenient run: {:?}",
+        boot.stop
     );
 }
 
+/// Milestone point 6: two runs of a whole life cycle, the reset included, are the same run.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
-fn two_boots_of_the_reference_image_are_identical_down_to_the_trace_hash() {
+fn two_life_cycles_are_identical_down_to_the_trace_hash_across_the_reset() {
     let config = SocConfig {
         trace_hash: true,
         ..SocConfig::default()
     };
-    let boot = || {
-        run(config, |console| {
-            console.contains("cpu_start: Unicore app\n")
-        })
-    };
-    let (first, second) = (boot(), boot());
-    // Two runs that both exhausted the budget before the application would compare equal too.
-    assert!(
-        first
-            .console
-            .lines()
-            .map(mask_timestamp)
-            .any(|line| line == FIRST_APPLICATION_LINE),
-        "the boot must reach the application:\n{}",
-        first.console
-    );
+    let life = || run(config, |console| application_starts(console) == 2);
+    let (first, second) = (life(), life());
+    // Two runs that both exhausted the budget before the second boot would compare equal too,
+    // and so would two runs a watchdog reset: the reset crossed is the one `esp_restart` asks
+    // for, and the second boot went as far as the first line of the application.
+    assert_eq!(application_starts(&first.console), 2, "{}", first.console);
+    assert_eq!(first.resets, 1);
+    let (_, second_boot) = first
+        .console
+        .split_once("rst:0xc (RTC_SW_CPU_RST)")
+        .unwrap_or_else(|| panic!("no software CPU reset in:\n{}", first.console));
+    assert_eq!(application_starts(second_boot), 1, "{}", first.console);
     assert!(first.trace_hash.is_some());
     assert_eq!(
-        first.trace_hash, second.trace_hash,
+        (first.trace_hash, first.cycles, first.device_time_nanos),
+        (second.trace_hash, second.cycles, second.device_time_nanos),
         "spec §8: same session, same trace hash"
     );
     assert_eq!(first.console, second.console);

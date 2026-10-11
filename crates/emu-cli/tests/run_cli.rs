@@ -480,49 +480,56 @@ fn x4_without_a_flash_image_loops_on_the_invalid_header_of_an_erased_chip() {
     );
 }
 
-/// The milestone through the real command: ROM, bootloader, first application line, strict stop.
+/// The milestone through the real command: ROM, bootloader, the whole life of the application,
+/// its restart and the first line of the second boot, with nothing unmodelled.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
-fn x4_boots_the_reference_firmware_to_its_first_application_line() {
+fn x4_boots_the_reference_firmware_through_its_restart_into_a_second_boot() {
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
     let flash = std::env::var("INKEMU_REF_FLASH").expect("set INKEMU_REF_FLASH");
+    // One life of the application is 28 million cycles and 11 s of device time; 40 million reach
+    // the second boot.
     let output = inkemu()
         .args([
             "run",
             "--device",
             "x4",
             "--strict-mmio",
+            "--max-cycles",
+            "40000000",
             "--rom-dir",
             &rom_dir,
             "--flash",
             &flash,
         ])
         .assert()
-        .code(3)
+        .code(0)
         .get_output()
         .clone();
     let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
-    assert!(console.contains("entry 0x403cbf1a\n"), "{console}");
-    assert!(
-        console.contains(") boot: ESP-IDF v5.5.2 2nd stage bootloader\n"),
-        "{console}"
-    );
-    assert!(
-        console.contains(") boot.esp32c3: SPI Mode       : DIO\n"),
-        "{console}"
-    );
-    assert!(
-        console.contains(") boot: Disabling RNG early entropy source...\n"),
-        "{console}"
-    );
-    assert!(console.contains(") cpu_start: Unicore app\n"), "{console}");
+    let mut from = 0;
+    for expected in [
+        "entry 0x403cbf1a\n",
+        ") boot: ESP-IDF v5.5.2 2nd stage bootloader\n",
+        ") cpu_start: Unicore app\n",
+        "Hello world!\n",
+        "Restarting in 10 seconds...\n",
+        "Restarting in 0 seconds...\n",
+        "Restarting now.\n",
+        "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        "Saved PC:0x40048b92\n",
+        ") boot: ESP-IDF v5.5.2 2nd stage bootloader\n",
+        ") cpu_start: Unicore app\n",
+    ] {
+        let at = console[from..]
+            .find(expected)
+            .unwrap_or_else(|| panic!("`{expected}` is missing, or out of order:\n{console}"));
+        from += at + expected.len();
+    }
     let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(log.contains("cycle limit reached"), "{log}");
     assert!(
-        log.contains("stopped by --strict-mmio") && log.contains("TIMG0.RTCCALICFG"),
-        "{log}"
-    );
-    assert!(
-        !log.contains("warning:"),
-        "nothing was reported before the stop: {log}"
+        !log.contains("warning:") && !log.contains("stopped by --strict-mmio"),
+        "nothing was reported in a whole life cycle: {log}"
     );
 }
