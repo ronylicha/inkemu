@@ -133,12 +133,45 @@ impl<E> Scheduler<E> {
     ///
     /// Returns `None` when the earliest pending event is still in the future or nothing is pending.
     pub fn pop_due(&mut self, now: Cycles) -> Option<(Cycles, E)> {
+        self.pop_due_where(now, |_| true)
+    }
+
+    /// The id the next scheduled event will get: every event scheduled from now on has an id at
+    /// or past it, every event scheduled before it, an id below. Meant for
+    /// [`Scheduler::pop_due_before`].
+    #[must_use]
+    pub fn watermark(&self) -> EventId {
+        EventId(self.next_id)
+    }
+
+    /// Pops the earliest pending event whose cycle is `<= now` and whose id is below `watermark`
+    /// (see [`Scheduler::watermark`]): an event scheduled after the watermark is not returned,
+    /// even if it is due and the earliest.
+    ///
+    /// The heap is ordered by (cycle, id), so this stops at the first due event at or past the
+    /// watermark: it returns `None` while older due events may still sit behind it. That loses
+    /// nothing when no event is scheduled for a cycle before the earliest due one, as long as
+    /// the caller schedules nothing earlier than `now` (an event scheduled for `now` or later
+    /// has a larger cycle, or the same cycle and a larger id, than every event due at `now`,
+    /// and sorts after them). The number of events returned for one watermark is bounded by the
+    /// number of events pending when it was taken.
+    pub fn pop_due_before(&mut self, now: Cycles, watermark: EventId) -> Option<(Cycles, E)> {
+        self.pop_due_where(now, |id| id < watermark)
+    }
+
+    fn pop_due_where(
+        &mut self,
+        now: Cycles,
+        accepts: impl Fn(EventId) -> bool,
+    ) -> Option<(Cycles, E)> {
         self.drop_cancelled_head();
         match self.heap.peek() {
-            Some(Reverse(head)) if head.at <= now => self.heap.pop().map(|Reverse(e)| {
-                self.live.remove(&e.id);
-                (e.at, e.event)
-            }),
+            Some(Reverse(head)) if head.at <= now && accepts(head.id) => {
+                self.heap.pop().map(|Reverse(e)| {
+                    self.live.remove(&e.id);
+                    (e.at, e.event)
+                })
+            }
             _ => None,
         }
     }
@@ -335,5 +368,73 @@ mod tests {
             assert!(s.pop_due(Cycles(round + 1)).is_none());
         }
         assert_eq!(s.tombstones(), 0);
+    }
+    #[test]
+    fn the_watermark_is_the_id_the_next_event_gets() {
+        let mut s = Scheduler::new();
+        let before = s.watermark();
+        let first = s.schedule(Cycles(1), 'a');
+        let after = s.watermark();
+        assert!(before <= first && first < after);
+        assert_eq!(after, s.watermark(), "reading it schedules nothing");
+        let second = s.schedule(Cycles(1), 'b');
+        assert!(after <= second);
+    }
+    #[test]
+    fn pop_due_before_returns_older_due_events_by_cycle_then_id() {
+        let mut s = Scheduler::new();
+        s.schedule(Cycles(20), 'c');
+        s.schedule(Cycles(10), 'a');
+        s.schedule(Cycles(10), 'b');
+        s.schedule(Cycles(50), 'x');
+        let watermark = s.watermark();
+        let order: Vec<char> =
+            std::iter::from_fn(|| s.pop_due_before(Cycles(30), watermark).map(|(_, e)| e))
+                .collect();
+        assert_eq!(order, vec!['a', 'b', 'c'], "'x' is not due");
+    }
+    #[test]
+    fn pop_due_before_does_not_return_an_event_scheduled_after_the_watermark() {
+        // Due and the earliest, but newer than the watermark: it is not returned, and it stops
+        // the pass (the older event behind it is left for a caller that schedules nothing in the
+        // past, which never has this case).
+        let mut s = Scheduler::new();
+        s.schedule(Cycles(10), 'o');
+        let watermark = s.watermark();
+        s.schedule(Cycles(5), 'n');
+        assert_eq!(s.pop_due_before(Cycles(10), watermark), None);
+        assert_eq!(
+            s.pop_due(Cycles(10)).map(|(_, e)| e),
+            Some('n'),
+            "it is due"
+        );
+        // Scheduled for the same cycle as an older event, it sorts after it.
+        let mut s = Scheduler::new();
+        s.schedule(Cycles(10), 'o');
+        let watermark = s.watermark();
+        s.schedule(Cycles(10), 'n');
+        assert_eq!(
+            s.pop_due_before(Cycles(10), watermark).map(|(_, e)| e),
+            Some('o')
+        );
+        assert_eq!(s.pop_due_before(Cycles(10), watermark), None);
+        assert_eq!(
+            s.pop_due(Cycles(10)).map(|(_, e)| e),
+            Some('n'),
+            "left for the next pass"
+        );
+    }
+    #[test]
+    fn pop_due_before_skips_a_cancelled_head() {
+        let mut s = Scheduler::new();
+        let gone = s.schedule(Cycles(1), 'g');
+        s.schedule(Cycles(2), 'k');
+        let watermark = s.watermark();
+        s.cancel(gone);
+        assert_eq!(
+            s.pop_due_before(Cycles(9), watermark).map(|(_, e)| e),
+            Some('k')
+        );
+        assert_eq!(s.pop_due_before(Cycles(9), watermark), None);
     }
 }

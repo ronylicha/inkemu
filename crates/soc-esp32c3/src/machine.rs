@@ -199,8 +199,8 @@ impl Esp32C3 {
     /// Acts on what the last instruction, or the passing of time, left in the context: wake-ups
     /// that are due, a reset, a clock change, a change of the interrupt lines.
     fn service(&mut self, pc: u32) {
-        // One pass, bounded by the wake-ups pending now: what a device arms for an instant not
-        // after the present time is delivered by the next call (`Ctx::deliver_due`).
+        // One pass, bounded by the wake-ups that were due when it began: a wake-up a device arms
+        // during the pass, for any instant, is delivered by the next call (`Ctx::deliver_due`).
         self.bus.deliver_due();
         if let Some(cause) = self.bus.ctx.take_reset() {
             self.reset(cause);
@@ -398,7 +398,7 @@ mod tests {
     use crate::memmap::SRAM_DBUS_BASE;
     use crate::test_support::{
         HANG, T0, T1, flat_rom, load_register, print_program as print, stop_watchdogs,
-        store_register, unmodeled_register,
+        store_register, unmodeled_register, within,
     };
     use cpu_rv32::asm::{addi, csrrs, csrrwi, jal, lui, lw, sw, wfi};
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
@@ -1505,17 +1505,26 @@ mod tests {
         // `EN` and `USE_XTAL`: 26 000 000 counts of the crystal, 104 million cycles.
         body.extend(store_register(reg("TIMG1", "WDTCONFIG0"), 0x8020_0000));
         body.push(HANG);
-        let mut m = machine(&body);
-        let mut calls = 0;
-        // 300 000 CPU cycles are 2.4 million cycles of the time base at 20 MHz: they cover the
-        // 2^20 left after the alarm.
-        while m.run_until(Cycles(300_000)) != StopReason::CycleBudget {
-            calls += 1;
-            assert!(calls < 10, "run_until keeps returning without the budget");
-        }
-        assert_eq!(m.resets(), 0, "no watchdog fell inside device time");
+        // On a thread with a limit: if the delivery pass were not bounded the loop would never
+        // leave one instruction, and nothing in the run could stop it.
+        let (calls, resets, now) = within(
+            std::time::Duration::from_secs(30),
+            "the run did not return: a delivery pass is not bounded",
+            move || {
+                let mut m = machine(&body);
+                let mut calls = 0;
+                // 300 000 CPU cycles are 2.4 million cycles of the time base at 20 MHz: they
+                // cover the 2^20 left after the alarm.
+                while m.run_until(Cycles(300_000)) != StopReason::CycleBudget && calls < 10 {
+                    calls += 1;
+                }
+                (calls, m.resets(), m.bus.ctx.now())
+            },
+        );
+        assert!(calls < 10, "run_until keeps returning without the budget");
+        assert_eq!(resets, 0, "no watchdog fell inside device time");
         assert_eq!(
-            m.bus.ctx.now(),
+            now,
             Cycles(u64::MAX),
             "the CPU ran on to the end of device time, where it saturates"
         );

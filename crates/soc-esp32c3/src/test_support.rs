@@ -368,3 +368,29 @@ pub fn stop_watchdogs() -> Vec<u32> {
     }
     program
 }
+
+/// Runs `work` on its own thread and waits at most `limit` for its result: a test of a loop that
+/// must end, which would otherwise hang the whole suite if the loop did not. On a timeout the
+/// test fails with `unbounded`; the thread is left to spin until the test process ends. A panic of
+/// `work` is the panic of the caller.
+///
+/// `work` builds what it needs itself (a machine is not `Send`) and returns plain data.
+pub fn within<T: Send + 'static>(
+    limit: std::time::Duration,
+    unbounded: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        // A closed channel means the caller gave up: nobody needs the result.
+        let _ = sender.send(work());
+    });
+    match receiver.recv_timeout(limit) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{unbounded}"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match thread.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => panic!("the thread ended without a result"),
+        },
+    }
+}

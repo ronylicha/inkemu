@@ -710,7 +710,11 @@ impl Peripheral<Ctx> for Timg {
                 // A write re-anchors the counter only for what changes its counting, so that
                 // the fraction of a count it has counted is not lost: a driver rewrites this
                 // register at every alarm (`timer_ll_enable_alarm`, `timer_ll.h:118`).
-                // - `EN`: `retime` starts or stops the counter, which keeps its value.
+                // - `EN`: `retime` starts or stops the counter, which keeps its value. A start
+                //   (0 to 1) resumes from the kept value with a fresh phase: the count in
+                //   progress is counted from the write.
+                // - `USE_XTAL`: the clock source changes the rate, which `retime` applies by
+                //   re-anchoring the counter at the write, like a divider change.
                 // - `INCREASE`: the value is kept and the direction changes from now.
                 // - `DIVIDER`: ASSUMPTION: a change takes effect at once and keeps the count
                 //   (`retime`). The header says the divider is changed with the timer stopped
@@ -795,9 +799,17 @@ mod tests {
         timg
     }
 
-    /// Delivers every wake-up due at the present time, as the machine does.
+    /// Drains every wake-up due at the present time, those a call arms for the present time
+    /// included (the machine delivers those one pass later: `Ctx::deliver_due`), and fails the
+    /// test after a thousand calls.
     fn pump(ctx: &mut Ctx, timg: &mut Timg) {
+        let mut calls = 0;
         while let Some(event) = ctx.take_due() {
+            calls += 1;
+            assert!(
+                calls <= 1_000,
+                "the device keeps arming itself at the present time"
+            );
             assert_eq!(event, timg.event());
             timg.wake(ctx);
         }

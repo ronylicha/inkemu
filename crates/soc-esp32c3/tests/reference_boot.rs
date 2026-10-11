@@ -391,10 +391,14 @@ fn the_countdown_lines_are_one_device_second_apart_and_the_cpu_sleeps_between_th
     assert_eq!(seen_at.len(), 11, "{}", String::from_utf8_lossy(&uart0));
     // `vTaskDelay(1000 / portTICK_PERIOD_MS)` waits 100 ticks counted from the next tick edge, so
     // the first delay, which starts inside a tick, lasts one second less the part of that tick
-    // already spent: it is shorter than a second by 0 to 10 ms and never longer (here 0.99 s).
+    // already spent: 0 to 10 ms shorter than a second, never longer. Which tick the first line is
+    // seen at depends on that phase and also on the time the UART takes to send the lines before
+    // it (a look is the first tick after the line is complete), so the first gap is bounded by
+    // the tick on one side and by a second on the other, each with the resolution of the looks
+    // (here 0.99 s).
     let first = seen_at[1] - seen_at[0];
     assert!(
-        (SECOND_NS - TICK_NS..=SECOND_NS).contains(&first),
+        (SECOND_NS - TICK_NS - LOOK_NS..=SECOND_NS + LOOK_NS).contains(&first),
         "the first gap is {first} ns: {seen_at:?}"
     );
     // The nine others start on the tick edge the previous delay ended on: a second exactly, to

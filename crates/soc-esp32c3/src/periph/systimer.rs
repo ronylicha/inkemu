@@ -397,9 +397,17 @@ mod tests {
         ctx.sleep_until(ctx.now() + cycles);
     }
 
-    /// Delivers every wake-up due at the present time, as the machine does.
+    /// Drains every wake-up due at the present time, those a call arms for the present time
+    /// included (the machine delivers those one pass later: `Ctx::deliver_due`), and fails the
+    /// test after a thousand calls.
     fn pump(ctx: &mut Ctx, timer: &mut Systimer) {
+        let mut calls = 0;
         while let Some(event) = ctx.take_due() {
+            calls += 1;
+            assert!(
+                calls <= 1_000,
+                "the device keeps arming itself at the present time"
+            );
             assert_eq!(event, Event::Systimer);
             timer.wake(ctx);
         }
