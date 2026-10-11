@@ -15,8 +15,9 @@ pub const EXIT_IDLE: u8 = 4;
 pub const RUN_EXIT_CODES_HELP: &str = "\
 Exit codes:
   0  the run ended normally: the cycle limit was reached, or the reader of standard output went away
-  2  error: unknown device, missing or invalid ROM, or standard output cannot be written
-  3  stopped by --strict-mmio (an unmodelled register or an 8/16-bit register write)
+  2  error: unknown device, missing or invalid ROM, refused flash image, or standard output cannot be written
+  3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
+     emulator cannot perform faithfully, or flash that is not mapped)
   4  the CPU is waiting for an interrupt and nothing can raise one (interrupts are not emulated yet)";
 
 #[cfg(test)]

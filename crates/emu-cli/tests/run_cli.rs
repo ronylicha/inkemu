@@ -2,6 +2,7 @@
 //! default ROM cache: every run names its ROM directory.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
 use assert_cmd::Command;
+use firmware::builder::{ImageSpec, build_flash_image, build_image};
 use predicates::prelude::*;
 use predicates::str::contains;
 
@@ -284,4 +285,161 @@ fn rom_fetch_all_prints_one_path_per_rom_and_downloads_nothing_when_they_are_pre
     for (line, name) in lines.iter().zip(names) {
         assert!(line.ends_with(name), "{line} should end with {name}");
     }
+}
+
+/// Runs `inkemu run --device x4 --flash <file with bytes>` with a ROM directory that holds nothing:
+/// a refusal of the flash file must come before any attempt to load a ROM.
+fn run_with_flash(bytes: &[u8]) -> assert_cmd::assert::Assert {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("flash.bin");
+    std::fs::write(&path, bytes).unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--max-cycles", "1000", "--flash"])
+        .arg(&path)
+        .arg("--rom-dir")
+        .arg(dir.path())
+        .assert()
+}
+
+#[test]
+fn xota_is_refused_before_boot() {
+    let mut bytes = b"XOTA".to_vec();
+    bytes.resize(0x9000, 0);
+    run_with_flash(&bytes).code(2).stderr(
+        contains("flash.bin")
+            .and(contains("encrypted OTA"))
+            .and(contains("; use")),
+    );
+}
+
+#[test]
+fn a_file_without_the_image_magic_is_refused_before_boot() {
+    run_with_flash(&vec![0u8; 0x9000]).code(2).stderr(
+        contains("first byte is 0x00")
+            .and(contains("expected 0xe9"))
+            .and(contains("merge_bin")),
+    );
+}
+
+#[test]
+fn image_for_another_chip_is_refused() {
+    run_with_flash(&build_flash_image(&ImageSpec {
+        chip: 9,
+        ..ImageSpec::default()
+    }))
+    .code(2)
+    .stderr(
+        contains("ESP32-S3")
+            .and(contains("ESP32-C3"))
+            .and(contains("; choose")),
+    );
+}
+
+#[test]
+fn image_declaring_more_flash_than_the_device_is_refused() {
+    run_with_flash(&build_flash_image(&ImageSpec {
+        flash_size_nibble: 5,
+        ..ImageSpec::default()
+    }))
+    .code(2)
+    .stderr(contains("32 MB").and(contains("16 MB")));
+}
+
+#[test]
+fn an_application_image_given_as_flash_is_refused() {
+    run_with_flash(&build_image(&ImageSpec::default()))
+        .code(2)
+        .stderr(contains("no partition table at offset 0x8000").and(contains("merge_bin")));
+}
+
+#[test]
+fn a_flash_file_that_does_not_exist_exits_2() {
+    inkemu()
+        .args(["run", "--device", "x4", "--flash", "/nonexistent/flash.bin"])
+        .assert()
+        .code(2)
+        .stderr(contains("/nonexistent/flash.bin").and(contains("; check the path")));
+}
+
+#[test]
+fn run_help_documents_the_flash_option_and_what_strict_stops_on() {
+    inkemu().args(["run", "--help"]).assert().code(0).stdout(
+        contains("--flash")
+            .and(contains("erased"))
+            .and(contains("flash that is not mapped")),
+    );
+}
+
+/// The real ROM on a full flash image, through the real command.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn x4_boots_a_flash_image_through_the_real_rom() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let stub = ImageSpec {
+        entry: 0x4038_0000,
+        segments: vec![(0x4038_0000, vec![0x6f, 0, 0, 0])],
+        ..ImageSpec::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("flash.bin");
+    std::fs::write(&path, build_flash_image(&stub)).unwrap();
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--strict-mmio",
+            "--max-cycles",
+            "5000000",
+            "--rom-dir",
+            &rom_dir,
+            "--flash",
+        ])
+        .arg(&path)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    assert!(
+        console.ends_with(
+            "SPIWP:0xee\nmode:DIO, clock div:1\nload:0x40380000,len:0x4\nentry 0x40380000\n"
+        ),
+        "{console}"
+    );
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        log.contains("flash: flash.bin") && log.contains("16 MiB") && !log.contains("warning:"),
+        "{log}"
+    );
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn x4_without_a_flash_image_loops_on_the_invalid_header_of_an_erased_chip() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--strict-mmio",
+            "--max-cycles",
+            "3000000",
+            "--rom-dir",
+            &rom_dir,
+        ])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    assert!(
+        console.matches("invalid header: 0xffffffff\n").count() >= 3,
+        "{console}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("flash: erased"),
+        "the header line says so"
+    );
 }
