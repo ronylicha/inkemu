@@ -12,10 +12,10 @@ use svd_regs::REGISTER_BYTES;
 /// start of `INTERRUPT_CORE0` (report IR §1.1) from `MAC_INTR_MAP`, at the base of the block, to
 /// `CACHE_CORE0_ACS_INT_MAP`, the last one; the registers that follow (`INTR_STATUS_REG_0`, ...)
 /// are not map registers. The count is read off the SVD table through that last register.
-const MAP_REGISTERS: u32 = (svd_regs::esp32c3::addr("INTERRUPT_CORE0", "CACHE_CORE0_ACS_INT_MAP")
-    - INTMATRIX_BASE)
-    / REGISTER_BYTES
-    + 1;
+pub(crate) const MAP_REGISTERS: u32 =
+    (svd_regs::esp32c3::addr("INTERRUPT_CORE0", "CACHE_CORE0_ACS_INT_MAP") - INTMATRIX_BASE)
+        / REGISTER_BYTES
+        + 1;
 
 /// One of the 62 peripheral interrupt sources: source `n` is the one `INTERRUPT_CORE0` routes with
 /// the map register at offset 4 × `n` (report IR §1.1).

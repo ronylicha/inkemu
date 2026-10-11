@@ -6,8 +6,8 @@ some keep only their configuration bits, beside a status bit the model answers
 (`EXTMEM.ICACHE_PRELOAD_CTRL`, `ICACHE_AUTOLOAD_CTRL`, `ICACHE_FREEZE`, the masked fields of
 `INTERRUPT_CORE0`). Two kinds do not store anything:
 
-- the write-only strobes `UART0.INT_CLR`, `UART1.INT_CLR` and `INTERRUPT_CORE0.CPU_INT_CLEAR`: the
-  write is accepted and dropped, since nothing is pending; **reading** one is reported as unmodelled;
+- the write-only strobes `UART0.INT_CLR` and `UART1.INT_CLR`: the write is accepted and dropped,
+  since nothing is pending; **reading** one is reported as unmodelled;
 - `EXTMEM.ICACHE_SYNC_CTRL`: the write is accepted and the register always reads its `SYNC_DONE`
   bit, because the operation it starts completes at once.
 
@@ -127,13 +127,7 @@ SP1b-3, SP1b-4, SP2, SP5a and SP8.
 | `0x600c001c` | `SYSTEM.PERIP_RST_EN1` | 1 | peripheral reset pulses | SP1b-3 |
 | `0x600c0040` | `SYSTEM.CACHE_CONTROL` | 1 | cache clock enable and reset | SP1b-4 |
 | `0x600c101c` | `SENSITIVE.INTERNAL_SRAM_USAGE_1` | 1 | SRAM0 handed to the cache as line storage | SP1b-4 |
-| `0x600c2000` | `INTERRUPT_CORE0.MAC_INTR_MAP` | 62 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c2100` | `INTERRUPT_CORE0.CLOCK_GATE` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c2104` | `INTERRUPT_CORE0.CPU_INT_ENABLE` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c2108` | `INTERRUPT_CORE0.CPU_INT_TYPE` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c210c` | `INTERRUPT_CORE0.CPU_INT_CLEAR` | 1 | edge-interrupt acknowledge: nothing is pending | SP1b-3 |
-| `0x600c2114` | `INTERRUPT_CORE0.CPU_INT_PRI_0` | 32 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c2194` | `INTERRUPT_CORE0.CPU_INT_THRESH` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
+| `0x600c2100` | `INTERRUPT_CORE0.CLOCK_GATE` | 1 | clock gate of the controller's registers: they always answer | SP8 |
 | `0x600c4000` | `EXTMEM.ICACHE_CTRL` | 1 | cache enable: the flash windows are always readable (D5) | SP1b-4 |
 | `0x600c4004` | `EXTMEM.ICACHE_CTRL1` | 1 | bus gating of the flash windows (SHUT_IBUS, SHUT_DBUS; D5) | SP1b-4 |
 | `0x600c4008` | `EXTMEM.ICACHE_TAG_POWER_CTRL` | 1 | tag memory power | SP8 |

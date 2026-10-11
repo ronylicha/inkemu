@@ -169,6 +169,28 @@ impl Storage {
     }
 }
 
+/// One 32-bit half of a wide value: bits 63:32 when `hi`, bits 31:0 otherwise. Registers expose
+/// 48- to 62-bit values as such pairs.
+#[must_use]
+pub const fn half_of(value: u64, hi: bool) -> u32 {
+    // Lossless: each operand is reduced to 32 bits before the cast.
+    if hi {
+        (value >> 32) as u32
+    } else {
+        (value & 0xFFFF_FFFF) as u32
+    }
+}
+
+/// `value` with one half replaced by `half`; `hi_mask` keeps the bits the high register has.
+#[must_use]
+pub fn replace_half(value: u64, hi: bool, half: u32, hi_mask: u32) -> u64 {
+    if hi {
+        (value & 0xFFFF_FFFF) | (u64::from(half & hi_mask) << 32)
+    } else {
+        (value & !0xFFFF_FFFF) | u64::from(half)
+    }
+}
+
 /// A block made only of registers accepted without effect.
 #[derive(Clone, Debug)]
 pub struct AcceptedBlock {
@@ -770,5 +792,20 @@ mod tests {
         assert_eq!(base_of(&mut p, 0x6000_8800), Some(EFUSE_BASE));
         assert_eq!(base_of(&mut p, 0x6000_8FFC), Some(EFUSE_BASE));
         assert_eq!(base_of(&mut p, 0x6000_9000), Some(IO_MUX_BASE));
+    }
+
+    #[test]
+    fn a_wide_value_is_read_and_written_as_two_halves() {
+        assert_eq!(half_of(0x0012_3456_89AB_CDEF, false), 0x89AB_CDEF);
+        assert_eq!(half_of(0x0012_3456_89AB_CDEF, true), 0x0012_3456);
+        // A 52-bit pair: the high register has 20 bits.
+        assert_eq!(
+            replace_half(0, true, 0xFFFF_FFFF, 0x000F_FFFF),
+            0x000F_FFFF_0000_0000
+        );
+        assert_eq!(
+            replace_half(0x000F_FFFF_0000_0000, false, 0x1234_5678, 0x000F_FFFF),
+            0x000F_FFFF_1234_5678
+        );
     }
 }
