@@ -37,7 +37,7 @@ I (31) boot: Disabling RNG early entropy source...
 I (31) cpu_start: Unicore app
 ```
 
-`--flash` takes a **full flash image**: a flash dump, or the output of `esptool.py merge_bin` (bootloader at offset 0, partition table at `0x8000`, application). The file may be shorter than the flash of the device; the rest reads as erased. inkemu refuses, before anything runs, a file that cannot be the flash of the device (exit code 2, with the cause and the remedy): an encrypted `.xota`, an application image alone, an image for another chip, an image that declares more flash than the device has, a file longer than the flash, an empty file. For example:
+`--flash` takes a **full flash image**: a dump of a device (`esptool.py read_flash 0 ALL flash.bin`), or the output of `esptool.py merge_bin` (bootloader at offset 0, partition table at `0x8000`, application). The file may be shorter than the flash of the device; the rest reads as erased. inkemu refuses, before anything runs, a file that cannot be the flash of the device (exit code 2, with the cause and the remedy): an encrypted `.xota`, an application image alone, an image for another chip, an image that declares more flash than the device has, a file longer than the flash, an empty file. For example:
 
 ```text
 $ target/release/inkemu run --device x4 --flash app.bin
@@ -56,9 +56,17 @@ warning: unmodeled register write: TIMG0.RTCCALICFG2 at 0x6001f080 (pc 0x40382a1
 inkemu: cycle limit reached; raise --max-cycles to run longer
 inkemu: stopped at pc 0x40382a1c after 50000000 cycles (39808633 instructions)
 inkemu: 632854 us of device time; CPU clock at 80 MHz
+inkemu: repeated 4806293 times: unmodeled register read: TIMG0.RTCCALICFG at 0x6001f068 (pc 0x403829fa); returning its documented reset value 0x00013000
+inkemu: repeated 4806293 times: unmodeled register read: TIMG0.RTCCALICFG2 at 0x6001f080 (pc 0x40382a08); returning its documented reset value 0xffffff98
 ```
 
-With `--strict-mmio` the same run stops on the first of these, with exit code 3. It is the first unmodelled access since the reset, and no CPU exception came before it:
+Until resets, watchdogs and flash writes are emulated (sub-project 1b-3), three things are worth knowing:
+
+- **A boot that fails does not end by itself.** When the ROM refuses the bootloader (a corrupted image, for instance) it prints its error and `ets_main.c 333`, then parks in an endless loop, where the watchdog of a real device would reset it. The watchdogs of inkemu never expire: the run goes on in silence, without a single warning, until `--max-cycles`. Always pass that option.
+- **A software reset is refused.** Firmware that asks for one — the bootloader does when it finds no bootable application — gets one warning (`a software reset was requested … but resets are not emulated yet`), then idles in its own loop until `--max-cycles`.
+- **The flash is read-only.** On the first boot of a layout with OTA slots and a blank `otadata` partition, which is the layout of the Xteink X4, the bootloader records the slot it chose. inkemu reports the refused sector erase and page program (`flash command 0x20 is not modeled`, then `0x02`) and the boot goes on to the application; with `--strict-mmio` the run stops at the first of the two.
+
+With `--strict-mmio` the run of the reference image stops on the first of its warnings, with exit code 3. It is the first unmodelled access since the reset, and no CPU exception came before it:
 
 ```text
 inkemu: stopped by --strict-mmio: unmodeled register read: TIMG0.RTCCALICFG at 0x6001f068 (pc 0x403829fa); returning its documented reset value 0x00013000
@@ -66,7 +74,7 @@ inkemu: stopped at pc 0x403829fc after 1937072 cycles (1358289 instructions)
 inkemu: 32068 us of device time; CPU clock at 80 MHz
 ```
 
-The device console goes to standard output. Everything inkemu has to say goes to standard error: the device, the timing model and the flash in use, then one `warning:` line for each thing it cannot do faithfully — an unmodelled register read or write (with the peripheral, the register, its address and the program counter), an 8- or 16-bit write to a peripheral register, an operation it cannot perform faithfully (a flash command the read-only flash does not implement, SHA through DMA, a clock source it cannot turn into a frequency, a software reset), an access to flash that no MMU entry maps, a CPU exception — and, at the end, the most repeated ones, the device time elapsed and the CPU clock. `--strict-mmio` turns the first of these (CPU exceptions excepted) into a stop with exit code 3, for CI. Registers that inkemu stores without modelling their effect are listed in [docs/registers-accepted-without-effect.md](docs/registers-accepted-without-effect.md).
+The device console goes to standard output. Everything inkemu has to say goes to standard error: the device, the timing model and the flash in use, then one `warning:` line for each thing it cannot do faithfully — an unmodelled register read or write (with the peripheral, the register, its address and the program counter), an 8- or 16-bit write to a peripheral register, an operation it cannot perform faithfully (a flash command other than identification and status: a program, an erase, a data read; an SPI flash transfer whose command is not 8 bits long; SHA through DMA; a SHA mode the chip does not have; a clock source it cannot turn into a frequency; a software reset), an access to flash that no MMU entry maps, a CPU exception — and, at the end, the most repeated ones, the device time elapsed and the CPU clock. `--strict-mmio` turns the first of these (CPU exceptions excepted) into a stop with exit code 3, for CI. Registers that inkemu stores without modelling their effect are listed in [docs/registers-accepted-without-effect.md](docs/registers-accepted-without-effect.md).
 
 To build the reference image yourself (it needs Docker; nothing is executed on the host), see [tools/reference-firmware/README.md](tools/reference-firmware/README.md).
 
