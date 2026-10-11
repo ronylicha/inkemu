@@ -439,4 +439,44 @@ mod tests {
         assert_ne!(run(&a).0, run(&b).0);
         assert_eq!(machine(&a).trace_hash(), None, "off unless asked for");
     }
+
+    #[test]
+    fn code_executed_from_the_flash_window_follows_a_remap() {
+        use cpu_rv32::asm::jalr;
+        const A0: u8 = 10;
+        const RA: u8 = 1;
+        const T2: u8 = 7;
+        const S0: u8 = 8;
+        // Flash page 0: `li a0, 1; ret`. Flash page 1: `li a0, 2; ret`.
+        let mut image = vec![0u8; 0x1_0008];
+        for (page, value) in [(0usize, 1), (1, 2)] {
+            for (i, word) in [addi(A0, 0, value), jalr(0, RA, 0)].into_iter().enumerate() {
+                let at = page * 0x1_0000 + 4 * i;
+                image[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let program = [
+            lui(T0, crate::periph::mmu::MMU_TABLE_BASE),
+            lui(T2, crate::memmap::FLASH_IBUS_BASE),
+            lui(S0, SRAM_DBUS_BASE),
+            sw(0, T0, 0),    // entry 0 = flash page 0
+            jalr(RA, T2, 0), // a0 = 1
+            sw(A0, S0, 0),
+            addi(T1, 0, 1),
+            sw(T1, T0, 0),   // entry 0 = flash page 1: same address, new code
+            jalr(RA, T2, 0), // a0 = 2 only if the decoded code was dropped
+            sw(A0, S0, 4),
+            HANG,
+        ];
+        let mut m = Esp32C3::with_flash(flat_rom(&program), image, &SocConfig::default()).unwrap();
+        m.run_until(Cycles(400));
+        assert_eq!(m.drain_diagnostics(), Vec::new());
+        assert_eq!(
+            (
+                bus_word(&mut m, SRAM_DBUS_BASE),
+                bus_word(&mut m, SRAM_DBUS_BASE + 4)
+            ),
+            (1, 2)
+        );
+    }
 }

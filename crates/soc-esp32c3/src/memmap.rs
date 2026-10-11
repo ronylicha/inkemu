@@ -1,5 +1,6 @@
 //! ESP32-C3 address space. Every value comes from `docs/research/esp32c3-boot-chain.md`, §A.1,
-//! which cites the ESP-IDF header named next to each constant.
+//! which cites the ESP-IDF header named next to each constant, and from `esp32c3-cache-mmu.md`
+//! §1 for the flash windows.
 
 /// Mask ROM code, I-bus (ESP-IDF `soc.h` `SOC_IROM_MASK_LOW`).
 pub const ROM_BASE: u32 = 0x4000_0000;
@@ -35,6 +36,14 @@ pub const RTC_RAM_SIZE: u32 = 0x2000;
 pub const PERIPH_BASE: u32 = 0x6000_0000;
 /// 1 MiB (`SOC_PERIPHERAL_HIGH - SOC_PERIPHERAL_LOW`).
 pub const PERIPH_SIZE: u32 = 0x10_0000;
+
+/// Flash cache window, data bus (`SOC_DRAM0_CACHE_ADDRESS_LOW`; report CM §1).
+pub const FLASH_DBUS_BASE: u32 = 0x3C00_0000;
+/// Flash cache window, instruction bus (`SOC_IRAM0_CACHE_ADDRESS_LOW`). The two windows share the
+/// 128 MMU entries: entry `i` maps `base + i * 64 KiB` of both.
+pub const FLASH_IBUS_BASE: u32 = 0x4200_0000;
+/// 8 MiB each (128 pages of 64 KiB).
+pub const FLASH_WINDOW_SIZE: u32 = 0x80_0000;
 
 /// The CPU starts executing at the first byte of the mask ROM (report §A.1, "reset PC").
 pub const RESET_PC: u32 = ROM_BASE;

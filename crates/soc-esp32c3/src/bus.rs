@@ -1,12 +1,14 @@
 //! The ESP32-C3 address space. Memory map: `docs/research/esp32c3-boot-chain.md`, §A.1.
 use crate::config::SocConfig;
-use crate::diag::{Diagnostic, Diagnostics, Direction};
+use crate::diag::{Diagnostic, Diagnostics, Direction, MappingFault};
 use crate::flash::FlashDevice;
 use crate::memmap::{
-    DROM_BASE, DROM_ROM_OFFSET, DROM_SIZE, PERIPH_BASE, PERIPH_SIZE, ROM_BASE, ROM_SIZE,
-    RTC_RAM_BASE, RTC_RAM_SIZE, SRAM_DBUS_BASE, SRAM_IBUS_BASE, SRAM_SIZE, SRAM0_BASE, SRAM0_SIZE,
+    DROM_BASE, DROM_ROM_OFFSET, DROM_SIZE, FLASH_DBUS_BASE, FLASH_IBUS_BASE, FLASH_WINDOW_SIZE,
+    PERIPH_BASE, PERIPH_SIZE, ROM_BASE, ROM_SIZE, RTC_RAM_BASE, RTC_RAM_SIZE, SRAM_DBUS_BASE,
+    SRAM_IBUS_BASE, SRAM_SIZE, SRAM0_BASE, SRAM0_SIZE,
 };
 use crate::periph::Peripherals;
+use crate::periph::mmu::{MMU_PAGE_BYTES, MmuMiss};
 use crate::rom::RomImage;
 use emu_core::{AccessKind, AccessSize, Bus, BusError, Ram, ReadOutcome};
 use svd_regs::REGISTER_BYTES;
@@ -32,6 +34,11 @@ enum Region {
     Sram(u32),
     Sram0,
     Rtc,
+    /// A flash window: the offset inside it, and whether it is the instruction-bus one.
+    Flash {
+        offset: u32,
+        instruction_bus: bool,
+    },
     Periph,
 }
 
@@ -55,6 +62,16 @@ fn locate(addr: u32, len: u32) -> Option<Region> {
         Some(Region::Sram0)
     } else if at(RTC_RAM_BASE, RTC_RAM_SIZE).is_some() {
         Some(Region::Rtc)
+    } else if let Some(offset) = at(FLASH_DBUS_BASE, FLASH_WINDOW_SIZE) {
+        Some(Region::Flash {
+            offset,
+            instruction_bus: false,
+        })
+    } else if let Some(offset) = at(FLASH_IBUS_BASE, FLASH_WINDOW_SIZE) {
+        Some(Region::Flash {
+            offset,
+            instruction_bus: true,
+        })
     } else if at(PERIPH_BASE, PERIPH_SIZE).is_some() {
         Some(Region::Periph)
     } else {
@@ -115,6 +132,55 @@ impl SocBus {
             reset_explicit: info.is_some_and(|r| r.reset_explicit),
         });
         reset
+    }
+
+    /// The flash offset one window byte maps to; a miss or a page past the chip is latched, reported, and yields `None`.
+    /// `vaddr` is the address of the access the byte belongs to: the fault registers and the diagnostic name it.
+    fn flash_offset(&mut self, vaddr: u32, window_offset: u32) -> Option<u32> {
+        let (entry, content, fault) = match self.periph.mmu.translate(window_offset) {
+            Ok(offset) if offset < self.periph.spi1.flash().size() => return Some(offset),
+            Ok(offset) => (
+                window_offset / MMU_PAGE_BYTES,
+                offset / MMU_PAGE_BYTES,
+                MappingFault::BeyondFlash,
+            ),
+            Err(MmuMiss { entry, content }) => (entry, content, MappingFault::InvalidEntry),
+        };
+        self.periph.extmem.latch_mmu_fault(vaddr, content);
+        self.diag.record(Diagnostic::FlashMapping {
+            vaddr,
+            entry,
+            content,
+            fault,
+            pc: self.pc,
+        });
+        None
+    }
+
+    /// Reads the flash **live** through the MMU table (decision D4): no cache line is modelled.
+    ///
+    /// ASSUMPTION: (decisions D4, D23) an access through an invalid entry, or to a page past the end
+    /// of the flash, returns 0. What silicon returns is not documented (report CM §6.1: "wrong
+    /// data"); 0 makes a fetch an illegal instruction, as ESP-IDF's panic handler expects. The fault
+    /// registers are latched and the access is reported; the SP1b-4 lockstep may refine the value.
+    fn flash_read(&mut self, vaddr: u32, window_offset: u32, size: AccessSize) -> ReadOutcome {
+        let len = size.bytes();
+        let mut bytes = [0u8; 4];
+        // Byte by byte: a misaligned access may straddle two 64 KiB pages, each with its own entry.
+        for (index, byte) in (0u32..len).zip(bytes.iter_mut()) {
+            // INVARIANT: `locate` checked that the whole access lies inside the window, so
+            // `window_offset + index` stays below `FLASH_WINDOW_SIZE` and cannot overflow.
+            if let Some(offset) = self.flash_offset(vaddr, window_offset + index) {
+                self.periph
+                    .spi1
+                    .flash()
+                    .read(offset, std::slice::from_mut(byte));
+            }
+        }
+        ReadOutcome {
+            value: u32::from_le_bytes(bytes) & size_mask(size),
+            stall: 0,
+        }
     }
 
     /// Turns everything a device could not do into diagnostics that name the instruction.
@@ -189,6 +255,7 @@ impl Bus for SocBus {
             Some(Region::Sram(dbus_addr)) => self.sram.read(dbus_addr, size, kind),
             Some(Region::Sram0) => self.sram0.read(addr, size, kind),
             Some(Region::Rtc) => self.rtc.read(addr, size, kind),
+            Some(Region::Flash { offset, .. }) => Ok(self.flash_read(addr, offset, size)),
             Some(Region::Periph) if kind != AccessKind::Fetch => self.mmio_read(addr, size),
             Some(Region::Periph) | None => Err(BusError::Unmapped { addr, kind }),
         }
@@ -200,6 +267,17 @@ impl Bus for SocBus {
             Some(Region::Sram0) => self.sram0.write(addr, size, value),
             Some(Region::Rtc) => self.rtc.write(addr, size, value),
             Some(Region::Periph) => self.mmio_write(addr, size, value),
+            // ASSUMPTION: (decision D4) a store to a flash window raises a store access fault, as the
+            // QEMU oracle does (CM §6.2); silicon latches the status bit, the fault is not established.
+            Some(Region::Flash {
+                instruction_bus, ..
+            }) => {
+                self.periph.extmem.latch_store(instruction_bus);
+                Err(BusError::Unmapped {
+                    addr,
+                    kind: AccessKind::Store,
+                })
+            }
             // Decision D10: a store to the mask ROM raises a store access fault.
             Some(Region::Rom(_)) | None => Err(BusError::Unmapped {
                 addr,
@@ -215,6 +293,12 @@ impl Bus for SocBus {
             Some(Region::Sram(dbus_addr)) => self.sram.page_version(dbus_addr),
             Some(Region::Sram0) => self.sram0.page_version(addr),
             Some(Region::Rtc) => self.rtc.page_version(addr),
+            // Flash content cannot change (the flash is read-only, D3); what an address shows changes
+            // with the MMU table and with the cache enables. Both counters only grow, so their sum
+            // changes whenever either does (decision D6).
+            Some(Region::Flash { .. }) => {
+                self.periph.mmu.generation() + self.periph.extmem.generation()
+            }
             Some(Region::Rom(_) | Region::Periph) | None => 0,
         }
     }
@@ -369,8 +453,8 @@ mod tests {
         let mut b = bus();
         for addr in [
             0,
-            0x3C00_0000,
-            0x4200_0000,
+            FLASH_DBUS_BASE - 4,
+            FLASH_IBUS_BASE - 4,
             SRAM_DBUS_BASE - 4,
             ROM_BASE + ROM_SIZE,
             RTC_RAM_BASE + RTC_RAM_SIZE,
@@ -626,5 +710,216 @@ mod tests {
         assert_eq!(b.periph.uart0.take_tx(), b"U");
         assert_eq!(b.periph.usb_serial_jtag.take_tx(), b"J");
         assert_eq!(b.diag.drain(), []);
+    }
+
+    /// A bus whose flash holds 0x11 at offset 0, then `page << 4 | n` patterns at the start of pages 1 and 2.
+    fn bus_with_flash(config: SocConfig) -> SocBus {
+        let mut image = vec![0u8; 0x3_0000];
+        image[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        image[0x1_0000..0x1_0004].copy_from_slice(&[0xE9, 0x06, 0x02, 0x4F]);
+        image[0x1_FFFC..0x2_0004]
+            .copy_from_slice(&[0xA0, 0xA1, 0xA2, 0xA3, 0xB0, 0xB1, 0xB2, 0xB3]);
+        let flash = NorFlash::with_image(image, config.flash).unwrap();
+        SocBus::new(
+            RomImage::from_flat(vec![0u8; ROM_SIZE as usize]).unwrap(),
+            Box::new(flash),
+            &config,
+        )
+    }
+    fn map(b: &mut SocBus, entry: u32, page: u32) {
+        b.write(crate::periph::mmu::MMU_TABLE_BASE + 4 * entry, Word, page)
+            .unwrap();
+    }
+
+    #[test]
+    fn one_entry_maps_the_same_flash_page_into_both_windows() {
+        // CM §7 T2: write entry 3 = 1; 0x3C030000 and 0x42030000 both read flash[0x10000..].
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 3, 1);
+        assert_eq!(load(&mut b, FLASH_DBUS_BASE + 0x3_0000), 0x4F02_06E9);
+        assert_eq!(load(&mut b, FLASH_IBUS_BASE + 0x3_0000), 0x4F02_06E9);
+        assert_eq!(
+            b.read(FLASH_IBUS_BASE + 0x3_0000, Half, Fetch)
+                .unwrap()
+                .value,
+            0x06E9
+        );
+        assert_eq!(
+            b.read(FLASH_DBUS_BASE + 0x3_0003, Byte, Load)
+                .unwrap()
+                .value,
+            0x4F
+        );
+        assert_eq!(b.diag.drain(), Vec::new());
+    }
+
+    #[test]
+    fn a_remap_is_visible_at_once() {
+        // CM §7 T3: the window is a live view (no cache contents, decision D4).
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 0, 1);
+        assert_eq!(load(&mut b, FLASH_DBUS_BASE), 0x4F02_06E9);
+        map(&mut b, 0, 0);
+        assert_eq!(load(&mut b, FLASH_DBUS_BASE), 0x4433_2211);
+    }
+
+    #[test]
+    fn what_the_image_does_not_hold_reads_erased() {
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 0, 0x80);
+        assert_eq!(
+            load(&mut b, FLASH_DBUS_BASE),
+            0xFFFF_FFFF,
+            "page 0x80 = offset 8 MiB, inside the 16 MiB chip"
+        );
+    }
+
+    #[test]
+    fn invalid_entry_reads_zero_latches_the_fault_and_is_reported() {
+        let mut b = bus_with_flash(SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        });
+        b.set_pc(0x4004_a186);
+        let vaddr = FLASH_DBUS_BASE + 0x5_0010;
+        assert_eq!(load(&mut b, vaddr), 0);
+        let expected = Diagnostic::FlashMapping {
+            vaddr,
+            entry: 5,
+            content: 0x100,
+            fault: crate::diag::MappingFault::InvalidEntry,
+            pc: 0x4004_a186,
+        };
+        assert_eq!(b.diag.drain(), vec![expected.clone()]);
+        assert_eq!(b.diag.take_violation(), Some(expected));
+        let st = svd_regs::esp32c3::addr("EXTMEM", "CACHE_ILG_INT_ST");
+        assert_eq!(load(&mut b, st), 1 << 5);
+        assert_eq!(
+            load(
+                &mut b,
+                svd_regs::esp32c3::addr("EXTMEM", "CACHE_MMU_FAULT_VADDR")
+            ),
+            vaddr
+        );
+        assert_eq!(
+            b.read(FLASH_IBUS_BASE + 0x5_0000, Half, Fetch)
+                .unwrap()
+                .value,
+            0,
+            "a fetch decodes 0: illegal instruction"
+        );
+    }
+
+    #[test]
+    fn page_beyond_the_flash_is_reported() {
+        let small = SocConfig {
+            flash: crate::flash::FlashConfig {
+                size: 1 << 20,
+                ..crate::flash::FlashConfig::default()
+            },
+            ..SocConfig::default()
+        };
+        let flash = NorFlash::with_image(vec![0xAB; 16], small.flash).unwrap();
+        let mut b = SocBus::new(
+            RomImage::from_flat(vec![0u8; ROM_SIZE as usize]).unwrap(),
+            Box::new(flash),
+            &small,
+        );
+        map(&mut b, 0, 0x10); // 1 MiB: the first page past a 1 MiB chip
+        assert_eq!(load(&mut b, FLASH_DBUS_BASE), 0);
+        assert!(matches!(
+            b.diag.drain().as_slice(),
+            [Diagnostic::FlashMapping {
+                entry: 0,
+                content: 0x10,
+                fault: crate::diag::MappingFault::BeyondFlash,
+                ..
+            }]
+        ));
+        map(&mut b, 0, 0x0F);
+        assert_eq!(
+            load(&mut b, FLASH_DBUS_BASE),
+            0xFFFF_FFFF,
+            "the last page of the chip is fine"
+        );
+    }
+
+    #[test]
+    fn load_straddling_two_pages_reads_each_byte_through_its_own_entry() {
+        // The machine performs misaligned loads; one that crosses a 64 KiB page uses two entries.
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 0, 1); // window page 0 -> flash page 1, ends with A0 A1 A2 A3
+        map(&mut b, 1, 0); // window page 1 -> flash page 0, starts with 11 22 33 44
+        assert_eq!(load(&mut b, FLASH_DBUS_BASE + 0xFFFE), 0x2211_A3A2);
+        map(&mut b, 1, 2); // -> flash page 2, starts with B0 B1 B2 B3
+        assert_eq!(load(&mut b, FLASH_DBUS_BASE + 0xFFFE), 0xB1B0_A3A2);
+    }
+
+    #[test]
+    fn access_straddling_the_end_of_the_window_is_unmapped() {
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 127, 0);
+        let last = FLASH_DBUS_BASE + FLASH_WINDOW_SIZE - 4;
+        assert!(b.read(last, Word, Load).is_ok());
+        for addr in [
+            last + 2,
+            FLASH_DBUS_BASE + FLASH_WINDOW_SIZE,
+            FLASH_IBUS_BASE + FLASH_WINDOW_SIZE,
+        ] {
+            assert_eq!(
+                b.read(addr, Word, Load),
+                Err(BusError::Unmapped { addr, kind: Load }),
+                "CM §6.2: load at 0x3C800000 faults"
+            );
+        }
+    }
+
+    #[test]
+    fn a_store_to_a_window_faults_and_is_latched() {
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 0, 0);
+        for (addr, bit) in [(FLASH_DBUS_BASE, 1u32 << 5), (FLASH_IBUS_BASE, 1 << 1)] {
+            assert_eq!(
+                b.write(addr, Word, 0),
+                Err(BusError::Unmapped { addr, kind: Store })
+            );
+            let st = svd_regs::esp32c3::addr("EXTMEM", "CORE0_ACS_CACHE_INT_ST");
+            assert_ne!(load(&mut b, st) & bit, 0);
+        }
+        assert_eq!(
+            load(&mut b, FLASH_DBUS_BASE),
+            0x4433_2211,
+            "the flash did not change"
+        );
+    }
+
+    #[test]
+    fn mapping_and_cache_enable_writes_change_the_version_of_both_windows() {
+        let mut b = bus_with_flash(SocConfig::default());
+        let versions = |b: &SocBus| {
+            (
+                b.page_version(FLASH_IBUS_BASE + 0x2000),
+                b.page_version(FLASH_DBUS_BASE + 0x7F_0000),
+            )
+        };
+        let start = versions(&b);
+        assert_eq!(start.0, start.1);
+        map(&mut b, 0, 0);
+        let mapped = versions(&b);
+        assert_ne!(mapped, start);
+        b.write(svd_regs::esp32c3::addr("EXTMEM", "ICACHE_CTRL"), Word, 1)
+            .unwrap();
+        let enabled = versions(&b);
+        assert_ne!(enabled, mapped);
+        b.write(svd_regs::esp32c3::addr("EXTMEM", "ICACHE_CTRL1"), Word, 0)
+            .unwrap();
+        assert_ne!(versions(&b), enabled);
+        let sram = b.page_version(SRAM_IBUS_BASE);
+        map(&mut b, 1, 1);
+        assert_eq!(
+            b.page_version(SRAM_IBUS_BASE),
+            sram,
+            "RAM versions are untouched"
+        );
     }
 }
