@@ -43,7 +43,7 @@ const INT_ENA_W1TS: u32 = reg("INT_ENA_RTC_W1TS");
 const INT_ENA_W1TC: u32 = reg("INT_ENA_RTC_W1TC");
 /// `INT_RAW_RTC` bit 3: the RTC watchdog (`rwdt_ll_set_intr_enable`,
 /// `IDF:hal/esp32c3/include/hal/rwdt_ll.h:297`); bit 15: the feed request of the super watchdog
-/// (`RTC_CNTL_SWD_INT_RAW`, `rtc_cntl_reg.h:639`).
+/// (`RTC_CNTL_SWD_INT_RAW`, `rtc_cntl_reg.h:637`).
 const INT_WDT: u32 = 1 << 3;
 const INT_SWD: u32 = 1 << 15;
 const CLK_CONF: u32 = reg("CLK_CONF");
@@ -79,6 +79,11 @@ const WDT_TIMEOUT_RESET: [u32; WDT_STAGES] = [200_000, 80_000, 0xFFF, 0xFFF];
 /// SVD gives 0 for this register and is wrong on this point.
 const WDT_KEY: u32 = 0x50D8_3AA1;
 const WDT_STAGES: usize = 4;
+/// The most iterations one evaluation of the stage walk takes: four expiries, the reduction of
+/// the count modulo a turn of the four stages, at most four more expiries, and the wait.
+const WALK_STEPS: usize = 2 * WDT_STAGES + 1;
+/// `EFUSE_WDT_DELAY_SEL` is two bits wide.
+const WDT_DELAY_SEL_MASK: u32 = 0b11;
 /// `WDTCONFIG0`: bit 31 `EN` (`rwdt_ll_enable`, `rwdt_ll.h:66`), three bits per stage from
 /// [30:28] for stage 0 to [21:19] for stage 3 (`rwdt_ll_config_stage`, line 113), bit 12
 /// `FLASHBOOT_MOD_EN` (`rwdt_ll_set_flashboot_en`, line 196). The rest is stored.
@@ -253,7 +258,7 @@ impl RtcCntl {
     pub fn new(flash_boot: bool, wdt_delay_sel: u32, now: Cycles) -> RtcCntl {
         let mut rtc = RtcCntl {
             flash_boot,
-            wdt_delay_sel,
+            wdt_delay_sel: wdt_delay_sel & WDT_DELAY_SEL_MASK,
             reset_cause: CAUSE_POWER_ON,
             reset_state_other: 0,
             store: [0; STORE_COUNT],
@@ -346,13 +351,18 @@ impl RtcCntl {
     /// The timeout of a stage, in slow-clock cycles. Stage 0 lasts `WDTCONFIG1 << (1 + delay)`,
     /// which is why `rwdt_ll_config_stage` writes its value shifted the other way (`rwdt_ll.h:119`;
     /// TRM §12.2.2.2; TW §C.3).
+    ///
+    /// ASSUMPTION: a stage lasts at least one count, so a timeout of 0 counts as 1: what a stage
+    /// timeout of 0 does on silicon is not documented. Programming 0 on a chip and timing the
+    /// reset settles it.
     fn stage_timeout(&self, stage: usize) -> u64 {
         let written = u64::from(self.wdt_timeout[stage]);
-        if stage == 0 {
+        let counted = if stage == 0 {
             written << (1 + self.wdt_delay_sel)
         } else {
             written
-        }
+        };
+        counted.max(1)
     }
 
     /// Whether the super watchdog can reset the chip.
@@ -369,15 +379,12 @@ impl RtcCntl {
     }
 
     /// Raises what is due at the present time, then asks to be woken for the next deadline.
-    fn evaluate(&mut self, ctx: &mut Ctx) {
+    fn evaluate(&mut self, ctx: &mut Ctx, from_register_write: bool) {
         let now = ctx.now();
-        self.wake.called(now);
-        let mut earliest: Option<Cycles> = None;
-        let mut sooner = |at: Option<Cycles>| {
-            if let Some(at) = at {
-                earliest = Some(earliest.map_or(at, |e: Cycles| e.min(at)));
-            }
-        };
+        // The deadline is worked out again at every call: a wake-up left by a timeout that was
+        // raised, a feed or a watchdog that was stopped would be a call for nothing, and one that
+        // is later than the new instant would not be replaced.
+        self.wake.cancel(ctx);
 
         let enabled = self.wdt_config0 & WDT_EN != 0 || self.flash_boot_protection();
         if enabled && !self.wdt_enabled {
@@ -388,60 +395,113 @@ impl RtcCntl {
         }
         self.wdt_enabled = enabled;
         self.wdt.run(enabled, now);
-        // A long sleep can cover several stages: each one starts when the one before it ends.
-        while self.wdt.is_running() {
-            let timeout = self.stage_timeout(self.wdt_stage);
-            let count = self.wdt.value(now);
-            // ASSUMPTION: a stage expires when the count has reached its timeout, not one count
-            // after. A real chip's first expiry, timed against a known feed, settles it.
-            if count < timeout {
-                sooner(self.wdt.instant_in(timeout - count, now));
-                break;
-            }
-            let action = self.stage_action(self.wdt_stage);
-            self.wdt.set(count - timeout, now);
-            self.wdt_stage = (self.wdt_stage + 1) % WDT_STAGES;
-            match action {
-                ACTION_INTERRUPT => self.int_raw |= INT_WDT,
-                ACTION_RESET_CPU => ctx.request_reset(ResetCause::RtcWatchdogCpu),
-                ACTION_RESET_SYSTEM => ctx.request_reset(ResetCause::RtcWatchdogCore),
-                ACTION_RESET_RTC => ctx.request_reset(ResetCause::RtcWatchdogSystem),
-                // An "off" stage is waited for and does nothing.
-                _ => {}
-            }
-        }
-
-        if self.swd_armed() {
-            let fed_at = *self.swd_fed_at.get_or_insert(now);
-            let waited = now.get().saturating_sub(fed_at.get());
-            if waited >= SWD_TIMEOUT {
-                self.swd_conf |= SWD_RESET_FLAG;
-                self.swd_fed_at = None;
-                ctx.request_reset(ResetCause::SuperWatchdog);
-            } else if waited >= SWD_FEED_REQUEST {
-                self.int_raw |= INT_SWD;
-                sooner(Some(fed_at + SWD_TIMEOUT));
-            } else {
-                sooner(Some(fed_at + SWD_FEED_REQUEST));
-            }
+        let mut earliest = if self.wdt.is_running() {
+            self.walk_stages(ctx, now, from_register_write)
         } else {
-            self.swd_fed_at = None;
+            None
+        };
+        if let Some(at) = self.step_super_watchdog(ctx, now) {
+            earliest = Some(earliest.map_or(at, |e| e.min(at)));
         }
-
         if let Some(at) = earliest {
             self.wake.arm(ctx, at, Event::RtcWatchdog);
         }
         self.drive(ctx);
     }
 
-    /// The feed request of the super watchdog reads in `SWD_CONF` while its interrupt is raw.
+    /// Lets the RTC watchdog go through the stages whose timeout the count has reached, and returns
+    /// the instant of the next expiry. The walk follows these rules:
+    ///
+    /// 1. A stage lasts at least one count (see [`RtcCntl::stage_timeout`]).
+    /// 2. A write that leaves the count at or past the timeout of the current stage expires that
+    ///    stage at the write, and the next stage counts from 0 (TW §B.3: "the counter returns to
+    ///    0 and the next stage becomes current"): the first expiry of such a call carries nothing.
+    /// 3. An expiry found because time passed carries the counts elapsed since the expiry into the
+    ///    next stage (`count - timeout`). The fraction of a count is lost at each transition: at
+    ///    most one count per transition, and deterministic.
+    /// 4. The walk is bounded whatever firmware wrote: after four expiries in one call every stage
+    ///    has acted once, so the remaining count is reduced modulo the sum of the four timeouts
+    ///    (whole turns change neither the stage nor which actions fired), which leaves at most four
+    ///    more expiries. One call costs at most [`WALK_STEPS`] iterations.
+    /// 5. The walk goes on after a reset request: the reset it asks for does not stop the RTC
+    ///    watchdog, and [`Ctx::request_reset`] keeps the first request, the earliest in time.
+    fn walk_stages(
+        &mut self,
+        ctx: &mut Ctx,
+        now: Cycles,
+        from_register_write: bool,
+    ) -> Option<Cycles> {
+        let timeouts: [u64; WDT_STAGES] = std::array::from_fn(|stage| self.stage_timeout(stage));
+        let turn: u64 = timeouts.iter().sum();
+        let mut count = self.wdt.value(now);
+        let mut carries = !from_register_write;
+        let mut expiries = 0;
+        for _ in 0..WALK_STEPS {
+            let timeout = timeouts[self.wdt_stage];
+            // A stage expires when the count is at or past its timeout, not only when it equals
+            // it (decision E27): the difference shows when a timeout is lowered below the count
+            // (TW §I question 5). ASSUMPTION: lowering a timeout below the count on a chip, and
+            // seeing whether the stage fires, settles it.
+            if count < timeout {
+                return self.wdt.instant_in(timeout - count, now);
+            }
+            let action = self.stage_action(self.wdt_stage);
+            count = if carries { count - timeout } else { 0 };
+            carries = true;
+            self.wdt_stage = (self.wdt_stage + 1) % WDT_STAGES;
+            expiries += 1;
+            if expiries == WDT_STAGES {
+                count %= turn;
+            }
+            self.wdt.set(count, now);
+            match action {
+                ACTION_INTERRUPT => self.int_raw |= INT_WDT,
+                // ASSUMPTION: action 2 resets the CPU whatever `PROCPU_RESET_EN` (`WDTCONFIG0` bit
+                // 11) holds (TW §D.5, §I question 5). Clearing the bit on a chip whose stage
+                // resets the CPU, and seeing whether the CPU still resets, settles it.
+                ACTION_RESET_CPU => ctx.request_reset(ResetCause::RtcWatchdogCpu),
+                ACTION_RESET_SYSTEM => ctx.request_reset(ResetCause::RtcWatchdogCore),
+                ACTION_RESET_RTC => ctx.request_reset(ResetCause::RtcWatchdogSystem),
+                // ASSUMPTION: an "off" stage is waited for, and does nothing (TW §B.3, §I question
+                // 5). A chip with stage 0 off and stage 1 resetting, timed, settles it.
+                _ => {}
+            }
+        }
+        // INVARIANT: unreachable. After the reduction the count is below the sum of the four
+        // timeouts, so at most four more stages expire and the walk returns above. A wake-up one
+        // count away keeps the watchdog alive if that were ever wrong.
+        self.wdt.instant_in(1, now)
+    }
+
+    /// The super watchdog at the present time; returns the instant it next needs a call.
+    fn step_super_watchdog(&mut self, ctx: &mut Ctx, now: Cycles) -> Option<Cycles> {
+        if !self.swd_armed() {
+            self.swd_fed_at = None;
+            return None;
+        }
+        let fed_at = *self.swd_fed_at.get_or_insert(now);
+        let waited = now.get().saturating_sub(fed_at.get());
+        if waited >= SWD_TIMEOUT {
+            self.swd_conf |= SWD_RESET_FLAG;
+            self.swd_fed_at = None;
+            ctx.request_reset(ResetCause::SuperWatchdog);
+            None
+        } else if waited >= SWD_FEED_REQUEST {
+            self.int_raw |= INT_SWD;
+            Some(fed_at + SWD_TIMEOUT)
+        } else {
+            Some(fed_at + SWD_FEED_REQUEST)
+        }
+    }
+
+    /// Drives the `RTC_CORE` source to the level of the enabled RTC interrupts.
     fn drive(&self, ctx: &mut Ctx) {
         ctx.irq(RTC_CORE, self.int_raw & self.int_ena != 0);
     }
 
     /// The device time of a wake-up has come, or the block was just built or reset.
     pub(crate) fn wake(&mut self, ctx: &mut Ctx) {
-        self.evaluate(ctx);
+        self.evaluate(ctx, false);
     }
 
     /// A write to a watchdog register other than the key: dropped unless the key is in place.
@@ -459,7 +519,7 @@ impl RtcCntl {
             }
             _ => self.wdt_timeout[((offset - WDTCONFIG1) / 4) as usize] = value,
         }
-        self.evaluate(ctx);
+        self.evaluate(ctx, true);
     }
 
     fn write_super_watchdog(&mut self, ctx: &mut Ctx, value: u32) {
@@ -474,7 +534,7 @@ impl RtcCntl {
             self.swd_fed_at = Some(ctx.now());
             self.int_raw &= !INT_SWD;
         }
-        self.evaluate(ctx);
+        self.evaluate(ctx, false);
     }
 }
 
@@ -497,6 +557,8 @@ impl Peripheral<Ctx> for RtcCntl {
             WDTCONFIG0 => self.wdt_config0,
             WDTWPROTECT => self.wdt_key,
             SWD_CONF => {
+                // The feed request of the super watchdog reads in `SWD_CONF` while its interrupt
+                // is raw.
                 let feed_request = if self.int_raw & INT_SWD == 0 {
                     0
                 } else {
@@ -564,7 +626,7 @@ impl Peripheral<Ctx> for RtcCntl {
             }
             FIB_SEL => {
                 let known = self.config.write(offset, value);
-                self.evaluate(ctx);
+                self.evaluate(ctx, false);
                 return known;
             }
             // Read-only: the write is reported as unmodelled.
@@ -895,12 +957,25 @@ mod tests {
         assert_eq!(rtc.read(ctx, SWD_WPROTECT), Some(0x8F1D_312A));
         after(ctx, &mut rtc, 10 * SECOND);
         assert_eq!(ctx.take_reset(), None);
-        // `bootloader_super_wdt_auto_feed`, then the clearing of FIB_SEL bit 2 and BYPASS_RST.
+        // The bootloader's order: `bootloader_ana_super_wdt_reset_config(true)` hands the reset to
+        // software (`bootloader_esp32c3.c:99`: `BYPASS_RST` clear, `FIB_SEL` bit 2 clear), and
+        // `bootloader_super_wdt_auto_feed` sets `AUTO_FEED_EN` later (`:133`; TW §C.4).
+        rtc.write(ctx, FIB_SEL, 0b011);
+        assert_eq!(
+            ctx.next_wake(),
+            Some(ctx.now() + SWD_FEED_REQUEST),
+            "armed from the first write"
+        );
+        // The window between the two: the super watchdog counts, and has not asked yet.
+        after(ctx, &mut rtc, SECOND / 2);
+        assert_eq!(rtc.read(ctx, INT_RAW), Some(0), "no feed request yet");
+        assert_eq!(ctx.take_reset(), None);
         rtc.write(ctx, SWD_WPROTECT, SWD_KEY);
         rtc.write(ctx, SWD_CONF, 0x04B0_0000 | SWD_AUTO_FEED_EN);
         rtc.write(ctx, SWD_WPROTECT, 0);
-        rtc.write(ctx, FIB_SEL, 0b011);
+        assert_eq!(ctx.next_wake(), None, "auto-fed: nothing left to wait for");
         after(ctx, &mut rtc, 10 * SECOND);
+        assert_eq!(rtc.read(ctx, INT_RAW), Some(0), "no feed request after");
         assert_eq!(ctx.take_reset(), None);
         rtc.write(ctx, SWD_CONF, 0x04B0_0000);
         assert_eq!(
@@ -940,6 +1015,193 @@ mod tests {
         assert_eq!(rtc.read(ctx, SWD_CONF), Some(0x04B0_0000 | SWD_RESET_FLAG));
         rtc.write(ctx, SWD_CONF, 0x04B0_0000 | SWD_RST_FLAG_CLR);
         assert_eq!(rtc.read(ctx, SWD_CONF), Some(0x04B0_0000));
+    }
+
+    /// Writes the four stage timeouts as `WDTCONFIG1..4` take them (stage 0 is halved by the
+    /// eFuse rule when it is counted), then `WDTCONFIG0`.
+    fn program_watchdog(ctx: &mut Ctx, rtc: &mut RtcCntl, timeouts: [u32; 4], config0: u32) {
+        for (i, timeout) in timeouts.into_iter().enumerate() {
+            assert!(rtc.write(ctx, WDTCONFIG1 + 4 * u32::try_from(i).unwrap(), timeout));
+        }
+        assert!(rtc.write(ctx, WDTCONFIG0, config0));
+    }
+
+    /// Cycles of the time base one stage-timeout of `counts` slow-clock cycles lasts, as the model
+    /// counts them: 20 000 / 17 cycles per count, rounded up.
+    fn cycles_of(counts: u64) -> u64 {
+        (counts * 20_000).div_ceil(17)
+    }
+
+    #[test]
+    fn stage_timeouts_of_zero_last_one_count_and_the_stage_walk_terminates() {
+        // ASSUMPTION (rule 1): a stage lasts at least one count. All four timeouts at 0, enabled.
+        let ctx = &mut Ctx::default();
+        let mut rtc = RtcCntl::new(false, 0, ctx.now());
+        rtc.wake(ctx);
+        program_watchdog(ctx, &mut rtc, [0; 4], WDT_EN);
+        assert_eq!(rtc.wdt_stage, 0);
+        assert_eq!(
+            ctx.next_wake(),
+            Some(Cycles(cycles_of(1))),
+            "1 count: 1177 cycles"
+        );
+        after(ctx, &mut rtc, cycles_of(1));
+        assert_eq!(
+            rtc.wdt_stage, 1,
+            "one stage per count, the fraction of a count is lost"
+        );
+        assert_eq!(ctx.next_wake(), Some(Cycles(2 * cycles_of(1))));
+        // A very late call walks the four stages at most twice, whatever the registers hold.
+        after(ctx, &mut rtc, 3_600 * SECOND);
+        assert!(rtc.wdt_stage < WDT_STAGES);
+        assert!(ctx.next_wake().is_some());
+    }
+
+    #[test]
+    fn lowering_the_timeouts_after_a_long_count_expires_one_stage_at_the_write() {
+        // Stage 0 counts up to 0xFFFF_FFFF << 1 = 8 589 934 590 counts (17.5 h at 136 kHz); one
+        // hour of device time is 3 600 * 136 000 = 489 600 000 counts. The write of stage 0's
+        // timeout (1 << 1 = 2 counts) leaves the count past it: stage 0 expires at that write and
+        // stage 1 counts from 0 (TW §B.3). The other writes find the count at 0, below 1: nothing
+        // more happens. Stage 1 is current, its wake-up one count after the writes.
+        let ctx = &mut Ctx::default();
+        let mut rtc = RtcCntl::new(false, 0, ctx.now());
+        rtc.wake(ctx);
+        program_watchdog(ctx, &mut rtc, [0xFFFF_FFFF, 80_000, 0xFFF, 0xFFF], WDT_EN);
+        after(ctx, &mut rtc, 3_600 * SECOND);
+        for (i, offset) in [WDTCONFIG1, WDTCONFIG1 + 4, WDTCONFIG1 + 8, WDTCONFIG4]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(rtc.write(ctx, offset, 1), "write {i}");
+        }
+        assert_eq!(rtc.wdt_stage, 1);
+        assert_eq!(ctx.next_wake(), Some(ctx.now() + cycles_of(1)));
+    }
+
+    #[test]
+    fn a_long_sleep_over_tiny_stages_is_walked_in_bounded_steps() {
+        // Stage 0 lasts 1 << 1 = 2 counts, stages 1 to 3 one count each: a turn is 5 counts.
+        // The wake-up due after 2 counts is delivered an hour late, plus 2 000 cycles (1.7
+        // counts): the count is 489 600 000 + 1 = 489 600 001. Four expiries take 2 + 1 + 1 + 1,
+        // leaving 489 599 996, which is 1 modulo 5. Whole turns change nothing, so the walk goes on
+        // from stage 0 with a count of 1: the interrupt of stage 0 is raised, and the next
+        // wake-up is one count (1 177 cycles) away.
+        let ctx = &mut Ctx::default();
+        let mut rtc = RtcCntl::new(false, 0, ctx.now());
+        rtc.wake(ctx);
+        program_watchdog(ctx, &mut rtc, [1; 4], WDT_EN | (ACTION_INTERRUPT << 28));
+        after(ctx, &mut rtc, 3_600 * SECOND + 2_000);
+        assert_eq!(rtc.read(ctx, INT_RAW), Some(INT_WDT));
+        assert_eq!(rtc.wdt_stage, 0);
+        assert_eq!(ctx.next_wake(), Some(ctx.now() + cycles_of(1)));
+    }
+
+    #[test]
+    fn a_timeout_lowered_below_the_count_fires_at_the_write_and_the_next_stage_starts_from_0() {
+        // Stage 0: interrupt after 136 000 counts (1 s), stage 1: reset the CPU after 80 000.
+        let ctx = &mut Ctx::default();
+        let mut rtc = RtcCntl::new(false, 0, ctx.now());
+        rtc.wake(ctx);
+        program_watchdog(
+            ctx,
+            &mut rtc,
+            [68_000, 80_000, 0xFFF, 0xFFF],
+            WDT_EN | (ACTION_INTERRUPT << 28) | (ACTION_RESET_CPU << 25),
+        );
+        // Half a second: 68 000 counts. Stage 0 is lowered to 34 000 << 1 = 68 000 counts: at or
+        // past the timeout, so it expires at the write (decision E27).
+        after(ctx, &mut rtc, SECOND / 2);
+        assert_eq!(rtc.read(ctx, INT_RAW), Some(0));
+        rtc.write(ctx, WDTCONFIG1, 34_000);
+        assert_eq!(rtc.read(ctx, INT_RAW), Some(INT_WDT));
+        assert_eq!(rtc.wdt_stage, 1);
+        assert_eq!(ctx.take_reset(), None);
+        let started = ctx.now();
+        assert_eq!(ctx.next_wake(), Some(started + cycles_of(80_000)), "from 0");
+        // 8 500 counts into stage 1, its timeout goes from 80 000 to 40 000: still above the
+        // count, nothing fires, and the wake-up moves up to 40 000 counts from the start.
+        after(ctx, &mut rtc, 10_000_000);
+        rtc.write(ctx, WDTCONFIG1 + 4, 40_000);
+        assert_eq!(ctx.take_reset(), None);
+        assert_eq!(rtc.wdt_stage, 1);
+        assert_eq!(ctx.next_wake(), Some(started + cycles_of(40_000)));
+    }
+
+    #[test]
+    fn the_stage_walk_goes_0_1_2_3_0_and_an_off_stage_is_waited_for_and_does_nothing() {
+        // Stage 0 interrupt, stage 1 off, stage 2 reset the CPU, stage 3 reset the RTC; each lasts
+        // 136 000 counts (1 s: stage 0 is written halved).
+        let ctx = &mut Ctx::default();
+        let mut rtc = RtcCntl::new(false, 0, ctx.now());
+        rtc.wake(ctx);
+        let config0 =
+            WDT_EN | (ACTION_INTERRUPT << 28) | (ACTION_RESET_CPU << 22) | (ACTION_RESET_RTC << 19);
+        program_watchdog(ctx, &mut rtc, [68_000, 136_000, 136_000, 136_000], config0);
+        after(ctx, &mut rtc, SECOND);
+        assert_eq!(rtc.read(ctx, INT_RAW), Some(INT_WDT));
+        assert_eq!((rtc.wdt_stage, ctx.take_reset()), (1, None));
+        rtc.write(ctx, INT_CLR, INT_WDT);
+        after(ctx, &mut rtc, SECOND);
+        assert_eq!(rtc.read(ctx, INT_RAW), Some(0), "the off stage did nothing");
+        assert_eq!((rtc.wdt_stage, ctx.take_reset()), (2, None));
+        after(ctx, &mut rtc, SECOND);
+        assert_eq!(rtc.wdt_stage, 3);
+        assert_eq!(ctx.take_reset(), Some(ResetCause::RtcWatchdogCpu));
+        after(ctx, &mut rtc, SECOND);
+        assert_eq!(rtc.wdt_stage, 0, "and round again");
+        assert_eq!(ctx.take_reset(), Some(ResetCause::RtcWatchdogSystem));
+        after(ctx, &mut rtc, SECOND);
+        assert_eq!(rtc.read(ctx, INT_RAW), Some(INT_WDT));
+        assert_eq!(rtc.wdt_stage, 1);
+    }
+
+    #[test]
+    fn an_expiry_delivered_late_carries_the_counts_since_the_deadline_into_the_next_stage() {
+        // Stage 0 lasts 136 000 counts (160 000 000 cycles), stage 1 80 000. The wake-up is
+        // delivered 5 883 cycles late: 5 counts (5 883 * 17 / 20 000 = 5.0006). Stage 1 has 5
+        // counts behind it when it starts, and its wake-up is that much earlier than 80 000 counts
+        // (94 117 648 cycles) away: 79 995 counts, 94 111 765 cycles.
+        let ctx = &mut Ctx::default();
+        let mut rtc = RtcCntl::new(false, 0, ctx.now());
+        rtc.wake(ctx);
+        program_watchdog(ctx, &mut rtc, [68_000, 80_000, 0xFFF, 0xFFF], WDT_EN);
+        assert_eq!(ctx.next_wake(), Some(Cycles(SECOND)));
+        after(ctx, &mut rtc, SECOND + 5_883);
+        assert_eq!(rtc.wdt_stage, 1);
+        assert_eq!(cycles_of(80_000), 94_117_648);
+        assert_eq!(cycles_of(79_995), 94_111_765);
+        assert_eq!(ctx.next_wake(), Some(Cycles(SECOND + 5_883 + 94_111_765)));
+    }
+
+    #[test]
+    fn stage_0_is_stretched_by_the_efuse_delay_and_the_delay_is_masked_to_its_two_bits() {
+        // The flash-boot protection counts `WDTCONFIG1` (200 000) << (1 + delay) slow-clock
+        // cycles: delay 1 is 800 000 counts, 800 000 * 20 000 / 17 = 941 176 470.6 -> 941 176 471
+        // cycles; delay 3 is 3 200 000 counts -> 3 764 705 882.4 -> 3 764 705 883 cycles. A
+        // delay with higher bits set is read through its two low bits.
+        for (delay, cycles) in [
+            (1, 941_176_471),
+            (3, 3_764_705_883),
+            (u32::MAX, 3_764_705_883),
+        ] {
+            let ctx = &mut Ctx::default();
+            let mut rtc = RtcCntl::new(true, delay, ctx.now());
+            rtc.wake(ctx);
+            assert_eq!(ctx.next_wake(), Some(Cycles(cycles)), "delay {delay:#x}");
+        }
+    }
+
+    #[test]
+    fn a_stopped_watchdog_leaves_no_wake_up_behind() {
+        let ctx = &mut Ctx::default();
+        let mut rtc = RtcCntl::new(false, 0, ctx.now());
+        rtc.wake(ctx);
+        assert_eq!(ctx.next_wake(), None, "nothing runs out of reset here");
+        rtc.write(ctx, WDTCONFIG0, WDT_EN);
+        assert!(ctx.next_wake().is_some());
+        rtc.write(ctx, WDTCONFIG0, 0);
+        assert_eq!(ctx.next_wake(), None);
     }
 
     #[test]

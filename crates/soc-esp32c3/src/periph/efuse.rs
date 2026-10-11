@@ -107,7 +107,7 @@ impl Efuse {
     }
 
     /// `WDT_DELAY_SEL`, `RD_REPEAT_DATA1[17:16]`: the multiplier of the stage 0 timeout of the RTC
-    /// watchdog (`IDF:hal/esp32c3/include/hal/rwdt_ll.h:119`; report TW §C.2).
+    /// watchdog (`IDF:hal/esp32c3/include/hal/rwdt_ll.h:119`; report TW §C.3).
     #[must_use]
     pub fn wdt_delay_sel(&self) -> u32 {
         let word = self
@@ -255,6 +255,34 @@ mod tests {
             0,
             "WDT_DELAY_SEL"
         );
+    }
+
+    #[test]
+    fn the_watchdog_delay_is_bits_17_and_16_of_repeat_data_1() {
+        let mut efuse = Efuse::new(ChipRevision::V0_3);
+        assert_eq!(efuse.wdt_delay_sel(), 0, "a production chip");
+        // Each word has its neighbours set the other way round from the field, so that a wrong
+        // shift or mask reads another value.
+        for (word, delay) in [
+            (0x0000_0000, 0),
+            (0x0001_0000, 1),
+            (0x0002_0000, 2),
+            (0x0003_0000, 3),
+            (0xFFFC_FFFF, 0),
+            (0xFFFD_FFFF, 1),
+            (0xFFFE_FFFF, 2),
+            (0xFFFF_FFFF, 3),
+            (0x0000_FFFF, 0),
+            (0xFFFC_0000, 0),
+        ] {
+            let entry = efuse
+                .read_mirror
+                .iter_mut()
+                .find(|(offset, _)| *offset == RD_REPEAT_DATA1)
+                .expect("RD_REPEAT_DATA1 is in the mirror");
+            entry.1 = word;
+            assert_eq!(efuse.wdt_delay_sel(), delay, "{word:#010x}");
+        }
     }
 
     #[test]

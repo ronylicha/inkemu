@@ -95,6 +95,14 @@ impl Deadline {
         }
     }
 
+    /// Withdraws the wake-up, if any: the device has nothing to be called for, or is about to
+    /// work out its next deadline again from scratch.
+    pub fn cancel(&mut self, ctx: &mut Ctx) {
+        if let Some((_, id)) = self.armed.take() {
+            ctx.cancel(id);
+        }
+    }
+
     /// Forgets a wake-up whose instant has come: the device is being called for it.
     pub fn called(&mut self, now: Cycles) {
         if self.armed.is_some_and(|(due, _)| due <= now) {
@@ -487,6 +495,22 @@ mod tests {
             ctx.next_wake(),
             Some(Cycles(900)),
             "once called, the deadline arms again"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_deadline_leaves_no_call_and_arms_again_at_any_instant() {
+        let mut ctx = Ctx::default();
+        let mut deadline = Deadline::default();
+        deadline.arm(&mut ctx, Cycles(500), FIRST);
+        deadline.cancel(&mut ctx);
+        assert_eq!(ctx.next_wake(), None);
+        deadline.cancel(&mut ctx);
+        deadline.arm(&mut ctx, Cycles(900), FIRST);
+        assert_eq!(
+            ctx.next_wake(),
+            Some(Cycles(900)),
+            "later than the call withdrawn"
         );
     }
 
