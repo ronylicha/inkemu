@@ -469,8 +469,9 @@ impl Peripherals {
     ///
     /// - Every level resets the CPU: the debug assistant records its PC, the permission registers
     ///   return to their reset values.
-    /// - A core reset rebuilds every digital peripheral. The flash chip, the random sequence and
-    ///   the console bytes that already left are no register: they stay.
+    /// - A core reset rebuilds every digital peripheral. The flash chip, the random sequence, the
+    ///   analog registers behind regi2c and the console bytes that already left are no digital
+    ///   register: they stay.
     /// - A system reset also returns `RTC_CNTL` to its reset values and clears the recorded PC.
     ///
     /// ASSUMPTION: a CPU reset leaves the interrupt controller as it is. The TRM lists only the PMS
@@ -478,6 +479,12 @@ impl Peripherals {
     /// boot (`ROM3:boot_prepare`, trace F1), which hides the difference (TW §D.2). A read of
     /// `INTERRUPT_CORE0` registers on a chip right after `esp_restart`, before the ROM touches
     /// them, settles it.
+    ///
+    /// ASSUMPTION: the analog registers written through regi2c keep their bytes at every level of
+    /// reset. ESP-IDF calibrates the O-code only after a power-on reset
+    /// (`IDF:components/esp_system/port/soc/esp32c3/clk.c:65-71`), which implies that the analog
+    /// side survives the other resets. Reading a regi2c register on a chip after a watchdog reset
+    /// settles it.
     pub(crate) fn reset(&mut self, ctx: &mut Ctx, cause: ResetCause, pc: u32, sp: u32) {
         let level = cause.level();
         self.assist_debug.cpu_reset(pc, sp);
@@ -504,7 +511,7 @@ impl Peripherals {
         self.spi1.reset();
         self.sha = Sha::new();
         self.apb_ctrl.reset();
-        self.ana_i2c = AnaI2c::new();
+        self.ana_i2c.reset();
         self.apb_saradc = AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED);
         self.radio_power = AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED);
         self.uart0.reset(ctx.now());
@@ -866,8 +873,9 @@ mod tests {
         let mut p = peripherals(ctx);
         // The clock selection `esp_restart_noos` leaves, through `rtc_clk_cpu_set_to_default_config`
         // (`IDF:components/esp_system/port/soc/esp32c3/system_internal.c:109`): the crystal
-        // undivided (report IR §4.1).
-        write(&mut p, ctx, svd("SYSTEM", "SYSCLK_CONF"), 0x0000_0400);
+        // undivided: `PRE_DIV_CNT` 0 and `SOC_CLK_SEL` 0 (report IR §4.1), where the reset value
+        // of `PRE_DIV_CNT` is 1.
+        write(&mut p, ctx, svd("SYSTEM", "SYSCLK_CONF"), 0);
         write(&mut p, ctx, svd("RTC_CNTL", "STORE4"), 0x0028_0028);
         write(&mut p, ctx, svd("SENSITIVE", "INTERNAL_SRAM_USAGE_1"), 0xE);
         write(&mut p, ctx, svd("ASSIST_DEBUG", "CORE_0_RCD_EN"), 3);
@@ -897,7 +905,8 @@ mod tests {
         assert_eq!(read(svd("SENSITIVE", "INTERNAL_SRAM_USAGE_1")), Some(0xF));
         assert_eq!(
             read(svd("SYSTEM", "SYSCLK_CONF")).map(|v| v & 0xFFF),
-            Some(0x400)
+            Some(0),
+            "`PRE_DIV_CNT` 0 is kept: the reset value is 1"
         );
         assert_eq!(read(svd("RTC_CNTL", "STORE4")), Some(0x0028_0028));
         assert_eq!(read(svd("SPI1", "USER1")), Some(0x1234_5678));
@@ -974,11 +983,69 @@ mod tests {
             read(&mut p, ctx, svd("RTC_CNTL", "STORE4")),
             Some(0x0028_0028)
         );
+    }
+
+    #[test]
+    fn the_flash_chip_is_not_part_of_the_controller_whatever_resets() {
+        let ctx = &mut Ctx::default();
+        let image = vec![0xE9, 0x02, 0x02, 0x2F, 0x5A];
+        let flash =
+            crate::flash::NorFlash::with_image(image.clone(), crate::flash::FlashConfig::default())
+                .expect("the image fits");
+        let mut p = Peripherals::new(&SocConfig::default(), Box::new(flash), ctx);
+        let programmed = |p: &Peripherals| {
+            let mut bytes = [0; 5];
+            p.spi1.flash().read(0, &mut bytes);
+            bytes.to_vec()
+        };
+        assert_eq!(programmed(&p), image);
+        p.deliver(ctx, Event::ModuleReset(Module::Spi01));
         assert_eq!(
-            p.spi1.flash().size(),
-            crate::flash::FlashConfig::default().size(),
-            "the flash chip is not part of the controller"
+            programmed(&p),
+            image,
+            "after a reset of the SPI controllers"
         );
+        p.reset(ctx, ResetCause::Mwdt0Core, 0x4004_c0d4, 0);
+        assert_eq!(programmed(&p), image, "after a core reset");
+        p.reset(ctx, ResetCause::RtcWatchdogSystem, 0x4004_c0d4, 0);
+        assert_eq!(programmed(&p), image, "after a system reset");
+    }
+
+    #[test]
+    fn analog_registers_written_through_regi2c_survive_every_level_of_reset() {
+        // ASSUMPTION: see `Peripherals::reset`. A byte written before the reset reads back after it.
+        let ctx = &mut Ctx::default();
+        let mut p = peripherals(ctx);
+        let cmd = ana_i2c::ANA_I2C_BASE;
+        // Block 0x66, register 4, data 0xA7, host 0: the write bit is bit 24.
+        write(&mut p, ctx, cmd, 0x66 | (4 << 8) | (0xA7 << 16) | (1 << 24));
+        let analog_byte = |p: &mut Peripherals, ctx: &mut Ctx| {
+            write(p, ctx, cmd, 0x66 | (4 << 8));
+            (read(p, ctx, cmd).unwrap() >> 16) & 0xFF
+        };
+        assert_eq!(analog_byte(&mut p, ctx), 0xA7);
+        p.reset(ctx, ResetCause::SoftwareCpu, 0x4004_8b92, 0);
+        assert_eq!(analog_byte(&mut p, ctx), 0xA7, "after a CPU reset");
+        p.reset(ctx, ResetCause::Mwdt0Core, 0x4004_c0d4, 0);
+        assert_eq!(analog_byte(&mut p, ctx), 0xA7, "after a core reset");
+        p.reset(ctx, ResetCause::RtcWatchdogSystem, 0x4004_c0d4, 0);
+        assert_eq!(analog_byte(&mut p, ctx), 0xA7, "after a system reset");
+    }
+
+    #[test]
+    fn the_digital_side_of_regi2c_returns_to_its_reset_values_at_a_core_reset() {
+        let ctx = &mut Ctx::default();
+        let mut p = peripherals(ctx);
+        let config = ana_i2c::ANA_I2C_BASE + 0x44;
+        write(&mut p, ctx, config, 0x1234);
+        p.reset(ctx, ResetCause::SoftwareCpu, 0x4004_8b92, 0);
+        assert_eq!(
+            read(&mut p, ctx, config),
+            Some(0x1234),
+            "a CPU reset keeps it"
+        );
+        p.reset(ctx, ResetCause::Mwdt0Core, 0x4004_c0d4, 0);
+        assert_eq!(read(&mut p, ctx, config), Some(0));
     }
 
     #[test]

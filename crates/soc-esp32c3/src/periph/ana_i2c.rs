@@ -74,6 +74,14 @@ impl AnaI2c {
         AnaI2c::default()
     }
 
+    /// A core reset returns the digital side (the command and configuration registers) to its
+    /// reset values. The analog registers keep their bytes: see the ASSUMPTION of
+    /// [`crate::periph::Peripherals::reset`].
+    pub(crate) fn reset(&mut self) {
+        self.command = [0; HOSTS];
+        self.config = [0; CONFIG_REGISTERS];
+    }
+
     /// Runs the transfer `word` asks for and returns what the command register then reads: never busy.
     fn run(&mut self, host: usize, word: u32) -> u32 {
         let [block, register, data, _] = word.to_le_bytes();

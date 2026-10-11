@@ -424,7 +424,8 @@ impl RtcCntl {
     ///    (whole turns change neither the stage nor which actions fired), which leaves at most four
     ///    more expiries. One call costs at most [`WALK_STEPS`] iterations.
     /// 5. The walk goes on after a reset request: the reset it asks for does not stop the RTC
-    ///    watchdog, and [`Ctx::request_reset`] keeps the first request, the earliest in time.
+    ///    watchdog, and [`Ctx::request_reset`] keeps the deepest request (system over core over
+    ///    CPU), the first between requests of the same level.
     fn walk_stages(
         &mut self,
         ctx: &mut Ctx,

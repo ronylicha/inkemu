@@ -121,6 +121,10 @@ impl SocBus {
     }
 
     /// Applies a reset to the peripherals. The memories keep their content (TRM §6.1.1).
+    ///
+    /// ASSUMPTION: the RTC memory keeps its content at a system reset too. The TRM says the
+    /// memories are not reset (§6.1.1); report TW §I question 9 leaves open what a reset of the
+    /// RTC domain does to them. Reading an RTC memory word on a chip after a `rst:0x10` settles it.
     pub(crate) fn reset(&mut self, cause: ResetCause, pc: u32, sp: u32) {
         self.periph.reset(&mut self.ctx, cause, pc, sp);
         self.settle();
@@ -349,7 +353,10 @@ impl Bus for SocBus {
             Some(Region::Rtc) => self.rtc.page_version(addr),
             // Flash content cannot change (the flash is read-only, D3); what an address shows changes
             // with the MMU table and with the cache enables. Both counters only grow, so their sum
-            // changes whenever either does (decision D6).
+            // changes whenever either does (decision D6). Both restart at 0 when a core reset
+            // rebuilds the MMU and the cache registers, so a version can repeat with another
+            // mapping: that is safe only because `Hart::reset` builds a new decode cache, at
+            // every level (`Esp32C3::reset`).
             Some(Region::Flash { .. }) => {
                 self.periph.mmu.generation() + self.periph.extmem.generation()
             }
@@ -1048,5 +1055,30 @@ mod tests {
             sram,
             "RAM versions are untouched"
         );
+    }
+
+    #[test]
+    fn the_memories_keep_their_content_at_every_level_of_reset() {
+        // TRM §6.1.1: a reset leaves the memories as they are. The RTC memory is the case the
+        // manual states least plainly for a system reset: ASSUMPTION in `SocBus::reset`.
+        let mut b = bus();
+        let words = [
+            (SRAM_DBUS_BASE + 0x40, 0x1111_1111),
+            (SRAM0_BASE + 0x40, 0x2222_2222),
+            (RTC_RAM_BASE + 0x40, 0x3333_3333),
+        ];
+        for (addr, value) in words {
+            b.write(addr, Word, value).unwrap();
+        }
+        for cause in [
+            ResetCause::SoftwareCpu,
+            ResetCause::Mwdt0Core,
+            ResetCause::RtcWatchdogSystem,
+        ] {
+            b.reset(cause, 0x4000_0000, 0);
+            for (addr, value) in words {
+                assert_eq!(load(&mut b, addr), value, "{addr:#010x} after {cause:?}");
+            }
+        }
     }
 }

@@ -22,8 +22,17 @@ const PERIP_RST_EN1: u32 = svd_regs::esp32c3::addr("SYSTEM", "PERIP_RST_EN1") - 
 ///
 /// ASSUMPTION: bit 0, `SYSTEM_TIMERS_RST` (`system_reg.h:503`), resets nothing here.
 /// `esp_system_reset_modules_on_exit` pulses it, and what it resets is not documented: the timer
-/// groups have their own bits (IR §4.3, §7 question 1; TW §F.1). The other bits belong to modules
-/// this plan does not model.
+/// groups have their own bits (IR §4.3, §7 question 1; TW §F.1). Bits 13 and 15 reset the timer
+/// groups (`SYSTEM_TIMERGROUP_RST`, `SYSTEM_TIMERGROUP1_RST`). A bit of no module listed here is
+/// stored and resets nothing; two of them belong to modules the model has and are not acted on:
+/// bit 23, `SYSTEM_USB_DEVICE_RST` (`system_reg.h:371`), and bit 28, `SYSTEM_APB_SARADC_RST`
+/// (`system_reg.h:341`).
+///
+/// ASSUMPTION: a module is reset when its bit goes from 0 to 1 and is not held in reset while the
+/// bit stays set. Report IR §8 item 16 says a module is in reset while its bit is 1: on silicon a
+/// module whose bit is still set (the SHA accelerator at power-on, `PERIP_RST_EN1` resets to
+/// `0x1FE`) would not answer, and writes made during a hold would not stick. Writing a register of
+/// a module while its reset bit is 1, on a chip, settles it.
 const RESETS_0: [(u32, Module); 6] = [
     (1 << 1, Module::Spi01),
     (1 << 2, Module::Uart0),

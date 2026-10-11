@@ -260,14 +260,22 @@ impl Esp32C3 {
     /// Applies a reset (TRM §6.1): the peripherals of its level return to their reset state, the
     /// CPU restarts in the ROM. The memories keep their content and device time goes on.
     ///
-    /// A watchdog that is still expired after the reset asks for the next one at the end of the
-    /// next instruction: at most one reset per instruction, and every instruction costs cycles,
-    /// so a run still reaches its cycle limit.
+    /// The bound that makes a reset loop safe: a reset request posted while a reset is performed
+    /// stays in the context and is taken at the end of the next instruction. That is one reset per
+    /// instruction at most, and every instruction advances the cycle count, so a run still
+    /// reaches its cycle limit.
     fn reset(&mut self, cause: ResetCause) {
         let (pc, sp) = (self.hart.pc, self.hart.x[STACK_POINTER]);
         self.bus.reset(cause, pc, sp);
+        // The flash-window page versions (`SocBus::page_version`) restart at 0 with the MMU and
+        // the cache registers: a version can repeat with another mapping. That is safe only
+        // because `Hart::reset` builds a new decode cache, at every level.
         self.hart.reset(RESET_PC);
+        // A CPU reset keeps the interrupt controller and the source levels (TRM §6.1.3), and the
+        // hart forgot the line it was shown: the next `service` selects again. The line becomes
+        // visible 4 CPU cycles after the reset, as one that has just become selectable does.
         self.selected = None;
+        self.bus.ctx.interrupts_changed();
         self.resets += 1;
     }
 
@@ -1151,5 +1159,285 @@ mod tests {
             "TG0WDT_SYS_RST"
         );
         assert_eq!(m.cycles().get(), 3, "only `wfi` was executed");
+    }
+
+    /// `rd` <- the word at `addr`, through `x10`.
+    fn load_into(rd: u8, addr: u32) -> [u32; 2] {
+        let page = addr.wrapping_add(0x800) & 0xFFFF_F000;
+        [
+            lui(10, page),
+            lw(rd, 10, addr.wrapping_sub(page).cast_signed()),
+        ]
+    }
+
+    /// Two passes around a CPU reset. The first routes software interrupt 0 to line 3, raises it
+    /// with the interrupts masked and asks for the reset; the controller and the source levels
+    /// survive a CPU reset, so the second pass finds the line still selected. It sets `MIE` when
+    /// `mie` is true and sleeps in `wfi`.
+    fn a_line_pending_across_a_cpu_reset(mie: bool) -> Esp32C3 {
+        const MARKER: u32 = SRAM_DBUS_BASE + 0x100;
+        let marker = load_register(MARKER);
+        let mut first = stop_watchdogs();
+        first.extend(store_register(MARKER, 1));
+        first.extend(route("CPU_INTR_FROM_CPU_0_MAP", 3));
+        first.extend(store_register(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"), 1));
+        first.extend(store_register(reg("RTC_CNTL", "OPTIONS0"), 1 << 5));
+        first.push(HANG);
+        let mut second = vec![lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)];
+        if mie {
+            second.push(csrrwi(0, MSTATUS, MSTATUS_MIE));
+        }
+        second.extend([wfi(), addi(1, 0, 1), HANG]);
+        let skip = 4 * (i32::try_from(first.len()).unwrap() + 1);
+        let mut body = vec![marker[0], marker[1], cpu_rv32::asm::bne(T1, 0, skip)];
+        body.extend(first);
+        body.extend(second);
+        machine(&with_vectors(&body))
+    }
+
+    #[test]
+    fn a_line_selected_before_a_cpu_reset_wakes_a_masked_wfi_after_it() {
+        // TRM §6.1.3: a CPU reset leaves the interrupt controller and the sources as they are.
+        let mut m = a_line_pending_across_a_cpu_reset(false);
+        assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
+        assert_eq!(m.resets(), 1);
+        assert_eq!(
+            bus_word(&mut m, reg("INTERRUPT_CORE0", "CPU_INT_EIP_STATUS")),
+            1 << 3,
+            "the source is still raised"
+        );
+        assert_eq!(
+            m.hart.x[1], 1,
+            "`mstatus.MIE` is 0: `wfi` ends, the code after it runs"
+        );
+    }
+
+    #[test]
+    fn a_line_selected_before_a_cpu_reset_is_taken_after_it() {
+        let mut m = a_line_pending_across_a_cpu_reset(true);
+        assert_eq!(m.run_until(Cycles(2_000)), StopReason::CycleBudget);
+        assert_eq!(m.resets(), 1);
+        assert_eq!(m.hart.csr.mcause, 0x8000_0003);
+        assert_eq!(m.pc(), VECTORS + 4 * 3, "the entry of line 3 parks");
+    }
+
+    #[test]
+    fn the_rtc_watchdog_resets_a_sleeping_hart_at_each_level_in_turn() {
+        // Stage 0 resets the CPU, stage 1 the core, stage 2 the whole chip (TW §D.2). Every pass
+        // appends a record to a log in RAM before it sleeps: the reset cause, `STORE0`, and the
+        // address of its first instruction. The log is the proof that the RAM is kept.
+        const NEXT: u32 = SRAM_DBUS_BASE + 0x100;
+        const LOG: u32 = SRAM_DBUS_BASE + 0x200;
+        // Registers: the base of the RAM, the log pointer (0 on the first pass), a copy of it, the
+        // value being logged, the address of the first instruction.
+        let (base, ptr, old, value, pc) = (8, 9, 13, 11, 12);
+        let mut body = vec![
+            cpu_rv32::asm::auipc(pc, 0),
+            lui(base, SRAM_DBUS_BASE),
+            lw(ptr, base, 0x100),
+            addi(old, ptr, 0),
+            cpu_rv32::asm::bne(ptr, 0, 8),
+            addi(ptr, base, 0x200),
+        ];
+        for (offset, register) in [(0, "RESET_STATE"), (4, "STORE0")] {
+            body.extend(load_into(value, reg("RTC_CNTL", register)));
+            body.push(sw(value, ptr, offset));
+        }
+        body.extend([sw(pc, ptr, 8), addi(ptr, ptr, 16), sw(ptr, base, 0x100)]);
+        // Only the first pass sets the retention register and arms the watchdog.
+        let mut first = store_register(reg("TIMG0", "WDTCONFIG0"), 0).to_vec();
+        first.extend(store_register(reg("RTC_CNTL", "STORE0"), 0xA5A5));
+        for (i, timeout) in [1_000, 2_000, 3_000, 4_000].into_iter().enumerate() {
+            first.extend(store_register(
+                reg("RTC_CNTL", "WDTCONFIG1") + 4 * u32::try_from(i).unwrap(),
+                timeout,
+            ));
+        }
+        first.extend(store_register(
+            reg("RTC_CNTL", "WDTCONFIG0"),
+            (1 << 31) | (2 << 28) | (3 << 25) | (4 << 22),
+        ));
+        body.push(cpu_rv32::asm::bne(
+            old,
+            0,
+            4 * (i32::try_from(first.len()).unwrap() + 1),
+        ));
+        body.extend(first);
+        body.extend([wfi(), HANG]);
+        let mut m = machine(&body);
+        assert_eq!(m.run_until(Cycles(100_000)), StopReason::Asleep);
+        assert!(m.resets() >= 3, "{} resets", m.resets());
+        let logged = (bus_word(&mut m, NEXT) - LOG) / 16;
+        assert!(
+            u64::from(logged) >= m.resets(),
+            "{logged} passes logged, {} resets",
+            m.resets()
+        );
+        let record = |m: &mut Esp32C3, pass: u32| {
+            let at = LOG + 16 * pass;
+            (
+                bus_word(m, at) & 0x3F,
+                bus_word(m, at + 4),
+                bus_word(m, at + 8),
+            )
+        };
+        for (pass, cause, store0) in [
+            (0, 0x01, 0),
+            (1, 0x0D, 0xA5A5),
+            (2, 0x09, 0xA5A5),
+            (3, 0x10, 0),
+        ] {
+            assert_eq!(
+                record(&mut m, pass),
+                (cause, store0, ROM_BASE),
+                "pass {pass}: cause, STORE0, and a start at the reset vector"
+            );
+        }
+    }
+
+    /// Two passes around the reset a `trigger` asks for. The first selects the PLL at 160 MHz and
+    /// runs `trigger`; the second parks.
+    fn a_machine_reset_after_selecting_the_pll(trigger: Vec<u32>) -> Esp32C3 {
+        const MARKER: u32 = SRAM_DBUS_BASE + 0x100;
+        let marker = load_register(MARKER);
+        let mut first = stop_watchdogs();
+        first.extend(store_register(MARKER, 1));
+        first.extend(store_register(SYSCLK_CONF, 0x400));
+        first.extend(store_register(CPU_PER_CONF, 0xD));
+        first.extend(trigger);
+        first.push(HANG);
+        let skip = 4 * (i32::try_from(first.len()).unwrap() + 1);
+        let mut body = vec![marker[0], marker[1], cpu_rv32::asm::bne(T1, 0, skip)];
+        body.extend(first);
+        body.push(HANG);
+        let mut m = machine(&body);
+        assert_eq!(m.run_until(Cycles(10_000)), StopReason::CycleBudget);
+        assert_eq!(m.resets(), 1);
+        m
+    }
+
+    #[test]
+    fn the_cpu_clock_selection_survives_a_cpu_reset_and_not_a_core_or_system_reset() {
+        // Decision E8: the crystal divided by 2 after a reset of the clock registers, 20 MHz.
+        let mut cpu = a_machine_reset_after_selecting_the_pll(
+            store_register(reg("RTC_CNTL", "OPTIONS0"), 1 << 5).to_vec(),
+        );
+        assert_eq!(
+            bus_word(&mut cpu, reg("RTC_CNTL", "RESET_STATE")) & 0x3F,
+            0x0C
+        );
+        assert_eq!(cpu.cpu_frequency().hz(), 160_000_000, "kept by a CPU reset");
+        let mut core = a_machine_reset_after_selecting_the_pll(
+            store_register(reg("RTC_CNTL", "OPTIONS0"), 1 << 31).to_vec(),
+        );
+        assert_eq!(
+            bus_word(&mut core, reg("RTC_CNTL", "RESET_STATE")) & 0x3F,
+            0x03
+        );
+        assert_eq!(
+            core.cpu_frequency().hz(),
+            20_000_000,
+            "reset by a core reset"
+        );
+        // The RTC watchdog's last stage resets the whole chip while the hart sleeps.
+        let mut watchdog = store_register(reg("RTC_CNTL", "WDTCONFIG1"), 100).to_vec();
+        watchdog.extend(store_register(
+            reg("RTC_CNTL", "WDTCONFIG0"),
+            (1 << 31) | (4 << 28),
+        ));
+        watchdog.push(wfi());
+        let mut system = a_machine_reset_after_selecting_the_pll(watchdog);
+        assert_eq!(
+            bus_word(&mut system, reg("RTC_CNTL", "RESET_STATE")) & 0x3F,
+            0x10
+        );
+        assert_eq!(
+            system.cpu_frequency().hz(),
+            20_000_000,
+            "reset by a system reset"
+        );
+    }
+
+    /// A core reset in the middle of a console line: `AB` leaves the UART during a delay, `CD`
+    /// is still in the FIFO when the reset comes, and the second pass prints `Z`.
+    fn a_console_line_cut_by_a_core_reset() -> Esp32C3 {
+        const MARKER: u32 = SRAM_DBUS_BASE + 0x100;
+        let marker = load_register(MARKER);
+        let mut first = stop_watchdogs();
+        first.extend(store_register(MARKER, 1));
+        first.extend(print(UART0, b"AB"));
+        // About 1 ms at 20 MHz: more than the two bytes take at the reset baud rate.
+        first.extend([
+            lui(14, 0x3000),
+            addi(14, 14, -1),
+            cpu_rv32::asm::bne(14, 0, -4),
+        ]);
+        first.extend(print(UART0, b"CD"));
+        first.extend(store_register(reg("RTC_CNTL", "OPTIONS0"), 1 << 31));
+        first.push(HANG);
+        let skip = 4 * (i32::try_from(first.len()).unwrap() + 1);
+        let mut body = vec![marker[0], marker[1], cpu_rv32::asm::bne(T1, 0, skip)];
+        body.extend(first);
+        body.extend(print(UART0, b"Z"));
+        body.push(HANG);
+        machine_with(
+            &body,
+            SocConfig {
+                trace_hash: true,
+                ..SocConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_core_reset_keeps_the_console_bytes_that_left_and_drops_those_in_the_fifo() {
+        let mut m = a_console_line_cut_by_a_core_reset();
+        assert_eq!(m.run_until(Cycles(200_000)), StopReason::CycleBudget);
+        assert_eq!(m.resets(), 1);
+        assert_eq!(m.take_console(ConsoleChannel::Uart0), b"ABZ");
+    }
+
+    #[test]
+    fn a_run_across_a_core_reset_is_the_same_whole_or_in_slices_of_seven_cycles() {
+        let mut whole = a_console_line_cut_by_a_core_reset();
+        whole.run_until(Cycles(200_000));
+        let end = whole.cycles().get();
+        let mut sliced = a_console_line_cut_by_a_core_reset();
+        let mut console = Vec::new();
+        while sliced.cycles().get() < end {
+            let next = (sliced.cycles().get() + 7).min(end);
+            sliced.run_until(Cycles(next));
+            console.extend(sliced.take_console(ConsoleChannel::Uart0));
+        }
+        assert_eq!(sliced.cycles(), whole.cycles());
+        assert_eq!(sliced.resets(), whole.resets());
+        assert_eq!(sliced.device_time_nanos(), whole.device_time_nanos());
+        assert_eq!(sliced.trace_hash(), whole.trace_hash());
+        assert!(whole.trace_hash().is_some());
+        assert_eq!(console, whole.take_console(ConsoleChannel::Uart0));
+    }
+
+    #[test]
+    fn a_strict_run_goes_on_across_a_reset_which_is_not_a_violation() {
+        const MARKER: u32 = SRAM_DBUS_BASE + 0x100;
+        let marker = load_register(MARKER);
+        let mut first = stop_watchdogs();
+        first.extend(store_register(MARKER, 1));
+        first.extend(store_register(reg("RTC_CNTL", "OPTIONS0"), 1 << 5));
+        first.push(HANG);
+        let skip = 4 * (i32::try_from(first.len()).unwrap() + 1);
+        let mut body = vec![marker[0], marker[1], cpu_rv32::asm::bne(T1, 0, skip)];
+        body.extend(first);
+        body.push(HANG);
+        let mut m = machine_with(
+            &body,
+            SocConfig {
+                strict_mmio: true,
+                ..SocConfig::default()
+            },
+        );
+        assert_eq!(m.run_until(Cycles(1_000)), StopReason::CycleBudget);
+        assert_eq!(m.resets(), 1);
+        assert_eq!(m.drain_diagnostics(), Vec::new());
     }
 }
