@@ -76,6 +76,12 @@ La relecture de la branche entière a relevé six choix qui ne s'étendent pas :
 - Chaque écriture de `ICACHE_CTRL` invalide tout le code de flash décodé. ESP-IDF coupe et rétablit le cache autour de chaque opération de flash : un coût à prévoir quand les opérations de flash et les interruptions existeront.
 - Reset : `Peripherals::new` consomme la flash, donc un reset ne peut pas reconstruire les périphériques sans reprendre la puce dans `Spi1`.
 - `DeviceProfile` a des champs publics et son `id` n'est validé que par le désérialiseur. Avant que l'identifiant ne nomme un fichier de flash par appareil, en faire un type validé.
+- **Reset et `VirtualClock`** : l'horloge de l'appareil est ancrée sur le compteur de cycles du hart (`crates/emu-core/src/time.rs`). Un reset ne doit pas faire reculer ce compteur, ou doit ré-ancrer l'horloge ; aujourd'hui un compteur qui recule est borné en silence.
+- **`FlashDevice` venu de l'extérieur** : `SocBus::new` et `Peripherals::new` sont publics et acceptent n'importe quelle puce. Quand une puce pourra venir d'une autre crate (fichier de flash par appareil), lier sa `size()` à la règle que porte `FlashConfig`.
+- **Décalages de registres en clair** : `uart.rs`, `intmatrix.rs` et `assist_debug.rs` gardent des décalages littéraux, que le test générique de la table rend cohérents sans les supprimer. Les prendre dans `svd_regs` au moment où ces trois modèles reçoivent leur logique d'interruption.
+- **Interruption par Ctrl-C** : sans `--max-cycles`, une exécution ne finit que par Ctrl-C, et n'affiche alors aucun résumé (diagnostics répétés, temps d'appareil). Dès qu'un firmware tourne sans fin, c'est la sortie normale : elle doit rendre le même résumé qu'un arrêt par limite de cycles.
+- **Le test OTA sur la vraie ROM** fixe *quelles* commandes de flash sont refusées, pas *combien de fois* (la clé de déduplication est l'opcode) ; le nombre n'est fixé que par les deux tests unitaires de SPI1. Avec une flash inscriptible, compter les écritures réellement faites.
+- Retouches de forme, pour qui touchera ces fichiers : la ligne `IO_MUX.DATE` de la table dit « rendu réel par SP2 » pour un registre entièrement modélisé ; la section `# Errors` de `from_named_toml` omet `MissingFlash` ; `ProfileError::Parse` répète le remède ; 40 MHz ÷ 3 s'affiche `13333333 Hz`.
 - Déjà notés plus haut et inchangés : lectures de données par SPI1, application de la PMP, registres de programmation des eFuse, tables de partitions dans les profils, interruptions d'erreur du cache.
 
 ## Reporté au plan SP1b-4 (lockstep QEMU, CoreMark, rejeu, hygiène CI)
@@ -117,6 +123,7 @@ Autres points pour SP1b-4 :
 - **La mise en route de la PLL, propre au matériel** (`esp32c3-bootloader-accesses.md`, §5, étapes 9 et 10) et la branche de calibration de `rtc_init` s'exécutent dans inkemu et ne peuvent pas être comparées à QEMU.
 - **Le chemin de démarrage depuis la flash des ROM rev0 et rev101** n'a pas été exécuté (`esp32c3-rom-flash-boot.md`, §L, point 9) : seule rev3 est testée depuis la flash.
 - **Fermeture des bus** des fenêtres de flash : mémorisée, pas appliquée (D5).
+- **Coût d'une lecture de flash** : un appel dynamique et une traduction MMU par octet lu (`bus.rs`, `flash_read`), et une recherche linéaire de région par accès. Correct, mais à mesurer avec CoreMark avant de fixer une tolérance.
 - **Mémoire du cache de décodage** : une page de 2 048 emplacements par page de 4 Kio exécutée, jamais évincée ; les deux fenêtres de flash portent le pire cas d'environ 200 pages à environ 4 300. Borné, mais gros pour un firmware hostile.
 - **CI** :
   - le job `reference-boot` récupère `espressif/idf` par étiquette, pas par empreinte ; les empreintes épinglées des fichiers produits le font échouer fermé. Épingler l'empreinte de l'image avec les autres épinglages. Le job n'a pas encore tourné sur GitHub (R21) ;
@@ -129,6 +136,7 @@ Autres points pour SP1b-4 :
 ## À prévoir plus tard
 
 - **SP2** : `--device <fichier.toml>` et le nettoyage du message d'erreur de `toml` ; broches GPIO, matrice GPIO et `IO_MUX` ; le SAR ADC ; chaque ligne de la table des registres acceptés dont la dernière colonne est SP2. Deux refus dont le texte est aujourd'hui trompeur : le dump d'une puce dont la flash est chiffrée est refusé comme « ne commence pas par une image de bootloader », alors que c'en est un ; une image complète dont la table de partitions n'est pas à `0x8000` est refusée comme « une application ou un bootloader seul ».
+- **SP4** (tests scriptés) : une exécution qui atteint `--max-cycles` sort avec le code 0 même quand le firmware n'a pas démarré. Les scripts de test auront besoin d'un critère de réussite explicite (une ligne attendue sur la console, par exemple) plutôt que de ce code.
 - **SP5a** : registres d'alimentation des mémoires de la radio, et chaque ligne de la table des registres acceptés dont la dernière colonne est SP5a. **Avant le Wi-Fi par le réseau de l'hôte**, l'adresse MAC par défaut (`58:cf:79:0f:96:8c`) est celle de la puce échantillon de la documentation eFuse d'Espressif : elle est partagée par tous les appareils émulés et elle est universellement administrée. Elle doit devenir une valeur par profil, localement administrée.
 - **SP8** : durées des transferts SPI et du SHA (`esp32c3-rom-flash-boot.md`, §L, point 1) ; fréquence du CPU au reset (hypothèse 6) ; chaque ligne de la table des registres acceptés dont la dernière colonne est SP8.
 - La puce de flash, le contenu des eFuse et la révision de silicium d'un Xteink X4 réel restent inconnus : `esptool.py flash_id`, `espefuse.py summary` et le journal de démarrage d'un appareil trancheraient les trois. La règle de capacité de R15 suppose une puce qui encode log2 de sa taille.
