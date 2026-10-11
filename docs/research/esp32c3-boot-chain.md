@@ -470,3 +470,17 @@ Skipped (only on other paths): `uart_baudrate_detect`, `ets_uart_download`, `spi
 * QEMU (GPL): only facts were extracted (addresses, reset values, sequencing, which registers matter); wording here is original. Do not copy QEMU source or comments into inkemu.
 * QEMU's bundled `pc-bios/esp32c3-rom.bin` has no stated licence (ADR 0001 already excludes it); this report uses the Apache-2.0 ROM ELFs from `espressif/esp-rom-elfs` for all ROM-side behaviour.
 * ESP-IDF headers (Apache-2.0) are the preferred origin for register names, offsets and bit positions in the Rust models (or the already-vendored SVD files).
+
+## M. Addendum, 2026-10-11 — facts established while booting the real ROMs (plan SP1b-1)
+
+These supersede the matching "unknown" entries of sections B.1, G.3 and K.
+
+1. **Misaligned loads and stores are performed by the silicon, not trapped** (settles B.1 "Misaligned loads/stores" and K.3).
+   Evidence: the shipped rev0 mask ROM executes `lw t0,0(a5)` at pc `0x40001e00` (in `_init`, the `.data` unpack loop) with the address `0x40058c3e`, which is 2 modulo 4. That address is the first byte after `.wifi0iram.3`, where the linker placed the initial `.data` image. No trap handler able to emulate the access is installed at that point, and rev0 chips boot. With a trapping core the emulated rev0 ROM never reaches its banner; with misaligned accesses performed it prints it with no diagnostic.
+   Consequence in inkemu: the ESP32-C3 machine runs with `MisalignedPolicy::Allow`. The generic conformance harness (`inkemu rvtest`, RISCOF/Sail) keeps trapping by default: it tests a generic hart.
+   Still unknown: the extra cycles such an access costs on silicon, and what a misaligned access to a peripheral register does (inkemu reports a bus error).
+2. **USB-Serial-JTAG sends a full 64-byte IN packet without waiting for `WR_DONE`** (completes G.3).
+   Source: ESP-IDF v5.5.2, `components/hal/esp32c3/include/hal/usb_serial_jtag_ll.h`, note on `usb_serial_jtag_ll_txfifo_flush`: "When fifo is full (with 64 byte), HW will flush the buffer automatically". The same note adds that the host treats a 64-byte packet as an incomplete transfer until more data or a zero-length packet follows.
+3. **Measured ROM path to the banner** (strict mode, nothing unmodelled, no CPU exception): the banner completes after 25,637 CPU cycles / 17,196 instructions (rev0), 26,681 / 17,932 (rev3), 26,775 / 17,994 (rev101), with the uncalibrated timing model and an UART that transmits instantly. The first register the rev3 ROM touches after its banner that inkemu does not model is `GPIO.ENABLE` (`0x60004020`) at pc `0x40051b08` (`gpio_output_disable`, flash-boot path, section J row 14).
+4. **One register beyond section J rows 0–12 is needed before the banner**: `EXTMEM.ICACHE_CTRL1` (`0x600C4004`), read-modify-written by `Cache_Mask_All` (row 2 lists it; it is plain read/write with reset value 3).
+5. **eFuse read mirror**: the SVD documents 91 registers in `0x2C..=0x1C4`; the 12 other offsets of that window (`0x18C`, `0x194`–`0x1BC`) are reserved holes.
