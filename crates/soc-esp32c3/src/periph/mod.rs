@@ -4,6 +4,7 @@ use emu_core::Peripheral;
 
 pub mod assist_debug;
 pub mod efuse;
+pub mod extmem;
 pub mod gpio;
 pub mod intmatrix;
 pub mod io_mux;
@@ -14,6 +15,7 @@ pub mod usb_serial_jtag;
 
 pub use assist_debug::AssistDebug;
 pub use efuse::Efuse;
+pub use extmem::Extmem;
 pub use gpio::Gpio;
 pub use intmatrix::IntMatrix;
 pub use io_mux::IoMux;
@@ -93,6 +95,7 @@ const EFUSE: (u32, u32) = (EFUSE_BASE, 0x6000_9000);
 const SYSTEM: (u32, u32) = (system::BASE, 0x600C_1000);
 const INTMATRIX_BASE: u32 = 0x600C_2000;
 const INTMATRIX: (u32, u32) = (INTMATRIX_BASE, 0x600C_3000);
+const EXTMEM: (u32, u32) = (extmem::BASE, 0x600C_5000);
 const ASSIST_DEBUG_BASE: u32 = 0x600C_E000;
 const ASSIST_DEBUG: (u32, u32) = (ASSIST_DEBUG_BASE, 0x600C_F000);
 /// The two UARTs and the USB-Serial-JTAG device: the ROM's consoles (report §G).
@@ -108,6 +111,7 @@ pub struct Peripherals {
     pub rtc_cntl: RtcCntl,
     pub system: System,
     pub efuse: Efuse,
+    pub extmem: Extmem,
     pub assist_debug: AssistDebug,
     pub uart0: Uart,
     pub uart1: Uart,
@@ -124,6 +128,7 @@ impl Peripherals {
             rtc_cntl: RtcCntl::new(),
             system: System::new(),
             efuse: Efuse::new(config.chip_revision),
+            extmem: Extmem::new(),
             assist_debug: AssistDebug::new(),
             uart0: Uart::new(UART0.0),
             uart1: Uart::new(UART1.0),
@@ -146,6 +151,8 @@ impl Peripherals {
             Some((&mut self.system, system::BASE))
         } else if within(INTMATRIX) {
             Some((&mut self.intmatrix, INTMATRIX_BASE))
+        } else if within(EXTMEM) {
+            Some((&mut self.extmem, extmem::BASE))
         } else if within(ASSIST_DEBUG) {
             Some((&mut self.assist_debug, ASSIST_DEBUG_BASE))
         } else if within(UART0) {

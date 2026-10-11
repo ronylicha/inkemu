@@ -7,8 +7,15 @@ pub mod bus;
 pub mod chip;
 pub mod config;
 pub mod diag;
+pub mod machine;
 pub mod memmap;
 pub mod periph;
 pub mod rom;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+
+pub use chip::ChipRevision;
+pub use config::SocConfig;
+pub use diag::Diagnostic;
+pub use machine::{ConsoleChannel, Esp32C3, StopReason};
+pub use rom::{RomError, RomImage};

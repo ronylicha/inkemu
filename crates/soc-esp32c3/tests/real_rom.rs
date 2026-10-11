@@ -2,8 +2,9 @@
 //! `INKEMU_ROM_ELF_DIR=<dir> cargo test -p soc-esp32c3 --test real_rom -- --ignored`
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
 
+use emu_core::Cycles;
 use sha2::{Digest, Sha256};
-use soc_esp32c3::rom::RomImage;
+use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason};
 use std::fmt::Write as _;
 
 fn elf(revision: u16) -> Vec<u8> {
@@ -48,4 +49,132 @@ fn converted_images_match_their_pinned_hashes() {
 fn eco_versions_identify_the_three_revisions() {
     let eco = |rev| RomImage::from_elf(&elf(rev)).unwrap().eco_version();
     assert_eq!((eco(0), eco(3), eco(101)), (0, 3, 7));
+}
+
+/// Far more than the ROM needs to reach its banner; a bound, not an expectation.
+const BANNER_BUDGET: u64 = 20_000_000;
+const SLICE: u64 = 100_000;
+const BOOT_LINE: &str = "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n";
+
+struct Boot {
+    uart0: String,
+    usb: String,
+    diagnostics: Vec<Diagnostic>,
+    stop: StopReason,
+    trace_hash: Option<u64>,
+    cycles: u64,
+}
+
+/// Runs the ROM of `revision` until its boot line is complete on UART0, or the budget runs out.
+/// Carriage returns are dropped: the ROM expands `\n` to `\r\n` on the UART.
+fn boot(revision: u16, config: SocConfig) -> Boot {
+    let mut machine = Esp32C3::new(RomImage::from_elf(&elf(revision)).unwrap(), &config);
+    let (mut uart0, mut usb, mut diagnostics) = (Vec::new(), Vec::new(), Vec::new());
+    let mut stop = StopReason::CycleBudget;
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
+    while stop == StopReason::CycleBudget
+        && machine.cycles().get() < BANNER_BUDGET
+        && !text(&uart0).contains(BOOT_LINE)
+    {
+        stop = machine.run_until(Cycles(machine.cycles().get() + SLICE));
+        uart0.extend(machine.take_console(ConsoleChannel::Uart0));
+        usb.extend(machine.take_console(ConsoleChannel::UsbSerialJtag));
+        diagnostics.extend(machine.drain_diagnostics());
+    }
+    Boot {
+        uart0: text(&uart0),
+        usb: text(&usb),
+        diagnostics,
+        stop,
+        trace_hash: machine.trace_hash(),
+        cycles: machine.cycles().get(),
+    }
+}
+
+fn banner(rom: &str, build: &str) -> String {
+    format!("ESP-ROM:{rom}\nBuild:{build}\n{BOOT_LINE}")
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rev3_rom_prints_its_banner_on_uart0() {
+    let boot = boot(3, SocConfig::default());
+    assert!(
+        boot.uart0
+            .starts_with(&banner("esp32c3-api1-20210207", "Feb  7 2021")),
+        "UART0 printed: {:?}\ndiagnostics: {:#?}",
+        boot.uart0,
+        boot.diagnostics
+    );
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rev3_rom_prints_the_same_banner_on_usb_serial_jtag() {
+    let boot = boot(3, SocConfig::default());
+    assert!(
+        boot.usb
+            .starts_with(&banner("esp32c3-api1-20210207", "Feb  7 2021")),
+        "USB printed: {:?}",
+        boot.usb
+    );
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rev0_and_rev101_roms_print_their_own_banners() {
+    assert!(
+        boot(0, SocConfig::default())
+            .uart0
+            .starts_with(&banner("esp32c3-20200918", "Sep 18 2020"))
+    );
+    assert!(
+        boot(101, SocConfig::default())
+            .uart0
+            .starts_with(&banner("esp32c3-eco7-20230720", "Jul 20 2023"))
+    );
+}
+
+/// Everything the ROM touches up to its banner is modelled: in strict mode the banner is complete
+/// before the machine stops, and no CPU exception occurred on the way.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rev3_banner_is_reached_without_any_unmodeled_access_or_exception() {
+    let boot = boot(
+        3,
+        SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        },
+    );
+    assert!(
+        boot.uart0
+            .starts_with(&banner("esp32c3-api1-20210207", "Feb  7 2021")),
+        "stopped early: {:?}\nUART0: {:?}",
+        boot.stop,
+        boot.uart0
+    );
+    assert!(
+        !boot
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, Diagnostic::Exception { .. })),
+        "{:#?}",
+        boot.diagnostics
+    );
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn two_boots_are_identical_down_to_the_trace_hash() {
+    let config = SocConfig {
+        trace_hash: true,
+        ..SocConfig::default()
+    };
+    let (a, b) = (boot(3, config), boot(3, config));
+    assert!(a.trace_hash.is_some());
+    assert_eq!(
+        (a.trace_hash, a.cycles, &a.uart0, &a.diagnostics),
+        (b.trace_hash, b.cycles, &b.uart0, &b.diagnostics)
+    );
 }
