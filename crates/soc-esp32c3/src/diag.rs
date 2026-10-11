@@ -128,6 +128,8 @@ pub enum Diagnostic {
         cause: Exception,
         tval: u32,
         pc: u32,
+        /// The stack pointer when the instruction started.
+        sp: u32,
     },
     /// Emitted once when [`MAX_DISTINCT_DIAGNOSTICS`] is reached.
     Suppressed,
@@ -239,9 +241,14 @@ impl fmt::Display for Diagnostic {
                     "access to the flash window at {vaddr:#010x} through MMU entry {entry} (content {content:#05x}, pc {pc:#010x}), which names a page beyond the end of the flash: 0 was returned; check the flash size of the device profile"
                 ),
             },
-            Diagnostic::Exception { cause, tval, pc } => write!(
+            Diagnostic::Exception {
+                cause,
+                tval,
+                pc,
+                sp,
+            } => write!(
                 f,
-                "CPU exception {cause:?} at pc {pc:#010x} (tval {tval:#010x})"
+                "CPU exception {cause:?} at pc {pc:#010x} (tval {tval:#010x}, sp {sp:#010x})"
             ),
             Diagnostic::Suppressed => write!(
                 f,
@@ -470,6 +477,7 @@ mod tests {
             cause: cpu_rv32::Exception::IllegalInstr,
             tval: 0,
             pc: 4,
+            sp: 0,
         });
         assert_eq!(
             strict.take_violation(),
@@ -540,6 +548,7 @@ mod tests {
             cause: cpu_rv32::Exception::IllegalInstr,
             tval: 0,
             pc: 4,
+            sp: 0,
         });
         assert_eq!(d.take_violation(), None);
     }
@@ -716,6 +725,39 @@ mod tests {
         assert!(
             nowhere.to_string().contains("no register is documented"),
             "{nowhere}"
+        );
+    }
+
+    #[test]
+    fn an_exception_names_its_pc_its_tval_and_the_stack_pointer() {
+        let text = Diagnostic::Exception {
+            cause: cpu_rv32::Exception::LoadAccessFault,
+            tval: 0x0000_0010,
+            pc: 0x4200_1234,
+            sp: 0x3FC9_0000,
+        }
+        .to_string();
+        assert_eq!(
+            text,
+            "CPU exception LoadAccessFault at pc 0x42001234 (tval 0x00000010, sp 0x3fc90000)"
+        );
+    }
+
+    #[test]
+    fn the_same_exception_at_the_same_pc_is_listed_once_whatever_the_stack_pointer() {
+        let mut d = Diagnostics::new(false);
+        for sp in [0x3FC9_0000, 0x3FC9_0010] {
+            d.record(Diagnostic::Exception {
+                cause: cpu_rv32::Exception::IllegalInstr,
+                tval: 0,
+                pc: 4,
+                sp,
+            });
+        }
+        assert_eq!(
+            d.drain().len(),
+            1,
+            "one line per cause and PC (decision E12)"
         );
     }
 }

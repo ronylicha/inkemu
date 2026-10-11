@@ -134,6 +134,8 @@ impl Esp32C3 {
             let pc = self.hart.pc;
             self.bus.set_pc(pc);
             let before = self.hart.cycles.get();
+            // The stack pointer the instruction started with, for the report of an exception.
+            let sp = self.hart.x[STACK_POINTER];
             match self.hart.step(&mut self.bus, &self.timing) {
                 StepOutcome::Waiting => {
                     // The CPU idles: device time jumps to the next instant a device asked for.
@@ -164,6 +166,7 @@ impl Esp32C3 {
                         cause: trap.cause,
                         tval: trap.tval,
                         pc,
+                        sp,
                     });
                 }
                 _ => {}
@@ -584,6 +587,7 @@ mod tests {
                     cause: expected,
                     tval: MISALIGNED,
                     pc: ROM_BASE + 4,
+                    sp: 0,
                 })
             );
         }
@@ -1439,5 +1443,25 @@ mod tests {
         assert_eq!(m.run_until(Cycles(1_000)), StopReason::CycleBudget);
         assert_eq!(m.resets(), 1);
         assert_eq!(m.drain_diagnostics(), Vec::new());
+    }
+
+    #[test]
+    fn an_exception_is_reported_with_the_stack_pointer_of_the_faulting_instruction() {
+        // Decision E12: one line per cause and PC, with what a developer needs to find the frame.
+        let mut m = machine(&[lui(2, 0x3FC9_0000), 0, HANG]);
+        m.run_until(Cycles(20));
+        let exception = m
+            .drain_diagnostics()
+            .into_iter()
+            .find(|d| matches!(d, Diagnostic::Exception { .. }));
+        assert_eq!(
+            exception,
+            Some(Diagnostic::Exception {
+                cause: Exception::IllegalInstr,
+                tval: 0,
+                pc: ROM_BASE + 4,
+                sp: 0x3FC9_0000,
+            })
+        );
     }
 }
