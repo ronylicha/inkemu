@@ -7,6 +7,8 @@ mod common;
 
 use emu_core::Cycles;
 use sha2::{Digest, Sha256};
+use soc_esp32c3::diag::Unsupported;
+use soc_esp32c3::memmap::{ROM_BASE, ROM_SIZE};
 use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason};
 
 /// SHA-256 of the merged reference image (`docs/research/sp1b-test-oracle.md`, §2).
@@ -56,6 +58,14 @@ const APPLICATION_ENTRY: u32 = 0x4038_0330;
 /// ROM below `0x4006_0000`, so neither is inside.
 const APPLICATION_CODE: [std::ops::Range<u32>; 2] =
     [0x4038_0000..0x4038_b514, 0x4200_0020..0x4200_e71c];
+/// The stock partition table of the Xteink X4 (repository fixture, built from `x4-stock.csv`):
+/// `nvs`, `otadata`, two OTA slots — `app0` at 0x10000, where the reference image has its
+/// application — `spiffs` and `coredump`; no factory application.
+const X4_STOCK_TABLE: &[u8] = include_bytes!("../../../tests/fixtures/partitions/x4-stock.bin");
+/// Flash offset of the partition table (ESP-IDF default, `CONFIG_PARTITION_TABLE_OFFSET`).
+const PARTITION_TABLE_OFFSET: usize = 0x8000;
+/// The instruction-bus addresses of the mask ROM (report BC §A.1).
+const MASK_ROM: std::ops::Range<u32> = ROM_BASE..ROM_BASE + ROM_SIZE;
 
 /// The ESP32-C3 (rev 3) mask ROM named by `INKEMU_ROM_ELF_DIR`; every failure says why and what to do.
 fn rom() -> RomImage {
@@ -120,11 +130,19 @@ struct Run {
 
 /// Runs the reference image until `done` accepts the console, the machine stops, or the budget ends.
 fn run(config: SocConfig, done: impl Fn(&str) -> bool) -> Run {
-    let mut machine = Esp32C3::with_flash(rom(), reference_flash(), &config).unwrap();
+    run_image(reference_flash(), config, |console, _| done(console))
+}
+
+/// Runs `image` until `done` accepts the console and the diagnostics seen so far, the machine
+/// stops, or the budget ends.
+fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic]) -> bool) -> Run {
+    let mut machine = Esp32C3::with_flash(rom(), image, &config).unwrap();
     let (mut uart0, mut diagnostics) = (Vec::new(), Vec::new());
     let mut stop = StopReason::CycleBudget;
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
-    while stop == StopReason::CycleBudget && machine.cycles().get() < BUDGET && !done(&text(&uart0))
+    while stop == StopReason::CycleBudget
+        && machine.cycles().get() < BUDGET
+        && !done(&text(&uart0), &diagnostics)
     {
         stop = machine.run_until(Cycles(machine.cycles().get() + SLICE));
         uart0.extend(machine.take_console(ConsoleChannel::Uart0));
@@ -261,6 +279,81 @@ fn without_strict_mode_the_wait_on_the_rtc_calibration_is_a_named_warning_not_a_
     );
 }
 
+/// Spec §5.1: "Reset → ROM → bootloader → table de partitions → `otadata` → application". The
+/// reference image has a factory application; the target device has none. Behind the stock X4
+/// table the unmodified bootloader finds a blank `otadata`, falls back to OTA slot 0 and records
+/// that choice: the mask ROM's sector-erase and page-program functions run. The flash is read-only
+/// in this plan, so both are refused, each once and by its own opcode, and nothing else is
+/// reported before the application reaches the RTC calibration.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn the_stock_x4_ota_layout_boots_and_only_the_otadata_update_is_refused() {
+    let mut image = reference_flash();
+    image[PARTITION_TABLE_OFFSET..PARTITION_TABLE_OFFSET + X4_STOCK_TABLE.len()]
+        .copy_from_slice(X4_STOCK_TABLE);
+    let is_rtc_calibration = |d: &Diagnostic| {
+        matches!(
+            d,
+            Diagnostic::UnmodeledMmio {
+                register: Some(("TIMG0", "RTCCALICFG")),
+                ..
+            }
+        )
+    };
+    let boot = run_image(image, SocConfig::default(), |_, diagnostics| {
+        diagnostics.iter().any(is_rtc_calibration)
+    });
+    assert!(
+        boot.console.starts_with(ROM_LINES),
+        "ROM part:\n{}",
+        boot.console
+    );
+    let lines: Vec<String> = boot.console.lines().map(mask_timestamp).collect();
+    let mut from = 0;
+    for expected in [
+        "I (#) boot: No factory image, trying OTA 0",
+        "I (#) boot: Loaded app from partition at offset 0x10000",
+        "I (#) boot: Set actual ota_seq=1 in otadata[0]",
+        FIRST_APPLICATION_LINE,
+    ] {
+        let at = lines[from..]
+            .iter()
+            .position(|line| line == expected)
+            .unwrap_or_else(|| panic!("`{expected}` is missing, or out of order:\n{lines:#?}"));
+        from += at + 1;
+    }
+    let reached = boot
+        .diagnostics
+        .iter()
+        .position(is_rtc_calibration)
+        .unwrap_or_else(|| {
+            panic!(
+                "the application never reached TIMG0.RTCCALICFG: {:#?}\nconsole:\n{}",
+                boot.diagnostics, boot.console
+            )
+        });
+    let before: Vec<(Unsupported, bool)> = boot.diagnostics[..reached]
+        .iter()
+        .map(|diagnostic| match diagnostic {
+            Diagnostic::Unsupported { what, pc } => (*what, MASK_ROM.contains(pc)),
+            other => panic!("unexpected diagnostic before the RTC calibration: {other}"),
+        })
+        .collect();
+    assert_eq!(
+        before,
+        [
+            (Unsupported::FlashCommand { opcode: 0x20 }, true),
+            (Unsupported::FlashCommand { opcode: 0x02 }, true),
+        ],
+        "exactly the sector erase and the page program of the otadata update, each run by the mask ROM"
+    );
+    assert_eq!(
+        boot.stop,
+        StopReason::CycleBudget,
+        "nothing stops a lenient run"
+    );
+}
+
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
 fn two_boots_of_the_reference_image_are_identical_down_to_the_trace_hash() {
@@ -274,6 +367,16 @@ fn two_boots_of_the_reference_image_are_identical_down_to_the_trace_hash() {
         })
     };
     let (first, second) = (boot(), boot());
+    // Two runs that both exhausted the budget before the application would compare equal too.
+    assert!(
+        first
+            .console
+            .lines()
+            .map(mask_timestamp)
+            .any(|line| line == FIRST_APPLICATION_LINE),
+        "the boot must reach the application:\n{}",
+        first.console
+    );
     assert!(first.trace_hash.is_some());
     assert_eq!(
         first.trace_hash, second.trace_hash,

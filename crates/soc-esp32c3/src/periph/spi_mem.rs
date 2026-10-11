@@ -24,8 +24,6 @@ const WORD_BYTES: usize = 4;
 
 /// `CMD` bit 18: run the transfer described by `USER`, `USER1`, `USER2`, `ADDR` and the lengths.
 const CMD_USR: u32 = 1 << 18;
-/// `CMD` bit 17, `FLASH_PE`: a user-defined program/erase; its opcode is the one in `USER2`.
-const CMD_PE: u32 = 1 << 17;
 const CMD_RDID: u32 = 1 << 28;
 const CMD_RDSR: u32 = 1 << 27;
 /// The hard-wired commands: `CMD` bit, the opcode the controller sends (ESP-IDF `spi_flash_defs.h`,
@@ -154,8 +152,8 @@ pub struct Spi1 {
     registers: Storage,
     flash: Box<dyn FlashDevice>,
     /// The commands the chip refused, oldest first. One `CMD` write runs at most one command per
-    /// `CMD` bit, so a write adds at most `HARD_WIRED.len() + 2` entries; the bus drains them after
-    /// every access.
+    /// command bit (the hard-wired ones and `USR`), so a write adds at most `HARD_WIRED.len() + 1`
+    /// entries; the bus drains them after every access.
     unsupported: VecDeque<Unsupported>,
 }
 
@@ -299,15 +297,24 @@ impl Spi1 {
     }
 
     /// Runs every command whose bit is set. Transfers complete at once, so `CMD` reads 0 afterwards.
+    ///
+    /// `CMD` bit 17, `FLASH_PE`, is not a command: "In user mode it is set to indicate that
+    /// program/erase operation will be triggered. The bit is combined with `spi_mem_usr` bit" (ESP-IDF
+    /// v5.5.2 `components/soc/esp32c3/register/soc/spi_mem_reg.h:113-116`). It accompanies the bit
+    /// that starts the transfer: the rev3 ROM's `SPI_sector_erase` stores `0x01020000`, `FLASH_SE |
+    /// FLASH_PE` (`lui a4,0x1020` at `0x4004d296`, store at `0x4004d29a`), and ESP-IDF's
+    /// `spimem_flash_ll_user_start(dev, pe_ops)` ORs in `0x60000`, `USR | FLASH_PE`, for every
+    /// program or erase (`components/hal/esp32c3/include/hal/spimem_flash_ll.h:391-395`). This model
+    /// has no use for the indication (program/erase suspend is not modelled: `SUS_STATUS` is
+    /// storage), so the flag changes nothing: the command bit it comes with runs once, as without it.
+    ///
+    /// ASSUMPTION: `FLASH_PE` written without any command bit starts no transfer and self-clears. No
+    /// ROM or ESP-IDF v5.5.2 code writes it alone; the SP1b-4 lockstep, or a device, settles it.
     fn run(&mut self, command_bits: u32) {
         for (bit, opcode) in HARD_WIRED {
             if command_bits & bit != 0 {
                 self.run_hard_wired(bit, opcode);
             }
-        }
-        if command_bits & CMD_PE != 0 {
-            let opcode = self.user_opcode();
-            self.run_hard_wired(CMD_PE, opcode);
         }
         if command_bits & CMD_USR != 0 {
             self.run_user();
@@ -342,6 +349,8 @@ mod tests {
     /// `USER` bit 31: the transfer has a command phase (every measured one does, so the model never
     /// tests the bit and the constant lives with the tests that build `USER` values).
     const USR_COMMAND: u32 = 1 << 31;
+    /// `CMD` bit 17, `FLASH_PE`: a flag that accompanies a command bit (see `Spi1::run`).
+    const CMD_FLASH_PE: u32 = 1 << 17;
 
     fn spi1() -> Spi1 {
         Spi1::new(Box::new(NorFlash::blank(FlashConfig::default())))
@@ -614,20 +623,65 @@ mod tests {
     }
 
     #[test]
-    fn the_program_erase_bit_sends_the_opcode_found_in_user2() {
+    fn the_rom_sector_erase_sets_the_program_erase_flag_and_is_one_command() {
+        // The rev3 ROM's `SPI_sector_erase` stores CMD = 0x01020000, `FLASH_SE | FLASH_PE`
+        // (`lui a4,0x1020` at 0x4004d296, store at 0x4004d29a).
+        const ROM_SECTOR_ERASE: u32 = 0x0102_0000;
+        assert_eq!(ROM_SECTOR_ERASE, (1 << 24) | CMD_FLASH_PE);
         let (mut spi, seen) = recording_spi1();
-        spi.write(USER2, 0x7000_0020);
-        assert!(spi.write(CMD, CMD_PE));
+        assert!(spi.write(CMD, ROM_SECTOR_ERASE));
         assert_eq!(seen.borrow().as_slice(), [(0x20, None, 0, Vec::new())]);
         assert_eq!(spi.read(CMD), Some(0), "self-clears");
-        // On the read-only chip the same bit is refused by name.
+        // On the read-only chip the erase is refused once, by its own opcode: `USER2` (0x00 in its low
+        // byte at reset) is not a second command.
         let mut refused = spi1();
-        refused.write(USER2, 0x7000_0020);
-        refused.write(CMD, CMD_PE);
+        refused.write(CMD, ROM_SECTOR_ERASE);
         assert_eq!(
             refused.take_unsupported(),
             Some(Unsupported::FlashCommand { opcode: 0x20 })
         );
+        assert_eq!(refused.take_unsupported(), None, "one command, one report");
+    }
+
+    #[test]
+    fn an_esp_idf_program_sets_the_flag_with_usr_and_its_opcode_runs_once() {
+        // `spimem_flash_ll_user_start(dev, pe_ops = true)` ORs 0x60000 into CMD: `USR | FLASH_PE`.
+        const USER_START_PE: u32 = 0x0006_0000;
+        assert_eq!(USER_START_PE, CMD_USR | CMD_FLASH_PE);
+        let page_program = |spi: &mut Spi1| {
+            spi.write(W0, 0x0403_0201);
+            spi.write(USER, USR_COMMAND | USR_ADDR | USR_MOSI);
+            spi.write(USER1, 23 << 26);
+            spi.write(USER2, 0x7000_0002);
+            spi.write(ADDR, 0xE000);
+            spi.write(MOSI_DLEN, 31);
+            spi.write(CMD, USER_START_PE);
+        };
+        let (mut spi, seen) = recording_spi1();
+        page_program(&mut spi);
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [(0x02, Some(0xE000), 0, vec![1, 2, 3, 4])],
+            "one transfer, with its address and its data"
+        );
+        let mut refused = spi1();
+        page_program(&mut refused);
+        assert_eq!(
+            refused.take_unsupported(),
+            Some(Unsupported::FlashCommand { opcode: 0x02 })
+        );
+        assert_eq!(refused.take_unsupported(), None, "one command, one report");
+    }
+
+    #[test]
+    fn the_program_erase_flag_alone_starts_no_command() {
+        // Pins the ASSUMPTION documented on `Spi1::run`.
+        let (mut spi, seen) = recording_spi1();
+        spi.write(USER2, 0x7000_0020);
+        assert!(spi.write(CMD, CMD_FLASH_PE));
+        assert_eq!(seen.borrow().as_slice(), []);
+        assert_eq!(spi.read(CMD), Some(0), "self-clears");
+        assert_eq!(spi.take_unsupported(), None);
     }
 
     #[test]
