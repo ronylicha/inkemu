@@ -128,7 +128,7 @@ impl DeviceProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soc_esp32c3::test_support::flat_rom;
+    use soc_esp32c3::test_support::{HANG, flat_rom};
 
     const VALID: &str = "id = \"demo\"\nname = \"Demo board\"\n\n[soc]\nfamily = \"esp32c3\"\nrevision = \"v1.1\"\n";
 
@@ -238,7 +238,7 @@ mod tests {
     fn instantiated_machine_sits_at_the_reset_vector() {
         let machine = builtin("x4")
             .unwrap()
-            .instantiate(flat_rom(&[0x0000_006f]), MachineOptions::default());
+            .instantiate(flat_rom(&[HANG]), MachineOptions::default());
         assert_eq!(machine.pc(), 0x4000_0000);
     }
 }
