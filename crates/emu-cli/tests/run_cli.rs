@@ -443,3 +443,50 @@ fn x4_without_a_flash_image_loops_on_the_invalid_header_of_an_erased_chip() {
         "the header line says so"
     );
 }
+
+/// The milestone through the real command: ROM, bootloader, first application line, strict stop.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn x4_boots_the_reference_firmware_to_its_first_application_line() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let flash = std::env::var("INKEMU_REF_FLASH").expect("set INKEMU_REF_FLASH");
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--strict-mmio",
+            "--rom-dir",
+            &rom_dir,
+            "--flash",
+            &flash,
+        ])
+        .assert()
+        .code(3)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    assert!(console.contains("entry 0x403cbf1a\n"), "{console}");
+    assert!(
+        console.contains(") boot: ESP-IDF v5.5.2 2nd stage bootloader\n"),
+        "{console}"
+    );
+    assert!(
+        console.contains(") boot.esp32c3: SPI Mode       : DIO\n"),
+        "{console}"
+    );
+    assert!(
+        console.contains(") boot: Disabling RNG early entropy source...\n"),
+        "{console}"
+    );
+    assert!(console.contains(") cpu_start: Unicore app\n"), "{console}");
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        log.contains("stopped by --strict-mmio") && log.contains("TIMG0.RTCCALICFG"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("warning:"),
+        "nothing was reported before the stop: {log}"
+    );
+}

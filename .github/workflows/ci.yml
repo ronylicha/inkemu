@@ -78,4 +78,40 @@ jobs:
           INKEMU_ROM_ELF_DIR: ${{ runner.temp }}/rom
         run: |
           cargo test --release -p soc-esp32c3 --test real_rom -- --ignored
-          cargo test --release -p emu-cli --test run_cli -- --ignored
+          cargo test --release -p emu-cli --test run_cli -- --ignored --skip x4_boots_the_reference_firmware
+  reference-boot:
+    # Boots the reference firmware (stock ESP-IDF bootloader + hello_world) from the real mask ROM to
+    # the first line of the application. The firmware is built here, inside the pinned ESP-IDF image,
+    # and checked against pinned SHA-256 values; it is never stored in this repository. The cache
+    # saves the build and replaces no check: the image is re-hashed on every run.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.99.0" }
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/rom
+          key: esp-rom-elfs-20260528
+      - id: firmware
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/reference-firmware
+          key: reference-firmware-${{ hashFiles('tools/reference-firmware/**', 'tools/docker/esp-idf/Dockerfile', 'tools/conformance/versions.env') }}
+      - name: Build the reference firmware
+        if: steps.firmware.outputs.cache-hit != 'true'
+        run: tools/reference-firmware/build.sh "$RUNNER_TEMP/reference-firmware"
+      - name: Verify the reference image
+        working-directory: ${{ runner.temp }}/reference-firmware
+        run: sha256sum -c "$GITHUB_WORKSPACE/tools/reference-firmware/SHA256SUMS.output"
+      - name: Fetch and verify the mask ROMs
+        run: cargo run --release -p emu-cli -- rom fetch --all --rom-dir "$RUNNER_TEMP/rom"
+      - name: Boot the reference firmware
+        env:
+          INKEMU_ROM_ELF_DIR: ${{ runner.temp }}/rom
+          INKEMU_REF_FLASH: ${{ runner.temp }}/reference-firmware/flash_hello.bin
+        run: |
+          cargo test --release -p soc-esp32c3 --test reference_boot -- --ignored
+          cargo test --release -p emu-cli --test run_cli x4_boots_the_reference_firmware -- --ignored
