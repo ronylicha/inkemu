@@ -9,7 +9,7 @@ use crate::rom::RomImage;
 use cpu_rv32::{
     DatasheetTiming, Exception, Hart, HartConfig, MisalignedPolicy, StepOutcome, VendorCsrs,
 };
-use emu_core::{Cycles, Frequency, TimingModel, TraceHash, VirtualClock};
+use emu_core::{Cycles, Frequency, TimingModel, TraceHash};
 
 /// The two serial consoles the mask ROM prints on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,8 +37,6 @@ pub struct Esp32C3 {
     hart: Hart,
     bus: SocBus,
     timing: DatasheetTiming,
-    /// Device time: follows the CPU clock the firmware selects.
-    clock: VirtualClock,
     trace: Option<TraceHash>,
 }
 
@@ -79,17 +77,18 @@ impl Esp32C3 {
             misaligned: MisalignedPolicy::Allow,
             vendor_csrs: VendorCsrs::Esp32C3,
         };
-        let bus = SocBus::new(rom, flash, config);
+        let mut bus = SocBus::new(rom, flash, config);
         let (sysclk_conf, cpu_per_conf) = bus.periph.system.clock_registers();
         // INVARIANT: the reset values of the two clock registers select the crystal with a divider
-        // of 2 (decision D21), for which a frequency always exists: 20 MHz. The fallback is never
-        // taken; it is the undivided crystal, 40 MHz, and not the reset frequency.
-        let frequency = clock::cpu_frequency(sysclk_conf, cpu_per_conf).unwrap_or(clock::XTAL);
+        // of 2 (decisions D21 and E8), which is a selection `cpu_clock` knows: the fallback is never
+        // taken, and it is that same power-on clock.
+        bus.ctx.set_clock(
+            clock::cpu_clock(sysclk_conf, cpu_per_conf).unwrap_or(clock::CpuClock::POWER_ON),
+        );
         Esp32C3 {
             hart: Hart::new(RESET_PC, hart_config),
             bus,
             timing: DatasheetTiming,
-            clock: VirtualClock::new(frequency),
             trace: config.trace_hash.then(TraceHash::new),
         }
     }
@@ -100,6 +99,7 @@ impl Esp32C3 {
         while self.hart.cycles.get() < limit.get() {
             let pc = self.hart.pc;
             self.bus.set_pc(pc);
+            let before = self.hart.cycles.get();
             match self.hart.step(&mut self.bus, &self.timing) {
                 StepOutcome::Waiting => return StopReason::Idle,
                 // An `ecall` is a request to the trap handler, not a fault worth reporting.
@@ -112,7 +112,9 @@ impl Esp32C3 {
                 }
                 _ => {}
             }
-            if self.bus.periph.system.take_clock_change() {
+            // Device time follows the CPU: the cycles of this instruction, at the clock it ran on.
+            self.bus.ctx.advance(self.hart.cycles.get() - before);
+            if self.bus.ctx.take_clock_written() {
                 self.retune(pc);
             }
             if let Some(trace) = &mut self.trace {
@@ -129,8 +131,8 @@ impl Esp32C3 {
     /// cycles last what the new selection says.
     fn retune(&mut self, pc: u32) {
         let (sysclk_conf, cpu_per_conf) = self.bus.periph.system.clock_registers();
-        match clock::cpu_frequency(sysclk_conf, cpu_per_conf) {
-            Some(frequency) => self.clock.set_frequency(self.hart.cycles, frequency),
+        match clock::cpu_clock(sysclk_conf, cpu_per_conf) {
+            Some(selected) => self.bus.ctx.set_clock(selected),
             // Decision D22: the previous frequency stays, and the selection is reported.
             None => self.bus.ctx.diag.record(Diagnostic::Unsupported {
                 what: Unsupported::ClockSource {
@@ -144,14 +146,14 @@ impl Esp32C3 {
 
     /// The CPU clock frequency the firmware selected.
     #[must_use]
-    pub const fn cpu_frequency(&self) -> Frequency {
-        self.clock.frequency()
+    pub fn cpu_frequency(&self) -> Frequency {
+        self.bus.ctx.clock().cpu_frequency()
     }
 
-    /// Time elapsed on the device since reset, following every CPU clock switch.
+    /// Time elapsed on the device since power-on, following every CPU clock switch.
     #[must_use]
     pub fn device_time_nanos(&self) -> u64 {
-        self.clock.nanos_at(self.hart.cycles)
+        clock::TIME_BASE.cycles_to_nanos(self.bus.ctx.now())
     }
 
     /// CPU clock cycles elapsed since reset.

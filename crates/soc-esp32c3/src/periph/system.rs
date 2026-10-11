@@ -85,7 +85,6 @@ const XTAL_FREQ_MHZ: u32 = crate::clock::XTAL_MHZ;
 pub struct System {
     sysclk_writable: u32,
     registers: Storage,
-    clock_changed: bool,
 }
 
 impl System {
@@ -94,7 +93,6 @@ impl System {
         System {
             sysclk_writable: SYSCLK_RESET,
             registers: Storage::accepted(SYSTEM_BASE, &ACCEPTED),
-            clock_changed: false,
         }
     }
 
@@ -107,11 +105,6 @@ impl System {
             // read always answers and the fallback is never taken.
             self.registers.read(CPU_PER_CONF).unwrap_or(0),
         )
-    }
-
-    /// Whether a clock register was written since the last call.
-    pub(crate) fn take_clock_change(&mut self) -> bool {
-        std::mem::take(&mut self.clock_changed)
     }
 }
 
@@ -129,15 +122,15 @@ impl Peripheral<Ctx> for System {
         self.registers.read(offset)
     }
 
-    fn write(&mut self, _ctx: &mut Ctx, offset: u32, value: u32) -> bool {
+    fn write(&mut self, ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         match offset {
             SYSCLK_CONF => {
                 self.sysclk_writable = value & SYSCLK_WRITABLE;
-                self.clock_changed = true;
+                ctx.clock_written();
                 true
             }
             CPU_PER_CONF => {
-                self.clock_changed = true;
+                ctx.clock_written();
                 self.registers.write(offset, value)
             }
             _ => self.registers.write(offset, value),
@@ -202,13 +195,13 @@ mod tests {
         let ctx = &mut Ctx::default();
         let mut sys = System::new();
         assert_eq!(sys.clock_registers(), (0x2_8001, 0xC), "reset: BA §5");
-        assert!(!sys.take_clock_change());
+        assert!(!ctx.take_clock_written());
         let cpu_per_conf = svd_regs::esp32c3::addr("SYSTEM", "CPU_PER_CONF") - SYSTEM_BASE;
         assert!(sys.write(ctx, cpu_per_conf, 0xD));
-        assert!(sys.take_clock_change());
-        assert!(!sys.take_clock_change(), "taken once");
+        assert!(ctx.take_clock_written());
+        assert!(!ctx.take_clock_written(), "taken once");
         sys.write(ctx, SYSCLK_CONF, 0x400);
-        assert!(sys.take_clock_change());
+        assert!(ctx.take_clock_written());
         assert_eq!(sys.clock_registers(), (0x2_8400, 0xD));
         sys.write(
             ctx,
@@ -216,7 +209,7 @@ mod tests {
             0,
         );
         assert!(
-            !sys.take_clock_change(),
+            !ctx.take_clock_written(),
             "a clock gate is not the CPU clock"
         );
     }
