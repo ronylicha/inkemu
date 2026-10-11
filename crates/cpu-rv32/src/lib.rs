@@ -10,7 +10,7 @@ pub use instr::*;
 #[cfg(any(test, feature = "test-support"))]
 pub mod asm;
 pub mod csr;
-mod csr_esp32c3;
+pub mod csr_esp32c3;
 mod dcache;
 mod exec;
 pub mod hart;

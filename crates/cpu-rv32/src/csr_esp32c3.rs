@@ -46,7 +46,9 @@ impl Esp32C3Csrs {
         if self.pcmr & PCMR_ENABLE == 0 {
             return self.count;
         }
-        // Other event selections (hazards, branches, loads...) are not modelled: the counter then stands still.
+        // ASSUMPTION: when both the cycle and the instruction events are selected the counter counts
+        // cycles, and any other event selection (hazards, branches, loads...) leaves it standing still;
+        // the SP1b-4 lockstep against silicon-faithful traces settles it.
         let elapsed = if self.pcer & PCER_CYCLES != 0 {
             cycles.get().wrapping_sub(self.snapshot_cycles)
         } else if self.pcer & PCER_INSTRUCTIONS != 0 {
@@ -152,6 +154,14 @@ mod tests {
         c.write(PCER_USER, PCER_INSTRUCTIONS, Cycles(0), 0);
         c.write(PCMR_USER, 1, Cycles(0), 0);
         assert_eq!(c.read(PCCR_USER, Cycles(400), 25), Some(25));
+    }
+
+    #[test]
+    fn selecting_both_events_counts_cycles() {
+        let mut c = Esp32C3Csrs::default();
+        c.write(PCER_USER, PCER_CYCLES | PCER_INSTRUCTIONS, Cycles(0), 0);
+        c.write(PCMR_USER, PCMR_ENABLE, Cycles(0), 0);
+        assert_eq!(c.read(PCCR_USER, Cycles(400), 25), Some(400));
     }
 
     #[test]

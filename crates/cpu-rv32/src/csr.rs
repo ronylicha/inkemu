@@ -202,6 +202,7 @@ fn replace_high(v: u64, high32: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::csr_esp32c3::PCER_USER;
 
     #[test]
     fn mstatus_keeps_mpp_at_machine_and_masks_unsupported_bits() {
@@ -300,9 +301,9 @@ mod tests {
     fn vendor_csrs_exist_only_when_selected() {
         let mut generic = CsrFile::new(VendorCsrs::None);
         let mut c3 = CsrFile::new(VendorCsrs::Esp32C3);
-        assert!(!generic.write(0x800, 1));
-        assert_eq!(generic.read(0x800, Cycles::ZERO, 0), None);
-        assert!(c3.write(0x800, 1));
-        assert_eq!(c3.read(0x800, Cycles::ZERO, 0), Some(1));
+        assert!(!generic.write(PCER_USER, 1));
+        assert_eq!(generic.read(PCER_USER, Cycles::ZERO, 0), None);
+        assert!(c3.write(PCER_USER, 1));
+        assert_eq!(c3.read(PCER_USER, Cycles::ZERO, 0), Some(1));
     }
 }

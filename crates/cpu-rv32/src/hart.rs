@@ -208,6 +208,7 @@ mod tests {
     use super::*;
     use crate::asm::*;
     use crate::csr::*;
+    use crate::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
     use emu_core::{InstrClass, Ram, TimingModel};
 
     #[derive(Debug)]
@@ -907,19 +908,27 @@ mod tests {
     fn esp32c3_cycle_counter_advances_between_two_reads() {
         // The ROM's ets_delay_us enables the counter through 0x800/0x801 and polls 0x802.
         let (mut hart, mut ram) = c3_machine(&[
-            csrrwi(0, 0x800, 1),
-            csrrwi(0, 0x801, 1),
-            csrrs(5, 0x802, 0),
+            csrrwi(0, PCER_USER, 1),
+            csrrwi(0, PCMR_USER, 1),
+            csrrs(5, PCCR_USER, 0),
             addi(0, 0, 0),
-            csrrs(6, 0x802, 0),
+            csrrs(6, PCCR_USER, 0),
         ]);
         run(&mut hart, &mut ram, 5);
         assert_eq!(hart.x[6] - hart.x[5], 2);
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn an_interrupt_line_beyond_31_is_refused() {
+        let (mut hart, _) = machine(&[], MisalignedPolicy::Trap);
+        hart.set_interrupt_pending(32, true);
+    }
+
     #[test]
     fn vendor_csrs_do_not_exist_on_a_generic_hart() {
-        let (mut hart, mut ram) = machine(&[csrrs(5, 0x802, 0)], MisalignedPolicy::Trap);
+        let (mut hart, mut ram) = machine(&[csrrs(5, PCCR_USER, 0)], MisalignedPolicy::Trap);
         let outcome = run(&mut hart, &mut ram, 1);
         assert!(
             matches!(outcome[0], StepOutcome::Trapped { trap, .. } if trap.cause == Exception::IllegalInstr)
