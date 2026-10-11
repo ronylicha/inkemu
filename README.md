@@ -2,7 +2,21 @@
 
 **A binary-level emulator for embedded e-ink devices.** inkemu runs the real, unmodified firmware image of a device on a virtual replica of its hardware. You can check how a firmware renders and behaves before you flash it.
 
-> **Status: design phase.** The architecture is specified; implementation has not started yet. See the [design spec](docs/superpowers/specs/2026-10-11-inkemu-design.md) and the [roadmap](#roadmap).
+> **Status: early development.** Sub-project 1a is implemented: the RV32IMC core (validated against riscv-tests and, through RISCOF, against the Sail reference model with riscv-arch-test), the ESP-IDF image and partition-table tooling, and the `inkemu inspect` and `inkemu rvtest` commands. It cannot boot a firmware yet: the ESP32-C3 SoC and the boot chain (sub-project 1b) are next. See the [design spec](docs/superpowers/specs/2026-10-11-inkemu-design.md) and the [roadmap](#roadmap).
+
+## Build & try
+
+```bash
+cargo build --release
+
+# Describe an ESP-IDF application image and check that inkemu can load it.
+target/release/inkemu inspect <app.bin>
+
+# Run a bare-metal RISC-V conformance test (riscv-tests or riscv-arch-test) and print its verdict.
+target/release/inkemu rvtest <elf>
+```
+
+`inspect` expects the application `.bin` (not a full flash dump or an encrypted `.xota` update) and explains what is wrong when it refuses a file. For the pinned conformance suites and how to run riscv-arch-test against Sail, see [tools/conformance/README.md](tools/conformance/README.md).
 
 ## Why
 
@@ -30,7 +44,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 
 ## Roadmap
 
-1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs
+1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a, the core, firmware tooling and CLI, is done; 1b, the SoC and the boot, is next.*
 2. X4 peripherals, desktop UI, e-ink rendering: **first visual milestone**
 3. X3 support (UC8253 panel, I2C sensors)
 4. Debugging, resource monitor, headless test runner
@@ -48,6 +62,8 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 ## Français
 
 inkemu est un émulateur **au niveau binaire** d'appareils embarqués à écran e-ink. Il exécute le firmware réel, sans recompilation, sur une réplique virtuelle du matériel : mémoire exacte, modèle de cycles, rendu e-ink fidèle (ghosting, niveaux de gris, durées de rafraîchissement), Wi-Fi avec accès Internet réel, BLE, débogage GDB et tests automatisés. Il tourne sur Linux, macOS, Windows et dans le navigateur. Les liseuses Xteink sont les premières cibles ; d'autres appareils suivront.
+
+**État :** le cœur RV32IMC, la lecture des images ESP-IDF et les commandes `inkemu inspect` et `inkemu rvtest` sont en place (sous-projet 1a) ; le SoC ESP32-C3 et le démarrage du firmware (sous-projet 1b) sont la prochaine étape.
 
 ## License
 

@@ -1,0 +1,28 @@
+[package]
+name = "emu-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "inkemu"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+emu-core.workspace = true
+cpu-rv32.workspace = true
+firmware.workspace = true
+clap.workspace = true
+goblin.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile = "3"
+firmware = { workspace = true, features = ["test-support"] }

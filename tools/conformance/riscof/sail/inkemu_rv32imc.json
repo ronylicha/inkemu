@@ -1,0 +1,370 @@
+// Sail RISC-V configuration (applied over the --rv32 defaults) that makes the reference model the
+// same machine as inkemu: RV32IMC + Zicsr + Zifencei, M-mode only, fixed misa, and misaligned
+// loads/stores raising an address-misaligned exception (the ISA YAML declares no hardware support).
+{
+  "base": {
+    "hpmevent_width_bits": 32,
+    "mstatus": { "fs_legal_states": "ExtContext_Off", "vs_legal_states": "ExtContext_Off" }
+  },
+  "memory": {
+    "physaddr_bits": 32,
+    "misaligned": {
+      "exceptions": { "load_store": { "Some": "AlignmentException" } }
+    }
+  },
+  "extensions": {
+    "A": {
+      "supported": false,
+      "mutable_misa": false
+    },
+    "F": {
+      "supported": false,
+      "mutable_misa": false
+    },
+    "D": {
+      "supported": false,
+      "mutable_misa": false
+    },
+    "V": {
+      "support_level": "Disabled",
+      "mutable_misa": false
+    },
+    "B": {
+      "supported": false,
+      "mutable_misa": false
+    },
+    "S": {
+      "supported": false,
+      "mutable_misa": false
+    },
+    "U": {
+      "supported": false,
+      "mutable_misa": false
+    },
+    "H": {
+      "supported": false,
+      "mutable_misa": false
+    },
+    "Zibi": {
+      "supported": false
+    },
+    "Zic64b": {
+      "supported": false
+    },
+    "Zicbom": {
+      "supported": false
+    },
+    "Zicbop": {
+      "supported": false
+    },
+    "Zicboz": {
+      "supported": false
+    },
+    "Ziccamoa": {
+      "supported": false
+    },
+    "Ziccamoc": {
+      "supported": false
+    },
+    "Ziccif": {
+      "supported": false
+    },
+    "Zicclsm": {
+      "supported": false
+    },
+    "Ziccrse": {
+      "supported": false
+    },
+    "Zicfilp": {
+      "supported": false
+    },
+    "Zicfiss": {
+      "supported": false
+    },
+    "Zicond": {
+      "supported": false
+    },
+    "Zicntr": {
+      "supported": false
+    },
+    "Zihintntl": {
+      "supported": false
+    },
+    "Zihintpause": {
+      "supported": false
+    },
+    "Zihpm": {
+      "supported": false
+    },
+    "Zilx": {
+      "supported": false
+    },
+    "Zimop": {
+      "supported": false
+    },
+    "Zmmul": {
+      "supported": false
+    },
+    "Zaamo": {
+      "supported": false
+    },
+    "Zabha": {
+      "supported": false
+    },
+    "Zacas": {
+      "supported": false
+    },
+    "Zalrsc": {
+      "supported": false
+    },
+    "Zama16b": {
+      "supported": false
+    },
+    "Zawrs": {
+      "supported": false
+    },
+    "Zfa": {
+      "supported": false
+    },
+    "Zfbfmin": {
+      "supported": false
+    },
+    "Zfh": {
+      "supported": false
+    },
+    "Zfhmin": {
+      "supported": false
+    },
+    "Zfinx": {
+      "supported": false
+    },
+    "Zdinx": {
+      "supported": false
+    },
+    "Zca": { "supported": true },
+    "Zcf": {
+      "supported": false
+    },
+    "Zcd": {
+      "supported": false
+    },
+    "Zcb": {
+      "supported": false
+    },
+    "Zcmop": {
+      "supported": false
+    },
+    "Zba": {
+      "supported": false
+    },
+    "Zbb": {
+      "supported": false
+    },
+    "Zbs": {
+      "supported": false
+    },
+    "Zbc": {
+      "supported": false
+    },
+    "Zbkb": {
+      "supported": false
+    },
+    "Zbkc": {
+      "supported": false
+    },
+    "Zbkx": {
+      "supported": false
+    },
+    "Zknd": {
+      "supported": false
+    },
+    "Zkne": {
+      "supported": false
+    },
+    "Zknh": {
+      "supported": false
+    },
+    "Zkr": {
+      "supported": false
+    },
+    "Zksed": {
+      "supported": false
+    },
+    "Zksh": {
+      "supported": false
+    },
+    "Zkt": {
+      "supported": false
+    },
+    "Zhinx": {
+      "supported": false
+    },
+    "Zhinxmin": {
+      "supported": false
+    },
+    "Zvabd": {
+      "supported": false
+    },
+    "Zvfbfmin": {
+      "supported": false
+    },
+    "Zvfbfwma": {
+      "supported": false
+    },
+    "Zvfh": {
+      "supported": false
+    },
+    "Zvfhmin": {
+      "supported": false
+    },
+    "Zvbb": {
+      "supported": false
+    },
+    "Zvbc": {
+      "supported": false
+    },
+    "Zvkb": {
+      "supported": false
+    },
+    "Zvkg": {
+      "supported": false
+    },
+    "Zvkned": {
+      "supported": false
+    },
+    "Zvknha": {
+      "supported": false
+    },
+    "Zvknhb": {
+      "supported": false
+    },
+    "Zvksed": {
+      "supported": false
+    },
+    "Zvksh": {
+      "supported": false
+    },
+    "Zvkt": {
+      "supported": false
+    },
+    "Ssccptr": {
+      "supported": false
+    },
+    "Sdtrig": {
+      "supported": false
+    },
+    "Sscofpmf": {
+      "supported": false
+    },
+    "Sha": {
+      "supported": false
+    },
+    "Shcounterenw": {
+      "supported": false
+    },
+    "Sscounterenw": {
+      "supported": false
+    },
+    "Shvsatpa": {
+      "supported": false
+    },
+    "Shvstvala": {
+      "supported": false
+    },
+    "Shvstvecd": {
+      "supported": false
+    },
+    "Ssstrict": {
+      "supported": false
+    },
+    "Sstc": {
+      "supported": false
+    },
+    "Shgatpa": {
+      "supported": false
+    },
+    "Shtvala": {
+      "supported": false
+    },
+    "Sstvala": {
+      "supported": false
+    },
+    "Sstvecd": {
+      "supported": false
+    },
+    "Svade": {
+      "supported": false
+    },
+    "Svadu": {
+      "supported": false
+    },
+    "Svinval": {
+      "supported": false
+    },
+    "Svrsw60t59b": {
+      "supported": false
+    },
+    "Svnapot": {
+      "supported": false
+    },
+    "Svukte": {
+      "supported": false
+    },
+    "Ssnpm": {
+      "supported": false
+    },
+    "Smnpm": {
+      "supported": false
+    },
+    "Smmpm": {
+      "supported": false
+    },
+    "Smcntrpmf": {
+      "supported": false
+    },
+    "Smdbltrp": {
+      "supported": false
+    },
+    "Ssdbltrp": {
+      "supported": false
+    },
+    "Svbare": {
+      "supported": false
+    },
+    "Sv32": {
+      "supported": false
+    },
+    "Sv39": {
+      "supported": false
+    },
+    "Sv48": {
+      "supported": false
+    },
+    "Sv57": {
+      "supported": false
+    },
+    "Stateen": {
+      "Smstateen": {
+        "supported": false
+      },
+      "Ssstateen": {
+        "supported": false
+      }
+    },
+    "Ssqosid": {
+      "supported": false
+    },
+    "Svpbmt": {
+      "supported": false
+    },
+    "Svvptc": {
+      "supported": false
+    },
+    "M": {
+      "mutable_misa": false
+    },
+    "C": {
+      "mutable_misa": false
+    }
+  }
+}

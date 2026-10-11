@@ -1,0 +1,162 @@
+//! Every message states the cause and what the user can do about it.
+//!
+//! Remedy convention (checked by `every_variant_message_states_a_remedy`): each message
+//! ends its cause with `"; "` followed by an imperative from [`REMEDY_VERBS`].
+use crate::chip::ChipId;
+use thiserror::Error;
+
+/// Imperatives that open the remedy clause of a message (`"; <verb> ..."`).
+pub const REMEDY_VERBS: [&str; 4] = ["select", "choose", "use", "re-download"];
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum FirmwareError {
+    #[error(
+        "the file is empty or shorter than an image header ({len} bytes); select an ESP-IDF application .bin"
+    )]
+    TooShort { len: usize },
+    #[error(
+        "this is an encrypted OTA update (.xota), which inkemu cannot read; use the plain application .bin of a release, not the encrypted OTA file"
+    )]
+    EncryptedOta,
+    #[error(
+        "this is a full flash image (bootloader + partition table + application), not an application image; select the application .bin, or wait for full-flash-image support in a later version"
+    )]
+    FlashImage,
+    #[error(
+        "not an ESP-IDF application image: first byte is {found:#04x}, expected 0xe9; select the application .bin from the build directory, not a merged flash image or another format"
+    )]
+    BadMagic { found: u8 },
+    #[error(
+        "image declares {count} segments, more than the {max} an ESP-IDF image can have; re-download the file or rebuild the firmware"
+    )]
+    TooManySegments { count: u8, max: u8 },
+    #[error(
+        "segment {index} header at file offset {offset} is cut short; re-download the file or rebuild the firmware"
+    )]
+    TruncatedSegmentHeader { index: usize, offset: usize },
+    #[error(
+        "segment {index} at file offset {offset} declares {declared} bytes but only {available} remain; re-download the file or rebuild the firmware"
+    )]
+    TruncatedSegment {
+        index: usize,
+        offset: usize,
+        declared: u64,
+        available: usize,
+    },
+    #[error(
+        "segment {index} length {len} is not a multiple of 4; re-download the file or rebuild the firmware"
+    )]
+    MisalignedSegment { index: usize, len: u32 },
+    #[error("unknown SPI flash mode {raw}; re-download the file or rebuild the firmware")]
+    BadSpiMode { raw: u8 },
+    #[error("unknown flash size code {raw}; re-download the file or rebuild the firmware")]
+    BadFlashSize { raw: u8 },
+    #[error(
+        "the image ends before its checksum/hash trailer; re-download the file or rebuild the firmware"
+    )]
+    TruncatedTrailer,
+    #[error(
+        "checksum mismatch (stored {stored:#04x}, computed {computed:#04x}); re-download the file or rebuild the firmware"
+    )]
+    ChecksumMismatch { stored: u8, computed: u8 },
+    #[error(
+        "SHA-256 mismatch: the file is corrupted or was modified after signing; re-download the file or rebuild the firmware"
+    )]
+    HashMismatch,
+    #[error(
+        "this firmware is built for {found}, but the selected device uses {expected}; choose the matching device or firmware"
+    )]
+    ChipMismatch { expected: ChipId, found: ChipId },
+    #[error(
+        "this firmware expects {needed} MB of flash, but the selected device has {available} MB; choose a device with at least {needed} MB of flash, or rebuild the firmware for a {available} MB flash"
+    )]
+    FlashTooSmall { needed: u32, available: u32 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chip::ChipId;
+
+    /// One instance of every variant. The exhaustive `match` in `variant_index` makes
+    /// adding a variant without adding it here a compile error.
+    fn one_of_each() -> Vec<FirmwareError> {
+        let all = vec![
+            FirmwareError::TooShort { len: 0 },
+            FirmwareError::EncryptedOta,
+            FirmwareError::FlashImage,
+            FirmwareError::BadMagic { found: 0 },
+            FirmwareError::TooManySegments { count: 17, max: 16 },
+            FirmwareError::TruncatedSegmentHeader {
+                index: 1,
+                offset: 288,
+            },
+            FirmwareError::TruncatedSegment {
+                index: 0,
+                offset: 24,
+                declared: 256,
+                available: 8,
+            },
+            FirmwareError::MisalignedSegment { index: 0, len: 3 },
+            FirmwareError::BadSpiMode { raw: 9 },
+            FirmwareError::BadFlashSize { raw: 8 },
+            FirmwareError::TruncatedTrailer,
+            FirmwareError::ChecksumMismatch {
+                stored: 1,
+                computed: 2,
+            },
+            FirmwareError::HashMismatch,
+            FirmwareError::ChipMismatch {
+                expected: ChipId::Esp32C3,
+                found: ChipId::Esp32S3,
+            },
+            FirmwareError::FlashTooSmall {
+                needed: 16,
+                available: 4,
+            },
+        ];
+        let mut seen = [false; 15];
+        for e in &all {
+            seen[variant_index(e)] = true;
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "one_of_each must cover every variant"
+        );
+        all
+    }
+
+    fn variant_index(e: &FirmwareError) -> usize {
+        match e {
+            FirmwareError::TooShort { .. } => 0,
+            FirmwareError::EncryptedOta => 1,
+            FirmwareError::FlashImage => 2,
+            FirmwareError::BadMagic { .. } => 3,
+            FirmwareError::TooManySegments { .. } => 4,
+            FirmwareError::TruncatedSegmentHeader { .. } => 5,
+            FirmwareError::TruncatedSegment { .. } => 6,
+            FirmwareError::MisalignedSegment { .. } => 7,
+            FirmwareError::BadSpiMode { .. } => 8,
+            FirmwareError::BadFlashSize { .. } => 9,
+            FirmwareError::TruncatedTrailer => 10,
+            FirmwareError::ChecksumMismatch { .. } => 11,
+            FirmwareError::HashMismatch => 12,
+            FirmwareError::ChipMismatch { .. } => 13,
+            FirmwareError::FlashTooSmall { .. } => 14,
+        }
+    }
+
+    #[test]
+    fn every_variant_message_states_a_remedy() {
+        for err in one_of_each() {
+            let msg = err.to_string();
+            let has_remedy = REMEDY_VERBS
+                .iter()
+                .any(|verb| msg.contains(&format!("; {verb} ")));
+            assert!(
+                has_remedy,
+                "no remedy clause (\"; <{REMEDY_VERBS:?}> ...\") in: {msg}"
+            );
+        }
+    }
+}
