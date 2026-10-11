@@ -622,6 +622,13 @@ fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_res
     let micros = device_micros(&log);
     assert!((1_500_000..=1_500_010).contains(&micros), "{log}");
     assert!(!log.contains("the CPU is asleep"), "{log}");
+    // The journal says what the ROM's `rst:0x7` line does, with the stack pointer besides.
+    assert!(
+        log.contains(
+            "\ninkemu: reset by main watchdog 0, a core reset (rst:0x7) at pc 0x4004c0d4, sp 0x"
+        ) && !log.contains("warning:"),
+        "{log}"
+    );
     let second = run();
     assert_eq!(
         first.stdout, second.stdout,
@@ -719,18 +726,17 @@ fn x4_boots_the_reference_firmware_through_its_restart_into_a_second_boot() {
     }
     let log = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(log.contains("cycle limit reached"), "{log}");
-    // The restart is an entry of the journal of the run, whatever prefix its line has.
+    // The restart is an event of the run, said in inkemu's own voice with its cause, PC and
+    // stack: not a warning.
     assert!(
-        log.contains("reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x"),
+        log.contains(
+            "\ninkemu: reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x"
+        ),
         "{log}"
     );
-    let other_warnings: Vec<&str> = log
-        .lines()
-        .filter(|line| line.starts_with("warning:") && !line.starts_with("warning: reset by "))
-        .collect();
     assert!(
-        other_warnings.is_empty() && !log.contains("stopped by --strict-mmio"),
-        "nothing but the restart was reported in a whole life cycle: {log}"
+        !log.contains("warning:") && !log.contains("stopped by --strict-mmio"),
+        "nothing was reported in a whole life cycle: {log}"
     );
 }
 

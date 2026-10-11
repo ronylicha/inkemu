@@ -2,7 +2,7 @@
 use crate::exit::{EXIT_ERROR, EXIT_IDLE, EXIT_OK, EXIT_STRICT_MMIO};
 use emu_core::Cycles;
 use soc_esp32c3::diag::MAX_DISTINCT_DIAGNOSTICS;
-use soc_esp32c3::{ConsoleChannel, Esp32C3, StopReason};
+use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, StopReason};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -151,6 +151,21 @@ fn relay_selected_console(
     outcome
 }
 
+/// What the line of `diagnostic` starts with. A reset is an event of the run, as the restart a
+/// firmware asks for is: it is said in inkemu's own voice. Everything else is something the
+/// emulation did not do as the device would, or a fault of the firmware: a warning.
+const fn journal_prefix(diagnostic: &Diagnostic) -> &'static str {
+    match diagnostic {
+        Diagnostic::Reset { .. } => "inkemu",
+        Diagnostic::UnmodeledMmio { .. }
+        | Diagnostic::SubWordWrite { .. }
+        | Diagnostic::Unsupported { .. }
+        | Diagnostic::FlashMapping { .. }
+        | Diagnostic::Exception { .. }
+        | Diagnostic::Suppressed => "warning",
+    }
+}
+
 /// Says what the firmware kept doing: the warnings list each diagnostic once, so a register polled
 /// a million times looks like a single line without this.
 fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
@@ -205,7 +220,7 @@ pub fn execute(
         for diagnostic in machine.drain_diagnostics() {
             if Some(&diagnostic) != violation {
                 // A failing log writer must not hide the run's outcome: there is nowhere left to report it.
-                let _ = writeln!(log, "warning: {diagnostic}");
+                let _ = writeln!(log, "{}: {diagnostic}", journal_prefix(&diagnostic));
             }
         }
         // A failure to write the console is logged whatever else ended the run in the same slice.
@@ -840,6 +855,41 @@ mod tests {
             "{lives} bytes"
         );
         assert!(m.device_time_nanos() > 5 * 1_300_000_000);
+    }
+
+    #[test]
+    fn a_reset_is_reported_as_an_event_of_the_run_and_not_as_a_warning() {
+        // The same firmware, under `--strict-mmio`: a watchdog reset is neither a fault of the
+        // emulation nor a violation. Each (cause, PC) pair is one line of the journal, the
+        // repeats are counted in the summary, and the run goes on to its limit.
+        let mut m = machine(&printing(UART0, b"a", &[wfi(), HANG]), STRICT);
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        let end = execute(
+            &mut m,
+            &options(300),
+            &NOT_INTERRUPTED,
+            &mut console,
+            &mut log,
+        );
+        assert_eq!((end, end.exit_code()), (RunEnd::Budget, 0));
+        let log = text(&log);
+        let by_the_main_watchdog =
+            "reset by main watchdog 0, a core reset (rst:0x7) at pc 0x40000010, sp 0x";
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.starts_with(&format!("inkemu: {by_the_main_watchdog}")))
+                .count(),
+            1,
+            "{log}"
+        );
+        assert!(
+            log.lines()
+                .any(|line| line.starts_with("inkemu: repeated ")
+                    && line.contains(by_the_main_watchdog)),
+            "the resets after the first are counted: {log}"
+        );
+        assert!(!log.contains("warning:"), "{log}");
+        assert!(m.resets() > 1);
     }
 
     #[test]
