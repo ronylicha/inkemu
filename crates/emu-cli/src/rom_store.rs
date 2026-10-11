@@ -238,8 +238,14 @@ impl Fetch for AnnouncingFetch<'_> {
 
 /// Where ROM files come from.
 pub enum RomSource<'a> {
-    /// The cache directory `dir`; a missing ELF is downloaded into it with `fetch`.
-    Cache { dir: PathBuf, fetch: &'a dyn Fetch },
+    /// The cache directory `dir`; a missing ELF is downloaded into it with `fetch`. `user_named` says
+    /// the user chose `dir` (`rom fetch --rom-dir`) rather than the per-user default: a remedy that
+    /// downloads must then name it again.
+    Cache {
+        dir: PathBuf,
+        fetch: &'a dyn Fetch,
+        user_named: bool,
+    },
     /// A directory the user supplied (`--rom-dir`): read only, never downloaded into.
     Directory(PathBuf),
 }
@@ -369,9 +375,13 @@ fn read_present(
 ) -> Result<Option<Vec<u8>>, RomStoreError> {
     let path = source.dir().join(entry.elf_name);
     let provenance = match source {
-        RomSource::Cache { .. } => Provenance::Cache,
+        RomSource::Cache {
+            dir, user_named, ..
+        } => Provenance::Cache {
+            named: user_named.then(|| dir.clone()),
+        },
         RomSource::Directory(dir) => Provenance::Directory {
-            dir: shown(dir),
+            dir: dir.clone(),
             release: archive.release,
         },
     };
@@ -528,33 +538,74 @@ fn extract_entry(
 
 /// Where a ROM file under verification came from, which decides what the user can do about a mismatch.
 enum Provenance {
-    /// The per-user cache: deleting the file makes the next run download it again.
-    Cache,
+    /// A cache: deleting the file makes the next download store it again. `named` is the directory
+    /// when the user chose it (`rom fetch --rom-dir`), `None` for the per-user default.
+    Cache { named: Option<PathBuf> },
     /// A directory the user supplied: nothing is downloaded there unless `inkemu rom fetch --rom-dir` is told to.
-    Directory { dir: String, release: &'static str },
+    Directory { dir: PathBuf, release: &'static str },
     /// The verified archive itself held something else.
     Archive,
 }
 
 impl Provenance {
-    /// The `inkemu rom fetch` invocation that restores the ROM files where they live: it runs as printed
-    /// (`--all` is mandatory without `--device`, and a user directory must be named again).
+    /// The `inkemu rom fetch` invocation that restores the ROM files where they live (`--all` is
+    /// mandatory without `--device`, and a directory the user chose must be named again).
     fn fetch_command(&self) -> String {
         match self {
-            Provenance::Cache | Provenance::Archive => "inkemu rom fetch --all".to_owned(),
-            Provenance::Directory { dir, .. } => format!("inkemu rom fetch --all --rom-dir {dir}"),
+            Provenance::Cache { named: None } | Provenance::Archive => {
+                "inkemu rom fetch --all".to_owned()
+            }
+            Provenance::Cache { named: Some(dir) } | Provenance::Directory { dir, .. } => {
+                format!("inkemu rom fetch --all --rom-dir {}", rom_dir_word(dir))
+            }
         }
     }
 
     fn remedy(&self) -> String {
         match self {
-            Provenance::Cache => "delete it to download it again, or point --rom-dir at a directory holding the genuine file".to_owned(),
+            Provenance::Cache { named: None } => "delete it to download it again, or point --rom-dir at a directory holding the genuine file".to_owned(),
+            Provenance::Cache { named: Some(_) } => format!(
+                "delete it and run `{}` to download it again, or replace it with the genuine file",
+                self.fetch_command()
+            ),
             Provenance::Directory { release, .. } => format!(
                 "replace it with the genuine file of esp-rom-elfs release {release}, or delete it and run `{}`",
                 self.fetch_command()
             ),
             Provenance::Archive => "retry the download, or supply the ROM yourself with --rom-dir".to_owned(),
         }
+    }
+}
+
+/// What stands for a directory that cannot be written the same way in every shell.
+const DIRECTORY_PLACEHOLDER: &str = "<directory>";
+
+/// `dir` as it is written after `--rom-dir` in a printed command, so that the command runs as printed in
+/// a POSIX shell, in cmd.exe and in PowerShell alike:
+/// - bare, when every character is inert in all three;
+/// - between double quotes, when only characters that double quotes neutralise in all three (a space,
+///   mostly) stand in the way;
+/// - as [`DIRECTORY_PLACEHOLDER`] otherwise: no single quoting is right in all three, and the message
+///   that carries the command already names the path.
+fn rom_dir_word(dir: &Path) -> String {
+    let text = dir.display().to_string();
+    let inert = |c: char| {
+        c.is_alphanumeric()
+            || std::path::is_separator(c)
+            || matches!(c, '.' | '_' | '-' | ':' | '~')
+    };
+    let inert_in_quotes =
+        |c: char| inert(c) || matches!(c, ' ' | '\'' | '(' | ')' | ',' | '+' | '=' | '@');
+    // A leading `-` reads as an option whatever the quoting; a leading `~` expands in a POSIX shell.
+    if text.is_empty() || text.starts_with(['-', '~']) {
+        DIRECTORY_PLACEHOLDER.to_owned()
+    } else if text.chars().all(inert) {
+        text
+    // A backslash before the closing quote would escape it.
+    } else if text.chars().all(inert_in_quotes) && !text.ends_with('\\') {
+        format!("\"{text}\"")
+    } else {
+        DIRECTORY_PLACEHOLDER.to_owned()
     }
 }
 
@@ -734,6 +785,7 @@ mod tests {
         let source = RomSource::Cache {
             dir: cache.clone(),
             fetch: &fetch,
+            user_named: false,
         };
         let first = load_rom(&source, &archive, &entry).unwrap();
         let second = load_rom(&source, &archive, &entry).unwrap();
@@ -755,6 +807,7 @@ mod tests {
         let source = RomSource::Cache {
             dir: dir.path().to_path_buf(),
             fetch: &fetch,
+            user_named: false,
         };
         let err = load_elf(&source, &archive, &entry).unwrap_err();
         assert!(
@@ -783,6 +836,7 @@ mod tests {
             let source = RomSource::Cache {
                 dir: dir.path().to_path_buf(),
                 fetch: &fetch,
+                user_named: false,
             };
             assert!(matches!(
                 load_elf(&source, &archive, &entry),
@@ -802,6 +856,7 @@ mod tests {
         let source = RomSource::Cache {
             dir: dir.path().to_path_buf(),
             fetch: &fetch,
+            user_named: false,
         };
         let err = load_elf(&source, &archive, &entry).unwrap_err();
         assert!(matches!(err, RomStoreError::ElfMismatch { .. }), "{err}");
@@ -839,6 +894,7 @@ mod tests {
         let source = RomSource::Cache {
             dir: dir.path().to_path_buf(),
             fetch: &fetch,
+            user_named: false,
         };
         let text = load_elf(&source, &archive, &entry).unwrap_err().to_string();
         for part in [archive.url, "dns error", ELF_NAME, "--rom-dir"] {
@@ -904,7 +960,8 @@ mod tests {
             load_elf(
                 &RomSource::Cache {
                     dir: cache.clone(),
-                    fetch: &fetch
+                    fetch: &fetch,
+                    user_named: false,
                 },
                 &archive,
                 &entry
@@ -940,6 +997,7 @@ mod tests {
                 &RomSource::Cache {
                     dir: dir.path().to_path_buf(),
                     fetch: &fetch,
+                    user_named: false,
                 },
                 &archive,
                 &entry,
@@ -983,6 +1041,7 @@ mod tests {
             &RomSource::Cache {
                 dir: dir.path().to_path_buf(),
                 fetch: &fetch,
+                user_named: false,
             },
             &archive,
             &entry,
@@ -1025,6 +1084,7 @@ mod tests {
             &RomSource::Cache {
                 dir: dir.path().to_path_buf(),
                 fetch: &fetch,
+                user_named: false,
             },
             &archive,
             &entry,
@@ -1130,6 +1190,16 @@ mod tests {
         RomSource::Cache {
             dir: dir.to_path_buf(),
             fetch,
+            user_named: false,
+        }
+    }
+
+    /// A cache in a directory the user chose, as `rom fetch --rom-dir` builds it.
+    fn named_cache_of<'a>(dir: &std::path::Path, fetch: &'a dyn Fetch) -> RomSource<'a> {
+        RomSource::Cache {
+            dir: dir.to_path_buf(),
+            fetch,
+            user_named: true,
         }
     }
 
@@ -1281,6 +1351,92 @@ mod tests {
             dir.path().display()
         );
         assert!(err.to_string().contains(&command), "{err}");
+    }
+
+    #[test]
+    fn an_unsuitable_file_in_a_cache_the_user_named_names_that_directory_in_the_fetch_command() {
+        let (body, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(ELF_NAME)).unwrap();
+        let fetch = FakeFetch::serving(body);
+        let err = load_elf(&named_cache_of(dir.path(), &fetch), &archive, &entry).unwrap_err();
+        assert!(matches!(err, RomStoreError::UnsuitableFile { .. }), "{err}");
+        let command = format!(
+            "`inkemu rom fetch --all --rom-dir {}`",
+            dir.path().display()
+        );
+        assert!(err.to_string().contains(&command), "{err}");
+        assert_eq!(fetch.calls.get(), 0);
+    }
+
+    #[test]
+    fn a_mismatch_in_a_cache_the_user_named_names_the_command_that_downloads_into_it() {
+        let (_, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ELF_NAME), b"not the ROM").unwrap();
+        let fetch = FakeFetch::serving(Vec::new());
+        let text = load_elf(&named_cache_of(dir.path(), &fetch), &archive, &entry)
+            .unwrap_err()
+            .to_string();
+        let command = format!(
+            "`inkemu rom fetch --all --rom-dir {}`",
+            dir.path().display()
+        );
+        assert!(text.contains(&command), "{text}");
+        assert!(!text.contains("point --rom-dir"), "{text}");
+    }
+
+    #[test]
+    fn a_directory_with_a_space_is_quoted_in_the_fetch_command() {
+        let (_, archive, entry) = fixture();
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("my roms");
+        std::fs::create_dir_all(dir.join(ELF_NAME)).unwrap();
+        let err = load_elf(&RomSource::Directory(dir.clone()), &archive, &entry).unwrap_err();
+        let command = format!("`inkemu rom fetch --all --rom-dir \"{}\"`", dir.display());
+        assert!(err.to_string().contains(&command), "{err}");
+    }
+
+    #[test]
+    fn a_directory_is_written_bare_only_when_every_shell_reads_it_as_one_word() {
+        let word = |text: &str| rom_dir_word(Path::new(text));
+        assert_eq!(word("roms"), "roms");
+        assert_eq!(word("/tmp/.tmpAb12/rom_dir-1"), "/tmp/.tmpAb12/rom_dir-1");
+        assert_eq!(word("/home/zoé/données"), "/home/zoé/données");
+        assert_eq!(word("/tmp/RUNNER~1/x"), "/tmp/RUNNER~1/x");
+    }
+
+    #[test]
+    fn a_directory_that_double_quotes_protect_in_every_shell_is_quoted() {
+        let word = |text: &str| rom_dir_word(Path::new(text));
+        assert_eq!(word("/tmp/my roms"), "\"/tmp/my roms\"");
+        assert_eq!(
+            word("/tmp/rom's (v3), a+b=c@d"),
+            "\"/tmp/rom's (v3), a+b=c@d\""
+        );
+    }
+
+    #[test]
+    fn a_directory_no_quoting_protects_in_every_shell_becomes_a_placeholder() {
+        let word = |text: &str| rom_dir_word(Path::new(text));
+        for hostile in [
+            "",
+            "-roms",
+            "~/roms",
+            "/tmp/$HOME",
+            "/tmp/a`b`",
+            "/tmp/a\"b",
+            "/tmp/50%",
+            "/tmp/a!b",
+            "/tmp/a;b",
+            "/tmp/a|b",
+            "/tmp/a&b",
+            "/tmp/a*b",
+            "/tmp/a\nb",
+            "/tmp/my roms\\",
+        ] {
+            assert_eq!(word(hostile), DIRECTORY_PLACEHOLDER, "{hostile:?}");
+        }
     }
 
     /// The text the decorator writes when the download starts, for the pinned test archive.

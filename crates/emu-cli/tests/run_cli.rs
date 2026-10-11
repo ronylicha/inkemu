@@ -108,6 +108,84 @@ fn the_fetch_command_suggested_for_a_user_directory_is_accepted_and_refuses_a_ta
     );
 }
 
+/// The command an error message prints, between its backticks.
+fn printed_command(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let start = text.find("`inkemu rom fetch").expect("a printed command") + 1;
+    let len = text[start..].find('`').expect("a closing backtick");
+    text[start..start + len].to_owned()
+}
+
+/// `rom fetch --rom-dir X` downloads into X, so its remedy must name X again: the bare command would
+/// download into the per-user cache instead.
+#[test]
+fn rom_fetch_into_a_named_directory_names_that_directory_in_its_remedy() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("esp32c3_rev3_rom.elf")).unwrap();
+    inkemu()
+        .args(["rom", "fetch", "--device", "x4", "--rom-dir"])
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            contains(format!(
+                "`inkemu rom fetch --all --rom-dir {}`",
+                dir.path().display()
+            ))
+            .and(contains("downloading").not()),
+        );
+}
+
+/// The printed command, pasted into a real shell, for a directory whose name holds a space: the shell
+/// must hand the directory to `inkemu` as one argument. The tampered file stops the command before any
+/// download, so this stays off the network.
+#[cfg(unix)]
+#[test]
+fn the_fetch_command_printed_for_a_directory_with_a_space_runs_as_printed_in_a_shell() {
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("my roms");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("esp32c3_rev3_rom.elf"), b"not the ROM").unwrap();
+    let refused = inkemu()
+        .args(["run", "--device", "x4", "--rom-dir"])
+        .arg(&dir)
+        .assert()
+        .code(2);
+    let command = printed_command(&refused.get_output().stderr);
+    assert_eq!(
+        command,
+        format!("inkemu rom fetch --all --rom-dir \"{}\"", dir.display())
+    );
+
+    // `inkemu` resolves through PATH, as it does for the person pasting the command.
+    let bin = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_inkemu"), bin.path().join("inkemu")).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .env("PATH", path)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            contains("expected sha256 19ac22e0")
+                .and(contains("my roms"))
+                .and(contains("downloading").not())
+                .and(contains("Usage:").not()),
+        );
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        1,
+        "nothing was downloaded or written"
+    );
+}
+
 #[test]
 fn rom_fetch_refuses_a_device_together_with_all() {
     inkemu()

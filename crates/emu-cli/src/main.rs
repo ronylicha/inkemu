@@ -206,6 +206,7 @@ fn run_device(
                 RomSource::Cache {
                     dir,
                     fetch: &announcing,
+                    user_named: false,
                 }
             }
             Err(e) => return fail(&e),
@@ -269,6 +270,7 @@ fn run_rom_fetch(device: Option<&str>, all: bool, rom_dir: Option<PathBuf>) -> E
     };
     let http = HttpFetch;
     let mut stderr = io::stderr();
+    let user_named = rom_dir.is_some();
     let dir = match rom_dir.map_or_else(rom_store::default_cache_dir, Ok) {
         Ok(dir) => dir,
         Err(e) => return fail(&e),
@@ -277,6 +279,7 @@ fn run_rom_fetch(device: Option<&str>, all: bool, rom_dir: Option<PathBuf>) -> E
     let source = RomSource::Cache {
         dir,
         fetch: &announcing,
+        user_named,
     };
     if let Err(e) = rom_store::ensure_elfs(&source, &ESP_ROM_ELFS, &entries) {
         return fail(&e);
