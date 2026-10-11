@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / UI
+node_modules/
+dist/
+
+# Local tooling and editor state
+.remember/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Emulator runtime data (flash images, SD images, recorded sessions, ROM cache)
+*.flash
+*.img
+*.inkrec
+/rom-cache/
+
+# Secrets (signing, notarization)
+.env
+.env.*
+*.p12
+*.pem
+*.key
