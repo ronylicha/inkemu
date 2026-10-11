@@ -471,3 +471,189 @@ fn two_flash_boots_are_identical_down_to_the_trace_hash() {
     assert_eq!(first.trace_hash, second.trace_hash);
     assert_eq!(first.after_banner, second.after_banner);
 }
+
+/// One second of device time, in nanoseconds.
+const SECOND_NS: u64 = 1_000_000_000;
+/// Cycles between two looks at the machine in the watchdog tests: 50 us at the 20 MHz the ROM
+/// runs at, the resolution the instant of a reset is observed with.
+const WATCHDOG_SLICE: u64 = 1_000;
+const WATCHDOG_SLICE_NS: u64 = 50_000;
+
+/// What a run that is reset by its watchdogs looked like.
+struct WatchdogRun {
+    console: String,
+    /// Device time, in nanoseconds, at the first look that found each reset done.
+    reset_seen_at: Vec<u64>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// Runs the rev3 ROM on `flash` until `resets` resets took place and `done` accepts the console.
+fn run_to_resets(flash: Option<Vec<u8>>, resets: u64, done: impl Fn(&str) -> bool) -> WatchdogRun {
+    let rom = RomImage::from_elf(&elf(3)).unwrap();
+    let mut machine = match flash {
+        Some(image) => Esp32C3::with_flash(rom, image, &strict()).unwrap(),
+        None => Esp32C3::new(rom, &strict()),
+    };
+    let (mut uart0, mut reset_seen_at, mut diagnostics) = (Vec::new(), Vec::new(), Vec::new());
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
+    while machine.cycles().get() < FLASH_BOOT_BUDGET * 4
+        && !(machine.resets() >= resets && done(&text(&uart0)))
+    {
+        let stop = machine.run_until(Cycles(machine.cycles().get() + WATCHDOG_SLICE));
+        assert!(
+            matches!(stop, StopReason::CycleBudget | StopReason::Asleep),
+            "{stop:?}"
+        );
+        if machine.resets() > u64::try_from(reset_seen_at.len()).unwrap() {
+            reset_seen_at.push(machine.device_time_nanos());
+        }
+        uart0.extend(machine.take_console(ConsoleChannel::Uart0));
+        let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
+        diagnostics.extend(machine.drain_diagnostics());
+    }
+    WatchdogRun {
+        console: text(&uart0),
+        reset_seen_at,
+        diagnostics,
+    }
+}
+
+/// Milestone point 4 of plan SP1b-3a. Nothing stops the watchdogs the reset values arm (TW §D.4):
+/// main watchdog 0 after 26 000 000 cycles of the 20 MHz APB clock, 1.3 s, a core reset the ROM
+/// reports as `rst:0x7` with the PC it was caught at; the RTC watchdog, which a core reset does
+/// not restart, after 400 000 cycles of the 136 kHz slow clock, 2.941 s, a system reset reported
+/// as `rst:0x10` without a saved PC.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_blank_flash_is_reset_by_the_main_watchdog_then_by_the_rtc_watchdog() {
+    // Until the boot that follows the third reset has printed a whole line of its own.
+    let run = run_to_resets(None, 3, |console| {
+        console
+            .split("rst:0x10 (RTCWDT_RTC_RST)")
+            .nth(1)
+            .is_some_and(|rest| rest.contains(INVALID_HEADER_BLANK))
+    });
+    assert_eq!(
+        run.diagnostics,
+        Vec::new(),
+        "strict mode: nothing unmodelled"
+    );
+    // Each reset takes place at the end of the instruction during which its watchdog expired, and
+    // is seen at the next look. The tolerance, two looks (100 us), is the resolution of the
+    // observation plus the instruction in progress; it is not a modelling error margin.
+    assert_eq!(
+        run.reset_seen_at.len(),
+        3,
+        "three resets: {:?}",
+        run.reset_seen_at
+    );
+    for (seen, expired_ns, what) in [
+        (run.reset_seen_at[0], 13 * SECOND_NS / 10, "main watchdog 0"),
+        (
+            run.reset_seen_at[1],
+            26 * SECOND_NS / 10,
+            "main watchdog 0 again",
+        ),
+        // 400 000 slow-clock cycles at 136 kHz: 2.941 176 5 s.
+        (run.reset_seen_at[2], 2_941_176_471, "the RTC watchdog"),
+    ] {
+        assert!(
+            (expired_ns..=expired_ns + 2 * WATCHDOG_SLICE_NS).contains(&seen),
+            "{what} expires at {expired_ns} ns of device time; the reset was seen at {seen} ns"
+        );
+    }
+    let lines: Vec<&str> = run.console.lines().collect();
+    let boots: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("rst:"))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        boots.iter().map(|&i| lines[i]).collect::<Vec<_>>(),
+        [
+            "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)",
+            "rst:0x7 (TG0WDT_SYS_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)",
+            "rst:0x7 (TG0WDT_SYS_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)",
+            "rst:0x10 (RTCWDT_RTC_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)",
+        ]
+    );
+    // The ROM was printing `invalid header` when it was reset: the PC is in its UART routine
+    // (`ROM3:uart_tx_one_char_uart.part.0@0x4004c0be`, the loop that waits for room in the FIFO).
+    assert_eq!(lines[boots[1] + 1], "Saved PC:0x4004c0d4");
+    assert_eq!(lines[boots[2] + 1], "Saved PC:0x4004c0d4");
+    assert_eq!(
+        lines[boots[3] + 1],
+        INVALID_HEADER_BLANK.trim_end(),
+        "a system reset clears the recorded PC: no `Saved PC` line (TW §D.2)"
+    );
+}
+
+const TIMG1_WDTCONFIG0: u32 = svd_regs::esp32c3::addr("TIMG1", "WDTCONFIG0");
+
+/// `lui`/`addi`/`sw` storing `value` at `addr` through `t0` and `t1`.
+fn store(addr: u32, value: u32) -> [u32; 4] {
+    use cpu_rv32::asm::{addi, lui, sw};
+    const T0: u8 = 5;
+    const T1: u8 = 6;
+    // `addi` sign-extends its 12 bits: the upper part is rounded so the sum is the value.
+    let split = |word: u32| {
+        let upper = word.wrapping_add(0x800) & 0xFFFF_F000;
+        (upper, word.wrapping_sub(upper).cast_signed())
+    };
+    let (page, offset) = split(addr);
+    let (upper, lower) = split(value);
+    [
+        lui(T0, page),
+        lui(T1, upper),
+        addi(T1, T1, lower),
+        sw(T1, T0, offset),
+    ]
+}
+
+/// Milestone point 5 of plan SP1b-3a (spec §10.3 criterion 4). A firmware stops the two
+/// watchdogs the reset values arm, starts main watchdog 1 with a 500 ms stage whose action is a
+/// core reset, and hangs with interrupts masked (`mstatus.MIE` is 0 since reset): its own
+/// watchdog resets it, and the next boot names the watchdog and the instruction it hung in.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_firmware_that_hangs_with_interrupts_masked_is_reset_by_its_own_watchdog() {
+    use cpu_rv32::asm::jal;
+    let mut program = Vec::new();
+    // `WDTCONFIG0` of both protections: unlocked at reset, 0 stops them (TW §B.3, §C.2).
+    program.extend(store(svd_regs::esp32c3::addr("TIMG0", "WDTCONFIG0"), 0));
+    program.extend(store(svd_regs::esp32c3::addr("RTC_CNTL", "WDTCONFIG0"), 0));
+    // Prescaler 20 000 on the 20 MHz APB clock (`mwdt_ll_set_prescaler`): one count a millisecond.
+    program.extend(store(TIMG1_WDTCONFIG0 + 4, 20_000 << 16));
+    // Stage 0: 500 counts. Enable, stage 0 = reset of the core (`mwdt_ll_config_stage`).
+    program.extend(store(TIMG1_WDTCONFIG0 + 8, 500));
+    program.extend(store(TIMG1_WDTCONFIG0, (1 << 31) | (3 << 29)));
+    program.push(jal(0, 0));
+    let hang_pc = STUB_ENTRY + 4 * u32::try_from(program.len() - 1).unwrap();
+    let code: Vec<u8> = program.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let spec = ImageSpec {
+        segments: vec![(STUB_ENTRY, code)],
+        ..stub_spec()
+    };
+    let run = run_to_resets(Some(build_image(&spec)), 1, |console| {
+        console
+            .split("Saved PC:")
+            .nth(1)
+            .is_some_and(|rest| rest.contains('\n'))
+    });
+    assert_eq!(run.diagnostics, Vec::new());
+    let lines: Vec<&str> = run.console.lines().collect();
+    let reset = lines
+        .iter()
+        .position(|line| line.starts_with("rst:0x8"))
+        .unwrap_or_else(|| panic!("no reset by main watchdog 1:\n{}", run.console));
+    assert_eq!(
+        lines[reset],
+        "rst:0x8 (TG1WDT_SYS_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)"
+    );
+    assert_eq!(
+        lines[reset + 1],
+        format!("Saved PC:{hang_pc:#010x}"),
+        "the `j .` of the firmware"
+    );
+}

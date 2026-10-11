@@ -49,7 +49,10 @@ pub struct CpuClock {
 }
 
 impl CpuClock {
-    /// The clocks after a power-on reset: the crystal divided by 2, 20 MHz (decisions D21 and E8).
+    /// The clocks after a power-on reset, and after any core or system reset: the crystal divided
+    /// by 2, 20 MHz (TRM §6.2.4.1; report TW §H.2: the period of the reset loop of a blank chip
+    /// excludes 40 MHz). A CPU reset keeps the selection the firmware made: after `esp_restart`
+    /// the ROM runs on the undivided crystal, 40 MHz (IR §4.1).
     pub const POWER_ON: CpuClock = CpuClock {
         cpu_period: 2 * XTAL_PERIOD,
         apb_period: 2 * XTAL_PERIOD,
