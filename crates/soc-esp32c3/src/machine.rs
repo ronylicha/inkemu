@@ -1,14 +1,15 @@
 //! The ESP32-C3 as a machine: one hart, its bus, and the loop that runs them.
 use crate::bus::SocBus;
+use crate::clock;
 use crate::config::SocConfig;
-use crate::diag::Diagnostic;
+use crate::diag::{Diagnostic, Unsupported};
 use crate::flash::{FlashImageError, NorFlash};
 use crate::memmap::RESET_PC;
 use crate::rom::RomImage;
 use cpu_rv32::{
     DatasheetTiming, Exception, Hart, HartConfig, MisalignedPolicy, StepOutcome, VendorCsrs,
 };
-use emu_core::{Cycles, TimingModel, TraceHash};
+use emu_core::{Cycles, Frequency, TimingModel, TraceHash, VirtualClock};
 
 /// The two serial consoles the mask ROM prints on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +37,8 @@ pub struct Esp32C3 {
     hart: Hart,
     bus: SocBus,
     timing: DatasheetTiming,
+    /// Device time: follows the CPU clock the firmware selects.
+    clock: VirtualClock,
     trace: Option<TraceHash>,
 }
 
@@ -76,10 +79,15 @@ impl Esp32C3 {
             misaligned: MisalignedPolicy::Allow,
             vendor_csrs: VendorCsrs::Esp32C3,
         };
+        let bus = SocBus::new(rom, Box::new(flash), config);
+        let (sysclk_conf, cpu_per_conf) = bus.periph.system.clock_registers();
+        // The reset values select the crystal, for which a frequency always exists.
+        let frequency = clock::cpu_frequency(sysclk_conf, cpu_per_conf).unwrap_or(clock::XTAL);
         Esp32C3 {
             hart: Hart::new(RESET_PC, hart_config),
-            bus: SocBus::new(rom, Box::new(flash), config),
+            bus,
             timing: DatasheetTiming,
+            clock: VirtualClock::new(frequency),
             trace: config.trace_hash.then(TraceHash::new),
         }
     }
@@ -102,6 +110,9 @@ impl Esp32C3 {
                 }
                 _ => {}
             }
+            if self.bus.periph.system.take_clock_change() {
+                self.retune(pc);
+            }
             if let Some(trace) = &mut self.trace {
                 trace.mix_u32(pc);
             }
@@ -110,6 +121,35 @@ impl Esp32C3 {
             }
         }
         StopReason::CycleBudget
+    }
+
+    /// Applies a write to the clock registers: from the end of the instruction that wrote them,
+    /// cycles last what the new selection says.
+    fn retune(&mut self, pc: u32) {
+        let (sysclk_conf, cpu_per_conf) = self.bus.periph.system.clock_registers();
+        match clock::cpu_frequency(sysclk_conf, cpu_per_conf) {
+            Some(frequency) => self.clock.set_frequency(self.hart.cycles, frequency),
+            // Decision D22: the previous frequency stays, and the selection is reported.
+            None => self.bus.diag.record(Diagnostic::Unsupported {
+                what: Unsupported::ClockSource {
+                    sysclk_conf,
+                    cpu_per_conf,
+                },
+                pc,
+            }),
+        }
+    }
+
+    /// The CPU clock frequency the firmware selected.
+    #[must_use]
+    pub const fn cpu_frequency(&self) -> Frequency {
+        self.clock.frequency()
+    }
+
+    /// Time elapsed on the device since reset, following every CPU clock switch.
+    #[must_use]
+    pub fn device_time_nanos(&self) -> u64 {
+        self.clock.nanos_at(self.hart.cycles)
     }
 
     /// CPU clock cycles elapsed since reset.
@@ -438,6 +478,72 @@ mod tests {
         assert_eq!(run(&a), run(&a));
         assert_ne!(run(&a).0, run(&b).0);
         assert_eq!(machine(&a).trace_hash(), None, "off unless asked for");
+    }
+
+    /// Three instructions that store `value` (a 12-bit signed immediate) at `addr`.
+    fn store(addr: u32, value: i32) -> [u32; 3] {
+        let page = addr.wrapping_add(0x800) & 0xFFFF_F000;
+        [
+            lui(T0, page),
+            addi(T1, 0, value),
+            sw(T1, T0, addr.wrapping_sub(page).cast_signed()),
+        ]
+    }
+    const SYSCLK_CONF: u32 = svd_regs::esp32c3::addr("SYSTEM", "SYSCLK_CONF");
+    const CPU_PER_CONF: u32 = svd_regs::esp32c3::addr("SYSTEM", "CPU_PER_CONF");
+
+    #[test]
+    fn device_time_follows_the_cpu_clock_the_firmware_selects() {
+        let mut program = Vec::new();
+        program.extend(store(SYSCLK_CONF, 0x400)); // PLL, CPUPERIOD_SEL = 0: 80 MHz
+        program.extend(store(CPU_PER_CONF, 0xD)); // CPUPERIOD_SEL = 1: 160 MHz
+        program.push(HANG);
+        let mut m = machine(&program);
+        assert_eq!(m.cpu_frequency().hz(), 20_000_000, "decision D21");
+        assert_eq!(m.device_time_nanos(), 0);
+        m.run_until(Cycles(1_000));
+        assert_eq!(m.cpu_frequency().hz(), 160_000_000);
+        assert_eq!(m.drain_diagnostics(), Vec::new());
+        // Fewer than 20 cycles ran before the switch to 160 MHz, each of at most 50 ns.
+        let nanos = m.device_time_nanos();
+        let all_fast = m.cycles().get() * 1_000 / 160;
+        assert!(
+            nanos >= all_fast && nanos <= all_fast + 20 * 50,
+            "{nanos} vs {all_fast}"
+        );
+    }
+
+    #[test]
+    fn device_time_at_the_reset_clock_is_50_ns_per_cycle() {
+        let mut m = machine(&[HANG]);
+        m.run_until(Cycles(2_000));
+        assert_eq!(m.device_time_nanos(), m.cycles().get() * 50);
+    }
+
+    #[test]
+    fn a_clock_selection_without_a_known_frequency_is_reported_and_keeps_the_previous_one() {
+        // -1024 = 0x...C00: SOC_CLK_SEL = 3 once masked to the 12 writable bits.
+        let mut program = store(SYSCLK_CONF, -1024).to_vec();
+        program.push(HANG);
+        let mut m = machine_with(
+            &program,
+            SocConfig {
+                strict_mmio: true,
+                ..SocConfig::default()
+            },
+        );
+        let stop = m.run_until(Cycles(1_000));
+        let StopReason::StrictMmio(Diagnostic::Unsupported { what, .. }) = &stop else {
+            panic!("expected a strict stop, got {stop:?}");
+        };
+        assert_eq!(
+            *what,
+            crate::diag::Unsupported::ClockSource {
+                sysclk_conf: 0x2_8C00,
+                cpu_per_conf: 0xC
+            }
+        );
+        assert_eq!(m.cpu_frequency().hz(), 20_000_000);
     }
 
     #[test]

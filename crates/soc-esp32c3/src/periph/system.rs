@@ -1,12 +1,15 @@
 //! `SYSTEM`: clock selection, peripheral clock gates and resets. Source: report §E.1.
-//! The clock tree itself (PLL, CPU frequency switch) arrives in SP1b-2.
+//! The CPU clock selection is read by `crate::clock`; gates and resets are stored.
 use crate::periph::{Accepted, SYSTEM_BASE, Storage};
 use emu_core::Peripheral;
 
-const SYSCLK_CONF: u32 = 0x58;
+const SYSCLK_CONF: u32 = svd_regs::esp32c3::addr("SYSTEM", "SYSCLK_CONF") - SYSTEM_BASE;
+const CPU_PER_CONF: u32 = svd_regs::esp32c3::addr("SYSTEM", "CPU_PER_CONF") - SYSTEM_BASE;
 /// `CPU_PERI_CLK_EN`, `CPU_PERI_RST_EN`, `PERIP_CLK_EN0/1`, `PERIP_RST_EN0/1`: gates and reset pulses the
-/// ROM toggles around each peripheral it sets up. Nothing acts on them yet.
-const ACCEPTED: [Accepted; 7] = [
+/// ROM toggles around each peripheral it sets up. Nothing acts on them yet. `CPU_PER_CONF` is stored
+/// as software wrote it; only its `CPUPERIOD_SEL` field acts, through `crate::clock`. `MEM_PD_MASK`
+/// is read by `rtc_init`.
+const ACCEPTED: [Accepted; 9] = [
     Accepted::svd(
         "SYSTEM",
         "CPU_PERI_CLK_EN",
@@ -49,6 +52,18 @@ const ACCEPTED: [Accepted; 7] = [
         "cache clock enable and reset",
         "SP1b-4",
     ),
+    Accepted::svd(
+        "SYSTEM",
+        "CPU_PER_CONF",
+        "PLL_FREQ_SEL and the CPU wait-mode bits (CPUPERIOD_SEL is used by the clock model)",
+        "SP8",
+    ),
+    Accepted::svd(
+        "SYSTEM",
+        "MEM_PD_MASK",
+        "memory power-down mask in light sleep",
+        "SP1b-3",
+    ),
 ];
 
 pub(crate) fn accepted() -> Vec<Accepted> {
@@ -67,7 +82,8 @@ const XTAL_FREQ_MHZ: u32 = 40;
 #[derive(Clone, Debug)]
 pub struct System {
     sysclk_writable: u32,
-    gates: Storage,
+    registers: Storage,
+    clock_changed: bool,
 }
 
 impl System {
@@ -75,8 +91,23 @@ impl System {
     pub fn new() -> System {
         System {
             sysclk_writable: SYSCLK_RESET,
-            gates: Storage::accepted(SYSTEM_BASE, &ACCEPTED),
+            registers: Storage::accepted(SYSTEM_BASE, &ACCEPTED),
+            clock_changed: false,
         }
+    }
+
+    /// `SYSCLK_CONF` and `CPU_PER_CONF` as software reads them: the inputs of [`crate::clock::cpu_frequency`].
+    #[must_use]
+    pub fn clock_registers(&self) -> (u32, u32) {
+        (
+            self.sysclk_writable | (XTAL_FREQ_MHZ << XTAL_FREQ_SHIFT),
+            self.registers.read(CPU_PER_CONF).unwrap_or(0),
+        )
+    }
+
+    /// Whether a clock register was written since the last call.
+    pub(crate) fn take_clock_change(&mut self) -> bool {
+        std::mem::take(&mut self.clock_changed)
     }
 }
 
@@ -89,17 +120,24 @@ impl Default for System {
 impl Peripheral for System {
     fn read(&mut self, offset: u32) -> Option<u32> {
         if offset == SYSCLK_CONF {
-            return Some(self.sysclk_writable | (XTAL_FREQ_MHZ << XTAL_FREQ_SHIFT));
+            return Some(self.clock_registers().0);
         }
-        self.gates.read(offset)
+        self.registers.read(offset)
     }
 
     fn write(&mut self, offset: u32, value: u32) -> bool {
-        if offset == SYSCLK_CONF {
-            self.sysclk_writable = value & SYSCLK_WRITABLE;
-            return true;
+        match offset {
+            SYSCLK_CONF => {
+                self.sysclk_writable = value & SYSCLK_WRITABLE;
+                self.clock_changed = true;
+                true
+            }
+            CPU_PER_CONF => {
+                self.clock_changed = true;
+                self.registers.write(offset, value)
+            }
+            _ => self.registers.write(offset, value),
         }
-        self.gates.write(offset, value)
     }
 }
 
@@ -148,10 +186,28 @@ mod tests {
             assert!(sys.write(offset, reset | 4));
             assert_eq!(sys.read(offset), Some(reset | 4));
         }
-        assert_eq!(
-            sys.read(0x08),
-            None,
-            "CPU_PER_CONF belongs to the clock tree (SP1b-2)"
+        assert_eq!(sys.read(0x08), Some(0xC), "CPU_PER_CONF reset");
+    }
+
+    #[test]
+    fn clock_writes_are_flagged_once_and_the_registers_read_as_software_sees_them() {
+        let mut sys = System::new();
+        assert_eq!(sys.clock_registers(), (0x2_8001, 0xC), "reset: BA §5");
+        assert!(!sys.take_clock_change());
+        let cpu_per_conf = svd_regs::esp32c3::addr("SYSTEM", "CPU_PER_CONF") - SYSTEM_BASE;
+        assert!(sys.write(cpu_per_conf, 0xD));
+        assert!(sys.take_clock_change());
+        assert!(!sys.take_clock_change(), "taken once");
+        sys.write(SYSCLK_CONF, 0x400);
+        assert!(sys.take_clock_change());
+        assert_eq!(sys.clock_registers(), (0x2_8400, 0xD));
+        sys.write(
+            svd_regs::esp32c3::addr("SYSTEM", "PERIP_CLK_EN0") - SYSTEM_BASE,
+            0,
+        );
+        assert!(
+            !sys.take_clock_change(),
+            "a clock gate is not the CPU clock"
         );
     }
 }

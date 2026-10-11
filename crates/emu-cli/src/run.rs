@@ -165,6 +165,12 @@ pub fn execute(
         machine.cycles().get(),
         machine.instructions()
     );
+    let _ = writeln!(
+        log,
+        "inkemu: {} us of device time; CPU clock at {} MHz",
+        machine.device_time_nanos() / 1_000,
+        machine.cpu_frequency().hz() / 1_000_000
+    );
     summarize_diagnostics(machine, log);
     if let Some(hash) = machine.trace_hash() {
         let _ = writeln!(log, "trace-hash {hash:016x}");
@@ -243,6 +249,10 @@ mod tests {
             log.contains("cycle limit")
                 && log.contains("--max-cycles")
                 && log.contains("0x40000000"),
+            "{log}"
+        );
+        assert!(
+            log.contains("us of device time") && log.contains("CPU clock at 20 MHz"),
             "{log}"
         );
     }

@@ -56,6 +56,8 @@ then rewrites the table below, and nothing else; review the diff before committi
 | `0x60010078` | `UART1.CLK_CONF` | 1 | clock source and divider | SP1b-3 |
 | `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals | SP1b-3 |
 | `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals | SP1b-3 |
+| `0x600c0008` | `SYSTEM.CPU_PER_CONF` | 1 | PLL_FREQ_SEL and the CPU wait-mode bits (CPUPERIOD_SEL is used by the clock model) | SP8 |
+| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep | SP1b-3 |
 | `0x600c0010` | `SYSTEM.PERIP_CLK_EN0` | 1 | peripheral clock gates | SP1b-3 |
 | `0x600c0014` | `SYSTEM.PERIP_CLK_EN1` | 1 | peripheral clock gates | SP1b-3 |
 | `0x600c0018` | `SYSTEM.PERIP_RST_EN0` | 1 | peripheral reset pulses | SP1b-3 |
