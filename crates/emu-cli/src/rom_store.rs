@@ -14,7 +14,7 @@
 //! - however many ROMs are missing, the archive is downloaded once ([`ensure_elfs`]).
 //!
 //! Sources: `docs/research/esp32c3-rom-elfs.md`, §2 (archive content, hashes) and §9 (image hashes).
-use crate::term::sanitize;
+use crate::term::{hex, sanitize};
 use etcetera::app_strategy::AppStrategy as _;
 use sha2::{Digest, Sha256};
 use soc_esp32c3::{ChipRevision, RomError, RomImage};
@@ -673,7 +673,7 @@ fn store(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), RomStoreError> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex(&Sha256::digest(bytes))
 }
 
 /// A path as it may be printed: control characters escaped, since it can come from the command line.
@@ -696,11 +696,10 @@ fn io_error_at(action: &'static str, path: &str, error: &std::io::Error) -> RomS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
     use std::cell::Cell;
 
     fn sha(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
+        sha256_hex(bytes)
     }
     fn leak(text: String) -> &'static str {
         Box::leak(text.into_boxed_str())

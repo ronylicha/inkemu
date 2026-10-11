@@ -2,6 +2,8 @@
 //! `INKEMU_ROM_ELF_DIR=<dir> cargo test -p soc-esp32c3 --test real_rom -- --ignored`
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
 
+mod common;
+
 use emu_core::Cycles;
 use sha2::{Digest, Sha256};
 use soc_esp32c3::{
@@ -17,7 +19,7 @@ fn elf(revision: u16) -> Vec<u8> {
 
 fn image_sha256(revision: u16) -> String {
     let rom = RomImage::from_elf(&elf(revision)).unwrap();
-    format!("{:x}", Sha256::digest(rom.bytes()))
+    common::hex(&Sha256::digest(rom.bytes()))
 }
 
 /// The chip a ROM revision really ships in: the eFuses must report a revision that ROM belongs to.

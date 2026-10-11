@@ -17,6 +17,18 @@ pub fn sanitize(text: &str) -> String {
         })
 }
 
+/// Lower-case hexadecimal of `bytes`: the form in which digests are pinned, compared and shown.
+#[must_use]
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(2 * bytes.len());
+    for byte in bytes {
+        // Writing to a String cannot fail.
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,5 +45,11 @@ mod tests {
     #[test]
     fn sanitize_leaves_printable_text_unchanged() {
         assert_eq!(sanitize("café 1.0"), "café 1.0");
+    }
+
+    #[test]
+    fn hex_writes_two_lower_case_digits_per_byte() {
+        assert_eq!(hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+        assert_eq!(hex(&[]), "");
     }
 }

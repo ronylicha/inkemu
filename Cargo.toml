@@ -17,8 +17,9 @@ svd-regs = { path = "crates/svd-regs", version = "0.1.0" }
 soc-esp32c3 = { path = "crates/soc-esp32c3", version = "0.1.0" }
 boards = { path = "crates/boards", version = "0.1.0" }
 thiserror = "2"
-sha2 = "0.10"
-md-5 = "0.10"
+sha2 = "0.11"
+sha1 = "0.11"
+md-5 = "0.11"
 roxmltree = "0.21"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

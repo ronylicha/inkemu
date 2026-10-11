@@ -91,7 +91,7 @@ fn fixture_directory_matches_the_sha256_manifest() {
     for (name, expected) in listed {
         let digest = Sha256::digest(std::fs::read(fixture_dir().join(&name)).unwrap());
         assert_eq!(
-            format!("{digest:x}"),
+            emu_cli::term::hex(&digest),
             expected,
             "{name} does not match its manifest hash"
         );
