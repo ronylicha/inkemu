@@ -9,6 +9,7 @@ use cpu_rv32::{
 };
 use emu_core::{Cycles, TimingModel, TraceHash};
 
+/// The two serial consoles the mask ROM prints on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleChannel {
     Uart0,
@@ -19,12 +20,15 @@ pub enum ConsoleChannel {
 pub enum StopReason {
     /// The cycle limit passed to [`Esp32C3::run_until`] was reached.
     CycleBudget,
-    /// `--strict-mmio`: the program touched a register the emulator does not model.
+    /// `--strict-mmio`: the program touched a register the emulator does not model, or wrote a
+    /// peripheral register with an 8- or 16-bit store.
     StrictMmio(Diagnostic),
     /// The CPU is in `wfi` and nothing can raise an interrupt yet (interrupt sources arrive in SP1b-3).
     Idle,
 }
 
+/// An ESP32-C3: one hart, the bus with everything it reaches, and the model that prices each
+/// instruction. It performs no host I/O: output is handed over through [`Esp32C3::take_console`].
 #[derive(Debug)]
 pub struct Esp32C3 {
     hart: Hart,
@@ -42,8 +46,9 @@ impl Esp32C3 {
         // after `.wifi0iram.3` where the linker placed the initial `.data` image, so real silicon
         // performs misaligned accesses; ESP-IDF treats them as functional but slow
         // (`docs/research/esp32c3-boot-chain.md` §B.1).
-        // Known gap: the extra cycles a misaligned access costs on silicon are not modelled yet, and a
-        // misaligned access to a peripheral register is still a bus error.
+        // ASSUMPTION: a misaligned access costs no extra cycle (a misaligned access to a peripheral
+        // register is a bus error and raises an access fault). Silicon may charge extra cycles; a
+        // silicon trace or the SP1b-4 lockstep settles it.
         let hart_config = HartConfig {
             misaligned: MisalignedPolicy::Allow,
             vendor_csrs: VendorCsrs::Esp32C3,
@@ -90,11 +95,13 @@ impl Esp32C3 {
         self.hart.cycles
     }
 
+    /// Instructions retired since reset.
     #[must_use]
     pub const fn instructions(&self) -> u64 {
         self.hart.instret
     }
 
+    /// The program counter: the address of the next instruction to execute.
     #[must_use]
     pub const fn pc(&self) -> u32 {
         self.hart.pc
@@ -111,6 +118,20 @@ impl Esp32C3 {
     /// Diagnostics seen for the first time since the last call.
     pub fn drain_diagnostics(&mut self) -> Vec<Diagnostic> {
         self.bus.diag.drain()
+    }
+
+    /// At most `limit` diagnostics that occurred more than once, the most frequent first, with their
+    /// number of occurrences: what the firmware keeps doing, such as polling one register.
+    #[must_use]
+    pub fn most_repeated_diagnostics(&self, limit: usize) -> Vec<(Diagnostic, u64)> {
+        self.bus.diag.most_repeated(limit)
+    }
+
+    /// Occurrences dropped because more than [`MAX_DISTINCT_DIAGNOSTICS`](crate::diag::MAX_DISTINCT_DIAGNOSTICS) distinct diagnostics were
+    /// known: they are counted but never listed.
+    #[must_use]
+    pub const fn suppressed_diagnostics(&self) -> u64 {
+        self.bus.diag.suppressed()
     }
 
     /// The model that prices each instruction, so a front end can say whether timing is calibrated.
@@ -131,14 +152,12 @@ mod tests {
     use super::*;
     use crate::memmap::ROM_BASE;
     use crate::memmap::SRAM_DBUS_BASE;
-    use crate::test_support::flat_rom;
+    use crate::test_support::{
+        HANG, T0, T1, flat_rom, load_register, print_program as print, unmodeled_register,
+    };
     use cpu_rv32::asm::{addi, csrrs, csrrwi, jal, lui, lw, sw, wfi};
+    use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
     use emu_core::{AccessKind, AccessSize, Bus};
-
-    const T0: u8 = 5;
-    const T1: u8 = 6;
-    /// `j .`: the program parks itself.
-    const HANG: u32 = 0x0000_006f;
 
     fn machine_with(program: &[u32], config: SocConfig) -> Esp32C3 {
         Esp32C3::new(flat_rom(program), &config)
@@ -152,13 +171,6 @@ mod tests {
             .read(addr, AccessSize::Word, AccessKind::Load)
             .unwrap()
             .value
-    }
-    fn print(base: u32, text: &[u8]) -> Vec<u32> {
-        let mut program = vec![lui(T0, base)];
-        for &byte in text {
-            program.extend([addi(T1, 0, i32::from(byte)), sw(T1, T0, 0)]);
-        }
-        program
     }
 
     #[test]
@@ -261,12 +273,16 @@ mod tests {
 
     #[test]
     fn the_rom_delay_counter_is_available() {
-        // What ets_delay_us relies on: enable through 0x800/0x801, then watch 0x802 advance.
+        // What ets_delay_us relies on: enable the counter, then watch it advance between two reads.
+        const SCRATCH: u8 = 7;
         let mut m = machine(&[
-            csrrwi(0, 0x800, 1),
-            csrrwi(0, 0x801, 1),
-            csrrs(T0, 0x802, 0),
-            csrrs(T1, 0x802, 0),
+            csrrwi(0, PCER_USER, 1),
+            csrrwi(0, PCMR_USER, 1),
+            csrrs(T0, PCCR_USER, 0),
+            csrrs(T1, PCCR_USER, 0),
+            lui(SCRATCH, SRAM_DBUS_BASE),
+            sw(T0, SCRATCH, 0),
+            sw(T1, SCRATCH, 4),
             HANG,
         ]);
         m.run_until(Cycles(200));
@@ -274,15 +290,46 @@ mod tests {
             m.drain_diagnostics().is_empty(),
             "no illegal-instruction exception"
         );
+        let (first, second) = (
+            bus_word(&mut m, SRAM_DBUS_BASE),
+            bus_word(&mut m, SRAM_DBUS_BASE + 4),
+        );
+        assert!(
+            second > first,
+            "the counter advanced: {first} then {second}"
+        );
+    }
+
+    #[test]
+    fn a_misaligned_word_access_to_a_peripheral_register_raises_an_access_fault() {
+        // Under the machine's `Allow` policy the access reaches the bus, which refuses it: the fault
+        // is reported with the faulting address as `tval` (IO_MUX.GPIO20 is at 0x6000_9054).
+        const MISALIGNED: u32 = 0x6000_9055;
+        for (access, expected) in [
+            (lw(T1, T0, 0x55), Exception::LoadAccessFault),
+            (sw(T1, T0, 0x55), Exception::StoreAccessFault),
+        ] {
+            let mut m = machine(&[lui(T0, 0x6000_9000), access, HANG]);
+            m.run_until(Cycles(100));
+            let first = m
+                .drain_diagnostics()
+                .into_iter()
+                .find(|d| matches!(d, Diagnostic::Exception { .. }));
+            assert_eq!(
+                first,
+                Some(Diagnostic::Exception {
+                    cause: expected,
+                    tval: MISALIGNED,
+                    pc: ROM_BASE + 4,
+                })
+            );
+        }
     }
 
     #[test]
     fn unmodeled_access_is_reported_with_the_pc_of_the_instruction() {
-        let ledc = svd_regs::esp32c3::registers()
-            .iter()
-            .find(|r| r.peripheral == "LEDC")
-            .unwrap();
-        let mut m = machine(&[lui(T0, ledc.addr), lw(T1, T0, 0), HANG]);
+        let [page, load] = load_register(unmodeled_register().addr);
+        let mut m = machine(&[page, load, HANG]);
         assert_eq!(m.run_until(Cycles(200)), StopReason::CycleBudget);
         let listed = m.drain_diagnostics();
         assert!(
@@ -293,15 +340,12 @@ mod tests {
 
     #[test]
     fn strict_mode_stops_at_the_unmodeled_access() {
-        let ledc = svd_regs::esp32c3::registers()
-            .iter()
-            .find(|r| r.peripheral == "LEDC")
-            .unwrap();
         let config = SocConfig {
             strict_mmio: true,
             ..SocConfig::default()
         };
-        let mut m = machine_with(&[lui(T0, ledc.addr), lw(T1, T0, 0), HANG], config);
+        let [page, load] = load_register(unmodeled_register().addr);
+        let mut m = machine_with(&[page, load, HANG], config);
         let StopReason::StrictMmio(diagnostic) = m.run_until(Cycles(10_000)) else {
             panic!("expected a strict stop")
         };

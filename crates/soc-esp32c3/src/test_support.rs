@@ -4,6 +4,7 @@
 
 use crate::memmap::ROM_BASE;
 use crate::rom::{ROM_LEN, RomImage};
+use cpu_rv32::asm;
 
 /// A minimal ELF32 little-endian writer: enough structure for `RomImage::from_elf`, nothing more.
 #[derive(Clone, Debug, Default)]
@@ -238,7 +239,7 @@ impl ElfBuilder {
 const RISCV: u16 = 243;
 const CODE_LEN: usize = 0x200;
 /// Offset of the `unpack` table inside the code segment of [`rom_elf`].
-pub const UNPACK_TABLE: usize = 0x100;
+pub(crate) const UNPACK_TABLE: usize = 0x100;
 
 /// A ROM laid out like the real ones, in miniature:
 /// code at `0x4000_0000` (0x200 bytes, zero-filled segment up to 0x300), an unpack table with two
@@ -297,4 +298,40 @@ pub fn flat_rom(program: &[u32]) -> RomImage {
         rom[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
     }
     RomImage::from_flat(rom).unwrap()
+}
+
+/// `j .`: the program parks itself.
+pub const HANG: u32 = 0x0000_006f;
+/// `t0`, the register [`print_program`] and [`load_register`] address through.
+pub const T0: u8 = 5;
+/// `t1`, the register that carries the byte or receives the value.
+pub const T1: u8 = 6;
+
+/// Code that writes each byte of `text` to the register at `base` (a UART FIFO, for instance).
+#[must_use]
+pub fn print_program(base: u32, text: &[u8]) -> Vec<u32> {
+    let mut program = vec![asm::lui(T0, base)];
+    for &byte in text {
+        program.extend([asm::addi(T1, 0, i32::from(byte)), asm::sw(T1, T0, 0)]);
+    }
+    program
+}
+
+/// The register every test uses as *the* unmodelled one: the first `LEDC` register with a documented,
+/// non-zero reset value. No `SP1b` plan models the `LEDC`.
+#[must_use]
+pub fn unmodeled_register() -> &'static svd_regs::RegisterInfo {
+    svd_regs::esp32c3::registers()
+        .iter()
+        .find(|r| r.peripheral == "LEDC" && r.reset_explicit && r.reset_value != 0)
+        .unwrap()
+}
+
+/// Two instructions that load the word at `addr` into [`T1`]: `lui` takes the page (rounded so that the
+/// remainder fits a signed 12-bit offset), `lw` the remainder.
+#[must_use]
+pub fn load_register(addr: u32) -> [u32; 2] {
+    let page = addr.wrapping_add(0x800) & 0xFFFF_F000;
+    let offset = addr.wrapping_sub(page).cast_signed();
+    [asm::lui(T0, page), asm::lw(T1, T0, offset)]
 }

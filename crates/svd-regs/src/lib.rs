@@ -13,7 +13,7 @@ pub struct RegisterInfo {
 }
 
 /// Every register of these SVD files is 32 bits wide (the generator rejects any other size).
-const REGISTER_BYTES: u32 = 4;
+pub const REGISTER_BYTES: u32 = 4;
 
 fn lookup_in(table: &'static [RegisterInfo], addr: u32) -> Option<&'static RegisterInfo> {
     let index = table.partition_point(|r| r.addr <= addr).checked_sub(1)?;

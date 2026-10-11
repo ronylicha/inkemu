@@ -29,10 +29,11 @@ impl Peripheral for AssistDebug {
     }
 
     fn write(&mut self, offset: u32, value: u32) -> bool {
-        if offset == CORE_0_RCD_EN {
+        let is_record_enable = offset == CORE_0_RCD_EN;
+        if is_record_enable {
             self.record_enable = value;
         }
-        offset == CORE_0_RCD_EN
+        is_record_enable
     }
 }
 

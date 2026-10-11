@@ -6,12 +6,15 @@ use emu_core::Peripheral;
 
 const EP1: u32 = 0x00;
 const EP1_CONF: u32 = 0x04;
-/// `EP1_CONF` bit 0, write 1: commit the bytes written so far as one IN packet.
+/// `EP1_CONF` bit 0, write 1: commit the bytes written so far as one IN packet. A write to `EP1_CONF`
+/// acts on this bit only: bits 1 and 2 are read-only (report §G.3).
 const WR_DONE: u32 = 1 << 0;
 /// `EP1_CONF` bit 1, read-only: the IN endpoint can take a byte.
 const SERIAL_IN_EP_DATA_FREE: u32 = 1 << 1;
 /// Size of a full-speed bulk packet: the hardware sends a full FIFO without waiting for `WR_DONE`.
-/// ASSUMPTION: taken from ESP-IDF's driver comments (`usb_serial_jtag_ll_txfifo_flush`), not measured.
+/// Source: ESP-IDF v5.5.2 `components/hal/esp32c3/include/hal/usb_serial_jtag_ll.h`, note on
+/// `usb_serial_jtag_ll_txfifo_flush`: "When fifo is full (with 64 byte), HW will flush the buffer
+/// automatically".
 const PACKET_BYTES: usize = 64;
 
 #[derive(Clone, Debug, Default)]

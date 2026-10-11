@@ -8,8 +8,7 @@ use crate::memmap::{
 use crate::periph::Peripherals;
 use crate::rom::RomImage;
 use emu_core::{AccessKind, AccessSize, Bus, BusError, Ram, ReadOutcome};
-
-const REGISTER_BYTES: u32 = 4;
+use svd_regs::REGISTER_BYTES;
 
 #[derive(Debug)]
 pub struct SocBus {
@@ -168,6 +167,9 @@ impl Bus for SocBus {
         size: AccessSize,
         kind: AccessKind,
     ) -> Result<ReadOutcome, BusError> {
+        // ASSUMPTION: an instruction fetch through a data-bus address (the DROM window, the SRAM D-bus
+        // view) is served like a load. The silicon behaviour is not established; the SP1b-4 lockstep
+        // against a reference trace settles it.
         match locate(addr, size.bytes()) {
             Some(Region::Rom(offset)) => Ok(ReadOutcome {
                 value: self.rom_read(offset, size),
@@ -210,13 +212,11 @@ impl Bus for SocBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{STRAP_SPI_FAST_FLASH_BOOT, SocConfig};
-    use crate::diag::{Diagnostic, Direction};
-    use crate::rom::RomImage;
+    use crate::config::STRAP_SPI_FAST_FLASH_BOOT;
+    use crate::test_support::unmodeled_register as unmodeled;
     use emu_core::{
         AccessKind::{Fetch, Load, Store},
         AccessSize::{Byte, Half, Word},
-        Bus, BusError,
     };
 
     fn bus_with(config: SocConfig) -> SocBus {
@@ -230,13 +230,6 @@ mod tests {
     }
     fn load(bus: &mut SocBus, addr: u32) -> u32 {
         bus.read(addr, Word, Load).unwrap().value
-    }
-    /// A register no `SP1b` plan models, with a documented non-zero reset value.
-    fn unmodeled() -> &'static svd_regs::RegisterInfo {
-        svd_regs::esp32c3::registers()
-            .iter()
-            .find(|r| r.peripheral == "LEDC" && r.reset_explicit && r.reset_value != 0)
-            .unwrap()
     }
 
     #[test]
@@ -255,6 +248,35 @@ mod tests {
         );
         assert_eq!(load(&mut b, ROM_BASE + DROM_ROM_OFFSET), 0xDDCC_BBAA);
         assert_eq!(b.read(ROM_BASE + 1, Half, Load).unwrap().value, 0x3322);
+    }
+
+    #[test]
+    fn a_fetch_through_a_data_bus_address_is_served_like_a_load() {
+        // Pins the ASSUMPTION documented on `Bus::read`.
+        let mut b = bus();
+        assert_eq!(b.read(DROM_BASE, Word, Fetch).unwrap().value, 0xDDCC_BBAA);
+        b.write(SRAM_DBUS_BASE + 0x40, Word, 0x0000_0013).unwrap();
+        assert_eq!(
+            b.read(SRAM_DBUS_BASE + 0x40, Word, Fetch).unwrap().value,
+            0x13
+        );
+    }
+
+    #[test]
+    fn the_last_word_of_the_rom_reads_and_one_straddling_its_end_is_unmapped() {
+        let mut rom = vec![0u8; ROM_SIZE as usize];
+        let end = rom.len();
+        rom[end - 4..].copy_from_slice(&[1, 2, 3, 4]);
+        let mut b = SocBus::new(RomImage::from_flat(rom).unwrap(), &SocConfig::default());
+        assert_eq!(load(&mut b, ROM_BASE + ROM_SIZE - 4), 0x0403_0201);
+        let straddling = ROM_BASE + ROM_SIZE - 2;
+        assert_eq!(
+            b.read(straddling, Word, Load),
+            Err(BusError::Unmapped {
+                addr: straddling,
+                kind: Load
+            })
+        );
     }
 
     #[test]
@@ -478,6 +500,22 @@ mod tests {
         assert!(matches!(
             b.diag.take_violation(),
             Some(Diagnostic::UnmodeledMmio { .. })
+        ));
+    }
+
+    #[test]
+    fn strict_mode_turns_an_unmodeled_write_into_a_violation() {
+        let mut b = bus_with(SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        });
+        b.write(unmodeled().addr, Word, 1).unwrap();
+        assert!(matches!(
+            b.diag.take_violation(),
+            Some(Diagnostic::UnmodeledMmio {
+                direction: Direction::Write,
+                ..
+            })
         ));
     }
 

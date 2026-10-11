@@ -15,7 +15,8 @@ const STATUS: u32 = 0x1C;
 const CONF0: u32 = 0x20;
 const CONF1: u32 = 0x24;
 const CLK_CONF: u32 = 0x78;
-/// Configuration the ROM and ESP-IDF write and read back; nothing acts on it yet.
+/// Configuration the ROM and ESP-IDF write and read back; nothing acts on it yet. `INT_ENA` is
+/// stored and has no effect until interrupts exist (SP1b-3, decision D7).
 const CONFIG: [u32; 5] = [INT_ENA, CLKDIV, CONF0, CONF1, CLK_CONF];
 /// `STATUS` bits [9:0] `RXFIFO_CNT` and [25:16] `TXFIFO_CNT`.
 const FIFO_COUNTS: u32 = 0x03FF_03FF;
@@ -128,6 +129,27 @@ mod tests {
             None,
             "INT_ST arrives with interrupts (SP1b-3)"
         );
+    }
+
+    #[test]
+    fn status_is_read_only_and_the_fifo_cannot_be_read() {
+        let mut uart = Uart::new(UART0);
+        assert!(!uart.write(0x1C, 0xFFFF_FFFF), "STATUS is read-only");
+        assert_eq!(
+            uart.read(0x00),
+            None,
+            "FIFO is write-only: RX is not modelled"
+        );
+    }
+
+    #[test]
+    fn both_uarts_report_the_documented_idle_status() {
+        // 0xE000_C000 is the SVD reset value of UART0.STATUS and UART1.STATUS; the FIFO counts are
+        // zero in it already. This pins the SVD lookup behind `Uart::new`.
+        for base in [UART0, 0x6001_0000] {
+            let mut uart = Uart::new(base);
+            assert_eq!(uart.read(0x1C), Some(0xE000_C000), "{base:#x}");
+        }
     }
 
     #[test]

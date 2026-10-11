@@ -4,8 +4,9 @@
 
 use emu_core::Cycles;
 use sha2::{Digest, Sha256};
-use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason};
-use std::fmt::Write as _;
+use soc_esp32c3::{
+    ChipRevision, ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason,
+};
 
 fn elf(revision: u16) -> Vec<u8> {
     let dir = std::env::var("INKEMU_ROM_ELF_DIR")
@@ -16,12 +17,25 @@ fn elf(revision: u16) -> Vec<u8> {
 
 fn image_sha256(revision: u16) -> String {
     let rom = RomImage::from_elf(&elf(revision)).unwrap();
-    Sha256::digest(rom.bytes())
-        .iter()
-        .fold(String::new(), |mut hex, byte| {
-            write!(hex, "{byte:02x}").unwrap();
-            hex
-        })
+    format!("{:x}", Sha256::digest(rom.bytes()))
+}
+
+/// The chip a ROM revision really ships in: the eFuses must report a revision that ROM belongs to.
+fn chip_of(rom_revision: u16) -> ChipRevision {
+    match rom_revision {
+        0 => ChipRevision::new(0, 0),
+        3 => ChipRevision::new(0, 3),
+        101 => ChipRevision::new(1, 1),
+        other => panic!("no chip revision for ROM revision {other}"),
+    }
+    .unwrap()
+}
+
+fn config_for(rom_revision: u16) -> SocConfig {
+    SocConfig {
+        chip_revision: chip_of(rom_revision),
+        ..SocConfig::default()
+    }
 }
 
 /// rev3 is byte-identical to the reference ROM image shipped with Espressif's QEMU; rev0 and rev101
@@ -124,33 +138,31 @@ fn rev3_rom_prints_the_same_banner_on_usb_serial_jtag() {
 #[ignore = "needs INKEMU_ROM_ELF_DIR"]
 fn rev0_and_rev101_roms_print_their_own_banners() {
     assert!(
-        boot(0, SocConfig::default())
+        boot(0, config_for(0))
             .uart0
             .starts_with(&banner("esp32c3-20200918", "Sep 18 2020"))
     );
     assert!(
-        boot(101, SocConfig::default())
+        boot(101, config_for(101))
             .uart0
             .starts_with(&banner("esp32c3-eco7-20230720", "Jul 20 2023"))
     );
 }
 
 /// Everything the ROM touches up to its banner is modelled: in strict mode the banner is complete
-/// before the machine stops, and no CPU exception occurred on the way.
-#[test]
-#[ignore = "needs INKEMU_ROM_ELF_DIR"]
-fn rev3_banner_is_reached_without_any_unmodeled_access_or_exception() {
+/// before the machine stops, and no CPU exception occurred on the way. Each ROM boots on the chip
+/// revision it ships in.
+fn assert_strict_boot_reaches_the_banner(rom_revision: u16, banner_text: &str) {
     let boot = boot(
-        3,
+        rom_revision,
         SocConfig {
             strict_mmio: true,
-            ..SocConfig::default()
+            ..config_for(rom_revision)
         },
     );
     assert!(
-        boot.uart0
-            .starts_with(&banner("esp32c3-api1-20210207", "Feb  7 2021")),
-        "stopped early: {:?}\nUART0: {:?}",
+        boot.uart0.starts_with(banner_text),
+        "rev{rom_revision} stopped early: {:?}\nUART0: {:?}",
         boot.stop,
         boot.uart0
     );
@@ -159,9 +171,27 @@ fn rev3_banner_is_reached_without_any_unmodeled_access_or_exception() {
             .diagnostics
             .iter()
             .any(|d| matches!(d, Diagnostic::Exception { .. })),
-        "{:#?}",
+        "rev{rom_revision}: {:#?}",
         boot.diagnostics
     );
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rev3_banner_is_reached_without_any_unmodeled_access_or_exception() {
+    assert_strict_boot_reaches_the_banner(3, &banner("esp32c3-api1-20210207", "Feb  7 2021"));
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rev0_banner_is_reached_without_any_unmodeled_access_or_exception() {
+    assert_strict_boot_reaches_the_banner(0, &banner("esp32c3-20200918", "Sep 18 2020"));
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rev101_banner_is_reached_without_any_unmodeled_access_or_exception() {
+    assert_strict_boot_reaches_the_banner(101, &banner("esp32c3-eco7-20230720", "Jul 20 2023"));
 }
 
 #[test]

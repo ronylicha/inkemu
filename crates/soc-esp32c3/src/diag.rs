@@ -3,8 +3,8 @@ use cpu_rv32::Exception;
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Past this many distinct diagnostics, further ones are counted but no longer listed: a runaway
-/// program must not grow the log without bound.
+/// Past this many distinct diagnostics, further new ones are counted (see [`Diagnostics::suppressed`])
+/// but no longer listed: a runaway program must not grow the log without bound.
 pub const MAX_DISTINCT_DIAGNOSTICS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,7 +51,7 @@ impl Diagnostic {
                 direction: Direction::Write,
                 ..
             } => (1, addr, 0),
-            Diagnostic::SubWordWrite { addr, .. } => (2, addr, 0),
+            Diagnostic::SubWordWrite { addr, bytes, .. } => (2, addr, bytes),
             Diagnostic::Exception { cause, pc, .. } => (3, pc, cause.code()),
             Diagnostic::Suppressed => (4, 0, 0),
         }
@@ -110,7 +110,7 @@ impl fmt::Display for Diagnostic {
             ),
             Diagnostic::Suppressed => write!(
                 f,
-                "more than {MAX_DISTINCT_DIAGNOSTICS} distinct diagnostics; further ones are counted but not listed"
+                "more than {MAX_DISTINCT_DIAGNOSTICS} distinct diagnostics; further new ones are counted but not listed"
             ),
         }
     }
@@ -119,11 +119,14 @@ impl fmt::Display for Diagnostic {
 #[derive(Debug)]
 pub struct Diagnostics {
     strict: bool,
-    /// Occurrences per key. A `BTreeMap` keeps every observable order deterministic.
-    seen: BTreeMap<Key, u64>,
+    /// The first diagnostic of each key and its number of occurrences. A `BTreeMap` keeps every
+    /// observable order deterministic.
+    seen: BTreeMap<Key, (Diagnostic, u64)>,
     pending: Vec<Diagnostic>,
     violation: Option<Diagnostic>,
     capped: bool,
+    /// Occurrences dropped because [`MAX_DISTINCT_DIAGNOSTICS`] distinct ones were already known.
+    suppressed: u64,
 }
 
 impl Diagnostics {
@@ -135,6 +138,7 @@ impl Diagnostics {
             pending: Vec::new(),
             violation: None,
             capped: false,
+            suppressed: 0,
         }
     }
 
@@ -142,17 +146,19 @@ impl Diagnostics {
         if self.strict && self.violation.is_none() && diagnostic.is_mmio() {
             self.violation = Some(diagnostic.clone());
         }
-        if let Some(count) = self.seen.get_mut(&diagnostic.key()) {
+        let key = diagnostic.key();
+        if let Some((_, count)) = self.seen.get_mut(&key) {
             *count += 1;
             return;
         }
         if self.seen.len() >= MAX_DISTINCT_DIAGNOSTICS {
+            self.suppressed += 1;
             if !std::mem::replace(&mut self.capped, true) {
                 self.pending.push(Diagnostic::Suppressed);
             }
             return;
         }
-        self.seen.insert(diagnostic.key(), 1);
+        self.seen.insert(key, (diagnostic.clone(), 1));
         self.pending.push(diagnostic);
     }
 
@@ -161,14 +167,40 @@ impl Diagnostics {
         std::mem::take(&mut self.pending)
     }
 
-    /// In strict mode, the first unmodeled access; `None` otherwise or once taken.
+    /// In strict mode, the first violation; `None` otherwise or once taken. A violation is the first
+    /// unmodeled access **or** the first 8- or 16-bit write to a peripheral register, modeled or not.
     pub fn take_violation(&mut self) -> Option<Diagnostic> {
         self.violation.take()
     }
 
     #[must_use]
     pub fn occurrences(&self, diagnostic: &Diagnostic) -> u64 {
-        self.seen.get(&diagnostic.key()).copied().unwrap_or(0)
+        self.seen
+            .get(&diagnostic.key())
+            .map_or(0, |&(_, count)| count)
+    }
+
+    /// How many occurrences were dropped because [`MAX_DISTINCT_DIAGNOSTICS`] distinct diagnostics were
+    /// already known: none of them is listed, and each is counted here.
+    #[must_use]
+    pub const fn suppressed(&self) -> u64 {
+        self.suppressed
+    }
+
+    /// At most `limit` diagnostics that occurred more than once, the most frequent first (ties in key
+    /// order, so the result is deterministic), each with its number of occurrences.
+    #[must_use]
+    pub fn most_repeated(&self, limit: usize) -> Vec<(Diagnostic, u64)> {
+        let mut repeated: Vec<(Diagnostic, u64)> = self
+            .seen
+            .values()
+            .filter(|(_, count)| *count > 1)
+            .cloned()
+            .collect();
+        // The map iterates in key order and the sort is stable: equal counts keep key order.
+        repeated.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+        repeated.truncate(limit);
+        repeated
     }
 
     #[must_use]
@@ -233,6 +265,67 @@ mod tests {
         assert_eq!(d.distinct(), MAX_DISTINCT_DIAGNOSTICS);
         assert_eq!(listed.len(), MAX_DISTINCT_DIAGNOSTICS + 1);
         assert_eq!(listed.last(), Some(&Diagnostic::Suppressed));
+    }
+
+    fn sub_word_write_at(index: u32) -> Diagnostic {
+        Diagnostic::SubWordWrite {
+            addr: 0x6000_0000 + 4 * index,
+            bytes: 1,
+            pc: 0,
+        }
+    }
+
+    #[test]
+    fn occurrences_past_the_cap_are_counted_as_suppressed() {
+        let mut d = Diagnostics::new(false);
+        let cap = u32::try_from(MAX_DISTINCT_DIAGNOSTICS).unwrap();
+        for i in 0..cap + 10 {
+            d.record(sub_word_write_at(i));
+        }
+        assert_eq!(d.suppressed(), 10);
+        d.record(sub_word_write_at(cap + 3)); // one more occurrence of a dropped diagnostic
+        assert_eq!(d.suppressed(), 11);
+        d.record(sub_word_write_at(0)); // a listed diagnostic is counted as such, not as suppressed
+        assert_eq!(d.suppressed(), 11);
+        assert_eq!(d.occurrences(&sub_word_write_at(0)), 2);
+    }
+
+    #[test]
+    fn most_repeated_lists_the_frequent_ones_first_and_skips_the_single_ones() {
+        let mut d = Diagnostics::new(false);
+        let times = |d: &mut Diagnostics, index: u32, n: u32| {
+            for _ in 0..n {
+                d.record(sub_word_write_at(index));
+            }
+        };
+        times(&mut d, 7, 1); // seen once: never listed
+        times(&mut d, 3, 5);
+        times(&mut d, 1, 9);
+        times(&mut d, 2, 5); // ties with index 3: key order puts the lower address first
+        let counts: Vec<(u32, u64)> = d
+            .most_repeated(10)
+            .into_iter()
+            .map(|(diagnostic, count)| match diagnostic {
+                Diagnostic::SubWordWrite { addr, .. } => ((addr - 0x6000_0000) / 4, count),
+                other => panic!("unexpected {other}"),
+            })
+            .collect();
+        assert_eq!(counts, [(1, 9), (2, 5), (3, 5)]);
+        assert_eq!(d.most_repeated(2).len(), 2, "the limit applies");
+        assert_eq!(Diagnostics::new(false).most_repeated(3).len(), 0);
+    }
+
+    #[test]
+    fn writes_of_different_widths_to_one_address_are_two_diagnostics() {
+        let mut d = Diagnostics::new(false);
+        for bytes in [1, 2] {
+            d.record(Diagnostic::SubWordWrite {
+                addr: 0x6000_9054,
+                bytes,
+                pc: 0,
+            });
+        }
+        assert_eq!(d.drain().len(), 2);
     }
 
     #[test]

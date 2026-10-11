@@ -10,7 +10,7 @@ workspace = true
 
 [features]
 # Exposes `RomImage::from_flat` so other crates can run tiny hand-written programs as a ROM in their tests.
-test-support = []
+test-support = ["cpu-rv32/test-support"]
 
 [dependencies]
 emu-core.workspace = true

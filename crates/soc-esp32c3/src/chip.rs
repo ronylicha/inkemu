@@ -19,7 +19,7 @@ pub struct ChipRevision {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ChipRevisionError {
     #[error(
-        "chip revision v{major}.{minor} does not fit the eFuse fields (major 0..=3, minor 0..=15); use a revision Espressif shipped, such as v0.3, v0.4 or v1.1"
+        "chip revision v{major}.{minor} does not fit the eFuse fields (major 0..={MAX_MAJOR}, minor 0..={MAX_MINOR}); use a revision Espressif shipped, such as v0.3, v0.4 or v1.1"
     )]
     OutOfRange { major: u8, minor: u8 },
     #[error("`{text}` is not a chip revision; write it as v<major>.<minor>, for example v0.3")]
@@ -56,6 +56,14 @@ impl ChipRevision {
     }
 }
 
+/// A decimal number in its canonical form: ASCII digits only, no sign, no leading zero.
+fn canonical_number(text: &str) -> Option<u8> {
+    let canonical = !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    canonical.then(|| text.parse().ok()).flatten()
+}
+
 impl FromStr for ChipRevision {
     type Err = ChipRevisionError;
 
@@ -67,8 +75,8 @@ impl FromStr for ChipRevision {
             .strip_prefix('v')
             .and_then(|rest| rest.split_once('.'))
             .ok_or_else(malformed)?;
-        let major = major.parse::<u8>().map_err(|_| malformed())?;
-        let minor = minor.parse::<u8>().map_err(|_| malformed())?;
+        let major = canonical_number(major).ok_or_else(malformed)?;
+        let minor = canonical_number(minor).ok_or_else(malformed)?;
         ChipRevision::new(major, minor)
     }
 }
@@ -101,10 +109,22 @@ mod tests {
 
     #[test]
     fn malformed_text_names_the_expected_form() {
-        for text in ["0.3", "v3", "v0.x", "", "v0.3.1", "v-1.0"] {
+        for text in [
+            "0.3", "v3", "v0.x", "", "v0.3.1", "v-1.0", "v+0.3", "v00.03", "v0.03",
+        ] {
             let err = text.parse::<ChipRevision>().unwrap_err().to_string();
             assert!(err.contains("v<major>.<minor>"), "{text:?}: {err}");
         }
+    }
+
+    #[test]
+    fn out_of_range_revisions_name_the_limits_of_the_fields() {
+        let err = "v4.0".parse::<ChipRevision>().unwrap_err();
+        assert_eq!(err, ChipRevisionError::OutOfRange { major: 4, minor: 0 });
+        assert!(
+            err.to_string().contains("major 0..=3, minor 0..=15"),
+            "{err}"
+        );
     }
 
     #[test]

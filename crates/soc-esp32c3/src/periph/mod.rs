@@ -81,27 +81,33 @@ impl Storage {
     }
 }
 
-/// Address ranges of the modelled blocks (`reg_base.h`; report §A.2). Ends are exclusive.
-const GPIO_BASE: u32 = 0x6000_4000;
+// Base address and range of every modelled block (`reg_base.h`; report §A.2), in one place. A range
+// is `(base, end)`, the end being exclusive. The peripheral modules import their base from here, and
+// ask the SVD for their registers relative to it.
+pub(crate) const GPIO_BASE: u32 = 0x6000_4000;
 const GPIO: (u32, u32) = (GPIO_BASE, 0x6000_4F00);
-/// Shared with [`io_mux`], which asks the SVD for its registers relative to this base.
 pub(crate) const IO_MUX_BASE: u32 = 0x6000_9000;
 const IO_MUX: (u32, u32) = (IO_MUX_BASE, 0x6000_A000);
+pub(crate) const RTC_CNTL_BASE: u32 = 0x6000_8000;
 /// `RTC_CNTL` and the eFuse mirror share the page `0x6000_8000`: the first 2 KiB, then the last.
-const RTC_CNTL: (u32, u32) = (rtc_cntl::BASE, EFUSE_BASE);
-/// Shared with [`efuse`], which asks the SVD for its registers relative to this base.
+const RTC_CNTL: (u32, u32) = (RTC_CNTL_BASE, EFUSE_BASE);
 pub(crate) const EFUSE_BASE: u32 = 0x6000_8800;
 const EFUSE: (u32, u32) = (EFUSE_BASE, 0x6000_9000);
-const SYSTEM: (u32, u32) = (system::BASE, 0x600C_1000);
-const INTMATRIX_BASE: u32 = 0x600C_2000;
+pub(crate) const SYSTEM_BASE: u32 = 0x600C_0000;
+const SYSTEM: (u32, u32) = (SYSTEM_BASE, 0x600C_1000);
+pub(crate) const INTMATRIX_BASE: u32 = 0x600C_2000;
 const INTMATRIX: (u32, u32) = (INTMATRIX_BASE, 0x600C_3000);
-const EXTMEM: (u32, u32) = (extmem::BASE, 0x600C_5000);
-const ASSIST_DEBUG_BASE: u32 = 0x600C_E000;
+pub(crate) const EXTMEM_BASE: u32 = 0x600C_4000;
+const EXTMEM: (u32, u32) = (EXTMEM_BASE, 0x600C_5000);
+pub(crate) const ASSIST_DEBUG_BASE: u32 = 0x600C_E000;
 const ASSIST_DEBUG: (u32, u32) = (ASSIST_DEBUG_BASE, 0x600C_F000);
-/// The two UARTs and the USB-Serial-JTAG device: the ROM's consoles (report §G).
-const UART0: (u32, u32) = (0x6000_0000, 0x6000_1000);
-const UART1: (u32, u32) = (0x6001_0000, 0x6001_1000);
-const USB_SERIAL_JTAG: (u32, u32) = (0x6004_3000, 0x6004_4000);
+// The two UARTs and the USB-Serial-JTAG device: the ROM's consoles (report §G).
+const UART0_BASE: u32 = 0x6000_0000;
+const UART0: (u32, u32) = (UART0_BASE, 0x6000_1000);
+const UART1_BASE: u32 = 0x6001_0000;
+const UART1: (u32, u32) = (UART1_BASE, 0x6001_1000);
+const USB_SERIAL_JTAG_BASE: u32 = 0x6004_3000;
+const USB_SERIAL_JTAG: (u32, u32) = (USB_SERIAL_JTAG_BASE, 0x6004_4000);
 
 #[derive(Debug)]
 pub struct Peripherals {
@@ -130,8 +136,8 @@ impl Peripherals {
             efuse: Efuse::new(config.chip_revision),
             extmem: Extmem::new(),
             assist_debug: AssistDebug::new(),
-            uart0: Uart::new(UART0.0),
-            uart1: Uart::new(UART1.0),
+            uart0: Uart::new(UART0_BASE),
+            uart1: Uart::new(UART1_BASE),
             usb_serial_jtag: UsbSerialJtag::new(),
         }
     }
@@ -144,23 +150,23 @@ impl Peripherals {
         } else if within(IO_MUX) {
             Some((&mut self.io_mux, IO_MUX_BASE))
         } else if within(RTC_CNTL) {
-            Some((&mut self.rtc_cntl, rtc_cntl::BASE))
+            Some((&mut self.rtc_cntl, RTC_CNTL_BASE))
         } else if within(EFUSE) {
             Some((&mut self.efuse, EFUSE_BASE))
         } else if within(SYSTEM) {
-            Some((&mut self.system, system::BASE))
+            Some((&mut self.system, SYSTEM_BASE))
         } else if within(INTMATRIX) {
             Some((&mut self.intmatrix, INTMATRIX_BASE))
         } else if within(EXTMEM) {
-            Some((&mut self.extmem, extmem::BASE))
+            Some((&mut self.extmem, EXTMEM_BASE))
         } else if within(ASSIST_DEBUG) {
             Some((&mut self.assist_debug, ASSIST_DEBUG_BASE))
         } else if within(UART0) {
-            Some((&mut self.uart0, UART0.0))
+            Some((&mut self.uart0, UART0_BASE))
         } else if within(UART1) {
-            Some((&mut self.uart1, UART1.0))
+            Some((&mut self.uart1, UART1_BASE))
         } else if within(USB_SERIAL_JTAG) {
-            Some((&mut self.usb_serial_jtag, USB_SERIAL_JTAG.0))
+            Some((&mut self.usb_serial_jtag, USB_SERIAL_JTAG_BASE))
         } else {
             None
         }
@@ -187,5 +193,16 @@ mod tests {
         );
         assert_eq!(picked.read(0x88), None);
         assert!(picked.write(0x8C, 9));
+    }
+
+    #[test]
+    fn the_page_shared_by_rtc_cntl_and_the_efuse_splits_at_the_last_two_kib() {
+        let mut p = Peripherals::new(&SocConfig::default());
+        let base_of = |p: &mut Peripherals, addr: u32| p.device(addr).map(|(_, base)| base);
+        assert_eq!(base_of(&mut p, 0x6000_8000), Some(RTC_CNTL_BASE));
+        assert_eq!(base_of(&mut p, 0x6000_87FC), Some(RTC_CNTL_BASE));
+        assert_eq!(base_of(&mut p, 0x6000_8800), Some(EFUSE_BASE));
+        assert_eq!(base_of(&mut p, 0x6000_8FFC), Some(EFUSE_BASE));
+        assert_eq!(base_of(&mut p, 0x6000_9000), Some(IO_MUX_BASE));
     }
 }

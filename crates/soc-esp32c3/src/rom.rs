@@ -41,11 +41,11 @@ pub enum RomError {
     )]
     WrongMachine { machine: u16 },
     #[error(
-        "ELF entry point {entry:#010x} is not the reset vector 0x40000000; use an unmodified ESP32-C3 ROM ELF"
+        "ELF entry point {entry:#010x} is not the reset vector {ROM_BASE:#010x}; use an unmodified ESP32-C3 ROM ELF"
     )]
     WrongEntry { entry: u64 },
     #[error(
-        "the ROM identifies itself as chip {found}, not 5 (ESP32-C3); use an `esp32c3_rev<N>_rom.elf` file"
+        "the ROM identifies itself as chip {found}, not {ESP32C3_CHIP_ID} (ESP32-C3); use an `esp32c3_rev<N>_rom.elf` file"
     )]
     WrongChip { found: u32 },
     #[error(
@@ -61,7 +61,7 @@ pub enum RomError {
     )]
     UnexpectedLayout { detail: String },
     #[error(
-        "a flat ROM image must be exactly 393216 bytes, got {len}; pass a complete 384 KiB dump"
+        "a flat ROM image must be exactly {ROM_LEN} bytes, got {len}; pass a complete 384 KiB dump"
     )]
     WrongSize { len: usize },
 }
@@ -316,14 +316,15 @@ impl RomImage {
             covered: vec![false; ROM_LEN],
         };
         source.place_segments(&mut layout)?;
-        source.place_data_bus_sections(&mut layout)?;
-        source.place_initial_data(&mut layout)?;
-        source.place_btdm_data(&mut layout)?;
-        // 5. Identity.
+        // Identity first: the chip id lives in a segment, so the ROM of another chip's RISC-V core is
+        // reported as such, not as whatever its different layout breaks below.
         let found = layout.word(source.symbol("_rom_chip_id")?, "_rom_chip_id")?;
         if found != ESP32C3_CHIP_ID {
             return Err(RomError::WrongChip { found });
         }
+        source.place_data_bus_sections(&mut layout)?;
+        source.place_initial_data(&mut layout)?;
+        source.place_btdm_data(&mut layout)?;
         let eco_version = layout.word(source.symbol("_rom_eco_version")?, "_rom_eco_version")?;
         Ok(RomImage {
             bytes: layout.rom.into_boxed_slice(),
@@ -374,6 +375,15 @@ mod tests {
         let b = rom.bytes();
         assert_eq!(b.len(), 0x6_0000);
         assert_eq!(rom.eco_version(), 3);
+        assert_eq!(
+            &b[0x10..0x18],
+            [5, 0, 0, 0, 3, 0, 0, 0],
+            "chip id and eco words: the code segment landed at the ROM start"
+        );
+        assert!(
+            !b.windows(4).any(|w| w == b"\x7fELF"),
+            "the RAM-addressed linker artefact holding the ELF header is not part of the image"
+        );
         assert_eq!(&b[0x300..0x304], [1, 2, 3, 4], "unpack entry 0");
         assert_eq!(&b[0x308..0x30C], [5, 6, 7, 8], "unpack entry 1");
         assert_eq!(
@@ -412,6 +422,29 @@ mod tests {
             RomImage::from_elf(&elf.build()),
             Err(RomError::WrongChip { found: 13 })
         ));
+    }
+
+    #[test]
+    fn the_chip_id_is_checked_before_the_layout_of_the_rest() {
+        let mut elf = rom_elf();
+        elf.segments[1].2[0x10] = 13;
+        elf.symbols.retain(|s| s.0 != "_data_end");
+        assert!(matches!(
+            RomImage::from_elf(&elf.build()),
+            Err(RomError::WrongChip { found: 13 })
+        ));
+    }
+
+    #[test]
+    fn messages_quote_the_constants_they_are_about() {
+        let mut elf = rom_elf();
+        elf.entry = 0x4000_0400;
+        let entry = RomImage::from_elf(&elf.build()).unwrap_err().to_string();
+        assert!(entry.contains("0x40000000"), "{entry}");
+        let chip = RomError::WrongChip { found: 13 }.to_string();
+        assert!(chip.contains("not 5 (ESP32-C3)"), "{chip}");
+        let size = RomImage::from_flat(vec![0; 1]).unwrap_err().to_string();
+        assert!(size.contains("exactly 393216 bytes"), "{size}");
     }
 
     #[test]

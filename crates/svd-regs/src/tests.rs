@@ -1,5 +1,6 @@
 extern crate std;
 
+use crate::REGISTER_BYTES;
 use crate::esp32c3::{lookup, registers};
 
 /// Update these two numbers only after reading the generator diff of an SVD bump.
@@ -11,24 +12,29 @@ fn table_is_sorted_unique_and_word_aligned() {
     assert_eq!(registers().len(), REGISTER_COUNT);
     for pair in registers().windows(2) {
         assert!(
-            pair[0].addr + 4 <= pair[1].addr,
+            pair[0].addr + REGISTER_BYTES <= pair[1].addr,
             "{:#x} overlaps {:#x}",
             pair[0].addr,
             pair[1].addr
         );
     }
-    assert!(registers().iter().all(|r| r.addr % 4 == 0));
+    assert!(registers().iter().all(|r| r.addr % REGISTER_BYTES == 0));
 }
 
 #[test]
 fn every_byte_of_a_register_resolves_to_it_and_gaps_resolve_to_nothing() {
     for (i, r) in registers().iter().enumerate() {
-        for byte in 0..4 {
+        for byte in 0..REGISTER_BYTES {
             assert_eq!(lookup(r.addr + byte), Some(r));
         }
         let next = registers().get(i + 1).map_or(u32::MAX, |n| n.addr);
-        if r.addr + 4 < next {
-            assert_eq!(lookup(r.addr + 4), None, "gap after {:#x}", r.addr);
+        if r.addr + REGISTER_BYTES < next {
+            assert_eq!(
+                lookup(r.addr + REGISTER_BYTES),
+                None,
+                "gap after {:#x}",
+                r.addr
+            );
         }
     }
     assert_eq!(lookup(0), None);

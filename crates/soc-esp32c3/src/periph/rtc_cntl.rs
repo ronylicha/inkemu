@@ -1,15 +1,22 @@
 //! `RTC_CNTL`: reset cause, retention registers, pad and power configuration.
 //! Source: report §E.2. Software reset, the RTC timer and the watchdogs arrive in SP1b-3.
-use crate::periph::Storage;
+use crate::periph::{RTC_CNTL_BASE, Storage};
 use emu_core::Peripheral;
 
-pub(crate) const BASE: u32 = 0x6000_8000;
 const RESET_STATE: u32 = 0x38;
 const STORE_COUNT: usize = 8;
 /// `RTC_CNTL_STORE0..7`: they survive a reset; the ROM keeps the APB frequency in STORE5.
 const STORE: [u32; STORE_COUNT] = [0x50, 0x54, 0x58, 0x5C, 0xB8, 0xBC, 0xC0, 0xC4];
 /// Configuration the ROM reads back and modifies before its banner: `PWC`, `DIG_ISO`,
 /// `SWD_CONF`, `PAD_HOLD`, `DIG_PAD_HOLD`. Nothing acts on it yet.
+///
+/// `SWD_CONF` is kept as plain storage although on silicon it mixes a read-only reset flag and
+/// write-only strobes. Its bits (ESP-IDF `rtc_cntl_reg.h`, `RTC_CNTL_SWD_CONF_REG`; report §E.2;
+/// same names in the SVD): `SWD_RESET_FLAG` [0] and `SWD_FEED_INT` [1] read-only; `SWD_BYPASS_RST` [17],
+/// `SWD_SIGNAL_WIDTH` [27:18], `SWD_DISABLE` [30] and `SWD_AUTO_FEED_EN` [31] read/write;
+/// `SWD_RST_FLAG_CLR` [28] and `SWD_FEED` [29] write-only. Storing them is harmless for the boot,
+/// which only reads bit 0 (it stays clear after a power-on reset); the super watchdog itself is
+/// modelled in SP1b-3.
 const CONFIG: [u32; 5] = [0x84, 0x8C, 0xAC, 0xD0, 0xD4];
 /// `RESET_CAUSE_PROCPU`, bits [5:0] of `RESET_STATE` (`soc/reset_reasons.h`).
 const RESET_CAUSE_MASK: u32 = 0x3F;
@@ -27,12 +34,13 @@ pub struct RtcCntl {
 impl RtcCntl {
     #[must_use]
     pub fn new() -> RtcCntl {
-        let documented = svd_regs::esp32c3::lookup(BASE + RESET_STATE).map_or(0, |r| r.reset_value);
+        let documented =
+            svd_regs::esp32c3::lookup(RTC_CNTL_BASE + RESET_STATE).map_or(0, |r| r.reset_value);
         RtcCntl {
             reset_cause: RESET_CAUSE_POWERON,
             reset_state_other: documented & !RESET_CAUSE_MASK,
             store: [0; STORE_COUNT],
-            config: Storage::for_offsets(BASE, &CONFIG),
+            config: Storage::for_offsets(RTC_CNTL_BASE, &CONFIG),
         }
     }
 }

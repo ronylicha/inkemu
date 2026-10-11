@@ -1,10 +1,9 @@
 //! `EXTMEM`: the flash-cache controller. Only `ICACHE_CTRL1` is modelled so far, as plain storage
 //! (report §C.1 and §J row 2); the cache itself (autoload, MMU, sync) arrives in SP1b-2. Every other
 //! EXTMEM register returns `None`/`false`, so the bus reports it by name.
-use super::Storage;
+use super::{EXTMEM_BASE, Storage};
 use emu_core::Peripheral;
 
-pub(crate) const BASE: u32 = 0x600C_4000;
 /// `ICACHE_CTRL1`: bit 0 `SHUT_IBUS`, bit 1 `SHUT_DBUS`. `Cache_Mask_All` sets both with a
 /// read-modify-write, the first peripheral access of `boot_prepare` (report §C.1 and §J row 2,
 /// `ROM3:Cache_Mask_All@0x40051138`). Plain read/write register; its SVD reset value is 3.
@@ -19,7 +18,7 @@ impl Extmem {
     #[must_use]
     pub fn new() -> Extmem {
         Extmem {
-            registers: Storage::for_offsets(BASE, &[ICACHE_CTRL1]),
+            registers: Storage::for_offsets(EXTMEM_BASE, &[ICACHE_CTRL1]),
         }
     }
 }
@@ -47,7 +46,7 @@ mod tests {
     #[test]
     fn icache_ctrl1_starts_at_its_documented_reset_value_and_remembers_writes() {
         let mut extmem = Extmem::new();
-        let reset = svd_regs::esp32c3::lookup(BASE + ICACHE_CTRL1)
+        let reset = svd_regs::esp32c3::lookup(EXTMEM_BASE + ICACHE_CTRL1)
             .unwrap()
             .reset_value;
         assert_eq!(extmem.read(ICACHE_CTRL1), Some(reset));

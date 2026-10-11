@@ -1,14 +1,14 @@
 //! `SYSTEM`: clock selection, peripheral clock gates and resets. Source: report §E.1.
 //! The clock tree itself (PLL, CPU frequency switch) arrives in SP1b-2.
-use crate::periph::Storage;
+use crate::periph::{SYSTEM_BASE, Storage};
 use emu_core::Peripheral;
 
-pub(crate) const BASE: u32 = 0x600C_0000;
 const SYSCLK_CONF: u32 = 0x58;
 /// `CPU_PERI_CLK_EN`, `CPU_PERI_RST_EN`, `PERIP_CLK_EN0/1`, `PERIP_RST_EN0/1`: gates and reset pulses the
 /// ROM toggles around each peripheral it sets up. Nothing acts on them yet.
 const GATES: [u32; 6] = [0x00, 0x04, 0x10, 0x14, 0x18, 0x1C];
-/// `SYSCLK_CONF`: bits [9:0] `PRE_DIV_CNT` and [11:10] `SOC_CLK_SEL` are writable.
+/// `SYSCLK_CONF`: bits [9:0] `PRE_DIV_CNT` and [11:10] `SOC_CLK_SEL` are writable; a write keeps
+/// bits [11:0] only, because `CLK_XTAL_FREQ` [18:12] and `CLK_DIV_EN` [19] are read-only (report §E.1).
 const SYSCLK_WRITABLE: u32 = 0xFFF;
 /// Reset: `PRE_DIV_CNT` = 1, `SOC_CLK_SEL` = 0 (the crystal drives the CPU).
 const SYSCLK_RESET: u32 = 1;
@@ -28,7 +28,7 @@ impl System {
     pub fn new() -> System {
         System {
             sysclk_writable: SYSCLK_RESET,
-            gates: Storage::for_offsets(BASE, &GATES),
+            gates: Storage::for_offsets(SYSTEM_BASE, &GATES),
         }
     }
 }
