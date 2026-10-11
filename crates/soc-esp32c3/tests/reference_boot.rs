@@ -450,6 +450,14 @@ fn the_countdown_lines_are_one_device_second_apart_and_the_cpu_sleeps_between_th
     );
 }
 
+/// The reference image with the stock partition table of the X4 in place of its own.
+fn reference_image_behind_the_stock_x4_table() -> Vec<u8> {
+    let mut image = reference_flash();
+    image[PARTITION_TABLE_OFFSET..PARTITION_TABLE_OFFSET + X4_STOCK_TABLE.len()]
+        .copy_from_slice(X4_STOCK_TABLE);
+    image
+}
+
 /// Spec §5.1: "Reset → ROM → bootloader → table de partitions → `otadata` → application". The
 /// reference image has a factory application; the target device has none. Behind the stock X4
 /// table the unmodified bootloader finds a blank `otadata`, falls back to OTA slot 0 and records
@@ -459,12 +467,11 @@ fn the_countdown_lines_are_one_device_second_apart_and_the_cpu_sleeps_between_th
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
 fn the_stock_x4_ota_layout_boots_and_only_the_otadata_update_is_refused() {
-    let mut image = reference_flash();
-    image[PARTITION_TABLE_OFFSET..PARTITION_TABLE_OFFSET + X4_STOCK_TABLE.len()]
-        .copy_from_slice(X4_STOCK_TABLE);
-    let boot = run_image(image, SocConfig::default(), |console, _| {
-        console.contains("Hello world!\n")
-    });
+    let boot = run_image(
+        reference_image_behind_the_stock_x4_table(),
+        SocConfig::default(),
+        |console, _| console.contains("Hello world!\n"),
+    );
     assert!(
         boot.console.starts_with(ROM_LINES),
         "ROM part:\n{}",
@@ -506,6 +513,65 @@ fn the_stock_x4_ota_layout_boots_and_only_the_otadata_update_is_refused() {
         "nothing stops a lenient run: {:?}",
         boot.stop
     );
+}
+
+/// The same layout in strict mode: the run stops on the first thing the model refuses, the sector
+/// erase with which the bootloader starts its `otadata` update, and the stop names the operation
+/// and the instruction. Nothing was reported before it, and the application did not start.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn a_strict_run_of_the_stock_x4_ota_layout_stops_at_the_first_flash_command_it_refuses() {
+    let strict = SocConfig {
+        strict_mmio: true,
+        ..SocConfig::default()
+    };
+    let boot = run_image(
+        reference_image_behind_the_stock_x4_table(),
+        strict,
+        |console, _| console.contains("Hello world!\n"),
+    );
+    let StopReason::StrictMmio(violation) = &boot.stop else {
+        panic!(
+            "a strict run of this layout must stop, got {:?}\nconsole:\n{}",
+            boot.stop, boot.console
+        );
+    };
+    let Diagnostic::Unsupported {
+        what: Unsupported::FlashCommand { opcode: 0x20 },
+        pc,
+    } = violation
+    else {
+        panic!("the stop is not the sector erase: {violation}");
+    };
+    assert!(
+        MASK_ROM.contains(pc),
+        "the erase is run by the mask ROM: pc {pc:#010x}"
+    );
+    let text = violation.to_string();
+    assert!(
+        text.contains("flash command 0x20 is not modeled") && text.contains(&format!("{pc:#010x}")),
+        "the stop names the operation and the instruction: {text}"
+    );
+    assert_eq!(
+        boot.diagnostics,
+        std::slice::from_ref(violation),
+        "nothing was reported before the stop, and the stop is in the journal once"
+    );
+    assert!(
+        boot.console
+            .lines()
+            .map(mask_timestamp)
+            .any(|line| line == "I (#) boot: No factory image, trying OTA 0"),
+        "the bootloader had chosen the OTA slot:\n{}",
+        boot.console
+    );
+    assert_eq!(
+        application_starts(&boot.console),
+        0,
+        "the run stopped in the bootloader:\n{}",
+        boot.console
+    );
+    assert_eq!(boot.resets, 0);
 }
 
 /// Milestone point 6: two runs of a whole life cycle, the reset included, are the same run.
