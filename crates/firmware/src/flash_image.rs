@@ -38,7 +38,7 @@ pub fn has_partition_table(bytes: &[u8]) -> bool {
 /// bootloader validate the rest when they run, as on the device.
 ///
 /// # Errors
-/// [`FirmwareError::EncryptedOta`], [`FirmwareError::FlashImageTooShort`],
+/// [`FirmwareError::EncryptedOtaAsFlash`], [`FirmwareError::FlashImageTooShort`],
 /// [`FirmwareError::NotAFlashImage`], [`FirmwareError::BadSpiMode`], [`FirmwareError::BadFlashSize`],
 /// [`FirmwareError::ChipMismatch`], [`FirmwareError::FlashTooSmall`] or [`FirmwareError::NoPartitionTable`].
 pub fn check_flash_image(
@@ -47,7 +47,7 @@ pub fn check_flash_image(
     device_flash_bytes: u64,
 ) -> Result<FlashImageInfo, FirmwareError> {
     if bytes.starts_with(XOTA_MAGIC) {
-        return Err(FirmwareError::EncryptedOta);
+        return Err(FirmwareError::EncryptedOtaAsFlash);
     }
     if bytes.len() < HEADER_LEN {
         return Err(FirmwareError::FlashImageTooShort { len: bytes.len() });
@@ -115,7 +115,17 @@ mod tests {
     fn an_encrypted_ota_file_is_refused() {
         let mut bytes = b"XOTA".to_vec();
         bytes.resize(0x9000, 0);
-        assert_eq!(refusal(&bytes), FirmwareError::EncryptedOta);
+        let err = refusal(&bytes);
+        assert_eq!(err, FirmwareError::EncryptedOtaAsFlash);
+        let text = err.to_string();
+        // The remedy of the application path ("the plain application .bin") would be refused here.
+        assert!(
+            text.contains("encrypted OTA update (.xota)")
+                && text.contains("; use a full flash dump")
+                && text.contains("merge_bin")
+                && !text.contains("application .bin"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -175,7 +175,8 @@ impl Peripheral for Sha {
                     self.compress(offset == START);
                 }
             }
-            // Decision D7: DMA-SHA is not modelled; the write is reported, never silently dropped.
+            // Decision D7: DMA-SHA is not modelled; a write that configures it (the block count) or
+            // starts it is reported, never silently dropped.
             DMA_BLOCK_NUM | DMA_START | DMA_CONTINUE => {
                 self.unsupported.push_back(Unsupported::ShaDma);
             }

@@ -305,10 +305,14 @@ fn run_with_flash(bytes: &[u8]) -> assert_cmd::assert::Assert {
 fn xota_is_refused_before_boot() {
     let mut bytes = b"XOTA".to_vec();
     bytes.resize(0x9000, 0);
+    // The remedy must fit `--flash`: an application .bin, what `inspect` asks for, is refused here.
     run_with_flash(&bytes).code(2).stderr(
         contains("flash.bin")
             .and(contains("encrypted OTA"))
-            .and(contains("; use")),
+            .and(contains(
+                "; use a full flash dump (`esptool.py read_flash`), or an image merged with `esptool.py merge_bin`",
+            ))
+            .and(contains("application .bin").not()),
     );
 }
 
@@ -352,13 +356,45 @@ fn an_application_image_given_as_flash_is_refused() {
         .stderr(contains("no partition table at offset 0x8000").and(contains("merge_bin")));
 }
 
+/// `inkemu run --device x4 --flash <path>` with an empty ROM directory: a refusal of the flash file
+/// that came after the ROM lookup would show as the ROM error, and never as a download.
+fn run_with_flash_path(path: &str) -> assert_cmd::assert::Assert {
+    let dir = tempfile::tempdir().unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--max-cycles", "1000", "--flash"])
+        .arg(path)
+        .arg("--rom-dir")
+        .arg(dir.path())
+        .assert()
+}
+
 #[test]
 fn a_flash_file_that_does_not_exist_exits_2() {
-    inkemu()
-        .args(["run", "--device", "x4", "--flash", "/nonexistent/flash.bin"])
-        .assert()
+    run_with_flash_path("/nonexistent/flash.bin")
         .code(2)
-        .stderr(contains("/nonexistent/flash.bin").and(contains("; check the path")));
+        .stderr(
+            contains("/nonexistent/flash.bin")
+                .and(contains("; check the path"))
+                .and(contains("downloading").not())
+                .and(contains("esp32c3_rev3_rom.elf").not()),
+        );
+}
+
+#[test]
+fn a_flash_path_with_control_characters_is_echoed_escaped() {
+    run_with_flash_path("/nonexistent/\u{1b}[31mred.bin")
+        .code(2)
+        .stderr(predicate::function(|err: &[u8]| !err.contains(&0x1b)))
+        .stderr(contains("/nonexistent/\\u{1b}[31mred.bin"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_device_node_given_as_flash_is_refused_at_once() {
+    // `/dev/zero` never ends: the command must refuse it for what it is instead of reading it.
+    run_with_flash_path("/dev/zero")
+        .code(2)
+        .stderr(contains("/dev/zero").and(contains("is not a regular file; use the path of")));
 }
 
 #[test]

@@ -48,6 +48,8 @@ const HARD_WIRED: [(u32, u8); 15] = [
 const JEDEC_ID_BYTES: usize = 3;
 const STATUS_BYTE_MASK: u32 = 0xFF;
 
+/// `USER` bit 31: the transfer has a command phase.
+const USR_COMMAND: u32 = 1 << 31;
 const USR_ADDR: u32 = 1 << 30;
 const USR_DUMMY: u32 = 1 << 29;
 const USR_MISO: u32 = 1 << 28;
@@ -58,6 +60,12 @@ const ADDR_BITLEN_MASK: u32 = 0x3F;
 const DUMMY_CYCLES_MASK: u32 = 0x3F;
 /// `USER2` [15:0]: the command; its low byte is the opcode of every 8-bit command.
 const OPCODE_MASK: u32 = 0xFF;
+/// `USER2` [31:28]: command length in bits, minus one.
+const COMMAND_BITLEN_SHIFT: u32 = 28;
+const COMMAND_BITLEN_MASK: u32 = 0xF;
+/// The only command length the model runs: every measured transfer has it (`USER2` [31:28] = 7,
+/// FB §B.2).
+const MODELED_COMMAND_BITS: u32 = 8;
 /// `MOSI_DLEN` / `MISO_DLEN` [9:0]: data length in bits, minus one.
 const DLEN_MASK: u32 = 0x3FF;
 
@@ -235,6 +243,11 @@ impl Spi1 {
     }
 
     /// Bytes a `xxx_DLEN` register asks for: its field is the bit length minus one.
+    ///
+    /// ASSUMPTION: a length that is not a whole number of bytes is rounded up, the bits past it
+    /// being transferred like the others. Every measured transfer is a whole number of bytes (FB
+    /// §B.2, BA §2.2); what the controller does with a partial byte is not established. The SP1b-4
+    /// lockstep settles it.
     fn data_len(&self, register: u32) -> usize {
         let bits = (self.register(register) & DLEN_MASK) + 1;
         usize::try_from(bits.div_ceil(8))
@@ -242,11 +255,27 @@ impl Spi1 {
             .min(DATA_BYTES)
     }
 
+    /// The length of the command phase `USER` and `USER2` describe: `None` without one.
+    fn command_bits(user: u32, user2: u32) -> Option<u32> {
+        (user & USR_COMMAND != 0)
+            .then_some(((user2 >> COMMAND_BITLEN_SHIFT) & COMMAND_BITLEN_MASK) + 1)
+    }
+
     fn run_user(&mut self) {
         let user = self.register(USER);
         let user1 = self.register(USER1);
-        // ASSUMPTION: every transfer has an 8-bit command phase (all measured ones do: `USER2`
-        // [31:28] = 7, FB §B.2); the opcode is the low byte of the command value.
+        // A transfer without a command phase, or whose command is not 8 bits long, has no opcode the
+        // chip model could be given: it is reported and nothing is sent, rather than run as if the
+        // low byte of `USER2` were its opcode.
+        let command_bits = Spi1::command_bits(user, self.register(USER2));
+        if command_bits != Some(MODELED_COMMAND_BITS) {
+            self.unsupported.push_back(Unsupported::FlashTransfer {
+                command_bits,
+                user,
+                user2: self.register(USER2),
+            });
+            return;
+        }
         let opcode = self.user_opcode();
         let address = (user & USR_ADDR != 0).then(|| {
             // The field can ask for up to 64 bits; the register holds 32.
@@ -346,9 +375,6 @@ mod tests {
     use crate::flash::{FlashConfig, NorFlash, UnmodeledCommand};
     use std::{cell::RefCell, rc::Rc};
 
-    /// `USER` bit 31: the transfer has a command phase (every measured one does, so the model never
-    /// tests the bit and the constant lives with the tests that build `USER` values).
-    const USR_COMMAND: u32 = 1 << 31;
     /// `CMD` bit 17, `FLASH_PE`: a flag that accompanies a command bit (see `Spi1::run`).
     const CMD_FLASH_PE: u32 = 1 << 17;
 
@@ -620,6 +646,56 @@ mod tests {
                 "address field {field}"
             );
         }
+    }
+
+    #[test]
+    fn a_user_transfer_without_an_8_bit_command_phase_is_reported_and_sends_nothing() {
+        for (user, user2, command_bits) in [
+            (USR_MISO, 0x7000_009F, None), // no command phase
+            (USR_COMMAND | USR_MISO, 0xF000_9F00, Some(16)),
+            (USR_COMMAND | USR_MISO, 0x0000_009F, Some(1)),
+            (USR_COMMAND | USR_MISO, 0x6000_009F, Some(7)),
+            (USR_COMMAND | USR_MISO, 0x8000_009F, Some(9)),
+        ] {
+            let (mut spi, seen) = recording_spi1();
+            spi.write(W0, 0xDEAD_BEEF);
+            spi.write(USER, user);
+            spi.write(USER2, user2);
+            spi.write(MISO_DLEN, 23);
+            assert!(spi.write(CMD, CMD_USR), "handled: reported, not dropped");
+            assert_eq!(
+                seen.borrow().as_slice(),
+                [],
+                "USER {user:#x} USER2 {user2:#x}"
+            );
+            assert_eq!(
+                spi.take_unsupported(),
+                Some(Unsupported::FlashTransfer {
+                    command_bits,
+                    user,
+                    user2
+                })
+            );
+            assert_eq!(spi.take_unsupported(), None);
+            assert_eq!(spi.read(W0), Some(0xDEAD_BEEF), "nothing was clocked in");
+            assert_eq!(spi.read(CMD), Some(0), "self-clears: no hang");
+        }
+    }
+
+    #[test]
+    fn data_lengths_round_up_to_whole_bytes() {
+        // Pins the ASSUMPTION documented on `Spi1::data_len`: 9 bits asked, 2 bytes transferred.
+        let (mut spi, seen) = recording_spi1();
+        spi.write(W0, 0x0403_0201);
+        spi.write(USER, USR_COMMAND | USR_MOSI);
+        spi.write(USER2, 0x7000_0002);
+        spi.write(MOSI_DLEN, 8);
+        spi.write(CMD, CMD_USR);
+        assert_eq!(seen.borrow()[0].3, [1, 2]);
+        let mut read = spi1();
+        read.write(W0, 0xFFFF_FFFF);
+        user_read(&mut read, 0x9F, 9);
+        assert_eq!(read.read(W0), Some(0x0000_609D), "two bytes of the id");
     }
 
     #[test]

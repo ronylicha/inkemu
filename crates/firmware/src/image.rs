@@ -283,7 +283,13 @@ mod tests {
         assert_eq!(err, FirmwareError::FlashImage);
         let msg = err.to_string();
         assert!(msg.contains("full flash image"), "{msg}");
-        assert!(msg.contains("; select the application .bin"), "{msg}");
+        assert!(
+            msg.contains(
+                "; select the application .bin to inspect it, or boot the full image with `inkemu run --flash`"
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("later version"), "the support exists: {msg}");
     }
 
     #[test]

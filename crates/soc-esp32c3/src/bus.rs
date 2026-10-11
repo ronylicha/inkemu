@@ -20,8 +20,10 @@ pub struct SocBus {
     sram: Ram,
     sram0: Ram,
     rtc: Ram,
-    pub periph: Peripherals,
-    pub diag: Diagnostics,
+    /// Reached from outside the crate only through the bus: a direct write would bypass the relay
+    /// of what a device refuses, and so the diagnostics.
+    pub(crate) periph: Peripherals,
+    pub(crate) diag: Diagnostics,
     /// PC of the instruction being executed, for diagnostics.
     pc: u32,
 }
@@ -40,6 +42,15 @@ enum Region {
         instruction_bus: bool,
     },
     Periph,
+}
+
+/// Why one byte of a flash window is backed by no flash byte: the MMU entry it goes through, the
+/// content of that entry, and what is wrong with it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct UnbackedByte {
+    entry: u32,
+    content: u32,
+    fault: MappingFault,
 }
 
 /// Offset of `[addr, addr + len)` in the block at `base`, when it lies entirely inside it.
@@ -134,27 +145,22 @@ impl SocBus {
         reset
     }
 
-    /// The flash offset one window byte maps to; a miss or a page past the chip is latched, reported, and yields `None`.
-    /// `vaddr` is the address of the access the byte belongs to: the fault registers and the diagnostic name it.
-    fn flash_offset(&mut self, vaddr: u32, window_offset: u32) -> Option<u32> {
-        let (entry, content, fault) = match self.periph.mmu.translate(window_offset) {
-            Ok(offset) if offset < self.periph.spi1.flash().size() => return Some(offset),
-            Ok(offset) => (
-                window_offset / MMU_PAGE_BYTES,
-                offset / MMU_PAGE_BYTES,
-                MappingFault::BeyondFlash,
-            ),
-            Err(MmuMiss { entry, content }) => (entry, content, MappingFault::InvalidEntry),
-        };
-        self.periph.extmem.latch_mmu_fault(vaddr, content);
-        self.diag.record(Diagnostic::FlashMapping {
-            vaddr,
-            entry,
-            content,
-            fault,
-            pc: self.pc,
-        });
-        None
+    /// The flash offset one window byte maps to, or why no flash byte backs it: an invalid entry, or
+    /// a page past the end of the chip.
+    fn flash_offset(&self, window_offset: u32) -> Result<u32, UnbackedByte> {
+        match self.periph.mmu.translate(window_offset) {
+            Ok(offset) if offset < self.periph.spi1.flash().size() => Ok(offset),
+            Ok(offset) => Err(UnbackedByte {
+                entry: window_offset / MMU_PAGE_BYTES,
+                content: offset / MMU_PAGE_BYTES,
+                fault: MappingFault::BeyondFlash,
+            }),
+            Err(MmuMiss { entry, content }) => Err(UnbackedByte {
+                entry,
+                content,
+                fault: MappingFault::InvalidEntry,
+            }),
+        }
     }
 
     /// Reads the flash **live** through the MMU table (decision D4): no cache line is modelled.
@@ -166,15 +172,34 @@ impl SocBus {
     fn flash_read(&mut self, vaddr: u32, window_offset: u32, size: AccessSize) -> ReadOutcome {
         let len = size.bytes();
         let mut bytes = [0u8; 4];
+        // The fault of the previous byte. The bytes of one access that miss through the same entry
+        // for the same reason are one event: the diagnostics count accesses, not bytes. An access is
+        // at most 4 bytes, so it touches at most two entries, one after the other: remembering the
+        // last fault is enough to report each (entry, fault) once.
+        let mut reported: Option<UnbackedByte> = None;
         // Byte by byte: a misaligned access may straddle two 64 KiB pages, each with its own entry.
         for (index, byte) in (0u32..len).zip(bytes.iter_mut()) {
             // INVARIANT: `locate` checked that the whole access lies inside the window, so
             // `window_offset + index` stays below `FLASH_WINDOW_SIZE` and cannot overflow.
-            if let Some(offset) = self.flash_offset(vaddr, window_offset + index) {
-                self.periph
+            match self.flash_offset(window_offset + index) {
+                Ok(offset) => self
+                    .periph
                     .spi1
                     .flash()
-                    .read(offset, std::slice::from_mut(byte));
+                    .read(offset, std::slice::from_mut(byte)),
+                Err(unbacked) if reported == Some(unbacked) => {}
+                Err(unbacked) => {
+                    // The fault registers and the diagnostic name the address of the access.
+                    self.periph.extmem.latch_mmu_fault(vaddr, unbacked.content);
+                    self.diag.record(Diagnostic::FlashMapping {
+                        vaddr,
+                        entry: unbacked.entry,
+                        content: unbacked.content,
+                        fault: unbacked.fault,
+                        pc: self.pc,
+                    });
+                    reported = Some(unbacked);
+                }
             }
         }
         ReadOutcome {
@@ -808,6 +833,45 @@ mod tests {
             0,
             "a fetch decodes 0: illegal instruction"
         );
+    }
+
+    #[test]
+    fn one_access_through_an_invalid_entry_is_one_occurrence_whatever_its_width() {
+        // "repeated N times" counts accesses: a 4-byte load is not four events.
+        for (size, bytes) in [(Word, 4u32), (Half, 2), (Byte, 1)] {
+            let mut b = bus_with_flash(SocConfig::default());
+            let vaddr = FLASH_DBUS_BASE + 0x5_0010;
+            assert_eq!(b.read(vaddr, size, Load).unwrap().value, 0);
+            let listed = b.diag.drain();
+            assert_eq!(listed.len(), 1, "{bytes}-byte load: {listed:?}");
+            assert_eq!(b.diag.occurrences(&listed[0]), 1, "{bytes}-byte load");
+            assert_eq!(b.read(vaddr, size, Load).unwrap().value, 0);
+            assert_eq!(b.diag.occurrences(&listed[0]), 2, "the second access");
+        }
+    }
+
+    #[test]
+    fn a_load_straddling_two_faulting_entries_reports_each_of_them_once() {
+        let mut b = bus_with_flash(SocConfig::default());
+        b.set_pc(0x4038_0040);
+        let vaddr = FLASH_DBUS_BASE + 0x5_FFFE; // two bytes through entry 5, two through entry 6
+        assert_eq!(load(&mut b, vaddr), 0);
+        let fault = |entry| Diagnostic::FlashMapping {
+            vaddr,
+            entry,
+            content: 0x100,
+            fault: MappingFault::InvalidEntry,
+            pc: 0x4038_0040,
+        };
+        assert_eq!(b.diag.drain(), vec![fault(5), fault(6)]);
+        assert_eq!(b.diag.occurrences(&fault(5)), 1);
+        assert_eq!(b.diag.occurrences(&fault(6)), 1);
+        // One valid half, one faulting half: the valid bytes are read, the fault is one occurrence.
+        map(&mut b, 5, 1); // window page 5 -> flash page 1, which ends with A0 A1 A2 A3
+        assert_eq!(load(&mut b, vaddr), 0x0000_A3A2);
+        assert_eq!(b.diag.drain(), Vec::new(), "entry 6 is already listed");
+        assert_eq!(b.diag.occurrences(&fault(5)), 1);
+        assert_eq!(b.diag.occurrences(&fault(6)), 2);
     }
 
     #[test]

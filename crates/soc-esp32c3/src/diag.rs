@@ -16,9 +16,17 @@ pub enum Direction {
 /// An operation the emulator cannot perform faithfully: it is reported, and `--strict-mmio` stops on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unsupported {
-    /// An SPI flash command the read-only flash model does not implement (D3).
+    /// An SPI flash command the flash model does not implement: a program, an erase, a data read,
+    /// or an opcode it does not know (D3).
     FlashCommand { opcode: u8 },
-    /// `SHA.DMA_START`/`DMA_CONTINUE` (D7).
+    /// An SPI1 user transfer whose command phase is not the 8-bit one the controller model
+    /// implements: no command phase at all (`None`), or a command of `command_bits` bits.
+    FlashTransfer {
+        command_bits: Option<u32>,
+        user: u32,
+        user2: u32,
+    },
+    /// A write to `SHA.DMA_BLOCK_NUM`, `DMA_START` or `DMA_CONTINUE` (D7).
     ShaDma,
     /// A `SHA.MODE` the ESP32-C3 accelerator does not have.
     ShaMode { mode: u32 },
@@ -26,6 +34,53 @@ pub enum Unsupported {
     ClockSource { sysclk_conf: u32, cpu_per_conf: u32 },
     /// A reset requested through `RTC_CNTL.OPTIONS0` (D27).
     SoftwareReset { options0: u32 },
+}
+
+impl Unsupported {
+    /// The message of the diagnostic: what the instruction at `pc` asked for and why it was not
+    /// done, then what the user can do.
+    fn describe(self, pc: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unsupported::FlashCommand { opcode } => write!(
+                f,
+                "flash command {opcode:#04x} is not modeled (pc {pc:#010x}): only the identification and status commands of the virtual flash are modeled, so nothing was read or changed; use firmware that sends no other flash command until SPI1 data reads and flash writes are emulated"
+            ),
+            Unsupported::FlashTransfer {
+                command_bits,
+                user,
+                user2,
+            } => {
+                write!(f, "SPI1 was asked for a flash transfer ")?;
+                match command_bits {
+                    Some(bits) => write!(f, "with a {bits}-bit command")?,
+                    None => write!(f, "without a command phase")?,
+                }
+                write!(
+                    f,
+                    " (USER {user:#010x}, USER2 {user2:#010x}, pc {pc:#010x}) but only transfers with an 8-bit command are modeled, so nothing was sent to the flash; use firmware whose flash commands are 8 bits long until other transfers are emulated"
+                )
+            }
+            Unsupported::ShaDma => write!(
+                f,
+                "SHA.DMA_BLOCK_NUM, DMA_START or DMA_CONTINUE was written (pc {pc:#010x}) but only the typical SHA mode is modeled, so DMA-SHA produces no digest; use firmware that hashes through SHA.START/CONTINUE until DMA-SHA is emulated"
+            ),
+            Unsupported::ShaMode { mode } => write!(
+                f,
+                "SHA.MODE {mode} selects an algorithm the ESP32-C3 accelerator does not have (pc {pc:#010x}), so the block was not hashed; use SHA-1 (0), SHA-224 (1) or SHA-256 (2)"
+            ),
+            Unsupported::ClockSource {
+                sysclk_conf,
+                cpu_per_conf,
+            } => write!(
+                f,
+                "the clock registers select a CPU clock inkemu cannot model (SYSCLK_CONF {sysclk_conf:#010x}, CPU_PER_CONF {cpu_per_conf:#010x}, pc {pc:#010x}), so emulated time keeps the previous frequency; select the crystal or the PLL at 80 or 160 MHz"
+            ),
+            Unsupported::SoftwareReset { options0 } => write!(
+                f,
+                "a software reset was requested through RTC_CNTL.OPTIONS0 (value {options0:#010x}, pc {pc:#010x}) but resets are not emulated yet, so the write was ignored; restart inkemu to reset the device"
+            ),
+        }
+    }
 }
 
 /// Why an access through the flash MMU could not be served from the flash.
@@ -97,6 +152,10 @@ impl Diagnostic {
                     cpu_per_conf,
                 } => (8, sysclk_conf, cpu_per_conf),
                 Unsupported::SoftwareReset { .. } => (9, 0, 0),
+                // A command is 1 to 16 bits long, so 0 is free for "no command phase".
+                Unsupported::FlashTransfer { command_bits, .. } => {
+                    (11, command_bits.unwrap_or(0), 0)
+                }
             },
             Diagnostic::FlashMapping { entry, fault, .. } => (10, entry, fault as u32),
         }
@@ -153,31 +212,7 @@ impl fmt::Display for Diagnostic {
                 f,
                 "{bytes}-byte write to a 32-bit peripheral register at {addr:#010x} (pc {pc:#010x}); the whole register was written, its other bytes as zero"
             ),
-            Diagnostic::Unsupported { what, pc } => match what {
-                Unsupported::FlashCommand { opcode } => write!(
-                    f,
-                    "flash command {opcode:#04x} is not modeled (pc {pc:#010x}): the virtual flash is read-only and did nothing; run firmware that does not program or erase flash until flash writes are emulated"
-                ),
-                Unsupported::ShaDma => write!(
-                    f,
-                    "DMA-SHA was started (pc {pc:#010x}) but only the typical SHA mode is modeled, so no digest was produced; use firmware that hashes through SHA.START/CONTINUE until DMA-SHA is emulated"
-                ),
-                Unsupported::ShaMode { mode } => write!(
-                    f,
-                    "SHA.MODE {mode} selects an algorithm the ESP32-C3 accelerator does not have (pc {pc:#010x}), so the block was not hashed; use SHA-1 (0), SHA-224 (1) or SHA-256 (2)"
-                ),
-                Unsupported::ClockSource {
-                    sysclk_conf,
-                    cpu_per_conf,
-                } => write!(
-                    f,
-                    "the clock registers select a CPU clock inkemu cannot model (SYSCLK_CONF {sysclk_conf:#010x}, CPU_PER_CONF {cpu_per_conf:#010x}, pc {pc:#010x}), so emulated time keeps the previous frequency; select the crystal or the PLL at 80 or 160 MHz"
-                ),
-                Unsupported::SoftwareReset { options0 } => write!(
-                    f,
-                    "a software reset was requested through RTC_CNTL.OPTIONS0 (value {options0:#010x}, pc {pc:#010x}) but resets are not emulated yet, so the write was ignored; restart inkemu to reset the device"
-                ),
-            },
+            Diagnostic::Unsupported { what, pc } => what.describe(pc, f),
             Diagnostic::FlashMapping {
                 vaddr,
                 entry,
@@ -554,6 +589,89 @@ mod tests {
                 .unwrap_or_else(|| panic!("no remedy in: {text}"));
             assert!(!cause.is_empty() && !remedy.is_empty(), "{text}");
         }
+    }
+
+    #[test]
+    fn a_refused_flash_command_is_described_truthfully_whatever_the_command_does() {
+        // The same text serves a program (0x02), an erase (0x20), a data read (0x03, 0x0B, 0xBB: how
+        // `esp_flash` reads NVS), deep power-down (0xB9) and an opcode no chip has (0x00).
+        for opcode in [0x02, 0x20, 0x03, 0x0B, 0xBB, 0xB9, 0x00] {
+            let text = unsupported(Unsupported::FlashCommand { opcode }).to_string();
+            assert!(
+                text.contains(&format!("flash command {opcode:#04x} is not modeled")),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "only the identification and status commands of the virtual flash are modeled, so nothing was read or changed"
+                ),
+                "{text}"
+            );
+            assert!(
+                !text.contains("read-only") && !text.contains("program or erase"),
+                "a refused read is not a write: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dma_sha_write_is_not_described_as_a_started_hash() {
+        // The same diagnostic reports a write to `DMA_BLOCK_NUM`, which configures and starts nothing.
+        let text = unsupported(Unsupported::ShaDma).to_string();
+        assert!(
+            text.contains("SHA.DMA_BLOCK_NUM, DMA_START or DMA_CONTINUE was written"),
+            "{text}"
+        );
+        assert!(!text.contains("was started"), "{text}");
+    }
+
+    #[test]
+    fn a_flash_transfer_of_an_unmodeled_shape_says_which_shape() {
+        let without = unsupported(Unsupported::FlashTransfer {
+            command_bits: None,
+            user: 0x1000_0000,
+            user2: 0x7000_009F,
+        });
+        let sixteen_bits = unsupported(Unsupported::FlashTransfer {
+            command_bits: Some(16),
+            user: 0x9000_0000,
+            user2: 0xF000_9F00,
+        });
+        assert!(
+            without.to_string().contains("without a command phase"),
+            "{without}"
+        );
+        assert!(
+            sixteen_bits.to_string().contains("with a 16-bit command"),
+            "{sixteen_bits}"
+        );
+        for diagnostic in [&without, &sixteen_bits] {
+            let text = diagnostic.to_string();
+            assert!(
+                text.contains("USER 0x") && text.contains("USER2 0x") && text.contains("pc 0x40"),
+                "{text}"
+            );
+            assert!(
+                text.contains("nothing was sent to the flash; use firmware"),
+                "{text}"
+            );
+        }
+        // Two shapes are two diagnostics; the same shape with another opcode or data phase is one.
+        let mut d = Diagnostics::new(true);
+        d.record(without.clone());
+        d.record(sixteen_bits);
+        d.record(unsupported(Unsupported::FlashTransfer {
+            command_bits: None,
+            user: 0x0800_0000,
+            user2: 0x7000_0002,
+        }));
+        assert_eq!(d.distinct(), 2);
+        assert_eq!(d.occurrences(&without), 2);
+        assert_eq!(
+            d.take_violation(),
+            Some(without),
+            "a strict run stops on it"
+        );
     }
 
     #[test]

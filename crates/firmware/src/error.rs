@@ -18,8 +18,14 @@ pub enum FirmwareError {
         "this is an encrypted OTA update (.xota), which inkemu cannot read; use the plain application .bin of a release, not the encrypted OTA file"
     )]
     EncryptedOta,
+    /// The same file given where a full flash image is expected: an application `.bin` is not
+    /// accepted there either, so the remedy differs from [`FirmwareError::EncryptedOta`].
     #[error(
-        "this is a full flash image (bootloader + partition table + application), not an application image; select the application .bin, or wait for full-flash-image support in a later version"
+        "this is an encrypted OTA update (.xota), which inkemu cannot read and which is not a flash image; use a full flash dump (`esptool.py read_flash`), or an image merged with `esptool.py merge_bin`"
+    )]
+    EncryptedOtaAsFlash,
+    #[error(
+        "this is a full flash image (bootloader + partition table + application), not an application image; select the application .bin to inspect it, or boot the full image with `inkemu run --flash`"
     )]
     FlashImage,
     #[error(
@@ -98,6 +104,7 @@ mod tests {
         let all = vec![
             FirmwareError::TooShort { len: 0 },
             FirmwareError::EncryptedOta,
+            FirmwareError::EncryptedOtaAsFlash,
             FirmwareError::FlashImage,
             FirmwareError::BadMagic { found: 0 },
             FirmwareError::TooManySegments { count: 17, max: 16 },
@@ -132,7 +139,7 @@ mod tests {
             FirmwareError::FlashImageTooShort { len: 10 },
             FirmwareError::NoPartitionTable,
         ];
-        let mut seen = [false; 18];
+        let mut seen = [false; 19];
         for e in &all {
             seen[variant_index(e)] = true;
         }
@@ -163,6 +170,7 @@ mod tests {
             FirmwareError::NotAFlashImage { .. } => 15,
             FirmwareError::FlashImageTooShort { .. } => 16,
             FirmwareError::NoPartitionTable => 17,
+            FirmwareError::EncryptedOtaAsFlash => 18,
         }
     }
 
