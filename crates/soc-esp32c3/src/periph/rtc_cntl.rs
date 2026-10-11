@@ -1,12 +1,29 @@
-//! `RTC_CNTL`: reset cause, retention registers, pad and power configuration.
-//! Source: report §E.2. Software reset, the RTC timer and the watchdogs arrive in SP1b-3.
+//! `RTC_CNTL`: reset cause, retention registers, pad, clock, analog and power configuration.
+//! Source: report §E.2. The watchdogs are stored and never expire (decision D11); the RTC timer and
+//! resets arrive in SP1b-3.
+use crate::diag::Unsupported;
 use crate::periph::{Accepted, RTC_CNTL_BASE, Storage};
 use emu_core::Peripheral;
+use std::collections::VecDeque;
+use svd_regs::esp32c3::addr;
 
-const RESET_STATE: u32 = 0x38;
+const OPTIONS0: u32 = addr("RTC_CNTL", "OPTIONS0") - RTC_CNTL_BASE;
+/// `OPTIONS0` bit 31 `SW_SYS_RST` and bit 5 `SW_PROCPU_RST` (report BC §E.2).
+const SW_SYS_RST: u32 = 1 << 31;
+const SW_PROCPU_RST: u32 = 1 << 5;
+const RESET_STATE: u32 = addr("RTC_CNTL", "RESET_STATE") - RTC_CNTL_BASE;
 const STORE_COUNT: usize = 8;
 /// `RTC_CNTL_STORE0..7`: they survive a reset; the ROM keeps the APB frequency in STORE5.
-const STORE: [u32; STORE_COUNT] = [0x50, 0x54, 0x58, 0x5C, 0xB8, 0xBC, 0xC0, 0xC4];
+const STORE: [u32; STORE_COUNT] = [
+    addr("RTC_CNTL", "STORE0") - RTC_CNTL_BASE,
+    addr("RTC_CNTL", "STORE1") - RTC_CNTL_BASE,
+    addr("RTC_CNTL", "STORE2") - RTC_CNTL_BASE,
+    addr("RTC_CNTL", "STORE3") - RTC_CNTL_BASE,
+    addr("RTC_CNTL", "STORE4") - RTC_CNTL_BASE,
+    addr("RTC_CNTL", "STORE5") - RTC_CNTL_BASE,
+    addr("RTC_CNTL", "STORE6") - RTC_CNTL_BASE,
+    addr("RTC_CNTL", "STORE7") - RTC_CNTL_BASE,
+];
 /// Configuration the ROM reads back and modifies before its banner: `PWC`, `DIG_ISO`,
 /// `SWD_CONF`, `PAD_HOLD`, `DIG_PAD_HOLD`. Nothing acts on it yet.
 ///
@@ -17,7 +34,98 @@ const STORE: [u32; STORE_COUNT] = [0x50, 0x54, 0x58, 0x5C, 0xB8, 0xBC, 0xC0, 0xC
 /// `SWD_RST_FLAG_CLR` [28] and `SWD_FEED` [29] write-only. Storing them is harmless for the boot,
 /// which only reads bit 0 (it stays clear after a power-on reset); the super watchdog itself is
 /// modelled in SP1b-3.
-const ACCEPTED: [Accepted; 5] = [
+const ACCEPTED: [Accepted; 26] = [
+    Accepted::svd(
+        "RTC_CNTL",
+        "OPTIONS0",
+        "BBPLL, crystal and I2C power forcing (software reset bits are refused)",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "TIMER1",
+        "clock and PLL wake-up delays",
+        "SP1b-3",
+    ),
+    Accepted::svd("RTC_CNTL", "TIMER3", "Wi-Fi/BT power-up timing", "SP1b-3"),
+    Accepted::svd("RTC_CNTL", "TIMER4", "digital power-up timing", "SP1b-3"),
+    Accepted::svd("RTC_CNTL", "TIMER5", "minimum sleep time", "SP1b-3"),
+    Accepted::svd("RTC_CNTL", "TIMER6", "peripheral power-up timing", "SP1b-3"),
+    Accepted::svd(
+        "RTC_CNTL",
+        "ANA_CONF",
+        "analog configuration, glitch reset",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "INT_ENA_RTC",
+        "RTC interrupt enables: nothing is raised",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "INT_CLR_RTC",
+        "RTC interrupt clear: nothing is pending",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "CLK_CONF",
+        "RTC fast and slow clock sources and dividers",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "SLOW_CLK_CONF",
+        "RTC slow clock divider",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "RTC_CNTL",
+        "RTC regulator and digital bias",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "DIG_PWC",
+        "digital power-domain control",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "WDTCONFIG0",
+        "RTC watchdog enable and stages: it never expires (D11)",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "WDTCONFIG1",
+        "RTC watchdog stage 0 timeout",
+        "SP1b-3",
+    ),
+    Accepted::svd("RTC_CNTL", "WDTFEED", "RTC watchdog feed", "SP1b-3"),
+    Accepted::svd(
+        "RTC_CNTL",
+        "WDTWPROTECT",
+        "RTC watchdog write protection: writes are never locked out",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "SWD_WPROTECT",
+        "super watchdog write protection",
+        "SP1b-3",
+    ),
+    Accepted::svd("RTC_CNTL", "BROWN_OUT", "brown-out detector", "SP1b-3"),
+    Accepted::svd(
+        "RTC_CNTL",
+        "FIB_SEL",
+        "brown-out and glitch reset selection",
+        "SP1b-3",
+    ),
+    Accepted::svd("RTC_CNTL", "SENSOR_CTRL", "SAR ADC power forcing", "SP2"),
     Accepted::svd("RTC_CNTL", "PWC", "RTC power-domain control", "SP1b-3"),
     Accepted::svd("RTC_CNTL", "DIG_ISO", "digital pad isolation", "SP1b-3"),
     Accepted::svd(
@@ -44,6 +152,8 @@ pub struct RtcCntl {
     reset_state_other: u32,
     store: [u32; STORE_COUNT],
     config: Storage,
+    /// Refused requests not taken yet, oldest first: none may be lost between two relays.
+    unsupported: VecDeque<Unsupported>,
 }
 
 impl RtcCntl {
@@ -56,7 +166,13 @@ impl RtcCntl {
             reset_state_other: documented & !RESET_CAUSE_MASK,
             store: [0; STORE_COUNT],
             config: Storage::accepted(RTC_CNTL_BASE, &ACCEPTED),
+            unsupported: VecDeque::new(),
         }
+    }
+
+    /// The oldest request this block refused and nobody took yet.
+    pub(crate) fn take_unsupported(&mut self) -> Option<Unsupported> {
+        self.unsupported.pop_front()
     }
 }
 
@@ -78,6 +194,13 @@ impl Peripheral for RtcCntl {
     }
 
     fn write(&mut self, offset: u32, value: u32) -> bool {
+        // Decision D27: a software reset is not emulated yet (SP1b-3). Storing the bit would be a
+        // reset that silently never happens: the request is reported and dropped instead.
+        if offset == OPTIONS0 && value & (SW_SYS_RST | SW_PROCPU_RST) != 0 {
+            self.unsupported
+                .push_back(Unsupported::SoftwareReset { options0: value });
+            return true;
+        }
         if let Some(i) = STORE.iter().position(|&o| o == offset) {
             self.store[i] = value;
             return true;
@@ -136,18 +259,127 @@ mod tests {
         );
     }
 
+    fn reg(name: &str) -> u32 {
+        svd_regs::esp32c3::addr("RTC_CNTL", name) - RTC_CNTL_BASE
+    }
+
+    #[test]
+    fn clock_analog_and_watchdog_configuration_is_stored_from_its_reset_value() {
+        let mut rtc = RtcCntl::new();
+        for (name, reset) in [
+            ("OPTIONS0", 0x1C00_A000),
+            ("TIMER1", 0x2814_0403),
+            ("ANA_CONF", 0x00C4_0000),
+            ("CLK_CONF", 0x1158_3218),
+            ("RTC_CNTL", 0xA000_0000),
+            ("DIG_PWC", 0x0055_5010),
+            ("WDTCONFIG0", 0x0001_3214),
+            ("WDTCONFIG1", 0x0003_0D40),
+            ("BROWN_OUT", 0x43FF_0010),
+            ("FIB_SEL", 0x0000_0007),
+        ] {
+            assert_eq!(rtc.read(reg(name)), Some(reset), "{name}");
+            assert!(rtc.write(reg(name), 0x0000_0140));
+            assert_eq!(rtc.read(reg(name)), Some(0x0000_0140), "{name}");
+        }
+        for name in [
+            "TIMER3",
+            "TIMER4",
+            "TIMER5",
+            "TIMER6",
+            "SLOW_CLK_CONF",
+            "INT_ENA_RTC",
+            "INT_CLR_RTC",
+            "WDTFEED",
+            "WDTWPROTECT",
+            "SWD_WPROTECT",
+            "SENSOR_CTRL",
+        ] {
+            assert!(rtc.write(reg(name), 0x8F1D_312A), "{name}");
+            assert_eq!(rtc.read(reg(name)), Some(0x8F1D_312A), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_bootloader_watchdog_sequence_leaves_the_registers_as_written_and_nothing_expires() {
+        // BA §6: unlock, clear FLASHBOOT_MOD_EN, stage 0 = 0x956A0, feed, enable, lock.
+        let mut rtc = RtcCntl::new();
+        rtc.write(reg("WDTWPROTECT"), 0x50D8_3AA1);
+        rtc.write(reg("WDTCONFIG1"), 0x0009_56A0);
+        rtc.write(reg("WDTFEED"), 1 << 31);
+        rtc.write(reg("WDTCONFIG0"), 0xC007_EA00);
+        rtc.write(reg("WDTWPROTECT"), 0);
+        assert_eq!(rtc.read(reg("WDTCONFIG0")), Some(0xC007_EA00));
+        assert_eq!(rtc.read(reg("WDTCONFIG1")), Some(0x0009_56A0));
+        assert_eq!(
+            rtc.read(RESET_STATE).map(|v| v & 0x3F),
+            Some(1),
+            "still a power-on reset: decision D11"
+        );
+        assert_eq!(rtc.take_unsupported(), None);
+    }
+
+    #[test]
+    fn a_software_reset_request_is_reported_and_not_stored() {
+        // BC §E.2: OPTIONS0 bit 31 SW_SYS_RST, bit 5 SW_PROCPU_RST.
+        for value in [1u32 << 31, 1 << 5, 0x1C00_A000 | (1 << 5)] {
+            let mut rtc = RtcCntl::new();
+            assert!(rtc.write(reg("OPTIONS0"), value));
+            assert_eq!(
+                rtc.take_unsupported(),
+                Some(Unsupported::SoftwareReset { options0: value })
+            );
+            assert_eq!(rtc.take_unsupported(), None);
+            assert_eq!(
+                rtc.read(reg("OPTIONS0")),
+                Some(0x1C00_A000),
+                "not stored: decision D27"
+            );
+        }
+        let mut rtc = RtcCntl::new();
+        rtc.write(reg("OPTIONS0"), 0x1C00_A000 & !(1 << 13));
+        assert_eq!(
+            rtc.take_unsupported(),
+            None,
+            "BBPLL power bits are plain configuration (BA §5 step 9)"
+        );
+    }
+
+    #[test]
+    fn two_software_reset_requests_before_a_relay_are_both_reported_in_order() {
+        let mut rtc = RtcCntl::new();
+        rtc.write(reg("OPTIONS0"), 1 << 31);
+        rtc.write(reg("OPTIONS0"), 1 << 5);
+        assert_eq!(
+            rtc.take_unsupported(),
+            Some(Unsupported::SoftwareReset { options0: 1 << 31 })
+        );
+        assert_eq!(
+            rtc.take_unsupported(),
+            Some(Unsupported::SoftwareReset { options0: 1 << 5 })
+        );
+        assert_eq!(rtc.take_unsupported(), None);
+    }
+
     #[test]
     fn everything_else_is_left_to_the_unmodeled_path() {
         let mut rtc = RtcCntl::new();
-        assert_eq!(
-            rtc.read(0x00),
-            None,
-            "OPTIONS0: software reset arrives in SP1b-3"
-        );
-        assert!(!rtc.write(0x38, 0), "RESET_STATE is not writable here");
         assert!(
-            !rtc.write(0x90, 0),
-            "watchdog configuration arrives in SP1b-3"
+            !rtc.write(RESET_STATE, 0),
+            "RESET_STATE is not writable here"
         );
+        for name in [
+            "TIME_UPDATE",
+            "TIME_LOW0",
+            "SLP_TIMER0",
+            "STATE0",
+            "WDTCONFIG2",
+        ] {
+            assert_eq!(
+                rtc.read(reg(name)),
+                None,
+                "{name}: the RTC timer, sleep and watchdog stages are SP1b-3"
+            );
+        }
     }
 }

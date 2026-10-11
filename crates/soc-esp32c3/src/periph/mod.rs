@@ -4,6 +4,7 @@ use crate::diag::Unsupported;
 use crate::flash::FlashDevice;
 use emu_core::Peripheral;
 
+pub mod ana_i2c;
 pub mod apb_ctrl;
 pub mod assist_debug;
 pub mod efuse;
@@ -19,6 +20,7 @@ pub mod system;
 pub mod uart;
 pub mod usb_serial_jtag;
 
+pub use ana_i2c::AnaI2c;
 pub use apb_ctrl::ApbCtrl;
 pub use assist_debug::AssistDebug;
 pub use efuse::Efuse;
@@ -201,6 +203,10 @@ pub fn accepted_without_effect() -> Vec<Accepted> {
         extmem::accepted(),
         spi_mem::accepted(),
         apb_ctrl::accepted(),
+        ana_i2c::accepted(),
+        TIMG0_ACCEPTED.to_vec(),
+        APB_SARADC_ACCEPTED.to_vec(),
+        RADIO_POWER_ACCEPTED.to_vec(),
     ]
     .concat();
     rows.sort_by_key(|row| row.addr);
@@ -274,6 +280,58 @@ const SHA: (u32, u32) = (SHA_BASE, 0x6003_C000);
 /// `DR_REG_SYSCON_BASE`; report BC §A.2.
 pub(crate) const APB_CTRL_BASE: u32 = 0x6002_6000;
 const APB_CTRL: (u32, u32) = (APB_CTRL_BASE, 0x6002_7000);
+const ANA_I2C: (u32, u32) = (ana_i2c::ANA_I2C_BASE, ana_i2c::ANA_I2C_BASE + 0x100);
+pub(crate) const TIMG0_BASE: u32 = 0x6001_F000;
+const TIMG0: (u32, u32) = (TIMG0_BASE, 0x6002_0000);
+pub(crate) const APB_SARADC_BASE: u32 = 0x6004_0000;
+const APB_SARADC: (u32, u32) = (APB_SARADC_BASE, 0x6004_1000);
+
+/// Decision D11: the main watchdog of timer group 0 is stored and never expires. The timers and the
+/// RTC calibration of this block are not modelled here: they are the first thing SP1b-3 adds.
+const TIMG0_ACCEPTED: [Accepted; 2] = [
+    Accepted::svd(
+        "TIMG0",
+        "WDTCONFIG0",
+        "main watchdog 0 enable and stages: it never expires (D11)",
+        "SP1b-3",
+    ),
+    Accepted::svd(
+        "TIMG0",
+        "WDTWPROTECT",
+        "main watchdog 0 write protection",
+        "SP1b-3",
+    ),
+];
+/// The bootloader configures the SAR ADC as an entropy source for the RNG (BA §2 rows 79 to 85).
+const WHY_SARADC: &str = "SAR ADC configuration: no conversion is performed";
+const APB_SARADC_ACCEPTED: [Accepted; 7] = [
+    Accepted::svd("APB_SARADC", "CTRL", WHY_SARADC, "SP2"),
+    Accepted::svd("APB_SARADC", "CTRL2", WHY_SARADC, "SP2"),
+    Accepted::svd("APB_SARADC", "FSM_WAIT", WHY_SARADC, "SP2"),
+    Accepted::svd("APB_SARADC", "SAR_PATT_TAB1", WHY_SARADC, "SP2"),
+    Accepted::svd("APB_SARADC", "SAR_PATT_TAB2", WHY_SARADC, "SP2"),
+    Accepted::svd("APB_SARADC", "DMA_CONF", WHY_SARADC, "SP2"),
+    Accepted::svd("APB_SARADC", "CLKM_CONF", WHY_SARADC, "SP2"),
+];
+/// Radio memory power bits `rtc_sleep_pu` sets in the application's `rtc_init` (BA §3 rows 30 to 33).
+/// Only `BB.BBPD_CTRL` is in the SVD; the three others are named in ESP-IDF `nrx_reg.h`
+/// (`NRXPD_CTRL`), `fe_reg.h` (`FE_GEN_CTRL`, `FE2_TX_INTERP_CTRL`) (decision D17).
+const NRX_NRXPD_CTRL: u32 = 0x6001_CCD4;
+const FE_GEN_CTRL: u32 = 0x6000_6090;
+const FE2_TX_INTERP_CTRL: u32 = 0x6000_50F0;
+const WHY_RADIO: &str = "radio memory power: there is no radio";
+const RADIO_POWER_ACCEPTED: [Accepted; 4] = [
+    Accepted::at(
+        "FE2",
+        "FE2_TX_INTERP_CTRL",
+        FE2_TX_INTERP_CTRL,
+        WHY_RADIO,
+        "SP5a",
+    ),
+    Accepted::at("FE", "FE_GEN_CTRL", FE_GEN_CTRL, WHY_RADIO, "SP5a"),
+    Accepted::at("NRX", "NRXPD_CTRL", NRX_NRXPD_CTRL, WHY_RADIO, "SP5a"),
+    Accepted::svd("BB", "BBPD_CTRL", WHY_RADIO, "SP5a"),
+];
 
 #[derive(Debug)]
 pub struct Peripherals {
@@ -291,6 +349,11 @@ pub struct Peripherals {
     pub spi1: Spi1,
     pub sha: Sha,
     pub apb_ctrl: ApbCtrl,
+    pub ana_i2c: AnaI2c,
+    pub timg0: AcceptedBlock,
+    pub apb_saradc: AcceptedBlock,
+    /// Four isolated words: its base is 0, so its offsets are absolute addresses.
+    pub radio_power: AcceptedBlock,
     pub uart0: Uart,
     pub uart1: Uart,
     pub usb_serial_jtag: UsbSerialJtag,
@@ -314,6 +377,10 @@ impl Peripherals {
             spi1: Spi1::new(flash),
             sha: Sha::new(),
             apb_ctrl: ApbCtrl::new(config.rng_seed),
+            ana_i2c: AnaI2c::new(),
+            timg0: AcceptedBlock::new(TIMG0_BASE, &TIMG0_ACCEPTED),
+            apb_saradc: AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED),
+            radio_power: AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED),
             uart0: Uart::new(UART0_BASE),
             uart1: Uart::new(UART1_BASE),
             usb_serial_jtag: UsbSerialJtag::new(),
@@ -351,12 +418,20 @@ impl Peripherals {
             Some((&mut self.sha, SHA_BASE))
         } else if within(APB_CTRL) {
             Some((&mut self.apb_ctrl, APB_CTRL_BASE))
+        } else if within(ANA_I2C) {
+            Some((&mut self.ana_i2c, ana_i2c::ANA_I2C_BASE))
+        } else if within(TIMG0) {
+            Some((&mut self.timg0, TIMG0_BASE))
+        } else if within(APB_SARADC) {
+            Some((&mut self.apb_saradc, APB_SARADC_BASE))
         } else if within(UART0) {
             Some((&mut self.uart0, UART0_BASE))
         } else if within(UART1) {
             Some((&mut self.uart1, UART1_BASE))
         } else if within(USB_SERIAL_JTAG) {
             Some((&mut self.usb_serial_jtag, USB_SERIAL_JTAG_BASE))
+        } else if RADIO_POWER_ACCEPTED.iter().any(|a| a.addr == addr) {
+            Some((&mut self.radio_power, 0))
         } else {
             None
         }
@@ -368,6 +443,7 @@ impl Peripherals {
         self.spi1
             .take_unsupported()
             .or_else(|| self.sha.take_unsupported())
+            .or_else(|| self.rtc_cntl.take_unsupported())
     }
 }
 
@@ -509,6 +585,77 @@ mod tests {
         assert_eq!(p.take_unsupported(), Some(Unsupported::ShaDma));
         assert_eq!(p.take_unsupported(), None);
         assert!(p.device(SHA.1).is_none(), "the page after SHA is not SHA");
+    }
+
+    #[test]
+    fn storage_only_blocks_answer_exactly_their_listed_registers() {
+        let mut p = Peripherals::new(
+            &SocConfig::default(),
+            Box::new(crate::flash::NorFlash::blank(
+                crate::flash::FlashConfig::default(),
+            )),
+        );
+        let mut read = |addr: u32| {
+            p.device(addr)
+                .and_then(|(device, base)| device.read(addr - base))
+        };
+        let svd = svd_regs::esp32c3::addr;
+        assert_eq!(
+            read(svd("TIMG0", "WDTCONFIG0")),
+            Some(0x0004_C000),
+            "FLASHBOOT_MOD_EN set at reset (BC §E.3)"
+        );
+        assert_eq!(read(svd("TIMG0", "WDTWPROTECT")), Some(0x50D8_3AA1));
+        assert_eq!(
+            read(svd("TIMG0", "RTCCALICFG")),
+            None,
+            "the RTC calibration is where SP1b-3 starts"
+        );
+        assert_eq!(read(svd("TIMG0", "T0CONFIG")), None);
+        assert_eq!(read(svd("APB_SARADC", "CTRL")), Some(0x4003_8240));
+        assert_eq!(read(svd("APB_SARADC", "CLKM_CONF")), Some(4));
+        assert_eq!(
+            read(svd("APB_SARADC", "ONETIME_SAMPLE")),
+            None,
+            "conversions are SP2"
+        );
+        for addr in [
+            svd("BB", "BBPD_CTRL"),
+            NRX_NRXPD_CTRL,
+            FE_GEN_CTRL,
+            FE2_TX_INTERP_CTRL,
+        ] {
+            assert_eq!(read(addr), Some(0), "{addr:#010x}");
+        }
+        assert_eq!(
+            read(svd("BB", "BBPD_CTRL") - 4),
+            None,
+            "the register before BBPD_CTRL is not listed"
+        );
+        assert_eq!(read(ana_i2c::ANA_I2C_BASE + 0x44), Some(0), "ANA_CONFIG");
+    }
+
+    #[test]
+    fn a_software_reset_request_reaches_the_relay() {
+        let mut p = Peripherals::new(
+            &SocConfig::default(),
+            Box::new(crate::flash::NorFlash::blank(
+                crate::flash::FlashConfig::default(),
+            )),
+        );
+        let options0 = svd_regs::esp32c3::addr("RTC_CNTL", "OPTIONS0");
+        let (device, base) = p.device(options0).expect("RTC_CNTL is routed");
+        assert!(device.write(options0 - base, 1 << 31));
+        assert!(device.write(options0 - base, 1 << 5));
+        assert_eq!(
+            p.take_unsupported(),
+            Some(Unsupported::SoftwareReset { options0: 1 << 31 })
+        );
+        assert_eq!(
+            p.take_unsupported(),
+            Some(Unsupported::SoftwareReset { options0: 1 << 5 })
+        );
+        assert_eq!(p.take_unsupported(), None);
     }
 
     #[test]

@@ -30,6 +30,9 @@ const INT_ENA: u32 = 0x0C;
 const INT_CLR: u32 = 0x10;
 const CLKDIV: u32 = 0x14;
 const STATUS: u32 = 0x1C;
+/// The model serves UART0 and UART1, whose register offsets are identical.
+const FSM_STATUS: u32 =
+    svd_regs::esp32c3::addr("UART0", "FSM_STATUS") - svd_regs::esp32c3::addr("UART0", "FIFO");
 const CONF0: u32 = 0x20;
 const CONF1: u32 = 0x24;
 const CLK_CONF: u32 = 0x78;
@@ -68,6 +71,9 @@ impl Peripheral for Uart {
     fn read(&mut self, offset: u32) -> Option<u32> {
         match offset {
             STATUS => Some(self.idle_status),
+            // The transmitter is idle: bytes leave at once (decision D7 of SP1b-1).
+            // `uart_tx_wait_idle` waits for bits [7:4] = 0 (BA §2.2).
+            FSM_STATUS => Some(0),
             _ => self.config.read(offset),
         }
     }
@@ -147,6 +153,15 @@ mod tests {
             None,
             "INT_ST arrives with interrupts (SP1b-3)"
         );
+    }
+
+    #[test]
+    fn the_transmitter_state_machine_reads_idle() {
+        // BA §2.2: `uart_tx_wait_idle` loops until FSM_STATUS[7:4] is 0.
+        let mut uart = Uart::new(UART0);
+        let fsm = svd_regs::esp32c3::addr("UART0", "FSM_STATUS") - UART0;
+        assert_eq!(uart.read(fsm), Some(0));
+        assert!(!uart.write(fsm, 0xFF), "read-only");
     }
 
     #[test]

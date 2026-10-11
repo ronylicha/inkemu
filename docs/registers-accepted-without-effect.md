@@ -42,20 +42,59 @@ then rewrites the table below, and nothing else; review the diff before committi
 | `0x60004020` | `GPIO.ENABLE` | 1 | pin output enable | SP2 |
 | `0x60004154` | `GPIO.FUNC0_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x60004158` | `GPIO.FUNC1_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
+| `0x600050f0` | `FE2.FE2_TX_INTERP_CTRL` | 1 | radio memory power: there is no radio | SP5a |
+| `0x60006090` | `FE.FE_GEN_CTRL` | 1 | radio memory power: there is no radio | SP5a |
+| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing (software reset bits are refused) | SP1b-3 |
+| `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays | SP1b-3 |
+| `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP1b-3 |
+| `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing | SP1b-3 |
+| `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time | SP1b-3 |
+| `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing | SP1b-3 |
+| `0x60008034` | `RTC_CNTL.ANA_CONF` | 1 | analog configuration, glitch reset | SP1b-3 |
+| `0x60008040` | `RTC_CNTL.INT_ENA_RTC` | 1 | RTC interrupt enables: nothing is raised | SP1b-3 |
+| `0x6000804c` | `RTC_CNTL.INT_CLR_RTC` | 1 | RTC interrupt clear: nothing is pending | SP1b-3 |
+| `0x60008070` | `RTC_CNTL.CLK_CONF` | 1 | RTC fast and slow clock sources and dividers | SP1b-3 |
+| `0x60008074` | `RTC_CNTL.SLOW_CLK_CONF` | 1 | RTC slow clock divider | SP1b-3 |
+| `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP1b-3 |
 | `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control | SP1b-3 |
+| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power-domain control | SP1b-3 |
 | `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation | SP1b-3 |
+| `0x60008090` | `RTC_CNTL.WDTCONFIG0` | 1 | RTC watchdog enable and stages: it never expires (D11) | SP1b-3 |
+| `0x60008094` | `RTC_CNTL.WDTCONFIG1` | 1 | RTC watchdog stage 0 timeout | SP1b-3 |
+| `0x600080a4` | `RTC_CNTL.WDTFEED` | 1 | RTC watchdog feed | SP1b-3 |
+| `0x600080a8` | `RTC_CNTL.WDTWPROTECT` | 1 | RTC watchdog write protection: writes are never locked out | SP1b-3 |
 | `0x600080ac` | `RTC_CNTL.SWD_CONF` | 1 | super watchdog: auto-feed, reset flag, strobes | SP1b-3 |
+| `0x600080b0` | `RTC_CNTL.SWD_WPROTECT` | 1 | super watchdog write protection | SP1b-3 |
 | `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | pad hold | SP2 |
 | `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | digital pad hold | SP2 |
+| `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector | SP1b-3 |
+| `0x6000810c` | `RTC_CNTL.FIB_SEL` | 1 | brown-out and glitch reset selection | SP1b-3 |
+| `0x6000811c` | `RTC_CNTL.SENSOR_CTRL` | 1 | SAR ADC power forcing | SP2 |
 | `0x60009000` | `IO_MUX.PIN_CTRL` | 24 | pad function, pulls, drive strength, input enable | SP2 |
+| `0x6000e000` | `ANA_I2C.HOST0_CMD` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
+| `0x6000e004` | `ANA_I2C.HOST1_CMD` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
+| `0x6000e040` | `ANA_I2C.I2C_MST_ANA_CONF0` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
+| `0x6000e044` | `ANA_I2C.ANA_CONFIG` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
+| `0x6000e048` | `ANA_I2C.ANA_CONFIG2` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6001000c` | `UART1.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3 |
 | `0x60010010` | `UART1.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3 |
 | `0x60010014` | `UART1.CLKDIV` | 1 | baud rate: bytes leave at once | SP1b-3 |
 | `0x60010020` | `UART1.CONF0` | 1 | frame format | SP1b-3 |
 | `0x60010024` | `UART1.CONF1` | 1 | FIFO thresholds | SP1b-3 |
 | `0x60010078` | `UART1.CLK_CONF` | 1 | clock source and divider | SP1b-3 |
+| `0x6001ccd4` | `NRX.NRXPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
+| `0x6001d054` | `BB.BBPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
+| `0x6001f048` | `TIMG0.WDTCONFIG0` | 1 | main watchdog 0 enable and stages: it never expires (D11) | SP1b-3 |
+| `0x6001f064` | `TIMG0.WDTWPROTECT` | 1 | main watchdog 0 write protection | SP1b-3 |
 | `0x6002609c` | `APB_CTRL.FRONT_END_MEM_PD` | 1 | radio front-end memory power | SP5a |
 | `0x600260ac` | `APB_CTRL.MEM_POWER_UP` | 1 | radio memory power | SP5a |
+| `0x60040000` | `APB_SARADC.CTRL` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
+| `0x60040004` | `APB_SARADC.CTRL2` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
+| `0x6004000c` | `APB_SARADC.FSM_WAIT` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
+| `0x60040018` | `APB_SARADC.SAR_PATT_TAB1` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
+| `0x6004001c` | `APB_SARADC.SAR_PATT_TAB2` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
+| `0x60040050` | `APB_SARADC.DMA_CONF` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
+| `0x60040054` | `APB_SARADC.CLKM_CONF` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
 | `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals | SP1b-3 |
 | `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals | SP1b-3 |
 | `0x600c0008` | `SYSTEM.CPU_PER_CONF` | 1 | PLL_FREQ_SEL and the CPU wait-mode bits (CPUPERIOD_SEL is used by the clock model) | SP8 |
