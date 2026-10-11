@@ -503,4 +503,23 @@ mod tests {
         );
         assert_eq!(b.diag.drain(), []);
     }
+
+    #[test]
+    fn efuse_reserved_hole_is_reported_as_unmodeled() {
+        let mut b = bus();
+        assert_eq!(load(&mut b, 0x6000_8800 + 0x194), 0);
+        let reported = b.diag.drain();
+        assert!(
+            matches!(
+                reported[..],
+                [Diagnostic::UnmodeledMmio {
+                    addr: 0x6000_8994,
+                    direction: Direction::Read,
+                    register: None,
+                    ..
+                }]
+            ),
+            "{reported:?}"
+        );
+    }
 }

@@ -83,7 +83,8 @@ pub(crate) const IO_MUX_BASE: u32 = 0x6000_9000;
 const IO_MUX: (u32, u32) = (IO_MUX_BASE, 0x6000_A000);
 /// `RTC_CNTL` and the eFuse mirror share the page `0x6000_8000`: the first 2 KiB, then the last.
 const RTC_CNTL: (u32, u32) = (rtc_cntl::BASE, EFUSE_BASE);
-const EFUSE_BASE: u32 = 0x6000_8800;
+/// Shared with [`efuse`], which asks the SVD for its registers relative to this base.
+pub(crate) const EFUSE_BASE: u32 = 0x6000_8800;
 const EFUSE: (u32, u32) = (EFUSE_BASE, 0x6000_9000);
 const SYSTEM: (u32, u32) = (system::BASE, 0x600C_1000);
 const INTMATRIX_BASE: u32 = 0x600C_2000;
