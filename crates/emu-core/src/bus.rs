@@ -38,7 +38,10 @@ pub struct ReadOutcome {
 pub enum BusError {
     #[error("no device is mapped at {addr:#010x} ({kind:?}); check the device memory map")]
     Unmapped { addr: u32, kind: AccessKind },
-    #[error("misaligned {size:?} access at {addr:#010x}")]
+    #[error(
+        "misaligned {size:?} access at {addr:#010x}; align the address to the access size \
+         or let the CPU core handle unaligned accesses"
+    )]
     Misaligned { addr: u32, size: AccessSize },
 }
 
@@ -61,4 +64,21 @@ pub trait Bus {
     /// A counter that changes whenever the 4 KiB page containing `addr` may hold new bytes.
     /// Decode caches compare it to detect self-modifying code and DMA writes.
     fn page_version(&self, addr: u32) -> u64;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn misaligned_message_names_the_correction() {
+        let msg = BusError::Misaligned {
+            addr: 0x1001,
+            size: AccessSize::Word,
+        }
+        .to_string();
+        assert!(
+            msg.contains("align the address to the access size"),
+            "{msg}"
+        );
+    }
 }

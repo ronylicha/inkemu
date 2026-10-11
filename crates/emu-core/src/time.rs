@@ -51,6 +51,12 @@ impl Frequency {
 mod tests {
     use super::*;
     #[test]
+    fn cycles_add_saturates_at_u64_max() {
+        assert_eq!(Cycles(3) + 4, Cycles(7));
+        assert_eq!(Cycles(u64::MAX - 1) + 5, Cycles(u64::MAX));
+        assert_eq!(Cycles(u64::MAX) + u64::MAX, Cycles(u64::MAX));
+    }
+    #[test]
     fn zero_frequency_is_rejected() {
         assert!(Frequency::from_hz(0).is_none());
     }

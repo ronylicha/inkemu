@@ -4,6 +4,9 @@ use crate::bus::{AccessKind, AccessSize, Bus, BusError, ReadOutcome};
 /// Page granularity used for code-invalidation tracking.
 pub const PAGE_SHIFT: u32 = 12;
 
+/// Widest bus access in bytes (a 32-bit word).
+const WORD_BYTES: usize = 4;
+
 #[derive(Debug, Clone)]
 pub struct Ram {
     base: u32,
@@ -81,7 +84,7 @@ impl Bus for Ram {
     ) -> Result<ReadOutcome, BusError> {
         let n = size.bytes() as usize;
         let start = self.offset(addr, size.bytes(), kind)?;
-        let mut word = [0u8; 4];
+        let mut word = [0u8; WORD_BYTES];
         word[..n].copy_from_slice(&self.data[start..start + n]);
         Ok(ReadOutcome {
             value: u32::from_le_bytes(word),
@@ -155,5 +158,52 @@ mod tests {
         ram.write(4094, AccessSize::Word, 0xFFFF_FFFF).unwrap();
         assert_ne!(ram.page_version(0), a);
         assert_ne!(ram.page_version(4096), b);
+    }
+    #[test]
+    fn load_copies_bytes_and_bumps_touched_pages() {
+        let mut ram = Ram::new(0x1000, 2 * 4096);
+        let (a, b) = (ram.page_version(0x1000), ram.page_version(0x1000 + 4096));
+        ram.load(0x1000 + 4094, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(ram.bytes(0x1000 + 4094, 4).unwrap(), &[1, 2, 3, 4]);
+        assert_ne!(ram.page_version(0x1000), a);
+        assert_ne!(ram.page_version(0x1000 + 4096), b);
+    }
+    #[test]
+    fn load_empty_slice_is_ok_and_changes_nothing() {
+        let mut ram = Ram::new(0x1000, 16);
+        let v = ram.page_version(0x1000);
+        assert_eq!(ram.load(0x1000, &[]), Ok(()));
+        assert_eq!(ram.page_version(0x1000), v);
+        assert_eq!(ram.bytes(0x1000, 16).unwrap(), &[0u8; 16]);
+    }
+    #[test]
+    fn load_out_of_range_is_unmapped_and_leaves_ram_untouched() {
+        let mut ram = Ram::new(0x1000, 16);
+        assert_eq!(
+            ram.load(0x100C, &[0xAA; 8]),
+            Err(BusError::Unmapped {
+                addr: 0x100C,
+                kind: AccessKind::Store
+            })
+        );
+        assert_eq!(
+            ram.load(0x0FFF, &[0xAA; 2]),
+            Err(BusError::Unmapped {
+                addr: 0x0FFF,
+                kind: AccessKind::Store
+            })
+        );
+        assert_eq!(ram.bytes(0x1000, 16).unwrap(), &[0u8; 16]);
+    }
+    #[test]
+    fn bytes_out_of_range_is_unmapped() {
+        let ram = Ram::new(0x1000, 16);
+        assert_eq!(
+            ram.bytes(0x100E, 4),
+            Err(BusError::Unmapped {
+                addr: 0x100E,
+                kind: AccessKind::Load
+            })
+        );
     }
 }
