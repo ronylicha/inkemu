@@ -23,3 +23,4 @@ sha2.workspace = true
 
 [dev-dependencies]
 cpu-rv32 = { workspace = true, features = ["test-support"] }
+firmware = { workspace = true, features = ["test-support"] }

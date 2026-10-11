@@ -791,6 +791,7 @@ version = "0.1.0"
 dependencies = [
  "cpu-rv32",
  "emu-core",
+ "firmware",
  "goblin",
  "sha1",
  "sha2",

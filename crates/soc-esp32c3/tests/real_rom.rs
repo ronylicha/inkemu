@@ -210,3 +210,246 @@ fn two_boots_are_identical_down_to_the_trace_hash() {
         (b.trace_hash, b.cycles, &b.uart0, &b.diagnostics)
     );
 }
+
+use firmware::builder::{ImageSpec, build_image};
+
+/// Where the synthetic bootloader is loaded and entered: the start of the SRAM seen from the instruction bus.
+const STUB_ENTRY: u32 = 0x4038_0000;
+/// `j .`
+const STUB_CODE: [u8; 4] = [0x6f, 0, 0, 0];
+/// Where the ROM parks after `ets_run_flash_bootloader` failed: the `j .` of `main` (FB §H, "hang").
+const ROM_HANG_PC: u32 = 0x4004_7ed2;
+/// The ROM path from the banner to the bootloader entry is about 121,000 instructions (FB §1 item 1).
+const FLASH_BOOT_BUDGET: u64 = 40_000_000;
+const INVALID_HEADER_BLANK: &str = "invalid header: 0xffffffff\n";
+
+fn stub_spec() -> ImageSpec {
+    ImageSpec {
+        chip: 5,
+        entry: STUB_ENTRY,
+        flash_size_nibble: 4,
+        spi_mode: 2,
+        segments: vec![(STUB_ENTRY, STUB_CODE.to_vec())],
+        hash_appended: true,
+    }
+}
+
+struct FlashBoot {
+    /// UART0 output after the three banner lines, carriage returns dropped.
+    after_banner: String,
+    diagnostics: Vec<Diagnostic>,
+    stop: StopReason,
+    pc: u32,
+    trace_hash: Option<u64>,
+}
+
+/// Boots the rev3 ROM on `flash` (`None`: an erased chip) until `done` accepts the text printed after
+/// the banner, then one more slice so the ROM reaches the place it stops at.
+fn flash_boot(flash: Option<Vec<u8>>, config: SocConfig, done: impl Fn(&str) -> bool) -> FlashBoot {
+    let rom = RomImage::from_elf(&elf(3)).unwrap();
+    let mut machine = match flash {
+        Some(image) => Esp32C3::with_flash(rom, image, &config).unwrap(),
+        None => Esp32C3::new(rom, &config),
+    };
+    let banner_text = banner("esp32c3-api1-20210207", "Feb  7 2021");
+    let (mut uart0, mut diagnostics) = (Vec::new(), Vec::new());
+    let mut stop = StopReason::CycleBudget;
+    let mut extra_slices = 1;
+    let after = |bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes).replace('\r', "");
+        text.strip_prefix(&banner_text)
+            .map(str::to_owned)
+            .unwrap_or_default()
+    };
+    while stop == StopReason::CycleBudget && machine.cycles().get() < FLASH_BOOT_BUDGET {
+        if done(&after(&uart0)) {
+            if extra_slices == 0 {
+                break;
+            }
+            extra_slices -= 1;
+        }
+        stop = machine.run_until(Cycles(machine.cycles().get() + SLICE));
+        uart0.extend(machine.take_console(ConsoleChannel::Uart0));
+        let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
+        diagnostics.extend(machine.drain_diagnostics());
+    }
+    FlashBoot {
+        after_banner: after(&uart0),
+        diagnostics,
+        stop,
+        pc: machine.pc(),
+        trace_hash: machine.trace_hash(),
+    }
+}
+
+fn strict() -> SocConfig {
+    SocConfig {
+        strict_mmio: true,
+        ..SocConfig::default()
+    }
+}
+
+/// The hexadecimal number that follows `label` in `text`.
+fn hex_after(text: &str, label: &str) -> u8 {
+    let rest = &text[text
+        .find(label)
+        .unwrap_or_else(|| panic!("no `{label}` in {text:?}"))
+        + label.len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    u8::from_str_radix(&digits, 16).unwrap()
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rom_loads_a_synthetic_bootloader_and_jumps_to_its_entry() {
+    let boot = flash_boot(Some(build_image(&stub_spec())), strict(), |text| {
+        text.contains("entry 0x")
+    });
+    assert_eq!(
+        boot.after_banner,
+        "SPIWP:0xee\nmode:DIO, clock div:1\nload:0x40380000,len:0x4\nentry 0x40380000\n",
+        "FB §G; no `SHA-256 comparison failed` line: the hardware digest equals the appended one"
+    );
+    assert_eq!(
+        boot.diagnostics,
+        Vec::new(),
+        "nothing unmodelled, no exception, on the whole flash path"
+    );
+    assert_eq!(boot.stop, StopReason::CycleBudget);
+    assert_eq!(boot.pc, STUB_ENTRY, "the ROM jumped into the image");
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn blank_flash_prints_invalid_header_forever() {
+    // FB §H row 1: a tight loop, no SPIWP line, never exits.
+    let boot = flash_boot(None, strict(), |text| {
+        text.matches(INVALID_HEADER_BLANK).count() >= 3
+    });
+    assert!(
+        boot.after_banner.matches(INVALID_HEADER_BLANK).count() >= 3,
+        "{:?}",
+        boot.after_banner
+    );
+    assert!(
+        boot.after_banner
+            .lines()
+            .all(|line| line == INVALID_HEADER_BLANK.trim_end()
+                || INVALID_HEADER_BLANK.starts_with(line)),
+        "only that line, the last one possibly cut by the slice: {:?}",
+        boot.after_banner
+    );
+    assert_eq!(boot.diagnostics, Vec::new());
+    assert_eq!(boot.stop, StopReason::CycleBudget, "a loop, not a stop");
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_header_that_is_not_an_image_is_printed_byte_by_byte() {
+    // FB §H rows 2 and 3: the four header bytes are printed as hdr[3] hdr[2] hdr[1] hdr[0].
+    let zeros = flash_boot(Some(vec![0u8; 16]), strict(), |text| text.contains('\n'));
+    assert!(
+        zeros
+            .after_banner
+            .starts_with("invalid header: 0x00000000\n"),
+        "{:?}",
+        zeros.after_banner
+    );
+    let mut image = build_image(&stub_spec());
+    image[0] = 0x00;
+    let no_magic = flash_boot(Some(image), strict(), |text| text.contains('\n'));
+    assert!(
+        no_magic
+            .after_banner
+            .starts_with("invalid header: 0x4f020100\n"),
+        "{:?}",
+        no_magic.after_banner
+    );
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn an_image_for_another_chip_stops_the_rom_before_it_configures_the_flash() {
+    // FB §H: chip id 9 -> one message, `ets_main.c 333 `, then `j .`; the check comes before SPIWP.
+    let image = build_image(&ImageSpec {
+        chip: 9,
+        ..stub_spec()
+    });
+    let boot = flash_boot(Some(image), strict(), |text| {
+        text.contains("ets_main.c 333 \n")
+    });
+    assert_eq!(
+        boot.after_banner,
+        "Invalid chip id. Expected 5 read 9. Bootloader for wrong chip?\nets_main.c 333 \n"
+    );
+    assert_eq!(boot.pc, ROM_HANG_PC);
+    assert_eq!(boot.diagnostics, Vec::new());
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_flipped_data_bit_is_a_checksum_failure() {
+    // FB §H: detected after the `load:` line; the ROM prints both checksums, then hangs.
+    const FIRST_DATA_BYTE: usize = 24 + 8; // image header, segment header
+    let mut image = build_image(&stub_spec());
+    image[FIRST_DATA_BYTE] ^= 0x01;
+    let stored = image[image.len() - 32 - 1];
+    let boot = flash_boot(Some(image), strict(), |text| {
+        text.contains("ets_main.c 333 \n")
+    });
+    assert!(
+        boot.after_banner
+            .contains("load:0x40380000,len:0x4\nChecksum failure. Calculated 0x"),
+        "{:?}",
+        boot.after_banner
+    );
+    assert_eq!(hex_after(&boot.after_banner, "stored 0x"), stored);
+    assert_eq!(
+        hex_after(&boot.after_banner, "Calculated 0x"),
+        stored ^ 0x01
+    );
+    assert!(!boot.after_banner.contains("entry"));
+    assert_eq!(boot.pc, ROM_HANG_PC);
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_wrong_digest_is_reported_and_the_rom_boots_anyway() {
+    // FB §F step 7 and §H: a SHA mismatch is not fatal without secure boot. The digest the ROM prints
+    // as "Calculated" comes out of the SHA accelerator model.
+    let mut image = build_image(&stub_spec());
+    let hashed = image.len() - 32;
+    let calculated = common::hex(&Sha256::digest(&image[..hashed]));
+    let last = image.len() - 1;
+    image[last] ^= 0xFF;
+    let expected = common::hex(&image[hashed..]);
+    let boot = flash_boot(Some(image), strict(), |text| text.contains("entry 0x"));
+    let text = boot.after_banner.to_lowercase();
+    assert!(
+        text.contains(&format!(
+            "sha-256 comparison failed:\ncalculated: {calculated}\nexpected: {expected}\nattempting to boot anyway...\nentry 0x40380000\n"
+        )),
+        "{:?}",
+        boot.after_banner
+    );
+    assert_eq!(boot.pc, STUB_ENTRY);
+    assert_eq!(boot.diagnostics, Vec::new());
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn two_flash_boots_are_identical_down_to_the_trace_hash() {
+    let config = SocConfig {
+        trace_hash: true,
+        ..SocConfig::default()
+    };
+    let run = || {
+        flash_boot(Some(build_image(&stub_spec())), config, |text| {
+            text.contains("entry 0x")
+        })
+    };
+    let (first, second) = (run(), run());
+    assert!(first.trace_hash.is_some());
+    assert_eq!(first.trace_hash, second.trace_hash);
+    assert_eq!(first.after_banner, second.after_banner);
+}
