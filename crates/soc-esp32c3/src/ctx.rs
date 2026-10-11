@@ -327,8 +327,10 @@ impl Ctx {
     /// began, whatever the devices do. The pass takes a watermark from the scheduler when it
     /// starts (the id the next wake-up will get) and delivers only due wake-ups whose id is below
     /// it. A wake-up that a device arms during the pass, for any instant, is not delivered by
-    /// this pass: the next pass delivers it (after the next instruction, or at the next step of a
-    /// sleep, where the bound on fruitless wake-ups ends the call). It also never hides an older
+    /// this pass. One armed for the present time or before is delivered by the next pass (after
+    /// the next instruction, or at the next step of a sleep, where the bound on the sleeps of a
+    /// call ends the call); one armed for a later instant is delivered at its own instant, by
+    /// the pass that finds it due. It also never hides an older
     /// one: the heap is ordered by (cycle, id), [`Ctx::schedule`] puts an instant in the past at
     /// the present time, and so a wake-up armed during the pass sorts after every wake-up that
     /// was due when it began, and the first due wake-up at or past the watermark ends the pass

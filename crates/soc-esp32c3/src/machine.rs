@@ -298,7 +298,8 @@ impl Esp32C3 {
     /// that are due, a reset, a clock change, a change of the interrupt lines.
     fn service(&mut self, pc: u32) {
         // One pass, bounded by the wake-ups that were due when it began: a wake-up a device arms
-        // during the pass, for any instant, is delivered by the next call (`Ctx::deliver_due`).
+        // during the pass, for any instant, is not delivered by it; a later pass delivers it,
+        // the next one when it is due already (`Ctx::deliver_due`).
         self.bus.deliver_due();
         if let Some(cause) = self.bus.ctx.take_reset() {
             self.reset(cause);

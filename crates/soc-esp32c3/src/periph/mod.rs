@@ -1099,7 +1099,8 @@ mod tests {
 
     #[test]
     fn analog_registers_written_through_regi2c_survive_every_level_of_reset() {
-        // ASSUMPTION: see `Peripherals::reset`. A byte written before the reset reads back after it.
+        // The assumption is marked on `Peripherals::reset`, with what settles it. A byte written
+        // before the reset reads back after it.
         let ctx = &mut Ctx::default();
         let mut p = peripherals(ctx);
         let cmd = ana_i2c::ANA_I2C_BASE;

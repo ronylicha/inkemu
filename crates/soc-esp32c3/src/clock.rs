@@ -54,8 +54,8 @@ impl CpuClock {
     /// The clocks after a power-on reset, and after any core or system reset: the crystal divided
     /// by 2, 20 MHz (TRM §6.2.4.1; report TW §H.2: the period of the reset loop of a blank chip
     /// excludes 40 MHz). A CPU reset keeps the selection the firmware made: after `esp_restart`
-    /// the ROM runs on the undivided crystal, 40 MHz (IR §4.1). The 20 MHz is a documented
-    /// assumption, not a measured fact: see the `ASSUMPTION:` in the documentation of [`cpu_clock`].
+    /// the ROM runs on the undivided crystal, 40 MHz (IR §4.1). The 20 MHz is an assumption, not
+    /// a measured fact: it is marked, with what settles it, in the documentation of [`cpu_clock`].
     pub const POWER_ON: CpuClock = CpuClock::new(2 * XTAL_PERIOD, 2 * XTAL_PERIOD);
 
     /// A CPU clock and an APB clock by their periods in time-base cycles; a period of 0 is taken
