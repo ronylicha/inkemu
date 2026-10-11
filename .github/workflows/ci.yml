@@ -7,18 +7,29 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    # A test that stops ending must fail this job, not hold a runner for the six hours GitHub
+    # allows by default. The same goes for `coverage`, which runs the same tests instrumented.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
-        with: { toolchain: "1.99.0", components: "rustfmt, clippy, llvm-tools-preview" }
+        with:
+          toolchain: "1.99.0"
+          components: "rustfmt, clippy, llvm-tools-preview"
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       - run: cargo run -p svd-gen -- --check
+      # The model crates do no host I/O and must go on building for `wasm32-unknown-unknown`,
+      # the target of the web version: nothing else would notice a host dependency slipping in.
+      - name: Build the model for WebAssembly
+        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3
       - uses: EmbarkStudios/cargo-deny-action@v2
   coverage:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -82,9 +93,10 @@ jobs:
           tools/ci/run-ignored-tests.sh 18 --release -p soc-esp32c3 --test real_rom -- --ignored
           tools/ci/run-ignored-tests.sh 10 --release -p emu-cli --test run_cli -- --ignored --skip x4_boots_the_reference_firmware
   reference-boot:
-    # Boots the reference firmware (stock ESP-IDF bootloader + hello_world) from the real mask ROM to
-    # the first line of the application. The firmware is built here, inside the pinned ESP-IDF image,
-    # and checked against pinned SHA-256 values; it is never stored in this repository. The cache
+    # Boots the reference firmware (stock ESP-IDF bootloader + hello_world) from the real mask ROM
+    # and runs it through a whole life: the application, its countdown, the restart it asks for
+    # and the second boot. The firmware is built here, inside the pinned ESP-IDF image, and
+    # checked against pinned SHA-256 values; it is never stored in this repository. The cache
     # saves the build and replaces no check: the image is re-hashed on every run.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -107,8 +119,7 @@ jobs:
       # without room made first, the pull or the Rust build after it can run out of disk. The
       # directories removed are toolchains preinstalled on the runner image that this job never
       # uses (.NET, the Android SDK, Haskell, CodeQL); `df` before and after puts the gain in the
-      # job log. Only needed when the firmware is not in the cache. This step, like the whole job,
-      # has not run on GitHub yet.
+      # job log. Only needed when the firmware is not in the cache.
       - name: Free disk space for the ESP-IDF image
         if: steps.firmware.outputs.cache-hit != 'true'
         run: |
