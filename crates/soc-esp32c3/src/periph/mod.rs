@@ -12,6 +12,7 @@ pub mod intmatrix;
 pub mod io_mux;
 pub mod mmu;
 pub mod rtc_cntl;
+pub mod sha;
 pub mod spi_mem;
 pub mod system;
 pub mod uart;
@@ -25,6 +26,7 @@ pub use intmatrix::IntMatrix;
 pub use io_mux::IoMux;
 pub use mmu::MmuTable;
 pub use rtc_cntl::RtcCntl;
+pub use sha::Sha;
 pub use spi_mem::{Spi0, Spi1};
 pub use system::System;
 pub use uart::Uart;
@@ -263,6 +265,9 @@ const UART1_BASE: u32 = 0x6001_0000;
 const UART1: (u32, u32) = (UART1_BASE, 0x6001_1000);
 const USB_SERIAL_JTAG_BASE: u32 = 0x6004_3000;
 const USB_SERIAL_JTAG: (u32, u32) = (USB_SERIAL_JTAG_BASE, 0x6004_4000);
+/// `DR_REG_SHA_BASE`; report BC §A.2.
+pub(crate) const SHA_BASE: u32 = 0x6003_B000;
+const SHA: (u32, u32) = (SHA_BASE, 0x6003_C000);
 
 #[derive(Debug)]
 pub struct Peripherals {
@@ -278,6 +283,7 @@ pub struct Peripherals {
     pub assist_debug: AssistDebug,
     pub spi0: Spi0,
     pub spi1: Spi1,
+    pub sha: Sha,
     pub uart0: Uart,
     pub uart1: Uart,
     pub usb_serial_jtag: UsbSerialJtag,
@@ -299,6 +305,7 @@ impl Peripherals {
             assist_debug: AssistDebug::new(),
             spi0: Spi0::new(),
             spi1: Spi1::new(flash),
+            sha: Sha::new(),
             uart0: Uart::new(UART0_BASE),
             uart1: Uart::new(UART1_BASE),
             usb_serial_jtag: UsbSerialJtag::new(),
@@ -332,6 +339,8 @@ impl Peripherals {
             Some((&mut self.spi1, SPI1_BASE))
         } else if within(SPI0) {
             Some((&mut self.spi0, SPI0_BASE))
+        } else if within(SHA) {
+            Some((&mut self.sha, SHA_BASE))
         } else if within(UART0) {
             Some((&mut self.uart0, UART0_BASE))
         } else if within(UART1) {
@@ -346,7 +355,9 @@ impl Peripherals {
     /// The oldest thing a device was asked to do and cannot do faithfully, not taken yet: call until
     /// `None` to get all of them, in order.
     pub(crate) fn take_unsupported(&mut self) -> Option<Unsupported> {
-        self.spi1.take_unsupported()
+        self.spi1
+            .take_unsupported()
+            .or_else(|| self.sha.take_unsupported())
     }
 }
 
@@ -471,6 +482,23 @@ mod tests {
             ),
             Some(SENSITIVE_BASE)
         );
+    }
+
+    #[test]
+    fn the_sha_block_is_routed_and_its_refusals_reach_the_relay() {
+        let mut p = Peripherals::new(
+            &SocConfig::default(),
+            Box::new(crate::flash::NorFlash::blank(
+                crate::flash::FlashConfig::default(),
+            )),
+        );
+        let dma_start = svd_regs::esp32c3::addr("SHA", "DMA_START");
+        let (device, base) = p.device(dma_start).expect("SHA is routed");
+        assert_eq!(base, SHA_BASE);
+        assert!(device.write(dma_start - base, 1));
+        assert_eq!(p.take_unsupported(), Some(Unsupported::ShaDma));
+        assert_eq!(p.take_unsupported(), None);
+        assert!(p.device(SHA.1).is_none(), "the page after SHA is not SHA");
     }
 
     #[test]
