@@ -4,6 +4,7 @@ use crate::diag::Unsupported;
 use crate::flash::FlashDevice;
 use emu_core::Peripheral;
 
+pub mod apb_ctrl;
 pub mod assist_debug;
 pub mod efuse;
 pub mod extmem;
@@ -18,6 +19,7 @@ pub mod system;
 pub mod uart;
 pub mod usb_serial_jtag;
 
+pub use apb_ctrl::ApbCtrl;
 pub use assist_debug::AssistDebug;
 pub use efuse::Efuse;
 pub use extmem::Extmem;
@@ -198,6 +200,7 @@ pub fn accepted_without_effect() -> Vec<Accepted> {
         assist_debug::accepted(),
         extmem::accepted(),
         spi_mem::accepted(),
+        apb_ctrl::accepted(),
     ]
     .concat();
     rows.sort_by_key(|row| row.addr);
@@ -268,6 +271,9 @@ const USB_SERIAL_JTAG: (u32, u32) = (USB_SERIAL_JTAG_BASE, 0x6004_4000);
 /// `DR_REG_SHA_BASE`; report BC §A.2.
 pub(crate) const SHA_BASE: u32 = 0x6003_B000;
 const SHA: (u32, u32) = (SHA_BASE, 0x6003_C000);
+/// `DR_REG_SYSCON_BASE`; report BC §A.2.
+pub(crate) const APB_CTRL_BASE: u32 = 0x6002_6000;
+const APB_CTRL: (u32, u32) = (APB_CTRL_BASE, 0x6002_7000);
 
 #[derive(Debug)]
 pub struct Peripherals {
@@ -284,6 +290,7 @@ pub struct Peripherals {
     pub spi0: Spi0,
     pub spi1: Spi1,
     pub sha: Sha,
+    pub apb_ctrl: ApbCtrl,
     pub uart0: Uart,
     pub uart1: Uart,
     pub usb_serial_jtag: UsbSerialJtag,
@@ -306,6 +313,7 @@ impl Peripherals {
             spi0: Spi0::new(),
             spi1: Spi1::new(flash),
             sha: Sha::new(),
+            apb_ctrl: ApbCtrl::new(config.rng_seed),
             uart0: Uart::new(UART0_BASE),
             uart1: Uart::new(UART1_BASE),
             usb_serial_jtag: UsbSerialJtag::new(),
@@ -341,6 +349,8 @@ impl Peripherals {
             Some((&mut self.spi0, SPI0_BASE))
         } else if within(SHA) {
             Some((&mut self.sha, SHA_BASE))
+        } else if within(APB_CTRL) {
+            Some((&mut self.apb_ctrl, APB_CTRL_BASE))
         } else if within(UART0) {
             Some((&mut self.uart0, UART0_BASE))
         } else if within(UART1) {

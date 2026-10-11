@@ -629,8 +629,8 @@ mod tests {
         assert_eq!(load(&mut b, 0x6000_8038) & 0x3F, 1, "RTC_CNTL.RESET_STATE");
         assert_eq!(
             load(&mut b, 0x6000_8850),
-            3 << 18,
-            "EFUSE.RD_MAC_SPI_SYS_3 of a v0.3 chip"
+            0x020C_0000,
+            "EFUSE.RD_MAC_SPI_SYS_3 of the production v0.3 chip"
         );
         assert_eq!(
             load(&mut b, 0x600C_0058) >> 12 & 0x7F,

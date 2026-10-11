@@ -54,6 +54,8 @@ then rewrites the table below, and nothing else; review the diff before committi
 | `0x60010020` | `UART1.CONF0` | 1 | frame format | SP1b-3 |
 | `0x60010024` | `UART1.CONF1` | 1 | FIFO thresholds | SP1b-3 |
 | `0x60010078` | `UART1.CLK_CONF` | 1 | clock source and divider | SP1b-3 |
+| `0x6002609c` | `APB_CTRL.FRONT_END_MEM_PD` | 1 | radio front-end memory power | SP5a |
+| `0x600260ac` | `APB_CTRL.MEM_POWER_UP` | 1 | radio memory power | SP5a |
 | `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals | SP1b-3 |
 | `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals | SP1b-3 |
 | `0x600c0008` | `SYSTEM.CPU_PER_CONF` | 1 | PLL_FREQ_SEL and the CPU wait-mode bits (CPUPERIOD_SEL is used by the clock model) | SP8 |
