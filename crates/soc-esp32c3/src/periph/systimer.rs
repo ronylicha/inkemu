@@ -63,7 +63,10 @@ const TARGET_CONF_WRITABLE: u32 = 0xC3FF_FFFF;
 const TARGET_UNIT_SEL: u32 = 1 << 31;
 const TARGET_PERIOD_MODE: u32 = 1 << 30;
 const TARGET_PERIOD_MASK: u32 = 0x03FF_FFFF;
-/// Bits 2..0 of the four interrupt registers: comparators 2, 1 and 0.
+/// Bits 2..0 of the four interrupt registers: comparators 2, 1 and 0. `INT_ENA` bit `alarm` is
+/// set and cleared by `systimer_ll_enable_alarm_int` (`systimer_ll.h:174-181`), `INT_ST` is read
+/// by `systimer_ll_is_alarm_int_fired` (lines 183-186) and `INT_CLR` bit `alarm` is written by
+/// `systimer_ll_clear_alarm_int` (lines 188-191); `INT_RAW` is set by the hardware only.
 const INT_MASK: u32 = 0b111;
 /// Bit 0 of `UNITn_LOAD` and `COMPx_LOAD`, a write-1 trigger (`systimer_ll_apply_counter_value`,
 /// line 114; `systimer_ll_apply_alarm_value`, line 158).
@@ -214,6 +217,14 @@ impl Systimer {
     /// Works out the next alarm of a comparator that was just enabled, loaded or switched to
     /// another mode: in period mode "alarms at t1 + n x period, t1 being the count at the start"
     /// (TRM §10.4.2); in target mode at the target, at once when it is already passed.
+    ///
+    /// ASSUMPTION: in period mode "the start" is each of the writes that call this: the write
+    /// that sets `TARGETx_WORK_EN`, a `COMPx_LOAD`, and a write that changes `PERIOD_MODE` or
+    /// the counter selected. `t1` is the count read at that write, so the last of them before
+    /// the first alarm sets the phase of every alarm after it. The TRM does not say which event
+    /// starts the period, nor whether a later one of these restarts it. Programming a period on
+    /// a chip, then writing `COMPx_LOAD` again half a period later, and timing the next alarm
+    /// against both writes, settles it.
     fn start(&mut self, comparator: usize, now: Cycles) {
         let count = self.count(self.unit_of(comparator), now);
         let c = &mut self.comparators[comparator];
@@ -233,7 +244,9 @@ impl Systimer {
     /// alarm whose target the stopped counter has already reached fires at once. This is TRM table
     /// 10.4-2 read literally; with the order in which `vSystimerSetup` programs the tick
     /// (`IDF:freertos/port_systick.c:60-118`) it gives one early tick interrupt that counts no tick
-    /// (report TW §A.4, §I question 6). A trace of a real chip settles it.
+    /// (report TW §A.4, §I question 6). What settles it is that interrupt: on a real chip, whether
+    /// `SYSTIMER_TARGET0` (source 37) is taken once between the write of `TARGET0_WORK_EN` and the
+    /// start of counter 1, before any tick period has gone by.
     fn evaluate(&mut self, ctx: &mut Ctx) {
         let now = ctx.now();
         self.wake.called(now);
@@ -407,7 +420,12 @@ impl Peripheral<Ctx> for Systimer {
                 self.int_raw &= !value;
                 self.drive(ctx);
             }
-            // Read-only: the write is reported as unmodelled.
+            // A write to anything else is reported as unmodelled: the read-only registers
+            // (`INT_ST`, the `VALUE` latches, `DATE`), and `INT_RAW`, which the SVD gives as
+            // read-write. Hardware sets its bits and software clears them through `INT_CLR`
+            // (`systimer_ll_clear_alarm_int`); no ESP-IDF code writes `INT_RAW`, and what a write
+            // to it does on silicon (raise an interrupt by hand, or nothing) is not known, so the
+            // model refuses the write rather than give it an effect.
             _ => return false,
         }
         true
@@ -653,6 +671,109 @@ mod tests {
         // The counter reads 11 000: a target of 5 000 is already passed.
         program(ctx, &mut timer, 5_000);
         assert_eq!(timer.read(ctx, INT_ST), Some(0b100), "fires immediately");
+    }
+
+    #[test]
+    fn a_target_is_compared_modulo_the_52_bits_of_the_counter() {
+        // TRM table 10.4-2: a target is passed when 0 <= count - t < 2^51 - 1, modulo 2^52.
+        let ctx = &mut Ctx::default();
+        let mut timer = Systimer::new(ctx.now());
+        timer.write(ctx, INT_ENA, 0b100);
+        // Counter 0 loaded 100 counts before its wrap.
+        timer.write(ctx, UNIT0_LOAD_HI, 0x000F_FFFF);
+        timer.write(ctx, UNIT0_LOAD_LO, 0xFFFF_FF9C);
+        timer.write(ctx, UNIT0_LOAD, 1);
+        // A target of 50 is 150 counts ahead, through the wrap: it is not "already passed".
+        timer.write(ctx, TARGET2_LO - 4, 0);
+        timer.write(ctx, TARGET2_LO, 50);
+        timer.write(ctx, COMP2_LOAD, 1);
+        timer.write(ctx, CONF, 0x4640_0000);
+        assert_eq!(timer.read(ctx, INT_RAW), Some(0));
+        assert_eq!(ctx.next_wake(), Some(Cycles(1_500)), "150 counts ahead");
+        after(ctx, 1_499);
+        pump(ctx, &mut timer);
+        assert_eq!(timer.read(ctx, INT_RAW), Some(0));
+        after(ctx, 1);
+        pump(ctx, &mut timer);
+        assert_eq!(timer.read(ctx, INT_ST), Some(0b100));
+        assert_eq!(counter(ctx, &mut timer, 0), 50, "the counter wrapped");
+        // A target 5 counts before the wrap, with the counter 50 counts after it: 55 counts
+        // behind, across the wrap, so it fires as soon as the comparator works.
+        timer.write(ctx, INT_CLR, 0b100);
+        timer.write(ctx, CONF, 0x4600_0000);
+        timer.write(ctx, TARGET2_LO - 4, 0x000F_FFFF);
+        timer.write(ctx, TARGET2_LO, 0xFFFF_FFFB);
+        timer.write(ctx, COMP2_LOAD, 1);
+        assert_eq!(timer.read(ctx, INT_RAW), Some(0), "not working yet");
+        timer.write(ctx, CONF, 0x4640_0000);
+        assert_eq!(timer.read(ctx, INT_ST), Some(0b100), "already passed");
+    }
+
+    #[test]
+    fn a_comparator_disabled_while_armed_raises_nothing_until_it_works_again() {
+        let ctx = &mut Ctx::default();
+        let mut timer = Systimer::new(ctx.now());
+        timer.write(ctx, INT_ENA, 0b100);
+        timer.write(ctx, TARGET2_LO, 1_000);
+        timer.write(ctx, COMP2_LOAD, 1);
+        timer.write(ctx, CONF, 0x4640_0000);
+        assert_eq!(ctx.next_wake(), Some(Cycles(10_000)));
+        after(ctx, 5_000);
+        // `TARGET2_WORK_EN` <- 0 with the alarm 500 counts away.
+        timer.write(ctx, CONF, 0x4600_0000);
+        after(ctx, 20_000);
+        pump(ctx, &mut timer);
+        assert_eq!(
+            timer.read(ctx, INT_RAW),
+            Some(0),
+            "a comparator that does not work compares nothing"
+        );
+        assert_eq!(ctx.sources(), 0);
+        assert_eq!(ctx.next_wake(), None, "and asks for no call");
+        // Enabled again with its target passed meanwhile: it fires at once (TRM table 10.4-2).
+        timer.write(ctx, CONF, 0x4640_0000);
+        assert_eq!(timer.read(ctx, INT_ST), Some(0b100));
+        assert_eq!(ctx.sources(), 1 << 39);
+    }
+
+    #[test]
+    fn a_comparator_switched_to_the_other_counter_compares_with_that_one() {
+        // `TARGETx_CONF` bit 31 selects the counter a comparator works with
+        // (`systimer_ll_connect_alarm_counter`): a switch acts at the write.
+        let ctx = &mut Ctx::default();
+        let mut timer = Systimer::new(ctx.now());
+        let (target1_conf, target1_lo, comp1_load) =
+            (TARGET0_CONF + 4, TARGET0_HI + 12, COMP0_LOAD + 4);
+        timer.write(ctx, INT_ENA, 0b010);
+        // Counter 0 reads 500 when counter 1 is started from 0.
+        after(ctx, 5_000);
+        timer.write(ctx, CONF, 0x6600_0000);
+        // Comparator 1 on counter 1, target 300.
+        timer.write(ctx, target1_conf, TARGET_UNIT_SEL);
+        timer.write(ctx, target1_lo, 300);
+        timer.write(ctx, comp1_load, 1);
+        timer.write(ctx, CONF, 0x6680_0000);
+        assert_eq!(timer.read(ctx, INT_RAW), Some(0));
+        assert_eq!(
+            ctx.next_wake(),
+            Some(Cycles(5_000 + 3_000)),
+            "300 counts of counter 1"
+        );
+        // Switched to counter 0, which is past 300: the alarm fires at the write.
+        timer.write(ctx, target1_conf, 0);
+        assert_eq!(timer.read(ctx, INT_ST), Some(0b010));
+        assert_eq!(ctx.sources(), 1 << 38, "SYSTIMER_TARGET1 is source 38");
+        // And back to counter 1, which is not there yet: it waits for it.
+        timer.write(ctx, INT_CLR, 0b010);
+        timer.write(ctx, target1_conf, TARGET_UNIT_SEL);
+        assert_eq!(timer.read(ctx, INT_RAW), Some(0));
+        after(ctx, 2_999);
+        pump(ctx, &mut timer);
+        assert_eq!(timer.read(ctx, INT_RAW), Some(0));
+        after(ctx, 1);
+        pump(ctx, &mut timer);
+        assert_eq!(timer.read(ctx, INT_ST), Some(0b010));
+        assert_eq!(counter(ctx, &mut timer, 1), 300);
     }
 
     #[test]

@@ -79,7 +79,9 @@ const SCLK_SEL_XTAL: u32 = 3;
 const TXFIFO_RST: u32 = 1 << 18;
 /// ASSUMPTION: a byte is 10 bit times on the wire (a start bit, 8 data bits, a stop bit), whatever
 /// `CONF0` says. The ROM and ESP-IDF consoles use this format; another one would only change how
-/// long a byte takes. SP2 gives the frame format its effect, with the receive side.
+/// long a byte takes. SP1b-3b gives the frame format its effect, with the receive side; a byte
+/// timed on a chip configured for another format (two stop bits, a parity bit) settles what each
+/// field adds.
 const BITS_PER_BYTE: u64 = 10;
 /// Device time is kept in sixteenths of a time-base cycle here: a bit lasts a whole number of them.
 const SUBCYCLES: u64 = 16;
@@ -204,6 +206,12 @@ impl Uart {
     /// its fraction) cycles of the source clock divided by `SCLK_DIV_NUM + 1`. The fractional
     /// divider of the source clock (`SCLK_DIV_A/B`) is ignored: it resets to 0 and no measured
     /// code writes it.
+    ///
+    /// ASSUMPTION: the divider is what the register holds, down to 0. An integer part of 0 with
+    /// a fraction divides by that fraction of a cycle, and a `CLKDIV` of 0 gives a byte no
+    /// duration: it leaves in the instant it is written, as fast as firmware can write. No source
+    /// says what the chip does below a divider of 1 (ESP-IDF never programs one); a byte timed on
+    /// a chip with `CLKDIV` = 0 settles it.
     fn byte_time(&self, source_period: u64) -> u64 {
         let clkdiv = self.config.read(CLKDIV).unwrap_or(0);
         let clk_conf = self.config.read(CLK_CONF).unwrap_or(0);
@@ -220,9 +228,13 @@ impl Uart {
             return;
         }
         let byte_time = self.byte_time(self.source_period(ctx));
-        // A byte keeps the duration it was given when it was written: a later change of `CLKDIV`,
-        // `CLK_CONF` or the APB clock applies to the bytes written after it. This is the model's
-        // choice; firmware that changes the clock with bytes on their way out is not modelled.
+        // ASSUMPTION: a byte keeps the duration it was given when it was written: a later change
+        // of `CLKDIV`, `CLK_CONF` or the APB clock applies to the bytes written after it. What
+        // silicon does with the bits not sent yet is not documented (the divider most likely
+        // acts on them from the change on). ESP-IDF waits for the transmitter to be idle before
+        // it changes a clock or restarts (report IR §4.1), so no measured path tells. A
+        // logic-analyser capture of a byte whose `CLKDIV` is rewritten while it is sent settles
+        // it.
         let now = ctx.now().get().saturating_mul(SUBCYCLES);
         let starts_at = self.in_flight.back().map_or(now, |&(gone_at, _)| gone_at);
         let gone_at = starts_at.max(now).saturating_add(byte_time);
@@ -569,6 +581,23 @@ mod tests {
         });
         assert_eq!(every_byte, text);
         assert_eq!(once_midway, text);
+    }
+
+    #[test]
+    fn an_integer_divider_of_zero_with_a_fraction_divides_by_the_fraction() {
+        // `CLKDIV` = 0 + 3/16 on the crystal: a bit lasts 3/16 of 4 time-base cycles, a byte ten
+        // of them, 7.5 cycles. It has not left after 7 cycles and has after 8.
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        uart.write(ctx, CLKDIV, 3 << CLKDIV_FRAG_SHIFT);
+        uart.write(ctx, FIFO, u32::from(b'f'));
+        assert_eq!(ctx.next_wake(), Some(Cycles(8)), "7.5 cycles, rounded up");
+        ctx.sleep_until(Cycles(7));
+        assert_eq!(uart.take_tx(ctx.now()), []);
+        assert_eq!(uart.read(ctx, FSM_STATUS), Some(ST_UTX_OUT_BUSY));
+        ctx.sleep_until(Cycles(8));
+        assert_eq!(uart.take_tx(ctx.now()), b"f");
+        assert_eq!(uart.read(ctx, FSM_STATUS), Some(0));
     }
 
     #[test]

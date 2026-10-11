@@ -544,8 +544,14 @@ impl Timg {
         if self.t0_config & T0_AUTORELOAD != 0 {
             // The counter restarts at the instant of the alarm, not at the call: a wake-up
             // delivered late finds the counter already `now - alarm` further on, and the phase of
-            // its count is kept (the counter is anchored at an instant, to the cycle). An alarm
-            // that was already past when it was enabled has no such instant: it reloads now.
+            // its count is kept (the counter is anchored at an instant, to the cycle).
+            //
+            // ASSUMPTION: an alarm that was already past when it was enabled has no such instant
+            // and reloads at the present time: the counter restarts from the reload value with
+            // a fresh phase, the fraction of a count it had counted being dropped. Whether the
+            // divider counter is restarted by a reload on silicon is not documented (TRM §11.2
+            // gives the value, not the phase). Reading the counter in a tight loop around an
+            // alarm with `AUTORELOAD`, on a chip with a large divider, settles it.
             let reached = self.t0_alarm_at.map_or(now, |at| at.min(now));
             self.set_t0(self.t0_load, reached);
         }
@@ -735,6 +741,12 @@ impl Peripheral<Ctx> for Timg {
                 self.t0_load = replace_half(self.t0_load, offset == T0LOADHI, value, T0_HI_MASK);
             }
             // Any write reloads (`timer_ll_trigger_soft_reload`, `timer_ll.h:258`).
+            //
+            // ASSUMPTION: the reload anchors the counter at the write: it reads the reload value
+            // now and its next count comes one whole count later, the fraction of a count gone
+            // by being dropped (as if the divider counter restarted with it). The TRM says the
+            // counter takes the value "immediately" (§11.2) and nothing of the divider. Reading
+            // the counter around a write of `T0LOAD` on a chip with a large divider settles it.
             T0LOAD => {
                 self.set_t0(self.t0_load, now);
                 self.t0_alarm_at = None;

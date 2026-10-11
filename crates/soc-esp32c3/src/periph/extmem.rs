@@ -232,6 +232,13 @@ impl Peripheral<Ctx> for Extmem {
             ICACHE_AUTOLOAD_CTRL => self.autoload = value & AUTOLOAD_CONFIG,
             ICACHE_FREEZE => self.freeze = value & (FREEZE_ENA | FREEZE_MODE),
             CACHE_ILG_INT_ENA => self.illegal_enable = value & ILLEGAL_BITS,
+            // ASSUMPTION: the clear register clears the status bit for bit: bit n written 1
+            // clears bit n of `CACHE_ILG_INT_ST`. It may instead be laid out as the enable
+            // register is, one bit for the two overflow status bits of each bus
+            // (`ILLEGAL_GATES`); the field names of `extmem_reg.h` do not settle it. This model
+            // never sets status bits 7 to 10 (the access counters are not modelled), so the two
+            // readings cannot differ today. A counter overflow on a chip, then a write of each
+            // clear bit with `CACHE_ILG_INT_ST` read after it, settles it.
             CACHE_ILG_INT_CLR => self.illegal_status &= !value,
             CORE0_ACS_CACHE_INT_ENA => self.access_enable = value & ACCESS_BITS,
             CORE0_ACS_CACHE_INT_CLR => self.access_status &= !value,

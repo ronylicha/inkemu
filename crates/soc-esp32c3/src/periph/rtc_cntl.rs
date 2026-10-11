@@ -110,6 +110,14 @@ const ACTION_RESET_RTC: u32 = 4;
 /// clears `BYPASS_RST` and sets `AUTO_FEED_EN` (`IDF:bootloader_support/src/esp32c3/bootloader_soc.c:10-19`,
 /// `bootloader_esp32c3.c:79-84`); the ROM reads `RESET_FLAG` and clears it with `RST_FLAG_CLR`
 /// (`ROM3:analog_super_wdt_reset_happened@0x40048a26`, `clear_super_wdt_reset_flag@0x40048b58`).
+///
+/// `DISABLE` (`rtc_cntl_reg.h:1716`) and `FEED` (`rtc_cntl_reg.h:1722`) are given a meaning here
+/// and have no call site to cite: in ESP-IDF v5.5.2 no code for the ESP32-C3 sets either (the
+/// only store to a bit of this register outside the headers is `AUTO_FEED_EN`,
+/// `IDF:bootloader_support/src/esp32c3/bootloader_esp32c3.c:82`). Their meaning is the TRM's
+/// (§12.3) and the header's field comments; the same holds for the feed-request interrupt, bit 15
+/// of the RTC interrupt registers (`RTC_CNTL_SWD_INT_ENA`, `_RAW`, `_ST`, `_CLR`:
+/// `rtc_cntl_reg.h:583, 639, 695, 751`).
 const SWD_CONF_RESET: u32 = 0x04B0_0000;
 const SWD_AUTO_FEED_EN: u32 = 1 << 31;
 const SWD_DISABLE: u32 = 1 << 30;
@@ -538,8 +546,12 @@ impl Peripheral<Ctx> for RtcCntl {
             WDTCONFIG0 => self.wdt_config0,
             WDTWPROTECT => self.wdt_key,
             SWD_CONF => {
-                // The feed request of the super watchdog reads in `SWD_CONF` while its interrupt
-                // is raw.
+                // ASSUMPTION: `FEED_INT` (bit 1, read-only) mirrors the raw bit of the feed
+                // request: it reads 1 from the request until software clears the interrupt
+                // (`INT_CLR_RTC` bit 15) or feeds. The header only names the bit
+                // (`rtc_cntl_reg.h:1706-1757`) and no ESP-IDF code reads it, so neither says what
+                // clears it. Reading `SWD_CONF` on a chip while the request is pending, then
+                // after a write of `INT_CLR_RTC`, then after a feed, settles it.
                 let feed_request = if self.int_raw & INT_SWD == 0 {
                     0
                 } else {
@@ -792,6 +804,40 @@ mod tests {
             "the capture before"
         );
         assert_eq!(rtc.read(ctx, TIME_HIGH1), Some(0));
+    }
+
+    #[test]
+    fn the_rtc_timer_wraps_at_48_bits() {
+        // TRM §9.3.3: the timer is 48 bits wide. 2^48 cycles of the slow clock are 65 years; the
+        // capture after them holds the low 48 bits of the count, and the one before it the last
+        // value before the wrap.
+        let ctx = &mut Ctx::default();
+        let mut rtc = rtc(ctx);
+        // Device time at which the slow clock has counted `counts`: 17 counts every 20 000 cycles.
+        let instant = |counts: u64| {
+            Cycles(u64::try_from((u128::from(counts) * 20_000).div_ceil(17)).unwrap())
+        };
+        ctx.sleep_until(instant((1 << 48) - 1));
+        pump(ctx, &mut rtc);
+        rtc.write(ctx, TIME_UPDATE, TIME_UPDATE_TRIGGER);
+        assert_eq!(
+            (rtc.read(ctx, TIME_LOW0), rtc.read(ctx, TIME_HIGH0)),
+            (Some(0xFFFF_FFFF), Some(0xFFFF)),
+            "the last count before the wrap"
+        );
+        ctx.sleep_until(instant((1 << 48) + 3));
+        pump(ctx, &mut rtc);
+        rtc.write(ctx, TIME_UPDATE, TIME_UPDATE_TRIGGER);
+        assert_eq!(
+            (rtc.read(ctx, TIME_LOW0), rtc.read(ctx, TIME_HIGH0)),
+            (Some(3), Some(0)),
+            "wrapped: bits 48 and up are not kept"
+        );
+        assert_eq!(
+            (rtc.read(ctx, TIME_LOW1), rtc.read(ctx, TIME_HIGH1)),
+            (Some(0xFFFF_FFFF), Some(0xFFFF)),
+            "the capture before"
+        );
     }
 
     #[test]

@@ -5,6 +5,12 @@ use emu_core::Cycles;
 
 /// How fast a counter runs: `counts` counts every `cycles` cycles of the time base. A rate that is
 /// not a whole number of time-base cycles per count (the RC oscillators) stays exact this way.
+///
+/// Two rates are equal when their two fields are, which is not the same as being the same
+/// speed: the fraction is not reduced (2 counts every 20 cycles is not equal to 1 every 10).
+/// Nothing builds one rate in two such ways (`every(n).divided_by(k)` always has one count, and
+/// the RC clocks one ratio each), and the only user of the comparison, [`Counter::retime`],
+/// would merely re-anchor a counter it could have left alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rate {
     counts: u64,
