@@ -7,7 +7,16 @@ const BUILTIN: [(&str, &str); 2] = [
     ("x3", include_str!("../profiles/x3.toml")),
     ("x4", include_str!("../profiles/x4.toml")),
 ];
-const BUILTIN_IDS: [&str; 2] = ["x3", "x4"];
+/// The ids of [`BUILTIN`], in the same order: derived, so there is one list to keep.
+const BUILTIN_IDS: [&str; BUILTIN.len()] = {
+    let mut ids = [""; BUILTIN.len()];
+    let mut i = 0;
+    while i < BUILTIN.len() {
+        ids[i] = BUILTIN[i].0;
+        i += 1;
+    }
+    ids
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -32,7 +41,7 @@ pub struct MachineOptions {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProfileError {
-    #[error("{origin}: {detail}; fix that line of the device profile")]
+    #[error("{origin}: {detail}; correct the device profile")]
     Parse { origin: String, detail: String },
     #[error("no device named `{id}`; choose one of: {known}")]
     UnknownDevice { id: String, known: String },
@@ -126,6 +135,11 @@ mod tests {
     #[test]
     fn builtin_profiles_load_and_carry_their_own_id() {
         assert_eq!(builtin_ids(), ["x3", "x4"]);
+        assert_eq!(
+            builtin_ids(),
+            BUILTIN.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            "one list of devices"
+        );
         for id in builtin_ids() {
             let profile = builtin(id).unwrap();
             assert_eq!(profile.id, *id);
@@ -189,9 +203,11 @@ mod tests {
 
     #[test]
     fn missing_key_and_broken_toml_are_reported_with_the_file_name() {
+        let missing =
+            error_for("id = \"demo\"\n[soc]\nfamily = \"esp32c3\"\nrevision = \"v0.3\"\n");
         assert!(
-            error_for("id = \"demo\"\n[soc]\nfamily = \"esp32c3\"\nrevision = \"v0.3\"\n")
-                .contains("name")
+            missing.contains("demo.toml") && missing.contains("`name`"),
+            "{missing}"
         );
         let broken = error_for("id = \n");
         assert!(
