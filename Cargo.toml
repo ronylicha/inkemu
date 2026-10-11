@@ -23,6 +23,10 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 goblin = "0.10"
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+flate2 = "1.1"
+tar = "0.4"
+etcetera = "0.11"
 assert_cmd = "2"
 predicates = "3"
 

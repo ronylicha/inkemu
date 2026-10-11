@@ -15,3 +15,8 @@ yanked = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+[[licenses.exceptions]]
+# Mozilla's root certificate list: data under a permissive data licence, used only to verify TLS when downloading the ROM.
+allow = ["CDLA-Permissive-2.0"]
+crate = "webpki-roots"
