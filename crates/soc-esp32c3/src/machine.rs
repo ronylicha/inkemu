@@ -17,11 +17,22 @@ use emu_core::{Cycles, Frequency, TimingModel, TraceHash};
 /// `x2`, the stack pointer of the RISC-V calling convention.
 const STACK_POINTER: usize = 2;
 
-/// The two serial consoles the mask ROM prints on.
+/// The serial outputs of the chip: the two consoles the mask ROM prints on, and UART1, which a
+/// firmware may log or talk to a peripheral on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleChannel {
     Uart0,
     UsbSerialJtag,
+    Uart1,
+}
+
+impl ConsoleChannel {
+    /// Every channel, for the callers that drain them all ([`Esp32C3::take_console`]).
+    pub const ALL: [ConsoleChannel; 3] = [
+        ConsoleChannel::Uart0,
+        ConsoleChannel::UsbSerialJtag,
+        ConsoleChannel::Uart1,
+    ];
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -341,10 +352,17 @@ impl Esp32C3 {
 
     /// The bytes that left the device on `channel` since the last call: a UART byte counts once
     /// its last bit has gone.
+    ///
+    /// A device keeps the bytes that left until they are taken here, and firmware decides how
+    /// many there are. A caller must therefore take **every** channel ([`ConsoleChannel::ALL`]),
+    /// the ones it does not show included, at least once per call of [`Esp32C3::run_until`], and
+    /// keep each call short enough for what it is ready to hold: nothing else bounds the memory
+    /// of a run whose firmware writes without end.
     pub fn take_console(&mut self, channel: ConsoleChannel) -> Vec<u8> {
         match channel {
             ConsoleChannel::Uart0 => self.bus.periph.uart0.take_tx(self.bus.ctx.now()),
             ConsoleChannel::UsbSerialJtag => self.bus.periph.usb_serial_jtag.take_tx(),
+            ConsoleChannel::Uart1 => self.bus.periph.uart1.take_tx(self.bus.ctx.now()),
         }
     }
 
@@ -356,6 +374,7 @@ impl Esp32C3 {
         match channel {
             ConsoleChannel::Uart0 => self.bus.periph.uart0.take_written(),
             ConsoleChannel::UsbSerialJtag => self.bus.periph.usb_serial_jtag.take_tx(),
+            ConsoleChannel::Uart1 => self.bus.periph.uart1.take_written(),
         }
     }
 
@@ -480,6 +499,49 @@ mod tests {
             Vec::<u8>::new(),
             "nothing went to UART0"
         );
+    }
+
+    #[test]
+    fn a_caller_that_drains_every_channel_leaves_no_output_held_by_a_device() {
+        // UART1 with a divider of 0: a byte leaves as soon as it is written, one per turn of the
+        // loop, for as long as the firmware runs.
+        let mut program = store_register(svd_regs::esp32c3::addr("UART1", "CLKDIV"), 0).to_vec();
+        program.extend(store_register(
+            svd_regs::esp32c3::addr("UART1", "FIFO"),
+            u32::from(b'u'),
+        ));
+        program.push(jal(0, -16));
+        let mut m = machine(&program);
+        let mut taken = 0;
+        for slice in 1..=4u64 {
+            assert_eq!(
+                m.run_until(Cycles(slice * 100_000)),
+                StopReason::CycleBudget
+            );
+            for channel in ConsoleChannel::ALL {
+                let bytes = m.take_console(channel);
+                if channel == ConsoleChannel::Uart1 {
+                    assert!(bytes.iter().all(|byte| *byte == b'u'));
+                    taken += bytes.len();
+                } else {
+                    assert_eq!(bytes, b"", "{channel:?}");
+                }
+            }
+            assert_eq!(
+                m.bus.periph.uart1.waiting_for_the_console(),
+                0,
+                "after slice {slice}, every channel drained"
+            );
+        }
+        assert!(taken > 50_000, "one byte per turn of the loop: {taken}");
+        // The end of a run takes what is still on its way out, on this channel as on UART0.
+        let mut slow = print(svd_regs::esp32c3::addr("UART1", "FIFO"), b"late");
+        slow.push(HANG);
+        let mut m = machine(&slow);
+        assert_eq!(m.run_until(Cycles(500)), StopReason::CycleBudget);
+        assert_eq!(m.take_console(ConsoleChannel::Uart1), b"");
+        assert_eq!(m.flush_console(ConsoleChannel::Uart1), b"late");
+        assert_eq!(m.flush_console(ConsoleChannel::Uart1), b"");
     }
 
     #[test]

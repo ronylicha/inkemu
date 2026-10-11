@@ -139,6 +139,13 @@ impl Uart {
         written
     }
 
+    /// How many bytes that left wait for [`Uart::take_tx`]: what a caller that never takes them
+    /// would let grow.
+    #[cfg(test)]
+    pub(crate) fn waiting_for_the_console(&self) -> usize {
+        self.tx.len()
+    }
+
     /// The device time of a wake-up has come: the bytes that have gone leave, and the device asks
     /// to be called again when the last one will have.
     pub(crate) fn wake(&mut self, ctx: &mut Ctx) {
