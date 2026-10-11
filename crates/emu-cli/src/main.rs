@@ -179,7 +179,9 @@ fn profile_for(id: &str) -> Result<DeviceProfile, boards::ProfileError> {
             id: sanitize(&id),
             known,
         },
-        other @ boards::ProfileError::Parse { .. } => other,
+        other @ (boards::ProfileError::Parse { .. } | boards::ProfileError::IdMismatch { .. }) => {
+            other
+        }
     })
 }
 

@@ -8,3 +8,13 @@ family = "esp32c3"
 # ESP32-C3 revision and selects the rev3 mask ROM. The chip revision a retail unit reports settles
 # it: `esptool.py chip_id`, or the "chip revision" line of its boot log.
 revision = "v0.3"
+
+[flash]
+# 16 MB: docs/research/xteink-hardware.md.
+size_mib = 16
+# ASSUMPTION: the flash part of retail units is not established. 0x9D6018 (manufacturer 0x9D, type
+# 0x60, capacity 2^24 bytes) is the id the flash of Espressif's QEMU answers, so the 2nd-stage
+# bootloader takes the vendor branch the reference traces were measured on
+# (docs/research/esp32c3-bootloader-accesses.md, section 2.1 item 5). `esptool.py flash_id` on a
+# unit settles it.
+jedec_id = 0x9D6018
