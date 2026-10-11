@@ -236,6 +236,10 @@ pub fn execute(
     console: &mut dyn Write,
     log: &mut dyn Write,
 ) -> RunEnd {
+    // Whether the console has taken everything it was given. A console that failed, or whose
+    // reader went away, is not written to again: a strict stop goes on to its own end after it,
+    // and must not report the same failure a second time.
+    let mut console_usable = true;
     let mut end = loop {
         if interrupt.load(Ordering::Relaxed) {
             let _ = writeln!(log, "inkemu: interrupted by the user");
@@ -248,6 +252,7 @@ pub fn execute(
             .map_or(slice_end, |max| max.min(slice_end));
         let stop = machine.run_within(Cycles(limit), options.max_device_nanos);
         let console_open = relay_selected_console(machine, options.console, console, reader_gone);
+        console_usable = matches!(console_open, Ok(true));
         // The stop line carries the violation: listing it as a warning too would print it twice.
         let violation = match &stop {
             StopReason::StrictMmio(diagnostic) => Some(diagnostic),
@@ -305,7 +310,7 @@ pub fn execute(
     };
     // What the firmware had written and the device had not sent yet: without it the console
     // would end before the place the run stopped at.
-    if !matches!(end, RunEnd::ConsoleClosed | RunEnd::ConsoleError) {
+    if console_usable {
         let flushed = relay(console, &machine.flush_console(options.console));
         log_console_error(log, &flushed);
         end = match (end, flushed) {
@@ -365,7 +370,7 @@ fn frequency_text(hz: u64) -> String {
 mod tests {
     use super::*;
     use boards::MachineOptions;
-    use cpu_rv32::asm::{addi, jal, sw, wfi};
+    use cpu_rv32::asm::{addi, bne, jal, lui, sw, wfi};
     use soc_esp32c3::test_support::{
         HANG, T0, T1, flat_rom, load_register, print_program, stop_watchdogs, store_register,
         unmodeled_register, within,
@@ -897,6 +902,90 @@ mod tests {
         let log = text(&log);
         assert!(log.contains("cannot write the console output"), "{log}");
         assert!(log.contains("stopped by --strict-mmio"), "{log}");
+    }
+
+    /// Five bytes written to UART0, a wait of 4 096 turns of a two-instruction loop, then the
+    /// read of the unmodelled register. A byte takes 6 940 cycles to leave at the reset baud rate
+    /// and clock: when the read stops a strict run, some have left and some have not.
+    fn printing_then_waiting_then_reading_the_unmodeled_register() -> Vec<u32> {
+        let wait = [lui(T1, 0x1000), addi(T1, T1, -1), bne(T1, 0, -4)];
+        let mut program = printing(UART0, b"hello", &wait);
+        program.extend(reading_unmodeled_register());
+        program
+    }
+
+    #[test]
+    fn a_strict_stop_after_the_console_failed_says_so_once() {
+        // The pass that ends on the violation has bytes to relay, and the UART still holds
+        // others for the end of the run: a console that failed at the first is not written to
+        // again, and its failure is one line of the log.
+        let mut twin = machine(
+            &printing_then_waiting_then_reading_the_unmodeled_register(),
+            STRICT,
+        );
+        assert!(matches!(
+            twin.run_until(Cycles(100_000)),
+            StopReason::StrictMmio(_)
+        ));
+        assert_eq!(twin.take_console(ConsoleChannel::Uart0), b"he");
+        assert_eq!(twin.flush_console(ConsoleChannel::Uart0), b"llo");
+
+        let mut m = machine(
+            &printing_then_waiting_then_reading_the_unmodeled_register(),
+            STRICT,
+        );
+        let mut log = Vec::new();
+        let end = execute(
+            &mut m,
+            &options(100_000),
+            &NOT_INTERRUPTED,
+            &reader_stays,
+            &mut Failing,
+            &mut log,
+        );
+        assert_eq!((end, end.exit_code()), (RunEnd::StrictMmio, 3));
+        let log = text(&log);
+        assert_eq!(
+            log.matches("cannot write the console output").count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("stopped by --strict-mmio"), "{log}");
+    }
+
+    #[test]
+    fn a_strict_stop_after_the_reader_went_away_does_not_write_to_the_console_again() {
+        let mut m = machine(
+            &printing_then_waiting_then_reading_the_unmodeled_register(),
+            STRICT,
+        );
+        let mut console = CountsWritesToAClosedPipe(0);
+        let mut log = Vec::new();
+        let end = execute(
+            &mut m,
+            &options(100_000),
+            &NOT_INTERRUPTED,
+            &reader_stays,
+            &mut console,
+            &mut log,
+        );
+        assert_eq!(end, RunEnd::StrictMmio);
+        assert_eq!(
+            console.0, 1,
+            "one write found the reader gone, none followed"
+        );
+    }
+
+    /// A console whose reader went away, which counts the writes it refuses.
+    struct CountsWritesToAClosedPipe(u32);
+    impl io::Write for CountsWritesToAClosedPipe {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            self.0 += 1;
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
