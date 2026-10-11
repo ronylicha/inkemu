@@ -19,9 +19,9 @@ Build:Feb  7 2021
 rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)
 ```
 
-The device console goes to standard output. Everything inkemu has to say goes to standard error: the device and timing model in use, then one `warning:` line for each register the firmware touches that inkemu does not model yet, with the peripheral, the register, its address and the program counter. `--strict-mmio` turns the first of them into a stop, for CI.
+The device console goes to standard output. Everything inkemu has to say goes to standard error: the device and timing model in use, then one `warning:` line for each unmodelled register and direction (read or write) the firmware touches, with the peripheral, the register, its address and the program counter. 8- and 16-bit writes to peripheral registers and CPU exceptions are reported the same way, and the most repeated diagnostics are summarised at the end of the run. `--strict-mmio` turns the first unmodelled access or sub-word register write into a stop, for CI.
 
-The first run downloads the ROM (4.9 MB) from Espressif's `esp-rom-elfs` release `20260528` and checks its SHA-256 before using it. To work offline, extract the archive yourself and pass `--rom-dir <directory>`; `inkemu rom fetch --all` fills a directory in advance.
+The first run downloads the ROM (4.9 MB) from Espressif's `esp-rom-elfs` release `20260528` and checks its SHA-256 before using it. To work offline, extract the archive yourself and pass `--rom-dir <directory>`, which must hold the three files `esp32c3_rev0_rom.elf`, `esp32c3_rev3_rom.elf` and `esp32c3_rev101_rom.elf`; `inkemu rom fetch --all` fills a directory in advance, with a single download.
 
 Other commands: `inkemu inspect <app.bin>` describes an ESP-IDF application image and explains what is wrong when it refuses a file; `inkemu rvtest <elf>` runs a bare-metal RISC-V conformance test. For the pinned conformance suites and how to run riscv-arch-test against Sail, see [tools/conformance/README.md](tools/conformance/README.md).
 
