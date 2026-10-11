@@ -6,7 +6,7 @@ use emu_core::Peripheral;
 const SYSCLK_CONF: u32 = 0x58;
 /// `CPU_PERI_CLK_EN`, `CPU_PERI_RST_EN`, `PERIP_CLK_EN0/1`, `PERIP_RST_EN0/1`: gates and reset pulses the
 /// ROM toggles around each peripheral it sets up. Nothing acts on them yet.
-const ACCEPTED: [Accepted; 6] = [
+const ACCEPTED: [Accepted; 7] = [
     Accepted::svd(
         "SYSTEM",
         "CPU_PERI_CLK_EN",
@@ -42,6 +42,12 @@ const ACCEPTED: [Accepted; 6] = [
         "PERIP_RST_EN1",
         "peripheral reset pulses",
         "SP1b-3",
+    ),
+    Accepted::svd(
+        "SYSTEM",
+        "CACHE_CONTROL",
+        "cache clock enable and reset",
+        "SP1b-4",
     ),
 ];
 
@@ -109,6 +115,16 @@ mod tests {
         assert_eq!((conf >> 12) & 0x7F, 40, "CLK_XTAL_FREQ");
         assert_eq!((conf >> 10) & 3, 0, "SOC_CLK_SEL = XTAL");
         assert_eq!(conf & 0x3FF, 1, "PRE_DIV_CNT");
+    }
+
+    #[test]
+    fn cache_control_is_storage_from_its_reset_value() {
+        // CM §2.1: reset 5; ROM_Boot_Cache_Init does |=1, |=2, &=~2.
+        let mut sys = System::new();
+        let offset = svd_regs::esp32c3::addr("SYSTEM", "CACHE_CONTROL") - SYSTEM_BASE;
+        assert_eq!(sys.read(offset), Some(5));
+        assert!(sys.write(offset, 7));
+        assert_eq!(sys.read(offset), Some(7));
     }
 
     #[test]

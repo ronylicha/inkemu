@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn gap_in_peripheral_window_reads_zero_and_warns() {
         let mut b = bus();
-        assert_eq!(load(&mut b, 0x600C_5000), 0); // MMU table: not in the SVD, not modelled before SP1b-2
+        assert_eq!(load(&mut b, 0x600C_5200), 0); // right after the MMU table: nothing is documented there
         assert!(matches!(
             b.diag.drain()[..],
             [Diagnostic::UnmodeledMmio {

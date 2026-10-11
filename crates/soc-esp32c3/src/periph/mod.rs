@@ -10,6 +10,7 @@ pub mod extmem;
 pub mod gpio;
 pub mod intmatrix;
 pub mod io_mux;
+pub mod mmu;
 pub mod rtc_cntl;
 pub mod spi_mem;
 pub mod system;
@@ -22,6 +23,7 @@ pub use extmem::Extmem;
 pub use gpio::Gpio;
 pub use intmatrix::IntMatrix;
 pub use io_mux::IoMux;
+pub use mmu::MmuTable;
 pub use rtc_cntl::RtcCntl;
 pub use spi_mem::{Spi0, Spi1};
 pub use system::System;
@@ -186,6 +188,8 @@ pub fn accepted_without_effect() -> Vec<Accepted> {
     let mut rows = [
         io_mux::accepted(),
         rtc_cntl::accepted(),
+        gpio::accepted(),
+        SENSITIVE_ACCEPTED.to_vec(),
         system::accepted(),
         uart::accepted(),
         intmatrix::accepted(),
@@ -235,10 +239,21 @@ pub(crate) const EFUSE_BASE: u32 = 0x6000_8800;
 const EFUSE: (u32, u32) = (EFUSE_BASE, 0x6000_9000);
 pub(crate) const SYSTEM_BASE: u32 = 0x600C_0000;
 const SYSTEM: (u32, u32) = (SYSTEM_BASE, 0x600C_1000);
+pub(crate) const SENSITIVE_BASE: u32 = 0x600C_1000;
+const SENSITIVE: (u32, u32) = (SENSITIVE_BASE, 0x600C_2000);
+/// `Cache_Occupy_ICache_MEMORY` gives SRAM0 to the cache by clearing bit 0 (CM §2.1). SRAM0 stays
+/// plain RAM here: nothing uses it once the cache is on (CM §9 item 9).
+const SENSITIVE_ACCEPTED: [Accepted; 1] = [Accepted::svd(
+    "SENSITIVE",
+    "INTERNAL_SRAM_USAGE_1",
+    "SRAM0 handed to the cache as line storage",
+    "SP1b-4",
+)];
 pub(crate) const INTMATRIX_BASE: u32 = 0x600C_2000;
 const INTMATRIX: (u32, u32) = (INTMATRIX_BASE, 0x600C_3000);
 pub(crate) const EXTMEM_BASE: u32 = 0x600C_4000;
-const EXTMEM: (u32, u32) = (EXTMEM_BASE, 0x600C_5000);
+const EXTMEM: (u32, u32) = (EXTMEM_BASE, mmu::MMU_TABLE_BASE);
+const MMU_TABLE: (u32, u32) = (mmu::MMU_TABLE_BASE, mmu::MMU_TABLE_BASE + 0x200);
 pub(crate) const ASSIST_DEBUG_BASE: u32 = 0x600C_E000;
 const ASSIST_DEBUG: (u32, u32) = (ASSIST_DEBUG_BASE, 0x600C_F000);
 // The two UARTs and the USB-Serial-JTAG device: the ROM's consoles (report §G).
@@ -258,6 +273,8 @@ pub struct Peripherals {
     pub system: System,
     pub efuse: Efuse,
     pub extmem: Extmem,
+    pub mmu: MmuTable,
+    pub sensitive: AcceptedBlock,
     pub assist_debug: AssistDebug,
     pub spi0: Spi0,
     pub spi1: Spi1,
@@ -277,6 +294,8 @@ impl Peripherals {
             system: System::new(),
             efuse: Efuse::new(config.chip_revision),
             extmem: Extmem::new(),
+            mmu: MmuTable::new(),
+            sensitive: AcceptedBlock::new(SENSITIVE_BASE, &SENSITIVE_ACCEPTED),
             assist_debug: AssistDebug::new(),
             spi0: Spi0::new(),
             spi1: Spi1::new(flash),
@@ -299,10 +318,14 @@ impl Peripherals {
             Some((&mut self.efuse, EFUSE_BASE))
         } else if within(SYSTEM) {
             Some((&mut self.system, SYSTEM_BASE))
+        } else if within(SENSITIVE) {
+            Some((&mut self.sensitive, SENSITIVE_BASE))
         } else if within(INTMATRIX) {
             Some((&mut self.intmatrix, INTMATRIX_BASE))
         } else if within(EXTMEM) {
             Some((&mut self.extmem, EXTMEM_BASE))
+        } else if within(MMU_TABLE) {
+            Some((&mut self.mmu, mmu::MMU_TABLE_BASE))
         } else if within(ASSIST_DEBUG) {
             Some((&mut self.assist_debug, ASSIST_DEBUG_BASE))
         } else if within(SPI1) {
@@ -421,6 +444,32 @@ mod tests {
             "| Address | Register | Count | Hardware effect not modelled | Made real by |\n|---|---|---|---|---|\n"
         ));
         assert_eq!(table.lines().count(), rows.len() + 2);
+    }
+
+    #[test]
+    fn the_mmu_table_sits_right_after_the_cache_registers() {
+        let mut p = Peripherals::new(
+            &SocConfig::default(),
+            Box::new(crate::flash::NorFlash::blank(
+                crate::flash::FlashConfig::default(),
+            )),
+        );
+        let base_of = |p: &mut Peripherals, addr: u32| p.device(addr).map(|(_, base)| base);
+        assert_eq!(base_of(&mut p, 0x600C_4FFC), Some(EXTMEM_BASE));
+        assert_eq!(base_of(&mut p, 0x600C_5000), Some(mmu::MMU_TABLE_BASE));
+        assert_eq!(base_of(&mut p, 0x600C_51FC), Some(mmu::MMU_TABLE_BASE));
+        assert_eq!(
+            base_of(&mut p, 0x600C_5200),
+            None,
+            "nothing is documented past the 128 entries"
+        );
+        assert_eq!(
+            base_of(
+                &mut p,
+                svd_regs::esp32c3::addr("SENSITIVE", "INTERNAL_SRAM_USAGE_1")
+            ),
+            Some(SENSITIVE_BASE)
+        );
     }
 
     #[test]

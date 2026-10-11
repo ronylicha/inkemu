@@ -39,6 +39,9 @@ then rewrites the table below, and nothing else; review the diff before committi
 | `0x60003034` | `SPI0.MISC` | 1 | chip-select enables | SP1b-4 |
 | `0x6000303c` | `SPI0.CACHE_FCTRL` | 1 | cache request enable | SP1b-4 |
 | `0x600030dc` | `SPI0.CLOCK_GATE` | 1 | register clock gate | SP1b-3 |
+| `0x60004020` | `GPIO.ENABLE` | 1 | pin output enable | SP2 |
+| `0x60004154` | `GPIO.FUNC0_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
+| `0x60004158` | `GPIO.FUNC1_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control | SP1b-3 |
 | `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation | SP1b-3 |
 | `0x600080ac` | `RTC_CNTL.SWD_CONF` | 1 | super watchdog: auto-feed, reset flag, strobes | SP1b-3 |
@@ -57,6 +60,8 @@ then rewrites the table below, and nothing else; review the diff before committi
 | `0x600c0014` | `SYSTEM.PERIP_CLK_EN1` | 1 | peripheral clock gates | SP1b-3 |
 | `0x600c0018` | `SYSTEM.PERIP_RST_EN0` | 1 | peripheral reset pulses | SP1b-3 |
 | `0x600c001c` | `SYSTEM.PERIP_RST_EN1` | 1 | peripheral reset pulses | SP1b-3 |
+| `0x600c0040` | `SYSTEM.CACHE_CONTROL` | 1 | cache clock enable and reset | SP1b-4 |
+| `0x600c101c` | `SENSITIVE.INTERNAL_SRAM_USAGE_1` | 1 | SRAM0 handed to the cache as line storage | SP1b-4 |
 | `0x600c2000` | `INTERRUPT_CORE0.MAC_INTR_MAP` | 62 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
 | `0x600c2100` | `INTERRUPT_CORE0.CLOCK_GATE` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
 | `0x600c2104` | `INTERRUPT_CORE0.CPU_INT_ENABLE` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
@@ -64,5 +69,18 @@ then rewrites the table below, and nothing else; review the diff before committi
 | `0x600c210c` | `INTERRUPT_CORE0.CPU_INT_CLEAR` | 1 | edge-interrupt acknowledge: nothing is pending | SP1b-3 |
 | `0x600c2114` | `INTERRUPT_CORE0.CPU_INT_PRI_0` | 32 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
 | `0x600c2194` | `INTERRUPT_CORE0.CPU_INT_THRESH` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c4004` | `EXTMEM.ICACHE_CTRL1` | 1 | bus gating of the flash windows (SHUT_IBUS, SHUT_DBUS) | SP1b-4 |
+| `0x600c4000` | `EXTMEM.ICACHE_CTRL` | 1 | cache enable: the flash windows are always readable (D5) | SP1b-4 |
+| `0x600c4004` | `EXTMEM.ICACHE_CTRL1` | 1 | bus gating of the flash windows (SHUT_IBUS, SHUT_DBUS; D5) | SP1b-4 |
+| `0x600c4008` | `EXTMEM.ICACHE_TAG_POWER_CTRL` | 1 | tag memory power | SP8 |
+| `0x600c4028` | `EXTMEM.ICACHE_SYNC_CTRL` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
+| `0x600c402c` | `EXTMEM.ICACHE_SYNC_ADDR` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
+| `0x600c4030` | `EXTMEM.ICACHE_SYNC_SIZE` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
+| `0x600c4034` | `EXTMEM.ICACHE_PRELOAD_CTRL` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
+| `0x600c4040` | `EXTMEM.ICACHE_AUTOLOAD_CTRL` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
+| `0x600c4078` | `EXTMEM.CACHE_ILG_INT_ENA` | 1 | cache error interrupt: the status is latched, no interrupt is raised | SP1b-3 |
+| `0x600c4084` | `EXTMEM.CORE0_ACS_CACHE_INT_ENA` | 1 | cache error interrupt: the status is latched, no interrupt is raised | SP1b-3 |
+| `0x600c40a8` | `EXTMEM.CACHE_WRAP_AROUND_CTRL` | 1 | wrap-around read mode | SP1b-4 |
+| `0x600c40ac` | `EXTMEM.CACHE_MMU_POWER_CTRL` | 1 | MMU memory power | SP8 |
+| `0x600c40c4` | `EXTMEM.CACHE_MMU_OWNER` | 1 | MMU ownership bits | SP1b-4 |
+| `0x600c40cc` | `EXTMEM.ICACHE_FREEZE` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
 | `0x600ce044` | `ASSIST_DEBUG.CORE_0_RCD_EN` | 1 | PC/SP recording at reset | SP1b-3 |
