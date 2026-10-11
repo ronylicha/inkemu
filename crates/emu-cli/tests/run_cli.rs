@@ -6,7 +6,9 @@ use cpu_rv32::asm::wfi;
 use firmware::builder::{ImageSpec, build_flash_image, build_image};
 use predicates::prelude::*;
 use predicates::str::contains;
-use soc_esp32c3::test_support::{HANG, stop_watchdogs, store_register};
+use soc_esp32c3::test_support::{
+    HANG, load_register, stop_watchdogs, store_register, unmodeled_register,
+};
 
 fn inkemu() -> Command {
     Command::new(env!("CARGO_BIN_EXE_inkemu"))
@@ -68,9 +70,9 @@ fn tampered_rom_is_refused_before_anything_runs() {
 fn run_help_lists_every_exit_code() {
     let help = inkemu().args(["run", "--help"]).assert().success();
     let out = String::from_utf8_lossy(&help.get_output().stdout).into_owned();
-    for code in ["0", "2", "3", "4"] {
+    for code in [0, 2, 3, 4, 130] {
         assert!(
-            out.contains(&format!("\n  {code}  ")),
+            out.contains(&format!("\n{code:>3}  ")),
             "exit code {code} missing from:\n{out}"
         );
     }
@@ -678,6 +680,58 @@ fn a_device_time_limit_ends_the_run_of_a_firmware_that_sleeps() {
     assert!(console.ends_with("entry 0x40380000\n"), "{console}");
 }
 
+/// Exit code 3 through the real command: a second stage that reads a register the emulator does
+/// not model, under `--strict-mmio`.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_strict_stop_exits_3_and_names_the_register() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let mut program = stop_watchdogs();
+    program.extend(load_register(unmodeled_register().addr));
+    program.push(HANG);
+    let (_dir, flash) = flash_image_of(&program);
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--strict-mmio",
+            "--rom-dir",
+            &rom_dir,
+            "--flash",
+        ])
+        .arg(&flash)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .code(3)
+        .stderr(contains("inkemu: stopped by --strict-mmio: ").and(contains("LEDC.")))
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    assert!(console.ends_with("entry 0x40380000\n"), "{console}");
+}
+
+/// Exit code 4 through the real command: a second stage that stops the watchdogs and waits for
+/// an interrupt nothing can raise. No limit is given: the run ends by itself.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_wait_for_an_interrupt_nothing_can_raise_exits_4() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let mut program = stop_watchdogs();
+    program.extend([wfi(), HANG]);
+    let (_dir, flash) = flash_image_of(&program);
+    inkemu()
+        .args(["run", "--device", "x4", "--rom-dir", &rom_dir, "--flash"])
+        .arg(&flash)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .code(4)
+        .stderr(
+            contains("inkemu: the CPU waits for an interrupt and none can come")
+                .and(contains("; the CPU is asleep, waiting for an interrupt\n")),
+        );
+}
+
 /// A run of the binary whose output is read while it goes on, for the tests that act on a run in
 /// progress. Every wait has a limit, and a run still going when its test ends is killed.
 #[cfg(unix)]
@@ -740,6 +794,15 @@ mod live {
     }
 
     impl Live {
+        /// Sends the run the signal a terminal sends for Ctrl-C.
+        pub fn interrupt(&self) {
+            let sent = Command::new("kill")
+                .args(["-INT", &self.child.id().to_string()])
+                .status()
+                .unwrap();
+            assert!(sent.success(), "kill -INT {}: {sent}", self.child.id());
+        }
+
         /// Waits until a line of standard output contains `text`.
         pub fn wait_for_line(&self, text: &str, limit: Duration) {
             let deadline = Instant::now() + limit;
@@ -794,6 +857,33 @@ fn run_of(rom_dir: &str, flash: &std::path::Path) -> std::process::Command {
         .args(["run", "--device", "x4", "--rom-dir", rom_dir, "--flash"])
         .arg(flash);
     command
+}
+
+/// Ctrl-C through the real command, with a real `SIGINT`: a blank chip prints and resets for ever,
+/// no limit is given, and the signal ends the run with its summary and exit code 0.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn ctrl_c_ends_a_run_without_a_limit_with_its_summary_and_exit_code_0() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_inkemu"));
+    command.args(["run", "--device", "x4", "--rom-dir", &rom_dir]);
+    // The reader stays to the end: the run must not end for having lost it.
+    let run = live::start(command, |_| false);
+    let limit = std::time::Duration::from_secs(60);
+    // The banner is on standard output: the handler is installed and the run is under way.
+    run.wait_for_line("ESP-ROM:esp32c3-api1-20210207", limit);
+    run.interrupt();
+    let (code, log) = run.finish(limit);
+    assert_eq!(code, Some(0), "{log}");
+    let interrupted = log
+        .find("inkemu: interrupted by the user\n")
+        .unwrap_or_else(|| panic!("no line for the interrupt in:\n{log}"));
+    assert!(
+        log[interrupted..].contains("\ninkemu: stopped at pc ")
+            && log[interrupted..].contains(" us of device time; "),
+        "the summary follows the interrupt: {log}"
+    );
 }
 
 /// `inkemu run firmware.bin | head`, with a firmware that prints nothing: no write ever fails,

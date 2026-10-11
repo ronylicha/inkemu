@@ -90,6 +90,18 @@ pub enum RunEnd {
 }
 
 impl RunEnd {
+    /// Every way a run can end, for what must hold for each of them: a variant added to the enum
+    /// is added here.
+    pub const ALL: [RunEnd; 7] = [
+        RunEnd::Budget,
+        RunEnd::TimeLimit,
+        RunEnd::ConsoleClosed,
+        RunEnd::ConsoleError,
+        RunEnd::StrictMmio,
+        RunEnd::Idle,
+        RunEnd::Interrupted,
+    ];
+
     /// The process exit code of a run that ended this way.
     #[must_use]
     pub const fn exit_code(self) -> u8 {

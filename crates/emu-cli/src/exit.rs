@@ -30,20 +30,39 @@ Exit codes:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::RunEnd;
 
     #[test]
     fn the_run_help_lists_every_exit_code_a_run_can_end_with() {
-        for code in [
-            EXIT_OK,
-            EXIT_ERROR,
-            EXIT_STRICT_MMIO,
-            EXIT_IDLE,
-            EXIT_SECOND_INTERRUPT,
-        ] {
+        // The code of every end of a run, and the one the handler of Ctrl-C exits with.
+        let codes = RunEnd::ALL
+            .iter()
+            .map(|end| (format!("{end:?}"), end.exit_code()))
+            .chain([("a second Ctrl-C".to_owned(), EXIT_SECOND_INTERRUPT)]);
+        for (end, code) in codes {
             assert!(
                 format!("\n{RUN_EXIT_CODES_HELP}").contains(&format!("\n{code:>3}  ")),
-                "{code} missing from the help"
+                "{code}, the exit code of {end}, is missing from the help"
             );
+        }
+    }
+
+    #[test]
+    fn every_end_of_a_run_is_listed_once() {
+        // The `match` has no wildcard: an end added to the enum does not compile here until
+        // someone gives it a place, which is the moment to add it to the list; the place of each
+        // end is the one it has there.
+        let place = |end: RunEnd| match end {
+            RunEnd::Budget => 0,
+            RunEnd::TimeLimit => 1,
+            RunEnd::ConsoleClosed => 2,
+            RunEnd::ConsoleError => 3,
+            RunEnd::StrictMmio => 4,
+            RunEnd::Idle => 5,
+            RunEnd::Interrupted => 6,
+        };
+        for (index, end) in RunEnd::ALL.into_iter().enumerate() {
+            assert_eq!(place(end), index, "{end:?}");
         }
     }
 }

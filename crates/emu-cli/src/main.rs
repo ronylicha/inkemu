@@ -319,10 +319,17 @@ fn stdout_reader_gone() -> bool {
 fn watch_ctrl_c(interrupt: &Arc<AtomicBool>) -> Result<(), ctrlc::Error> {
     let requested = Arc::clone(interrupt);
     ctrlc::set_handler(move || {
-        if requested.swap(true, Ordering::Relaxed) {
+        if second_request(&requested) {
             std::process::exit(i32::from(EXIT_SECOND_INTERRUPT));
         }
     })
+}
+
+/// Records in `requested` that the user asked the run to stop, and says whether that had already
+/// been asked: the first request is left to the run, which ends with its summary; a second one
+/// means that the run has not come back, and the process is ended at once.
+fn second_request(requested: &AtomicBool) -> bool {
+    requested.swap(true, Ordering::Relaxed)
 }
 
 /// The one line that says what is being emulated and how much to trust its timing.
@@ -524,6 +531,18 @@ mod tests {
             remedy.contains("--device <id>") && remedy.contains("--all"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn the_first_request_to_stop_is_left_to_the_run_and_the_second_ends_the_process() {
+        let requested = AtomicBool::new(false);
+        assert!(!second_request(&requested));
+        assert!(
+            requested.load(Ordering::Relaxed),
+            "the run reads the request at its next pass"
+        );
+        assert!(second_request(&requested));
+        assert!(second_request(&requested), "and so does every one after it");
     }
 
     #[test]
