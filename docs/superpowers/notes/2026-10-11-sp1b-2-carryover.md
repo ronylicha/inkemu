@@ -2,7 +2,7 @@
 
 Bilan de l'exécution du plan `docs/superpowers/plans/2026-10-11-sp1b-2-flash-bootloader.md`. Ce document garde deux choses que l'historique git ne dit pas : les **décisions** prises en cours de route, et ce qui est **volontairement reporté**, avec le plan qui en hérite.
 
-Les 18 tâches du plan (0 à 17) sont livrées et ont été relues une à une. La branche a ensuite été relue en entier : prête à fusionner avec corrections, aucune remarque critique, 7 importantes (F1 à F7) et 12 mineures (F8 à F19). Une vague unique de corrections a traité les 19 entrées ; ce document en tient compte. Ce qui reste à faire avant la fusion est dit en R21.
+Les 18 tâches du plan (0 à 17) sont livrées et ont été relues une à une. La branche a ensuite été relue en entier : prête à fusionner avec corrections, aucune remarque critique, 7 importantes (F1 à F7) et 12 mineures (F8 à F19). Une vague unique de corrections a traité les 19 entrées ; ce document en tient compte. La branche a été fusionnée dans `main` par la pull request n° 2, après un passage vert des cinq jobs de CI (R21).
 
 ## Résultat
 
@@ -12,7 +12,7 @@ En mode strict, aucun registre non modélisé n'est touché et aucune exception 
 
 La même application démarre aussi derrière la table de partitions d'origine du X4 (`otadata`, deux emplacements OTA, pas d'application d'usine : `tests/fixtures/partitions/x4-stock.bin` placée à `0x8000` de l'image de référence). Le bootloader, non modifié, affiche `No factory image, trying OTA 0`, charge l'application, puis `Set actual ota_seq=1 in otadata[0]` : il enregistre son choix par les fonctions d'effacement et de programmation de la ROM. La flash étant en lecture seule, inkemu signale exactement deux commandes refusées, l'effacement de secteur `0x20` et la programmation de page `0x02`, et rien d'autre avant `TIMG0.RTCCALICFG`.
 
-Le job CI `reference-boot`, qui reconstruit l'image dans Docker et rejoue ces tests, n'a pas encore tourné sur GitHub.
+Le job CI `reference-boot` reconstruit l'image dans Docker et rejoue ces tests. À son premier passage sur GitHub (pull request n° 2), la construction sur une machine neuve a rendu exactement les empreintes épinglées, et les cinq tests ont passé.
 
 ## Décisions prises pendant l'exécution
 
@@ -38,7 +38,7 @@ Le job CI `reference-boot`, qui reconstruit l'image dans Docker et rejoue ces te
 | R18 | Les diagnostics disent vrai (F8, F10) : un accès à travers une entrée MMU fautive compte une occurrence par accès et par couple (entrée, faute), et non par octet ; le texte d'une commande de flash refusée ne prétend plus à une écriture pour une lecture ou un opcode inconnu ; celui du SHA par DMA ne dit plus « démarré » pour une écriture du nombre de blocs. | Le « répété N fois » comptait des octets ; deux textes affirmaient une chose fausse dans des cas qu'ils couvraient. | Nul. |
 | R19 | Le tableau des registres acceptés sans effet est vérifié contre les **modèles réels** : un test écrit le premier et le dernier registre de chaque ligne à travers l'arbre des périphériques (F4). | Pour 112 registres, la liste était de la documentation posée à côté du modèle, pas sa source. Le test a aussitôt trouvé une ligne fausse : `IO_MUX` annonçait 24 registres consécutifs alors que `DATE` est à part, en `+0xFC` ; le bloc fait désormais deux lignes. | Nul. |
 | R20 | Un démarrage qui échoue, ou un firmware qui demande un reset logiciel, tourne en silence jusqu'à `--max-cycles` : le README le dit, le comportement ne change pas (F16). | Les resets et l'expiration des watchdogs arrivent avec SP1b-3 ; les simuler à moitié ici serait un état faux de plus. | Un utilisateur qui lance un démarrage en échec sans `--max-cycles` attend sans fin. |
-| R21 | La fusion passe par une pull request, et n'a lieu qu'après un premier passage vert du job `reference-boot` sur GitHub. | Le critère d'acceptation 8 du plan demande ce job vert, et il n'a jamais tourné : il tire une image Docker de 12,5 Go sur un runner hébergé. Une étape libère du disque avant la construction (les chaînes d'outils préinstallées que le job n'utilise pas) ; elle n'est pas prouvée non plus. | Un cycle de CI si le job échoue sur le disque ou sur le temps. |
+| R21 | La fusion passe par une pull request, et n'a lieu qu'après un premier passage vert du job `reference-boot` sur GitHub. | Le critère d'acceptation 8 du plan demande ce job vert, et il n'avait jamais tourné : il tire une image Docker de 12,5 Go sur un runner hébergé. Une étape libère du disque avant la construction (les chaînes d'outils préinstallées que le job n'utilise pas). | Aucun : le job a passé du premier coup, en 5 minutes (le runner avait 86 Gio libres avant l'étape de nettoyage, 107 Gio après : l'étape n'était pas nécessaire cette fois, elle reste comme marge). |
 | R22 | Le `clippy` de la CI passe `--all-features`, comme la barrière du plan (F7). | Le code compilé seulement sous `test-support`, hors `cfg(test)`, n'était pas analysé par la CI. | Nul. |
 
 Les décisions de conception D1 à D29 du plan restent valables (D20 a été corrigée avant l'exécution : voir R1). Celles que les plans suivants doivent connaître : la flash est en lecture seule (D3) ; les fenêtres de cache sont une vue en direct de la flash (D4, ADR 0002) ; les watchdogs n'expirent jamais (D11) ; les registres PMP sont mémorisés mais pas appliqués (D18) ; le CPU tourne à 20 MHz au reset (D21, une hypothèse).
@@ -126,7 +126,7 @@ Autres points pour SP1b-4 :
 - **Coût d'une lecture de flash** : un appel dynamique et une traduction MMU par octet lu (`bus.rs`, `flash_read`), et une recherche linéaire de région par accès. Correct, mais à mesurer avec CoreMark avant de fixer une tolérance.
 - **Mémoire du cache de décodage** : une page de 2 048 emplacements par page de 4 Kio exécutée, jamais évincée ; les deux fenêtres de flash portent le pire cas d'environ 200 pages à environ 4 300. Borné, mais gros pour un firmware hostile.
 - **CI** :
-  - le job `reference-boot` récupère `espressif/idf` par étiquette, pas par empreinte ; les empreintes épinglées des fichiers produits le font échouer fermé. Épingler l'empreinte de l'image avec les autres épinglages. Le job n'a pas encore tourné sur GitHub (R21) ;
+  - le job `reference-boot` récupère `espressif/idf` par étiquette, pas par empreinte ; les empreintes épinglées des fichiers produits le font échouer fermé. Épingler l'empreinte de l'image avec les autres épinglages ;
   - durcissement du conteneur de construction (`--cap-drop ALL --cap-add CHOWN`, `no-new-privileges`, chemin de sortie contenant `:`) : de l'hygiène, pas une faille, pour la même raison ;
   - actions épinglées par étiquette (`dtolnay/rust-toolchain@master`, `Swatinem/rust-cache@v2`, …) : déjà relevé par SP1b-1 ;
   - une étape `cargo check --target wasm32-unknown-unknown -p soc-esp32c3`, pour que la contrainte « aucune entrée-sortie d'hôte dans la crate du SoC » soit tenue par la CI et non par la relecture (ou au sous-projet 6).
