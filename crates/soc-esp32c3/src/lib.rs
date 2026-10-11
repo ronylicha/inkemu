@@ -20,6 +20,7 @@ pub mod flash;
 pub mod machine;
 pub mod memmap;
 pub mod periph;
+pub mod reset;
 pub mod rom;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
