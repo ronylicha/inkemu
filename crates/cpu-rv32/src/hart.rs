@@ -114,6 +114,7 @@ impl Hart {
                 let cycles = timing.instr_cycles(done.class) + fetch_stall + done.stall;
                 self.cycles = self.cycles + u64::from(cycles);
                 self.instret += 1;
+                self.csr.on_instruction_retired();
                 self.pc = done.next_pc;
                 self.waiting = done.wait;
                 StepOutcome::Retired { cycles }
@@ -494,6 +495,41 @@ mod tests {
         run(&mut h, &mut m, 3);
         assert_eq!((h.x[2], h.x[3]), (1, 2));
     }
+    #[test]
+    fn minstret_write_suppresses_the_writing_instructions_own_increment() {
+        // Privileged spec: a CSR write to minstret takes precedence over the increment
+        // that the writing instruction itself would cause (riscv-tests rv32mi-p-instret_overflow).
+        let (mut h, mut m) = machine(
+            &[
+                csrrwi(0, MINSTRET, 0),
+                csrrs(1, MINSTRET, 0),
+                csrrs(2, MINSTRET, 0),
+            ],
+            MisalignedPolicy::Trap,
+        );
+        run(&mut h, &mut m, 3);
+        assert_eq!((h.x[1], h.x[2]), (0, 1));
+    }
+
+    #[test]
+    fn minstreth_write_suppresses_the_writing_instructions_own_increment() {
+        let (mut h, mut m) = machine(
+            &[
+                addi(5, 0, -1),
+                csrrw(0, MINSTRET, 5),
+                csrrw(0, MINSTRETH, 5),
+                addi(0, 0, 0),
+                csrrs(1, MINSTRET, 0),
+                csrrs(2, MINSTRETH, 0),
+            ],
+            MisalignedPolicy::Trap,
+        );
+        run(&mut h, &mut m, 6);
+        // Both writes are suppressed, so minstret holds u64::MAX when the nop retires and
+        // wraps to 0 there; the first csrrs then reads 0, and the second reads the high word 0.
+        assert_eq!((h.x[1], h.x[2]), (0, 0));
+    }
+
     #[test]
     fn illegal_csr_access_reports_instruction_word() {
         let word = csrrw(1, MHARTID, 2);

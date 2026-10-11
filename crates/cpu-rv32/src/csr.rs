@@ -45,6 +45,8 @@ pub struct CsrFile {
     pub mtval: u32,
     cycle_offset: u64,
     instret_offset: u64,
+    /// Set by a software write to `minstret`/`minstreth` until the hart retires that instruction.
+    instret_written: bool,
 }
 
 #[allow(clippy::cast_possible_truncation)] // deliberate: callers want the low 32 bits
@@ -114,10 +116,12 @@ impl CsrFile {
                         .wrapping_sub(cycles.get());
             }
             MINSTRET => {
+                self.instret_written = true;
                 self.instret_offset = replace_low(instret.wrapping_add(self.instret_offset), value)
                     .wrapping_sub(instret);
             }
             MINSTRETH => {
+                self.instret_written = true;
                 self.instret_offset =
                     replace_high(instret.wrapping_add(self.instret_offset), value)
                         .wrapping_sub(instret);
@@ -127,9 +131,21 @@ impl CsrFile {
         true
     }
 
+    /// Called when the instruction that just executed retires. A software write to `minstret` or
+    /// `minstreth` takes precedence over the increment of that same instruction (Privileged spec,
+    /// machine counters), so the retirement increment is cancelled in the offset.
+    pub fn on_instruction_retired(&mut self) {
+        if std::mem::take(&mut self.instret_written) {
+            self.instret_offset = self.instret_offset.wrapping_sub(1);
+        }
+    }
+
     /// Convenience for tests and reset code (counters at zero).
     pub fn write(&mut self, addr: u16, value: u32) -> bool {
-        self.write_with_counters(addr, value, Cycles::ZERO, 0)
+        let known = self.write_with_counters(addr, value, Cycles::ZERO, 0);
+        // Not executed by an instruction: there is no retirement increment to cancel.
+        self.instret_written = false;
+        known
     }
 }
 
