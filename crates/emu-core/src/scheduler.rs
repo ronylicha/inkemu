@@ -47,11 +47,17 @@ impl<E> Ord for Entry<E> {
 /// Events fire in cycle order; events due at the same cycle fire in the order they were scheduled.
 /// Cancellation is lazy: a cancelled entry stays in the heap until it reaches the head, or until
 /// a cancel finds the cancelled entries outnumber the live ones (scheduled, not yet fired, not
-/// cancelled) by more than `COMPACTION_SLACK`, when the heap is rebuilt without them. So the
-/// cancelled entries never number more than the live ones plus the slack, the heap never holds
-/// more than twice the live entries plus the slack, and a cancel costs amortised O(log n): a
-/// rebuild is linear and follows at least `live + slack` cancels. A cancelled entry whose
-/// instant is far ahead does not stay until then.
+/// cancelled) by more than `COMPACTION_SLACK`, when the heap is rebuilt without them.
+///
+/// The bound holds **after every cancel**: right after one, the cancelled entries number at most
+/// the live ones plus the slack, and the heap holds at most twice the live entries plus the
+/// slack. Between two cancels it can be exceeded, because an event that fires makes the live
+/// ones fewer without a cancel looking at the count: the heap then holds at most what it held
+/// after the last cancel plus what was scheduled since, and the next cancel restores the bound.
+/// So memory is bounded by the live entries at the last cancel, not by how many cancels a caller
+/// ever made, and a cancelled entry whose instant is far ahead does not stay until then. A cancel
+/// costs amortised O(log n): a rebuild is linear in the entries stored, and more than half of
+/// them were cancelled since the last rebuild.
 #[derive(Debug)]
 pub struct Scheduler<E> {
     heap: BinaryHeap<Reverse<Entry<E>>>,
@@ -270,8 +276,8 @@ mod tests {
         assert_eq!(s.tombstones(), 0);
         assert_eq!(s.next_due(), None);
     }
-    /// What the struct promises at every step: the heap holds at most twice the live entries plus
-    /// the slack, and so do the tombstones.
+    /// What the struct promises after every cancel: the heap holds at most twice the live entries
+    /// plus the slack, and the tombstones number at most the live entries plus the slack.
     fn assert_bounded<E>(s: &Scheduler<E>) {
         assert!(s.tombstones() <= s.live.len() + COMPACTION_SLACK);
         assert!(
@@ -297,6 +303,43 @@ mod tests {
         let order: Vec<u32> =
             std::iter::from_fn(|| s.pop_due(Cycles(u64::MAX)).map(|(_, e)| e)).collect();
         assert_eq!(order, vec![0, 1, 2], "the cancelled ones never fire");
+    }
+
+    #[test]
+    fn the_bound_is_the_bound_after_a_cancel_and_the_next_cancel_restores_it() {
+        // 100 live events, then as many far-ahead cancels as the bound allows without a rebuild
+        // (live + slack = 132), then 99 of the live ones fire. No cancel looked at the count
+        // since: one live entry, 132 cancelled ones, and the heap is past `2 * live + slack`.
+        let mut s: Scheduler<u32> = Scheduler::new();
+        for live in 0..100u32 {
+            s.schedule(Cycles(10 + u64::from(live)), live);
+        }
+        for far in 0..132u64 {
+            let id = s.schedule(Cycles(1_000_000 + far), u32::MAX);
+            s.cancel(id);
+            assert_bounded(&s);
+        }
+        assert_eq!((s.stored_entries(), s.tombstones()), (232, 132));
+        for expected in 0..99u32 {
+            assert_eq!(s.pop_due(Cycles(500)).map(|(_, e)| e), Some(expected));
+        }
+        assert_eq!(s.live.len(), 1);
+        assert_eq!(
+            (s.stored_entries(), s.tombstones()),
+            (133, 132),
+            "firing removes no cancelled entry that is not at the head: the bound is exceeded"
+        );
+        // The next cancel finds the cancelled entries outnumber the live ones and rebuilds.
+        let id = s.schedule(Cycles(2_000_000), u32::MAX);
+        s.cancel(id);
+        assert_bounded(&s);
+        assert_eq!(
+            (s.stored_entries(), s.tombstones()),
+            (1, 0),
+            "only the live entry is left"
+        );
+        assert_eq!(s.pop_due(Cycles(500)).map(|(_, e)| e), Some(99));
+        assert_eq!(s.next_due(), None);
     }
 
     #[test]
