@@ -613,7 +613,7 @@ Container: `docker run -d --name inkemu-timers --network none --entrypoint sleep
 
 Licence hygiene: QEMU sources (GPL) were read for behaviour only; no code or comment was copied, and the facts taken from them are restated in original wording. Register names, bit positions and reset values come from the Apache-2.0 ESP-IDF headers and the vendored SVD; ROM facts from the Apache-2.0 `esp-rom-elfs` ELF; the TRM is cited by section.
 
-## M. Corrections found while planning SP1b-3a (2026-10-11)
+## M. Corrections found while planning and building SP1b-3a (2026-10-11)
 
 - §B.3 says the configuration registers of a main watchdog take effect when `WDTCONFIG0.CONF_UPDATE_EN` is written. `_timer_ll_reset_register` (`IDF:hal/esp32c3/include/hal/timer_ll.h:50-66`) clears `FLASHBOOT_MOD_EN` with a plain read-modify-write right after a peripheral reset, without that bit, "to prevent the system from being reset unexpectedly": the flash-boot bit at least acts when it is written. The model applies every write at once and reads `CONF_UPDATE_EN` as 0; which registers really wait for the bit is open (list of SP1b-4).
 - The SVD gives 0 as the reset value of `RTC_CNTL.WDTWPROTECT` and `RTC_CNTL.SWD_WPROTECT`. ESP-IDF's header gives the keys, `0x50D83AA1` and `0x8F1D312A` (`IDF:soc/esp32c3/register/soc/rtc_cntl_reg.h:1700`, `:1758`): both watchdogs are unlocked at reset, which is why the bootloader can stop the RTC watchdog. The model uses the header's values.

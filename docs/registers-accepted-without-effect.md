@@ -31,8 +31,10 @@ then rewrites the table below, and nothing else; review the diff before committi
 
 "Count" is 1 for a single register, or the number of consecutive registers the row stands for.
 "Made real by" names the plan that gives the register its effect. Each plan inherits the rows that
-name it: the carry-over note `docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` says so under
-SP1b-3b, SP1b-4, SP2, SP5a, SP5b and SP8.
+name it. The table has six heirs: SP1b-3b, SP1b-4, SP2, SP5a, SP5b and SP8. The carry-over note
+`docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` names the rows of each heir one by one, as
+the table stood at the end of plan SP1b-3a, in its section "Lignes de la table des registres
+acceptés, par héritier".
 
 <!-- generated table -->
 | Address | Register | Count | Hardware effect not modelled | Made real by |
