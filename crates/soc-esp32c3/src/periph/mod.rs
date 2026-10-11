@@ -446,9 +446,12 @@ impl Peripherals {
     }
 
     /// `SYSTEM.PERIP_RST_EN0/1` put a module in reset: its registers return to their reset values.
-    /// What `esp_system_reset_modules_on_exit` does to the UARTs, the SPI controllers, the timer
-    /// groups and the SYSTIMER before `esp_restart_noos` resets the CPU
-    /// (`IDF:components/esp_system/port/soc/esp32c3/system_internal.c:52-60`; report IR §4.1).
+    /// `esp_system_reset_modules_on_exit` pulses the bits of `TIMERS` (not modelled), the SPI
+    /// controllers, UART 0 and the SYSTIMER before `esp_restart_noos` resets the CPU
+    /// (`IDF:components/esp_system/port/soc/esp32c3/system_internal.c:52-54`; reports IR §4.1,
+    /// TW §F.1). The timer groups are reset by `_timer_ll_reset_register` when a driver
+    /// initialises them (`IDF:components/hal/esp32c3/include/hal/timer_ll.h:58-64`), UART 1 by
+    /// `uart_ll_reset_register`.
     fn reset_module(&mut self, ctx: &mut Ctx, module: Module) {
         match module {
             Module::Spi01 => {
@@ -1073,6 +1076,45 @@ mod tests {
             p.deliver(ctx, event);
         }
         assert_eq!(read(&mut p, ctx, svd("SYSTIMER", "INT_RAW")), Some(1));
+    }
+
+    #[test]
+    fn timer_group_1_is_routed_and_answers_through_the_device_tree() {
+        let ctx = &mut Ctx::default();
+        let mut p = peripherals(ctx);
+        let svd = svd_regs::esp32c3::addr;
+        assert_eq!(
+            read(&mut p, ctx, svd("TIMG1", "NTIMG_DATE")),
+            Some(0x0200_6191)
+        );
+        write(&mut p, ctx, svd("TIMG1", "T0ALARMLO"), 0x1234);
+        assert_eq!(read(&mut p, ctx, svd("TIMG1", "T0ALARMLO")), Some(0x1234));
+        assert_eq!(
+            read(&mut p, ctx, svd("TIMG0", "T0ALARMLO")),
+            Some(0),
+            "and group 0 is another device"
+        );
+    }
+
+    #[test]
+    fn delivering_the_reset_of_a_module_posts_no_signal() {
+        // `settle_signals` ends because a delivery posts nothing: only a write to `SYSTEM` does.
+        let ctx = &mut Ctx::default();
+        let mut p = peripherals(ctx);
+        for module in [
+            Module::Spi01,
+            Module::Uart0,
+            Module::Uart1,
+            Module::Timg0,
+            Module::Timg1,
+            Module::Systimer,
+            Module::Sha,
+        ] {
+            p.deliver(ctx, Event::ModuleReset(module));
+            assert_eq!(ctx.take_signal(), None, "{module:?}");
+        }
+        p.deliver(ctx, Event::ClockChanged);
+        assert_eq!(ctx.take_signal(), None);
     }
 
     #[test]

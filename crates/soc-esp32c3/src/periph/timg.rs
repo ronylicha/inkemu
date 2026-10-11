@@ -64,6 +64,7 @@ const T0_AUTORELOAD: u32 = 1 << 29;
 const T0_DIVIDER_SHIFT: u32 = 13;
 const T0_DIVIDER_MASK: u32 = 0xFFFF;
 const T0_ALARM_EN: u32 = 1 << 10;
+const T0_DIVCNT_RST: u32 = 1 << 12;
 const T0_USE_XTAL: u32 = 1 << 9;
 const T0CONFIG_STORED: u32 = 0xFFFF_E600;
 /// The counter, its alarm and its reload value are 54 bits wide: 22 bits in the `HI` registers.
@@ -144,8 +145,16 @@ const fn crystal_cycles_per_slow_cycle(clk_sel: u32) -> Option<(u64, u64)> {
         // RC_SLOW, 136 kHz: 40 000 000 / 136 000 = 5 000 / 17.
         0 => Some((5_000, 17)),
         // RC_FAST divided by 256, 17.5 MHz / 256: 40 000 000 * 256 / 17 500 000 = 4 096 / 7.
+        //
+        // ASSUMPTION: this clock is measured whatever `RTC_CNTL.CLK_CONF` says about its enable
+        // (`rtc_clk_cal_internal` switches it on first: `IDF:esp_hw_support/port/esp32c3/rtc_time.c:62`;
+        // TW §B.4). With the oscillator off, a chip may count nothing and time out. Calibrating
+        // RC_FAST with its enable cleared, and reading `RDY` and `TIMEOUT`, settles it.
         1 => Some((4_096, 7)),
-        // The 32 kHz crystal: none is fitted (see `Calibration::start`).
+        // ASSUMPTION: the 32 kHz crystal (selection 2), which no board of this plan fits (see
+        // `Calibration::start`), and selection 3, which `rtc_cal_sel_t` does not define, both
+        // measure nothing and end in `TIMEOUT`. A calibration of selection 3 on a chip, and of
+        // selection 2 on a board with and one without the crystal, settles it.
         _ => None,
     }
 }
@@ -278,6 +287,9 @@ pub struct Timg {
     t0: Counter,
     t0_latch: u64,
     t0_alarm: u64,
+    /// The instant T0 reaches its alarm, as the last look worked it out and nothing has changed
+    /// since: where an auto-reload restarts the counter when the wake-up comes late.
+    t0_alarm_at: Option<Cycles>,
     t0_load: u64,
     wdt_config0: u32,
     wdt_config1: u32,
@@ -311,6 +323,7 @@ impl Timg {
             t0: Counter::new(0, now, Rate::every(1), false),
             t0_latch: 0,
             t0_alarm: 0,
+            t0_alarm_at: None,
             t0_load: 0,
             wdt_config0: WDTCONFIG0_RESET,
             wdt_config1: WDTCONFIG1_RESET,
@@ -499,19 +512,27 @@ impl Timg {
     /// T0 at the present time; returns the instant of its alarm, if one is waited for.
     fn step_t0(&mut self, now: Cycles) -> Option<Cycles> {
         if self.t0_config & T0_ALARM_EN == 0 || !self.t0.is_running() {
+            self.t0_alarm_at = None;
             return None;
         }
         let ahead = self.t0_counts_to_alarm(now);
         if ahead != 0 {
-            return self.t0.instant_in(ahead, now);
+            self.t0_alarm_at = self.t0.instant_in(ahead, now);
+            return self.t0_alarm_at;
         }
         // At the alarm the interrupt is raised, `ALARM_EN` is cleared by hardware and, with
         // `AUTORELOAD`, the counter restarts from the reload value (TW §B.2).
         self.int_raw |= INT_T0;
         self.t0_config &= !T0_ALARM_EN;
         if self.t0_config & T0_AUTORELOAD != 0 {
-            self.set_t0(self.t0_load, now);
+            // The counter restarts at the instant of the alarm, not at the call: a wake-up
+            // delivered late finds the counter already `now - alarm` further on, and the phase of
+            // its count is kept (the counter is anchored at an instant, to the cycle). An alarm
+            // that was already past when it was enabled has no such instant: it reloads now.
+            let reached = self.t0_alarm_at.map_or(now, |at| at.min(now));
+            self.set_t0(self.t0_load, reached);
         }
+        self.t0_alarm_at = None;
         None
     }
 
@@ -570,6 +591,10 @@ impl Timg {
             self.wdt.set(count, now);
             match (action, self.group) {
                 (ACTION_INTERRUPT, _) => self.int_raw |= INT_WDT,
+                // ASSUMPTION: action 2 resets the CPU whatever `PROCPU_RESET_EN` (`WDTCONFIG0`
+                // bit 13) holds, as for the RTC watchdog (TW §D.5, §I question 5). Clearing the
+                // bit on a chip whose stage resets the CPU, and seeing whether the CPU still
+                // resets, settles it.
                 (ACTION_RESET_CPU, Group::Timg0) => ctx.request_reset(ResetCause::Mwdt0Cpu),
                 (ACTION_RESET_CPU, Group::Timg1) => ctx.request_reset(ResetCause::Mwdt1Cpu),
                 (ACTION_RESET_SYSTEM, Group::Timg0) => ctx.request_reset(ResetCause::Mwdt0Core),
@@ -602,6 +627,8 @@ impl Timg {
 
     /// The APB clock changed: the counters keep their value and count on at the new rate.
     pub(crate) fn clock_changed(&mut self, ctx: &mut Ctx) {
+        // The instant of the alarm was worked out at the old rate.
+        self.t0_alarm_at = None;
         self.retime(ctx);
         self.evaluate(ctx, false);
     }
@@ -680,10 +707,29 @@ impl Peripheral<Ctx> for Timg {
         let now = ctx.now();
         match offset {
             T0CONFIG => {
-                // The count is read in the old direction and put back in the new one.
+                // A write re-anchors the counter only for what changes its counting, so that
+                // the fraction of a count it has counted is not lost: a driver rewrites this
+                // register at every alarm (`timer_ll_enable_alarm`, `timer_ll.h:118`).
+                // - `EN`: `retime` starts or stops the counter, which keeps its value.
+                // - `INCREASE`: the value is kept and the direction changes from now.
+                // - `DIVIDER`: ASSUMPTION: a change takes effect at once and keeps the count
+                //   (`retime`). The header says the divider is changed with the timer stopped
+                //   and that `DIVCNT_RST` restarts the divider counter; what a running change
+                //   does is not documented. Changing the divider of a running timer on a chip
+                //   and reading the counter settles it.
+                // - `DIVCNT_RST` written 1: the divider counter restarts, which drops the
+                //   fraction of a count (`timer_group_reg.h:36`; written at `timer_ll.h:137`).
+                // A write that changes none of these changes nothing in the counter.
                 let count = self.t0_count(now);
+                let flipped = (self.t0_config ^ value) & T0_INCREASE != 0;
                 self.t0_config = value & T0CONFIG_STORED;
-                self.set_t0(count, now);
+                if flipped {
+                    self.set_t0(count, now);
+                }
+                if value & T0_DIVCNT_RST != 0 {
+                    self.t0.set(self.t0.value(now), now);
+                }
+                self.t0_alarm_at = None;
                 self.retime(ctx);
                 self.evaluate(ctx, false);
             }
@@ -691,6 +737,7 @@ impl Peripheral<Ctx> for Timg {
             T0UPDATE => self.t0_latch = self.t0_count(now),
             T0ALARMLO | T0ALARMHI => {
                 self.t0_alarm = replace_half(self.t0_alarm, offset == T0ALARMHI, value, T0_HI_MASK);
+                self.t0_alarm_at = None;
                 self.evaluate(ctx, false);
             }
             T0LOADLO | T0LOADHI => {
@@ -699,6 +746,7 @@ impl Peripheral<Ctx> for Timg {
             // Any write reloads (`timer_ll_trigger_soft_reload`, `timer_ll.h:258`).
             T0LOAD => {
                 self.set_t0(self.t0_load, now);
+                self.t0_alarm_at = None;
                 self.evaluate(ctx, false);
             }
             WDTWPROTECT => self.wdt_key = value,
@@ -718,10 +766,14 @@ impl Peripheral<Ctx> for Timg {
             }
             REGCLK => {
                 self.regclk = value & REGCLK_STORED;
+                self.t0_alarm_at = None;
                 self.retime(ctx);
                 self.evaluate(ctx, false);
             }
-            // Read-only: the write is reported as unmodelled.
+            // `INT_ST`, `T0LO`/`T0HI` and `RTCCALICFG1` are read-only; `INT_RAW` is set by the
+            // hardware and cleared through `INT_CLR` (R/SS/WTC, `timer_group_reg.h:440`);
+            // `NTIMG_DATE` is R/W (:524) but the model keeps its version value. A write to any of
+            // them is reported as unmodelled.
             _ => return false,
         }
         true
@@ -1346,5 +1398,167 @@ mod tests {
         after(ctx, &mut timg, 2 * MILLISECOND);
         timg.write(ctx, T0CONFIG, config | T0_ALARM_EN);
         assert_eq!(timg.read(ctx, INT_RAW), Some(INT_T0));
+    }
+
+    /// Time-base cycles of one count of T0 with the APB clock at 20 MHz and a divider of 20.
+    const T0_COUNT: u64 = 160;
+    const T0_COUNTING: u32 = T0_EN | T0_INCREASE | (20 << T0_DIVIDER_SHIFT);
+
+    #[test]
+    fn t0config_rewritten_with_the_same_value_does_not_lose_the_fraction_of_a_count() {
+        // A count is 160 cycles and the register is rewritten every 159: after 1 000 rounds
+        // 159 000 cycles have gone by, which is 993 whole counts (993.75). A rewrite that
+        // re-anchored the counter would lose the 159 cycles each time and read 0.
+        let ctx = &mut Ctx::default();
+        let mut timg = group(ctx, Group::Timg1);
+        timg.write(ctx, T0CONFIG, T0_COUNTING);
+        for _ in 0..1_000 {
+            ctx.sleep_until(ctx.now() + 159);
+            timg.write(ctx, T0CONFIG, T0_COUNTING);
+        }
+        assert_eq!(t0_value(ctx, &mut timg), 993);
+    }
+
+    #[test]
+    fn a_periodic_alarm_that_is_enabled_again_late_falls_at_the_same_period_every_time() {
+        // Alarm after 1 000 counts (160 000 cycles), reload from 0. The driver enables the alarm
+        // again 100.5 counts after each interrupt (the hardware cleared `ALARM_EN`), and the
+        // wake-up is delivered 90 cycles late (0.56 count). The counter restarts at the instant of
+        // the alarm and keeps its phase, so the next alarm is due exactly one period after the
+        // last: the Nth alarm falls at N periods, with no tolerance.
+        const PERIOD: u64 = 1_000 * T0_COUNT;
+        let ctx = &mut Ctx::default();
+        let mut timg = group(ctx, Group::Timg1);
+        timg.write(ctx, T0ALARMLO, 1_000);
+        timg.write(ctx, T0CONFIG, T0_COUNTING | T0_AUTORELOAD | T0_ALARM_EN);
+        for n in 1..=1_000u64 {
+            assert_eq!(ctx.next_wake(), Some(Cycles(n * PERIOD)), "alarm {n}");
+            ctx.sleep_until(Cycles(n * PERIOD + 90));
+            pump(ctx, &mut timg);
+            assert_eq!(timg.read(ctx, INT_RAW), Some(INT_T0), "alarm {n}");
+            timg.write(ctx, INT_CLR, INT_T0);
+            ctx.sleep_until(Cycles(n * PERIOD + 16_080));
+            timg.write(ctx, T0CONFIG, T0_COUNTING | T0_AUTORELOAD | T0_ALARM_EN);
+        }
+        assert_eq!(ctx.next_wake(), Some(Cycles(1_001 * PERIOD)));
+    }
+
+    #[test]
+    fn divcnt_rst_drops_the_fraction_of_a_count() {
+        // `DIVCNT_RST` restarts the divider counter (`timer_group_reg.h`, written by
+        // `timer_ll_set_clock_prescale`). 159 cycles into a count the trigger is written: the
+        // count that was to come 1 cycle later comes 160 cycles after the trigger.
+        let ctx = &mut Ctx::default();
+        let mut timg = group(ctx, Group::Timg1);
+        timg.write(ctx, T0CONFIG, T0_COUNTING);
+        ctx.sleep_until(Cycles(159));
+        timg.write(ctx, T0CONFIG, T0_COUNTING | (1 << 12));
+        assert_eq!(timg.read(ctx, T0CONFIG), Some(T0_COUNTING), "a trigger");
+        ctx.sleep_until(Cycles(160));
+        assert_eq!(t0_value(ctx, &mut timg), 0);
+        ctx.sleep_until(Cycles(318));
+        assert_eq!(t0_value(ctx, &mut timg), 0);
+        ctx.sleep_until(Cycles(319));
+        assert_eq!(t0_value(ctx, &mut timg), 1);
+    }
+
+    #[test]
+    fn flipping_the_direction_keeps_the_value() {
+        let ctx = &mut Ctx::default();
+        let mut timg = group(ctx, Group::Timg1);
+        timg.write(ctx, T0CONFIG, T0_COUNTING);
+        ctx.sleep_until(Cycles(1_000 * T0_COUNT));
+        timg.write(ctx, T0CONFIG, T0_COUNTING & !T0_INCREASE);
+        assert_eq!(t0_value(ctx, &mut timg), 1_000, "kept");
+        ctx.sleep_until(ctx.now() + 400 * T0_COUNT);
+        assert_eq!(t0_value(ctx, &mut timg), 600, "counting down from now");
+        timg.write(ctx, T0CONFIG, T0_COUNTING);
+        ctx.sleep_until(ctx.now() + 100 * T0_COUNT);
+        assert_eq!(t0_value(ctx, &mut timg), 700, "and up again");
+    }
+
+    #[test]
+    fn a_divider_changed_while_counting_takes_effect_at_once_and_keeps_the_count() {
+        // ASSUMPTION of `Timg::write` (T0CONFIG): see its comment.
+        let ctx = &mut Ctx::default();
+        let mut timg = group(ctx, Group::Timg1);
+        timg.write(ctx, T0CONFIG, T0_COUNTING);
+        ctx.sleep_until(Cycles(1_000 * T0_COUNT));
+        timg.write(
+            ctx,
+            T0CONFIG,
+            T0_EN | T0_INCREASE | (40 << T0_DIVIDER_SHIFT),
+        );
+        assert_eq!(t0_value(ctx, &mut timg), 1_000);
+        ctx.sleep_until(ctx.now() + 1_000 * T0_COUNT);
+        assert_eq!(t0_value(ctx, &mut timg), 1_500, "one count per 320 cycles");
+    }
+
+    #[test]
+    fn the_t0_divider_field_0_divides_by_65_536_and_1_by_2() {
+        let ctx = &mut Ctx::default();
+        let mut timg = group(ctx, Group::Timg1);
+        timg.write(ctx, T0CONFIG, T0_EN | T0_INCREASE);
+        ctx.sleep_until(Cycles(8 * 65_536 - 1));
+        assert_eq!(t0_value(ctx, &mut timg), 0);
+        ctx.sleep_until(Cycles(8 * 65_536));
+        assert_eq!(t0_value(ctx, &mut timg), 1, "field 0: 65 536 APB cycles");
+        timg.write(ctx, T0LOAD, 1);
+        timg.write(ctx, T0CONFIG, T0_EN | T0_INCREASE | (1 << T0_DIVIDER_SHIFT));
+        assert_eq!(t0_value(ctx, &mut timg), 0);
+        ctx.sleep_until(ctx.now() + 16 * 100);
+        assert_eq!(t0_value(ctx, &mut timg), 100, "field 1: 2 APB cycles");
+    }
+
+    #[test]
+    fn a_watchdog_prescaler_of_0_divides_by_65_536() {
+        // Pins the ASSUMPTION of `Timg::wdt_rate`: one count is 65 536 crystal cycles.
+        let ctx = &mut Ctx::default();
+        let mut timg = group(ctx, Group::Timg1);
+        timg.write(ctx, WDTCONFIG1, 0);
+        timg.write(ctx, WDTCONFIG2, 1);
+        timg.write(ctx, WDTCONFIG0, WDT_EN | WDT_USE_XTAL);
+        assert_eq!(ctx.next_wake(), Some(Cycles(XTAL_PERIOD * 65_536)));
+    }
+
+    #[test]
+    fn a_down_counting_timer_reaches_its_alarm_going_down() {
+        // From 5 000 down to the alarm at 4 000: 1 000 counts, 1 ms.
+        let ctx = &mut Ctx::default();
+        let mut timg = group(ctx, Group::Timg1);
+        timg.write(ctx, T0LOADLO, 5_000);
+        timg.write(ctx, T0LOAD, 1);
+        timg.write(ctx, T0ALARMLO, 4_000);
+        timg.write(
+            ctx,
+            T0CONFIG,
+            T0_EN | (20 << T0_DIVIDER_SHIFT) | T0_ALARM_EN,
+        );
+        assert_eq!(ctx.next_wake(), Some(Cycles(1_000 * T0_COUNT)));
+        after(ctx, &mut timg, 1_000 * T0_COUNT - 1);
+        assert_eq!(timg.read(ctx, INT_RAW), Some(0));
+        after(ctx, &mut timg, 1);
+        assert_eq!(timg.read(ctx, INT_RAW), Some(INT_T0));
+        assert_eq!(t0_value(ctx, &mut timg), 4_000);
+    }
+
+    #[test]
+    fn an_alarm_without_auto_reload_fires_once_and_the_counter_goes_on() {
+        let ctx = &mut Ctx::default();
+        let mut timg = group(ctx, Group::Timg1);
+        timg.write(ctx, T0ALARMLO, 1_000);
+        timg.write(ctx, T0CONFIG, T0_COUNTING | T0_ALARM_EN);
+        after(ctx, &mut timg, 1_000 * T0_COUNT);
+        assert_eq!(timg.read(ctx, INT_RAW), Some(INT_T0));
+        assert_eq!(
+            timg.read(ctx, T0CONFIG),
+            Some(T0_COUNTING),
+            "ALARM_EN cleared"
+        );
+        timg.write(ctx, INT_CLR, INT_T0);
+        after(ctx, &mut timg, 1_000 * T0_COUNT);
+        assert_eq!(timg.read(ctx, INT_RAW), Some(0), "once");
+        assert_eq!(t0_value(ctx, &mut timg), 2_000, "and not reloaded");
+        assert_eq!(ctx.next_wake(), None);
     }
 }

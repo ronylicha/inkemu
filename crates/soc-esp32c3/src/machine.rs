@@ -199,9 +199,9 @@ impl Esp32C3 {
     /// Acts on what the last instruction, or the passing of time, left in the context: wake-ups
     /// that are due, a reset, a clock change, a change of the interrupt lines.
     fn service(&mut self, pc: u32) {
-        while let Some(event) = self.bus.ctx.take_due() {
-            self.bus.deliver(event);
-        }
+        // One pass, bounded by the wake-ups pending now: what a device arms for an instant not
+        // after the present time is delivered by the next call (`Ctx::deliver_due`).
+        self.bus.deliver_due();
         if let Some(cause) = self.bus.ctx.take_reset() {
             self.reset(cause);
         }
@@ -1462,6 +1462,62 @@ mod tests {
                 pc: ROM_BASE + 4,
                 sp: 0x3FC9_0000,
             })
+        );
+    }
+
+    #[test]
+    fn a_clock_change_reaches_a_watchdog_that_counts_the_apb_clock() {
+        // Main watchdog 0 counts 26 000 000 cycles of the APB clock (decision E26): 1.3 s at the
+        // 20 MHz of the power-on clock. The program selects the crystal undivided (40 MHz) and
+        // sleeps: the watchdog counts twice as fast from the write, and resets the chip after
+        // 0.65 s plus 25 ns for each count (50 ns) it had already counted at the old rate: the
+        // four instructions of the store, 100 ns. A core reset returns the clock to its power-on
+        // value, so the second life does the same, and the second reset is at 1.3 s plus 200 ns.
+        // Without the delivery of the clock change to the groups the watchdog would go on at
+        // 20 MHz, reset at 1.3 s, and the call would return after that first reset.
+        let mut body = store_register(reg("SYSTEM", "SYSCLK_CONF"), 0).to_vec();
+        body.extend([wfi(), HANG]);
+        let mut m = machine(&body);
+        assert_eq!(m.run_until(Cycles(10_000)), StopReason::Asleep);
+        assert_eq!(
+            m.resets(),
+            2,
+            "two sleeps of 0.65 s pass the second a call may sleep"
+        );
+        assert_eq!(m.device_time_nanos(), 1_300_000_200);
+    }
+
+    #[test]
+    fn a_wake_up_at_the_end_of_device_time_does_not_hang_the_host() {
+        // T0 of group 1 counts 20 MHz / 65 536 (divider field 0): one count is 2^19 cycles of the
+        // time base. An alarm 2^45 - 2 counts ahead is due 2^64 - 2^20 cycles after the timer
+        // started, 2^20 cycles short of the end of device time. One `wfi` sleeps there; the
+        // watchdog the program starts next would fall past the end, where every instant
+        // saturates to `u64::MAX` and a wake-up is due for ever. Such a wake-up never comes.
+        let mut body = stop_watchdogs();
+        body.extend(route("TG1_T0_INT_MAP", 4));
+        body.extend(store_register(reg("TIMG1", "INT_ENA_TIMERS"), 1));
+        body.extend(store_register(reg("TIMG1", "T0ALARMLO"), 0xFFFF_FFFE));
+        body.extend(store_register(reg("TIMG1", "T0ALARMHI"), 0x1FFF));
+        // `EN`, `INCREASE`, `ALARM_EN`.
+        body.extend(store_register(reg("TIMG1", "T0CONFIG"), 0xC000_0400));
+        body.push(wfi());
+        // `EN` and `USE_XTAL`: 26 000 000 counts of the crystal, 104 million cycles.
+        body.extend(store_register(reg("TIMG1", "WDTCONFIG0"), 0x8020_0000));
+        body.push(HANG);
+        let mut m = machine(&body);
+        let mut calls = 0;
+        // 300 000 CPU cycles are 2.4 million cycles of the time base at 20 MHz: they cover the
+        // 2^20 left after the alarm.
+        while m.run_until(Cycles(300_000)) != StopReason::CycleBudget {
+            calls += 1;
+            assert!(calls < 10, "run_until keeps returning without the budget");
+        }
+        assert_eq!(m.resets(), 0, "no watchdog fell inside device time");
+        assert_eq!(
+            m.bus.ctx.now(),
+            Cycles(u64::MAX),
+            "the CPU ran on to the end of device time, where it saturates"
         );
     }
 }

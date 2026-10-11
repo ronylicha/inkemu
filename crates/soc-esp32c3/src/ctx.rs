@@ -107,15 +107,18 @@ pub struct Deadline {
 
 impl Deadline {
     /// Makes sure the device is called with `event` at `at`, or before. A call already due earlier
-    /// is kept: the device re-arms when it is called.
+    /// is kept: the device re-arms when it is called. An instant that is the end of device time
+    /// never comes (see [`Ctx::schedule`]): it asks for nothing, and leaves a call due later in
+    /// place.
     pub fn arm(&mut self, ctx: &mut Ctx, at: Cycles, event: Event) {
         match self.armed {
             Some((due, _)) if due <= at => {}
+            _ if at.get() == u64::MAX => {}
             previous => {
                 if let Some((_, id)) = previous {
                     ctx.cancel(id);
                 }
-                self.armed = Some((at, ctx.schedule(at, event)));
+                self.armed = ctx.schedule(at, event).map(|id| (at, id));
             }
         }
     }
@@ -241,9 +244,19 @@ impl Ctx {
 
     /// Asks for `event` to be delivered at device time `at`; an instant already past is delivered
     /// when the current instruction ends.
-    pub fn schedule(&mut self, at: Cycles, event: Event) -> EventId {
+    ///
+    /// Device time ends at `u64::MAX` cycles of the time base (about 3 650 years), and its
+    /// arithmetic saturates there: an instant a device works out from a count that reaches that
+    /// far lands on `u64::MAX`, and so would every later one. A wake-up that would fall at the end
+    /// of device time never comes, so it is not scheduled (`None`): `next_wake` reads `u64::MAX`
+    /// as "no wake-up", and a wake-up kept at that instant would be due, and called again, for
+    /// ever. This is the one place every wake-up goes through.
+    pub fn schedule(&mut self, at: Cycles, event: Event) -> Option<EventId> {
+        if at.get() == u64::MAX {
+            return None;
+        }
         self.next_wake = self.next_wake.min(at.get());
-        self.events.schedule(at, event)
+        Some(self.events.schedule(at, event))
     }
 
     /// Withdraws a wake-up; one that was already delivered or withdrawn is ignored.
@@ -268,10 +281,11 @@ impl Ctx {
         (self.next_wake != u64::MAX).then_some(Cycles(self.next_wake))
     }
 
-    /// Whether a wake-up is due now. One comparison: the run loop asks after every instruction.
+    /// Whether a wake-up is due now. Two comparisons: the run loop asks after every instruction.
+    /// At the end of device time (`now` is `u64::MAX`) "no wake-up" is not a due one.
     #[must_use]
     pub const fn wake_due(&self) -> bool {
-        self.next_wake <= self.now.get()
+        self.next_wake <= self.now.get() && self.next_wake != u64::MAX
     }
 
     /// The oldest wake-up that is due, if any.
@@ -279,6 +293,23 @@ impl Ctx {
         let (_, event) = self.events.pop_due(self.now)?;
         self.refresh_next_wake();
         Some(event)
+    }
+
+    /// One delivery pass: hands the wake-ups that are due to `deliver`, oldest first.
+    ///
+    /// INVARIANT: the work of a pass is bounded by the number of entries the scheduler held when
+    /// it began, whatever the devices do. A wake-up that a device arms during the pass for an
+    /// instant not after the present time is due again, but past the budget of this pass: the
+    /// next pass delivers it (after the next instruction, or at the next step of a sleep, where
+    /// the bound on fruitless wake-ups ends the call). Without the bound a device that arms
+    /// itself at the present time on every call would keep one instruction from ever ending.
+    pub(crate) fn deliver_due(&mut self, mut deliver: impl FnMut(&mut Ctx, Event)) {
+        for _ in 0..self.events.stored_entries() {
+            let Some(event) = self.take_due() else {
+                break;
+            };
+            deliver(self, event);
+        }
     }
 
     /// Asks for `event` to be delivered before the current instruction ends, after the events
@@ -496,7 +527,7 @@ mod tests {
         let mut ctx = Ctx::default();
         assert_eq!(ctx.next_wake(), None);
         assert!(!ctx.wake_due());
-        let late = ctx.schedule(Cycles(300), THIRD);
+        let late = ctx.schedule(Cycles(300), THIRD).unwrap();
         ctx.schedule(Cycles(100), FIRST);
         ctx.schedule(Cycles(200), SECOND);
         assert_eq!(ctx.next_wake(), Some(Cycles(100)));
@@ -540,6 +571,69 @@ mod tests {
             Some(Cycles(900)),
             "once called, the deadline arms again"
         );
+    }
+
+    #[test]
+    fn the_end_of_device_time_is_never() {
+        // Device time ends at `u64::MAX`: an instant that saturates there never comes, and the
+        // context reads `u64::MAX` as "no wake-up".
+        let mut ctx = Ctx::default();
+        assert_eq!(ctx.schedule(Cycles(u64::MAX), FIRST), None);
+        assert_eq!(ctx.next_wake(), None);
+        assert_eq!(ctx.scheduled_entries(), 0);
+        let mut deadline = Deadline::default();
+        deadline.arm(&mut ctx, Cycles(u64::MAX), FIRST);
+        assert_eq!((ctx.next_wake(), ctx.scheduled_entries()), (None, 0));
+        deadline.arm(&mut ctx, Cycles(900), FIRST);
+        deadline.arm(&mut ctx, Cycles(u64::MAX), FIRST);
+        assert_eq!(
+            (ctx.next_wake(), ctx.scheduled_entries()),
+            (Some(Cycles(900)), 1),
+            "a call that never comes does not replace one that does"
+        );
+        ctx.sleep_until(Cycles(u64::MAX));
+        assert!(ctx.wake_due());
+        assert_eq!(ctx.take_due(), Some(FIRST));
+        assert!(
+            !ctx.wake_due(),
+            "nothing is left to be due at the end of time"
+        );
+    }
+
+    #[test]
+    fn a_delivery_pass_calls_a_device_that_arms_itself_at_now_once_and_the_next_pass_again() {
+        // A device whose deadline is never later than the present time: it is armed again at
+        // every call. One pass delivers the call that was pending when it began, not the one the
+        // delivery armed.
+        let mut ctx = Ctx::default();
+        ctx.sleep_until(Cycles(1_000));
+        let mut deadline = Deadline::default();
+        deadline.arm(&mut ctx, Cycles(900), FIRST);
+        let mut calls = 0;
+        for pass in 1..=5 {
+            ctx.deliver_due(|ctx, event| {
+                assert_eq!(event, FIRST);
+                calls += 1;
+                deadline.called(ctx.now());
+                let now = ctx.now();
+                deadline.arm(ctx, now, FIRST);
+            });
+            assert_eq!(calls, pass, "one call per pass");
+            assert!(ctx.wake_due(), "and the next pass has its call");
+        }
+    }
+
+    #[test]
+    fn a_delivery_pass_delivers_every_wake_up_that_was_pending_when_it_began() {
+        let mut ctx = Ctx::default();
+        ctx.schedule(Cycles(10), FIRST);
+        ctx.schedule(Cycles(20), SECOND);
+        ctx.schedule(Cycles(30), THIRD);
+        ctx.sleep_until(Cycles(25));
+        let mut delivered = Vec::new();
+        ctx.deliver_due(|_, event| delivered.push(event));
+        assert_eq!(delivered, [FIRST, SECOND], "the third is not due");
+        assert_eq!(ctx.next_wake(), Some(Cycles(30)));
     }
 
     #[test]

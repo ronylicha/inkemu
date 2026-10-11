@@ -130,12 +130,20 @@ impl SocBus {
         self.settle();
     }
 
+    /// One delivery pass of the wake-ups that are due (see [`Ctx::deliver_due`]), each followed by
+    /// the events its call had something to tell.
+    pub(crate) fn deliver_due(&mut self) {
+        let SocBus { periph, ctx, .. } = self;
+        ctx.deliver_due(|ctx, event| {
+            periph.deliver(ctx, event);
+            settle_signals(periph, ctx);
+        });
+    }
+
     /// Delivers what the devices posted for each other during a register access or a call: such
     /// an event reaches its device before the instruction ends.
     fn settle(&mut self) {
-        while let Some(event) = self.ctx.take_signal() {
-            self.periph.deliver(&mut self.ctx, event);
-        }
+        settle_signals(&mut self.periph, &mut self.ctx);
     }
 
     /// Tells the bus which instruction is running, so diagnostics can name it.
@@ -280,6 +288,19 @@ impl SocBus {
             self.unmodeled(reg_addr, Direction::Write, word);
         }
         Ok(0)
+    }
+}
+
+/// Delivers the events devices posted with [`Ctx::signal`], oldest first.
+///
+/// The loop ends: the only code that posts a signal is a write to `SYSTEM.PERIP_RST_EN0/1`
+/// (`System::write`), which a register access reaches and a delivery does not. A delivery resets a
+/// module, and no module reset writes a register of `SYSTEM` or posts a signal. So the signals
+/// there are to deliver are those one register access posted (at most one per module), and
+/// delivering them posts none.
+fn settle_signals(periph: &mut Peripherals, ctx: &mut Ctx) {
+    while let Some(event) = ctx.take_signal() {
+        periph.deliver(ctx, event);
     }
 }
 

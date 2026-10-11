@@ -14,8 +14,14 @@ use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, Stop
 
 /// SHA-256 of the merged reference image (`docs/research/sp1b-test-oracle.md`, §2).
 const REFERENCE_SHA256: &str = "fc05ef5dbe85372e1da52abdec3bfcbbb110738a60163734666095fcd8c39bf2";
-/// QEMU reaches the first application line after 1.69 M instructions (BA §1); far more than needed.
+/// The CPU cycles every driver may spend: far more than a whole life cycle needs. QEMU reaches the
+/// first application line after 1.69 M instructions (BA §1), the application's first life is 28 M
+/// cycles to the restart, and the second boot to its first application line a few million more.
 const BUDGET: u64 = 400_000_000;
+/// The device time every driver may spend, in nanoseconds: the CPU cycles do not move while the
+/// CPU sleeps, so a regression that leaves it asleep with a device counting would never reach
+/// `BUDGET`. A first life, its restart and the second boot take about 12 s; 60 s is far more.
+const DEVICE_TIME_BUDGET_NS: u64 = 60 * 1_000_000_000;
 const SLICE: u64 = 1_000_000;
 
 /// The ROM lines of the reference image (FB §G, measured).
@@ -208,6 +214,7 @@ fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic
     // `Asleep` is the CPU waiting for its next interrupt: device time goes on, the run too.
     while matches!(stop, StopReason::CycleBudget | StopReason::Asleep)
         && machine.cycles().get() < BUDGET
+        && machine.device_time_nanos() < DEVICE_TIME_BUDGET_NS
         && !done(&text(&uart0), &diagnostics)
     {
         stop = machine.run_until(Cycles(machine.cycles().get() + SLICE));
@@ -215,6 +222,13 @@ fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic
         let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
         diagnostics.extend(machine.drain_diagnostics());
     }
+    assert!(
+        machine.device_time_nanos() < DEVICE_TIME_BUDGET_NS || done(&text(&uart0), &diagnostics),
+        "device time ran out ({} ns) after {} CPU cycles before the run was done: the CPU sleeps and nothing wakes it?\nconsole:\n{}",
+        machine.device_time_nanos(),
+        machine.cycles().get(),
+        text(&uart0)
+    );
     // The run is over: what the firmware wrote and the UART had not sent yet belongs to its console.
     uart0.extend(machine.flush_console(ConsoleChannel::Uart0));
     Run {
@@ -333,8 +347,17 @@ fn a_strict_run_crosses_the_restart_without_anything_unmodelled() {
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
 fn the_countdown_lines_are_one_device_second_apart_and_the_cpu_sleeps_between_them() {
-    /// CPU cycles between two looks at the console, and the device time they take at the
-    /// 160 MHz the application runs at: the resolution of the times read below.
+    /// CPU cycles one call to `run_until` executes before it returns, and the device time they
+    /// take at the 160 MHz the application runs at (6.25 ns a cycle).
+    ///
+    /// The resolution of the times read below: while the CPU sleeps a call does not return, UART
+    /// bytes leaving or not (a wake-up without an interrupt is not a reason to return). It
+    /// returns `LOOK` cycles after the next tick interrupt wakes the CPU, so every look is a tick
+    /// instant (a multiple of 10 ms) plus `LOOK_NS`, and the time of the look is the time the
+    /// line was complete rounded up to the next tick, not the time it was printed. The gap between
+    /// two looks is therefore a whole number of ticks within the difference of two such offsets,
+    /// which is under `LOOK_NS`: measured, the nine gaps are 1 s - 1.08 us to 1 s + 0.26 us. One
+    /// tick of error in the application's delay is 10 ms, four orders of magnitude more.
     const LOOK: u64 = 200;
     const LOOK_NS: u64 = 1_250;
     /// One tick of the application's scheduler (`CONFIG_FREERTOS_HZ` is 100).
@@ -345,7 +368,10 @@ fn the_countdown_lines_are_one_device_second_apart_and_the_cpu_sleeps_between_th
     // printed.
     let mut seen_at: Vec<u64> = Vec::new();
     let mut restarting = false;
-    while machine.cycles().get() < BUDGET && !restarting {
+    while machine.cycles().get() < BUDGET
+        && machine.device_time_nanos() < DEVICE_TIME_BUDGET_NS
+        && !restarting
+    {
         let stop = machine.run_until(Cycles(machine.cycles().get() + LOOK));
         assert!(
             matches!(stop, StopReason::CycleBudget | StopReason::Asleep),
@@ -363,13 +389,20 @@ fn the_countdown_lines_are_one_device_second_apart_and_the_cpu_sleeps_between_th
         restarting = console.contains("Restarting now.");
     }
     assert_eq!(seen_at.len(), 11, "{}", String::from_utf8_lossy(&uart0));
-    // `vTaskDelay(1000 / portTICK_PERIOD_MS)` between two lines: one second, less the part of a
-    // tick already spent when the first delay starts. The tolerance is that one tick, plus the
-    // resolution of the reading.
-    for pair in seen_at.windows(2) {
+    // `vTaskDelay(1000 / portTICK_PERIOD_MS)` waits 100 ticks counted from the next tick edge, so
+    // the first delay, which starts inside a tick, lasts one second less the part of that tick
+    // already spent: it is shorter than a second by 0 to 10 ms and never longer (here 0.99 s).
+    let first = seen_at[1] - seen_at[0];
+    assert!(
+        (SECOND_NS - TICK_NS..=SECOND_NS).contains(&first),
+        "the first gap is {first} ns: {seen_at:?}"
+    );
+    // The nine others start on the tick edge the previous delay ended on: a second exactly, to
+    // the resolution of the looks.
+    for pair in seen_at[1..].windows(2) {
         let gap = pair[1] - pair[0];
         assert!(
-            gap.abs_diff(SECOND_NS) <= TICK_NS + LOOK_NS,
+            gap.abs_diff(SECOND_NS) <= LOOK_NS,
             "two countdown lines are {gap} ns apart: {seen_at:?}"
         );
     }
