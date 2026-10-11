@@ -42,7 +42,39 @@ fn step_budget_exhaustion_exits_two() {
         .args(["--max-steps", "3"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("no verdict after 3 steps"));
+        .stderr(predicate::str::contains("no verdict after 3 steps"))
+        .stderr(predicate::str::contains(
+            "; raise --max-steps or check that the test writes to tohost",
+        ));
+}
+
+#[test]
+fn unreadable_elf_exits_two_with_a_remedy() {
+    rvtest()
+        .arg("/nonexistent/test.elf")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "cannot read /nonexistent/test.elf",
+        ))
+        .stderr(predicate::str::contains(
+            "; check the path and read permissions",
+        ));
+}
+
+#[test]
+fn unwritable_signature_path_exits_two_with_a_remedy() {
+    rvtest()
+        .arg(fixture("rv32ui-p-lw"))
+        .args(["--signature", "/nonexistent/dir/lw.sig"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "cannot write /nonexistent/dir/lw.sig",
+        ))
+        .stderr(predicate::str::contains(
+            "; check that the directory exists and is writable",
+        ));
 }
 
 #[test]

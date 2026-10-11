@@ -100,7 +100,12 @@ fn run_rvtest(
         },
     };
     let machine = std::fs::read(elf)
-        .map_err(|e| format!("cannot read {}: {e}", elf.display()))
+        .map_err(|e| {
+            format!(
+                "cannot read {}: {e}; check the path and read permissions",
+                elf.display()
+            )
+        })
         .and_then(|bytes| TestMachine::from_elf(&bytes, config).map_err(|e| e.to_string()));
     let mut machine = match machine {
         Ok(m) => m,
@@ -127,7 +132,10 @@ fn run_rvtest(
             acc
         });
         if let Err(e) = std::fs::write(path, text) {
-            eprintln!("error: cannot write {}: {e}", path.display());
+            eprintln!(
+                "error: cannot write {}: {e}; check that the directory exists and is writable",
+                path.display()
+            );
             return ExitCode::from(EXIT_ERROR);
         }
     }
@@ -141,7 +149,9 @@ fn run_rvtest(
             ExitCode::from(EXIT_FAIL)
         }
         RunResult::Timeout => {
-            eprintln!("error: no verdict after {max_steps} steps");
+            eprintln!(
+                "error: no verdict after {max_steps} steps; raise --max-steps or check that the test writes to tohost"
+            );
             ExitCode::from(EXIT_ERROR)
         }
     }

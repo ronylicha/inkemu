@@ -11,19 +11,21 @@ const TOHOST_PASS: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum RvTestError {
-    #[error("not a valid ELF file: {0}")]
+    #[error(
+        "not a valid ELF file ({0}); select a bare-metal RV32 ELF built for riscv-tests or riscv-arch-test"
+    )]
     Elf(#[from] goblin::error::Error),
     #[error("ELF is not 32-bit RISC-V; build the test with -march=rv32... -mabi=ilp32")]
     WrongArch,
-    #[error(
-        "ELF has no `{0}` symbol; the test must be linked with the riscv-tests/arch-test environment"
-    )]
+    #[error("ELF has no `{0}` symbol; link the test with the riscv-tests/arch-test environment")]
     MissingSymbol(&'static str),
     #[error(
-        "ELF segment at {addr:#010x} does not fit in the {RAM_SIZE}-byte test RAM at {RAM_BASE:#010x}"
+        "ELF segment at {addr:#010x} does not fit in the {RAM_SIZE}-byte test RAM at {RAM_BASE:#010x}; link the test at {RAM_BASE:#010x} and keep its footprint within the test RAM"
     )]
     SegmentOutOfRange { addr: u32 },
-    #[error("signature region is outside test RAM")]
+    #[error(
+        "signature region is outside test RAM; check that begin_signature and end_signature lie inside a loaded segment"
+    )]
     SignatureOutOfRange,
 }
 
@@ -172,5 +174,59 @@ impl TestMachine {
     #[must_use]
     pub fn trace_hash(&self) -> u64 {
         self.trace.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Imperatives that open the remedy clause of a message (`"; <verb> ..."`).
+    const REMEDY_VERBS: [&str; 4] = ["select", "build", "link", "check"];
+
+    /// One instance of every variant. The exhaustive `match` in `variant_index` makes
+    /// adding a variant without adding it here a compile error.
+    fn one_of_each() -> Vec<RvTestError> {
+        let elf_error = Elf::parse(b"not an elf").unwrap_err();
+        let all = vec![
+            RvTestError::Elf(elf_error),
+            RvTestError::WrongArch,
+            RvTestError::MissingSymbol("tohost"),
+            RvTestError::SegmentOutOfRange { addr: 0x1000 },
+            RvTestError::SignatureOutOfRange,
+        ];
+        let mut seen = [false; 5];
+        for e in &all {
+            seen[variant_index(e)] = true;
+        }
+        assert!(
+            seen.iter().all(|&s| s),
+            "one_of_each must cover every variant"
+        );
+        all
+    }
+
+    fn variant_index(e: &RvTestError) -> usize {
+        match e {
+            RvTestError::Elf(_) => 0,
+            RvTestError::WrongArch => 1,
+            RvTestError::MissingSymbol(_) => 2,
+            RvTestError::SegmentOutOfRange { .. } => 3,
+            RvTestError::SignatureOutOfRange => 4,
+        }
+    }
+
+    #[test]
+    fn every_variant_message_states_a_remedy() {
+        for err in one_of_each() {
+            let msg = err.to_string();
+            let has_remedy = REMEDY_VERBS
+                .iter()
+                .any(|verb| msg.contains(&format!("; {verb} ")));
+            assert!(
+                has_remedy,
+                "no remedy clause (\"; <{REMEDY_VERBS:?}> ...\") in: {msg}"
+            );
+        }
     }
 }
