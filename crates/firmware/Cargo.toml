@@ -1,0 +1,14 @@
+[package]
+name = "firmware"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+sha2.workspace = true
+md-5.workspace = true
