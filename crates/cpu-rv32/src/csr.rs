@@ -204,8 +204,9 @@ impl CsrFile {
 
     /// From here on `mcycle` and `minstret` read what a new hart reads: 0 now, then what the hart
     /// executes. For a reset of a hart whose own totals (`cycles`, `instret`) go on across it:
-    /// the architecture leaves the reset value of the two counters arbitrary, and software that
-    /// was just reset must not read the age of the run in them.
+    /// software that was just reset must not read the age of the run in them. That the counters
+    /// of the chip restart with the core is assumed: the marker is on `Hart::reset`, with what
+    /// settles it.
     pub(crate) fn restart_counters(&mut self, cycles: Cycles, instret: u64) {
         self.cycle_offset = 0u64.wrapping_sub(cycles.get());
         self.instret_offset = 0u64.wrapping_sub(instret);

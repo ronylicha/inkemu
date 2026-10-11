@@ -679,6 +679,28 @@ mod tests {
             d.occurrences(&unsupported(Unsupported::FlashCommand { opcode: 0x02 })),
             2
         );
+
+        // A byte sent on a clock that is not modelled is about its UART and the selection, not
+        // about the instruction that wrote it: a firmware prints from many places.
+        let uart_clock = |uart: u8, sclk_sel: u32, pc: u32| Diagnostic::Unsupported {
+            what: Unsupported::UartClock { uart, sclk_sel },
+            pc,
+        };
+        d.record(uart_clock(0, 2, 0x4038_1000));
+        d.record(uart_clock(0, 2, 0x4200_0000));
+        assert_eq!(d.distinct(), 5, "one entry for two call sites");
+        assert_eq!(d.occurrences(&uart_clock(0, 2, 0x4038_2000)), 2);
+        d.record(uart_clock(0, 0, 0x4038_1000));
+        assert_eq!(d.distinct(), 6, "another selection is another entry");
+        d.record(uart_clock(1, 2, 0x4038_1000));
+        assert_eq!(d.distinct(), 7, "another UART is another entry");
+        for (uart, sclk_sel, count) in [(0, 2, 2), (0, 0, 1), (1, 2, 1), (1, 0, 0)] {
+            assert_eq!(
+                d.occurrences(&uart_clock(uart, sclk_sel, 0x4038_1000)),
+                count,
+                "UART{uart}, SCLK_SEL {sclk_sel}"
+            );
+        }
     }
 
     #[test]

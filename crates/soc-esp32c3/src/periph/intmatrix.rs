@@ -221,9 +221,19 @@ impl IntMatrix {
     /// `*_r = *_r | _b` (`IDF:soc/esp32c3/include/soc/soc.h:51-53`), and nothing there writes a bit
     /// back to 0. It does not settle the rule: it passes the line number where the macro takes a
     /// mask, and `esp_intr_alloc` calls it when an edge interrupt is allocated
-    /// (`IDF:esp_hw_support/intr_alloc.c:650`), not when one is served. An edge interrupt on a
-    /// real chip, acknowledged by one write of 1 and then by the toggle, with
-    /// `CPU_INT_EIP_STATUS` read after each write, settles it (report IR §1.3, §7 question 8).
+    /// (`IDF:esp_hw_support/intr_alloc.c:650`), not when one is served.
+    ///
+    /// The latch is one bit, so the rule decides what becomes of a second edge. One that arrives
+    /// after the CPU took the line and before the acknowledge merges with the edge being served
+    /// and is cleared with it: one interrupt for two edges. One that arrives after the
+    /// acknowledge, between the two writes of the TRM's toggle included, latches anew and is
+    /// kept: the write of 0 clears nothing. Report IR §7 question 8 leaves "the exact effect of
+    /// the toggle on an edge that arrives between the 1 and the 0" open.
+    ///
+    /// An edge interrupt on a real chip, acknowledged by one write of 1 and then by the toggle,
+    /// with `CPU_INT_EIP_STATUS` read after each write, and a second edge raised before the
+    /// acknowledge and then between the two writes, settles all of it (report IR §1.3, §7
+    /// question 8).
     fn acknowledge(&mut self, value: u32) {
         let written = value & LINES_MASK;
         let clearable = self.claimed | !self.enable;
@@ -512,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn an_edge_line_latches_until_it_is_taken_and_acknowledged_by_a_toggle() {
+    fn an_edge_line_latches_until_it_is_taken_and_acknowledged_by_a_write_of_its_bit() {
         let ctx = &mut Ctx::default();
         let mut m = application_setup(ctx);
         m.write(ctx, CPU_INT_TYPE, 1 << 4);
@@ -581,6 +591,67 @@ mod tests {
                 "round {round}: the write with the bit set acknowledged the edge"
             );
         }
+    }
+
+    #[test]
+    fn a_second_edge_is_lost_before_the_acknowledge_and_kept_after_it() {
+        // Every change of the source is seen by an evaluation, so each rise is an edge: what the
+        // controller resolves with the source low, then with the source high again.
+        fn pulse(m: &mut IntMatrix, ctx: &mut Ctx) -> (Option<u32>, Option<u32>) {
+            ctx.irq(TICK, false);
+            let low = m.resolve(ctx.sources());
+            ctx.irq(TICK, true);
+            (low, m.resolve(ctx.sources()))
+        }
+
+        // Pins what the ASSUMPTION of `acknowledge` says of a second edge: the latch is one bit.
+        let ctx = &mut Ctx::default();
+        let mut m = application_setup(ctx);
+        m.write(ctx, CPU_INT_TYPE, 1 << 4);
+
+        // Between the claim and the acknowledge: merged with the edge being served.
+        assert_eq!(pulse(&mut m, ctx), (None, Some(4)), "the first edge");
+        m.claim(4);
+        assert_eq!(
+            pulse(&mut m, ctx),
+            (Some(4), Some(4)),
+            "a second edge while the first is served: the latch is already set"
+        );
+        m.write(ctx, CPU_INT_CLEAR, 1 << 4);
+        assert_eq!(
+            m.resolve(ctx.sources()),
+            None,
+            "one acknowledge for two edges: the second went with the first"
+        );
+        assert_eq!(m.read(ctx, CPU_INT_EIP_STATUS), Some(0));
+
+        // Between the two writes of the toggle: after the acknowledge, so kept.
+        assert_eq!(
+            pulse(&mut m, ctx),
+            (None, Some(4)),
+            "an edge after the write of 1 latches anew"
+        );
+        m.write(ctx, CPU_INT_CLEAR, 0);
+        assert_eq!(
+            m.resolve(ctx.sources()),
+            Some(4),
+            "the write of 0 clears nothing: the edge is kept"
+        );
+        assert_eq!(m.read(ctx, CPU_INT_EIP_STATUS), Some(1 << 4));
+
+        // After a whole toggle: kept too, and served by its own acknowledge.
+        m.claim(4);
+        m.write(ctx, CPU_INT_CLEAR, 1 << 4);
+        m.write(ctx, CPU_INT_CLEAR, 0);
+        assert_eq!(m.resolve(ctx.sources()), None);
+        assert_eq!(
+            pulse(&mut m, ctx),
+            (None, Some(4)),
+            "an edge after the toggle"
+        );
+        m.claim(4);
+        m.write(ctx, CPU_INT_CLEAR, 1 << 4);
+        assert_eq!(m.resolve(ctx.sources()), None);
     }
 
     #[test]

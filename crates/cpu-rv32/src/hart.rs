@@ -98,10 +98,17 @@ impl Hart {
     /// Resets the hart: registers, CSRs (the PMP entries and their lock bits with them) and
     /// decoded instructions are those of a new hart about to execute `reset_pc`. The cycle and
     /// instruction totals ([`Hart::cycles`], [`Hart::instret`]) are measures of the run, not
-    /// state of the core: they go on. What software reads of them does restart: `mcycle` and
-    /// `minstret` read 0 after a reset, as on a new hart, and so does the vendor's counter. The
-    /// decode cache is rebuilt, so its statistics ([`Hart::decode_cache_stats`]) restart at zero
-    /// too.
+    /// state of the core: they go on. The decode cache is rebuilt, so its statistics
+    /// ([`Hart::decode_cache_stats`]) restart at zero too.
+    ///
+    /// ASSUMPTION: what software reads of the counters restarts with the core: `mcycle` and
+    /// `minstret` read 0 after a reset, as on a new hart, and so does the vendor's performance
+    /// counter `mpccr`. Nothing establishes it. The architecture leaves the reset value of
+    /// `mcycle` and `minstret` arbitrary, and the TRM does not list the two among the CSRs of
+    /// this core (§1.4.1, as quoted in report IR §2.1); the reset of `mpccr` with the core is
+    /// "not established; ASSUMED" (report IR §4.2), on the strength of log timestamps that are
+    /// small after a restart in every log seen (report IR §7 question 7). Reading `mpccr` at the
+    /// first instruction after a CPU reset on a real chip settles it.
     ///
     /// ASSUMPTION: a reset clears the integer registers. The architecture leaves them undefined;
     /// the mask ROM writes every register it reads, so no measured boot tells the difference. A

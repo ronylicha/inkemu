@@ -226,7 +226,7 @@ pub(crate) fn accepted() -> Vec<Accepted> {
 /// `RESET_CAUSE_PROCPU`, bits [5:0] of `RESET_STATE` (`soc/reset_reasons.h`).
 const RESET_CAUSE_MASK: u32 = 0x3F;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RtcCntl {
     /// Whether the chip boots from flash: the strapping the flash-boot protection depends on.
     flash_boot: bool,

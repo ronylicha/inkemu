@@ -295,7 +295,7 @@ fn earlier(a: Option<Cycles>, b: Option<Cycles>) -> Option<Cycles> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Timg {
     group: Group,
     /// Whether the chip boots from flash: the strapping the flash-boot protection depends on.

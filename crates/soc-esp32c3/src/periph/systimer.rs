@@ -118,7 +118,7 @@ struct Comparator {
     next: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Systimer {
     conf: u32,
     units: [Unit; UNITS],

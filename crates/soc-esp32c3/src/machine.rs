@@ -253,8 +253,8 @@ impl Esp32C3 {
                 }
                 StepOutcome::Interrupted { cause } => {
                     // The CPU took the line: the controller marks the edge it had latched for it as
-                    // claimed (the latch stays until the firmware's `CPU_INT_CLEAR` toggle
-                    // releases it), and the lines are evaluated again.
+                    // claimed (the latch stays until the firmware writes `CPU_INT_CLEAR` with
+                    // the bit of the line set), and the lines are evaluated again.
                     self.bus.periph.intmatrix.claim(cause);
                     self.bus.ctx.interrupts_changed();
                 }
@@ -1427,8 +1427,13 @@ mod tests {
     const SECOND_NS: u64 = 1_000_000_000;
     /// `SYSTIMER.CONF`: its reset value with `TARGET0_WORK_EN`, bit 24 (`systimer_ll_enable_alarm`).
     const SYSTIMER_ALARM0_ON: u32 = 0x4600_0000 | (1 << 24);
-    /// More CPU cycles than any of the device-time tests executes: their limit is the time.
+    /// More CPU cycles than any device-time test whose CPU sleeps executes: its limit is the time.
     const NO_CYCLE_LIMIT: Cycles = Cycles(1_000_000_000);
+    /// The cycle limit of the device-time tests whose CPU executes without end, all of them
+    /// limited to a millisecond or less: five times the 20 000 cycles a millisecond holds at the
+    /// 20 MHz of the reset clock. A correct run never reaches it, and a run the time limit fails
+    /// to stop ends at once on it.
+    const BUSY_CYCLE_LIMIT: Cycles = Cycles(100_000);
 
     /// What two runs must agree on to be the same run.
     fn state(m: &Esp32C3) -> (Cycles, Cycles, u32, u64, Option<u64>, bool) {
@@ -1568,7 +1573,7 @@ mod tests {
         };
         let mut whole = traced(&[HANG]);
         assert_eq!(
-            whole.run_within(NO_CYCLE_LIMIT, Some(MILLISECOND_NS)),
+            whole.run_within(BUSY_CYCLE_LIMIT, Some(MILLISECOND_NS)),
             StopReason::TimeBudget
         );
         let now = whole.bus.ctx.now().get();
@@ -1619,7 +1624,7 @@ mod tests {
     fn when_both_limits_are_reached_at_the_same_boundary_the_cycle_limit_is_reported() {
         let mut by_time = machine(&[HANG]);
         assert_eq!(
-            by_time.run_within(NO_CYCLE_LIMIT, Some(MILLISECOND_NS)),
+            by_time.run_within(BUSY_CYCLE_LIMIT, Some(MILLISECOND_NS)),
             StopReason::TimeBudget
         );
         let boundary = by_time.cycles();
@@ -1643,7 +1648,7 @@ mod tests {
     fn a_device_time_limit_of_zero_stops_before_the_first_instruction() {
         let mut m = machine(&[HANG]);
         assert_eq!(
-            m.run_within(NO_CYCLE_LIMIT, Some(0)),
+            m.run_within(BUSY_CYCLE_LIMIT, Some(0)),
             StopReason::TimeBudget
         );
         assert_eq!((m.cycles(), m.pc()), (Cycles(0), ROM_BASE));
@@ -1867,6 +1872,17 @@ mod tests {
         machine(&with_vectors(&body))
     }
 
+    /// What `route("CPU_INTR_FROM_CPU_0_MAP", 3)` wrote into the interrupt controller, read
+    /// back: the line enables, the map register of the source and the priority of line 3. Only
+    /// the first of the two passes writes them.
+    fn routing_of_line_3(m: &mut Esp32C3) -> (u32, u32, u32) {
+        (
+            bus_word(m, reg("INTERRUPT_CORE0", "CPU_INT_ENABLE")),
+            bus_word(m, reg("INTERRUPT_CORE0", "CPU_INTR_FROM_CPU_0_MAP")),
+            bus_word(m, reg("INTERRUPT_CORE0", "CPU_INT_PRI_3")),
+        )
+    }
+
     #[test]
     fn a_line_selected_before_a_cpu_reset_becomes_visible_four_cpu_cycles_after_it() {
         let mut m = a_line_pending_across_a_cpu_reset(true);
@@ -1898,6 +1914,11 @@ mod tests {
             bus_word(&mut m, reg("INTERRUPT_CORE0", "CPU_INT_EIP_STATUS")),
             1 << 3,
             "the source is still raised"
+        );
+        assert_eq!(
+            routing_of_line_3(&mut m),
+            (1 << 3, 3, 1),
+            "the controller keeps what the first pass wrote: enable, map, priority"
         );
         assert_eq!(
             m.hart.x[1], 1,
@@ -1953,6 +1974,11 @@ mod tests {
                 ),
                 (0, 0),
                 "{cause:#x}: the source and the line"
+            );
+            assert_eq!(
+                routing_of_line_3(&mut m),
+                (0, 0, 0),
+                "{cause:#x}: the controller is rebuilt: enable, map and priority at their reset values"
             );
             assert_eq!(
                 m.hart.csr.mcause, 0,
@@ -2210,13 +2236,23 @@ mod tests {
     /// software interrupt of higher priority (line 3), a main loop that writes a byte to UART0
     /// and sleeps in `wfi` until the next tick, and the watchdogs of the reset values left on, so
     /// that the chip is reset at 1.3 s, 2.6 s and 2.94 s and starts again each time.
-    fn a_ticking_firmware_under_the_reset_watchdogs() -> Vec<u32> {
+    ///
+    /// The first and the third reset find the CPU asleep. The second finds it executing: the
+    /// life that follows the first reset (a count of the lives, kept in RAM, tells it which one
+    /// it is) stops sleeping [`TickingFirmware::BUSY_AFTER`] ticks after its start, two
+    /// milliseconds before its watchdog, and counts in a loop the ticks go on interrupting.
+    fn a_ticking_firmware_under_the_reset_watchdogs() -> TickingFirmware {
         const TICK: u8 = 4;
         const SOFTWARE: u8 = 3;
         // 6 400 counts of the 16 MHz counter. A byte takes 347 us to leave at the reset baud rate
         // and clock: one byte a tick, and none waits for the one before it.
         const PERIOD: u32 = 6_400;
+        /// The lives before this one, kept across the resets.
+        const LIVES: u32 = SRAM_DBUS_BASE + 0x100;
         let (page, value) = (28, 29);
+        // 0 in the life that follows the first reset; the ticks left before it stops sleeping;
+        // what its busy loop counts.
+        let (not_the_second_life, ticks_left, count) = (27, 30, 31);
         let split = |addr: u32| {
             let upper = addr.wrapping_add(0x800) & 0xFFFF_F000;
             (upper, addr.wrapping_sub(upper).cast_signed())
@@ -2224,7 +2260,19 @@ mod tests {
         let (clear, clear_offset) = split(reg("SYSTIMER", "INT_CLR"));
         let (software, software_offset) = split(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"));
         let (uart, uart_offset) = split(UART0);
+        let (lives, lives_offset) = split(LIVES);
+        let (ticks_upper, ticks_lower) = split(TickingFirmware::BUSY_AFTER);
         let mut body = vec![lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)];
+        // A reset clears the registers and keeps the RAM.
+        body.extend([
+            lui(T0, lives),
+            lw(T1, T0, lives_offset),
+            addi(not_the_second_life, T1, -1),
+            addi(T1, T1, 1),
+            sw(T1, T0, lives_offset),
+            lui(ticks_left, ticks_upper),
+            addi(ticks_left, ticks_left, ticks_lower),
+        ]);
         for (register, setting) in [
             ("SYSTIMER_TARGET0_INT_MAP", u32::from(TICK)),
             ("CPU_INTR_FROM_CPU_0_MAP", u32::from(SOFTWARE)),
@@ -2243,14 +2291,21 @@ mod tests {
         body.extend(store_register(reg("SYSTIMER", "INT_ENA"), 1));
         body.extend(store_register(reg("SYSTIMER", "CONF"), SYSTIMER_ALARM0_ON));
         body.push(csrrwi(0, MSTATUS, MSTATUS_MIE));
-        // The main loop: a byte, then sleep until an interrupt; back to the byte.
+        // The main loop: a byte, then sleep until an interrupt; back to the byte. The life that
+        // follows the first reset leaves it once its ticks are counted down, for a loop that
+        // only counts.
         body.extend([
             lui(10, uart),
             addi(11, 0, i32::from(b'.')),
             sw(11, 10, uart_offset),
             wfi(),
-            jal(0, -8),
+            cpu_rv32::asm::bne(not_the_second_life, 0, -12),
+            cpu_rv32::asm::blt(0, ticks_left, -16),
+            addi(count, count, 1),
+            jal(0, -4),
         ]);
+        let end = ROM_BASE + 4 * u32::try_from(body.len()).unwrap();
+        let (after_the_wfi, busy_loop) = (end - 16, end - 8..end);
         let mut program = with_vectors(&body);
         let table = ((VECTORS - ROM_BASE) / 4) as usize;
         let handler_after = |program: &[u32], line: u8| {
@@ -2259,12 +2314,13 @@ mod tests {
                 4 * i32::try_from(program.len() - (table + usize::from(line))).unwrap(),
             )
         };
-        // The tick: acknowledge the alarm, raise the software interrupt, return.
+        // The tick: acknowledge the alarm, count it, raise the software interrupt, return.
         program[table + usize::from(TICK)] = handler_after(&program, TICK);
         program.extend([
             lui(page, clear),
             addi(value, 0, 1),
             sw(value, page, clear_offset),
+            addi(ticks_left, ticks_left, -1),
             lui(page, software),
             sw(value, page, software_offset),
             cpu_rv32::asm::mret(),
@@ -2276,7 +2332,27 @@ mod tests {
             sw(0, page, software_offset),
             cpu_rv32::asm::mret(),
         ]);
-        program
+        TickingFirmware {
+            program,
+            after_the_wfi,
+            busy_loop,
+        }
+    }
+
+    /// The program of [`a_ticking_firmware_under_the_reset_watchdogs`] and the two places a
+    /// reset can find it at.
+    struct TickingFirmware {
+        program: Vec<u32>,
+        /// Where the PC of a sleeping CPU stands: the instruction after the `wfi`.
+        after_the_wfi: u32,
+        /// The loop the life that follows the first reset ends in.
+        busy_loop: std::ops::Range<u32>,
+    }
+
+    impl TickingFirmware {
+        /// Ticks of 400 us after which the life that follows the first reset stops sleeping:
+        /// 1.298 s, five ticks before the watchdog that resets it at 1.3 s.
+        const BUSY_AFTER: u32 = 3_245;
     }
 
     /// Everything a run leaves behind that a caller can see.
@@ -2299,7 +2375,7 @@ mod tests {
     /// Runs the ticking firmware to `total` cycles in calls of `slice` cycles, taking the console
     /// after each call as a front end does.
     fn tick_in_calls_of(slice: u64, total: u64) -> Outcome {
-        let mut m = traced(&a_ticking_firmware_under_the_reset_watchdogs());
+        let mut m = traced(&a_ticking_firmware_under_the_reset_watchdogs().program);
         let (mut console_bytes, mut journal) = (0, Vec::new());
         // A call that returns `CycleBudget` has run to its limit; one that returns `Asleep` has
         // slept through a second of device time, and the run lasts under four: 64 of those is
@@ -2346,23 +2422,49 @@ mod tests {
 
     #[test]
     fn a_run_with_interrupts_sleeps_output_and_resets_is_the_same_however_it_is_cut_into_calls() {
-        // This firmware sleeps most of each tick and executes about 65 000 cycles in a second of
-        // device time: 210 000 cycles are a little over three seconds, past the three resets and
-        // into a fourth life.
-        const TOTAL: u64 = 210_000;
+        // This firmware sleeps most of each tick and executes about 70 000 cycles in a second of
+        // device time, and 40 000 more in the two milliseconds its second life is busy: 260 000
+        // cycles are a little over three seconds, past the three resets and into a fourth life.
+        const TOTAL: u64 = 260_000;
         let whole = tick_in_calls_of(u64::MAX, TOTAL);
         assert_eq!(whole.resets, 3, "the two watchdogs, as on a blank chip");
+        assert!(
+            whole.device_time > Cycles(3 * clock::SECOND),
+            "into the fourth life: {:?}",
+            whole.device_time
+        );
         assert!(whole.trace_hash.is_some());
         assert!(
             whole.console_bytes > 7_000,
             "a byte a tick for three seconds: {} bytes",
             whole.console_bytes
         );
+        // The journal is the resets and nothing else, each with the place it found the CPU at:
+        // asleep after the `wfi` at 1.3 s and at 2.94 s, executing its busy loop at 2.6 s.
+        let firmware = a_ticking_firmware_under_the_reset_watchdogs();
+        let resets: Vec<(u32, &str)> = whole
+            .journal
+            .iter()
+            .map(|entry| match entry {
+                Diagnostic::Reset { cause, pc, .. } if *pc == firmware.after_the_wfi => {
+                    (cause.code(), "asleep")
+                }
+                Diagnostic::Reset { cause, pc, .. } if firmware.busy_loop.contains(pc) => {
+                    (cause.code(), "executing")
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
         assert_eq!(
-            whole.journal.len(),
-            2,
-            "the resets, and nothing else: {:?}",
+            resets,
+            [(0x07, "asleep"), (0x07, "executing"), (0x10, "asleep")],
+            "{:?}",
             whole.journal
+        );
+        assert_eq!(
+            whole.repeated,
+            [],
+            "no reset found the CPU where another had"
         );
         for slice in [1, 7, 1_000] {
             assert_eq!(

@@ -86,7 +86,7 @@ const BITS_PER_BYTE: u64 = 10;
 /// Device time is kept in sixteenths of a time-base cycle here: a bit lasts a whole number of them.
 const SUBCYCLES: u64 = 16;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Uart {
     /// 0 for UART0, 1 for UART1: named in diagnostics.
     index: u8,

@@ -108,10 +108,9 @@ pub enum Event {
 /// The wake-up a device keeps for its next deadline.
 ///
 /// One deadline stands for at most one wake-up in the scheduler, which only it can withdraw. It
-/// is not `Copy` for that reason: a copy that armed again would leave the wake-up of the other
-/// live and tracked by nobody. A device that is cloned (the device models are `Clone`) must not
-/// go on using both clones with one context.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// is neither `Copy` nor `Clone` for that reason, and nor is a device that holds one: a second
+/// handle that armed again would leave the wake-up of the first live and tracked by nobody.
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct Deadline {
     armed: Option<(Cycles, EventId)>,
 }
