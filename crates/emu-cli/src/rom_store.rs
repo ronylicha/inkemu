@@ -18,6 +18,7 @@ use crate::term::sanitize;
 use etcetera::app_strategy::AppStrategy as _;
 use sha2::{Digest, Sha256};
 use soc_esp32c3::{ChipRevision, RomError, RomImage};
+use std::cell::RefCell;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -76,6 +77,8 @@ pub const ESP32C3_ROMS: [RomEntry; 3] = [
 const MAX_ELF_BYTES: u64 = 4 * 1024 * 1024;
 /// A whole download is abandoned after this long, so a stalled connection cannot hang the tool.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Size granularity of the download notice: 0.1 MB (decimal megabytes).
+const TENTH_OF_A_MEGABYTE: u64 = 100_000;
 /// Sub-directory of the user data directory that holds the cache.
 const CACHE_SUBDIR: &str = "rom";
 /// Application name under the user data directory.
@@ -113,9 +116,14 @@ pub enum RomStoreError {
         remedy: String,
     },
     #[error(
-        "{path} cannot be a ROM ELF ({reason}); replace it with the genuine file, or delete it and run `inkemu rom fetch`"
+        "{path} cannot be a ROM ELF ({reason}); replace it with the genuine file, or delete it and run `{fetch_command}`"
     )]
-    UnsuitableFile { path: String, reason: String },
+    UnsuitableFile {
+        path: String,
+        reason: String,
+        /// The `inkemu rom fetch` invocation that restores the file where it lives.
+        fetch_command: String,
+    },
     #[error(
         "cannot read the verified archive {url}: {detail}; the pinned release does not have the expected layout: report it, and supply the ROM with --rom-dir meanwhile"
     )]
@@ -175,6 +183,56 @@ impl Fetch for HttpFetch {
         let mut body = Vec::new();
         reader.read_to_end(&mut body).map_err(|e| e.to_string())?;
         Ok(body)
+    }
+}
+
+/// A [`Fetch`] that says on `log` that the archive is being downloaded, at the moment the download
+/// starts and not before: a refusal reached earlier (a tampered file, a directory that is never
+/// downloaded into) never shows the notice, since nothing is downloaded then.
+pub struct AnnouncingFetch<'a> {
+    inner: &'a dyn Fetch,
+    log: RefCell<&'a mut dyn std::io::Write>,
+    notice: String,
+}
+
+impl<'a> AnnouncingFetch<'a> {
+    /// `dir` is where the downloaded ROMs will be stored; it is only named in the notice.
+    pub fn new(
+        inner: &'a dyn Fetch,
+        log: &'a mut dyn std::io::Write,
+        archive: &RomArchive,
+        dir: &Path,
+    ) -> AnnouncingFetch<'a> {
+        // Tenths of a megabyte, in integers: the size is only shown to one decimal.
+        let tenths = archive.size / TENTH_OF_A_MEGABYTE;
+        let notice = format!(
+            "inkemu: downloading the ESP32-C3 mask ROM (esp-rom-elfs {}, {}.{} MB) into {}\n",
+            archive.release,
+            tenths / 10,
+            tenths % 10,
+            shown(dir)
+        );
+        AnnouncingFetch {
+            inner,
+            log: RefCell::new(log),
+            notice,
+        }
+    }
+}
+
+impl std::fmt::Debug for AnnouncingFetch<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnnouncingFetch")
+            .field("notice", &self.notice)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Fetch for AnnouncingFetch<'_> {
+    fn fetch(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+        // Best effort: a closed log must not turn a working download into a failure.
+        let _ = self.log.borrow_mut().write_all(self.notice.as_bytes());
+        self.inner.fetch(url, max_bytes)
     }
 }
 
@@ -310,15 +368,15 @@ fn read_present(
     entry: &RomEntry,
 ) -> Result<Option<Vec<u8>>, RomStoreError> {
     let path = source.dir().join(entry.elf_name);
-    let Some(bytes) = read_bounded(&path)? else {
-        return Ok(None);
-    };
     let provenance = match source {
         RomSource::Cache { .. } => Provenance::Cache,
         RomSource::Directory(dir) => Provenance::Directory {
             dir: shown(dir),
             release: archive.release,
         },
+    };
+    let Some(bytes) = read_bounded(&path, &provenance)? else {
+        return Ok(None);
     };
     check_elf(&bytes, entry, &path, &provenance)?;
     Ok(Some(bytes))
@@ -327,10 +385,11 @@ fn read_present(
 /// The content of the regular file at `path`, reading at most [`MAX_ELF_BYTES`] bytes; `None` when it
 /// does not exist. Anything that is not a regular file, or is longer than the bound, is refused without
 /// being hashed: the path may be a directory, a pipe that would block, or a huge file.
-fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, RomStoreError> {
+fn read_bounded(path: &Path, provenance: &Provenance) -> Result<Option<Vec<u8>>, RomStoreError> {
     let unsuitable = |reason: &str| RomStoreError::UnsuitableFile {
         path: shown(path),
         reason: reason.to_owned(),
+        fetch_command: provenance.fetch_command(),
     };
     // Checked before opening: opening a pipe would wait for a writer.
     match std::fs::metadata(path) {
@@ -471,18 +530,28 @@ fn extract_entry(
 enum Provenance {
     /// The per-user cache: deleting the file makes the next run download it again.
     Cache,
-    /// A directory the user supplied: nothing is downloaded there unless `inkemu rom fetch` is told to.
+    /// A directory the user supplied: nothing is downloaded there unless `inkemu rom fetch --rom-dir` is told to.
     Directory { dir: String, release: &'static str },
     /// The verified archive itself held something else.
     Archive,
 }
 
 impl Provenance {
+    /// The `inkemu rom fetch` invocation that restores the ROM files where they live: it runs as printed
+    /// (`--all` is mandatory without `--device`, and a user directory must be named again).
+    fn fetch_command(&self) -> String {
+        match self {
+            Provenance::Cache | Provenance::Archive => "inkemu rom fetch --all".to_owned(),
+            Provenance::Directory { dir, .. } => format!("inkemu rom fetch --all --rom-dir {dir}"),
+        }
+    }
+
     fn remedy(&self) -> String {
         match self {
             Provenance::Cache => "delete it to download it again, or point --rom-dir at a directory holding the genuine file".to_owned(),
-            Provenance::Directory { dir, release } => format!(
-                "replace it with the genuine file of esp-rom-elfs release {release}, or delete it and run `inkemu rom fetch --rom-dir {dir}`"
+            Provenance::Directory { release, .. } => format!(
+                "replace it with the genuine file of esp-rom-elfs release {release}, or delete it and run `{}`",
+                self.fetch_command()
             ),
             Provenance::Archive => "retry the download, or supply the ROM yourself with --rom-dir".to_owned(),
         }
@@ -1057,7 +1126,7 @@ mod tests {
         (body, archive, entries, elfs)
     }
 
-    fn cache_of<'a>(dir: &std::path::Path, fetch: &'a FakeFetch) -> RomSource<'a> {
+    fn cache_of<'a>(dir: &std::path::Path, fetch: &'a dyn Fetch) -> RomSource<'a> {
         RomSource::Cache {
             dir: dir.to_path_buf(),
             fetch,
@@ -1162,11 +1231,139 @@ mod tests {
         )
         .unwrap_err();
         let text = err.to_string();
+        let command = format!(
+            "`inkemu rom fetch --all --rom-dir {}`",
+            dir.path().display()
+        );
         assert!(
-            text.contains("rom fetch --rom-dir") && text.contains("esp-rom-elfs release test"),
+            text.contains(&command) && text.contains("esp-rom-elfs release test"),
             "{text}"
         );
         assert!(!text.contains("download it again"), "{text}");
+    }
+
+    #[test]
+    fn a_cache_mismatch_names_no_command_that_needs_arguments() {
+        let (_, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ELF_NAME), b"not the ROM").unwrap();
+        let fetch = FakeFetch::serving(Vec::new());
+        let err = load_elf(&cache_of(dir.path(), &fetch), &archive, &entry).unwrap_err();
+        assert!(!err.to_string().contains("inkemu rom fetch"), "{err}");
+    }
+
+    #[test]
+    fn an_unsuitable_file_in_the_cache_suggests_a_fetch_command_that_runs_as_printed() {
+        let (body, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(ELF_NAME)).unwrap();
+        let fetch = FakeFetch::serving(body);
+        let err = load_elf(&cache_of(dir.path(), &fetch), &archive, &entry).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`inkemu rom fetch --all`"), "{text}");
+        assert!(!text.contains("--rom-dir"), "{text}");
+    }
+
+    #[test]
+    fn an_unsuitable_file_in_a_user_directory_names_that_directory_in_the_fetch_command() {
+        let (_, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(ELF_NAME)).unwrap();
+        let err = load_elf(
+            &RomSource::Directory(dir.path().to_path_buf()),
+            &archive,
+            &entry,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RomStoreError::UnsuitableFile { .. }), "{err}");
+        let command = format!(
+            "`inkemu rom fetch --all --rom-dir {}`",
+            dir.path().display()
+        );
+        assert!(err.to_string().contains(&command), "{err}");
+    }
+
+    /// The text the decorator writes when the download starts, for the pinned test archive.
+    fn notice_count(log: &[u8]) -> usize {
+        String::from_utf8_lossy(log)
+            .matches("inkemu: downloading the ESP32-C3 mask ROM")
+            .count()
+    }
+
+    #[test]
+    fn the_download_notice_is_not_shown_when_a_tampered_file_stops_the_batch() {
+        let (body, archive, entries, elfs) = trio();
+        let dir = tempfile::tempdir().unwrap();
+        // rev0 missing, rev3 valid, rev101 tampered: the check refuses before any download.
+        std::fs::write(dir.path().join(entries[1].elf_name), &elfs[1]).unwrap();
+        std::fs::write(dir.path().join(entries[2].elf_name), b"tampered").unwrap();
+        let inner = FakeFetch::serving(body);
+        let mut log = Vec::new();
+        let announcing = AnnouncingFetch::new(&inner, &mut log, &archive, dir.path());
+        let all: Vec<&RomEntry> = entries.iter().collect();
+        let err = ensure_elfs(&cache_of(dir.path(), &announcing), &archive, &all).unwrap_err();
+        assert!(matches!(err, RomStoreError::ElfMismatch { .. }), "{err}");
+        assert_eq!(inner.calls.get(), 0);
+        drop(announcing);
+        assert_eq!(notice_count(&log), 0, "{}", String::from_utf8_lossy(&log));
+    }
+
+    #[test]
+    fn the_download_notice_is_shown_once_when_the_archive_is_downloaded() {
+        let (body, archive, entries, elfs) = trio();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(entries[1].elf_name), &elfs[1]).unwrap();
+        let inner = FakeFetch::serving(body);
+        let mut log = Vec::new();
+        let announcing = AnnouncingFetch::new(&inner, &mut log, &archive, dir.path());
+        let all: Vec<&RomEntry> = entries.iter().collect();
+        let loaded = ensure_elfs(&cache_of(dir.path(), &announcing), &archive, &all).unwrap();
+        assert_eq!(loaded, elfs);
+        assert_eq!(inner.calls.get(), 1);
+        drop(announcing);
+        let text = String::from_utf8_lossy(&log).into_owned();
+        assert_eq!(notice_count(&log), 1, "{text}");
+        assert!(
+            text.contains("esp-rom-elfs test") && text.contains(&dir.path().display().to_string()),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_download_notice_is_not_shown_when_every_rom_is_present() {
+        let (body, archive, entries, elfs) = trio();
+        let dir = tempfile::tempdir().unwrap();
+        for (entry, elf) in entries.iter().zip(&elfs) {
+            std::fs::write(dir.path().join(entry.elf_name), elf).unwrap();
+        }
+        let inner = FakeFetch::serving(body);
+        let mut log = Vec::new();
+        let announcing = AnnouncingFetch::new(&inner, &mut log, &archive, dir.path());
+        let all: Vec<&RomEntry> = entries.iter().collect();
+        ensure_elfs(&cache_of(dir.path(), &announcing), &archive, &all).unwrap();
+        assert_eq!(inner.calls.get(), 0);
+        drop(announcing);
+        assert!(log.is_empty(), "{}", String::from_utf8_lossy(&log));
+    }
+
+    #[test]
+    fn the_download_notice_precedes_a_failed_download() {
+        let (_, archive, entry) = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let inner = FakeFetch {
+            body: Err("dns error".into()),
+            calls: Cell::new(0),
+        };
+        let mut log = Vec::new();
+        let announcing = AnnouncingFetch::new(&inner, &mut log, &archive, dir.path());
+        let err = load_elf(&cache_of(dir.path(), &announcing), &archive, &entry).unwrap_err();
+        assert!(matches!(err, RomStoreError::Download { .. }), "{err}");
+        drop(announcing);
+        assert_eq!(
+            notice_count(&log),
+            1,
+            "a download was attempted, so it was announced"
+        );
     }
 
     #[test]
@@ -1207,7 +1404,10 @@ mod tests {
         let fetch = FakeFetch::serving(body);
         let err = load_elf(&cache_of(dir.path(), &fetch), &archive, &entry).unwrap_err();
         assert!(matches!(err, RomStoreError::UnsuitableFile { .. }), "{err}");
-        assert!(err.to_string().contains("rom fetch"), "{err}");
+        assert!(
+            err.to_string().contains("`inkemu rom fetch --all`"),
+            "{err}"
+        );
         assert_eq!(fetch.calls.get(), 0);
     }
 

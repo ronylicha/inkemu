@@ -53,7 +53,10 @@ fn tampered_rom_is_refused_before_anything_runs() {
         .stderr(
             contains("expected sha256 19ac22e0")
                 .and(contains("got "))
-                .and(contains("rom fetch"))
+                .and(contains(format!(
+                    "`inkemu rom fetch --all --rom-dir {}`",
+                    dir.path().display()
+                )))
                 .and(contains("download it again").not()),
         );
 }
@@ -77,6 +80,32 @@ fn run_help_lists_every_exit_code() {
 #[test]
 fn rom_fetch_requires_a_device_or_all() {
     inkemu().args(["rom", "fetch"]).assert().code(2);
+}
+
+/// The command the error messages print (`inkemu rom fetch --all --rom-dir <dir>`) must be accepted by the
+/// argument parser. A tampered file present in the directory is refused before any download, so this
+/// stays off the network.
+#[test]
+fn the_fetch_command_suggested_for_a_user_directory_is_accepted_and_refuses_a_tampered_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("esp32c3_rev3_rom.elf"), b"not the ROM").unwrap();
+    inkemu()
+        .args(["rom", "fetch", "--all", "--rom-dir"])
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            contains("expected sha256 19ac22e0")
+                .and(contains("got "))
+                .and(contains("downloading").not())
+                .and(contains("Usage:").not()),
+        );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "nothing was downloaded or written"
+    );
 }
 
 #[test]

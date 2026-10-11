@@ -3,7 +3,9 @@ use boards::{DeviceProfile, MachineOptions};
 use clap::{Parser, Subcommand};
 use cpu_rv32::{HartConfig, MisalignedPolicy};
 use emu_cli::exit::{EXIT_ERROR, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
-use emu_cli::rom_store::{self, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource};
+use emu_cli::rom_store::{
+    self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
+};
 use emu_cli::run::{RunOptions, execute, relay};
 use emu_cli::rvtest::{RunResult, TestMachine};
 use emu_cli::term::sanitize;
@@ -13,9 +15,6 @@ use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-
-/// Size granularity of the download notice: 0.1 MB (decimal megabytes).
-const TENTH_OF_A_MEGABYTE: u64 = 100_000;
 
 #[derive(Parser)]
 #[command(
@@ -184,29 +183,6 @@ fn profile_for(id: &str) -> Result<DeviceProfile, boards::ProfileError> {
     })
 }
 
-/// Says on standard error that the archive is about to be downloaded, when the cache lacks at least
-/// one of `entries`. It is said once however many files are missing: the archive is downloaded once.
-fn announce_download(source: &RomSource<'_>, entries: &[&RomEntry]) {
-    let RomSource::Cache { dir, .. } = source else {
-        return;
-    };
-    if entries
-        .iter()
-        .all(|entry| dir.join(entry.elf_name).exists())
-    {
-        return;
-    }
-    // Tenths of a megabyte, in integers: the size is only shown to one decimal.
-    let tenths = ESP_ROM_ELFS.size / TENTH_OF_A_MEGABYTE;
-    eprintln!(
-        "inkemu: downloading the ESP32-C3 mask ROM (esp-rom-elfs {}, {}.{} MB) into {}",
-        ESP_ROM_ELFS.release,
-        tenths / 10,
-        tenths % 10,
-        sanitize(&dir.display().to_string())
-    );
-}
-
 fn run_device(
     device: &str,
     rom_dir: Option<PathBuf>,
@@ -218,17 +194,24 @@ fn run_device(
         Err(e) => return fail(&e),
     };
     let entry = rom_store::rom_entry_for(profile.chip_revision);
-    let fetch = HttpFetch;
+    let http = HttpFetch;
+    let mut stderr = io::stderr();
+    let announcing;
     // An explicit directory is read only; without one the cache downloads on first use.
     let source = match rom_dir {
-        Some(dir) => Ok(RomSource::Directory(dir)),
-        None => rom_store::default_cache_dir().map(|dir| RomSource::Cache { dir, fetch: &fetch }),
+        Some(dir) => RomSource::Directory(dir),
+        None => match rom_store::default_cache_dir() {
+            Ok(dir) => {
+                announcing = AnnouncingFetch::new(&http, &mut stderr, &ESP_ROM_ELFS, &dir);
+                RomSource::Cache {
+                    dir,
+                    fetch: &announcing,
+                }
+            }
+            Err(e) => return fail(&e),
+        },
     };
-    let rom = source.and_then(|source| {
-        announce_download(&source, &[entry]);
-        rom_store::load_rom(&source, &ESP_ROM_ELFS, entry)
-    });
-    let rom = match rom {
+    let rom = match rom_store::load_rom(&source, &ESP_ROM_ELFS, entry) {
         Ok(rom) => rom,
         Err(e) => return fail(&e),
     };
@@ -260,23 +243,41 @@ fn header(profile: &DeviceProfile, entry: &RomEntry, machine: &soc_esp32c3::Esp3
     )
 }
 
+/// The ROM entries a `rom fetch` invocation asks for. clap already refuses the two invalid
+/// combinations; refusing again keeps `--all`'s download from ever being the default.
+fn select_roms(device: Option<&str>, all: bool) -> Result<Vec<&'static RomEntry>, String> {
+    match (device, all) {
+        (Some(id), false) => profile_for(id)
+            .map(|profile| vec![rom_store::rom_entry_for(profile.chip_revision)])
+            .map_err(|e| e.to_string()),
+        (None, true) => Ok(ESP32C3_ROMS.iter().collect()),
+        (Some(_), true) => Err(
+            "--device and --all were both given; pass --device <id> to fetch one ROM, or --all to fetch every ROM, not both"
+                .to_owned(),
+        ),
+        (None, false) => Err(
+            "neither --device nor --all was given; pass --device <id> to fetch one ROM or --all to fetch every ROM"
+                .to_owned(),
+        ),
+    }
+}
+
 fn run_rom_fetch(device: Option<&str>, all: bool, rom_dir: Option<PathBuf>) -> ExitCode {
-    let entries: Vec<&RomEntry> = match (device, all) {
-        (Some(id), false) => match profile_for(id) {
-            Ok(profile) => vec![rom_store::rom_entry_for(profile.chip_revision)],
-            Err(e) => return fail(&e),
-        },
-        (None, true) => ESP32C3_ROMS.iter().collect(),
-        // clap already refuses these; refusing again keeps `--all`'s download from being the default.
-        (Some(_), true) | (None, false) => return fail(&"pass either --device <id> or --all"),
+    let entries = match select_roms(device, all) {
+        Ok(entries) => entries,
+        Err(message) => return fail(&message),
     };
-    let fetch = HttpFetch;
+    let http = HttpFetch;
+    let mut stderr = io::stderr();
     let dir = match rom_dir.map_or_else(rom_store::default_cache_dir, Ok) {
         Ok(dir) => dir,
         Err(e) => return fail(&e),
     };
-    let source = RomSource::Cache { dir, fetch: &fetch };
-    announce_download(&source, &entries);
+    let announcing = AnnouncingFetch::new(&http, &mut stderr, &ESP_ROM_ELFS, &dir);
+    let source = RomSource::Cache {
+        dir,
+        fetch: &announcing,
+    };
     if let Err(e) = rom_store::ensure_elfs(&source, &ESP_ROM_ELFS, &entries) {
         return fail(&e);
     }
@@ -393,5 +394,40 @@ fn run_rvtest(
             );
             ExitCode::from(EXIT_ERROR)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selecting_no_rom_states_the_cause_then_the_remedy() {
+        let Err(message) = select_roms(None, false) else {
+            panic!("no selection must be refused")
+        };
+        assert_eq!(
+            message,
+            "neither --device nor --all was given; pass --device <id> to fetch one ROM or --all to fetch every ROM"
+        );
+    }
+
+    #[test]
+    fn selecting_a_device_and_all_states_the_cause_then_the_remedy() {
+        let Err(message) = select_roms(Some("x4"), true) else {
+            panic!("a double selection must be refused")
+        };
+        let (cause, remedy) = message.split_once("; ").expect("cause; remedy");
+        assert!(cause.contains("--device and --all"), "{message}");
+        assert!(
+            remedy.contains("--device <id>") && remedy.contains("--all"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn selecting_all_yields_the_three_roms_and_a_device_yields_one() {
+        assert_eq!(select_roms(None, true).map(|roms| roms.len()), Ok(3));
+        assert_eq!(select_roms(Some("x4"), false).map(|roms| roms.len()), Ok(1));
     }
 }
