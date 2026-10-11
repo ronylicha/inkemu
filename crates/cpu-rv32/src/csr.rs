@@ -29,6 +29,10 @@ pub const MSTATUS_MPIE: u32 = 1 << 7;
 /// MPP is hard-wired to machine mode (0b11): this hart has no lower privilege mode in scope.
 pub const MSTATUS_MPP_M: u32 = 0b11 << 11;
 const MSTATUS_WRITABLE: u32 = MSTATUS_MIE | MSTATUS_MPIE;
+/// `mtvec.MODE` = 1, vectored.
+const MTVEC_VECTORED: u32 = 1;
+/// The bits of `mtvec` below `BASE` on the ESP32-C3 core.
+const MTVEC_C3_LOW: u32 = 0xFF;
 /// MXL=1 (32-bit) | C | I | M.
 const MISA_RV32IMC: u32 = (1 << 30) | (1 << 2) | (1 << 8) | (1 << 12);
 /// CSR addresses whose bits [11:10] are 0b11 are read-only (Privileged spec §2.1).
@@ -76,6 +80,10 @@ impl CsrFile {
     #[must_use]
     pub fn new(vendor: VendorCsrs) -> CsrFile {
         CsrFile {
+            mtvec: match vendor {
+                VendorCsrs::None => 0,
+                VendorCsrs::Esp32C3 => MTVEC_VECTORED,
+            },
             vendor: match vendor {
                 VendorCsrs::None => None,
                 VendorCsrs::Esp32C3 => Some(Esp32C3Csrs::default()),
@@ -131,6 +139,11 @@ impl CsrFile {
             // `mip` pending bits are driven by the interrupt controller, not by software;
             // `misa` is WARL: writes are ignored, the ISA is fixed.
             MIP | MISA => {}
+            // The ESP32-C3 core only has the vectored mode: `MODE` reads 1, `BASE` is bits 31:8
+            // (TRM §1.5.2, register 1.7; report IR §2.1).
+            // ASSUMPTION: bits 7:2 read 0. The TRM draws `BASE` as [31:8] and says nothing of the
+            // bits below it; every value the ROM and ESP-IDF write has them clear.
+            MTVEC if self.vendor.is_some() => self.mtvec = (value & !MTVEC_C3_LOW) | MTVEC_VECTORED,
             MTVEC => self.mtvec = value & !0b10, // modes 0 (direct) and 1 (vectored) only
             MSCRATCH => self.mscratch = value,
             MEPC => self.mepc = value & !1,
@@ -295,6 +308,37 @@ mod tests {
         assert!(csr.write(MCYCLE, 50));
         csr.on_instruction_retired(5);
         assert_eq!(csr.read(MCYCLE, Cycles(5), 1), Some(55));
+    }
+
+    #[test]
+    fn the_esp32_c3_mtvec_is_vectored_only_with_a_256_byte_aligned_base() {
+        // IR §2.2: the ROM writes 0x40001D00 and reads back 0x40001D01; the application writes
+        // 0x40380001.
+        let mut csr = CsrFile::new(VendorCsrs::Esp32C3);
+        assert_eq!(
+            csr.read(MTVEC, Cycles::ZERO, 0),
+            Some(1),
+            "vectored at reset"
+        );
+        assert!(csr.write(MTVEC, 0x4000_1D00));
+        assert_eq!(csr.read(MTVEC, Cycles::ZERO, 0), Some(0x4000_1D01));
+        assert!(csr.write(MTVEC, 0x4038_0001));
+        assert_eq!(csr.read(MTVEC, Cycles::ZERO, 0), Some(0x4038_0001));
+        assert!(csr.write(MTVEC, 0x4038_00FE));
+        assert_eq!(
+            csr.read(MTVEC, Cycles::ZERO, 0),
+            Some(0x4038_0001),
+            "the bits under the base read 0, the mode reads 1"
+        );
+        // The generic core keeps the two standard modes.
+        let mut generic = CsrFile::new(VendorCsrs::None);
+        assert_eq!(generic.read(MTVEC, Cycles::ZERO, 0), Some(0));
+        assert!(generic.write(MTVEC, 0x1000));
+        assert_eq!(
+            generic.read(MTVEC, Cycles::ZERO, 0),
+            Some(0x1000),
+            "direct mode"
+        );
     }
 
     #[test]

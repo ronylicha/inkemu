@@ -76,6 +76,7 @@ impl Esp32C3 {
         let hart_config = HartConfig {
             misaligned: MisalignedPolicy::Allow,
             vendor_csrs: VendorCsrs::Esp32C3,
+            ..HartConfig::default()
         };
         let mut bus = SocBus::new(rom, flash, config);
         let (sysclk_conf, cpu_per_conf) = bus.periph.system.clock_registers();

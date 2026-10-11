@@ -26,11 +26,29 @@ pub enum MisalignedPolicy {
     Allow,
 }
 
+/// Where the hart's interrupts come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum InterruptModel {
+    /// The privileged specification: a line is taken when its bit is set in both `mip` and `mie`
+    /// (the default).
+    #[default]
+    Standard,
+    /// An interrupt controller outside the hart selects at most one line and presents it with
+    /// [`Hart::set_external_interrupt`]. `mie` and `mip` are plain read/write CSRs that gate
+    /// nothing; `mstatus.MIE` still does.
+    ///
+    /// ASSUMPTION: on the ESP32-C3, `mie` and `mip` are plain registers, and `wfi` ends when a
+    /// line is presented even with `mstatus.MIE` clear (decisions E3 and E4). Neither is
+    /// documented (report IR §7, questions 4 and 5); a probe on a real chip settles both.
+    Controller,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct HartConfig {
     pub misaligned: MisalignedPolicy,
     /// Which vendor's CSRs the hart implements besides the machine-mode ones.
     pub vendor_csrs: VendorCsrs,
+    pub interrupts: InterruptModel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +72,8 @@ pub struct Hart {
     pub instret: u64,
     pub config: HartConfig,
     pub(crate) waiting: bool,
+    /// The line an outside controller presents ([`InterruptModel::Controller`]).
+    pub(crate) external: Option<u32>,
     pub(crate) dcache: DecodeCache,
 }
 
@@ -68,8 +88,40 @@ impl Hart {
             instret: 0,
             config,
             waiting: false,
+            external: None,
             dcache: DecodeCache::new(),
         }
+    }
+
+    /// Resets the hart: registers, CSRs (the PMP entries and their lock bits with them) and
+    /// decoded instructions are those of a new hart about to execute `reset_pc`. The cycle and
+    /// instruction totals are measures of the run, not state of the core: they go on.
+    ///
+    /// ASSUMPTION: a reset clears the integer registers. The architecture leaves them undefined;
+    /// the mask ROM writes every register it reads, so no measured boot tells the difference.
+    pub fn reset(&mut self, reset_pc: u32) {
+        self.x = [0; 32];
+        self.pc = reset_pc;
+        self.csr = CsrFile::new(self.config.vendor_csrs);
+        self.waiting = false;
+        self.external = None;
+        self.dcache = DecodeCache::new();
+    }
+
+    /// Presents the line an outside interrupt controller selected, `None` when it selects none.
+    /// Only used with [`InterruptModel::Controller`]; `line` must be lower than 32.
+    pub fn set_external_interrupt(&mut self, line: Option<u32>) {
+        debug_assert!(
+            line.is_none_or(|line| line < 32),
+            "interrupt line out of range"
+        );
+        self.external = line;
+    }
+
+    /// Whether the hart is parked in `wfi`.
+    #[must_use]
+    pub const fn is_waiting(&self) -> bool {
+        self.waiting
     }
 
     /// `(hits, misses)` of the decoded-instruction cache, for performance reporting.
@@ -89,23 +141,27 @@ impl Hart {
         }
     }
 
-    /// Highest-numbered line that is pending and enabled (`ESP32-C3` priorities are applied by the `SoC` in `SP1b`).
+    /// The line to take: the highest-numbered one that is pending and enabled in the CSRs, or the
+    /// one an outside controller presents.
     fn pending_line(&self) -> Option<u32> {
-        let ready = self.csr.mip & self.csr.mie;
-        ready.checked_ilog2()
+        match self.config.interrupts {
+            InterruptModel::Standard => (self.csr.mip & self.csr.mie).checked_ilog2(),
+            InterruptModel::Controller => self.external,
+        }
     }
 
     /// Executes one instruction, or takes one pending interrupt, or reports that the hart is waiting.
     pub fn step(&mut self, bus: &mut dyn Bus, timing: &dyn TimingModel) -> StepOutcome {
+        let pending = self.pending_line();
         if self.waiting {
-            if self.csr.mip & self.csr.mie == 0 {
+            if pending.is_none() {
                 return StepOutcome::Waiting;
             }
             // wfi resumes on any enabled pending interrupt, even when mstatus.MIE masks it.
             self.waiting = false;
         }
         if self.csr.mstatus & MSTATUS_MIE != 0
-            && let Some(line) = self.pending_line()
+            && let Some(line) = pending
         {
             self.enter_trap(MCAUSE_INTERRUPT | line, 0);
             return StepOutcome::Interrupted { cause: line };
@@ -918,6 +974,114 @@ mod tests {
         ]);
         run(&mut hart, &mut ram, 5);
         assert_eq!(hart.x[6] - hart.x[5], 2);
+    }
+
+    /// A hart whose interrupts come from an outside controller, as on the ESP32-C3.
+    fn controller_machine(program: &[u32]) -> (Hart, Ram) {
+        let (_, ram) = c3_machine(program);
+        let config = HartConfig {
+            vendor_csrs: VendorCsrs::Esp32C3,
+            interrupts: InterruptModel::Controller,
+            ..HartConfig::default()
+        };
+        (Hart::new(0, config), ram)
+    }
+
+    #[test]
+    fn a_line_presented_by_the_controller_is_taken_whatever_mie_and_mip_say() {
+        // IR §2.4: on the ESP32-C3 `mie` gates nothing; §3.3: the first interrupt of the
+        // reference application is line 3, vector `mtvec.BASE + 12`, `mcause` 0x80000003.
+        let (mut h, mut m) = controller_machine(&[addi(1, 0, 1), addi(1, 1, 1)]);
+        assert!(h.csr.write(MTVEC, 0x800));
+        assert!(h.csr.write(MSTATUS, MSTATUS_MIE));
+        assert_eq!(h.csr.mie, 0, "no line is enabled in `mie`");
+        run(&mut h, &mut m, 1);
+        h.set_external_interrupt(Some(3));
+        assert_eq!(
+            h.step(&mut m, &OneCycle),
+            StepOutcome::Interrupted { cause: 3 }
+        );
+        assert_eq!(h.pc, 0x800 + 4 * 3);
+        assert_eq!(h.csr.mcause, 0x8000_0003);
+        assert_eq!(h.csr.mepc, 4);
+        assert_eq!(h.csr.mip, 0, "`mip` is not driven by the controller");
+        // `mstatus.MIE` is cleared on entry: the line stays presented and is not taken again.
+        h.pc = 4;
+        assert!(matches!(
+            h.step(&mut m, &OneCycle),
+            StepOutcome::Retired { .. }
+        ));
+        // Bits of `mip` and `mie` alone raise nothing.
+        h.set_external_interrupt(None);
+        assert!(h.csr.write(MSTATUS, MSTATUS_MIE));
+        assert!(h.csr.write(MIE, 1 << 7));
+        h.set_interrupt_pending(7, true);
+        h.pc = 0;
+        assert!(matches!(
+            h.step(&mut m, &OneCycle),
+            StepOutcome::Retired { .. }
+        ));
+    }
+
+    #[test]
+    fn wfi_ends_when_the_controller_presents_a_line_even_with_interrupts_masked() {
+        // Decision E4; IR §2.6: the instruction after `wfi` runs, no trap is taken.
+        let (mut h, mut m) = controller_machine(&[wfi(), addi(1, 0, 1)]);
+        run(&mut h, &mut m, 1);
+        assert!(h.is_waiting());
+        assert_eq!(h.step(&mut m, &OneCycle), StepOutcome::Waiting);
+        h.set_external_interrupt(Some(4));
+        assert!(matches!(
+            h.step(&mut m, &OneCycle),
+            StepOutcome::Retired { .. }
+        ));
+        assert_eq!(h.x[1], 1);
+        assert!(!h.is_waiting());
+    }
+
+    #[test]
+    fn the_standard_model_ignores_a_line_presented_by_a_controller() {
+        let (mut h, mut m) = machine(&[addi(1, 0, 1)], MisalignedPolicy::Trap);
+        assert!(h.csr.write(MSTATUS, MSTATUS_MIE));
+        h.set_external_interrupt(Some(3));
+        assert!(matches!(
+            h.step(&mut m, &OneCycle),
+            StepOutcome::Retired { .. }
+        ));
+    }
+
+    #[test]
+    fn a_reset_returns_the_hart_to_its_reset_state_and_keeps_the_totals() {
+        const PMPCFG0: u16 = 0x3A0;
+        let (mut h, mut m) = controller_machine(&[addi(1, 0, 1), wfi()]);
+        assert!(h.csr.write(MTVEC, 0x800));
+        assert!(h.csr.write(PMPCFG0, 0x9F), "an entry with its lock bit");
+        run(&mut h, &mut m, 2);
+        assert!(h.is_waiting());
+        h.set_external_interrupt(Some(5));
+        let (cycles, instret) = (h.cycles, h.instret);
+        h.reset(0x40);
+        assert_eq!(h.pc, 0x40);
+        assert_eq!(h.x, [0; 32]);
+        assert!(!h.is_waiting());
+        assert_eq!(
+            h.csr.read(PMPCFG0, h.cycles, h.instret),
+            Some(0),
+            "the PMP entries and their locks are cleared"
+        );
+        assert_eq!(h.csr.mtvec, 1, "the ESP32-C3 reset value");
+        assert_eq!(
+            (h.cycles, h.instret),
+            (cycles, instret),
+            "totals of the run"
+        );
+        // The presented line is forgotten: the controller presents it again if it still selects it.
+        assert!(h.csr.write(MSTATUS, MSTATUS_MIE));
+        h.pc = 0;
+        assert!(matches!(
+            h.step(&mut m, &OneCycle),
+            StepOutcome::Retired { .. }
+        ));
     }
 
     #[cfg(debug_assertions)]
