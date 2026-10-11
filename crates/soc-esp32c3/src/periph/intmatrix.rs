@@ -14,13 +14,14 @@
 //! `mie` and `mip` play no part: "the ESP32-C3 implements its interrupt mechanism using an
 //! interrupt controller instead of RISC-V Privileged ISA specification" (TRM §8.3.2).
 //!
-//! Sampling contract (report IR §1.3, controller ruling Q13): the context carries the LEVELS of
-//! the sources, and the controller samples them when it is evaluated (`resolve`, a register read
-//! or a register write). A source raised and lowered again between two evaluations is not seen,
-//! so an edge-type line does not latch it. That matches the chip, where a source into the
-//! interrupt matrix is a level its peripheral holds until software acknowledges it; a device model
-//! must do the same (see `Ctx::irq`). The measured application only ever writes 0 to
-//! `CPU_INT_TYPE`.
+//! Sampling contract (ADR 0003; report IR §1.3): a device holds its interrupt source raised
+//! until software acknowledges it, and the controller samples the levels at instruction
+//! boundaries. The context carries the LEVELS of the sources; the controller reads them when it
+//! is evaluated (`resolve`, a register read or a register write), which the machine does between
+//! two instructions. A source raised and lowered again between two evaluations is not seen, so
+//! an edge-type line does not latch it. That matches the chip, where a source into the interrupt
+//! matrix is a level its peripheral holds until software acknowledges it; a device model must do
+//! the same (see `Ctx::irq`). The measured application only ever writes 0 to `CPU_INT_TYPE`.
 use super::{Accepted, INTMATRIX_BASE, half_of};
 use crate::ctx::{Ctx, MAP_REGISTERS};
 use emu_core::Peripheral;
@@ -52,8 +53,10 @@ const CLOCK_GATE: u32 = reg("CLOCK_GATE");
 const CPU_INT_ENABLE: u32 = reg("CPU_INT_ENABLE");
 /// Bit n (1: edge) is set by `ROM3:esprv_intc_int_set_type@0x40052972`.
 const CPU_INT_TYPE: u32 = reg("CPU_INT_TYPE");
-/// Bit n is set by `rv_utils_intr_edge_ack` (`IDF:riscv/include/esp_private/interrupt_intc.h:62-65`,
-/// `REG_SET_BIT(INTERRUPT_CORE0_CPU_INT_CLEAR_REG, intr_num)`), never written back to 0 there.
+/// Bit n acknowledges an edge latched on line n (TRM §1.5.2). Written by `rv_utils_intr_edge_ack`
+/// (`IDF:riscv/include/esp_private/interrupt_intc.h:62-65`:
+/// `REG_SET_BIT(INTERRUPT_CORE0_CPU_INT_CLEAR_REG, intr_num)`, an OR into the register with the
+/// line number as its mask, nothing written back to 0 there): see [`IntMatrix::acknowledge`].
 const CPU_INT_CLEAR: u32 = reg("CPU_INT_CLEAR");
 /// Read-only view of `pending(n)` (TRM register 8.60); no ROM or ESP-IDF code reads it on the
 /// measured paths (IR §1.5).
@@ -95,7 +98,8 @@ pub struct IntMatrix {
     clock_gate: u32,
     enable: u32,
     edge_type: u32,
-    /// `CPU_INT_CLEAR` as last written: an edge is acknowledged by a bit going from 1 to 0.
+    /// `CPU_INT_CLEAR` as last written, for the read-back: an edge is acknowledged by the write
+    /// that has its bit set, and what is stored here gates nothing.
     clear: u32,
     priority: [u32; CPU_LINE_COUNT],
     threshold: u32,
@@ -204,20 +208,32 @@ impl IntMatrix {
         self.edge_type = value & LINES_MASK;
     }
 
-    /// A write to `CPU_INT_CLEAR`: "first setting and then clearing the corresponding bit" clears
-    /// the edge latch of a line the CPU has taken; a latched edge that was never taken can only be
-    /// flushed once its line is disabled (TRM §1.5.2, properties 4 and 5).
+    /// A write to `CPU_INT_CLEAR`: a bit written 1 clears the edge latch of its line when the CPU
+    /// has taken that line; a latched edge that was never taken can only be flushed once its line
+    /// is disabled (TRM §1.5.2, properties 4 and 5). The register stores what is written and what
+    /// it holds gates nothing: a new edge latches whatever the stored bit is.
     ///
-    /// ASSUMPTION: the latch is cleared when the bit goes from 1 to 0, the end of the toggle. What
-    /// a write of 1 alone does is not stated. ESP-IDF's own helper only ever sets the bit
-    /// (`rv_utils_intr_edge_ack`, `IDF:riscv/include/esp_private/interrupt_intc.h:62-65`; report IR
-    /// §1.3), so the firmware does not settle it; a probe on a real chip does.
+    /// ASSUMPTION: the latch is cleared by the write that has the bit set, whatever the bit held
+    /// before. The TRM describes the acknowledge as "first setting and then clearing the
+    /// corresponding bit" (§1.5.2) and says neither which of the two writes acts nor what a second
+    /// set without a clear in between does. Clearing at the set serves both ways of writing it:
+    /// the first write of the TRM's toggle acknowledges and the second changes nothing, and a
+    /// helper that only ever ORs into the register acknowledges every time, which a rule waiting
+    /// for the bit to fall never would. ESP-IDF's helper is of that kind:
+    /// `rv_utils_intr_edge_ack` is `REG_SET_BIT(INTERRUPT_CORE0_CPU_INT_CLEAR_REG, intr_num)`
+    /// (`IDF:riscv/include/esp_private/interrupt_intc.h:62-65`), `REG_SET_BIT(_r, _b)` being
+    /// `*_r = *_r | _b` (`IDF:soc/esp32c3/include/soc/soc.h:51-53`), and nothing there writes a bit
+    /// back to 0. It does not settle the rule: it passes the line number where the macro takes a
+    /// mask, and `esp_intr_alloc` calls it when an edge interrupt is allocated
+    /// (`IDF:esp_hw_support/intr_alloc.c:650`), not when one is served. An edge interrupt on a
+    /// real chip, acknowledged by one write of 1 and then by the toggle, with
+    /// `CPU_INT_EIP_STATUS` read after each write, settles it (report IR §1.3, §7 question 8).
     fn acknowledge(&mut self, value: u32) {
-        let released = self.clear & !value & LINES_MASK;
+        let written = value & LINES_MASK;
         let clearable = self.claimed | !self.enable;
-        self.latched &= !(released & clearable);
+        self.latched &= !(written & clearable);
         self.claimed &= self.latched;
-        self.clear = value & LINES_MASK;
+        self.clear = written;
     }
 }
 
@@ -517,15 +533,23 @@ mod tests {
         m.write(ctx, CPU_INT_CLEAR, 0);
         assert_eq!(m.resolve(ctx.sources()), Some(4));
         m.claim(4);
+        // A write that sets another line's bit acknowledges nothing on this one.
+        m.write(ctx, CPU_INT_CLEAR, 1 << 3);
+        assert_eq!(m.resolve(ctx.sources()), Some(4));
         m.write(ctx, CPU_INT_CLEAR, 1 << 4);
         assert_eq!(m.read(ctx, CPU_INT_CLEAR), Some(1 << 4));
         assert_eq!(
             m.resolve(ctx.sources()),
-            Some(4),
-            "setting the bit is half of the toggle"
+            None,
+            "the write that sets the bit acknowledges: the first half of the toggle"
         );
         m.write(ctx, CPU_INT_CLEAR, 0);
-        assert_eq!(m.resolve(ctx.sources()), None);
+        assert_eq!(m.read(ctx, CPU_INT_CLEAR), Some(0));
+        assert_eq!(
+            m.resolve(ctx.sources()),
+            None,
+            "the second half changes nothing"
+        );
         // A source that stayed high is no new edge.
         ctx.irq(TICK, true);
         assert_eq!(m.resolve(ctx.sources()), Some(4));
@@ -533,6 +557,34 @@ mod tests {
         m.write(ctx, CPU_INT_CLEAR, 1 << 4);
         m.write(ctx, CPU_INT_CLEAR, 0);
         assert_eq!(m.resolve(ctx.sources()), None, "still high: no rising edge");
+    }
+
+    #[test]
+    fn a_write_that_sets_a_bit_already_set_acknowledges_the_edge_too() {
+        // A helper that only ever ORs a mask into the register, as ESP-IDF's does and never
+        // writes a bit back to 0: set, an edge the CPU takes, set again, and once more.
+        let ctx = &mut Ctx::default();
+        let mut m = application_setup(ctx);
+        m.write(ctx, CPU_INT_TYPE, 1 << 4);
+        m.write(ctx, CPU_INT_CLEAR, 1 << 4);
+        for round in 0..2 {
+            ctx.irq(TICK, true);
+            assert_eq!(
+                m.resolve(ctx.sources()),
+                Some(4),
+                "round {round}: a new edge latches whatever the stored bit is"
+            );
+            ctx.irq(TICK, false);
+            m.claim(4);
+            let stored = m.read(ctx, CPU_INT_CLEAR).unwrap();
+            assert_eq!(stored, 1 << 4, "the bit stays as it was written");
+            m.write(ctx, CPU_INT_CLEAR, stored | (1 << 4));
+            assert_eq!(
+                m.resolve(ctx.sources()),
+                None,
+                "round {round}: the write with the bit set acknowledged the edge"
+            );
+        }
     }
 
     #[test]
@@ -572,8 +624,9 @@ mod tests {
 
     #[test]
     fn a_pulse_shorter_than_one_evaluation_is_lost_to_an_edge_line() {
-        // The sampling contract (report IR §1.3, controller ruling Q13): the context carries
-        // levels and the controller samples them when it is evaluated.
+        // The sampling contract (ADR 0003; report IR §1.3): a device holds its source until
+        // software acknowledges it, the context carries levels, and the controller samples them
+        // when it is evaluated, at instruction boundaries.
         let ctx = &mut Ctx::default();
         let mut m = application_setup(ctx);
         m.write(ctx, CPU_INT_TYPE, 1 << 4);

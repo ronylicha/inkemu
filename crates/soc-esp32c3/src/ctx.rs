@@ -349,11 +349,13 @@ impl Ctx {
 
     /// Drives the level of an interrupt source.
     ///
-    /// The context carries levels, and the interrupt controller samples them when it is
-    /// evaluated. A device holds its source raised until software acknowledges it, as the chip's
-    /// peripherals do; a pulse shorter than one instruction (raised and lowered again before the
-    /// controller is evaluated) is lost to an edge-type line (report IR §1.3, controller ruling
-    /// Q13).
+    /// The contract (ADR 0003; report IR §1.3): the context carries levels, and the interrupt
+    /// controller samples them at instruction boundaries, when the machine evaluates it. A device
+    /// must hold its source raised until software acknowledges it (a write to the device's own
+    /// clear register, or whatever that device's acknowledge is), as the chip's peripherals do,
+    /// and lower it by that acknowledge and by nothing else. A device that raised and lowered its
+    /// source within one instruction would never be seen: the pulse is lost to a level-type line
+    /// and to an edge-type line alike.
     pub fn irq(&mut self, source: Source, asserted: bool) {
         let levels = if asserted {
             self.sources | source.mask()
