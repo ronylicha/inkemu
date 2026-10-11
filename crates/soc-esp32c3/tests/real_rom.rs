@@ -507,22 +507,27 @@ fn reset_entries(diagnostics: &[Diagnostic]) -> Vec<(ResetCause, u32)> {
         .collect()
 }
 
-/// Runs the rev3 ROM on `flash` until `resets` resets took place and `done` accepts the console.
+/// The rev3 ROM on `flash` (`None`: an erased chip), in strict mode, at power-on.
+fn strict_machine(flash: Option<Vec<u8>>) -> Esp32C3 {
+    let rom = RomImage::from_elf(&elf(3)).unwrap();
+    match flash {
+        Some(image) => Esp32C3::with_flash(rom, image, &strict()).unwrap(),
+        None => Esp32C3::new(rom, &strict()),
+    }
+}
+
+/// Runs `machine` until `resets` resets took place and `done` accepts the console, which is
+/// everything UART0 sent since power-on.
 ///
 /// Two bounds end a run that does not get there, and the failure says what was seen: a budget of CPU
 /// cycles, and `limit_ns` of device time. Both are needed: the cycle counter stands still while the
 /// CPU sleeps, so a machine that sleeps for ever would never exhaust the first.
 fn run_to_resets(
-    flash: Option<Vec<u8>>,
+    mut machine: Esp32C3,
     resets: u64,
     limit_ns: u64,
     done: impl Fn(&str) -> bool,
 ) -> WatchdogRun {
-    let rom = RomImage::from_elf(&elf(3)).unwrap();
-    let mut machine = match flash {
-        Some(image) => Esp32C3::with_flash(rom, image, &strict()).unwrap(),
-        None => Esp32C3::new(rom, &strict()),
-    };
     let (mut uart0, mut reset_seen_at, mut diagnostics) = (Vec::new(), Vec::new(), Vec::new());
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
     while !(machine.resets() >= resets && done(&text(&uart0))) {
@@ -571,7 +576,7 @@ fn a_blank_flash_is_reset_by_the_main_watchdog_then_by_the_rtc_watchdog() {
     // Three seconds of device time beyond the last reset: the whole run is a little over 2.9 s.
     let limit_ns = 2_941_176_471 + 3 * SECOND_NS;
     // Until the boot that follows the third reset has printed a whole line of its own.
-    let run = run_to_resets(None, 3, limit_ns, |console| {
+    let run = run_to_resets(strict_machine(None), 3, limit_ns, |console| {
         console
             .split("rst:0x10 (RTCWDT_RTC_RST)")
             .nth(1)
@@ -676,10 +681,6 @@ fn store(addr: u32, value: u32) -> [u32; 4] {
     ]
 }
 
-/// Device time, in nanoseconds, of the store with which the hanging program enables main watchdog 1
-/// (measured; what it is made of is explained in the test that uses it).
-const ENABLED_AT_NS: u64 = 4_828_650;
-
 /// Milestone point 5 of plan SP1b-3a (spec §10.3 criterion 4). A firmware stops the two
 /// watchdogs the reset values arm, starts main watchdog 1 with a 500 ms stage whose action is a
 /// core reset, masks interrupts (`mstatus` ← 0) and hangs: its own watchdog resets it, 500 ms after
@@ -689,6 +690,8 @@ const ENABLED_AT_NS: u64 = 4_828_650;
 fn a_firmware_that_hangs_with_interrupts_masked_is_reset_by_its_own_watchdog() {
     use cpu_rv32::asm::{csrrwi, jal};
     const MSTATUS: u16 = 0x300;
+    /// The stage the program gives its watchdog: 500 counts of a millisecond.
+    const STAGE_NS: u64 = 500 * SECOND_NS / 1000;
     let timg1 = |name| svd_regs::esp32c3::addr("TIMG1", name);
     let mut program = vec![
         // `mstatus.MIE` is already 0 after a reset; the program clears it itself so the test does
@@ -711,19 +714,35 @@ fn a_firmware_that_hangs_with_interrupts_masked_is_reset_by_its_own_watchdog() {
         segments: vec![(STUB_ENTRY, code)],
         ..stub_spec()
     };
-    // The reset takes place one stage, 500 counts of 1 ms, after the store that enables the
-    // watchdog. That store lands at 4 828 650 ns of device time (measured, one instruction at a
-    // time): the ROM boots the image in 96 553 cycles of 20 MHz, 4 827 650 ns, and the program's
-    // 20 instructions before the store (the `csrrwi`, four stores of four, and the three that
-    // prepare the last one) take one cycle each, 1 000 ns. Nothing but that and the 500 ms is in the figure. A prescaler off by a factor of
-    // two moves the reset by 250 ms, a stage of 250 or 1000 counts by 250 or 500 ms, an immediate
-    // expiry by 500 ms: the window of 100 us (as in the blank-flash test) is thousands of times
+    // The instant the watchdog is enabled at is read from the run, so that the test does not
+    // rest on the time the ROM takes to boot the image: one instruction a call, to the boundary
+    // at which the enabling store, the instruction before the `j .`, is next. Device time
+    // moves at the end of an instruction: the store executes at the time read here.
+    let enabling_store_pc = hang_pc - 4;
+    let mut machine = strict_machine(Some(build_image(&spec)));
+    while machine.pc() != enabling_store_pc {
+        assert!(
+            machine.cycles().get() < FLASH_BOOT_BUDGET,
+            "the program never reached the store at {enabling_store_pc:#010x} that enables its watchdog: at pc {:#010x} after {} cycles",
+            machine.pc(),
+            machine.cycles().get()
+        );
+        let stop = machine.run_until(Cycles(machine.cycles().get() + 1));
+        assert_eq!(stop, StopReason::CycleBudget);
+    }
+    let enabled_ns = machine.device_time_nanos();
+    // The reset takes place one stage, 500 counts of 1 ms, after that store. That a watchdog
+    // counts its first stage from 0 when it is switched on is the model's choice, marked
+    // `ASSUMPTION:` where the timer groups enable it: it is not observed on silicon.
+    //
+    // A prescaler half as large moves the reset by 250 ms and one twice as large by 500 ms, a
+    // stage of 250 or 1 000 counts by 250 or 500 ms, an immediate expiry by 500 ms: the window
+    // of 100 us (the resolution of the looks, as in the blank-flash test) is thousands of times
     // tighter than any of them.
-    let expected_ns = ENABLED_AT_NS + 500 * SECOND_NS / 1000;
     let run = run_to_resets(
-        Some(build_image(&spec)),
+        machine,
         1,
-        expected_ns + 3 * SECOND_NS,
+        enabled_ns + STAGE_NS + 3 * SECOND_NS,
         |console| {
             console
                 .split("Saved PC:")
@@ -737,10 +756,10 @@ fn a_firmware_that_hangs_with_interrupts_masked_is_reset_by_its_own_watchdog() {
         "the journal: the reset by the firmware's own watchdog, in its `j .`, and nothing else"
     );
     assert_eq!(run.repeated, Vec::new());
-    let seen = run.reset_seen_at[0];
+    let after_enabling = run.reset_seen_at[0] - enabled_ns;
     assert!(
-        (expected_ns..=expected_ns + 2 * WATCHDOG_SLICE_NS).contains(&seen),
-        "main watchdog 1 expires at {expected_ns} ns of device time; the reset was seen at {seen} ns"
+        (STAGE_NS..=STAGE_NS + 2 * WATCHDOG_SLICE_NS).contains(&after_enabling),
+        "main watchdog 1 expires {STAGE_NS} ns after it is enabled (at {enabled_ns} ns of device time); the reset was seen {after_enabling} ns after it"
     );
     let lines: Vec<&str> = run.console.lines().collect();
     let reset = lines
