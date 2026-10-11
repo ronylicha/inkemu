@@ -522,4 +522,16 @@ mod tests {
             "{reported:?}"
         );
     }
+
+    #[test]
+    fn consoles_are_reachable_through_the_bus() {
+        let mut b = bus();
+        b.write(0x6000_0000, Word, u32::from(b'U')).unwrap();
+        b.write(0x6004_3000, Word, u32::from(b'J')).unwrap();
+        b.write(0x6004_3004, Word, 1).unwrap();
+        b.write(0x6001_0010, Word, 1).unwrap(); // UART1.INT_CLR, written by the ROM's uartAttach
+        assert_eq!(b.periph.uart0.take_tx(), b"U");
+        assert_eq!(b.periph.usb_serial_jtag.take_tx(), b"J");
+        assert_eq!(b.diag.drain(), []);
+    }
 }

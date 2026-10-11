@@ -9,6 +9,8 @@ pub mod intmatrix;
 pub mod io_mux;
 pub mod rtc_cntl;
 pub mod system;
+pub mod uart;
+pub mod usb_serial_jtag;
 
 pub use assist_debug::AssistDebug;
 pub use efuse::Efuse;
@@ -17,6 +19,8 @@ pub use intmatrix::IntMatrix;
 pub use io_mux::IoMux;
 pub use rtc_cntl::RtcCntl;
 pub use system::System;
+pub use uart::Uart;
+pub use usb_serial_jtag::UsbSerialJtag;
 
 /// Registers deliberately modelled as plain read/write memory: configuration the emulator
 /// acknowledges but does not act on. Listing them here is a decision; anything else is reported.
@@ -91,6 +95,10 @@ const INTMATRIX_BASE: u32 = 0x600C_2000;
 const INTMATRIX: (u32, u32) = (INTMATRIX_BASE, 0x600C_3000);
 const ASSIST_DEBUG_BASE: u32 = 0x600C_E000;
 const ASSIST_DEBUG: (u32, u32) = (ASSIST_DEBUG_BASE, 0x600C_F000);
+/// The two UARTs and the USB-Serial-JTAG device: the ROM's consoles (report §G).
+const UART0: (u32, u32) = (0x6000_0000, 0x6000_1000);
+const UART1: (u32, u32) = (0x6001_0000, 0x6001_1000);
+const USB_SERIAL_JTAG: (u32, u32) = (0x6004_3000, 0x6004_4000);
 
 #[derive(Debug)]
 pub struct Peripherals {
@@ -101,6 +109,9 @@ pub struct Peripherals {
     pub system: System,
     pub efuse: Efuse,
     pub assist_debug: AssistDebug,
+    pub uart0: Uart,
+    pub uart1: Uart,
+    pub usb_serial_jtag: UsbSerialJtag,
 }
 
 impl Peripherals {
@@ -114,6 +125,9 @@ impl Peripherals {
             system: System::new(),
             efuse: Efuse::new(config.chip_revision),
             assist_debug: AssistDebug::new(),
+            uart0: Uart::new(UART0.0),
+            uart1: Uart::new(UART1.0),
+            usb_serial_jtag: UsbSerialJtag::new(),
         }
     }
 
@@ -134,6 +148,12 @@ impl Peripherals {
             Some((&mut self.intmatrix, INTMATRIX_BASE))
         } else if within(ASSIST_DEBUG) {
             Some((&mut self.assist_debug, ASSIST_DEBUG_BASE))
+        } else if within(UART0) {
+            Some((&mut self.uart0, UART0.0))
+        } else if within(UART1) {
+            Some((&mut self.uart1, UART1.0))
+        } else if within(USB_SERIAL_JTAG) {
+            Some((&mut self.usb_serial_jtag, USB_SERIAL_JTAG.0))
         } else {
             None
         }
