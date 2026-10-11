@@ -33,6 +33,24 @@ fn unknown_device_name_is_echoed_with_control_characters_escaped() {
         .stderr(contains("x\\u{1b}[31m9"));
 }
 
+/// `/dev/full` refuses every write: the error message cannot be printed, and the exit code must
+/// still say that the command was refused, not that the program crashed (101).
+#[cfg(target_os = "linux")]
+#[test]
+fn an_error_that_cannot_be_written_to_standard_error_keeps_its_exit_code() {
+    // The path of the binary is `$0` of the shell, so that no quoting of it is needed.
+    for command in [
+        r#""$0" run --device x9 2>/dev/full"#,
+        r#""$0" inspect /nonexistent/firmware.bin 2>/dev/full"#,
+        r#""$0" rvtest /nonexistent/test.elf 2>/dev/full"#,
+    ] {
+        Command::new("sh")
+            .args(["-c", command, env!("CARGO_BIN_EXE_inkemu")])
+            .assert()
+            .code(2);
+    }
+}
+
 #[test]
 fn empty_rom_dir_exits_2_naming_the_file_and_never_downloads() {
     let dir = tempfile::tempdir().unwrap();

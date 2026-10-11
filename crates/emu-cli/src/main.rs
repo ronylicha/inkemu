@@ -175,9 +175,20 @@ fn main() -> ExitCode {
     }
 }
 
+/// Writes `line` and a newline to `stream`, standard error or standard output, and goes on if
+/// that fails.
+///
+/// `eprintln!` and `println!` panic when the write fails (`2>/dev/full`, a pipe whose reader
+/// left), and the process then ends with the code of a panic, 101, instead of the code that says
+/// what happened. Standard error is where failures are reported: when it fails itself there is
+/// nowhere left to say so, and the exit code must still be the right one.
+fn write_line(mut stream: impl io::Write, line: &dyn std::fmt::Display) {
+    let _ = writeln!(stream, "{line}");
+}
+
 /// Prints `error: {message}` and yields the input-error exit code.
 fn fail(message: &dyn std::fmt::Display) -> ExitCode {
-    eprintln!("error: {message}");
+    write_line(io::stderr(), &format_args!("error: {message}"));
     ExitCode::from(EXIT_ERROR)
 }
 
@@ -277,11 +288,17 @@ fn run_device(
         },
         None => profile.instantiate(rom, machine_options),
     };
-    eprintln!("{}; {flash_note}", header(&profile, entry, &machine));
+    write_line(
+        io::stderr(),
+        &format_args!("{}; {flash_note}", header(&profile, entry, &machine)),
+    );
     let interrupt = Arc::new(AtomicBool::new(false));
     if let Err(e) = watch_ctrl_c(&interrupt) {
-        eprintln!(
-            "warning: cannot watch for Ctrl-C: {e}; the run is not affected, but interrupting it will not print its summary: use --max-cycles or --max-time to bound it"
+        write_line(
+            io::stderr(),
+            &format_args!(
+                "warning: cannot watch for Ctrl-C: {e}; the run is not affected, but interrupting it will not print its summary: use --max-cycles or --max-time to bound it"
+            ),
         );
     }
     let end = execute(
@@ -410,8 +427,9 @@ fn run_inspect(path: &Path) -> ExitCode {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("error: cannot read {shown}: {e}; check the path and read permissions");
-            return ExitCode::from(EXIT_ERROR);
+            return fail(&format_args!(
+                "cannot read {shown}: {e}; check the path and read permissions"
+            ));
         }
     };
     match firmware::FirmwareImage::parse(&bytes) {
@@ -425,10 +443,7 @@ fn run_inspect(path: &Path) -> ExitCode {
                 ControlFlow::Break(code) => code,
             }
         }
-        Err(e) => {
-            eprintln!("error: {shown}: {e}");
-            ExitCode::from(EXIT_ERROR)
-        }
+        Err(e) => fail(&format_args!("{shown}: {e}")),
     }
 }
 
@@ -457,22 +472,21 @@ fn run_rvtest(
         .and_then(|bytes| TestMachine::from_elf(&bytes, config).map_err(|e| e.to_string()));
     let mut machine = match machine {
         Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(EXIT_ERROR);
-        }
+        Err(e) => return fail(&e),
     };
     let result = machine.run(max_steps);
+    // What goes to standard output here is for a person: the verdict of the test is the exit
+    // code, which must not depend on who reads the lines.
     if trace_hash {
-        println!("trace-hash {:016x}", machine.trace_hash());
+        write_line(
+            io::stdout(),
+            &format_args!("trace-hash {:016x}", machine.trace_hash()),
+        );
     }
     if let Some(path) = signature {
         let words = match machine.signature() {
             Ok(w) => w,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::from(EXIT_ERROR);
-            }
+            Err(e) => return fail(&e),
         };
         let text = words.iter().fold(String::new(), |mut acc, w| {
             // Writing to a String cannot fail.
@@ -480,28 +494,24 @@ fn run_rvtest(
             acc
         });
         if let Err(e) = std::fs::write(path, text) {
-            eprintln!(
-                "error: cannot write {}: {e}; check that the directory exists and is writable",
+            return fail(&format_args!(
+                "cannot write {}: {e}; check that the directory exists and is writable",
                 path.display()
-            );
-            return ExitCode::from(EXIT_ERROR);
+            ));
         }
     }
     match result {
         RunResult::Passed => {
-            println!("Passed");
+            write_line(io::stdout(), &"Passed");
             ExitCode::SUCCESS
         }
         RunResult::Failed { test_number } => {
-            println!("FAILED at test #{test_number}");
+            write_line(io::stdout(), &format_args!("FAILED at test #{test_number}"));
             ExitCode::from(EXIT_TEST_FAILURE)
         }
-        RunResult::Timeout => {
-            eprintln!(
-                "error: no verdict after {max_steps} steps; raise --max-steps or check that the test writes to tohost"
-            );
-            ExitCode::from(EXIT_ERROR)
-        }
+        RunResult::Timeout => fail(&format_args!(
+            "no verdict after {max_steps} steps; raise --max-steps or check that the test writes to tohost"
+        )),
     }
 }
 
