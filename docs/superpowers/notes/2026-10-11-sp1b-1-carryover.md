@@ -24,14 +24,14 @@ Les décisions de conception D1 à D12 du plan restent valables, sauf D10 compl�
 
 ## Reporté au plan SP1b-2 (flash, cache/MMU, SHA, bootloader)
 
-- Premier registre attendu par la ROM après sa bannière : `EXTMEM.ICACHE_SYNC_CTRL` (elle boucle sur son bit de fin). Viennent avant lui `GPIO.ENABLE`, la matrice GPIO, `IO_MUX` des broches de flash, SPI0/SPI1 : voir la liste des avertissements de `inkemu run --device x4` et le rapport `esp32c3-boot-chain.md`, §J lignes 13 à 23.
-- La table MMU (`0x600C_5000`) n'est pas dans le SVD : à modéliser à la main.
-- eFuse : adresse MAC et version de bloc (le bootloader les lit), registres de programmation.
-- `SYSTEM.CPU_PER_CONF` et l'arbre d'horloges (passage du CPU à 80 puis 160 MHz).
-- Profils d'appareil : taille de flash, tables de partitions, puis validation d'un profil fourni par l'utilisateur (identifiant vide, cohérence de l'identifiant). Si `--device <fichier.toml>` voit le jour, nettoyer le message d'erreur de `toml` avant de l'afficher (il cite la ligne du fichier).
-- Points de SP1a toujours ouverts : `fetch_stall` et le cache flash, l'heuristique de dump flash, le message de `BadFlashSize`, le `Display` de `SpiMode`.
-- `rom_store` décompresse l'archive une fois par ELF manquant (trois fois pour `rom fetch --all` à froid) : une seule passe suffirait.
-- Trois modules de tests écrivent des adresses de base en clair au lieu de les prendre dans `svd-regs`.
+- ~~Premier registre attendu par la ROM après sa bannière : `EXTMEM.ICACHE_SYNC_CTRL` (elle boucle sur son bit de fin). Viennent avant lui `GPIO.ENABLE`, la matrice GPIO, `IO_MUX` des broches de flash, SPI0/SPI1 : voir la liste des avertissements de `inkemu run --device x4` et le rapport `esp32c3-boot-chain.md`, §J lignes 13 à 23.~~ **Levé par SP1b-2** : le contrôleur de cache, le GPIO, `IO_MUX` et SPI0/SPI1 sont modélisés, et la ROM charge le bootloader depuis la flash (ADR 0002).
+- ~~La table MMU (`0x600C_5000`) n'est pas dans le SVD : à modéliser à la main.~~ **Levé par SP1b-2** : `crates/soc-esp32c3/src/periph/mmu.rs`.
+- eFuse : ~~adresse MAC et version de bloc (le bootloader les lit)~~ **Levé par SP1b-2** (le contenu d'une puce de production v0.3, bloc v1.2) ; registres de programmation : **Reporté à SP1b-3**.
+- ~~`SYSTEM.CPU_PER_CONF` et l'arbre d'horloges (passage du CPU à 80 puis 160 MHz).~~ **Levé par SP1b-2** : la fréquence du CPU découle des registres d'horloge (`crates/soc-esp32c3/src/clock.rs`).
+- Profils d'appareil : ~~taille de flash~~, tables de partitions, puis ~~validation d'un profil fourni par l'utilisateur (identifiant vide, cohérence de l'identifiant)~~ **Levé par SP1b-2** (la taille et l'identifiant JEDEC sont validés à la lecture du profil). Les tables de partitions : **Reporté à SP1b-3** (avec `--firmware`). Si `--device <fichier.toml>` voit le jour, nettoyer le message d'erreur de `toml` avant de l'afficher (il cite la ligne du fichier) : **Reporté à SP2**
+- Points de SP1a toujours ouverts : `fetch_stall` et le cache flash : **Reporté à SP1b-4** ; ~~l'heuristique de dump flash, le message de `BadFlashSize`, le `Display` de `SpiMode`~~ **Levé par SP1b-2** (détection de la table de partitions par son contenu, message de `BadFlashSize` complété, `SpiMode` affiche les noms de la ROM).
+- ~~`rom_store` décompresse l'archive une fois par ELF manquant (trois fois pour `rom fetch --all` à froid) : une seule passe suffirait.~~ **Levé par SP1b-2** : une seule passe sur l'archive.
+- ~~Trois modules de tests écrivent des adresses de base en clair au lieu de les prendre dans `svd-regs`.~~ **Levé par SP1b-2**.
 
 ## Reporté au plan SP1b-3 (interruptions, timers, watchdogs, reset)
 
