@@ -1,8 +1,9 @@
 //! Flattens the ESP32-C3 SVD into an address-sorted register list.
 //!
 //! Deliberately strict: any SVD construct this file does not use today (clusters,
-//! register-level `derivedFrom`, comma-list `dimIndex`, a `size` other than 32 bits)
-//! is an error, never a silent skip. Mechanics and occurrence counts for the pinned
+//! register-level `derivedFrom`, comma-list `dimIndex`, a `size` other than 32 bits, a
+//! `resetValue` or `dim` on a peripheral, a derived peripheral with registers of its own,
+//! `dim` = 0) is an error, never a silent skip. Mechanics and occurrence counts for the pinned
 //! file: `docs/research/esp32c3-svd.md`, sections 2.2 and 2.3.
 use roxmltree::{Document, Node};
 
@@ -64,6 +65,18 @@ pub enum GenError {
         second: String,
         addr: u32,
     },
+    #[error(
+        "{registers} are all at {addr:#010x}; an alias rule can only choose between two registers, so review the generator before bumping the SVD"
+    )]
+    CrowdedAddress { registers: String, addr: u32 },
+    #[error(
+        "the alias rule for {peripheral}.{register} at {addr:#010x} matches no address collision; remove it"
+    )]
+    UnusedAlias {
+        peripheral: &'static str,
+        register: &'static str,
+        addr: u32,
+    },
 }
 
 /// Expands `derivedFrom` peripherals and `dim` register arrays of `svd_xml`.
@@ -115,6 +128,7 @@ fn expand_peripheral<'a, 'input>(
         name,
         "baseAddress",
     )?)?;
+    reject_peripheral_level_settings(peripheral, name)?;
     let source = register_source(peripheral, name, seen)?;
     let Some(registers) = child(source, "registers") else {
         return Ok(());
@@ -127,6 +141,28 @@ fn expand_peripheral<'a, 'input>(
             });
         }
         expand_register(element, name, base, default_reset, out)?;
+    }
+    Ok(())
+}
+
+/// Settings the expansion would otherwise ignore: SVD lets a peripheral carry its own `resetValue`
+/// (overriding the device default for its registers) or a `dim` (an array of peripherals), and a
+/// derived peripheral may add registers to its parent's. None of this occurs in the pinned file.
+fn reject_peripheral_level_settings(peripheral: Node, name: &str) -> Result<(), GenError> {
+    let unsupported = |what: &str| GenError::Unsupported {
+        context: name.to_owned(),
+        what: what.to_owned(),
+    };
+    if child(peripheral, "resetValue").is_some() {
+        return Err(unsupported("a peripheral-level <resetValue>"));
+    }
+    if child(peripheral, "dim").is_some() {
+        return Err(unsupported("a peripheral-level <dim>"));
+    }
+    if peripheral.attribute("derivedFrom").is_some() && child(peripheral, "registers").is_some() {
+        return Err(unsupported(
+            "a derived peripheral with <registers> of its own",
+        ));
     }
     Ok(())
 }
@@ -218,6 +254,12 @@ fn instances(register: Node, name: &str, context: &str) -> Result<Vec<(String, u
         return Ok(vec![(name.to_owned(), 0)]);
     };
     let dim = parse_number(dim_text)?;
+    if dim == 0 {
+        return Err(GenError::Unsupported {
+            context: context.to_owned(),
+            what: "dim = 0, an array of no register".to_owned(),
+        });
+    }
     let increment = parse_number(required_text(
         register,
         "register",
@@ -269,6 +311,7 @@ fn resolve_collisions(
     registers
         .sort_by(|a, b| (a.addr, &a.peripheral, &a.name).cmp(&(b.addr, &b.peripheral, &b.name)));
     let mut resolved: Vec<Register> = Vec::with_capacity(registers.len());
+    let mut used = vec![false; aliases.len()];
     let mut pending = registers.into_iter().peekable();
     while let Some(first) = pending.next() {
         let addr = first.addr;
@@ -276,28 +319,48 @@ fn resolve_collisions(
         while let Some(next) = pending.next_if(|r| r.addr == addr) {
             group.push(next);
         }
-        resolved.push(pick_survivor(group, aliases)?);
+        resolved.push(pick_survivor(group, aliases, &mut used)?);
+    }
+    // A rule that resolved nothing is stale (the SVD changed, or the rule was mistyped).
+    if let Some(index) = used.iter().position(|&was_used| !was_used) {
+        let alias = &aliases[index];
+        return Err(GenError::UnusedAlias {
+            peripheral: alias.peripheral,
+            register: alias.register,
+            addr: alias.addr,
+        });
     }
     Ok(resolved)
 }
 
 /// The register that keeps an address shared by `group` (never empty). A group of one
-/// needs no rule; a larger group needs an alias naming one of its members.
-fn pick_survivor(mut group: Vec<Register>, aliases: &[Alias]) -> Result<Register, GenError> {
-    let is_named_by_alias = |r: &Register| {
-        aliases
-            .iter()
-            .any(|a| a.addr == r.addr && a.peripheral == r.peripheral && a.register == r.name)
-    };
-    let survivor = if group.len() == 1 {
-        Some(0)
-    } else {
-        group.iter().position(is_named_by_alias)
-    };
-    if let Some(index) = survivor {
-        return Ok(group.swap_remove(index));
-    }
+/// needs no rule; a group of two needs an alias naming one of its members (marked in `used`);
+/// a larger group is an error whatever the rules say.
+fn pick_survivor(
+    mut group: Vec<Register>,
+    aliases: &[Alias],
+    used: &mut [bool],
+) -> Result<Register, GenError> {
     let label = |r: &Register| format!("{}.{}", r.peripheral, r.name);
+    if group.len() == 1 {
+        return Ok(group.swap_remove(0));
+    }
+    if group.len() > 2 {
+        return Err(GenError::CrowdedAddress {
+            registers: group.iter().map(label).collect::<Vec<_>>().join(", "),
+            addr: group[0].addr,
+        });
+    }
+    let named_by_alias = group.iter().enumerate().find_map(|(member, r)| {
+        let rule = aliases.iter().position(|a| {
+            a.addr == r.addr && a.peripheral == r.peripheral && a.register == r.name
+        })?;
+        Some((member, rule))
+    });
+    if let Some((member, rule)) = named_by_alias {
+        used[rule] = true;
+        return Ok(group.swap_remove(member));
+    }
     // INVARIANT: this point is reached only with `group.len() >= 2`, the single-element
     // case having returned above, so indices 0 and 1 exist.
     Err(GenError::Collision {
@@ -613,5 +676,82 @@ mod tests {
         ));
         let err = expand(&xml, &[]).unwrap_err().to_string();
         assert!(err.contains("0xZZ"), "{err}");
+    }
+
+    fn assert_unsupported(xml: &str, expected: &str) {
+        match expand(xml, &[]) {
+            Err(GenError::Unsupported { what, .. }) => {
+                assert!(what.contains(expected), "{what}");
+            }
+            other => panic!("expected an unsupported construct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_peripheral_level_reset_value_is_rejected_not_ignored() {
+        let xml = format!(
+            "<peripheral><name>P</name><baseAddress>0x0</baseAddress><resetValue>0x1</resetValue><registers>{}</registers></peripheral>",
+            reg("R", "0x0", "")
+        );
+        assert_unsupported(&device(&xml), "<resetValue>");
+    }
+
+    #[test]
+    fn a_peripheral_level_dim_is_rejected_not_ignored() {
+        let xml = format!(
+            "<peripheral><name>P%s</name><baseAddress>0x0</baseAddress><dim>2</dim><dimIncrement>0x100</dimIncrement><registers>{}</registers></peripheral>",
+            reg("R", "0x0", "")
+        );
+        assert_unsupported(&device(&xml), "<dim>");
+    }
+
+    #[test]
+    fn a_derived_peripheral_with_registers_of_its_own_is_rejected() {
+        let parent = periph("A", "0x0", &reg("R", "0x0", ""));
+        let child = format!(
+            "<peripheral derivedFrom=\"A\"><name>B</name><baseAddress>0x100</baseAddress><registers>{}</registers></peripheral>",
+            reg("EXTRA", "0x4", "")
+        );
+        assert_unsupported(&device(&format!("{parent}{child}")), "derived peripheral");
+    }
+
+    #[test]
+    fn a_zero_sized_array_is_rejected() {
+        let extra = "<dim>0</dim><dimIncrement>0x4</dimIncrement>";
+        assert_unsupported(
+            &device(&periph("P", "0x0", &reg("R%s", "0x0", extra))),
+            "dim = 0",
+        );
+    }
+
+    #[test]
+    fn three_registers_at_one_address_are_an_error_even_when_an_alias_names_one() {
+        let at = |name: &str, register: &str| periph(name, "0x60000000", &reg(register, "0x0", ""));
+        let xml = device(&format!("{}{}{}", at("A", "X"), at("B", "Y"), at("C", "Z")));
+        let alias = [Alias {
+            addr: 0x6000_0000,
+            peripheral: "B",
+            register: "Y",
+        }];
+        let err = expand(&xml, &alias).unwrap_err();
+        assert!(matches!(err, GenError::CrowdedAddress { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("A.X") && text.contains("B.Y") && text.contains("C.Z"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_alias_rule_that_resolves_no_collision_is_an_error_telling_to_remove_it() {
+        let xml = device(&periph("A", "0x60000000", &reg("X", "0x0", "")));
+        let alias = [Alias {
+            addr: 0x6000_0000,
+            peripheral: "A",
+            register: "X",
+        }];
+        let err = expand(&xml, &alias).unwrap_err();
+        assert!(matches!(err, GenError::UnusedAlias { .. }), "{err}");
+        assert!(err.to_string().contains("remove it"), "{err}");
     }
 }

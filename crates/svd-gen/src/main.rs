@@ -49,7 +49,7 @@ enum CliError {
     SvdDigest { found: String },
     #[error(transparent)]
     Generate(#[from] GenError),
-    #[error("{OUTPUT_DISPLAY_NAME} is stale; run cargo run -p svd-gen")]
+    #[error("{OUTPUT_DISPLAY_NAME} is missing or stale; run cargo run -p svd-gen")]
     Stale,
 }
 
@@ -98,17 +98,21 @@ fn run(mode: &Mode) -> Result<(), CliError> {
             path: output_path.display().to_string(),
             source,
         }),
-        Mode::Check => {
-            let on_disk = fs::read_to_string(&output_path).map_err(|source| CliError::Read {
-                path: output_path.display().to_string(),
-                source,
-            })?;
-            if on_disk == generated {
-                Ok(())
-            } else {
-                Err(CliError::Stale)
-            }
-        }
+        Mode::Check => check(&generated, &output_path),
+    }
+}
+
+/// `--check`: the file at `output_path` must be exactly `generated`. A file that does not exist is as
+/// stale as one that differs: the generator has to be run.
+fn check(generated: &str, output_path: &Path) -> Result<(), CliError> {
+    match fs::read_to_string(output_path) {
+        Ok(on_disk) if on_disk == generated => Ok(()),
+        Ok(_) => Err(CliError::Stale),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(CliError::Stale),
+        Err(source) => Err(CliError::Read {
+            path: output_path.display().to_string(),
+            source,
+        }),
     }
 }
 
@@ -162,6 +166,27 @@ mod tests {
             generate(&tampered),
             Err(CliError::SvdDigest { .. })
         ));
+    }
+
+    #[test]
+    fn check_accepts_the_identical_file_and_calls_a_different_or_missing_one_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("esp32c3.rs");
+        assert!(
+            matches!(check("table", &path), Err(CliError::Stale)),
+            "missing"
+        );
+        fs::write(&path, "an older table").unwrap();
+        assert!(
+            matches!(check("table", &path), Err(CliError::Stale)),
+            "different"
+        );
+        fs::write(&path, "table").unwrap();
+        assert!(check("table", &path).is_ok());
+        let message = check("table", &dir.path().join("absent"))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("run cargo run -p svd-gen"), "{message}");
     }
 
     #[test]
