@@ -635,20 +635,12 @@ mod tests {
         rtc
     }
 
-    /// Drains every wake-up due at the present time, those a call arms for the present time
-    /// included (the machine delivers those one pass later: `Ctx::deliver_due`), and fails the
-    /// test after a thousand calls.
+    /// Calls the block for every wake-up due at the present time (`periph::pump`).
     fn pump(ctx: &mut Ctx, rtc: &mut RtcCntl) {
-        let mut calls = 0;
-        while let Some(event) = ctx.take_due() {
-            calls += 1;
-            assert!(
-                calls <= 1_000,
-                "the device keeps arming itself at the present time"
-            );
+        crate::periph::pump(ctx, |ctx, event| {
             assert_eq!(event, Event::RtcWatchdog);
             rtc.wake(ctx);
-        }
+        });
     }
 
     fn after(ctx: &mut Ctx, rtc: &mut RtcCntl, cycles: u64) {

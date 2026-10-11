@@ -784,20 +784,12 @@ mod tests {
         timg
     }
 
-    /// Drains every wake-up due at the present time, those a call arms for the present time
-    /// included (the machine delivers those one pass later: `Ctx::deliver_due`), and fails the
-    /// test after a thousand calls.
+    /// Calls the group for every wake-up due at the present time (`periph::pump`).
     fn pump(ctx: &mut Ctx, timg: &mut Timg) {
-        let mut calls = 0;
-        while let Some(event) = ctx.take_due() {
-            calls += 1;
-            assert!(
-                calls <= 1_000,
-                "the device keeps arming itself at the present time"
-            );
+        crate::periph::pump(ctx, |ctx, event| {
             assert_eq!(event, timg.event());
             timg.wake(ctx);
-        }
+        });
     }
 
     fn after(ctx: &mut Ctx, timg: &mut Timg, cycles: u64) {

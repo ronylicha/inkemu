@@ -1,5 +1,6 @@
-//! `APB_CTRL` (`SYSCON`): the hardware random number generator and two radio memory power registers.
-//! Sources: report BA §2 row 88, §2.3 item 1, §3 rows 29 and 34.
+//! `APB_CTRL` (`SYSCON`): the hardware random number generator, and four registers of a radio
+//! this model does not have (two memory power registers, the clock gates, the resets).
+//! Sources: report BA §2 row 88, §2.3 item 1, §3 rows 29 and 34, §9.
 use super::{APB_CTRL_BASE, Accepted, Storage};
 use crate::config::DEFAULT_RNG_SEED;
 use crate::ctx::Ctx;
@@ -20,8 +21,10 @@ const ACCEPTED: [Accepted; 4] = [
         "SP5a",
     ),
     Accepted::svd("APB_CTRL", "MEM_POWER_UP", "radio memory power", "SP5a"),
-    // `esp_perip_clk_init` gates the radio clocks (`IDF:esp_system/port/soc/esp32c3/clk.c:317`);
-    // the radio resets are pulsed by `esp_system_reset_modules_on_exit` at a restart (trace F1).
+    // `esp_perip_clk_init` gates the radio clocks at start-up
+    // (`IDF:esp_system/port/soc/esp32c3/clk.c:317`) and touches the radio resets in the same
+    // pass (report BA §9, the row of `esp_perip_clk_init`); the resets are pulsed again by
+    // `esp_system_reset_modules_on_exit` at a restart (trace F1).
     Accepted::svd(
         "APB_CTRL",
         "WIFI_CLK_EN",
@@ -41,8 +44,8 @@ pub(crate) fn accepted() -> Vec<Accepted> {
 }
 
 /// The `APB_CTRL` block as far as the boot uses it: the random number register, which answers the
-/// next value of a seeded sequence on every read, and the two radio memory power registers, which
-/// are storage.
+/// next value of a seeded sequence on every read, and the four radio registers (memory power,
+/// clock gates, resets), which are storage.
 #[derive(Clone, Debug)]
 pub struct ApbCtrl {
     /// State of the generator; never zero.
@@ -143,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn the_generator_is_read_only_and_the_two_power_registers_are_stored() {
+    fn the_generator_is_read_only_and_the_four_radio_registers_are_stored() {
         let ctx = &mut Ctx::default();
         let mut apb = ApbCtrl::new(DEFAULT_RNG_SEED);
         assert!(!apb.write(ctx, RND_DATA, 0));

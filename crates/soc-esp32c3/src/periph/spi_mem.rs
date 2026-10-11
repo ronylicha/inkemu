@@ -69,7 +69,9 @@ const MODELED_COMMAND_BITS: u32 = 8;
 /// `MOSI_DLEN` / `MISO_DLEN` [9:0]: data length in bits, minus one.
 const DLEN_MASK: u32 = 0x3FF;
 
-/// Configuration of SPI1 that only shapes the electrical transfer, which is instantaneous here.
+/// Configuration of SPI1 that nothing acts on here: what shapes the electrical transfer, which
+/// is instantaneous, and the automatic wait, suspend and resume around a program or an erase,
+/// which arrive with the flash writes.
 const SPI1_ACCEPTED: [Accepted; 9] = [
     Accepted::svd("SPI1", "CTRL", "read mode, dummy output, WP level", "SP8"),
     Accepted::svd(
@@ -840,6 +842,33 @@ mod tests {
                 "FB §B.2: 256 bits, one cache line"
             );
             assert_eq!(spi0.read(ctx, offset), Some(0xFF));
+        }
+    }
+
+    #[test]
+    fn the_registers_the_flash_driver_configures_are_stored_from_their_svd_reset_values() {
+        // What `spi_flash_hal_device_config` writes on SPI1 and `spimem_flash_ll_get_source_freq_mhz`
+        // reads on SPI0 (trace F1). A row removed from the accepted lists makes its register
+        // unmodelled, and its read here `None`.
+        let ctx = &mut Ctx::default();
+        let reset = |peripheral: &str, name: &str| {
+            svd_regs::esp32c3::lookup(svd_regs::esp32c3::addr(peripheral, name))
+                .unwrap()
+                .reset_value
+        };
+        let mut spi1 = spi1();
+        for name in ["MISC", "FLASH_SUS_CTRL", "FLASH_WAITI_CTRL"] {
+            let offset = svd_regs::esp32c3::addr("SPI1", name) - SPI1_BASE;
+            assert_eq!(spi1.read(ctx, offset), Some(reset("SPI1", name)), "{name}");
+            assert!(spi1.write(ctx, offset, 0x5), "{name}");
+            assert_eq!(spi1.read(ctx, offset), Some(0x5), "{name}");
+        }
+        let mut spi0 = Spi0::new();
+        for name in ["CORE_CLK_SEL", "MISC"] {
+            let offset = svd_regs::esp32c3::addr("SPI0", name) - SPI0_BASE;
+            assert_eq!(spi0.read(ctx, offset), Some(reset("SPI0", name)), "{name}");
+            assert!(spi0.write(ctx, offset, 0x1), "{name}");
+            assert_eq!(spi0.read(ctx, offset), Some(0x1), "{name}");
         }
     }
 }

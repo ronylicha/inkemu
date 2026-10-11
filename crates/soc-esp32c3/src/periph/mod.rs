@@ -202,6 +202,23 @@ pub(crate) const fn consecutive(peripheral: &str, names: &[&str]) -> bool {
     true
 }
 
+/// For the tests of the device models: drains every wake-up due at the present time, handing
+/// each to `wake`, those a call arms for the present time included (the machine delivers those
+/// one pass later: `Ctx::deliver_due`). It fails the test after a thousand calls, so a device
+/// that keeps arming itself at the present time is a failure and not a test that never ends.
+#[cfg(test)]
+pub(crate) fn pump(ctx: &mut Ctx, mut wake: impl FnMut(&mut Ctx, Event)) {
+    let mut calls = 0;
+    while let Some(event) = ctx.take_due() {
+        calls += 1;
+        assert!(
+            calls <= 1_000,
+            "the device keeps arming itself at the present time"
+        );
+        wake(ctx, event);
+    }
+}
+
 /// One 32-bit half of a wide value: bits 63:32 when `hi`, bits 31:0 otherwise. Registers expose
 /// 48- to 62-bit values as such pairs.
 #[must_use]
@@ -797,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sha_block_is_routed_and_its_refusals_reach_the_relay() {
+    fn the_sha_block_is_routed_and_its_refusals_reach_the_context() {
         let ctx = &mut Ctx::default();
         let mut p = peripherals(ctx);
         let dma_start = svd_regs::esp32c3::addr("SHA", "DMA_START");
@@ -838,7 +855,11 @@ mod tests {
             None,
             "the register before BBPD_CTRL is not listed"
         );
-        assert_eq!(read(ana_i2c::ANA_I2C_BASE + 0x44), Some(0), "ANA_CONFIG");
+        assert_eq!(
+            read(ana_i2c::ANA_I2C_BASE + ana_i2c::ANA_CONFIG),
+            Some(0),
+            "ANA_CONFIG"
+        );
     }
 
     #[test]
@@ -1101,7 +1122,7 @@ mod tests {
     fn the_digital_side_of_regi2c_returns_to_its_reset_values_at_a_core_reset() {
         let ctx = &mut Ctx::default();
         let mut p = peripherals(ctx);
-        let config = ana_i2c::ANA_I2C_BASE + 0x44;
+        let config = ana_i2c::ANA_I2C_BASE + ana_i2c::ANA_CONFIG;
         write(&mut p, ctx, config, 0x1234);
         p.reset(ctx, ResetCause::SoftwareCpu, 0x4004_8b92, 0);
         assert_eq!(
@@ -1134,9 +1155,7 @@ mod tests {
             Some(0),
             "not called yet"
         );
-        while let Some(event) = ctx.take_due() {
-            p.deliver(ctx, event);
-        }
+        pump(ctx, |ctx, event| p.deliver(ctx, event));
         assert_eq!(read(&mut p, ctx, svd("SYSTIMER", "INT_RAW")), Some(1));
     }
 

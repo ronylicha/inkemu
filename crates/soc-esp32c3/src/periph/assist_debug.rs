@@ -1,11 +1,12 @@
 //! `ASSIST_DEBUG`: the debug assistant. It records the PC at a CPU reset, which the ROM prints as
 //! `Saved PC`, and guards the stack pointer for ESP-IDF. Sources: TRM chapter 17, ESP-IDF
-//! `assist_debug_reg.h`; reports IR §4.4 and §5, TW §D.2 and §D.3.
+//! `IDF:components/soc/esp32c3/register/soc/assist_debug_reg.h`; reports IR §4.4 and §5, TW §D.2
+//! and §D.3.
 //!
-//! The SVD and `assist_debug_reg.h` do not name two of the addresses alike: the SVD calls
-//! `+0x000` `CORE_0_MONTR_ENA` and `+0x008` `CORE_0_INTR_ENA`, the header calls them
-//! `ASSIST_DEBUG_CORE_0_INTR_ENA_REG` (line 14) and `ASSIST_DEBUG_CORE_0_INTR_RLS_REG` (line 162).
-//! The model follows the SVD names.
+//! The SVD and that header do not name two of the addresses alike: the SVD calls `+0x000`
+//! `CORE_0_MONTR_ENA` and `+0x008` `CORE_0_INTR_ENA`, the header calls them
+//! `ASSIST_DEBUG_CORE_0_INTR_ENA_REG` (`assist_debug_reg.h:14`) and
+//! `ASSIST_DEBUG_CORE_0_INTR_RLS_REG` (`assist_debug_reg.h:162`). The model follows the SVD names.
 use super::{ASSIST_DEBUG_BASE, Accepted, Storage};
 use crate::ctx::Ctx;
 use emu_core::Peripheral;

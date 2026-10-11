@@ -16,7 +16,7 @@ const HOST0_CMD: u32 = 0x00;
 const HOST1_CMD: u32 = 0x04;
 /// `I2C_MST_ANA_CONF0_REG`, `ANA_CONFIG_REG`, `ANA_CONFIG2_REG` (`regi2c_defs.h`).
 const I2C_MST_ANA_CONF0: u32 = 0x40;
-const ANA_CONFIG: u32 = 0x44;
+pub(crate) const ANA_CONFIG: u32 = 0x44;
 const ANA_CONFIG2: u32 = 0x48;
 const HOSTS: usize = 2;
 const CONFIG_REGISTERS: usize = 3;

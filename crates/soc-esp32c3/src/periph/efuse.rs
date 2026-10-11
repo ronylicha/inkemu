@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_holes_between_documented_registers_are_unmodeled() {
+    fn the_holes_between_documented_registers_are_unmodeled_but_for_the_one_esp_idf_reads() {
         let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::V0_3);
         assert_eq!(
