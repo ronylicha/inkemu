@@ -255,15 +255,34 @@ mod tests {
     fn rejects_encrypted_xota() {
         let mut b = b"XOTA".to_vec();
         b.resize(512, 0);
-        assert_eq!(FirmwareImage::parse(&b), Err(FirmwareError::EncryptedOta));
+        let err = FirmwareImage::parse(&b).unwrap_err();
+        assert_eq!(err, FirmwareError::EncryptedOta);
+        let msg = err.to_string();
+        assert!(msg.contains("encrypted"), "{msg}");
+        assert!(msg.contains("plain .bin"), "{msg}");
     }
 
     #[test]
     fn rejects_bad_magic() {
-        assert_eq!(
-            FirmwareImage::parse(&with(|b| b[0] = 0x00)),
-            Err(FirmwareError::BadMagic { found: 0 })
-        );
+        let err = FirmwareImage::parse(&with(|b| b[0] = 0x00)).unwrap_err();
+        assert_eq!(err, FirmwareError::BadMagic { found: 0 });
+        let msg = err.to_string();
+        assert!(msg.contains("0xe9") && msg.contains("0x00"), "{msg}");
+    }
+
+    #[test]
+    fn inflated_segment_count_is_refused_cleanly() {
+        // Count 16 is the legal maximum, but the file holds only 2 segments: the parser
+        // must refuse at the first segment that does not fit, never panic or over-read.
+        // The third segment header sits at 300 and declares a length read from the hash.
+        assert!(matches!(
+            FirmwareImage::parse(&with(|b| b[1] = 16)),
+            Err(FirmwareError::TruncatedSegment {
+                index: 2,
+                offset: 300,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -429,13 +448,17 @@ mod tests {
     #[test]
     fn flash_size_must_fit_device() {
         let img = FirmwareImage::parse(&build_image(&ImageSpec::default())).unwrap();
+        let err = img.require_flash(FlashSize::Mb4).unwrap_err();
         assert_eq!(
-            img.require_flash(FlashSize::Mb4),
-            Err(FirmwareError::FlashTooSmall {
+            err,
+            FirmwareError::FlashTooSmall {
                 needed: 16,
                 available: 4
-            })
+            }
         );
+        let msg = err.to_string();
+        assert!(msg.contains("16 MB") && msg.contains("4 MB"), "{msg}");
+        assert!(msg.contains("choose a device"), "{msg}");
         assert_eq!(img.require_flash(FlashSize::Mb16), Ok(()));
     }
 
