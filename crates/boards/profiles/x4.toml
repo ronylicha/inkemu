@@ -1,0 +1,9 @@
+# Xteink X4. Hardware facts and their sources: docs/research/xteink-hardware.md.
+id = "x4"
+name = "Xteink X4"
+
+[soc]
+family = "esp32c3"
+# Assumed: the silicon revision of retail units is not established. v0.3 is the most common
+# ESP32-C3 revision and selects the rev3 mask ROM.
+revision = "v0.3"
