@@ -2,14 +2,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use cpu_rv32::HartConfig;
 use emu_cli::rvtest::{RunResult, TestMachine};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 const MAX_STEPS: u64 = 5_000_000;
-/// rv32ui + um + uc + mi physical-memory (`-p`) variants; the `-v` ones need S-mode.
-const MIN_FIXTURES: usize = 60;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn fixture_dir() -> PathBuf {
+    repo_root().join("tests/fixtures/riscv-tests")
 }
 
 fn skip_list() -> Vec<String> {
@@ -23,28 +26,28 @@ fn skip_list() -> Vec<String> {
         .collect()
 }
 
-fn fixtures() -> Vec<PathBuf> {
-    let dir = repo_root().join("tests/fixtures/riscv-tests");
-    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("rv32"))
+/// `(file name, sha256 hex)` pairs of `SHA256SUMS`, the manifest written by `build-riscv-tests.sh`.
+fn manifest() -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(fixture_dir().join("SHA256SUMS")).unwrap();
+    text.lines()
+        .map(|line| {
+            let (hash, name) = line.split_once("  ").expect("`<sha256>  <name>` line");
+            (name.to_string(), hash.to_string())
         })
-        .collect();
-    v.sort();
-    v
+        .collect()
+}
+
+fn fixtures() -> Vec<PathBuf> {
+    manifest()
+        .into_iter()
+        .map(|(name, _)| fixture_dir().join(name))
+        .collect()
 }
 
 #[test]
 fn all_riscv_tests_pass_except_documented_skips() {
     let skips = skip_list();
     let files = fixtures();
-    assert!(
-        files.len() >= MIN_FIXTURES,
-        "fixtures missing: run tools/conformance/build-riscv-tests.sh"
-    );
     let mut failures = Vec::new();
     let mut ran = 0_usize;
     for path in &files {
@@ -67,6 +70,32 @@ fn all_riscv_tests_pass_except_documented_skips() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+#[test]
+fn fixture_directory_matches_the_sha256_manifest() {
+    let listed = manifest();
+    let mut on_disk: Vec<String> = std::fs::read_dir(fixture_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("rv32"))
+        .collect();
+    on_disk.sort();
+    let mut names: Vec<String> = listed.iter().map(|(n, _)| n.clone()).collect();
+    names.sort();
+    assert_eq!(
+        on_disk, names,
+        "rv32* files differ from SHA256SUMS: rerun tools/conformance/build-riscv-tests.sh"
+    );
+    assert!(!names.is_empty(), "empty manifest");
+    for (name, expected) in listed {
+        let digest = Sha256::digest(std::fs::read(fixture_dir().join(&name)).unwrap());
+        assert_eq!(
+            format!("{digest:x}"),
+            expected,
+            "{name} does not match its manifest hash"
+        );
+    }
 }
 
 #[test]
@@ -96,12 +125,32 @@ fn skip_list_entries_exist_and_have_reasons() {
 
 #[test]
 fn same_test_twice_gives_same_trace_hash() {
-    let path = repo_root().join("tests/fixtures/riscv-tests/rv32ui-p-add");
-    let bytes = std::fs::read(path).unwrap();
+    let bytes = std::fs::read(fixture_dir().join("rv32ui-p-add")).unwrap();
     let run = || {
         let mut m = TestMachine::from_elf(&bytes, HartConfig::default()).unwrap();
-        m.run(MAX_STEPS);
+        assert_eq!(m.run(MAX_STEPS), RunResult::Passed);
         m.trace_hash()
     };
     assert_eq!(run(), run());
+}
+
+/// `rv32ui-p-lw` keeps four data words between `begin_signature` and `end_signature`
+/// (`objdump -s -j .data`: `ff00ff00 00ff00ff f00ff00f 0ff00ff0` as bytes, i.e. these little-endian words).
+const LW_SIGNATURE: [u32; 4] = [0x00ff_00ff, 0xff00_ff00, 0x0ff0_0ff0, 0xf00f_f00f];
+
+#[test]
+fn signature_returns_the_words_of_the_signature_region() {
+    let bytes = std::fs::read(fixture_dir().join("rv32ui-p-lw")).unwrap();
+    let mut m = TestMachine::from_elf(&bytes, HartConfig::default()).unwrap();
+    assert_eq!(m.run(MAX_STEPS), RunResult::Passed);
+    assert_eq!(m.signature().unwrap(), LW_SIGNATURE);
+}
+
+#[test]
+fn signature_is_empty_when_the_region_is_empty() {
+    // rv32ui-p-add has begin_signature == end_signature.
+    let bytes = std::fs::read(fixture_dir().join("rv32ui-p-add")).unwrap();
+    let mut m = TestMachine::from_elf(&bytes, HartConfig::default()).unwrap();
+    assert_eq!(m.run(MAX_STEPS), RunResult::Passed);
+    assert_eq!(m.signature().unwrap(), Vec::<u32>::new());
 }

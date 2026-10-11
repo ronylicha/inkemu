@@ -1,4 +1,4 @@
-# One test per line: <file name> # <reason, citing the spec section that puts the feature out of scope>
+# One test per line: <file name> # <reason>. A skip is only allowed for a feature the current stage does not implement yet.
 rv32ui-p-ma_data # misaligned data accesses trap by default (MisalignedPolicy::Trap); the C3 behaviour is arbitrated by the QEMU lockstep in SP1b (spec §4.4)
-rv32mi-p-breakpoint # needs the Sdtrig debug-trigger CSRs (tselect/tdata1/tdata2/tcontrol): an optional extension outside the RV32IMC + Zicsr core of SP1a (spec §10.2 item 5, §4.4)
-rv32mi-p-pmpaddr # needs the optional Physical Memory Protection CSRs (pmpcfg0/pmpaddr0): outside the machine-mode-only RV32IMC + Zicsr core of SP1a (spec §10.2 item 5, §4.4)
+rv32mi-p-breakpoint # Sdtrig trigger CSRs (tselect/tdata1/tdata2/tcontrol) not implemented in SP1a (core only); SP1b implements the ESP32-C3 PMP/trigger CSRs (spec §10.2 item 5)
+rv32mi-p-pmpaddr # PMP CSRs (pmpcfg0/pmpaddr0) not implemented in SP1a (core only); SP1b implements the ESP32-C3 PMP/trigger CSRs (spec §10.2 item 5)

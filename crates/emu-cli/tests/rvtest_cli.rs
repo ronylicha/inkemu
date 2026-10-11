@@ -84,20 +84,17 @@ fn trace_hash_flag_prints_a_stable_hash() {
 
 #[test]
 fn signature_flag_writes_one_hex_word_per_line() {
+    // rv32ui-p-lw: four data words in its signature region (little-endian view of its .data).
     let dir = std::env::temp_dir().join(format!("inkemu-sig-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let sig = dir.join("add.sig");
+    let sig = dir.join("lw.sig");
     rvtest()
-        .arg(fixture("rv32ui-p-add"))
+        .arg(fixture("rv32ui-p-lw"))
         .arg("--signature")
         .arg(&sig)
         .assert()
         .code(0);
     let text = std::fs::read_to_string(&sig).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
-    assert!(
-        text.lines()
-            .all(|l| l.len() == 8 && l.chars().all(|c| c.is_ascii_hexdigit())),
-        "{text}"
-    );
+    assert_eq!(text, "00ff00ff\nff00ff00\n0ff00ff0\nf00ff00f\n");
 }

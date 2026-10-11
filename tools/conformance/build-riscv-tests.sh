@@ -5,8 +5,11 @@ cd "$(dirname "$0")/../.."
 source tools/conformance/versions.env
 out=tests/fixtures/riscv-tests
 docker build -t inkemu/riscv-gcc tools/docker/riscv-gcc
-rm -rf "$out" && mkdir -p "$out"
-docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD/$out:/out" -w /tmp inkemu/riscv-gcc bash -euo pipefail -c "
+# Build in a scratch dir, then replace only the ELFs and the manifest: LICENSE and README.md stay.
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+mkdir -p "$out"
+docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$stage:/out" -w /tmp inkemu/riscv-gcc bash -euo pipefail -c "
   git clone -q https://github.com/riscv-software-src/riscv-tests src
   cd src && git checkout -q $RISCV_TESTS_COMMIT && git submodule update -q --init env
   cd isa
@@ -18,5 +21,7 @@ docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD/$out:/out" -w /tmp 
     # the committed fixtures are byte-for-byte reproducible (every other symbol is kept).
     case \$f in *.dump) ;; *) riscv64-unknown-elf-objcopy --wildcard --strip-symbol 'cc*.o' \"\$f\" \"/out/\$f\" ;; esac
   done"
-(cd "$out" && sha256sum -- * > SHA256SUMS)
-echo "built $(ls "$out" | wc -l) files into $out"
+find "$out" -maxdepth 1 -type f \( -name 'rv32*' -o -name SHA256SUMS \) -delete
+cp "$stage"/rv32* "$out"/
+(cd "$out" && LC_ALL=C sha256sum -- rv32* > SHA256SUMS)
+echo "built $(wc -l < "$out/SHA256SUMS") fixtures into $out"

@@ -21,5 +21,6 @@ goblin.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
