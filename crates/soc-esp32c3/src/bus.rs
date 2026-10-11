@@ -1,6 +1,7 @@
 //! The ESP32-C3 address space. Memory map: `docs/research/esp32c3-boot-chain.md`, §A.1.
 use crate::config::SocConfig;
 use crate::diag::{Diagnostic, Diagnostics, Direction};
+use crate::flash::FlashDevice;
 use crate::memmap::{
     DROM_BASE, DROM_ROM_OFFSET, DROM_SIZE, PERIPH_BASE, PERIPH_SIZE, ROM_BASE, ROM_SIZE,
     RTC_RAM_BASE, RTC_RAM_SIZE, SRAM_DBUS_BASE, SRAM_IBUS_BASE, SRAM_SIZE, SRAM0_BASE, SRAM0_SIZE,
@@ -71,13 +72,13 @@ const fn size_mask(size: AccessSize) -> u32 {
 
 impl SocBus {
     #[must_use]
-    pub fn new(rom: RomImage, config: &SocConfig) -> SocBus {
+    pub fn new(rom: RomImage, flash: Box<dyn FlashDevice>, config: &SocConfig) -> SocBus {
         SocBus {
             rom,
             sram: Ram::new(SRAM_DBUS_BASE, SRAM_SIZE as usize),
             sram0: Ram::new(SRAM0_BASE, SRAM0_SIZE as usize),
             rtc: Ram::new(RTC_RAM_BASE, RTC_RAM_SIZE as usize),
-            periph: Peripherals::new(config),
+            periph: Peripherals::new(config, flash),
             diag: Diagnostics::new(config.strict_mmio),
             pc: 0,
         }
@@ -116,6 +117,14 @@ impl SocBus {
         reset
     }
 
+    /// Turns what a device could not do into a diagnostic that names the instruction.
+    fn relay_unsupported(&mut self) {
+        if let Some(what) = self.periph.take_unsupported() {
+            self.diag
+                .record(Diagnostic::Unsupported { what, pc: self.pc });
+        }
+    }
+
     fn mmio_read(&mut self, addr: u32, size: AccessSize) -> Result<ReadOutcome, BusError> {
         if !addr.is_multiple_of(size.bytes()) {
             return Err(BusError::Misaligned { addr, size });
@@ -125,6 +134,7 @@ impl SocBus {
             .periph
             .device(reg_addr)
             .and_then(|(device, base)| device.read(reg_addr - base));
+        self.relay_unsupported();
         let word = match modelled {
             Some(word) => word,
             None => self.unmodeled(reg_addr, Direction::Read, 0),
@@ -153,6 +163,7 @@ impl SocBus {
             .periph
             .device(reg_addr)
             .is_some_and(|(device, base)| device.write(reg_addr - base, word));
+        self.relay_unsupported();
         if !handled {
             self.unmodeled(reg_addr, Direction::Write, word);
         }
@@ -213,6 +224,7 @@ impl Bus for SocBus {
 mod tests {
     use super::*;
     use crate::config::STRAP_SPI_FAST_FLASH_BOOT;
+    use crate::flash::NorFlash;
     use crate::test_support::unmodeled_register as unmodeled;
     use emu_core::{
         AccessKind::{Fetch, Load, Store},
@@ -223,7 +235,11 @@ mod tests {
         let mut rom = vec![0u8; ROM_SIZE as usize];
         rom[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
         rom[0x4_0000..0x4_0004].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        SocBus::new(RomImage::from_flat(rom).unwrap(), &config)
+        SocBus::new(
+            RomImage::from_flat(rom).unwrap(),
+            Box::new(NorFlash::blank(config.flash)),
+            &config,
+        )
     }
     fn bus() -> SocBus {
         bus_with(SocConfig::default())
@@ -267,7 +283,11 @@ mod tests {
         let mut rom = vec![0u8; ROM_SIZE as usize];
         let end = rom.len();
         rom[end - 4..].copy_from_slice(&[1, 2, 3, 4]);
-        let mut b = SocBus::new(RomImage::from_flat(rom).unwrap(), &SocConfig::default());
+        let mut b = SocBus::new(
+            RomImage::from_flat(rom).unwrap(),
+            Box::new(NorFlash::blank(SocConfig::default().flash)),
+            &SocConfig::default(),
+        );
         assert_eq!(load(&mut b, ROM_BASE + ROM_SIZE - 4), 0x0403_0201);
         let straddling = ROM_BASE + ROM_SIZE - 2;
         assert_eq!(
@@ -559,6 +579,24 @@ mod tests {
             ),
             "{reported:?}"
         );
+    }
+
+    #[test]
+    fn an_unmodelled_flash_command_becomes_a_named_diagnostic_and_a_strict_violation() {
+        let cmd = svd_regs::esp32c3::addr("SPI1", "CMD");
+        let mut b = bus_with(SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        });
+        b.set_pc(0x4038_0010);
+        b.write(cmd, Word, 1 << 24).unwrap(); // sector erase
+        let expected = Diagnostic::Unsupported {
+            what: crate::diag::Unsupported::FlashCommand { opcode: 0x20 },
+            pc: 0x4038_0010,
+        };
+        assert_eq!(b.diag.drain(), vec![expected.clone()]);
+        assert_eq!(b.diag.take_violation(), Some(expected));
+        assert_eq!(load(&mut b, cmd), 0);
     }
 
     #[test]

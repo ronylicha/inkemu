@@ -2,6 +2,7 @@
 use crate::bus::SocBus;
 use crate::config::SocConfig;
 use crate::diag::Diagnostic;
+use crate::flash::{FlashImageError, NorFlash};
 use crate::memmap::RESET_PC;
 use crate::rom::RomImage;
 use cpu_rv32::{
@@ -39,9 +40,30 @@ pub struct Esp32C3 {
 }
 
 impl Esp32C3 {
-    /// A machine in its power-on reset state, about to execute the first ROM instruction.
+    /// A machine in its power-on reset state with an erased flash, about to execute the first ROM
+    /// instruction.
     #[must_use]
     pub fn new(rom: RomImage, config: &SocConfig) -> Esp32C3 {
+        Esp32C3::build(rom, NorFlash::blank(config.flash), config)
+    }
+
+    /// A machine whose flash holds `image` from offset 0; what the image does not cover is erased.
+    ///
+    /// # Errors
+    /// [`FlashImageError`] when the image is longer than the flash or the flash size is not valid.
+    pub fn with_flash(
+        rom: RomImage,
+        image: Vec<u8>,
+        config: &SocConfig,
+    ) -> Result<Esp32C3, FlashImageError> {
+        Ok(Esp32C3::build(
+            rom,
+            NorFlash::with_image(image, config.flash)?,
+            config,
+        ))
+    }
+
+    fn build(rom: RomImage, flash: NorFlash, config: &SocConfig) -> Esp32C3 {
         // Misaligned loads and stores are performed, not trapped. Evidence: the rev0 mask ROM's `_init`
         // executes `lw t0,0(a5)` at pc 0x40001e00 from address 0x40058c3e (2 mod 4), the first byte
         // after `.wifi0iram.3` where the linker placed the initial `.data` image, so real silicon
@@ -56,7 +78,7 @@ impl Esp32C3 {
         };
         Esp32C3 {
             hart: Hart::new(RESET_PC, hart_config),
-            bus: SocBus::new(rom, config),
+            bus: SocBus::new(rom, Box::new(flash), config),
             timing: DatasheetTiming,
             trace: config.trace_hash.then(TraceHash::new),
         }
@@ -182,6 +204,18 @@ mod tests {
         let m = machine(&[HANG]);
         assert!(!m.timing_model().is_calibrated());
         assert_eq!(m.timing_model().name(), "datasheet-uncalibrated");
+    }
+
+    #[test]
+    fn a_machine_can_be_built_around_a_flash_image_and_refuses_one_that_is_too_long() {
+        let config = SocConfig::default();
+        assert!(Esp32C3::with_flash(flat_rom(&[HANG]), vec![0xE9; 64], &config).is_ok());
+        let too_long = vec![0u8; config.flash.size as usize + 1];
+        let err = Esp32C3::with_flash(flat_rom(&[HANG]), too_long, &config).unwrap_err();
+        assert!(
+            matches!(err, crate::flash::FlashImageError::TooLong { .. }),
+            "{err}"
+        );
     }
 
     #[test]

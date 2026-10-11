@@ -1,5 +1,7 @@
 //! The modelled peripherals of the ESP32-C3 and their place in the address space.
 use crate::config::SocConfig;
+use crate::diag::Unsupported;
+use crate::flash::FlashDevice;
 use emu_core::Peripheral;
 
 pub mod assist_debug;
@@ -9,6 +11,7 @@ pub mod gpio;
 pub mod intmatrix;
 pub mod io_mux;
 pub mod rtc_cntl;
+pub mod spi_mem;
 pub mod system;
 pub mod uart;
 pub mod usb_serial_jtag;
@@ -20,6 +23,7 @@ pub use gpio::Gpio;
 pub use intmatrix::IntMatrix;
 pub use io_mux::IoMux;
 pub use rtc_cntl::RtcCntl;
+pub use spi_mem::{Spi0, Spi1};
 pub use system::System;
 pub use uart::Uart;
 pub use usb_serial_jtag::UsbSerialJtag;
@@ -187,6 +191,7 @@ pub fn accepted_without_effect() -> Vec<Accepted> {
         intmatrix::accepted(),
         assist_debug::accepted(),
         extmem::accepted(),
+        spi_mem::accepted(),
     ]
     .concat();
     rows.sort_by_key(|row| row.addr);
@@ -214,6 +219,11 @@ pub fn render_accepted_table(rows: &[Accepted]) -> String {
 // Base address and range of every modelled block (`reg_base.h`; report §A.2), in one place. A range
 // is `(base, end)`, the end being exclusive. The peripheral modules import their base from here, and
 // ask the SVD for their registers relative to it.
+// The two MSPI controllers (`reg_base.h` `DR_REG_SPI1_BASE`, `DR_REG_SPI0_BASE`; report BC §A.2).
+pub(crate) const SPI1_BASE: u32 = 0x6000_2000;
+const SPI1: (u32, u32) = (SPI1_BASE, 0x6000_3000);
+pub(crate) const SPI0_BASE: u32 = 0x6000_3000;
+const SPI0: (u32, u32) = (SPI0_BASE, 0x6000_4000);
 pub(crate) const GPIO_BASE: u32 = 0x6000_4000;
 const GPIO: (u32, u32) = (GPIO_BASE, 0x6000_4F00);
 pub(crate) const IO_MUX_BASE: u32 = 0x6000_9000;
@@ -249,6 +259,8 @@ pub struct Peripherals {
     pub efuse: Efuse,
     pub extmem: Extmem,
     pub assist_debug: AssistDebug,
+    pub spi0: Spi0,
+    pub spi1: Spi1,
     pub uart0: Uart,
     pub uart1: Uart,
     pub usb_serial_jtag: UsbSerialJtag,
@@ -256,7 +268,7 @@ pub struct Peripherals {
 
 impl Peripherals {
     #[must_use]
-    pub fn new(config: &SocConfig) -> Peripherals {
+    pub fn new(config: &SocConfig, flash: Box<dyn FlashDevice>) -> Peripherals {
         Peripherals {
             gpio: Gpio::new(config.strapping),
             io_mux: IoMux::new(),
@@ -266,6 +278,8 @@ impl Peripherals {
             efuse: Efuse::new(config.chip_revision),
             extmem: Extmem::new(),
             assist_debug: AssistDebug::new(),
+            spi0: Spi0::new(),
+            spi1: Spi1::new(flash),
             uart0: Uart::new(UART0_BASE),
             uart1: Uart::new(UART1_BASE),
             usb_serial_jtag: UsbSerialJtag::new(),
@@ -291,6 +305,10 @@ impl Peripherals {
             Some((&mut self.extmem, EXTMEM_BASE))
         } else if within(ASSIST_DEBUG) {
             Some((&mut self.assist_debug, ASSIST_DEBUG_BASE))
+        } else if within(SPI1) {
+            Some((&mut self.spi1, SPI1_BASE))
+        } else if within(SPI0) {
+            Some((&mut self.spi0, SPI0_BASE))
         } else if within(UART0) {
             Some((&mut self.uart0, UART0_BASE))
         } else if within(UART1) {
@@ -300,6 +318,11 @@ impl Peripherals {
         } else {
             None
         }
+    }
+
+    /// What a device was asked to do and cannot do faithfully, since the last call.
+    pub(crate) fn take_unsupported(&mut self) -> Option<Unsupported> {
+        self.spi1.take_unsupported()
     }
 }
 
@@ -402,7 +425,12 @@ mod tests {
 
     #[test]
     fn the_page_shared_by_rtc_cntl_and_the_efuse_splits_at_the_last_two_kib() {
-        let mut p = Peripherals::new(&SocConfig::default());
+        let mut p = Peripherals::new(
+            &SocConfig::default(),
+            Box::new(crate::flash::NorFlash::blank(
+                crate::flash::FlashConfig::default(),
+            )),
+        );
         let base_of = |p: &mut Peripherals, addr: u32| p.device(addr).map(|(_, base)| base);
         assert_eq!(base_of(&mut p, 0x6000_8000), Some(RTC_CNTL_BASE));
         assert_eq!(base_of(&mut p, 0x6000_87FC), Some(RTC_CNTL_BASE));

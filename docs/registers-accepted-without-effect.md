@@ -22,6 +22,23 @@ then rewrites the table below, and nothing else; review the diff before committi
 | `0x60000020` | `UART0.CONF0` | 1 | frame format | SP1b-3 |
 | `0x60000024` | `UART0.CONF1` | 1 | FIFO thresholds | SP1b-3 |
 | `0x60000078` | `UART0.CLK_CONF` | 1 | clock source and divider | SP1b-3 |
+| `0x60002008` | `SPI1.CTRL` | 1 | read mode, dummy output, WP level | SP8 |
+| `0x6000200c` | `SPI1.CTRL1` | 1 | CS hold delay after a release-from-power-down | SP8 |
+| `0x60002010` | `SPI1.CTRL2` | 1 | CS setup and hold times | SP8 |
+| `0x60002014` | `SPI1.CLOCK` | 1 | SPI clock divider: a transfer takes no time | SP8 |
+| `0x600020a4` | `SPI1.SUS_STATUS` | 1 | program/erase suspend state | SP1b-3 |
+| `0x600020dc` | `SPI1.CLOCK_GATE` | 1 | register clock gate | SP1b-3 |
+| `0x60003008` | `SPI0.CTRL` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
+| `0x60003010` | `SPI0.CTRL2` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
+| `0x60003014` | `SPI0.CLOCK` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
+| `0x60003018` | `SPI0.USER` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
+| `0x6000301c` | `SPI0.USER1` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
+| `0x60003020` | `SPI0.USER2` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
+| `0x60003024` | `SPI0.MOSI_DLEN` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
+| `0x60003028` | `SPI0.MISO_DLEN` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
+| `0x60003034` | `SPI0.MISC` | 1 | chip-select enables | SP1b-4 |
+| `0x6000303c` | `SPI0.CACHE_FCTRL` | 1 | cache request enable | SP1b-4 |
+| `0x600030dc` | `SPI0.CLOCK_GATE` | 1 | register clock gate | SP1b-3 |
 | `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control | SP1b-3 |
 | `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation | SP1b-3 |
 | `0x600080ac` | `RTC_CNTL.SWD_CONF` | 1 | super watchdog: auto-feed, reset flag, strobes | SP1b-3 |
