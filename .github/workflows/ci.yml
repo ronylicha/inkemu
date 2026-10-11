@@ -25,19 +25,27 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --workspace --fail-under-lines 80
   arch-test:
-    # riscv-arch-test through RISCOF against Sail. On PRs it only runs when the core, the CLI that
-    # drives it or the conformance tooling changed; on pushes to main it always runs.
+    # riscv-arch-test through RISCOF against Sail. On pushes to main it always runs. On PRs it is
+    # skipped only when the diff provably touches nothing it depends on: any error computing the
+    # diff runs the job.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - name: Detect relevant changes
         id: scope
         run: |
+          set -euo pipefail
           run=true
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            git diff --name-only "origin/$GITHUB_BASE_REF...HEAD" \
-              | grep -qE '^(crates/cpu-rv32/|crates/emu-cli/|tools/conformance/|tools/docker/riscof/)' || run=false
+            if changed="$(git diff --name-only "origin/$GITHUB_BASE_REF...HEAD")"; then
+              if ! grep -qE '^(crates/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$|tools/conformance/|tools/docker/riscof/)' <<<"$changed"; then
+                run=false
+              fi
+            else
+              echo "git diff failed: running arch-test"
+            fi
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
       - if: steps.scope.outputs.run == 'true'
