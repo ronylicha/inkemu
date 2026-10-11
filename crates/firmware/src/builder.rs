@@ -3,7 +3,9 @@
 // u8/u32::MAX), so the narrowing casts cannot truncate in practice.
 #![allow(clippy::cast_possible_truncation)]
 use crate::app_desc::APP_DESC_MAGIC;
+use crate::chip::FlashSize;
 use crate::image::{CHECKSUM_SEED, IMAGE_MAGIC, TRAILER_ALIGN};
+use crate::partition::{PARTITION_TABLE_OFFSET, xteink_x4_stock};
 use sha2::{Digest, Sha256};
 
 /// Write-protect pin value meaning "disabled" in ESP-IDF headers.
@@ -71,6 +73,33 @@ pub fn build_image(spec: &ImageSpec) -> Vec<u8> {
     out
 }
 
+/// An erased flash byte, which fills the gap between the image and the partition table.
+const ERASED: u8 = 0xFF;
+
+/// A full flash image: the image of `spec` at offset 0, where the bootloader goes, erased bytes up
+/// to the partition table at `0x8000`, then the stock Xteink X4 table for a 16 MB flash. The result
+/// is `0x8C00` bytes long; what a real flash holds after the table reads erased.
+///
+/// # Panics
+/// When the image of `spec` does not fit below the partition table.
+#[must_use]
+pub fn build_flash_image(spec: &ImageSpec) -> Vec<u8> {
+    let table_offset = PARTITION_TABLE_OFFSET as usize;
+    let mut flash = build_image(spec);
+    assert!(
+        flash.len() <= table_offset,
+        "the image is {} bytes and would overlap the partition table at {table_offset:#x}; use smaller segments",
+        flash.len()
+    );
+    flash.resize(table_offset, ERASED);
+    let Ok(table) = xteink_x4_stock().to_bytes(FlashSize::Mb16) else {
+        // INVARIANT: the stock table is a fixed layout that is valid for a 16 MB flash.
+        unreachable!("the stock partition table is valid for a 16 MB flash")
+    };
+    flash.extend(table);
+    flash
+}
+
 /// A 256-byte `esp_app_desc_t` with the given strings (truncated to their field sizes).
 #[must_use]
 pub fn app_desc_bytes(version: &str, project: &str, idf: &str) -> Vec<u8> {
@@ -87,4 +116,37 @@ pub fn app_desc_bytes(version: &str, project: &str, idf: &str) -> Vec<u8> {
     put(&mut d, 96, 16, "Oct 11 2026");
     put(&mut d, 112, 32, idf);
     d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::partition::{PARTITION_TABLE_LEN, PartitionTable};
+
+    #[test]
+    fn a_flash_image_is_the_image_then_erased_bytes_then_the_stock_table() {
+        let spec = ImageSpec::default();
+        let image = build_image(&spec);
+        let flash = build_flash_image(&spec);
+        assert_eq!(flash.len(), 0x8000 + PARTITION_TABLE_LEN);
+        assert_eq!(flash[..image.len()], image[..], "the image is at offset 0");
+        assert!(
+            flash[image.len()..0x8000].iter().all(|&byte| byte == 0xFF),
+            "erased up to the table"
+        );
+        assert_eq!(
+            PartitionTable::parse(&flash[0x8000..]),
+            Ok(xteink_x4_stock())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "would overlap the partition table")]
+    fn an_image_that_reaches_the_partition_table_is_refused() {
+        let spec = ImageSpec {
+            segments: vec![(0x4038_0000, vec![0; 0x8000])],
+            ..ImageSpec::default()
+        };
+        let _ = build_flash_image(&spec);
+    }
 }

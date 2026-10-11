@@ -21,11 +21,12 @@ docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1
   # The suite is the arch-test groups listed in ARCH_TEST_EXPECTED. I, M, C and Zifencei are the
   # unprivileged groups; privilege/ holds the M-mode trap tests (ecall, ebreak, misaligned
   # accesses). The A/B/F/D/K/V/... groups are not part of this ISA and RISCOF drops them from the
-  # ISA YAML. pmp32/ needs PMP CSRs, which this core does not have and the ISA YAML does not
-  # advertise, yet RISCOF selects it anyway, so it is left out of the suite directory itself.
+  # ISA YAML. pmp32/ needs enforced PMP. The generic hart this bench runs has no PMP CSRs and the
+  # ISA YAML does not advertise them (the ESP32-C3 hart stores them, unenforced, since SP1b-2), yet
+  # RISCOF selects pmp32/ anyway, so it is left out of the suite directory itself.
   groups=""
   for entry in $ARCH_TEST_EXPECTED; do groups="$groups ${entry%%=*}"; done
-  echo "arch-test groups:$groups (pmp32 excluded: PMP CSRs not implemented in SP1a; SP1b re-enables by adding pmp32 back to ARCH_TEST_EXPECTED)"
+  echo "arch-test groups:$groups (pmp32 excluded: PMP is stored on the ESP32-C3 hart and not enforced; SP1b-3 enforces it and re-enables pmp32 by adding it back to ARCH_TEST_EXPECTED)"
   # RISCOF deletes and recreates its work dir, so a kept copy is made on exit instead of a mount.
   trap "[[ -d /keep ]] && cp -r /tmp/riscof_work/. /tmp/riscof.log /keep/ || true" EXIT
   src=/opt/riscv-arch-test/riscv-test-suite

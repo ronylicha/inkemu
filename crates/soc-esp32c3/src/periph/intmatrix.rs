@@ -2,12 +2,34 @@
 //! Register layout: `interrupt_core0_reg.h` (report §B.3).
 //! This plan keeps the configuration the software writes; no source is modelled yet, so nothing is
 //! ever pending. Delivery to the CPU arrives in SP1b-3.
+use super::Accepted;
 use emu_core::Peripheral;
 
 /// `<SRC>_MAP` registers: `UART_INTR_MAP` ... `CACHE_CORE0_ACS_INT_MAP` @0xF4 (report §B.3).
 pub const SOURCE_COUNT: usize = 62;
 /// `CPU_INT_PRI_0..31`; line 0 is invalid for software but its register exists in the SVD.
 pub const CPU_LINE_COUNT: usize = 32;
+// The rows of `accepted()` count these registers: a change of either constant must update them.
+const _: () = assert!(SOURCE_COUNT == 62 && CPU_LINE_COUNT == 32);
+
+/// `MAC_INTR_MAP` is the map register of source 0 (`0x600C_2000`).
+pub(crate) fn accepted() -> Vec<Accepted> {
+    const WHY: &str = "interrupt routing: nothing is delivered to the CPU";
+    vec![
+        Accepted::svd("INTERRUPT_CORE0", "MAC_INTR_MAP", WHY, "SP1b-3").block(62),
+        Accepted::svd("INTERRUPT_CORE0", "CLOCK_GATE", WHY, "SP1b-3"),
+        Accepted::svd("INTERRUPT_CORE0", "CPU_INT_ENABLE", WHY, "SP1b-3"),
+        Accepted::svd("INTERRUPT_CORE0", "CPU_INT_TYPE", WHY, "SP1b-3"),
+        Accepted::svd(
+            "INTERRUPT_CORE0",
+            "CPU_INT_CLEAR",
+            "edge-interrupt acknowledge: nothing is pending",
+            "SP1b-3",
+        ),
+        Accepted::svd("INTERRUPT_CORE0", "CPU_INT_PRI_0", WHY, "SP1b-3").block(32),
+        Accepted::svd("INTERRUPT_CORE0", "CPU_INT_THRESH", WHY, "SP1b-3"),
+    ]
+}
 
 /// `INTR_STATUS_REG_0/1` (the report calls them `INTR_STATUS_0/1`): raw source status.
 const STATUS_0: u32 = 0xF8;

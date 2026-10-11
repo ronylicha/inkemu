@@ -4,14 +4,35 @@
 //! always reads empty and the baud rate has no effect. Real timing, reception and interrupts arrive
 //! in SP1b-3; until then the emulated boot is shorter than the real one by the time the UART would
 //! take to send its log.
-use crate::periph::Storage;
+use crate::periph::{Accepted, Storage};
 use emu_core::Peripheral;
+
+/// `INT_CLR` is write-only and accepted; the five others are stored.
+pub(crate) fn accepted() -> Vec<Accepted> {
+    let mut rows = Vec::new();
+    for peripheral in ["UART0", "UART1"] {
+        for (register, not_modeled) in [
+            ("INT_ENA", "interrupt enables: nothing is raised"),
+            ("INT_CLR", "interrupt clear: nothing is pending"),
+            ("CLKDIV", "baud rate: bytes leave at once"),
+            ("CONF0", "frame format"),
+            ("CONF1", "FIFO thresholds"),
+            ("CLK_CONF", "clock source and divider"),
+        ] {
+            rows.push(Accepted::svd(peripheral, register, not_modeled, "SP1b-3"));
+        }
+    }
+    rows
+}
 
 const FIFO: u32 = 0x00;
 const INT_ENA: u32 = 0x0C;
 const INT_CLR: u32 = 0x10;
 const CLKDIV: u32 = 0x14;
 const STATUS: u32 = 0x1C;
+/// The model serves UART0 and UART1, whose register offsets are identical.
+const FSM_STATUS: u32 =
+    svd_regs::esp32c3::addr("UART0", "FSM_STATUS") - svd_regs::esp32c3::addr("UART0", "FIFO");
 const CONF0: u32 = 0x20;
 const CONF1: u32 = 0x24;
 const CLK_CONF: u32 = 0x78;
@@ -50,6 +71,9 @@ impl Peripheral for Uart {
     fn read(&mut self, offset: u32) -> Option<u32> {
         match offset {
             STATUS => Some(self.idle_status),
+            // The transmitter is idle: bytes leave at once (decision D7 of SP1b-1).
+            // `uart_tx_wait_idle` waits for bits [7:4] = 0 (BA §2.2).
+            FSM_STATUS => Some(0),
             _ => self.config.read(offset),
         }
     }
@@ -72,7 +96,7 @@ mod tests {
     use super::*;
     use emu_core::Peripheral;
 
-    const UART0: u32 = 0x6000_0000;
+    const UART0: u32 = svd_regs::esp32c3::addr("UART0", "FIFO");
 
     #[test]
     fn bytes_written_to_the_fifo_come_out_in_order_and_only_once() {
@@ -129,6 +153,15 @@ mod tests {
             None,
             "INT_ST arrives with interrupts (SP1b-3)"
         );
+    }
+
+    #[test]
+    fn the_transmitter_state_machine_reads_idle() {
+        // BA §2.2: `uart_tx_wait_idle` loops until FSM_STATUS[7:4] is 0.
+        let mut uart = Uart::new(UART0);
+        let fsm = svd_regs::esp32c3::addr("UART0", "FSM_STATUS") - UART0;
+        assert_eq!(uart.read(fsm), Some(0));
+        assert!(!uart.write(fsm, 0xFF), "read-only");
     }
 
     #[test]

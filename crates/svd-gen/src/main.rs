@@ -70,9 +70,20 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Mode, CliError> 
     Ok(mode)
 }
 
+/// Lower-case hexadecimal of `bytes`, the form the pinned digest is written in.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(2 * bytes.len());
+    for byte in bytes {
+        // Writing to a String cannot fail.
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
 /// Verifies the SVD digest, expands it and renders the register table.
 fn generate(svd_xml: &str) -> Result<String, CliError> {
-    let found = format!("{:x}", Sha256::digest(svd_xml.as_bytes()));
+    let found = hex(&Sha256::digest(svd_xml.as_bytes()));
     if found != ESP32C3_SVD_SHA256 {
         return Err(CliError::SvdDigest { found });
     }

@@ -165,11 +165,32 @@ pub fn execute(
         machine.cycles().get(),
         machine.instructions()
     );
+    let _ = writeln!(
+        log,
+        "inkemu: {} us of device time; CPU clock at {}",
+        machine.device_time_nanos() / 1_000,
+        frequency_text(machine.cpu_frequency().hz())
+    );
     summarize_diagnostics(machine, log);
     if let Some(hash) = machine.trace_hash() {
         let _ = writeln!(log, "trace-hash {hash:016x}");
     }
     end
+}
+
+/// A frequency in the largest unit that states it exactly: `80 MHz`, `625 kHz`, `39062 Hz`. Never a
+/// rounded figure: the crystal divider can bring the CPU clock far below 1 MHz, where a number of
+/// MHz would read 0.
+fn frequency_text(hz: u64) -> String {
+    const KILO: u64 = 1_000;
+    const MEGA: u64 = 1_000_000;
+    if hz.is_multiple_of(MEGA) {
+        format!("{} MHz", hz / MEGA)
+    } else if hz.is_multiple_of(KILO) {
+        format!("{} kHz", hz / KILO)
+    } else {
+        format!("{hz} Hz")
+    }
 }
 
 #[cfg(test)]
@@ -180,8 +201,8 @@ mod tests {
     use soc_esp32c3::test_support::{
         HANG, T0, T1, flat_rom, load_register, print_program, unmodeled_register,
     };
-    const UART0: u32 = 0x6000_0000;
-    const USB: u32 = 0x6004_3000;
+    const UART0: u32 = svd_regs::esp32c3::addr("UART0", "FIFO");
+    const USB: u32 = svd_regs::esp32c3::addr("USB_DEVICE", "EP1");
 
     fn machine(program: &[u32], options: MachineOptions) -> Esp32C3 {
         boards::builtin("x4")
@@ -245,6 +266,25 @@ mod tests {
                 && log.contains("0x40000000"),
             "{log}"
         );
+        assert!(
+            log.contains("us of device time") && log.contains("CPU clock at 20 MHz"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_frequency_is_printed_exactly_and_never_as_zero() {
+        for (hz, text) in [
+            (160_000_000, "160 MHz"),
+            (20_000_000, "20 MHz"),
+            (1_000_000, "1 MHz"),
+            (625_000, "625 kHz"),        // 40 MHz / 64
+            (39_062, "39062 Hz"),        // 40 MHz / 1024, the lowest crystal division, rounded down
+            (13_333_333, "13333333 Hz"), // 40 MHz / 3
+            (1, "1 Hz"),
+        ] {
+            assert_eq!(frequency_text(hz), text);
+        }
     }
 
     #[test]

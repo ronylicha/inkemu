@@ -14,7 +14,7 @@
 //! - however many ROMs are missing, the archive is downloaded once ([`ensure_elfs`]).
 //!
 //! Sources: `docs/research/esp32c3-rom-elfs.md`, §2 (archive content, hashes) and §9 (image hashes).
-use crate::term::sanitize;
+use crate::term::{hex, sanitize};
 use etcetera::app_strategy::AppStrategy as _;
 use sha2::{Digest, Sha256};
 use soc_esp32c3::{ChipRevision, RomError, RomImage};
@@ -359,9 +359,30 @@ pub fn ensure_elfs(
         }
     };
     let body = download(fetch, archive, entries[first_missing])?;
+    let missing: Vec<&RomEntry> = entries
+        .iter()
+        .zip(&elfs)
+        .filter(|(_, elf)| elf.is_none())
+        .map(|(entry, _)| *entry)
+        .collect();
+    // One decompression of the archive, however many ELF files are missing.
+    // INVARIANT: `extract_entries` returns exactly `missing.len()` ELF files, in the order of
+    // `missing`, or an error. Every empty slot therefore receives one below, and the final `flatten`
+    // drops nothing: the result has one ELF per entry.
+    let mut extracted = extract_entries(&body, archive, &missing)?.into_iter();
     for (slot, entry) in elfs.iter_mut().zip(entries) {
-        if slot.is_none() {
-            *slot = Some(extract_and_store(&body, archive, entry, source.dir())?);
+        if slot.is_none()
+            && let Some(elf) = extracted.next()
+        {
+            // Each ELF is checked against the manifest before it is stored.
+            check_elf(
+                &elf,
+                entry,
+                &source.dir().join(entry.elf_name),
+                &Provenance::Archive,
+            )?;
+            store(source.dir(), entry.elf_name, &elf)?;
+            *slot = Some(elf);
         }
     }
     Ok(elfs.into_iter().flatten().collect())
@@ -480,45 +501,41 @@ fn download(
     Ok(body)
 }
 
-/// Extracts `entry` from the verified archive `body`, checks it against the manifest and stores it.
-fn extract_and_store(
-    body: &[u8],
-    archive: &RomArchive,
-    entry: &RomEntry,
-    dir: &Path,
-) -> Result<Vec<u8>, RomStoreError> {
-    let elf = extract_entry(body, archive, entry)?;
-    check_elf(&elf, entry, &dir.join(entry.elf_name), &Provenance::Archive)?;
-    store(dir, entry.elf_name, &elf)?;
-    Ok(elf)
-}
-
-/// Reads the entry named exactly `entry.elf_name` out of the gzip-compressed tar `body`, in memory.
+/// Reads the entries named exactly like `wanted` out of the gzip-compressed tar `body`, in one pass
+/// over the archive, in memory. The result has the order of `wanted`.
 ///
 /// No other entry is looked at and no entry name is used as a path.
-fn extract_entry(
+fn extract_entries(
     body: &[u8],
     archive: &RomArchive,
-    entry: &RomEntry,
-) -> Result<Vec<u8>, RomStoreError> {
+    wanted: &[&RomEntry],
+) -> Result<Vec<Vec<u8>>, RomStoreError> {
     let read_error = |e: &std::io::Error| RomStoreError::Archive {
         url: sanitize(archive.url),
         detail: sanitize(&e.to_string()),
     };
+    let mut found: Vec<Option<Vec<u8>>> = vec![None; wanted.len()];
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(body));
     for member in tar.entries().map_err(|e| read_error(&e))? {
+        if found.iter().all(Option::is_some) {
+            break;
+        }
         let member = member.map_err(|e| read_error(&e))?;
-        if !member.header().entry_type().is_file()
-            || member.path_bytes().as_ref() != entry.elf_name.as_bytes()
-        {
+        if !member.header().entry_type().is_file() {
             continue;
         }
+        // The first member with a wanted name wins, as when the entries were extracted one by one.
+        let Some(index) = wanted.iter().zip(&found).position(|(entry, slot)| {
+            slot.is_none() && member.path_bytes().as_ref() == entry.elf_name.as_bytes()
+        }) else {
+            continue;
+        };
         if member.size() > MAX_ELF_BYTES {
             return Err(RomStoreError::Archive {
                 url: sanitize(archive.url),
                 detail: format!(
                     "the entry `{}` is {} bytes, above the {MAX_ELF_BYTES} byte (4 MiB) limit of a ROM ELF",
-                    entry.elf_name,
+                    wanted[index].elf_name,
                     member.size()
                 ),
             });
@@ -528,12 +545,20 @@ fn extract_entry(
             .take(MAX_ELF_BYTES)
             .read_to_end(&mut bytes)
             .map_err(|e| read_error(&e))?;
-        return Ok(bytes);
+        // INVARIANT: `index` comes from `position` over `wanted` zipped with `found`, which have the
+        // same length, so it is in bounds for both.
+        found[index] = Some(bytes);
     }
-    Err(RomStoreError::MissingInArchive {
-        url: archive.url.to_owned(),
-        elf_name: entry.elf_name,
-    })
+    wanted
+        .iter()
+        .zip(found)
+        .map(|(entry, bytes)| {
+            bytes.ok_or_else(|| RomStoreError::MissingInArchive {
+                url: archive.url.to_owned(),
+                elf_name: entry.elf_name,
+            })
+        })
+        .collect()
 }
 
 /// Where a ROM file under verification came from, which decides what the user can do about a mismatch.
@@ -673,7 +698,7 @@ fn store(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), RomStoreError> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex(&Sha256::digest(bytes))
 }
 
 /// A path as it may be printed: control characters escaped, since it can come from the command line.
@@ -696,11 +721,10 @@ fn io_error_at(action: &'static str, path: &str, error: &std::io::Error) -> RomS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
     use std::cell::Cell;
 
     fn sha(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
+        sha256_hex(bytes)
     }
     fn leak(text: String) -> &'static str {
         Box::leak(text.into_boxed_str())
@@ -1201,6 +1225,79 @@ mod tests {
             fetch,
             user_named: true,
         }
+    }
+
+    #[test]
+    fn every_wanted_elf_is_extracted_in_one_pass_whatever_their_order() {
+        let (body, archive, entries, elfs) = trio();
+        let wanted = [&entries[2], &entries[0], &entries[1]];
+        let extracted = extract_entries(&body, &archive, &wanted).unwrap();
+        assert_eq!(
+            extracted,
+            [elfs[2].clone(), elfs[0].clone(), elfs[1].clone()]
+        );
+        assert_eq!(
+            extract_entries(&body, &archive, &[]).unwrap(),
+            Vec::<Vec<u8>>::new()
+        );
+    }
+
+    #[test]
+    fn a_wanted_elf_the_archive_lacks_is_named() {
+        let (body, archive, entries, _) = trio();
+        let absent = RomEntry {
+            elf_name: "esp32c3_rev999_rom.elf",
+            ..entries[0]
+        };
+        let err = extract_entries(&body, &archive, &[&entries[0], &absent]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RomStoreError::MissingInArchive {
+                    elf_name: "esp32c3_rev999_rom.elf",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_archive_that_lacks_a_wanted_rom_names_it_and_leaves_the_cache_empty() {
+        // The archive is the pinned one, yet holds only two of the three ELF files: the absence is
+        // known before anything is stored, so no ROM of a batch that cannot complete is written.
+        let (_, _, entries, elfs) = trio();
+        let body = archive_of(&[
+            (entries[0].elf_name, elfs[0].as_slice()),
+            (entries[2].elf_name, elfs[2].as_slice()),
+        ]);
+        let archive = RomArchive {
+            release: "test",
+            url: "https://example.invalid/partial.tar.gz",
+            sha256: leak(sha(&body)),
+            size: body.len() as u64,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = FakeFetch::serving(body);
+        let all: Vec<&RomEntry> = entries.iter().collect();
+        let err = ensure_elfs(&cache_of(dir.path(), &fetch), &archive, &all).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RomStoreError::MissingInArchive {
+                    elf_name: "esp32c3_rev3_rom.elf",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("esp32c3_rev3_rom.elf"), "{err}");
+        assert_eq!(fetch.calls.get(), 1);
+        assert_eq!(
+            files_in(dir.path()),
+            Vec::<String>::new(),
+            "neither of the two ELF files the archive does hold was stored"
+        );
     }
 
     #[test]

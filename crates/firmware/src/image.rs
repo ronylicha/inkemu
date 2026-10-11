@@ -2,13 +2,12 @@
 use crate::app_desc::AppDesc;
 use crate::chip::{ChipId, FlashSize, SpiMode};
 use crate::error::FirmwareError;
-use crate::partition::{ENTRY_MAGIC, FIRST_PARTITION_OFFSET, PARTITION_TABLE_OFFSET};
 use sha2::{Digest, Sha256};
 
 /// Header byte 0 of every ESP-IDF application image.
 pub const IMAGE_MAGIC: u8 = 0xE9;
 /// Prefix of an encrypted OTA update, which is not a plain application image.
-const XOTA_MAGIC: &[u8; 4] = b"XOTA";
+pub(crate) const XOTA_MAGIC: &[u8; 4] = b"XOTA";
 /// Common header (8 bytes) followed by the extended header (16 bytes).
 pub const HEADER_LEN: usize = 24;
 /// Segment header: `load_addr` (u32) then `data_len` (u32).
@@ -47,21 +46,12 @@ pub struct FirmwareImage {
     pub app_desc: Option<AppDesc>,
 }
 
-fn le_u16(b: &[u8], at: usize) -> u16 {
+pub(crate) fn le_u16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
 }
 
-fn le_u32(b: &[u8], at: usize) -> u32 {
+pub(crate) fn le_u32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-
-/// A flash dump or merged image holds the partition table at 0x8000, so its first entry magic is
-/// there and the file reaches the first partition (0x9000). The bytes at offset 0 are then the
-/// bootloader, which parses as a valid-looking image and must not be mistaken for the application.
-fn is_flash_image(bytes: &[u8]) -> bool {
-    let table = PARTITION_TABLE_OFFSET as usize;
-    bytes.len() >= FIRST_PARTITION_OFFSET as usize
-        && bytes.get(table..table + ENTRY_MAGIC.len()) == Some(&ENTRY_MAGIC[..])
 }
 
 impl FirmwareImage {
@@ -73,7 +63,10 @@ impl FirmwareImage {
         if bytes.starts_with(XOTA_MAGIC) {
             return Err(FirmwareError::EncryptedOta);
         }
-        if is_flash_image(bytes) {
+        // A flash dump or merged image holds a partition table at 0x8000: the bytes at offset 0 are
+        // then the bootloader, which parses as a valid-looking image and must not be mistaken for
+        // the application.
+        if crate::flash_image::has_partition_table(bytes) {
             return Err(FirmwareError::FlashImage);
         }
         if bytes.len() < HEADER_LEN {
@@ -213,7 +206,7 @@ impl FirmwareImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::{ImageSpec, build_image};
+    use crate::builder::{ImageSpec, build_flash_image, build_image};
 
     fn with<F: FnOnce(&mut Vec<u8>)>(f: F) -> Vec<u8> {
         let mut b = build_image(&ImageSpec::default());
@@ -279,10 +272,8 @@ mod tests {
     /// A bootloader-first flash image: here the application image stands in for the bootloader
     /// at offset 0, padded with erased flash up to the partition table at 0x8000.
     fn flash_image(len: usize) -> Vec<u8> {
-        let mut b = build_image(&ImageSpec::default());
+        let mut b = build_flash_image(&ImageSpec::default());
         b.resize(len, 0xFF);
-        b[0x8000] = 0xAA;
-        b[0x8001] = 0x50;
         b
     }
 
@@ -292,13 +283,32 @@ mod tests {
         assert_eq!(err, FirmwareError::FlashImage);
         let msg = err.to_string();
         assert!(msg.contains("full flash image"), "{msg}");
-        assert!(msg.contains("; select the application .bin"), "{msg}");
+        assert!(
+            msg.contains(
+                "; select the application .bin to inspect it, or boot the full image with `inkemu run --flash`"
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("later version"), "the support exists: {msg}");
     }
 
     #[test]
-    fn flash_image_detection_starts_at_the_end_of_the_partition_table_sector() {
-        // One byte short of 0x9000: the table bytes exist but this is not yet a flash image.
-        assert!(FirmwareImage::parse(&flash_image(0x8FFF)).is_ok());
+    fn flash_image_detection_needs_a_table_not_a_file_length() {
+        assert_eq!(
+            FirmwareImage::parse(&flash_image(0x8C00)),
+            Err(FirmwareError::FlashImage),
+            "a dump cut in the table sector"
+        );
+        let mut coincidence = build_image(&ImageSpec::default());
+        let len = coincidence.len();
+        coincidence.resize(0x9000, 0);
+        coincidence[0x8000] = 0xAA;
+        coincidence[0x8001] = 0x50;
+        // Not a table: the file is parsed as the application it starts with (its trailing bytes are ignored).
+        assert!(
+            FirmwareImage::parse(&coincidence).is_ok(),
+            "image of {len} bytes with AA 50 at 0x8000"
+        );
     }
 
     #[test]

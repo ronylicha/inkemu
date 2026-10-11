@@ -117,6 +117,20 @@ impl SpiMode {
     }
 }
 
+impl fmt::Display for SpiMode {
+    /// The names the mask ROM prints in its `mode:` line (`docs/research/esp32c3-rom-flash-boot.md`, §G).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            SpiMode::Qio => "QIO",
+            SpiMode::Qout => "QOUT",
+            SpiMode::Dio => "DIO",
+            SpiMode::Dout => "DOUT",
+            SpiMode::FastRead => "FAST_RD",
+            SpiMode::SlowRead => "SLOW_RD",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +175,15 @@ mod tests {
             assert_eq!(size.bytes(), u64::from(mb) * 1024 * 1024);
         }
         assert_eq!(FlashSize::from_nibble(8), None);
+    }
+
+    #[test]
+    fn spi_modes_print_the_names_the_rom_prints() {
+        // The ROM's own table (report FB §G): QIO, QOUT, DIO, DOUT, FAST_RD, SLOW_RD.
+        let names: Vec<String> = (0..6)
+            .map(|raw| SpiMode::from_raw(raw).unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["QIO", "QOUT", "DIO", "DOUT", "FAST_RD", "SLOW_RD"]);
     }
 
     #[test]

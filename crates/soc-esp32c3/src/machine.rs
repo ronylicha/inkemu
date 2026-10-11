@@ -1,13 +1,15 @@
 //! The ESP32-C3 as a machine: one hart, its bus, and the loop that runs them.
 use crate::bus::SocBus;
+use crate::clock;
 use crate::config::SocConfig;
-use crate::diag::Diagnostic;
+use crate::diag::{Diagnostic, Unsupported};
+use crate::flash::{FlashDevice, FlashImageError, NorFlash};
 use crate::memmap::RESET_PC;
 use crate::rom::RomImage;
 use cpu_rv32::{
     DatasheetTiming, Exception, Hart, HartConfig, MisalignedPolicy, StepOutcome, VendorCsrs,
 };
-use emu_core::{Cycles, TimingModel, TraceHash};
+use emu_core::{Cycles, Frequency, TimingModel, TraceHash, VirtualClock};
 
 /// The two serial consoles the mask ROM prints on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,8 +22,9 @@ pub enum ConsoleChannel {
 pub enum StopReason {
     /// The cycle limit passed to [`Esp32C3::run_until`] was reached.
     CycleBudget,
-    /// `--strict-mmio`: the program touched a register the emulator does not model, or wrote a
-    /// peripheral register with an 8- or 16-bit store.
+    /// `--strict-mmio`: the program touched a register the emulator does not model, wrote a
+    /// peripheral register with an 8- or 16-bit store, asked for an operation the emulator cannot
+    /// perform faithfully, or used flash it had not mapped.
     StrictMmio(Diagnostic),
     /// The CPU is in `wfi` and nothing can raise an interrupt yet (interrupt sources arrive in SP1b-3).
     Idle,
@@ -34,13 +37,36 @@ pub struct Esp32C3 {
     hart: Hart,
     bus: SocBus,
     timing: DatasheetTiming,
+    /// Device time: follows the CPU clock the firmware selects.
+    clock: VirtualClock,
     trace: Option<TraceHash>,
 }
 
 impl Esp32C3 {
-    /// A machine in its power-on reset state, about to execute the first ROM instruction.
+    /// A machine in its power-on reset state with an erased flash, about to execute the first ROM
+    /// instruction.
     #[must_use]
     pub fn new(rom: RomImage, config: &SocConfig) -> Esp32C3 {
+        Esp32C3::build(rom, Box::new(NorFlash::blank(config.flash)), config)
+    }
+
+    /// A machine whose flash holds `image` from offset 0; what the image does not cover is erased.
+    ///
+    /// # Errors
+    /// [`FlashImageError`] when the image is longer than the flash.
+    pub fn with_flash(
+        rom: RomImage,
+        image: Vec<u8>,
+        config: &SocConfig,
+    ) -> Result<Esp32C3, FlashImageError> {
+        Ok(Esp32C3::build(
+            rom,
+            Box::new(NorFlash::with_image(image, config.flash)?),
+            config,
+        ))
+    }
+
+    fn build(rom: RomImage, flash: Box<dyn FlashDevice>, config: &SocConfig) -> Esp32C3 {
         // Misaligned loads and stores are performed, not trapped. Evidence: the rev0 mask ROM's `_init`
         // executes `lw t0,0(a5)` at pc 0x40001e00 from address 0x40058c3e (2 mod 4), the first byte
         // after `.wifi0iram.3` where the linker placed the initial `.data` image, so real silicon
@@ -53,10 +79,17 @@ impl Esp32C3 {
             misaligned: MisalignedPolicy::Allow,
             vendor_csrs: VendorCsrs::Esp32C3,
         };
+        let bus = SocBus::new(rom, flash, config);
+        let (sysclk_conf, cpu_per_conf) = bus.periph.system.clock_registers();
+        // INVARIANT: the reset values of the two clock registers select the crystal with a divider
+        // of 2 (decision D21), for which a frequency always exists: 20 MHz. The fallback is never
+        // taken; it is the undivided crystal, 40 MHz, and not the reset frequency.
+        let frequency = clock::cpu_frequency(sysclk_conf, cpu_per_conf).unwrap_or(clock::XTAL);
         Esp32C3 {
             hart: Hart::new(RESET_PC, hart_config),
-            bus: SocBus::new(rom, config),
+            bus,
             timing: DatasheetTiming,
+            clock: VirtualClock::new(frequency),
             trace: config.trace_hash.then(TraceHash::new),
         }
     }
@@ -79,6 +112,9 @@ impl Esp32C3 {
                 }
                 _ => {}
             }
+            if self.bus.periph.system.take_clock_change() {
+                self.retune(pc);
+            }
             if let Some(trace) = &mut self.trace {
                 trace.mix_u32(pc);
             }
@@ -87,6 +123,35 @@ impl Esp32C3 {
             }
         }
         StopReason::CycleBudget
+    }
+
+    /// Applies a write to the clock registers: from the end of the instruction that wrote them,
+    /// cycles last what the new selection says.
+    fn retune(&mut self, pc: u32) {
+        let (sysclk_conf, cpu_per_conf) = self.bus.periph.system.clock_registers();
+        match clock::cpu_frequency(sysclk_conf, cpu_per_conf) {
+            Some(frequency) => self.clock.set_frequency(self.hart.cycles, frequency),
+            // Decision D22: the previous frequency stays, and the selection is reported.
+            None => self.bus.diag.record(Diagnostic::Unsupported {
+                what: Unsupported::ClockSource {
+                    sysclk_conf,
+                    cpu_per_conf,
+                },
+                pc,
+            }),
+        }
+    }
+
+    /// The CPU clock frequency the firmware selected.
+    #[must_use]
+    pub const fn cpu_frequency(&self) -> Frequency {
+        self.clock.frequency()
+    }
+
+    /// Time elapsed on the device since reset, following every CPU clock switch.
+    #[must_use]
+    pub fn device_time_nanos(&self) -> u64 {
+        self.clock.nanos_at(self.hart.cycles)
     }
 
     /// CPU clock cycles elapsed since reset.
@@ -159,6 +224,9 @@ mod tests {
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
     use emu_core::{AccessKind, AccessSize, Bus};
 
+    const UART0: u32 = svd_regs::esp32c3::addr("UART0", "FIFO");
+    const USB: u32 = svd_regs::esp32c3::addr("USB_DEVICE", "EP1");
+
     fn machine_with(program: &[u32], config: SocConfig) -> Esp32C3 {
         Esp32C3::new(flat_rom(program), &config)
     }
@@ -181,13 +249,25 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_can_be_built_around_a_flash_image_and_refuses_one_that_is_too_long() {
+        let config = SocConfig::default();
+        assert!(Esp32C3::with_flash(flat_rom(&[HANG]), vec![0xE9; 64], &config).is_ok());
+        let too_long = vec![0u8; config.flash.size() as usize + 1];
+        let err = Esp32C3::with_flash(flat_rom(&[HANG]), too_long, &config).unwrap_err();
+        assert!(
+            matches!(err, crate::flash::FlashImageError::TooLong { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn hang_instruction_is_what_the_assembler_produces() {
         assert_eq!(jal(0, 0), HANG);
     }
 
     #[test]
     fn starts_at_the_reset_vector_and_prints_through_uart0() {
-        let mut program = print(0x6000_0000, b"Hi");
+        let mut program = print(UART0, b"Hi");
         program.push(HANG);
         let mut m = machine(&program);
         assert_eq!(m.pc(), ROM_BASE);
@@ -204,7 +284,7 @@ mod tests {
 
     #[test]
     fn usb_serial_jtag_console_is_a_separate_channel() {
-        let mut program = print(0x6004_3000, b"ok");
+        let mut program = print(USB, b"ok");
         program.extend([addi(T1, 0, 1), sw(T1, T0, 4), HANG]);
         let mut m = machine(&program);
         m.run_until(Cycles(500));
@@ -395,10 +475,194 @@ mod tests {
             m.run_until(Cycles(2_000));
             (m.trace_hash().unwrap(), m.instructions(), m.cycles())
         };
-        let a = print(0x6000_0000, b"A");
-        let b = print(0x6000_0000, b"AB");
+        let a = print(UART0, b"A");
+        let b = print(UART0, b"AB");
         assert_eq!(run(&a), run(&a));
         assert_ne!(run(&a).0, run(&b).0);
         assert_eq!(machine(&a).trace_hash(), None, "off unless asked for");
+    }
+
+    /// Three instructions that store `value` (a 12-bit signed immediate) at `addr`.
+    fn store(addr: u32, value: i32) -> [u32; 3] {
+        let page = addr.wrapping_add(0x800) & 0xFFFF_F000;
+        [
+            lui(T0, page),
+            addi(T1, 0, value),
+            sw(T1, T0, addr.wrapping_sub(page).cast_signed()),
+        ]
+    }
+    const SYSCLK_CONF: u32 = svd_regs::esp32c3::addr("SYSTEM", "SYSCLK_CONF");
+    const CPU_PER_CONF: u32 = svd_regs::esp32c3::addr("SYSTEM", "CPU_PER_CONF");
+
+    #[test]
+    fn device_time_follows_the_cpu_clock_the_firmware_selects() {
+        let mut program = Vec::new();
+        program.extend(store(SYSCLK_CONF, 0x400)); // PLL, CPUPERIOD_SEL = 0: 80 MHz
+        program.extend(store(CPU_PER_CONF, 0xD)); // CPUPERIOD_SEL = 1: 160 MHz
+        program.push(HANG);
+        let mut m = machine(&program);
+        assert_eq!(m.cpu_frequency().hz(), 20_000_000, "decision D21");
+        assert_eq!(m.device_time_nanos(), 0);
+        m.run_until(Cycles(1_000));
+        assert_eq!(m.cpu_frequency().hz(), 160_000_000);
+        assert_eq!(m.drain_diagnostics(), Vec::new());
+        // Fewer than 20 cycles ran before the switch to 160 MHz, each of at most 50 ns.
+        let nanos = m.device_time_nanos();
+        let all_fast = m.cycles().get() * 1_000 / 160;
+        assert!(
+            nanos >= all_fast && nanos <= all_fast + 20 * 50,
+            "{nanos} vs {all_fast}"
+        );
+    }
+
+    #[test]
+    fn device_time_at_the_reset_clock_is_50_ns_per_cycle() {
+        let mut m = machine(&[HANG]);
+        m.run_until(Cycles(2_000));
+        assert_eq!(m.device_time_nanos(), m.cycles().get() * 50);
+    }
+
+    #[test]
+    fn a_clock_selection_without_a_known_frequency_is_reported_and_keeps_the_previous_one() {
+        // -1024 = 0x...C00: SOC_CLK_SEL = 3 once masked to the 12 writable bits.
+        let mut program = store(SYSCLK_CONF, -1024).to_vec();
+        program.push(HANG);
+        let mut m = machine_with(
+            &program,
+            SocConfig {
+                strict_mmio: true,
+                ..SocConfig::default()
+            },
+        );
+        let stop = m.run_until(Cycles(1_000));
+        let StopReason::StrictMmio(Diagnostic::Unsupported { what, .. }) = &stop else {
+            panic!("expected a strict stop, got {stop:?}");
+        };
+        assert_eq!(
+            *what,
+            crate::diag::Unsupported::ClockSource {
+                sysclk_conf: 0x2_8C00,
+                cpu_per_conf: 0xC
+            }
+        );
+        assert_eq!(m.cpu_frequency().hz(), 20_000_000);
+    }
+
+    /// A flash chip whose content the test can change behind the machine's back, which the real
+    /// read-only chip never does: the only way to see decoded code being dropped.
+    #[derive(Debug)]
+    struct SharedFlash(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl FlashDevice for SharedFlash {
+        fn size(&self) -> u32 {
+            SocConfig::default().flash.size()
+        }
+        fn read(&self, offset: u32, out: &mut [u8]) {
+            let content = self.0.borrow();
+            for (byte, index) in out.iter_mut().zip(offset as usize..) {
+                *byte = content.get(index).copied().unwrap_or(crate::flash::ERASED);
+            }
+        }
+        fn execute(
+            &mut self,
+            command: &crate::flash::FlashCommand<'_>,
+            _data_in: &mut [u8],
+        ) -> Result<(), crate::flash::UnmodeledCommand> {
+            Err(crate::flash::UnmodeledCommand {
+                opcode: command.opcode,
+            })
+        }
+    }
+
+    #[test]
+    fn a_write_to_either_cache_control_register_drops_the_code_decoded_from_the_flash_window() {
+        use cpu_rv32::asm::jalr;
+        const A0: u8 = 10;
+        const RA: u8 = 1;
+        const T2: u8 = 7;
+        const S0: u8 = 8;
+        // The flash holds `li a0, <value>; ret` at offset 0.
+        let function = |value: i32| -> Vec<u8> {
+            [addi(A0, 0, value), jalr(0, RA, 0)]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect()
+        };
+        for register in ["ICACHE_CTRL", "ICACHE_CTRL1"] {
+            let cache_control = svd_regs::esp32c3::addr("EXTMEM", register);
+            let mut program = vec![
+                lui(T0, crate::periph::mmu::MMU_TABLE_BASE),
+                lui(T2, crate::memmap::FLASH_IBUS_BASE),
+                lui(S0, SRAM_DBUS_BASE),
+                sw(0, T0, 0),    // entry 0 = flash page 0
+                jalr(RA, T2, 0), // decodes the function: a0 = 1
+                sw(A0, S0, 0),
+                HANG,
+            ];
+            let second_part = u32::try_from(4 * program.len()).unwrap();
+            program.extend([jalr(RA, T2, 0), sw(A0, S0, 4)]);
+            program.extend(store(cache_control, 1));
+            program.extend([jalr(RA, T2, 0), sw(A0, S0, 8), HANG]);
+
+            let content = std::rc::Rc::new(std::cell::RefCell::new(function(1)));
+            let flash = SharedFlash(std::rc::Rc::clone(&content));
+            let mut m = Esp32C3::build(flat_rom(&program), Box::new(flash), &SocConfig::default());
+            m.run_until(Cycles(200));
+            // The content changes without the bus knowing; the machine resumes after the first part.
+            *content.borrow_mut() = function(2);
+            m.hart.pc = ROM_BASE + second_part;
+            m.run_until(Cycles(m.cycles().get() + 200));
+            assert_eq!(m.drain_diagnostics(), Vec::new(), "{register}");
+            assert_eq!(
+                (
+                    bus_word(&mut m, SRAM_DBUS_BASE),
+                    // The control of the experiment: nothing has invalidated the decoded code yet.
+                    bus_word(&mut m, SRAM_DBUS_BASE + 4),
+                    bus_word(&mut m, SRAM_DBUS_BASE + 8)
+                ),
+                (1, 1, 2),
+                "the write to {register} must make the next call decode the flash again"
+            );
+        }
+    }
+
+    #[test]
+    fn code_executed_from_the_flash_window_follows_a_remap() {
+        use cpu_rv32::asm::jalr;
+        const A0: u8 = 10;
+        const RA: u8 = 1;
+        const T2: u8 = 7;
+        const S0: u8 = 8;
+        // Flash page 0: `li a0, 1; ret`. Flash page 1: `li a0, 2; ret`.
+        let mut image = vec![0u8; 0x1_0008];
+        for (page, value) in [(0usize, 1), (1, 2)] {
+            for (i, word) in [addi(A0, 0, value), jalr(0, RA, 0)].into_iter().enumerate() {
+                let at = page * 0x1_0000 + 4 * i;
+                image[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let program = [
+            lui(T0, crate::periph::mmu::MMU_TABLE_BASE),
+            lui(T2, crate::memmap::FLASH_IBUS_BASE),
+            lui(S0, SRAM_DBUS_BASE),
+            sw(0, T0, 0),    // entry 0 = flash page 0
+            jalr(RA, T2, 0), // a0 = 1
+            sw(A0, S0, 0),
+            addi(T1, 0, 1),
+            sw(T1, T0, 0),   // entry 0 = flash page 1: same address, new code
+            jalr(RA, T2, 0), // a0 = 2 only if the decoded code was dropped
+            sw(A0, S0, 4),
+            HANG,
+        ];
+        let mut m = Esp32C3::with_flash(flat_rom(&program), image, &SocConfig::default()).unwrap();
+        m.run_until(Cycles(400));
+        assert_eq!(m.drain_diagnostics(), Vec::new());
+        assert_eq!(
+            (
+                bus_word(&mut m, SRAM_DBUS_BASE),
+                bus_word(&mut m, SRAM_DBUS_BASE + 4)
+            ),
+            (1, 2)
+        );
     }
 }

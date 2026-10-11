@@ -19,6 +19,9 @@ dist/
 *.img
 *.inkrec
 /rom-cache/
+# A flash dump or a merged image dropped at the root for `inkemu run --flash` is third-party material:
+# it must never be committed. Test fixtures live under crates/*/tests/fixtures/ and are not affected.
+/*.bin
 
 # Secrets (signing, notarization)
 .env

@@ -82,6 +82,8 @@ All four options tried inside Docker on the hello_world flash image.
 | D. gdbstub | `-gdb tcp:127.0.0.1:1234 -S` + RSP `s`,`g`,`p<n>` | Works, exact retire semantics, but ~6,400-7,100 steps/s (2 round trips per step: the stub ignores any packet sent while the CPU is running, so the `g` cannot be pipelined behind the `s`). 2.4 M insns to `app_main` = ~6 min. |
 | E. TCG plugin | | **Not available** (plugin interface disabled in both released builds). |
 
+Addendum 2026-10-11 (from `esp32c3-bootloader-accesses.md` §11): MMIO accesses can be traced without plugins with `-trace 'memory_region_ops_*'`, and QEMU's random number generator makes a register-level lockstep diverge inside the bootloader (first read at instruction ≈ 635,927): mask the affected registers and memory, or inject the values.
+
 `-singlestep` is not needed: in QEMU 9.2 the spelling is `-accel tcg,one-insn-per-tb=on`.
 
 Exact working command (recommended, option A):

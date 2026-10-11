@@ -1,14 +1,16 @@
 //! inkemu command-line interface.
-use boards::{DeviceProfile, MachineOptions};
+use boards::{DeviceProfile, MachineOptions, SocFamily};
 use clap::{Parser, Subcommand};
 use cpu_rv32::{HartConfig, MisalignedPolicy};
 use emu_cli::exit::{EXIT_ERROR, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
+use emu_cli::flash_file;
 use emu_cli::rom_store::{
     self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
 };
 use emu_cli::run::{RunOptions, execute, relay};
 use emu_cli::rvtest::{RunResult, TestMachine};
 use emu_cli::term::sanitize;
+use firmware::ChipId;
 use soc_esp32c3::ConsoleChannel;
 use std::fmt::Write as _;
 use std::io;
@@ -44,7 +46,7 @@ enum Command {
         #[arg(long)]
         allow_misaligned: bool,
     },
-    /// Describe a firmware image and check that inkemu can load it.
+    /// Describe an ESP-IDF application image and say what is wrong with a file it refuses.
     Inspect { file: PathBuf },
     /// Boot a device from its mask ROM and print its console.
     #[command(after_help = RUN_EXIT_CODES_HELP)]
@@ -52,11 +54,18 @@ enum Command {
         /// Device profile id; an unknown id prints the available ones.
         #[arg(long)]
         device: String,
+        /// Full flash image to boot: a dump of a device (`esptool.py read_flash 0 ALL flash.bin`),
+        /// or the output of `esptool.py merge_bin`. Its bootloader, partition table and
+        /// application run as on the device. Without it the flash is erased and the ROM reports
+        /// an invalid header, as a blank chip does.
+        #[arg(long)]
+        flash: Option<PathBuf>,
         /// Stop when the CPU has executed this many clock cycles.
         #[arg(long)]
         max_cycles: Option<u64>,
-        /// Stop at the first access to a register the emulator does not model, or the first 8/16-bit
-        /// write to a peripheral register (exit code 3).
+        /// Stop at the first access to a register the emulator does not model, 8/16-bit write to a
+        /// peripheral register, operation the emulator cannot perform faithfully, or access to flash
+        /// that is not mapped (exit code 3).
         #[arg(long)]
         strict_mmio: bool,
         /// Which console of the device goes to standard output.
@@ -125,6 +134,7 @@ fn main() -> ExitCode {
         Command::Inspect { file } => run_inspect(&file),
         Command::Run {
             device,
+            flash,
             max_cycles,
             strict_mmio,
             console,
@@ -132,6 +142,7 @@ fn main() -> ExitCode {
             trace_hash,
         } => run_device(
             &device,
+            flash.as_deref(),
             rom_dir,
             MachineOptions {
                 strict_mmio,
@@ -179,12 +190,23 @@ fn profile_for(id: &str) -> Result<DeviceProfile, boards::ProfileError> {
             id: sanitize(&id),
             known,
         },
-        other @ boards::ProfileError::Parse { .. } => other,
+        other @ (boards::ProfileError::Parse { .. }
+        | boards::ProfileError::MissingFlash { .. }
+        | boards::ProfileError::IdMismatch { .. }) => other,
     })
+}
+
+/// The chip id a firmware image must declare to run on the device of `profile`. The `match` is
+/// exhaustive on purpose: a new chip family does not compile until it has its chip id here.
+const fn image_chip(profile: &DeviceProfile) -> ChipId {
+    match profile.soc {
+        SocFamily::Esp32C3 => ChipId::Esp32C3,
+    }
 }
 
 fn run_device(
     device: &str,
+    flash: Option<&Path>,
     rom_dir: Option<PathBuf>,
     machine_options: MachineOptions,
     run_options: &RunOptions,
@@ -192,6 +214,15 @@ fn run_device(
     let profile = match profile_for(device) {
         Ok(p) => p,
         Err(e) => return fail(&e),
+    };
+    // The flash file is checked first: refusing it needs no ROM, and no download should start for a
+    // run that cannot happen.
+    let flash_image = match flash {
+        Some(path) => match flash_file::load(path, image_chip(&profile), profile.flash.size()) {
+            Ok(bytes) => Some((path, bytes)),
+            Err(e) => return fail(&e),
+        },
+        None => None,
     };
     let entry = rom_store::rom_entry_for(profile.chip_revision);
     let http = HttpFetch;
@@ -216,8 +247,26 @@ fn run_device(
         Ok(rom) => rom,
         Err(e) => return fail(&e),
     };
-    let mut machine = profile.instantiate(rom, machine_options);
-    eprintln!("{}", header(&profile, entry, &machine));
+    let flash_note = match &flash_image {
+        Some((path, bytes)) => format!(
+            "flash: {} ({} bytes in {} MiB)",
+            sanitize(&path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned()
+            )),
+            bytes.len(),
+            profile.flash.size() >> 20
+        ),
+        None => format!("flash: erased ({} MiB)", profile.flash.size() >> 20),
+    };
+    let mut machine = match flash_image {
+        Some((_, bytes)) => match profile.instantiate_with_flash(rom, bytes, machine_options) {
+            Ok(machine) => machine,
+            Err(e) => return fail(&e),
+        },
+        None => profile.instantiate(rom, machine_options),
+    };
+    eprintln!("{}; {flash_note}", header(&profile, entry, &machine));
     let end = execute(
         &mut machine,
         run_options,

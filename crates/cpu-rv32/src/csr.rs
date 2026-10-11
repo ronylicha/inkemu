@@ -40,7 +40,7 @@ pub enum VendorCsrs {
     /// A plain RV32IMC machine-mode hart (conformance tests).
     #[default]
     None,
-    /// The `ESP32-C3` core: `ustatus` and the performance counter.
+    /// The `ESP32-C3` core: `ustatus`, the performance counter and the PMP registers (stored, not enforced).
     Esp32C3,
 }
 
