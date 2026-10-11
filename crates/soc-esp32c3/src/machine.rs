@@ -2138,6 +2138,213 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_neither_mixes_into_the_trace_nor_forgets_it() {
+        // Two machines execute the same instructions at the same addresses, up to and including
+        // one store to `RTC_CNTL.OPTIONS0`: the first stores the request for a CPU reset, the
+        // second stores 0. The trace is the sequence of executed PCs, so after that store the two
+        // are equal: a trace that started again at the reset would be the empty one, and one the
+        // reset had been mixed into would be different.
+        let program = |value| {
+            let mut body = stop_watchdogs();
+            body.extend(store_register(reg("RTC_CNTL", "OPTIONS0"), value));
+            body.push(HANG);
+            body
+        };
+        let after_the_store = ROM_BASE + 4 * u32::try_from(program(0).len() - 1).unwrap();
+        let mut plain = traced(&program(0));
+        step_to(&mut plain, after_the_store, 100);
+        let mut reset = traced(&program(SOFTWARE_CPU_RESET));
+        assert_eq!(reset.run_until(plain.cycles()), StopReason::CycleBudget);
+        assert_eq!((reset.resets(), plain.resets()), (1, 0));
+        assert_eq!(
+            (reset.cycles(), reset.instructions()),
+            (plain.cycles(), plain.instructions()),
+            "the same instructions ran"
+        );
+        assert_eq!((reset.pc(), plain.pc()), (ROM_BASE, after_the_store));
+        assert_eq!(reset.trace_hash(), plain.trace_hash());
+        assert_ne!(
+            reset.trace_hash(),
+            traced(&program(0)).trace_hash(),
+            "and it is not the trace of a machine that has executed nothing"
+        );
+        // The trace goes on after the reset: the next instruction of each is at another address.
+        for m in [&mut reset, &mut plain] {
+            let next = Cycles(m.cycles().get() + 1);
+            assert_eq!(m.run_until(next), StopReason::CycleBudget);
+        }
+        assert_ne!(reset.trace_hash(), plain.trace_hash());
+    }
+
+    /// A firmware in miniature, with everything that can make a run depend on how it is cut into
+    /// calls: a period alarm of the SYSTIMER every 400 us whose handler (line 4) raises a
+    /// software interrupt of higher priority (line 3), a main loop that writes a byte to UART0
+    /// and sleeps in `wfi` until the next tick, and the watchdogs of the reset values left on, so
+    /// that the chip is reset at 1.3 s, 2.6 s and 2.94 s and starts again each time.
+    fn a_ticking_firmware_under_the_reset_watchdogs() -> Vec<u32> {
+        const TICK: u8 = 4;
+        const SOFTWARE: u8 = 3;
+        // 6 400 counts of the 16 MHz counter. A byte takes 347 us to leave at the reset baud rate
+        // and clock: one byte a tick, and none waits for the one before it.
+        const PERIOD: u32 = 6_400;
+        let (page, value) = (28, 29);
+        let split = |addr: u32| {
+            let upper = addr.wrapping_add(0x800) & 0xFFFF_F000;
+            (upper, addr.wrapping_sub(upper).cast_signed())
+        };
+        let (clear, clear_offset) = split(reg("SYSTIMER", "INT_CLR"));
+        let (software, software_offset) = split(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"));
+        let (uart, uart_offset) = split(UART0);
+        let mut body = vec![lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)];
+        for (register, setting) in [
+            ("SYSTIMER_TARGET0_INT_MAP", u32::from(TICK)),
+            ("CPU_INTR_FROM_CPU_0_MAP", u32::from(SOFTWARE)),
+            ("CPU_INT_PRI_3", 2),
+            ("CPU_INT_PRI_4", 1),
+            ("CPU_INT_ENABLE", (1 << SOFTWARE) | (1 << TICK)),
+            ("CPU_INT_THRESH", 1),
+        ] {
+            body.extend(store_register(reg("INTERRUPT_CORE0", register), setting));
+        }
+        body.extend(store_register(
+            reg("SYSTIMER", "TARGET0_CONF"),
+            (1 << 30) | PERIOD,
+        ));
+        body.extend(store_register(reg("SYSTIMER", "COMP0_LOAD"), 1));
+        body.extend(store_register(reg("SYSTIMER", "INT_ENA"), 1));
+        body.extend(store_register(reg("SYSTIMER", "CONF"), SYSTIMER_ALARM0_ON));
+        body.push(csrrwi(0, MSTATUS, MSTATUS_MIE));
+        // The main loop: a byte, then sleep until an interrupt; back to the byte.
+        body.extend([
+            lui(10, uart),
+            addi(11, 0, i32::from(b'.')),
+            sw(11, 10, uart_offset),
+            wfi(),
+            jal(0, -8),
+        ]);
+        let mut program = with_vectors(&body);
+        let table = ((VECTORS - ROM_BASE) / 4) as usize;
+        let handler_after = |program: &[u32], line: u8| {
+            jal(
+                0,
+                4 * i32::try_from(program.len() - (table + usize::from(line))).unwrap(),
+            )
+        };
+        // The tick: acknowledge the alarm, raise the software interrupt, return.
+        program[table + usize::from(TICK)] = handler_after(&program, TICK);
+        program.extend([
+            lui(page, clear),
+            addi(value, 0, 1),
+            sw(value, page, clear_offset),
+            lui(page, software),
+            sw(value, page, software_offset),
+            cpu_rv32::asm::mret(),
+        ]);
+        // The software interrupt: lower it, return.
+        program[table + usize::from(SOFTWARE)] = handler_after(&program, SOFTWARE);
+        program.extend([
+            lui(page, software),
+            sw(0, page, software_offset),
+            cpu_rv32::asm::mret(),
+        ]);
+        program
+    }
+
+    /// Everything a run leaves behind that a caller can see.
+    #[derive(Debug, PartialEq)]
+    struct Outcome {
+        trace_hash: Option<u64>,
+        device_time: Cycles,
+        cycles: Cycles,
+        instructions: u64,
+        pc: u32,
+        asleep: bool,
+        resets: u64,
+        /// The bytes UART0 sent, every one of them the `.` of the main loop: their number is the
+        /// whole console.
+        console_bytes: usize,
+        journal: Vec<Diagnostic>,
+        repeated: Vec<(Diagnostic, u64)>,
+    }
+
+    /// Runs the ticking firmware to `total` cycles in calls of `slice` cycles, taking the console
+    /// after each call as a front end does.
+    fn tick_in_calls_of(slice: u64, total: u64) -> Outcome {
+        let mut m = traced(&a_ticking_firmware_under_the_reset_watchdogs());
+        let (mut console_bytes, mut journal) = (0, Vec::new());
+        // A call that returns `CycleBudget` has run to its limit; one that returns `Asleep` has
+        // slept through a second of device time, and the run lasts under four: 64 of those is
+        // far more than there can be.
+        let mut calls_left = total / slice + 64;
+        while m.cycles().get() < total {
+            assert!(
+                calls_left > 0,
+                "no progress in calls of {slice} cycles: {} cycles at {} ns of device time",
+                m.cycles().get(),
+                m.device_time_nanos()
+            );
+            calls_left -= 1;
+            let limit = m.cycles().get().saturating_add(slice).min(total);
+            let stop = m.run_until(Cycles(limit));
+            assert!(
+                matches!(stop, StopReason::CycleBudget | StopReason::Asleep),
+                "{stop:?}"
+            );
+            for channel in ConsoleChannel::ALL {
+                let bytes = m.take_console(channel);
+                if channel == ConsoleChannel::Uart0 {
+                    assert!(bytes.iter().all(|byte| *byte == b'.'), "{bytes:?}");
+                    console_bytes += bytes.len();
+                } else {
+                    assert_eq!(bytes, b"", "{channel:?}");
+                }
+            }
+            journal.extend(m.drain_diagnostics());
+        }
+        Outcome {
+            trace_hash: m.trace_hash(),
+            device_time: m.bus.ctx.now(),
+            cycles: m.cycles(),
+            instructions: m.instructions(),
+            pc: m.pc(),
+            asleep: m.is_asleep(),
+            resets: m.resets(),
+            console_bytes,
+            journal,
+            repeated: m.most_repeated_diagnostics(8),
+        }
+    }
+
+    #[test]
+    fn a_run_with_interrupts_sleeps_output_and_resets_is_the_same_however_it_is_cut_into_calls() {
+        // This firmware sleeps most of each tick and executes about 65 000 cycles in a second of
+        // device time: 210 000 cycles are a little over three seconds, past the three resets and
+        // into a fourth life.
+        const TOTAL: u64 = 210_000;
+        let whole = tick_in_calls_of(u64::MAX, TOTAL);
+        assert_eq!(whole.resets, 3, "the two watchdogs, as on a blank chip");
+        assert!(whole.trace_hash.is_some());
+        assert!(
+            whole.console_bytes > 7_000,
+            "a byte a tick for three seconds: {} bytes",
+            whole.console_bytes
+        );
+        assert_eq!(
+            whole.journal.len(),
+            2,
+            "the resets, and nothing else: {:?}",
+            whole.journal
+        );
+        for slice in [1, 7, 1_000] {
+            assert_eq!(
+                tick_in_calls_of(slice, TOTAL),
+                whole,
+                "calls of {slice} cycles"
+            );
+        }
+    }
+
+    #[test]
     fn a_strict_run_goes_on_across_a_reset_which_is_not_a_violation() {
         const MARKER: u32 = SRAM_DBUS_BASE + 0x100;
         let marker = load_register(MARKER);
