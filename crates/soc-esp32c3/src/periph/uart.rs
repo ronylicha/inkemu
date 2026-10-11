@@ -64,9 +64,10 @@ const CLKDIV_FRAG_SHIFT: u32 = 20;
 const CLKDIV_FRAG_MASK: u32 = 0xF;
 /// `CLK_CONF`: bits [19:12] `SCLK_DIV_NUM`, the divider of the source clock minus one (the
 /// bootloader clears it: `bootloader_console_init`, store at `0x403cc8b6` in trace F1), bits
-/// [21:20] `SCLK_SEL`, 1 = `APB_CLK`, 3 = the crystal (`ROM3:Uart_Init` sets 3, store at
-/// `0x4004c2e2` in trace F1; BA §7: "the UART core clock is the crystal"; reset value 3 in
-/// `uart_reg.h:1189`).
+/// [21:20] `SCLK_SEL`, 1 = `APB_CLK` (`case UART_SCLK_APB: hw->clk_conf.sclk_sel = 1;`,
+/// `components/hal/esp32c3/include/hal/uart_ll.h:175-176`, ESP-IDF v5.5.2), 3 = the crystal
+/// (`ROM3:Uart_Init` sets 3, store at `0x4004c2e2` in trace F1; BA §7: "the UART core clock is
+/// the crystal"; reset value 3 in `uart_reg.h:1189`, ESP-IDF v5.5.2).
 const SCLK_DIV_NUM_SHIFT: u32 = 12;
 const SCLK_DIV_NUM_MASK: u32 = 0xFF;
 const SCLK_SEL_SHIFT: u32 = 20;
@@ -169,9 +170,10 @@ impl Uart {
     /// its fraction) cycles of the source clock divided by `SCLK_DIV_NUM + 1`.
     ///
     /// Known simplification: a source selection other than `APB_CLK` is clocked by the crystal. 3
-    /// is the crystal. 2 selects the RC fast clock in ESP-IDF's HAL (`uart_reg.h:1189` documents
-    /// only the reset value, 3); the RC fast clock is modelled at the crystal frequency, and
-    /// nothing on the measured paths selects it. The fractional divider of the source clock
+    /// is the crystal. 2 selects the RC fast clock (`case UART_SCLK_RTC: hw->clk_conf.sclk_sel =
+    /// 2;`, `components/hal/esp32c3/include/hal/uart_ll.h:178-179`, ESP-IDF v5.5.2; `uart_reg.h:1189`
+    /// documents only the reset value, 3); the RC fast clock is modelled at the crystal frequency,
+    /// and nothing on the measured paths selects it. The fractional divider of the source clock
     /// (`SCLK_DIV_A/B`) is ignored: it resets to 0 and no measured code writes it.
     fn byte_time(&self, ctx: &Ctx) -> u64 {
         let clkdiv = self.config.read(CLKDIV).unwrap_or(0);
@@ -193,6 +195,9 @@ impl Uart {
             ctx.unsupported(Unsupported::UartOverflow { uart: self.index });
             return;
         }
+        // A byte keeps the duration it was given when it was written: a later change of `CLKDIV`,
+        // `CLK_CONF` or the APB clock applies to the bytes written after it. This is the model's
+        // choice; firmware that changes the clock with bytes on their way out is not modelled.
         let now = ctx.now().get().saturating_mul(SUBCYCLES);
         let starts_at = self.in_flight.back().map_or(now, |&(gone_at, _)| gone_at);
         let gone_at = starts_at.max(now).saturating_add(self.byte_time(ctx));
@@ -509,5 +514,105 @@ mod tests {
             Some(0),
             "the transmission ended"
         );
+    }
+
+    #[test]
+    fn the_console_is_the_same_whenever_it_is_taken() {
+        // Taking after every byte time, or once in the middle and then flushing at the end of the
+        // run, gives the same bytes in the same order.
+        let text = *b"hello";
+        let collect = |takes: &dyn Fn(&mut Ctx, &mut Uart, &mut Vec<u8>)| {
+            let ctx = &mut Ctx::default();
+            let mut uart = console(ctx);
+            for byte in text {
+                uart.write(ctx, FIFO, u32::from(byte));
+            }
+            let mut console_bytes = Vec::new();
+            takes(ctx, &mut uart, &mut console_bytes);
+            console_bytes.extend(uart.take_written());
+            console_bytes
+        };
+        let every_byte = collect(&|ctx, uart, out| {
+            for _ in text {
+                after_bytes(ctx, 1);
+                out.extend(uart.take_tx(ctx.now()));
+            }
+        });
+        let once_midway = collect(&|ctx, uart, out| {
+            after_bytes(ctx, 2);
+            out.extend(uart.take_tx(ctx.now()));
+        });
+        assert_eq!(every_byte, text);
+        assert_eq!(once_midway, text);
+    }
+
+    #[test]
+    fn a_divider_of_zero_sends_the_byte_at_once() {
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        uart.write(ctx, CLKDIV, 0);
+        uart.write(ctx, FIFO, u32::from(b'z'));
+        assert_eq!(uart.take_tx(ctx.now()), b"z");
+        assert_eq!(uart.read(ctx, FSM_STATUS), Some(0));
+    }
+
+    #[test]
+    fn the_rc_fast_selections_are_timed_from_the_crystal() {
+        // A known simplification: values 0 and 2 of `SCLK_SEL` run at the crystal frequency.
+        for selection in [0, 2] {
+            let ctx = &mut Ctx::default();
+            let mut uart = console(ctx);
+            uart.write(
+                ctx,
+                CLK_CONF,
+                (CLK_CONF_XTAL & !(SCLK_SEL_MASK << SCLK_SEL_SHIFT))
+                    | (selection << SCLK_SEL_SHIFT),
+            );
+            uart.write(ctx, FIFO, u32::from(b'r'));
+            assert_eq!(uart.take_tx(ctx.now()), [], "SCLK_SEL {selection}");
+            after_bytes(ctx, 1);
+            assert_eq!(uart.take_tx(ctx.now()), b"r", "SCLK_SEL {selection}");
+        }
+    }
+
+    #[test]
+    fn a_byte_keeps_the_duration_it_was_given_when_the_clock_changes_later() {
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        uart.write(ctx, FIFO, u32::from(b'a'));
+        // The crystal divided by 2: only the bytes written from now on are slower.
+        uart.write(ctx, CLK_CONF, CLK_CONF_XTAL | (1 << SCLK_DIV_NUM_SHIFT));
+        uart.write(ctx, FIFO, u32::from(b'b'));
+        after_bytes(ctx, 1);
+        assert_eq!(uart.take_tx(ctx.now()), b"a", "a was timed at 115 200 baud");
+        after_bytes(ctx, 1);
+        assert_eq!(uart.take_tx(ctx.now()), [], "b takes two byte times");
+        after_bytes(ctx, 2);
+        assert_eq!(uart.take_tx(ctx.now()), b"b");
+    }
+
+    #[test]
+    fn the_wake_up_of_bytes_dropped_by_a_fifo_reset_finds_nothing_to_do() {
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        for byte in *b"abc" {
+            uart.write(ctx, FIFO, u32::from(byte));
+        }
+        // The call is now armed for the last byte, which the reset drops.
+        let first_gone = Cycles(BYTE_SUBCYCLES.div_ceil(SUBCYCLES));
+        let last_gone = Cycles((3 * BYTE_SUBCYCLES).div_ceil(SUBCYCLES));
+        ctx.sleep_until(first_gone);
+        assert_eq!(ctx.take_due(), Some(Event::Uart(0)));
+        uart.wake(ctx);
+        assert_eq!(ctx.next_wake(), Some(last_gone));
+        uart.write(ctx, CONF0, TXFIFO_RST);
+        uart.write(ctx, CONF0, 0);
+        ctx.sleep_until(last_gone);
+        assert_eq!(ctx.take_due(), Some(Event::Uart(0)));
+        uart.wake(ctx);
+        assert_eq!(ctx.next_wake(), None, "nothing is left to wait for");
+        assert_eq!(uart.take_tx(ctx.now()), b"ab", "c was dropped");
+        assert_eq!(uart.read(ctx, FSM_STATUS), Some(0));
+        assert_eq!(ctx.take_unsupported(), None);
     }
 }

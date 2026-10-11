@@ -38,7 +38,10 @@ pub enum Unsupported {
     Reset { cause: ResetCause },
     /// `RTC_CNTL.CLK_CONF` selects a slow clock other than the RC oscillator, the only one modelled.
     SlowClock { clk_conf: u32 },
-    /// A byte written to a UART whose transmit FIFO was full: the hardware drops it too.
+    /// A byte written to a UART whose transmit FIFO was full.
+    /// ASSUMPTION: the byte is dropped. No source says what the silicon does with such a write;
+    /// writing 129 bytes or more without waiting on `TXFIFO_CNT` on a real chip and reading what
+    /// comes out would settle it.
     UartOverflow { uart: u8 },
 }
 
@@ -104,7 +107,7 @@ impl Unsupported {
             ),
             Unsupported::UartOverflow { uart } => write!(
                 f,
-                "a byte was written to UART{uart} while its 128-byte transmit FIFO was full (pc {pc:#010x}), so the byte was dropped, as on the device; wait for room in the FIFO (UART.STATUS TXFIFO_CNT) before writing"
+                "a byte was written to UART{uart} while its 128-byte transmit FIFO was full (pc {pc:#010x}), so inkemu dropped the byte; wait for room in the FIFO (UART.STATUS TXFIFO_CNT) before writing"
             ),
         }
     }

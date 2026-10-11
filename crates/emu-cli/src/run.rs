@@ -62,6 +62,17 @@ pub fn relay(out: &mut dyn Write, bytes: &[u8]) -> io::Result<bool> {
     }
 }
 
+/// Says in `log` that the console could not be written. A failing log writer must not hide the
+/// run's outcome: there is nowhere left to report it.
+fn log_console_error(log: &mut dyn Write, outcome: &io::Result<bool>) {
+    if let Err(e) = outcome {
+        let _ = writeln!(
+            log,
+            "error: cannot write the console output: {e}; check where stdout is redirected"
+        );
+    }
+}
+
 /// Takes the bytes of every console and relays those of `selected`; the others are discarded.
 fn relay_selected_console(
     machine: &mut Esp32C3,
@@ -103,7 +114,7 @@ pub fn execute(
     console: &mut dyn Write,
     log: &mut dyn Write,
 ) -> RunEnd {
-    let end = loop {
+    let mut end = loop {
         let now = machine.cycles().get();
         let slice_end = now.saturating_add(SLICE_CYCLES);
         let limit = options
@@ -123,12 +134,7 @@ pub fn execute(
             }
         }
         // A failure to write the console is logged whatever else ended the run in the same slice.
-        if let Err(e) = &console_open {
-            let _ = writeln!(
-                log,
-                "error: cannot write the console output: {e}; check where stdout is redirected"
-            );
-        }
+        log_console_error(log, &console_open);
         match (console_open, stop) {
             // `--strict-mmio` exists for CI: its exit code must not depend on the state of the console.
             (_, StopReason::StrictMmio(diagnostic)) => {
@@ -162,7 +168,15 @@ pub fn execute(
     // What the firmware had written and the device had not sent yet: without it the console
     // would end before the place the run stopped at.
     if !matches!(end, RunEnd::ConsoleClosed | RunEnd::ConsoleError) {
-        let _ = relay(console, &machine.flush_console(options.console));
+        let flushed = relay(console, &machine.flush_console(options.console));
+        log_console_error(log, &flushed);
+        end = match (end, flushed) {
+            // As in the loop: a `--strict-mmio` stop keeps its exit code whatever the console did.
+            (RunEnd::StrictMmio, _) => RunEnd::StrictMmio,
+            (_, Err(_)) => RunEnd::ConsoleError,
+            (_, Ok(false)) => RunEnd::ConsoleClosed,
+            (other, Ok(true)) => other,
+        };
     }
     let _ = writeln!(
         log,
@@ -506,6 +520,49 @@ mod tests {
         );
         assert_eq!((end, end.exit_code()), (RunEnd::ConsoleError, 2));
         assert!(text(&log).contains("disk full"), "{}", text(&log));
+    }
+
+    /// Five bytes written, none of which has left the UART when the run stops: the console is
+    /// written for the first time by the flush at the end of the run.
+    fn bytes_still_in_the_uart(then: &[u32], options: MachineOptions) -> Esp32C3 {
+        let mut program = printing(UART0, b"hello", &[]);
+        program.extend_from_slice(then);
+        machine(&program, options)
+    }
+
+    #[test]
+    fn a_console_that_fails_at_the_final_flush_ends_the_run_as_a_console_error() {
+        let mut m = bytes_still_in_the_uart(&[HANG], MachineOptions::default());
+        let mut log = Vec::new();
+        let end = execute(&mut m, &options(3_000), &mut Failing, &mut log);
+        assert_eq!((end, end.exit_code()), (RunEnd::ConsoleError, 2));
+        let log = text(&log);
+        assert!(
+            log.contains(
+                "error: cannot write the console output: disk full; check where stdout is redirected"
+            ),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_console_closed_at_the_final_flush_ends_the_run_as_console_closed() {
+        let mut m = bytes_still_in_the_uart(&[HANG], MachineOptions::default());
+        let mut log = Vec::new();
+        let end = execute(&mut m, &options(3_000), &mut Closed, &mut log);
+        assert_eq!((end, end.exit_code()), (RunEnd::ConsoleClosed, 0));
+        assert!(!text(&log).contains("cannot write"), "{}", text(&log));
+    }
+
+    #[test]
+    fn a_strict_mmio_stop_keeps_its_end_when_the_final_flush_fails() {
+        let mut m = bytes_still_in_the_uart(&reading_unmodeled_register(), STRICT);
+        let mut log = Vec::new();
+        let end = execute(&mut m, &options(10_000), &mut Failing, &mut log);
+        assert_eq!(end, RunEnd::StrictMmio);
+        let log = text(&log);
+        assert!(log.contains("cannot write the console output"), "{log}");
+        assert!(log.contains("stopped by --strict-mmio"), "{log}");
     }
 
     #[test]
