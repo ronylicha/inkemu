@@ -46,8 +46,11 @@ rows, and that plan inherits them too.
 | `0x6000200c` | `SPI1.CTRL1` | 1 | CS hold delay after a release-from-power-down | SP8 |
 | `0x60002010` | `SPI1.CTRL2` | 1 | CS setup and hold times | SP8 |
 | `0x60002014` | `SPI1.CLOCK` | 1 | SPI clock divider: a transfer takes no time | SP8 |
-| `0x600020a4` | `SPI1.SUS_STATUS` | 1 | program/erase suspend state | SP1b-3 |
-| `0x600020dc` | `SPI1.CLOCK_GATE` | 1 | register clock gate | SP1b-3 |
+| `0x60002034` | `SPI1.MISC` | 1 | chip-select idle level and enables | SP8 |
+| `0x60002098` | `SPI1.FLASH_WAITI_CTRL` | 1 | automatic wait for the chip to be idle after a program or an erase | SP1b-3b |
+| `0x6000209c` | `SPI1.FLASH_SUS_CTRL` | 1 | automatic program/erase suspend and resume | SP1b-3b |
+| `0x600020a4` | `SPI1.SUS_STATUS` | 1 | program/erase suspend state | SP1b-3b |
+| `0x600020dc` | `SPI1.CLOCK_GATE` | 1 | register clock gate | SP8 |
 | `0x60003008` | `SPI0.CTRL` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
 | `0x60003010` | `SPI0.CTRL2` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
 | `0x60003014` | `SPI0.CLOCK` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
@@ -58,10 +61,15 @@ rows, and that plan inherits them too.
 | `0x60003028` | `SPI0.MISO_DLEN` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
 | `0x60003034` | `SPI0.MISC` | 1 | chip-select enables | SP1b-4 |
 | `0x6000303c` | `SPI0.CACHE_FCTRL` | 1 | cache request enable | SP1b-4 |
-| `0x600030dc` | `SPI0.CLOCK_GATE` | 1 | register clock gate | SP1b-3 |
+| `0x600030dc` | `SPI0.CLOCK_GATE` | 1 | register clock gate | SP8 |
+| `0x600030e0` | `SPI0.CORE_CLK_SEL` | 1 | MSPI core clock selection: a transfer takes no time | SP8 |
 | `0x60004020` | `GPIO.ENABLE` | 1 | pin output enable | SP2 |
 | `0x60004154` | `GPIO.FUNC0_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x60004158` | `GPIO.FUNC1_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
+| `0x6000415c` | `GPIO.FUNC2_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
+| `0x60004160` | `GPIO.FUNC3_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
+| `0x60004164` | `GPIO.FUNC4_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
+| `0x60004168` | `GPIO.FUNC5_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x600050f0` | `FE2.FE2_TX_INTERP_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60006090` | `FE.FE_GEN_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits act) | SP1b-3b |
@@ -97,6 +105,8 @@ rows, and that plan inherits them too.
 | `0x6001d054` | `BB.BBPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x6001f048` | `TIMG0.WDTCONFIG0` | 1 | main watchdog 0 enable and stages: it never expires (D11) | SP1b-3 |
 | `0x6001f064` | `TIMG0.WDTWPROTECT` | 1 | main watchdog 0 write protection | SP1b-3 |
+| `0x60026014` | `APB_CTRL.WIFI_CLK_EN` | 1 | radio clock gates: there is no radio | SP5a |
+| `0x60026018` | `APB_CTRL.WIFI_RST_EN` | 1 | radio resets: there is no radio | SP5a |
 | `0x6002609c` | `APB_CTRL.FRONT_END_MEM_PD` | 1 | radio front-end memory power | SP5a |
 | `0x600260ac` | `APB_CTRL.MEM_POWER_UP` | 1 | radio memory power | SP5a |
 | `0x60040000` | `APB_SARADC.CTRL` | 1 | SAR ADC configuration: no conversion is performed | SP2 |

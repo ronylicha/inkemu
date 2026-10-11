@@ -1,7 +1,8 @@
 //! eFuse read mirror of a production chip. Layout: `efuse_reg.h` (report §H).
 //! The mirror answers only the read registers the SVD documents between `RD_WR_DIS` and `RD_RS_ERR1`
-//! (`svd_regs::esp32c3`, peripheral `EFUSE`): the reserved holes between them (such as 0x18C and
-//! 0x194..=0x1BC) are not registers, so they stay unmodelled and surface as diagnostics (spec §5.2).
+//! (`svd_regs::esp32c3`, peripheral `EFUSE`) and the one hole the application reads (`0x18C`, see
+//! `RD_REPEAT_ERR_GAP`): the other reserved holes (such as 0x194..=0x1BC) are not registers, so they
+//! stay unmodelled and surface as diagnostics (spec §5.2).
 //! The content is that of a production chip (decision D9); programming registers stay unmodelled
 //! until a firmware needs them (SP1b-3).
 use crate::chip::ChipRevision;
@@ -21,6 +22,14 @@ const RD_LAST: u32 = reg("RD_RS_ERR1");
 const RD_REPEAT_DATA1: u32 = reg("RD_REPEAT_DATA1");
 const WDT_DELAY_SEL_SHIFT: u32 = 16;
 const WDT_DELAY_SEL_MASK: u32 = 0b11;
+/// The word between `RD_REPEAT_ERR3` (`+0x188`) and `RD_REPEAT_ERR4` (`+0x190`). No register is
+/// documented there, in the SVD or in ESP-IDF `efuse_reg.h`; the application reads it all the
+/// same, as the fifth word of the repeat-error block, at every start
+/// (`APP:esp_efuse_utility_check_errors@0x420003f8`, the load at `0x4200045c`).
+///
+/// ASSUMPTION: it reads 0, like the error registers around it on a chip without eFuse errors. A
+/// read on a real chip settles it.
+const RD_REPEAT_ERR_GAP: u32 = reg("RD_REPEAT_ERR3") + svd_regs::REGISTER_BYTES;
 /// `RD_MAC_SPI_SYS_3` bits [20:18]: `WAFER_VERSION_MINOR_LO`.
 const RD_MAC_SPI_SYS_3: u32 = reg("RD_MAC_SPI_SYS_3");
 const WAFER_MINOR_LO_SHIFT: u32 = 18;
@@ -121,6 +130,9 @@ impl Efuse {
 
 impl Peripheral<Ctx> for Efuse {
     fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
+        if offset == RD_REPEAT_ERR_GAP {
+            return Some(0);
+        }
         self.read_mirror
             .binary_search_by_key(&offset, |&(o, _)| o)
             .ok()
@@ -312,7 +324,11 @@ mod tests {
     fn reserved_holes_between_documented_registers_are_unmodeled() {
         let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::V0_3);
-        assert_eq!(efuse.read(ctx, 0x18C), None, "hole");
+        assert_eq!(
+            efuse.read(ctx, 0x18C),
+            Some(0),
+            "the hole ESP-IDF reads as a fifth repeat-error word"
+        );
         assert_eq!(efuse.read(ctx, 0x194), None, "hole");
         let answered = (0x2C..=0x1C4)
             .step_by(4)
@@ -320,12 +336,12 @@ mod tests {
             .count();
         assert_eq!(
             answered,
-            svd_read_offsets().len(),
-            "the mirror answers exactly the documented registers"
+            svd_read_offsets().len() + 1,
+            "the mirror answers exactly the documented registers, and the one hole ESP-IDF reads"
         );
         assert_eq!(
-            answered, 91,
-            "103 words in the window minus 12 reserved holes; a changed count means the SVD changed"
+            answered, 92,
+            "103 words in the window minus 11 unanswered holes; a changed count means the SVD changed"
         );
     }
 

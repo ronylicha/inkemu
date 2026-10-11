@@ -70,7 +70,7 @@ const MODELED_COMMAND_BITS: u32 = 8;
 const DLEN_MASK: u32 = 0x3FF;
 
 /// Configuration of SPI1 that only shapes the electrical transfer, which is instantaneous here.
-const SPI1_ACCEPTED: [Accepted; 6] = [
+const SPI1_ACCEPTED: [Accepted; 9] = [
     Accepted::svd("SPI1", "CTRL", "read mode, dummy output, WP level", "SP8"),
     Accepted::svd(
         "SPI1",
@@ -89,9 +89,23 @@ const SPI1_ACCEPTED: [Accepted; 6] = [
         "SPI1",
         "SUS_STATUS",
         "program/erase suspend state",
-        "SP1b-3",
+        "SP1b-3b",
     ),
-    Accepted::svd("SPI1", "CLOCK_GATE", "register clock gate", "SP1b-3"),
+    Accepted::svd("SPI1", "CLOCK_GATE", "register clock gate", "SP8"),
+    // `spi_flash_hal_device_config` and what it calls (`IDF:hal/spi_flash_hal_common.inc:45`; F1).
+    Accepted::svd("SPI1", "MISC", "chip-select idle level and enables", "SP8"),
+    Accepted::svd(
+        "SPI1",
+        "FLASH_WAITI_CTRL",
+        "automatic wait for the chip to be idle after a program or an erase",
+        "SP1b-3b",
+    ),
+    Accepted::svd(
+        "SPI1",
+        "FLASH_SUS_CTRL",
+        "automatic program/erase suspend and resume",
+        "SP1b-3b",
+    ),
 ];
 
 /// SPI0 `+0x24` and `+0x28`: `MOSI_DLEN` and `MISO_DLEN`. The SVD omits them for SPI0; ESP-IDF
@@ -101,7 +115,7 @@ const SPI0_MISO_DLEN: u32 = SPI0_BASE + 0x28;
 const SPI0_FSM: u32 = addr("SPI0", "FSM") - SPI0_BASE;
 const WHY_SPI0: &str =
     "cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly";
-const SPI0_ACCEPTED: [Accepted; 11] = [
+const SPI0_ACCEPTED: [Accepted; 12] = [
     Accepted::svd("SPI0", "CTRL", WHY_SPI0, "SP1b-4"),
     Accepted::svd("SPI0", "CTRL2", WHY_SPI0, "SP1b-4"),
     Accepted::svd("SPI0", "CLOCK", WHY_SPI0, "SP1b-4"),
@@ -112,7 +126,14 @@ const SPI0_ACCEPTED: [Accepted; 11] = [
     Accepted::at("SPI0", "MISO_DLEN", SPI0_MISO_DLEN, WHY_SPI0, "SP1b-4"),
     Accepted::svd("SPI0", "MISC", "chip-select enables", "SP1b-4"),
     Accepted::svd("SPI0", "CACHE_FCTRL", "cache request enable", "SP1b-4"),
-    Accepted::svd("SPI0", "CLOCK_GATE", "register clock gate", "SP1b-3"),
+    Accepted::svd("SPI0", "CLOCK_GATE", "register clock gate", "SP8"),
+    // Read, never written: `spimem_flash_ll_get_source_freq_mhz` (`spimem_flash_ll.h:630`; F1).
+    Accepted::svd(
+        "SPI0",
+        "CORE_CLK_SEL",
+        "MSPI core clock selection: a transfer takes no time",
+        "SP8",
+    ),
 ];
 
 pub(crate) fn accepted() -> Vec<Accepted> {
@@ -546,8 +567,8 @@ mod tests {
         assert_eq!(spi.read(ctx, w15), Some(0x9D18_609D));
         assert_eq!(
             spi.read(ctx, w15 + 4),
-            None,
-            "FLASH_WAITI_CTRL is not modelled: nothing was stored past W15"
+            Some(0x14),
+            "FLASH_WAITI_CTRL keeps its reset value: nothing was stored past W15"
         );
     }
 

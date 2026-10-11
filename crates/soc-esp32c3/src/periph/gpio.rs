@@ -9,7 +9,8 @@ const STRAP: u32 = svd_regs::esp32c3::addr("GPIO", "STRAP") - GPIO_BASE;
 
 /// What the ROM's flash-boot path reads back and modifies (FB §B.1): the output enables and the two
 /// input selectors of the flash pads. Pins themselves arrive with the board wiring (SP2).
-const ACCEPTED: [Accepted; 3] = [
+const WHY_IN_SEL: &str = "input signal routing (GPIO matrix)";
+const ACCEPTED: [Accepted; 7] = [
     Accepted::svd("GPIO", "ENABLE", "pin output enable", "SP2"),
     Accepted::svd(
         "GPIO",
@@ -23,6 +24,12 @@ const ACCEPTED: [Accepted; 3] = [
         "input signal routing (GPIO matrix)",
         "SP2",
     ),
+    // The inputs of the flash signals: `esp_restart_noos` returns them to what the ROM expects,
+    // `0x30` in each (`IDF:esp_system/port/soc/esp32c3/system_internal.c:98-103`; trace F1).
+    Accepted::svd("GPIO", "FUNC2_IN_SEL_CFG", WHY_IN_SEL, "SP2"),
+    Accepted::svd("GPIO", "FUNC3_IN_SEL_CFG", WHY_IN_SEL, "SP2"),
+    Accepted::svd("GPIO", "FUNC4_IN_SEL_CFG", WHY_IN_SEL, "SP2"),
+    Accepted::svd("GPIO", "FUNC5_IN_SEL_CFG", WHY_IN_SEL, "SP2"),
 ];
 
 pub(crate) fn accepted() -> Vec<Accepted> {

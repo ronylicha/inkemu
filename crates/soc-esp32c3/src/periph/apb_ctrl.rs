@@ -12,7 +12,7 @@ const RND_DATA: u32 = addr("RNG", "DATA") - APB_CTRL_BASE;
 /// xorshift generators, scrambled", 2016).
 const XORSHIFT_STAR: u64 = 0x2545_F491_4F6C_DD1D;
 
-const ACCEPTED: [Accepted; 2] = [
+const ACCEPTED: [Accepted; 4] = [
     Accepted::svd(
         "APB_CTRL",
         "FRONT_END_MEM_PD",
@@ -20,6 +20,20 @@ const ACCEPTED: [Accepted; 2] = [
         "SP5a",
     ),
     Accepted::svd("APB_CTRL", "MEM_POWER_UP", "radio memory power", "SP5a"),
+    // `esp_perip_clk_init` gates the radio clocks (`IDF:esp_system/port/soc/esp32c3/clk.c:317`);
+    // the radio resets are pulsed by `esp_system_reset_modules_on_exit` at a restart (trace F1).
+    Accepted::svd(
+        "APB_CTRL",
+        "WIFI_CLK_EN",
+        "radio clock gates: there is no radio",
+        "SP5a",
+    ),
+    Accepted::svd(
+        "APB_CTRL",
+        "WIFI_RST_EN",
+        "radio resets: there is no radio",
+        "SP5a",
+    ),
 ];
 
 pub(crate) fn accepted() -> Vec<Accepted> {
@@ -133,17 +147,22 @@ mod tests {
         let ctx = &mut Ctx::default();
         let mut apb = ApbCtrl::new(DEFAULT_RNG_SEED);
         assert!(!apb.write(ctx, RND_DATA, 0));
-        for (name, reset) in [("FRONT_END_MEM_PD", 0x15), ("MEM_POWER_UP", 0x3F)] {
+        for (name, reset) in [
+            ("FRONT_END_MEM_PD", 0x15),
+            ("MEM_POWER_UP", 0x3F),
+            ("WIFI_CLK_EN", 0xFFFC_E030),
+            ("WIFI_RST_EN", 0),
+        ] {
             let offset = svd_regs::esp32c3::addr("APB_CTRL", name) - APB_CTRL_BASE;
             assert_eq!(apb.read(ctx, offset), Some(reset), "{name}");
             assert!(apb.write(ctx, offset, 1));
             assert_eq!(apb.read(ctx, offset), Some(1));
         }
-        let wifi_clk_en = svd_regs::esp32c3::addr("APB_CTRL", "WIFI_CLK_EN") - APB_CTRL_BASE;
+        let clk_out_en = svd_regs::esp32c3::addr("APB_CTRL", "CLK_OUT_EN") - APB_CTRL_BASE;
         assert_eq!(
-            apb.read(ctx, wifi_clk_en),
+            apb.read(ctx, clk_out_en),
             None,
-            "WIFI_CLK_EN belongs to a later plan"
+            "CLK_OUT_EN is not modelled"
         );
     }
 }
