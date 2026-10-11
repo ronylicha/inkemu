@@ -480,4 +480,27 @@ mod tests {
             Some(Diagnostic::UnmodeledMmio { .. })
         ));
     }
+
+    #[test]
+    fn rtc_cntl_and_efuse_share_a_page_but_not_their_registers() {
+        let mut b = bus();
+        assert_eq!(load(&mut b, 0x6000_8038) & 0x3F, 1, "RTC_CNTL.RESET_STATE");
+        assert_eq!(
+            load(&mut b, 0x6000_8850),
+            3 << 18,
+            "EFUSE.RD_MAC_SPI_SYS_3 of a v0.3 chip"
+        );
+        assert_eq!(
+            load(&mut b, 0x600C_0058) >> 12 & 0x7F,
+            40,
+            "SYSTEM.SYSCLK_CONF"
+        );
+        assert_eq!(load(&mut b, 0x600C_2100), 1, "INTERRUPT_CORE0.CLOCK_GATE");
+        assert_eq!(
+            load(&mut b, 0x600C_E048),
+            0,
+            "ASSIST_DEBUG.CORE_0_RCD_PDEBUGPC"
+        );
+        assert_eq!(b.diag.drain(), []);
+    }
 }

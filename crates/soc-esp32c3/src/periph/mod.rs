@@ -2,11 +2,21 @@
 use crate::config::SocConfig;
 use emu_core::Peripheral;
 
+pub mod assist_debug;
+pub mod efuse;
 pub mod gpio;
+pub mod intmatrix;
 pub mod io_mux;
+pub mod rtc_cntl;
+pub mod system;
 
+pub use assist_debug::AssistDebug;
+pub use efuse::Efuse;
 pub use gpio::Gpio;
+pub use intmatrix::IntMatrix;
 pub use io_mux::IoMux;
+pub use rtc_cntl::RtcCntl;
+pub use system::System;
 
 /// Registers deliberately modelled as plain read/write memory: configuration the emulator
 /// acknowledges but does not act on. Listing them here is a decision; anything else is reported.
@@ -71,11 +81,25 @@ const GPIO: (u32, u32) = (GPIO_BASE, 0x6000_4F00);
 /// Shared with [`io_mux`], which asks the SVD for its registers relative to this base.
 pub(crate) const IO_MUX_BASE: u32 = 0x6000_9000;
 const IO_MUX: (u32, u32) = (IO_MUX_BASE, 0x6000_A000);
+/// `RTC_CNTL` and the eFuse mirror share the page `0x6000_8000`: the first 2 KiB, then the last.
+const RTC_CNTL: (u32, u32) = (rtc_cntl::BASE, EFUSE_BASE);
+const EFUSE_BASE: u32 = 0x6000_8800;
+const EFUSE: (u32, u32) = (EFUSE_BASE, 0x6000_9000);
+const SYSTEM: (u32, u32) = (system::BASE, 0x600C_1000);
+const INTMATRIX_BASE: u32 = 0x600C_2000;
+const INTMATRIX: (u32, u32) = (INTMATRIX_BASE, 0x600C_3000);
+const ASSIST_DEBUG_BASE: u32 = 0x600C_E000;
+const ASSIST_DEBUG: (u32, u32) = (ASSIST_DEBUG_BASE, 0x600C_F000);
 
 #[derive(Debug)]
 pub struct Peripherals {
     pub gpio: Gpio,
     pub io_mux: IoMux,
+    pub intmatrix: IntMatrix,
+    pub rtc_cntl: RtcCntl,
+    pub system: System,
+    pub efuse: Efuse,
+    pub assist_debug: AssistDebug,
 }
 
 impl Peripherals {
@@ -84,6 +108,11 @@ impl Peripherals {
         Peripherals {
             gpio: Gpio::new(config.strapping),
             io_mux: IoMux::new(),
+            intmatrix: IntMatrix::new(),
+            rtc_cntl: RtcCntl::new(),
+            system: System::new(),
+            efuse: Efuse::new(config.chip_revision),
+            assist_debug: AssistDebug::new(),
         }
     }
 
@@ -94,6 +123,16 @@ impl Peripherals {
             Some((&mut self.gpio, GPIO_BASE))
         } else if within(IO_MUX) {
             Some((&mut self.io_mux, IO_MUX_BASE))
+        } else if within(RTC_CNTL) {
+            Some((&mut self.rtc_cntl, rtc_cntl::BASE))
+        } else if within(EFUSE) {
+            Some((&mut self.efuse, EFUSE_BASE))
+        } else if within(SYSTEM) {
+            Some((&mut self.system, system::BASE))
+        } else if within(INTMATRIX) {
+            Some((&mut self.intmatrix, INTMATRIX_BASE))
+        } else if within(ASSIST_DEBUG) {
+            Some((&mut self.assist_debug, ASSIST_DEBUG_BASE))
         } else {
             None
         }
