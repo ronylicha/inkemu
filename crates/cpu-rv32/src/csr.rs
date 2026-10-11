@@ -139,12 +139,19 @@ impl CsrFile {
             // `mip` pending bits are driven by the interrupt controller, not by software;
             // `misa` is WARL: writes are ignored, the ISA is fixed.
             MIP | MISA => {}
-            // The ESP32-C3 core only has the vectored mode: `MODE` reads 1, `BASE` is bits 31:8
-            // (TRM §1.5.2, register 1.7; report IR §2.1).
-            // ASSUMPTION: bits 7:2 read 0. The TRM draws `BASE` as [31:8] and says nothing of the
-            // bits below it; every value the ROM and ESP-IDF write has them clear.
-            MTVEC if self.vendor.is_some() => self.mtvec = (value & !MTVEC_C3_LOW) | MTVEC_VECTORED,
-            MTVEC => self.mtvec = value & !0b10, // modes 0 (direct) and 1 (vectored) only
+            MTVEC => {
+                self.mtvec = match self.vendor {
+                    // The ESP32-C3 core only has the vectored mode: `MODE` reads 1, `BASE` is
+                    // bits 31:8 (TRM §1.5.2, register 1.7; report IR §2.2).
+                    // ASSUMPTION: bits 7:2 read 0. The TRM draws `BASE` as [31:8] and says
+                    // nothing of the bits below it; every value the ROM and ESP-IDF write has
+                    // them clear. Writing `0xFFFFFFFF` to `mtvec` on a chip and reading it back
+                    // settles it.
+                    Some(Esp32C3Csrs { .. }) => (value & !MTVEC_C3_LOW) | MTVEC_VECTORED,
+                    // A plain hart: modes 0 (direct) and 1 (vectored) only.
+                    None => value & !0b10,
+                };
+            }
             MSCRATCH => self.mscratch = value,
             MEPC => self.mepc = value & !1,
             MCAUSE => self.mcause = value,
@@ -193,6 +200,15 @@ impl CsrFile {
         if std::mem::take(&mut self.cycle_written) {
             self.cycle_offset = self.cycle_offset.wrapping_sub(u64::from(cycles_spent));
         }
+    }
+
+    /// From here on `mcycle` and `minstret` read what a new hart reads: 0 now, then what the hart
+    /// executes. For a reset of a hart whose own totals (`cycles`, `instret`) go on across it:
+    /// the architecture leaves the reset value of the two counters arbitrary, and software that
+    /// was just reset must not read the age of the run in them.
+    pub(crate) fn restart_counters(&mut self, cycles: Cycles, instret: u64) {
+        self.cycle_offset = 0u64.wrapping_sub(cycles.get());
+        self.instret_offset = 0u64.wrapping_sub(instret);
     }
 
     /// Convenience for tests and reset code (counters at zero).

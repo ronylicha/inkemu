@@ -48,6 +48,8 @@ pub struct HartConfig {
     pub misaligned: MisalignedPolicy,
     /// Which vendor's CSRs the hart implements besides the machine-mode ones.
     pub vendor_csrs: VendorCsrs,
+    /// Where interrupts come from: `mip` and `mie` (the default), or a line presented by a
+    /// controller outside the hart ([`Hart::set_external_interrupt`]).
     pub interrupts: InterruptModel,
 }
 
@@ -95,27 +97,32 @@ impl Hart {
 
     /// Resets the hart: registers, CSRs (the PMP entries and their lock bits with them) and
     /// decoded instructions are those of a new hart about to execute `reset_pc`. The cycle and
-    /// instruction totals are measures of the run, not state of the core: they go on.
+    /// instruction totals ([`Hart::cycles`], [`Hart::instret`]) are measures of the run, not
+    /// state of the core: they go on. What software reads of them does restart: `mcycle` and
+    /// `minstret` read 0 after a reset, as on a new hart, and so does the vendor's counter. The
+    /// decode cache is rebuilt, so its statistics ([`Hart::decode_cache_stats`]) restart at zero
+    /// too.
     ///
     /// ASSUMPTION: a reset clears the integer registers. The architecture leaves them undefined;
-    /// the mask ROM writes every register it reads, so no measured boot tells the difference.
+    /// the mask ROM writes every register it reads, so no measured boot tells the difference. A
+    /// register dump taken at the first instruction after a reset, on a chip with a debugger
+    /// attached, settles it.
     pub fn reset(&mut self, reset_pc: u32) {
         self.x = [0; 32];
         self.pc = reset_pc;
         self.csr = CsrFile::new(self.config.vendor_csrs);
+        self.csr.restart_counters(self.cycles, self.instret);
         self.waiting = false;
         self.external = None;
         self.dcache = DecodeCache::new();
     }
 
     /// Presents the line an outside interrupt controller selected, `None` when it selects none.
-    /// Only used with [`InterruptModel::Controller`]; `line` must be lower than 32.
+    /// Only used with [`InterruptModel::Controller`]. The hart has lines 0 to 31 (the cause is
+    /// five bits wide and indexes the vector table): a line of 32 or more does not exist and is
+    /// taken as `None`.
     pub fn set_external_interrupt(&mut self, line: Option<u32>) {
-        debug_assert!(
-            line.is_none_or(|line| line < 32),
-            "interrupt line out of range"
-        );
-        self.external = line;
+        self.external = line.filter(|line| *line < 32);
     }
 
     /// Whether the hart is parked in `wfi`.
@@ -157,7 +164,9 @@ impl Hart {
             if pending.is_none() {
                 return StepOutcome::Waiting;
             }
-            // wfi resumes on any enabled pending interrupt, even when mstatus.MIE masks it.
+            // `wfi` ends on any pending line, even when `mstatus.MIE` keeps it from being taken:
+            // one set in both `mip` and `mie` (the standard model), or the one a controller
+            // presents (the instruction after `wfi` then runs: `InterruptModel::Controller`).
             self.waiting = false;
         }
         if self.csr.mstatus & MSTATUS_MIE != 0
@@ -250,6 +259,11 @@ impl Hart {
     }
 
     /// `mret`: restores `MIE` from `MPIE`, sets `MPIE`, and returns the address to resume at.
+    ///
+    /// ASSUMPTION: `mret` sets `MPIE`, the rule of the RISC-V privileged specification (and what
+    /// QEMU does). The ESP32-C3 TRM says `MPIE` is cleared (report IR §2.3, §7 question 6). The
+    /// difference shows only in a read of `mstatus` outside a handler, which no measured code
+    /// does. Reading `mstatus` right after an `mret` on a chip settles it.
     pub(crate) fn return_from_trap(&mut self) -> u32 {
         let csr = &mut self.csr;
         let mpie = csr.mstatus & MSTATUS_MPIE != 0;
@@ -1060,6 +1074,19 @@ mod tests {
         assert!(h.is_waiting());
         h.set_external_interrupt(Some(5));
         let (cycles, instret) = (h.cycles, h.instret);
+        assert_eq!((cycles.get(), instret), (2, 2));
+        // What the reset has to undo is there before it: the locked entry (a write to it is
+        // ignored), `mtvec`, a non-zero register, counters that read the run so far.
+        assert!(h.csr.write(PMPCFG0, 0));
+        assert_eq!(
+            h.csr.read(PMPCFG0, h.cycles, h.instret),
+            Some(0x9F),
+            "the entry is locked: only a reset clears it"
+        );
+        assert_eq!(h.csr.mtvec, 0x801);
+        assert_eq!(h.x[1], 1);
+        assert_eq!(h.csr.read(MCYCLE, h.cycles, h.instret), Some(2));
+        assert_ne!(h.decode_cache_stats(), (0, 0));
         h.reset(0x40);
         assert_eq!(h.pc, 0x40);
         assert_eq!(h.x, [0; 32]);
@@ -1075,6 +1102,19 @@ mod tests {
             (cycles, instret),
             "totals of the run"
         );
+        assert_eq!(
+            (
+                h.csr.read(MCYCLE, h.cycles, h.instret),
+                h.csr.read(MINSTRET, h.cycles, h.instret)
+            ),
+            (Some(0), Some(0)),
+            "software reads the counters of a new hart, not the age of the run"
+        );
+        assert_eq!(
+            h.decode_cache_stats(),
+            (0, 0),
+            "the decode cache is new, its statistics with it"
+        );
         // The presented line is forgotten: the controller presents it again if it still selects it.
         assert!(h.csr.write(MSTATUS, MSTATUS_MIE));
         h.pc = 0;
@@ -1082,6 +1122,77 @@ mod tests {
             h.step(&mut m, &OneCycle),
             StepOutcome::Retired { .. }
         ));
+        assert_eq!(
+            (
+                h.csr.read(MCYCLE, h.cycles, h.instret),
+                h.csr.read(MINSTRET, h.cycles, h.instret),
+                h.csr.read(MCYCLEH, h.cycles, h.instret),
+            ),
+            (Some(1), Some(1), Some(0)),
+            "and they count on from the reset"
+        );
+    }
+
+    #[test]
+    fn a_line_the_hart_does_not_have_is_no_line() {
+        // The cause is five bits wide and indexes the vector table: line 32 does not exist.
+        let (mut h, mut m) = controller_machine(&[addi(1, 0, 1), addi(1, 1, 1)]);
+        assert!(h.csr.write(MTVEC, 0x800));
+        assert!(h.csr.write(MSTATUS, MSTATUS_MIE));
+        for line in [32, 33, u32::MAX] {
+            h.set_external_interrupt(Some(line));
+            assert!(
+                matches!(h.step(&mut m, &OneCycle), StepOutcome::Retired { .. }),
+                "line {line}"
+            );
+            h.pc = 0;
+        }
+        h.set_external_interrupt(Some(31));
+        assert_eq!(
+            h.step(&mut m, &OneCycle),
+            StepOutcome::Interrupted { cause: 31 }
+        );
+        assert_eq!(h.pc, 0x800 + 4 * 31, "the last entry of the vector table");
+    }
+
+    #[test]
+    fn a_line_still_presented_is_taken_again_right_after_mret() {
+        // A level interrupt whose handler returns without acknowledging its source: `mret`
+        // restores `MIE` and the line, which the controller still presents, is taken before the
+        // instruction `mepc` points at. The handler sits at the vector of line 3.
+        let mut program = vec![addi(1, 0, 1), addi(1, 1, 1)];
+        program.resize(0x100 / 4 + 3, addi(0, 0, 0));
+        program.push(mret());
+        let (mut h, mut m) = controller_machine(&program);
+        assert!(h.csr.write(MTVEC, 0x100));
+        assert!(h.csr.write(MSTATUS, MSTATUS_MIE));
+        h.set_external_interrupt(Some(3));
+        for round in 0..3 {
+            assert_eq!(
+                h.step(&mut m, &OneCycle),
+                StepOutcome::Interrupted { cause: 3 },
+                "round {round}"
+            );
+            assert_eq!((h.pc, h.csr.mepc), (0x100 + 4 * 3, 0));
+            assert_eq!(h.csr.mstatus & MSTATUS_MIE, 0, "masked in the handler");
+            assert!(matches!(
+                h.step(&mut m, &OneCycle),
+                StepOutcome::Retired { .. }
+            ));
+            assert_eq!(h.pc, 0, "`mret` returned to the interrupted instruction");
+            assert_ne!(h.csr.mstatus & MSTATUS_MIE, 0);
+        }
+        assert_eq!(
+            h.x[1], 0,
+            "which never ran: the line was taken first each time"
+        );
+        // Once the controller withdraws the line the program goes on.
+        h.set_external_interrupt(None);
+        assert!(matches!(
+            h.step(&mut m, &OneCycle),
+            StepOutcome::Retired { .. }
+        ));
+        assert_eq!(h.x[1], 1);
     }
 
     #[cfg(debug_assertions)]
