@@ -1,0 +1,5 @@
+inkemu
+
+This product includes register descriptions derived from Espressif's CMSIS-SVD files
+(https://github.com/espressif/svd), Copyright Espressif Systems (Shanghai) Co., Ltd.,
+licensed under the Apache License, Version 2.0. See third_party/espressif-svd/.

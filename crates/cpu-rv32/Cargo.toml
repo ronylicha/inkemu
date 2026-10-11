@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Exposes the instruction encoders (`asm`) to the tests of other crates.
+test-support = []
+
 [lints]
 workspace = true
 

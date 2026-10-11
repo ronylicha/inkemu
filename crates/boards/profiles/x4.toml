@@ -1,0 +1,10 @@
+# Xteink X4. Hardware facts and their sources: docs/research/xteink-hardware.md.
+id = "x4"
+name = "Xteink X4"
+
+[soc]
+family = "esp32c3"
+# ASSUMPTION: the silicon revision of retail units is not established. v0.3 is the most common
+# ESP32-C3 revision and selects the rev3 mask ROM. The chip revision a retail unit reports settles
+# it: `esptool.py chip_id`, or the "chip revision" line of its boot log.
+revision = "v0.3"

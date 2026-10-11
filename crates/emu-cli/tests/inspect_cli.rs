@@ -108,3 +108,24 @@ fn inspect_real_crosspoint_firmware() {
         .stdout(contains("ESP32-C3"))
         .stdout(contains("DROM"));
 }
+
+/// A reader that goes away (`inkemu inspect fw.bin | head -0`) is a normal way to end, not a panic.
+#[test]
+fn inspect_with_a_closed_stdout_does_not_panic() {
+    use std::process::{Command, Stdio};
+    let (_d, path) = write_temp(&build_image(&ImageSpec::default()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_inkemu"))
+        .arg("inspect")
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take()); // the reader goes away before inkemu writes
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+        "{output:?}"
+    );
+    assert!(output.status.success(), "{output:?}");
+}

@@ -1,0 +1,24 @@
+[package]
+name = "soc-esp32c3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exposes `RomImage::from_flat` so other crates can run tiny hand-written programs as a ROM in their tests.
+test-support = ["cpu-rv32/test-support"]
+
+[dependencies]
+emu-core.workspace = true
+cpu-rv32.workspace = true
+svd-regs.workspace = true
+goblin.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+cpu-rv32 = { workspace = true, features = ["test-support"] }
+sha2.workspace = true

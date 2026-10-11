@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/emu-core", "crates/cpu-rv32", "crates/firmware", "crates/emu-cli"]
+members = ["crates/emu-core", "crates/cpu-rv32", "crates/firmware", "crates/emu-cli", "crates/svd-gen", "crates/svd-regs", "crates/soc-esp32c3", "crates/boards"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,13 +13,21 @@ repository = "https://github.com/ronylicha/inkemu"
 emu-core = { path = "crates/emu-core", version = "0.1.0" }
 cpu-rv32 = { path = "crates/cpu-rv32", version = "0.1.0" }
 firmware = { path = "crates/firmware", version = "0.1.0" }
+svd-regs = { path = "crates/svd-regs", version = "0.1.0" }
+soc-esp32c3 = { path = "crates/soc-esp32c3", version = "0.1.0" }
+boards = { path = "crates/boards", version = "0.1.0" }
 thiserror = "2"
 sha2 = "0.10"
 md-5 = "0.10"
+roxmltree = "0.21"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-goblin = "0.9"
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
+goblin = { version = "0.10", default-features = false, features = ["std", "elf32", "elf64", "endian_fd"] }
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+flate2 = "1.1"
+tar = "0.4"
+etcetera = "0.11"
 assert_cmd = "2"
 predicates = "3"
 

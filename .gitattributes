@@ -1,0 +1,2 @@
+third_party/espressif-svd/esp32c3.svd -text
+crates/svd-regs/src/esp32c3.rs text eol=lf

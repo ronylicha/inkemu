@@ -1,0 +1,4 @@
+ESP32-C3 CMSIS-SVD register description
+Copyright Espressif Systems (Shanghai) Co., Ltd.
+Licensed under the Apache License, Version 2.0 (see LICENSE in this directory).
+Source: https://github.com/espressif/svd (release 2024-05-09).

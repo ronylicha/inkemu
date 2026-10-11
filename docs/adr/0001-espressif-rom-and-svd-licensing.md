@@ -66,7 +66,7 @@ Conditions : copier les deux fichiers à l'identique depuis la release `2024-05-
 
 ## Conséquences
 
-- **Cache local de la ROM** : `<data_dir>/inkemu/rom/`, où `<data_dir>` est le répertoire de données utilisateur de la plateforme. Le premier lancement qui a besoin d'une ROM absente télécharge l'archive épinglée, **vérifie son SHA-256 avant toute extraction**, extrait les seuls ELF nécessaires et les convertit en images. Les écritures se font vers un fichier temporaire puis renommage, pour qu'un téléchargement interrompu ne laisse jamais un fichier partiel à l'emplacement final.
+- **Cache local de la ROM** : le répertoire de données utilisateur de la plateforme pour `inkemu`, plus `rom` (les chemins de chaque système sont documentés sur `rom_store::default_cache_dir`). Le premier lancement qui a besoin d'une ROM absente télécharge l'archive épinglée, **vérifie son SHA-256 avant toute extraction**, extrait les seuls ELF nécessaires et les convertit en images. Les écritures se font vers un fichier temporaire puis renommage, pour qu'un téléchargement interrompu ne laisse jamais un fichier partiel à l'emplacement final.
 - **Manifeste de ROM versionné dans le dépôt** : tag de release, URL, SHA-256 de l'archive, et, une fois calculés, SHA-256 de chaque ELF (C3 par révision, S3 `REV0`). La première tâche de SP1b doit ouvrir l'archive, relever les noms de fichiers, vérifier que les segments chargeables contiennent bien la ROM complète, et inscrire ces empreintes. Si la vérification échoue, cet ADR doit être révisé avant d'écrire le chargeur.
 - **Vérification à chaque lancement** : les empreintes des images en cache sont revérifiées contre le manifeste.
 - **Messages d'erreur** : ROM absente et réseau indisponible, ROM altérée ou empreinte différente, archive téléchargée dont l'empreinte ne correspond pas. Chacun doit nommer le fichier, l'empreinte attendue et celle observée, et indiquer comment fournir la ROM manuellement. Une ROM altérée n'est jamais chargée.
@@ -75,3 +75,19 @@ Conditions : copier les deux fichiers à l'identique depuis la release `2024-05-
 - **Dépôt** : aucun binaire de ROM n'est commité. Le dépôt contient en revanche `third_party/espressif-svd/` (deux SVD, licence, provenance).
 - **Avis dans la documentation** : indiquer que la ROM est le code d'Espressif, qu'elle n'est pas open-source, et qu'elle est utilisée sous Apache-2.0 selon le README d'`esp-rom-elfs`.
 - **Révision de l'ADR** : à rouvrir si Espressif publie des empreintes par fichier ou des images plates sous licence explicite, ou si un besoin de distribution hors ligne impose d'embarquer la ROM.
+
+## Mise en œuvre (SP1b-1, 2026-10-11)
+
+La décision ci-dessus n'est pas réécrite : elle tient. Cette section consigne ce que la mise en œuvre a établi, et l'écart assumé par rapport au texte.
+
+**Les trois points « inconnus » sont levés** (rapport `docs/research/esp32c3-rom-elfs.md`, §2, §3, §7 et §9 ; manifeste dans `crates/emu-cli/src/rom_store.rs`, constantes `ESP_ROM_ELFS` et `ESP32C3_ROMS`) :
+
+- *Noms des fichiers dans l'archive* : 17 ELF à plat, sans dossier, nommés `<puce>_rev<révision>_rom.elf`. Les trois ROM de l'ESP32-C3 sont `esp32c3_rev0_rom.elf`, `esp32c3_rev3_rom.elf` et `esp32c3_rev101_rom.elf`.
+- *Contenu des ELF* : ils contiennent bien la ROM complète. La recette de reconstruction de l'image plate de 384 Kio tient en cinq étapes (rapport §7, avec la règle de l'étape 4 bis ajoutée au §9 pour `.data_btdm`). Elle a été validée octet pour octet pour rev3 : l'image reconstruite est identique à l'image de référence, de SHA-256 `0de1e65020e803bea0d7443dca149d61895e01fca3bb9c82d073234eebd73f99`. Les images rev0 et rev101 sont produites par la même règle, sans image de référence pour les comparer.
+- *Empreintes par fichier* : calculées une fois sur l'archive épinglée et inscrites dans le manifeste, pour chaque ELF et pour chaque image reconstruite. L'ELF est vérifié avant tout usage, puis l'image après conversion ; une ROM dont l'empreinte diffère n'est jamais chargée.
+
+**Écart par rapport aux « Conséquences »** : le cache ne contient que l'ELF vérifié, pas une image convertie. Le texte ci-dessus disait « extrait les seuls ELF nécessaires et les convertit en images ». L'image est en fait reconstruite à chaque lancement, et son empreinte est vérifiée contre le manifeste avant d'être chargée. Ce choix évite un second fichier de cache à tenir cohérent avec le premier : une seule pièce vérifiée sur disque, tout le reste est dérivé et re-contrôlé. Le cache se trouve dans le répertoire de données utilisateur de la plateforme pour `inkemu`, plus `rom`, résolu par la crate `etcetera` ; les chemins de chaque système sont documentés sur `rom_store::default_cache_dir`.
+
+**Un seul SVD est copié pour l'instant** : `third_party/espressif-svd/` ne contient que `esp32c3.svd`. Le texte de la décision en prévoyait deux ; celui de l'ESP32-S3 sera copié, à l'identique et avec la même empreinte, avec le sous-projet 7, quand le cœur Xtensa en aura besoin.
+
+**Image de référence de QEMU** : le `esp32c3-rom.bin` de QEMU a servi une seule fois, comme référence de comparaison, dans un conteneur, pour valider la reconstruction de rev3. Il n'a été ni copié dans le dépôt ni distribué, et inkemu ne le charge pas.

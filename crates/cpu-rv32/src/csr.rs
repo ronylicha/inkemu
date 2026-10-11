@@ -1,4 +1,5 @@
-//! Machine-mode CSR file (Zicsr). `SoC`-specific CSRs are added by the `SoC` crate in `SP1b`.
+//! Machine-mode CSR file (Zicsr), plus the CSRs of a vendor core selected by [`VendorCsrs`].
+use crate::csr_esp32c3::Esp32C3Csrs;
 use emu_core::Cycles;
 
 pub const MSTATUS: u16 = 0x300;
@@ -33,6 +34,16 @@ const MISA_RV32IMC: u32 = (1 << 30) | (1 << 2) | (1 << 8) | (1 << 12);
 /// CSR addresses whose bits [11:10] are 0b11 are read-only (Privileged spec §2.1).
 const READ_ONLY_MASK: u16 = 0xC00;
 
+/// CSRs that only one vendor's core implements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VendorCsrs {
+    /// A plain RV32IMC machine-mode hart (conformance tests).
+    #[default]
+    None,
+    /// The `ESP32-C3` core: `ustatus` and the performance counter.
+    Esp32C3,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CsrFile {
     pub mstatus: u32,
@@ -47,6 +58,9 @@ pub struct CsrFile {
     instret_offset: u64,
     /// Set by a software write to `minstret`/`minstreth` until the hart retires that instruction.
     instret_written: bool,
+    /// Set by a software write to `mcycle`/`mcycleh` until the hart retires that instruction.
+    cycle_written: bool,
+    vendor: Option<Esp32C3Csrs>,
 }
 
 #[allow(clippy::cast_possible_truncation)] // deliberate: callers want the low 32 bits
@@ -58,6 +72,18 @@ const fn high(v: u64) -> u32 {
 }
 
 impl CsrFile {
+    /// A CSR file with the machine-mode CSRs and those of `vendor`.
+    #[must_use]
+    pub fn new(vendor: VendorCsrs) -> CsrFile {
+        CsrFile {
+            vendor: match vendor {
+                VendorCsrs::None => None,
+                VendorCsrs::Esp32C3 => Some(Esp32C3Csrs::default()),
+            },
+            ..CsrFile::default()
+        }
+    }
+
     /// Reads a CSR; `None` means "no such CSR" (illegal instruction).
     #[must_use]
     pub fn read(&self, addr: u16, cycles: Cycles, instret: u64) -> Option<u32> {
@@ -78,7 +104,12 @@ impl CsrFile {
             MINSTRET | INSTRET => low(ret),
             MINSTRETH | INSTRETH => high(ret),
             MVENDORID | MARCHID | MIMPID | MHARTID => 0,
-            _ => return None,
+            _ => {
+                return self
+                    .vendor
+                    .as_ref()
+                    .and_then(|v| v.read(addr, cycles, instret));
+            }
         })
     }
 
@@ -106,11 +137,13 @@ impl CsrFile {
             MCAUSE => self.mcause = value,
             MTVAL => self.mtval = value,
             MCYCLE => {
+                self.cycle_written = true;
                 self.cycle_offset =
                     replace_low(cycles.get().wrapping_add(self.cycle_offset), value)
                         .wrapping_sub(cycles.get());
             }
             MCYCLEH => {
+                self.cycle_written = true;
                 self.cycle_offset =
                     replace_high(cycles.get().wrapping_add(self.cycle_offset), value)
                         .wrapping_sub(cycles.get());
@@ -126,17 +159,26 @@ impl CsrFile {
                     replace_high(instret.wrapping_add(self.instret_offset), value)
                         .wrapping_sub(instret);
             }
-            _ => return false,
+            _ => {
+                return self
+                    .vendor
+                    .as_mut()
+                    .is_some_and(|v| v.write(addr, value, cycles, instret));
+            }
         }
         true
     }
 
-    /// Called when the instruction that just executed retires. A software write to `minstret` or
-    /// `minstreth` takes precedence over the increment of that same instruction (Privileged spec,
-    /// machine counters), so the retirement increment is cancelled in the offset.
-    pub fn on_instruction_retired(&mut self) {
+    /// Called when the instruction that just executed retires, having spent `cycles_spent` cycles.
+    /// A software write to `minstret`/`minstreth` or to `mcycle`/`mcycleh` takes precedence over the
+    /// increment of that same instruction (Privileged spec, machine counters), so the increment
+    /// (one instruction, `cycles_spent` cycles) is cancelled in the offset.
+    pub fn on_instruction_retired(&mut self, cycles_spent: u32) {
         if std::mem::take(&mut self.instret_written) {
             self.instret_offset = self.instret_offset.wrapping_sub(1);
+        }
+        if std::mem::take(&mut self.cycle_written) {
+            self.cycle_offset = self.cycle_offset.wrapping_sub(u64::from(cycles_spent));
         }
     }
 
@@ -145,6 +187,7 @@ impl CsrFile {
         let known = self.write_with_counters(addr, value, Cycles::ZERO, 0);
         // Not executed by an instruction: there is no retirement increment to cancel.
         self.instret_written = false;
+        self.cycle_written = false;
         known
     }
 }
@@ -159,6 +202,7 @@ fn replace_high(v: u64, high32: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::csr_esp32c3::PCER_USER;
 
     #[test]
     fn mstatus_keeps_mpp_at_machine_and_masks_unsupported_bits() {
@@ -228,5 +272,38 @@ mod tests {
             assert!(csr.write(addr, 0xdead_beef));
             assert_eq!(csr.read(addr, Cycles::ZERO, 0), Some(0xdead_beef));
         }
+    }
+
+    #[test]
+    fn retiring_a_cycle_counter_write_cancels_the_cycles_of_that_instruction() {
+        let mut csr = CsrFile::default();
+        // The write executes at cycle 10 and the instruction then spends 3 cycles.
+        assert!(csr.write_with_counters(MCYCLE, 100, Cycles(10), 0));
+        csr.on_instruction_retired(3);
+        assert_eq!(csr.read(MCYCLE, Cycles(13), 1), Some(100));
+        assert!(csr.write_with_counters(MCYCLEH, 7, Cycles(13), 1));
+        csr.on_instruction_retired(2);
+        assert_eq!(csr.read(MCYCLEH, Cycles(15), 2), Some(7));
+        // Only the instruction that wrote is affected.
+        csr.on_instruction_retired(4);
+        assert_eq!(csr.read(MCYCLE, Cycles(19), 3), Some(104));
+    }
+
+    #[test]
+    fn convenience_write_leaves_no_pending_cycle_cancellation() {
+        let mut csr = CsrFile::default();
+        assert!(csr.write(MCYCLE, 50));
+        csr.on_instruction_retired(5);
+        assert_eq!(csr.read(MCYCLE, Cycles(5), 1), Some(55));
+    }
+
+    #[test]
+    fn vendor_csrs_exist_only_when_selected() {
+        let mut generic = CsrFile::new(VendorCsrs::None);
+        let mut c3 = CsrFile::new(VendorCsrs::Esp32C3);
+        assert!(!generic.write(PCER_USER, 1));
+        assert_eq!(generic.read(PCER_USER, Cycles::ZERO, 0), None);
+        assert!(c3.write(PCER_USER, 1));
+        assert_eq!(c3.read(PCER_USER, Cycles::ZERO, 0), Some(1));
     }
 }
