@@ -8,25 +8,45 @@ use emu_core::{Cycles, EventId, Scheduler};
 use std::collections::VecDeque;
 use svd_regs::REGISTER_BYTES;
 
+/// The number of interrupt map registers, hence of peripheral interrupt sources. They fill the
+/// start of `INTERRUPT_CORE0` (report IR §1.1) from `MAC_INTR_MAP`, at the base of the block, to
+/// `CACHE_CORE0_ACS_INT_MAP`, the last one; the registers that follow (`INTR_STATUS_REG_0`, ...)
+/// are not map registers. The count is read off the SVD table through that last register.
+const MAP_REGISTERS: u32 = (svd_regs::esp32c3::addr("INTERRUPT_CORE0", "CACHE_CORE0_ACS_INT_MAP")
+    - INTMATRIX_BASE)
+    / REGISTER_BYTES
+    + 1;
+
 /// One of the 62 peripheral interrupt sources: source `n` is the one `INTERRUPT_CORE0` routes with
 /// the map register at offset 4 × `n` (report IR §1.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Source(u8);
+pub struct Source(u32);
 
 impl Source {
-    /// The source routed by `INTERRUPT_CORE0.<map_register>`. Used in a `const`, an unknown register
-    /// name fails the build.
+    /// The source routed by `INTERRUPT_CORE0.<map_register>`. Meant for a `const`, where the build
+    /// fails when the SVD has no such register in `INTERRUPT_CORE0`, and when the register is one of
+    /// the block that is not an interrupt map register (`INTR_STATUS_REG_0`, `CLOCK_GATE`, ...).
+    ///
+    /// The check is on the position: a register inside the first [`MAP_REGISTERS`] words of the
+    /// block is taken to be a map register, as the SVD lays them out (a test pins that).
+    ///
+    /// # Panics
+    /// When the register is not an interrupt map register (at compile time in a `const`).
     #[must_use]
     pub const fn of(map_register: &str) -> Source {
         let offset = svd_regs::esp32c3::addr("INTERRUPT_CORE0", map_register) - INTMATRIX_BASE;
-        // The 62 map registers end at offset 0xF4: the quotient fits in the 6 bits kept.
-        Source(((offset / REGISTER_BYTES) & 0x3F) as u8)
+        let index = offset / REGISTER_BYTES;
+        assert!(
+            index < MAP_REGISTERS,
+            "the name is not an INTERRUPT_CORE0 interrupt map register"
+        );
+        Source(index)
     }
 
     /// The source number, 0 to 61.
     #[must_use]
     pub const fn number(self) -> u32 {
-        self.0 as u32
+        self.0
     }
 
     const fn mask(self) -> u64 {
@@ -322,6 +342,64 @@ mod tests {
         assert_eq!(SOFTWARE.number(), 50);
         assert_eq!(Source::of("MAC_INTR_MAP").number(), 0);
         assert_eq!(Source::of("CACHE_CORE0_ACS_INT_MAP").number(), 61);
+    }
+
+    #[test]
+    fn the_sources_are_the_map_registers_and_the_register_after_them_is_not_one() {
+        let offset = |name: &str| svd_regs::esp32c3::addr("INTERRUPT_CORE0", name) - INTMATRIX_BASE;
+        // The lowest and the highest valid source, and the count the build-time check relies on.
+        assert_eq!(Source::of("MAC_INTR_MAP").number(), 0);
+        assert_eq!(
+            Source::of("CACHE_CORE0_ACS_INT_MAP").number(),
+            MAP_REGISTERS - 1
+        );
+        assert_eq!(MAP_REGISTERS, 62);
+        // Every register of the map area is a map register by its name, and the first register
+        // after it (INTR_STATUS_REG_0) is not: a neighbour never passes for a source.
+        for register in svd_regs::esp32c3::registers()
+            .iter()
+            .filter(|r| r.peripheral == "INTERRUPT_CORE0")
+        {
+            let in_map_area = register.addr - INTMATRIX_BASE < MAP_REGISTERS * REGISTER_BYTES;
+            assert_eq!(
+                in_map_area,
+                register.name.ends_with("_MAP"),
+                "{}",
+                register.name
+            );
+        }
+        assert_eq!(offset("INTR_STATUS_REG_0"), MAP_REGISTERS * REGISTER_BYTES);
+    }
+
+    #[test]
+    fn two_wake_ups_due_together_come_out_in_the_order_they_were_asked_for() {
+        let mut ctx = Ctx::default();
+        ctx.schedule(Cycles(100), SECOND);
+        ctx.schedule(Cycles(100), FIRST);
+        ctx.sleep_until(Cycles(100));
+        assert_eq!(ctx.take_due(), Some(SECOND));
+        assert_eq!(ctx.take_due(), Some(FIRST));
+        assert_eq!(ctx.take_due(), None);
+    }
+
+    #[test]
+    fn a_wake_up_asked_for_an_instant_already_past_is_due_at_once() {
+        let mut ctx = Ctx::default();
+        ctx.sleep_until(Cycles(500));
+        ctx.schedule(Cycles(100), FIRST);
+        assert_eq!(ctx.next_wake(), Some(Cycles(100)));
+        assert!(ctx.wake_due());
+        assert_eq!(ctx.take_due(), Some(FIRST));
+        assert!(!ctx.wake_due());
+    }
+
+    #[test]
+    fn a_source_raised_twice_and_lowered_once_is_lowered() {
+        let mut ctx = Ctx::default();
+        ctx.irq(TICK, true);
+        ctx.irq(TICK, true);
+        ctx.irq(TICK, false);
+        assert_eq!(ctx.sources(), 0);
     }
 
     #[test]
