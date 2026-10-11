@@ -731,6 +731,49 @@ mod tests {
     }
 
     #[test]
+    fn store_into_the_second_half_of_a_cached_instruction_invalidates_it_with_an_unaligned_ram_base()
+     {
+        // RAM at 0x1800..0x3800: the 4-byte `addi x5,x0,1` at 0x27FE sits inside the absolute
+        // page 0x2000 but straddles the RAM-relative page boundary at 0x2800. Its high parcel
+        // is rewritten with `sh` from code in another absolute page, so nothing else refreshes
+        // the decode cache of page 0x2000: only `page_version` can invalidate the stale entry.
+        let words =
+            |program: &[u32]| -> Vec<u8> { program.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let mut ram = Ram::new(0x1800, 0x2000);
+        ram.load(
+            0x1800,
+            &words(&[
+                lui(2, 0x2000),    // x2 = 0x2000
+                addi(2, 2, 0x7fe), // x2 = 0x27fe
+                jalr(0, 2, 0),     // run the straddling instruction
+            ]),
+        )
+        .unwrap();
+        ram.load(
+            0x1810,
+            &words(&[
+                addi(3, 0, 0x70), // high parcel of `addi x5,x0,7` is 0x0070
+                sh(3, 2, 2),      // rewrite the parcel at 0x2800
+                jalr(0, 2, 0),    // run the rewritten instruction
+            ]),
+        )
+        .unwrap();
+        ram.load(0x2802, &words(&[jal(0, 0x1810 - 0x2802)]))
+            .unwrap();
+        // Loaded last: one write spanning both RAM-relative pages gives them the same version,
+        // so the decode cache cannot be refreshed by accident when it first runs from 0x2802.
+        ram.load(0x27fe, &addi(5, 0, 1).to_le_bytes()).unwrap();
+        let mut h = Hart::new(0x1800, HartConfig::default());
+        // 3 entry + straddling addi + jal + 3 patch + straddling addi again.
+        run(&mut h, &mut ram, 9);
+        assert_eq!(
+            h.x[5], 7,
+            "the rewritten instruction must run, not the cached one"
+        );
+        assert_eq!(h.pc, 0x2802);
+    }
+
+    #[test]
     fn cache_hit_still_pays_fetch_stall() {
         #[derive(Debug)]
         struct SlowFetch(Ram);

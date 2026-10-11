@@ -89,6 +89,9 @@ pub fn lhu(rd: u8, rs1: u8, imm: i32) -> u32 {
 pub fn sb(rs2: u8, rs1: u8, imm: i32) -> u32 {
     s(imm, rs2, rs1, 0, 0x23)
 }
+pub fn sh(rs2: u8, rs1: u8, imm: i32) -> u32 {
+    s(imm, rs2, rs1, 1, 0x23)
+}
 pub fn sw(rs2: u8, rs1: u8, imm: i32) -> u32 {
     s(imm, rs2, rs1, 2, 0x23)
 }

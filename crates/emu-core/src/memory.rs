@@ -7,10 +7,14 @@ pub const PAGE_SHIFT: u32 = 12;
 /// Widest bus access in bytes (a 32-bit word).
 const WORD_BYTES: usize = 4;
 
+/// Versions are kept per ABSOLUTE 4 KiB page (`addr >> PAGE_SHIFT`), as `Bus::page_version` requires,
+/// so a base that is not page-aligned must not shift the page boundaries.
 #[derive(Debug, Clone)]
 pub struct Ram {
     base: u32,
     data: Vec<u8>,
+    /// Absolute page number of `page_versions[0]`.
+    first_page: u32,
     page_versions: Vec<u64>,
     next_version: u64,
 }
@@ -18,10 +22,18 @@ pub struct Ram {
 impl Ram {
     #[must_use]
     pub fn new(base: u32, len: usize) -> Ram {
-        let pages = len.div_ceil(1 << PAGE_SHIFT);
+        let first_page = base >> PAGE_SHIFT;
+        let pages = if len == 0 {
+            0
+        } else {
+            // Wide arithmetic: `base + len - 1` may exceed `u32` for a RAM that ends at the top of the address space.
+            let last_byte = u64::from(base) + len as u64 - 1;
+            (last_byte >> PAGE_SHIFT) as usize - first_page as usize + 1
+        };
         Ram {
             base,
             data: vec![0; len],
+            first_page,
             page_versions: vec![0; pages],
             next_version: 1,
         }
@@ -37,13 +49,24 @@ impl Ram {
         Ok(start)
     }
 
+    /// Marks the pages touched by `len` bytes at RAM offset `start` as written.
     fn bump_pages(&mut self, start: usize, len: usize) {
-        let first = start >> PAGE_SHIFT;
-        let last = (start + len - 1) >> PAGE_SHIFT;
+        let first = self.page_index(self.base_plus(start));
+        let last = self.page_index(self.base_plus(start + len - 1));
         for page in &mut self.page_versions[first..=last] {
             *page = self.next_version;
         }
         self.next_version += 1;
+    }
+
+    /// Absolute address of the byte at RAM offset `offset`; callers have already range-checked it.
+    fn base_plus(&self, offset: usize) -> u64 {
+        u64::from(self.base) + offset as u64
+    }
+
+    /// Index into `page_versions` of the absolute page containing `addr`.
+    fn page_index(&self, addr: u64) -> usize {
+        (addr >> PAGE_SHIFT) as usize - self.first_page as usize
     }
 
     /// Copies `bytes` at `addr` (used to load images); bumps page versions.
@@ -101,8 +124,9 @@ impl Bus for Ram {
     }
 
     fn page_version(&self, addr: u32) -> u64 {
-        addr.checked_sub(self.base)
-            .and_then(|off| self.page_versions.get((off >> PAGE_SHIFT) as usize))
+        ((addr >> PAGE_SHIFT) as usize)
+            .checked_sub(self.first_page as usize)
+            .and_then(|index| self.page_versions.get(index))
             .copied()
             .unwrap_or(0)
     }
@@ -159,6 +183,47 @@ mod tests {
         assert_ne!(ram.page_version(0), a);
         assert_ne!(ram.page_version(4096), b);
     }
+    #[test]
+    fn page_versions_follow_absolute_4k_pages_for_an_unaligned_base() {
+        // 0x1800..0x3800: the absolute page 0x2000..0x2FFF straddles the RAM-relative 4 KiB boundary at 0x2800.
+        let mut ram = Ram::new(0x1800, 0x2000);
+        let (low_half, high_half) = (ram.page_version(0x27FE), ram.page_version(0x2800));
+        ram.write(0x2800, AccessSize::Byte, 1).unwrap();
+        assert_ne!(ram.page_version(0x2800), high_half);
+        assert_ne!(
+            ram.page_version(0x27FE),
+            low_half,
+            "0x27FE and 0x2800 share the absolute page 0x2000"
+        );
+        assert_eq!(ram.page_version(0x27FE), ram.page_version(0x2800));
+        assert_eq!(ram.page_version(0x2000), ram.page_version(0x2FFF));
+    }
+
+    #[test]
+    fn unaligned_base_keeps_neighbouring_absolute_pages_independent() {
+        let mut ram = Ram::new(0x1800, 0x2000);
+        let (first, second, third) = (
+            ram.page_version(0x1800),
+            ram.page_version(0x2000),
+            ram.page_version(0x3000),
+        );
+        ram.write(0x1FFF, AccessSize::Byte, 1).unwrap();
+        assert_ne!(ram.page_version(0x1800), first);
+        assert_eq!(ram.page_version(0x2000), second);
+        assert_eq!(ram.page_version(0x3000), third);
+        ram.write(0x37FF, AccessSize::Byte, 1).unwrap();
+        assert_ne!(ram.page_version(0x3000), third);
+        assert_eq!(ram.page_version(0x2000), second);
+    }
+
+    #[test]
+    fn page_version_is_zero_outside_the_covered_pages() {
+        let ram = Ram::new(0x1800, 0x2000);
+        assert_eq!(ram.page_version(0x0FFF), 0);
+        assert_eq!(ram.page_version(0x4000), 0);
+        assert_eq!(Ram::new(0x1800, 0).page_version(0x1800), 0);
+    }
+
     #[test]
     fn load_copies_bytes_and_bumps_touched_pages() {
         let mut ram = Ram::new(0x1000, 2 * 4096);
