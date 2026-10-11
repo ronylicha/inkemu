@@ -27,6 +27,10 @@ impl Source {
     /// fails when the SVD has no such register in `INTERRUPT_CORE0`, and when the register is one of
     /// the block that is not an interrupt map register (`INTR_STATUS_REG_0`, `CLOCK_GATE`, ...).
     ///
+    /// Keep every call in a `const` item (or a test). The lookup is by name through the whole
+    /// register table of the chip: in a `const` the compiler runs it once, in a function body it
+    /// would run at every call, on a path firmware can take once per instruction.
+    ///
     /// The check is on the position: a register inside the first [`MAP_REGISTERS`] words of the
     /// block is taken to be a map register, as the SVD lays them out (a test pins that).
     ///

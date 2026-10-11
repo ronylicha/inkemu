@@ -104,6 +104,15 @@ const ACTION_RESET_SYSTEM: u32 = 3;
 const INT_T0: u32 = 1 << 0;
 const INT_WDT: u32 = 1 << 1;
 const INT_MASK: u32 = INT_T0 | INT_WDT;
+/// The interrupt sources of each group, T0 then the watchdog (the watchdogs are sources 33 and
+/// 35: report IR §3.2).
+///
+/// They are `const` items on purpose: [`Source::of`] finds its register by name in the SVD
+/// table, a scan of every register of the chip. In a `const` the compiler does it once; called
+/// from a function body it would run at every evaluation of the group.
+const TIMG0_SOURCES: (Source, Source) = (Source::of("TG_T0_INT_MAP"), Source::of("TG_WDT_INT_MAP"));
+const TIMG1_SOURCES: (Source, Source) =
+    (Source::of("TG1_T0_INT_MAP"), Source::of("TG1_WDT_INT_MAP"));
 
 /// `REGCLK`: bit 31 `CLK_EN` (`timer_ll_enable_register_clock_always_on`, `timer_ll.h:313`), bit 30
 /// `TIMER_CLK_IS_ACTIVE`, bit 29 `WDT_CLK_IS_ACTIVE` (`mwdt_ll_enable_clock`, `mwdt_ll.h:299`): the
@@ -355,8 +364,8 @@ impl Timg {
 
     const fn sources(&self) -> (Source, Source) {
         match self.group {
-            Group::Timg0 => (Source::of("TG_T0_INT_MAP"), Source::of("TG_WDT_INT_MAP")),
-            Group::Timg1 => (Source::of("TG1_T0_INT_MAP"), Source::of("TG1_WDT_INT_MAP")),
+            Group::Timg0 => TIMG0_SOURCES,
+            Group::Timg1 => TIMG1_SOURCES,
         }
     }
 
