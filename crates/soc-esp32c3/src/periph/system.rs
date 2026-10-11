@@ -3,7 +3,7 @@
 //! The CPU clock selection is read by `crate::clock`; the clock gates are stored; a peripheral
 //! reset bit resets its module; the four software interrupt registers are interrupt sources.
 use crate::ctx::{Ctx, Event, Module, Source};
-use crate::periph::{Accepted, SYSTEM_BASE, Storage};
+use crate::periph::{Accepted, SYSTEM_BASE, Storage, consecutive, index_in};
 use emu_core::Peripheral;
 
 const SYSCLK_CONF: u32 = svd_regs::esp32c3::addr("SYSTEM", "SYSCLK_CONF") - SYSTEM_BASE;
@@ -48,9 +48,25 @@ const RESETS_1: [(u32, Module); 1] = [(1 << 2, Module::Sha)];
 /// `CPU_INTR_FROM_CPU_0..3`: bit 0 of each register is the level of an interrupt source, set and
 /// cleared by software (`esp_crosscore_int_send` stores 1 at `APP@0x40381bc6`, its handler stores
 /// 0 at `APP@0x40381b50`: report IR §3.3, §5).
+///
+/// ASSUMPTION: registers 1 to 3 behave as register 0 does, each with its own source (51 to 53).
+/// Only register 0 is written on the measured paths; the SVD and `system_reg.h` describe the four
+/// alike, and the three others are modelled by that analogy. Setting bit 0 of
+/// `CPU_INTR_FROM_CPU_1` on a chip, with its source routed to an enabled line, and seeing the
+/// interrupt, settles it.
 const CPU_INTR_FROM_CPU_0: u32 =
     svd_regs::esp32c3::addr("SYSTEM", "CPU_INTR_FROM_CPU_0") - SYSTEM_BASE;
 const SOFTWARE_INTERRUPTS: usize = 4;
+// The four registers follow one another: `software_interrupt` indexes them by their offset.
+const _: () = assert!(consecutive(
+    "SYSTEM",
+    &[
+        "CPU_INTR_FROM_CPU_0",
+        "CPU_INTR_FROM_CPU_1",
+        "CPU_INTR_FROM_CPU_2",
+        "CPU_INTR_FROM_CPU_3",
+    ]
+));
 const SOFTWARE_SOURCES: [Source; SOFTWARE_INTERRUPTS] = [
     Source::of("CPU_INTR_FROM_CPU_0_MAP"),
     Source::of("CPU_INTR_FROM_CPU_1_MAP"),
@@ -174,8 +190,7 @@ fn reset_value(offset: u32) -> u32 {
 
 /// Index of `offset` among the four software interrupt registers.
 fn software_interrupt(offset: u32) -> Option<usize> {
-    let index = usize::try_from(offset.checked_sub(CPU_INTR_FROM_CPU_0)? / 4).ok()?;
-    (index < SOFTWARE_INTERRUPTS).then_some(index)
+    index_in(offset, CPU_INTR_FROM_CPU_0, SOFTWARE_INTERRUPTS)
 }
 
 impl Default for System {

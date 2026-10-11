@@ -4,7 +4,7 @@
 use super::counter::{Counter, Rate};
 use super::stages::{self, STAGES};
 use super::{TIMG0_BASE, TIMG1_BASE};
-use super::{half_of, replace_half};
+use super::{consecutive, half_of, index_in, replace_half};
 use crate::clock::XTAL_PERIOD;
 use crate::ctx::{Ctx, Deadline, Event, Group, Source};
 use crate::reset::ResetCause;
@@ -16,6 +16,16 @@ const fn reg(name: &str) -> u32 {
     addr("TIMG0", name) - TIMG0_BASE
 }
 const _: () = assert!(addr("TIMG1", "REGCLK") - TIMG1_BASE == reg("REGCLK"));
+// The four stage timeout registers follow one another: they are indexed by their offset.
+const _: () = assert!(
+    consecutive(
+        "TIMG0",
+        &["WDTCONFIG2", "WDTCONFIG3", "WDTCONFIG4", "WDTCONFIG5"]
+    ) && consecutive(
+        "TIMG1",
+        &["WDTCONFIG2", "WDTCONFIG3", "WDTCONFIG4", "WDTCONFIG5"]
+    )
+);
 
 const T0CONFIG: u32 = reg("T0CONFIG");
 const T0LO: u32 = reg("T0LO");
@@ -29,6 +39,7 @@ const T0LOAD: u32 = reg("T0LOAD");
 const WDTCONFIG0: u32 = reg("WDTCONFIG0");
 const WDTCONFIG1: u32 = reg("WDTCONFIG1");
 const WDTCONFIG2: u32 = reg("WDTCONFIG2");
+#[cfg(test)]
 const WDTCONFIG5: u32 = reg("WDTCONFIG5");
 const WDTFEED: u32 = reg("WDTFEED");
 const WDTWPROTECT: u32 = reg("WDTWPROTECT");
@@ -624,7 +635,13 @@ impl Timg {
                 self.wdt.set(0, now);
                 self.wdt_stage = 0;
             }
-            _ => self.wdt_timeout[((offset - WDTCONFIG2) / 4) as usize] = value,
+            _ => {
+                // INVARIANT: the caller passes one of the four stage timeout registers besides
+                // the three above; any other offset changes nothing.
+                if let Some(stage) = index_in(offset, WDTCONFIG2, STAGES) {
+                    self.wdt_timeout[stage] = value;
+                }
+            }
         }
         self.retime(ctx);
         self.evaluate(ctx, true);
@@ -634,6 +651,9 @@ impl Timg {
 impl Peripheral<Ctx> for Timg {
     fn read(&mut self, ctx: &mut Ctx, offset: u32) -> Option<u32> {
         let now = ctx.now();
+        if let Some(stage) = index_in(offset, WDTCONFIG2, STAGES) {
+            return Some(self.wdt_timeout[stage]);
+        }
         Some(match offset {
             T0CONFIG => self.t0_config,
             T0LO => half_of(self.t0_latch, false),
@@ -666,9 +686,6 @@ impl Peripheral<Ctx> for Timg {
             INT_ST => self.int_raw & self.int_ena,
             NTIMG_DATE => NTIMG_DATE_VALUE,
             REGCLK => self.regclk,
-            offset if (WDTCONFIG2..=WDTCONFIG5).contains(&offset) => {
-                self.wdt_timeout[((offset - WDTCONFIG2) / 4) as usize]
-            }
             _ => return None,
         })
     }
@@ -725,7 +742,7 @@ impl Peripheral<Ctx> for Timg {
             }
             WDTWPROTECT => self.wdt_key = value,
             WDTCONFIG0 | WDTCONFIG1 | WDTFEED => self.write_watchdog(ctx, offset, value),
-            offset if (WDTCONFIG2..=WDTCONFIG5).contains(&offset) => {
+            offset if index_in(offset, WDTCONFIG2, STAGES).is_some() => {
                 self.write_watchdog(ctx, offset, value);
             }
             RTCCALICFG => self.calibration.write_config(value, now),

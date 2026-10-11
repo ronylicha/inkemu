@@ -22,9 +22,10 @@
 //! an edge-type line does not latch it. That matches the chip, where a source into the interrupt
 //! matrix is a level its peripheral holds until software acknowledges it; a device model must do
 //! the same (see `Ctx::irq`). The measured application only ever writes 0 to `CPU_INT_TYPE`.
-use super::{Accepted, INTMATRIX_BASE, half_of};
+use super::{Accepted, INTMATRIX_BASE, half_of, index_in};
 use crate::ctx::{Ctx, MAP_REGISTERS};
 use emu_core::Peripheral;
+use svd_regs::REGISTER_BYTES;
 use svd_regs::esp32c3::addr;
 
 /// `<SRC>_MAP` registers: `MAC_INTR_MAP` (source 0) to `CACHE_CORE0_ACS_INT_MAP` (source 61).
@@ -66,10 +67,11 @@ const CPU_INT_PRI_0: u32 = reg("CPU_INT_PRI_0");
 /// Set by `ROM3:esprv_intc_int_set_threshold@0x400529a2` (`xPortStartScheduler`), and by the
 /// critical sections and `_interrupt_handler` of ESP-IDF (IR §1.5).
 const CPU_INT_THRESH: u32 = reg("CPU_INT_THRESH");
-// The two blocks are consecutive registers: the index arithmetic below relies on it.
+// The two blocks are consecutive registers: the index arithmetic below relies on it. The map
+// registers are checked one by one, by their place and their name, in a test of `ctx.rs`.
 const _: () = assert!(
-    reg("CACHE_CORE0_ACS_INT_MAP") == MAP_0 + 4 * (SOURCES - 1)
-        && reg("CPU_INT_PRI_31") == CPU_INT_PRI_0 + 4 * (LINES - 1)
+    reg("CACHE_CORE0_ACS_INT_MAP") == MAP_0 + REGISTER_BYTES * (SOURCES - 1)
+        && reg("CPU_INT_PRI_31") == CPU_INT_PRI_0 + REGISTER_BYTES * (LINES - 1)
 );
 
 /// Bits [4:0] of a `<SRC>_MAP` register: the CPU line; 0 routes the source nowhere.
@@ -109,12 +111,6 @@ pub struct IntMatrix {
     latched: u32,
     /// Lines the CPU has taken since their latch was set.
     claimed: u32,
-}
-
-/// Index of `offset` in a block of `count` 32-bit registers starting at `first`.
-fn index_in(offset: u32, first: u32, count: usize) -> Option<usize> {
-    let index = usize::try_from(offset.checked_sub(first)? / 4).ok()?;
-    (index < count).then_some(index)
 }
 
 impl IntMatrix {

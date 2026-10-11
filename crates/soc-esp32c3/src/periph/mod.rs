@@ -178,6 +178,30 @@ impl Storage {
     }
 }
 
+/// Index of the register at `offset` in a block of `count` consecutive 32-bit registers whose
+/// first is at `first`: `None` when the offset is before or past the block. The one place the
+/// index arithmetic of such a block is written; the block must be consecutive in the SVD, which
+/// each user asserts with [`consecutive`]. The bus hands a device offsets on register boundaries
+/// only.
+pub(crate) fn index_in(offset: u32, first: u32, count: usize) -> Option<usize> {
+    let index = usize::try_from(offset.checked_sub(first)? / svd_regs::REGISTER_BYTES).ok()?;
+    (index < count).then_some(index)
+}
+
+/// Whether the registers `names` of `peripheral` follow one another in that order, one register
+/// apart: what [`index_in`] relies on. For a `const` assertion next to the block it is about.
+pub(crate) const fn consecutive(peripheral: &str, names: &[&str]) -> bool {
+    let mut next = 1;
+    while next < names.len() {
+        let previous = svd_regs::esp32c3::addr(peripheral, names[next - 1]);
+        if svd_regs::esp32c3::addr(peripheral, names[next]) != previous + svd_regs::REGISTER_BYTES {
+            return false;
+        }
+        next += 1;
+    }
+    true
+}
+
 /// One 32-bit half of a wide value: bits 63:32 when `hi`, bits 31:0 otherwise. Registers expose
 /// 48- to 62-bit values as such pairs.
 #[must_use]
@@ -845,6 +869,43 @@ mod tests {
         assert_eq!(base_of(&mut p, 0x6000_8800), Some(EFUSE_BASE));
         assert_eq!(base_of(&mut p, 0x6000_8FFC), Some(EFUSE_BASE));
         assert_eq!(base_of(&mut p, 0x6000_9000), Some(IO_MUX_BASE));
+    }
+
+    #[test]
+    fn a_register_is_indexed_in_its_block_and_nowhere_else() {
+        // A block of three registers whose first is at offset 0x40.
+        assert_eq!(index_in(0x40, 0x40, 3), Some(0));
+        assert_eq!(index_in(0x48, 0x40, 3), Some(2));
+        assert_eq!(
+            index_in(0x4C, 0x40, 3),
+            None,
+            "the register after the block"
+        );
+        assert_eq!(index_in(0x3C, 0x40, 3), None, "the register before it");
+        assert_eq!(index_in(0, 0x40, 3), None);
+        assert_eq!(index_in(u32::MAX, 0, 3), None);
+        assert_eq!(
+            index_in(0x40, 0x40, 0),
+            None,
+            "an empty block has no register"
+        );
+    }
+
+    #[test]
+    fn the_layout_check_tells_consecutive_registers_from_the_others() {
+        assert!(consecutive(
+            "SYSTIMER",
+            &["TARGET0_HI", "TARGET0_LO", "TARGET1_HI"]
+        ));
+        assert!(
+            !consecutive("SYSTIMER", &["TARGET0_HI", "TARGET1_HI"]),
+            "one register apart, not two"
+        );
+        assert!(
+            !consecutive("SYSTIMER", &["TARGET0_LO", "TARGET0_HI"]),
+            "in that order"
+        );
+        assert!(consecutive("SYSTIMER", &["CONF"]) && consecutive("SYSTIMER", &[]));
     }
 
     #[test]

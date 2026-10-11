@@ -7,7 +7,7 @@
 //! instant, and a comparator asks to be woken at the device time of its next alarm.
 use super::SYSTIMER_BASE;
 use super::counter::{Counter, Rate};
-use super::{half_of, replace_half};
+use super::{consecutive, half_of, index_in, replace_half};
 use crate::ctx::{Ctx, Deadline, Event, Source};
 use emu_core::{Cycles, Peripheral};
 use svd_regs::esp32c3::addr;
@@ -17,20 +17,15 @@ const fn reg(name: &str) -> u32 {
 }
 
 const CONF: u32 = reg("CONF");
+// The first register of each block that is indexed by its offset (`index_in`, `pair_in`): the
+// others follow it, which the assertion below `pair_in` checks.
 const UNIT0_OP: u32 = reg("UNIT0_OP");
-const UNIT1_OP: u32 = reg("UNIT1_OP");
 const UNIT0_LOAD_HI: u32 = reg("UNIT0_LOAD_HI");
-const UNIT1_LOAD_LO: u32 = reg("UNIT1_LOAD_LO");
 const TARGET0_HI: u32 = reg("TARGET0_HI");
-const TARGET2_LO: u32 = reg("TARGET2_LO");
 const TARGET0_CONF: u32 = reg("TARGET0_CONF");
-const TARGET2_CONF: u32 = reg("TARGET2_CONF");
 const UNIT0_VALUE_HI: u32 = reg("UNIT0_VALUE_HI");
-const UNIT1_VALUE_LO: u32 = reg("UNIT1_VALUE_LO");
 const COMP0_LOAD: u32 = reg("COMP0_LOAD");
-const COMP2_LOAD: u32 = reg("COMP2_LOAD");
 const UNIT0_LOAD: u32 = reg("UNIT0_LOAD");
-const UNIT1_LOAD: u32 = reg("UNIT1_LOAD");
 const INT_ENA: u32 = reg("INT_ENA");
 const INT_RAW: u32 = reg("INT_RAW");
 const INT_CLR: u32 = reg("INT_CLR");
@@ -130,15 +125,49 @@ pub struct Systimer {
     wake: Deadline,
 }
 
-/// Splits a register offset inside a block of `(HI, LO)` pairs into the pair index and whether it
-/// is the `HI` half.
-fn pair_in(offset: u32, first: u32, last: u32) -> Option<(usize, bool)> {
-    if !(first..=last).contains(&offset) {
-        return None;
-    }
-    let word = (offset - first) / 4;
-    Some((usize::try_from(word / 2).ok()?, word.is_multiple_of(2)))
+/// Splits a register offset inside a block of `pairs` `(HI, LO)` pairs whose first register is at
+/// `first` into the pair index and whether it is the `HI` half.
+fn pair_in(offset: u32, first: u32, pairs: usize) -> Option<(usize, bool)> {
+    let word = index_in(offset, first, 2 * pairs)?;
+    Some((word / 2, word.is_multiple_of(2)))
 }
+
+// The blocks indexed by offset are consecutive registers, in the order the indexing assumes:
+// `(HI, LO)` pairs per counter and per comparator, then one register per counter or comparator.
+const _: () = assert!(
+    consecutive(
+        "SYSTIMER",
+        &[
+            "UNIT0_LOAD_HI",
+            "UNIT0_LOAD_LO",
+            "UNIT1_LOAD_HI",
+            "UNIT1_LOAD_LO"
+        ]
+    ) && consecutive(
+        "SYSTIMER",
+        &[
+            "TARGET0_HI",
+            "TARGET0_LO",
+            "TARGET1_HI",
+            "TARGET1_LO",
+            "TARGET2_HI",
+            "TARGET2_LO"
+        ]
+    ) && consecutive(
+        "SYSTIMER",
+        &[
+            "UNIT0_VALUE_HI",
+            "UNIT0_VALUE_LO",
+            "UNIT1_VALUE_HI",
+            "UNIT1_VALUE_LO"
+        ]
+    ) && consecutive(
+        "SYSTIMER",
+        &["TARGET0_CONF", "TARGET1_CONF", "TARGET2_CONF"]
+    ) && consecutive("SYSTIMER", &["COMP0_LOAD", "COMP1_LOAD", "COMP2_LOAD"])
+        && consecutive("SYSTIMER", &["UNIT0_OP", "UNIT1_OP"])
+        && consecutive("SYSTIMER", &["UNIT0_LOAD", "UNIT1_LOAD"])
+);
 
 impl Systimer {
     /// The block after a power-on or a peripheral reset: counter 0 counts from 0 at `now`
@@ -278,33 +307,37 @@ impl Systimer {
 
 impl Peripheral<Ctx> for Systimer {
     fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
-        if let Some((unit, hi)) = pair_in(offset, UNIT0_LOAD_HI, UNIT1_LOAD_LO) {
+        if let Some((unit, hi)) = pair_in(offset, UNIT0_LOAD_HI, UNITS) {
             return Some(half_of(self.units[unit].load, hi));
         }
-        if let Some((comparator, hi)) = pair_in(offset, TARGET0_HI, TARGET2_LO) {
+        if let Some((comparator, hi)) = pair_in(offset, TARGET0_HI, COMPARATORS) {
             return Some(half_of(self.comparators[comparator].target, hi));
         }
-        if let Some((unit, hi)) = pair_in(offset, UNIT0_VALUE_HI, UNIT1_VALUE_LO) {
+        if let Some((unit, hi)) = pair_in(offset, UNIT0_VALUE_HI, UNITS) {
             return Some(half_of(self.units[unit].latch, hi));
         }
-        if (TARGET0_CONF..=TARGET2_CONF).contains(&offset) {
-            return Some(self.comparators[((offset - TARGET0_CONF) / 4) as usize].conf);
+        if let Some(comparator) = index_in(offset, TARGET0_CONF, COMPARATORS) {
+            return Some(self.comparators[comparator].conf);
+        }
+        if let Some(unit) = index_in(offset, UNIT0_OP, UNITS) {
+            return Some(if self.units[unit].valid {
+                OP_VALUE_VALID
+            } else {
+                0
+            });
+        }
+        // Write-only triggers read 0.
+        if index_in(offset, COMP0_LOAD, COMPARATORS).is_some()
+            || index_in(offset, UNIT0_LOAD, UNITS).is_some()
+        {
+            return Some(0);
         }
         Some(match offset {
             CONF => self.conf,
-            UNIT0_OP | UNIT1_OP => {
-                if self.units[((offset - UNIT0_OP) / 4) as usize].valid {
-                    OP_VALUE_VALID
-                } else {
-                    0
-                }
-            }
             INT_ENA => self.int_ena,
             INT_RAW => self.int_raw,
             INT_ST => self.int_raw & self.int_ena,
-            // Write-only triggers read 0.
-            INT_CLR | UNIT0_LOAD | UNIT1_LOAD => 0,
-            offset if (COMP0_LOAD..=COMP2_LOAD).contains(&offset) => 0,
+            INT_CLR => 0,
             DATE => DATE_VALUE,
             _ => return None,
         })
@@ -312,17 +345,16 @@ impl Peripheral<Ctx> for Systimer {
 
     fn write(&mut self, ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         let now = ctx.now();
-        if let Some((unit, hi)) = pair_in(offset, UNIT0_LOAD_HI, UNIT1_LOAD_LO) {
+        if let Some((unit, hi)) = pair_in(offset, UNIT0_LOAD_HI, UNITS) {
             self.units[unit].load = replace_half(self.units[unit].load, hi, value, HI_MASK);
             return true;
         }
-        if let Some((comparator, hi)) = pair_in(offset, TARGET0_HI, TARGET2_LO) {
+        if let Some((comparator, hi)) = pair_in(offset, TARGET0_HI, COMPARATORS) {
             let target = &mut self.comparators[comparator].target;
             *target = replace_half(*target, hi, value, HI_MASK);
             return true;
         }
-        if (TARGET0_CONF..=TARGET2_CONF).contains(&offset) {
-            let comparator = ((offset - TARGET0_CONF) / 4) as usize;
+        if let Some(comparator) = index_in(offset, TARGET0_CONF, COMPARATORS) {
             let previous = self.comparators[comparator].conf;
             self.comparators[comparator].conf = value & TARGET_CONF_WRITABLE;
             // The mode and the counter act as soon as they are written: ESP-IDF sets
@@ -334,9 +366,8 @@ impl Peripheral<Ctx> for Systimer {
             self.evaluate(ctx);
             return true;
         }
-        if (COMP0_LOAD..=COMP2_LOAD).contains(&offset) {
+        if let Some(comparator) = index_in(offset, COMP0_LOAD, COMPARATORS) {
             if value & LOAD_TRIGGER != 0 {
-                let comparator = ((offset - COMP0_LOAD) / 4) as usize;
                 let c = &mut self.comparators[comparator];
                 c.loaded_target = c.target;
                 c.loaded_period = u64::from(c.conf & TARGET_PERIOD_MASK);
@@ -345,26 +376,29 @@ impl Peripheral<Ctx> for Systimer {
             }
             return true;
         }
+        if let Some(unit) = index_in(offset, UNIT0_OP, UNITS) {
+            if value & OP_UPDATE != 0 {
+                // ASSUMPTION: the latch is valid at once, so `VALUE_VALID` reads 1 from the write
+                // of `UPDATE` on. The TRM gives no latency for it (TW §A.3, §I question 6), and
+                // ESP-IDF polls the bit without a timeout, so a late one would only cost time.
+                // Reading `UNITn_OP` in a tight loop right after the write of `UPDATE` on a chip,
+                // and counting the reads that return 0, settles it.
+                self.units[unit].latch = self.count(unit, now);
+                self.units[unit].valid = true;
+            }
+            return true;
+        }
+        if let Some(unit) = index_in(offset, UNIT0_LOAD, UNITS) {
+            if value & LOAD_TRIGGER != 0 {
+                // "The current count value will be changed immediately" (TRM §10.5).
+                let load = self.units[unit].load;
+                self.units[unit].counter.set(load, now);
+                self.evaluate(ctx);
+            }
+            return true;
+        }
         match offset {
             CONF => self.write_conf(ctx, value),
-            UNIT0_OP | UNIT1_OP => {
-                if value & OP_UPDATE != 0 {
-                    let unit = ((offset - UNIT0_OP) / 4) as usize;
-                    // ASSUMPTION: the latch is valid at once. The TRM gives no latency for
-                    // `VALUE_VALID` (TW §A.3, §I question 6); ESP-IDF polls it without a timeout.
-                    self.units[unit].latch = self.count(unit, now);
-                    self.units[unit].valid = true;
-                }
-            }
-            UNIT0_LOAD | UNIT1_LOAD => {
-                if value & LOAD_TRIGGER != 0 {
-                    let unit = ((offset - UNIT0_LOAD) / 4) as usize;
-                    // "The current count value will be changed immediately" (TRM §10.5).
-                    let load = self.units[unit].load;
-                    self.units[unit].counter.set(load, now);
-                    self.evaluate(ctx);
-                }
-            }
             INT_ENA => {
                 self.int_ena = value & INT_MASK;
                 self.drive(ctx);
@@ -386,7 +420,13 @@ mod tests {
 
     const UNIT0_LOAD_LO: u32 = reg("UNIT0_LOAD_LO");
     const UNIT1_LOAD_HI: u32 = reg("UNIT1_LOAD_HI");
+    const UNIT1_LOAD_LO: u32 = reg("UNIT1_LOAD_LO");
     const UNIT0_VALUE_LO: u32 = reg("UNIT0_VALUE_LO");
+    const UNIT1_OP: u32 = reg("UNIT1_OP");
+    const UNIT1_LOAD: u32 = reg("UNIT1_LOAD");
+    const TARGET2_LO: u32 = reg("TARGET2_LO");
+    const TARGET2_CONF: u32 = reg("TARGET2_CONF");
+    const COMP2_LOAD: u32 = reg("COMP2_LOAD");
 
     /// 10 ms of device time: 160 000 counts, 1 600 000 cycles of the time base.
     const TICK_COUNTS: u32 = 160_000;

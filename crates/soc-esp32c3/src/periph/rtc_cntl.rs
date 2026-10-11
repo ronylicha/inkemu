@@ -11,7 +11,7 @@ use crate::ctx::{Ctx, Deadline, Event, Source};
 use crate::diag::Unsupported;
 use crate::periph::counter::{Counter, Rate};
 use crate::periph::stages::{self, STAGES as WDT_STAGES};
-use crate::periph::{Accepted, RTC_CNTL_BASE, Storage, half_of};
+use crate::periph::{Accepted, RTC_CNTL_BASE, Storage, consecutive, half_of, index_in};
 use crate::reset::{CAUSE_POWER_ON, ResetCause};
 use emu_core::{Cycles, Peripheral};
 use svd_regs::esp32c3::addr;
@@ -54,7 +54,13 @@ const CLK_CONF: u32 = reg("CLK_CONF");
 const ANA_CLK_RTC_SEL_SHIFT: u32 = 30;
 const WDTCONFIG0: u32 = reg("WDTCONFIG0");
 const WDTCONFIG1: u32 = reg("WDTCONFIG1");
+#[cfg(test)]
 const WDTCONFIG4: u32 = reg("WDTCONFIG4");
+// The four stage timeout registers follow one another: they are indexed by their offset.
+const _: () = assert!(consecutive(
+    "RTC_CNTL",
+    &["WDTCONFIG1", "WDTCONFIG2", "WDTCONFIG3", "WDTCONFIG4"]
+));
 const WDTFEED: u32 = reg("WDTFEED");
 const WDTWPROTECT: u32 = reg("WDTWPROTECT");
 const SWD_CONF: u32 = reg("SWD_CONF");
@@ -486,7 +492,13 @@ impl RtcCntl {
                     self.wdt_stage = 0;
                 }
             }
-            _ => self.wdt_timeout[((offset - WDTCONFIG1) / 4) as usize] = value,
+            _ => {
+                // INVARIANT: the caller passes one of the four stage timeout registers besides
+                // the two above; any other offset changes nothing.
+                if let Some(stage) = index_in(offset, WDTCONFIG1, WDT_STAGES) {
+                    self.wdt_timeout[stage] = value;
+                }
+            }
         }
         self.evaluate(ctx, true);
     }
@@ -536,10 +548,11 @@ impl Peripheral<Ctx> for RtcCntl {
                 self.swd_conf | feed_request
             }
             SWD_WPROTECT => self.swd_key,
-            offset if (WDTCONFIG1..=WDTCONFIG4).contains(&offset) => {
-                self.wdt_timeout[((offset - WDTCONFIG1) / 4) as usize]
+            _ => {
+                return index_in(offset, WDTCONFIG1, WDT_STAGES)
+                    .map(|stage| self.wdt_timeout[stage])
+                    .or_else(|| self.config.read(offset));
             }
-            _ => return self.config.read(offset),
         })
     }
 
@@ -576,7 +589,7 @@ impl Peripheral<Ctx> for RtcCntl {
                 self.write_watchdog(ctx, offset, value);
                 return true;
             }
-            offset if (WDTCONFIG1..=WDTCONFIG4).contains(&offset) => {
+            offset if index_in(offset, WDTCONFIG1, WDT_STAGES).is_some() => {
                 self.write_watchdog(ctx, offset, value);
                 return true;
             }
