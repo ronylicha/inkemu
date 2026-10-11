@@ -173,8 +173,9 @@ pub fn execute(
                 );
                 break RunEnd::Budget;
             }
-            // The CPU sleeps and device time goes on: the next slice continues.
-            (Ok(true), StopReason::CycleBudget | StopReason::Asleep) => {}
+            // The CPU sleeps and device time goes on: the next slice continues. `run_until`
+            // passes no device-time limit, so `TimeBudget` cannot come back from it.
+            (Ok(true), StopReason::CycleBudget | StopReason::Asleep | StopReason::TimeBudget) => {}
         }
     };
     // What the firmware had written and the device had not sent yet: without it the console

@@ -37,26 +37,38 @@ impl ConsoleChannel {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopReason {
-    /// The cycle limit passed to [`Esp32C3::run_until`] was reached.
+    /// The cycle limit passed to [`Esp32C3::run_within`] or [`Esp32C3::run_until`] was reached.
     CycleBudget,
+    /// The device-time limit passed to [`Esp32C3::run_within`] was reached.
+    TimeBudget,
     /// `--strict-mmio`: the program touched a register the emulator does not model, wrote a
     /// peripheral register with an 8- or 16-bit store, asked for an operation the emulator cannot
     /// perform faithfully, or used flash it had not mapped.
     StrictMmio(Diagnostic),
     /// The CPU waits for an interrupt and none can come: no interrupt line is pending and no
-    /// device has anything scheduled.
+    /// device has anything scheduled. Device time stands still from here on, so no limit of
+    /// [`Esp32C3::run_within`] can end such a run: this does.
     Idle,
-    /// The CPU has been waiting for an interrupt through [`SLEEP_SLICE`] of device time, or was
-    /// called [`MAX_FRUITLESS_WAKES`] times without one, since the call began. Device time goes
-    /// on while the CPU sleeps and its cycle counter does not: a caller that only watches the
-    /// cycle limit gets control back here, and calls again to go on.
+    /// The call has slept through [`SLEEP_SLICE`] of device time, or [`MAX_FRUITLESS_WAKES`]
+    /// times, and gives control back: the cycle counter stands still while the CPU sleeps, so
+    /// the cycle limit alone would never end a call of a firmware that sleeps. The caller calls
+    /// again to go on, and bounds such a run with the device-time limit.
+    ///
+    /// Both bounds are counted over the whole call, the sleeps an interrupt ended included. The
+    /// reason therefore says what the call did, not the state it leaves: the sleep that reaches a
+    /// bound may be the one an interrupt ends, and the call in which a watchdog resets a
+    /// sleeping CPU returns `Asleep` although the CPU is then awake, about to execute the first
+    /// instruction of the ROM. [`Esp32C3::is_asleep`] gives the state.
     Asleep,
 }
 
-/// Device time a call to [`Esp32C3::run_until`] spends asleep before it returns
-/// [`StopReason::Asleep`]: one second, in cycles of the time base.
+/// Device time one call to [`Esp32C3::run_within`] sleeps through, all its sleeps added, before
+/// it returns [`StopReason::Asleep`]: one second, in cycles of the time base.
 pub const SLEEP_SLICE: u64 = clock::SECOND;
-/// Wake-ups without an interrupt one call goes through before it returns [`StopReason::Asleep`].
+/// Sleeps one call to [`Esp32C3::run_within`] goes through before it returns
+/// [`StopReason::Asleep`]. Every sleep counts, whether an interrupt ended it or not; the bound is
+/// there for the wake-ups that wake nothing (a device alarm whose interrupt is not enabled),
+/// which would otherwise keep a call from returning for as long as [`SLEEP_SLICE`] takes them.
 pub const MAX_FRUITLESS_WAKES: u32 = 100_000;
 /// CPU clock cycles between the instant the controller selects a line and the instant the CPU
 /// can take it: "the interrupt controller ... takes 4 cycles" (TRM §1.6.1; report IR §2.7).
@@ -65,6 +77,36 @@ pub const MAX_FRUITLESS_WAKES: u32 = 100_000;
 /// disappears at once. The TRM gives one figure and no direction; the SP1b-4 lockstep compares
 /// with an oracle that has no latency at all, and needs this to be configurable.
 pub const INTERRUPT_LATENCY_CYCLES: u64 = 4;
+
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+/// The instant, in cycles of the time base since power-on, at which a device-time limit of
+/// `nanos` nanoseconds is reached: the first cycle boundary at or after that time, 4 cycles for
+/// every 25 ns at 160 MHz. A whole number of microseconds is exact.
+///
+/// It is never the `u64::MAX` at which device time saturates: the longest limit, 584 years, is
+/// under a sixth of the time the base can count.
+fn limit_instant(nanos: u64) -> Cycles {
+    // In 128 bits: the product is under 2^92.
+    let cycles = (u128::from(nanos) * u128::from(clock::TIME_BASE.hz())).div_ceil(NANOS_PER_SECOND);
+    // INVARIANT: a second has more nanoseconds than cycles of the time base (asserted below), so
+    // the quotient is at most `nanos` and fits: the fallback, that same bound, is never taken.
+    Cycles(u64::try_from(cycles).unwrap_or(nanos))
+}
+// A widening cast: `u128::from` is not callable in a constant.
+const _: () = assert!(clock::TIME_BASE.hz() as u128 <= NANOS_PER_SECOND);
+
+/// What one sleep of the CPU came to.
+enum Sleep {
+    /// Device time moved to the next instant something was due, by this many cycles of the time
+    /// base.
+    Until(u64),
+    /// Nothing is due at any time.
+    NothingDue,
+    /// The next instant something is due is after the device-time limit of the call: device time
+    /// is at the limit.
+    CutAtDeadline,
+}
 
 /// An ESP32-C3: one hart, the bus with everything it reaches, and the model that prices each
 /// instruction. It performs no host I/O: output is handed over through [`Esp32C3::take_console`].
@@ -137,11 +179,37 @@ impl Esp32C3 {
     }
 
     /// Runs until the hart's cycle counter reaches `limit` (an absolute [`Esp32C3::cycles`] value) or
-    /// the machine stops for another reason.
+    /// the machine stops for another reason: [`Esp32C3::run_within`] without a device-time limit.
     pub fn run_until(&mut self, limit: Cycles) -> StopReason {
+        self.run_within(limit, None)
+    }
+
+    /// Runs until the hart's cycle counter reaches `cycles` (an absolute [`Esp32C3::cycles`]
+    /// value), until device time reaches `device_time_nanos` (nanoseconds since power-on, as
+    /// [`Esp32C3::device_time_nanos`] counts them: they go on while the CPU sleeps and across
+    /// resets; `None` is no limit), or until the machine stops for another reason.
+    ///
+    /// The device-time limit is an instant, the same whatever the calls a run is cut into: the
+    /// number of nanoseconds rounded up to a cycle of the time base, so that a run never ends
+    /// before the time asked.
+    /// - While the CPU executes, the call returns [`StopReason::TimeBudget`] at the first
+    ///   instruction boundary at which device time is at or past the instant. The instruction
+    ///   that crosses it is executed whole, as the last one of a cycle limit is.
+    /// - While the CPU sleeps, a wake-up due at or before the instant is delivered as without a
+    ///   limit. When the next one is after it, device time is set to exactly the instant, nothing
+    ///   is delivered, the CPU stays asleep and the call returns [`StopReason::TimeBudget`].
+    /// - A CPU nothing can wake is [`StopReason::Idle`] whatever the limit, and device time is
+    ///   not moved to it.
+    /// - The cycle limit is tested first: at a boundary where both limits are reached the call
+    ///   returns [`StopReason::CycleBudget`].
+    pub fn run_within(&mut self, cycles: Cycles, device_time_nanos: Option<u64>) -> StopReason {
+        let deadline = device_time_nanos.map(limit_instant);
         let mut slept: u64 = 0;
-        let mut fruitless_wakes: u32 = 0;
-        while self.hart.cycles.get() < limit.get() {
+        let mut sleeps: u32 = 0;
+        while self.hart.cycles.get() < cycles.get() {
+            if deadline.is_some_and(|deadline| self.bus.ctx.now() >= deadline) {
+                return StopReason::TimeBudget;
+            }
             let pc = self.hart.pc;
             self.bus.set_pc(pc);
             let before = self.hart.cycles.get();
@@ -150,16 +218,18 @@ impl Esp32C3 {
             match self.hart.step(&mut self.bus, &self.timing) {
                 StepOutcome::Waiting => {
                     // The CPU idles: device time jumps to the next instant a device asked for.
-                    let Some(duration) = self.sleep() else {
-                        return StopReason::Idle;
+                    let duration = match self.sleep(deadline) {
+                        Sleep::Until(duration) => duration,
+                        Sleep::NothingDue => return StopReason::Idle,
+                        Sleep::CutAtDeadline => return StopReason::TimeBudget,
                     };
                     slept = slept.saturating_add(duration);
-                    fruitless_wakes += 1;
+                    sleeps += 1;
                     self.service(pc);
                     if let Some(violation) = self.bus.ctx.diag.take_violation() {
                         return StopReason::StrictMmio(violation);
                     }
-                    if slept >= SLEEP_SLICE || fruitless_wakes >= MAX_FRUITLESS_WAKES {
+                    if slept >= SLEEP_SLICE || sleeps >= MAX_FRUITLESS_WAKES {
                         return StopReason::Asleep;
                     }
                     continue;
@@ -253,22 +323,28 @@ impl Esp32C3 {
     }
 
     /// Moves device time to the next instant something is due: a wake-up a device asked for, or
-    /// the end of the latency of the selected interrupt line. Returns the time skipped, `None`
-    /// when nothing is due at any time.
+    /// the end of the latency of the selected interrupt line. When that instant is after
+    /// `deadline`, the device-time limit of the call, device time moves to the deadline and no
+    /// further: the caller returns without delivering anything.
     ///
     /// The CPU clock is gated while the CPU waits: its cycle counter does not move (TRM register
     /// 1.12 `mpccr`, "the counter stops when the CPU is in WFI"; report TW §H.3).
-    fn sleep(&mut self) -> Option<u64> {
+    fn sleep(&mut self, deadline: Option<Cycles>) -> Sleep {
         let now = self.bus.ctx.now();
         let latency_end = self.selected.map(|(_, visible_at)| visible_at);
         let wake = match (self.bus.ctx.next_wake(), latency_end) {
             (Some(a), Some(b)) => a.min(b),
-            (a, b) => a.or(b)?,
+            (Some(only), None) | (None, Some(only)) => only,
+            (None, None) => return Sleep::NothingDue,
         };
         // A wake-up already due is delivered without moving time.
         let target = wake.max(now);
+        if let Some(deadline) = deadline.filter(|deadline| target > *deadline) {
+            self.bus.ctx.sleep_until(deadline);
+            return Sleep::CutAtDeadline;
+        }
         self.bus.ctx.sleep_until(target);
-        Some(target.get() - now.get())
+        Sleep::Until(target.get() - now.get())
     }
 
     /// Applies a reset (TRM §6.1): the peripherals of its level return to their reset state, the
@@ -348,6 +424,13 @@ impl Esp32C3 {
     #[must_use]
     pub const fn pc(&self) -> u32 {
         self.hart.pc
+    }
+
+    /// Whether the CPU is asleep: it executed `wfi` and no interrupt has ended the wait yet.
+    /// [`Esp32C3::pc`] is then the instruction after the `wfi`.
+    #[must_use]
+    pub const fn is_asleep(&self) -> bool {
+        self.hart.is_waiting()
     }
 
     /// The bytes that left the device on `channel` since the last call: a UART byte counts once
@@ -1156,6 +1239,310 @@ mod tests {
         );
         assert_eq!(m.run_until(Cycles(10_000)), StopReason::Asleep, "and again");
         assert!(m.device_time_nanos() > first);
+    }
+
+    const MILLISECOND_NS: u64 = 1_000_000;
+    const SECOND_NS: u64 = 1_000_000_000;
+    /// `SYSTIMER.CONF`: its reset value with `TARGET0_WORK_EN`, bit 24 (`systimer_ll_enable_alarm`).
+    const SYSTIMER_ALARM0_ON: u32 = 0x4600_0000 | (1 << 24);
+    /// More CPU cycles than any of the device-time tests executes: their limit is the time.
+    const NO_CYCLE_LIMIT: Cycles = Cycles(1_000_000_000);
+
+    /// What two runs must agree on to be the same run.
+    fn state(m: &Esp32C3) -> (Cycles, Cycles, u32, u64, Option<u64>, bool) {
+        (
+            m.cycles(),
+            m.bus.ctx.now(),
+            m.pc(),
+            m.resets(),
+            m.trace_hash(),
+            m.is_asleep(),
+        )
+    }
+
+    fn traced(program: &[u32]) -> Esp32C3 {
+        machine_with(
+            program,
+            SocConfig {
+                trace_hash: true,
+                ..SocConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_device_time_limit_ends_a_sleep_at_exactly_its_instant() {
+        // A period alarm every 16 384 counts of the 16 MHz counter (1.024 ms), its interrupt not
+        // enabled: the CPU sleeps for ever under wake-ups that wake nothing. Half a second is no
+        // multiple of the period: the last alarm before it is delivered, the next one is not, and
+        // device time stops on the limit, not on an alarm.
+        let mut body = stop_watchdogs();
+        body.extend(store_register(
+            reg("SYSTIMER", "TARGET0_CONF"),
+            (1 << 30) | 16_384,
+        ));
+        body.extend(store_register(reg("SYSTIMER", "COMP0_LOAD"), 1));
+        body.extend(store_register(reg("SYSTIMER", "CONF"), SYSTIMER_ALARM0_ON));
+        body.extend([wfi(), HANG]);
+        let wfi_at = ROM_BASE + 4 * u32::try_from(body.len() - 2).unwrap();
+        let mut m = machine(&body);
+        // The program is asleep long before the first alarm: a first limit inside that sleep.
+        assert_eq!(
+            m.run_within(NO_CYCLE_LIMIT, Some(MILLISECOND_NS)),
+            StopReason::TimeBudget
+        );
+        assert_eq!(m.device_time_nanos(), MILLISECOND_NS);
+        assert!(m.is_asleep());
+        assert_eq!(
+            bus_word(&mut m, reg("SYSTIMER", "INT_RAW")),
+            0,
+            "the first alarm is after the limit: it was not delivered"
+        );
+        let executed = m.cycles();
+        assert_eq!(
+            m.run_within(NO_CYCLE_LIMIT, Some(SECOND_NS / 2)),
+            StopReason::TimeBudget
+        );
+        assert_eq!(m.device_time_nanos(), 500_000_000);
+        assert_eq!(m.cycles(), executed, "a sleeping CPU executes no cycle");
+        assert!(m.is_asleep());
+        assert_eq!(m.pc(), wfi_at + 4, "the instruction after the `wfi`");
+        assert_eq!(
+            bus_word(&mut m, reg("SYSTIMER", "INT_RAW")),
+            1,
+            "the alarms before the limit were delivered"
+        );
+        assert_eq!(
+            m.run_within(NO_CYCLE_LIMIT, Some(SECOND_NS / 2)),
+            StopReason::TimeBudget,
+            "the limit is an instant since power-on: reached, it stays reached"
+        );
+        assert_eq!(m.device_time_nanos(), 500_000_000);
+    }
+
+    /// A one-shot alarm two seconds ahead whose interrupt is not enabled, then `wfi`.
+    fn a_sleep_to_an_alarm_two_seconds_ahead() -> Esp32C3 {
+        let mut body = stop_watchdogs();
+        body.extend(store_register(reg("SYSTIMER", "TARGET0_LO"), 32_000_000));
+        body.extend(store_register(reg("SYSTIMER", "COMP0_LOAD"), 1));
+        body.extend(store_register(reg("SYSTIMER", "CONF"), SYSTIMER_ALARM0_ON));
+        body.extend([wfi(), HANG]);
+        traced(&body)
+    }
+
+    #[test]
+    fn a_sleep_cut_by_a_device_time_limit_goes_on_as_if_it_had_not_been() {
+        let mut cut = a_sleep_to_an_alarm_two_seconds_ahead();
+        assert_eq!(
+            cut.run_within(NO_CYCLE_LIMIT, Some(SECOND_NS / 2)),
+            StopReason::TimeBudget
+        );
+        assert_eq!(cut.device_time_nanos(), 500_000_000);
+        assert_eq!(
+            bus_word(&mut cut, reg("SYSTIMER", "INT_RAW")),
+            0,
+            "the alarm is 1.5 s away: nothing was delivered"
+        );
+        let mut whole = a_sleep_to_an_alarm_two_seconds_ahead();
+        for m in [&mut cut, &mut whole] {
+            // The alarm is before the limit: the sleep ends on it, as without a limit, and the
+            // call gives control back for having slept more than a second.
+            assert_eq!(
+                m.run_within(NO_CYCLE_LIMIT, Some(3 * SECOND_NS)),
+                StopReason::Asleep
+            );
+            assert_eq!(
+                m.device_time_nanos(),
+                2 * SECOND_NS,
+                "the alarm at its own instant"
+            );
+            assert_eq!(bus_word(m, reg("SYSTIMER", "INT_RAW")), 1);
+        }
+        assert_eq!(state(&cut), state(&whole));
+        assert!(whole.trace_hash().is_some());
+        for m in [&mut cut, &mut whole] {
+            assert_eq!(
+                m.run_within(NO_CYCLE_LIMIT, Some(3 * SECOND_NS)),
+                StopReason::Idle,
+                "nothing else is scheduled: no limit is reached, the run is over"
+            );
+            assert_eq!(
+                m.device_time_nanos(),
+                2 * SECOND_NS,
+                "time is not moved to the limit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_time_limit_stops_an_executing_cpu_at_the_first_instruction_boundary_past_it() {
+        // `j .` at the 20 MHz of the reset clock: a CPU cycle is 8 cycles of the time base, and
+        // one millisecond is 160 000 of those.
+        const LIMIT: u64 = 160_000;
+        let cost = {
+            let mut one = machine(&[HANG]);
+            one.run_until(Cycles(1));
+            one.bus.ctx.now().get()
+        };
+        let mut whole = traced(&[HANG]);
+        assert_eq!(
+            whole.run_within(NO_CYCLE_LIMIT, Some(MILLISECOND_NS)),
+            StopReason::TimeBudget
+        );
+        let now = whole.bus.ctx.now().get();
+        assert!(
+            (LIMIT..LIMIT + cost).contains(&now),
+            "stopped at {now}: the instruction that crosses {LIMIT} is executed whole ({cost} cycles of the time base), and no other after it"
+        );
+        assert!(!whole.is_asleep());
+        // The stop does not depend on how the run is cut into calls.
+        let mut sliced = traced(&[HANG]);
+        let mut calls = 0;
+        loop {
+            let next = Cycles(sliced.cycles().get() + 7);
+            match sliced.run_within(next, Some(MILLISECOND_NS)) {
+                StopReason::CycleBudget => {}
+                StopReason::TimeBudget => break,
+                other => panic!("{other:?}"),
+            }
+            calls += 1;
+            assert!(calls < 100_000, "the limit is never reached");
+        }
+        assert_eq!(state(&sliced), state(&whole));
+        assert!(whole.trace_hash().is_some());
+    }
+
+    #[test]
+    fn a_cpu_nothing_can_wake_is_idle_whatever_the_device_time_limit() {
+        // Strapped for another boot mode, no watchdog runs at reset: nothing is scheduled.
+        let config = SocConfig {
+            strapping: 0,
+            ..SocConfig::default()
+        };
+        let mut m = machine_with(&[wfi(), HANG], config);
+        assert_eq!(
+            m.run_within(NO_CYCLE_LIMIT, Some(SECOND_NS)),
+            StopReason::Idle,
+            "a dead firmware is the more useful thing to report"
+        );
+        assert_eq!(
+            m.device_time_nanos(),
+            150,
+            "device time is not moved to the limit"
+        );
+        assert!(m.is_asleep());
+    }
+
+    #[test]
+    fn when_both_limits_are_reached_at_the_same_boundary_the_cycle_limit_is_reported() {
+        let mut by_time = machine(&[HANG]);
+        assert_eq!(
+            by_time.run_within(NO_CYCLE_LIMIT, Some(MILLISECOND_NS)),
+            StopReason::TimeBudget
+        );
+        let boundary = by_time.cycles();
+        let mut both = machine(&[HANG]);
+        assert_eq!(
+            both.run_within(boundary, Some(MILLISECOND_NS)),
+            StopReason::CycleBudget,
+            "it is tested first"
+        );
+        assert_eq!(both.cycles(), boundary);
+        assert_eq!(both.bus.ctx.now(), by_time.bus.ctx.now());
+        assert_eq!(
+            both.run_within(Cycles(boundary.get() + 1), Some(MILLISECOND_NS)),
+            StopReason::TimeBudget,
+            "one more cycle allowed: the time limit is the one that holds the run"
+        );
+        assert_eq!(both.cycles(), boundary, "and nothing ran");
+    }
+
+    #[test]
+    fn a_device_time_limit_of_zero_stops_before_the_first_instruction() {
+        let mut m = machine(&[HANG]);
+        assert_eq!(
+            m.run_within(NO_CYCLE_LIMIT, Some(0)),
+            StopReason::TimeBudget
+        );
+        assert_eq!((m.cycles(), m.pc()), (Cycles(0), ROM_BASE));
+    }
+
+    #[test]
+    fn the_limit_instant_is_rounded_up_to_a_cycle_of_the_time_base() {
+        // 6.25 ns a cycle: a run never ends before the time asked.
+        for (nanos, cycles) in [
+            (0, 0),
+            (1, 1),
+            (6, 1),
+            (7, 2),
+            (25, 4),
+            (1_000, 160),
+            (SECOND_NS, clock::SECOND),
+            // The longest time there is: it fits, and it is not the instant that means "never".
+            (u64::MAX, 2_951_479_051_793_528_259),
+        ] {
+            assert_eq!(limit_instant(nanos), Cycles(cycles), "{nanos} ns");
+            assert!(
+                clock::TIME_BASE.cycles_to_nanos(limit_instant(nanos)) >= nanos,
+                "{nanos} ns"
+            );
+        }
+    }
+
+    /// A short loop, then `wfi`, with the watchdogs of the reset values left on: main watchdog 0
+    /// resets the core at 1.3 s (TW §D.4), and the second life does the same.
+    fn a_sleep_under_the_flash_boot_watchdog() -> Esp32C3 {
+        traced(&[
+            addi(14, 0, 500),
+            addi(14, 14, -1),
+            cpu_rv32::asm::bne(14, 0, -4),
+            wfi(),
+            HANG,
+        ])
+    }
+
+    /// Calls `run_within` with the cycle limit `next` gives until the device-time limit `nanos`
+    /// ends a call.
+    fn run_to_the_time_limit(m: &mut Esp32C3, nanos: u64, next: impl Fn(&Esp32C3) -> Cycles) {
+        let mut calls = 0;
+        loop {
+            let limit = next(m);
+            match m.run_within(limit, Some(nanos)) {
+                StopReason::CycleBudget | StopReason::Asleep => {}
+                StopReason::TimeBudget => return,
+                other => panic!("{other:?}"),
+            }
+            calls += 1;
+            assert!(calls < 100_000, "the limit of {nanos} ns is never reached");
+        }
+    }
+
+    #[test]
+    fn a_device_time_limit_past_a_watchdog_reset_is_reached_the_same_whole_or_in_slices() {
+        const LIMIT_NS: u64 = 2 * SECOND_NS;
+        let mut whole = a_sleep_under_the_flash_boot_watchdog();
+        run_to_the_time_limit(&mut whole, LIMIT_NS, |_| NO_CYCLE_LIMIT);
+        assert_eq!(whole.device_time_nanos(), LIMIT_NS, "exactly the limit");
+        assert_eq!(
+            whole.resets(),
+            1,
+            "the reset at 1.3 s, not yet the one at 2.6 s"
+        );
+        assert!(whole.is_asleep());
+        assert!(whole.trace_hash().is_some());
+        // In calls of seven cycles.
+        let mut sliced = a_sleep_under_the_flash_boot_watchdog();
+        run_to_the_time_limit(&mut sliced, LIMIT_NS, |m| Cycles(m.cycles().get() + 7));
+        assert_eq!(state(&sliced), state(&whole));
+        // In steps of device time, one of them the instant of the reset itself.
+        let mut stepped = a_sleep_under_the_flash_boot_watchdog();
+        for nanos in [400, 800, 1_200, 1_300, 1_600, 2_000] {
+            let nanos = nanos * MILLISECOND_NS;
+            run_to_the_time_limit(&mut stepped, nanos, |_| NO_CYCLE_LIMIT);
+            assert_eq!(stepped.device_time_nanos(), nanos);
+            assert_eq!(stepped.resets(), u64::from(nanos >= 1_300 * MILLISECOND_NS));
+        }
+        assert_eq!(state(&stepped), state(&whole));
     }
 
     #[test]
