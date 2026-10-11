@@ -49,19 +49,56 @@ const BOOTLOADER_LINES: [&str; 21] = [
 const FIRST_APPLICATION_LINE: &str = "I (#) cpu_start: Unicore app";
 /// `call_start_cpu0` of the application (BA §1).
 const APPLICATION_ENTRY: u32 = 0x4038_0330;
+/// The address ranges of the application's code, from the `esp_image` segment lines of the golden
+/// log: IRAM is segment 2 (`vaddr=40380000 size=088a4h`) followed contiguously by segment 4
+/// (`vaddr=403888a4 size=02c70h`), ending at 0x4038b514; the flash text window is segment 3
+/// (`vaddr=42000020 size=0e6fch`), ending at 0x4200e71c. The bootloader runs at `0x403c_xxxx` and the
+/// ROM below `0x4006_0000`, so neither is inside.
+const APPLICATION_CODE: [std::ops::Range<u32>; 2] =
+    [0x4038_0000..0x4038_b514, 0x4200_0020..0x4200_e71c];
 
+/// The ESP32-C3 (rev 3) mask ROM named by `INKEMU_ROM_ELF_DIR`; every failure says why and what to do.
 fn rom() -> RomImage {
-    let dir = std::env::var("INKEMU_ROM_ELF_DIR")
-        .expect("set INKEMU_ROM_ELF_DIR to the directory holding the ROM ELF files");
+    let dir = std::env::var("INKEMU_ROM_ELF_DIR").unwrap_or_else(|e| {
+        panic!(
+            "INKEMU_ROM_ELF_DIR is not usable ({e}); fetch the ROMs with `inkemu rom fetch --all --rom-dir <dir>` and set the variable to <dir>"
+        )
+    });
     let path = std::path::Path::new(&dir).join("esp32c3_rev3_rom.elf");
-    RomImage::from_elf(&std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
-        .unwrap()
+    let elf = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read the ROM ELF {} ({e}); fetch the ROMs with `inkemu rom fetch --all --rom-dir {dir}`",
+            path.display()
+        )
+    });
+    RomImage::from_elf(&elf).unwrap_or_else(|e| {
+        panic!(
+            "{} is not a usable ESP32-C3 ROM ELF ({e}); delete it and fetch it again with `inkemu rom fetch --all --rom-dir {dir}`",
+            path.display()
+        )
+    })
 }
 
+/// The reference flash image named by `INKEMU_REF_FLASH`, accepted only if it is the pinned one:
+/// every test boots it, so a wrong image fails here with its real cause instead of as a
+/// golden-log difference.
 fn reference_flash() -> Vec<u8> {
-    let path = std::env::var("INKEMU_REF_FLASH")
-        .expect("set INKEMU_REF_FLASH to flash_hello.bin (tools/reference-firmware/build.sh)");
-    std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    let path = std::env::var("INKEMU_REF_FLASH").unwrap_or_else(|e| {
+        panic!(
+            "INKEMU_REF_FLASH is not usable ({e}); build the image with `tools/reference-firmware/build.sh` and set the variable to the flash_hello.bin it prints"
+        )
+    });
+    let image = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read the reference image {path} ({e}); build it with `tools/reference-firmware/build.sh`"
+        )
+    });
+    let digest = common::hex(&Sha256::digest(&image));
+    assert_eq!(
+        digest, REFERENCE_SHA256,
+        "{path} is not the pinned reference image; rebuild it with `tools/reference-firmware/build.sh`, which verifies the pins"
+    );
+    image
 }
 
 /// `I (123) tag: text` becomes `I (#) tag: text`: timestamps depend on the timing model.
@@ -100,15 +137,6 @@ fn run(config: SocConfig, done: impl Fn(&str) -> bool) -> Run {
         stop,
         trace_hash: machine.trace_hash(),
     }
-}
-
-#[test]
-#[ignore = "needs INKEMU_REF_FLASH"]
-fn the_image_under_test_is_the_pinned_reference() {
-    assert_eq!(
-        common::hex(&Sha256::digest(reference_flash())),
-        REFERENCE_SHA256
-    );
 }
 
 #[test]
@@ -190,14 +218,13 @@ fn strict_run_reaches_the_application_and_ends_on_the_rtc_calibration() {
         "{}",
         boot.console
     );
-    if let Diagnostic::UnmodeledMmio { pc, .. } = violation {
-        assert!(
-            (0x4038_0000..0x403E_0000).contains(pc)
-                || (0x4200_0000..0x4280_0000).contains(pc)
-                || (0x4000_0000..0x4006_0000).contains(pc),
-            "the access comes from application or ROM code: {pc:#010x} (application entry {APPLICATION_ENTRY:#010x})"
-        );
-    }
+    let Diagnostic::UnmodeledMmio { pc, .. } = violation else {
+        panic!("expected an unmodelled register access, got: {violation}");
+    };
+    assert!(
+        APPLICATION_CODE.iter().any(|code| code.contains(pc)),
+        "the access must come from the application's own code {APPLICATION_CODE:x?} (entry {APPLICATION_ENTRY:#010x}), not from the bootloader or the ROM: pc {pc:#010x}"
+    );
 }
 
 #[test]
@@ -226,11 +253,11 @@ fn without_strict_mode_the_wait_on_the_rtc_calibration_is_a_named_warning_not_a_
                 && matches!(
                     d,
                     Diagnostic::UnmodeledMmio {
-                        register: Some(("TIMG0", _)),
+                        register: Some(("TIMG0", "RTCCALICFG")),
                         ..
                     }
                 )),
-        "the end-of-run summary shows what the firmware keeps polling"
+        "the end-of-run summary must show TIMG0.RTCCALICFG as what the firmware keeps polling"
     );
 }
 
