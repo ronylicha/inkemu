@@ -732,4 +732,117 @@ mod tests {
             assert_eq!(c(raw), Instr::Illegal(u32::from(raw)), "{raw:#06x}");
         }
     }
+
+    #[test]
+    fn compressed_branches_cover_every_cb_offset_bit() {
+        // Encodings: GNU as, binutils 2.42-1ubuntu1+6 (`c.bnez`, `c.beqz`; objdump lines in task-4-report.md).
+        check(&[
+            (
+                0xecfd,
+                Instr::Branch {
+                    op: BranchOp::Ne,
+                    rs1: 9,
+                    rs2: 0,
+                    offset: 254,
+                },
+            ), // c.bnez s1,. + 254
+            (
+                0xccfd,
+                Instr::Branch {
+                    op: BranchOp::Eq,
+                    rs1: 9,
+                    rs2: 0,
+                    offset: 254,
+                },
+            ), // c.beqz s1,. + 254
+            (
+                0xe8d9,
+                Instr::Branch {
+                    op: BranchOp::Ne,
+                    rs1: 9,
+                    rs2: 0,
+                    offset: 150,
+                },
+            ), // c.bnez s1,. + 150
+            (
+                0xc8d9,
+                Instr::Branch {
+                    op: BranchOp::Eq,
+                    rs1: 9,
+                    rs2: 0,
+                    offset: 150,
+                },
+            ), // c.beqz s1,. + 150
+            (
+                0xf8d9,
+                Instr::Branch {
+                    op: BranchOp::Ne,
+                    rs1: 9,
+                    rs2: 0,
+                    offset: -106,
+                },
+            ), // c.bnez s1,. - 106
+            (
+                0xd8d9,
+                Instr::Branch {
+                    op: BranchOp::Eq,
+                    rs1: 9,
+                    rs2: 0,
+                    offset: -106,
+                },
+            ), // c.beqz s1,. - 106
+            (
+                0xf089,
+                Instr::Branch {
+                    op: BranchOp::Ne,
+                    rs1: 9,
+                    rs2: 0,
+                    offset: -254,
+                },
+            ), // c.bnez s1,. - 254
+            (
+                0xd4ad,
+                Instr::Branch {
+                    op: BranchOp::Eq,
+                    rs1: 9,
+                    rs2: 0,
+                    offset: -150,
+                },
+            ), // c.beqz s1,. - 150
+        ]);
+    }
+
+    #[test]
+    fn compressed_addi4spn_covers_every_ciw_immediate_bit() {
+        // Encodings: GNU as, binutils 2.42-1ubuntu1+6 (`c.addi4spn`; objdump lines in task-4-report.md).
+        check(&[
+            (
+                0x0020,
+                Instr::OpImm {
+                    op: AluOp::Add,
+                    rd: 8,
+                    rs1: 2,
+                    imm: 8,
+                },
+            ), // c.addi4spn s0,sp,8 (bit 3)
+            (
+                0x1fe0,
+                Instr::OpImm {
+                    op: AluOp::Add,
+                    rd: 8,
+                    rs1: 2,
+                    imm: 1020,
+                },
+            ), // c.addi4spn s0,sp,1020
+            (
+                0x0040,
+                Instr::OpImm {
+                    op: AluOp::Add,
+                    rd: 8,
+                    rs1: 2,
+                    imm: 4,
+                },
+            ), // c.addi4spn s0,sp,4 (bit 2)
+        ]);
+    }
 }
