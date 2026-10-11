@@ -13,7 +13,9 @@ pub mod csr;
 mod dcache;
 mod exec;
 pub mod hart;
+pub mod timing;
 pub mod trap;
 
 pub use hart::{Hart, HartConfig, MisalignedPolicy, StepOutcome};
+pub use timing::DatasheetTiming;
 pub use trap::{Exception, Trap};
