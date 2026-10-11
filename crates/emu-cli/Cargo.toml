@@ -18,6 +18,7 @@ cpu-rv32.workspace = true
 firmware.workspace = true
 clap.workspace = true
 goblin.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
