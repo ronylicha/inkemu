@@ -2,6 +2,7 @@
 //! and the registers of the slow-clock calibration. Sources: TRM chapters 11 and 12, ESP-IDF
 //! `timer_group_reg.h`, `timer_ll.h`, `mwdt_ll.h`, `rtc_time.c`; report TW §B and §D.
 use super::counter::{Counter, Rate};
+use super::stages::{self, STAGES};
 use super::{TIMG0_BASE, TIMG1_BASE};
 use super::{half_of, replace_half};
 use crate::clock::XTAL_PERIOD;
@@ -93,10 +94,6 @@ const WDTCONFIG1_STORED: u32 = 0xFFFF_0000;
 /// The key that unlocks every watchdog register (`mwdt_ll_write_protect_disable`, line 245); it
 /// is also the reset value of `WDTWPROTECT`: the watchdog is unlocked out of reset (TW §B.3).
 const WDT_KEY: u32 = 0x50D8_3AA1;
-const STAGES: usize = 4;
-/// The most iterations one evaluation of the stage walk takes: four expiries, the reduction of
-/// the count modulo a turn of the four stages, at most four more expiries, and the wait.
-const WALK_STEPS: usize = 2 * STAGES + 1;
 /// Stage actions (`IDF:hal/include/hal/wdt_types.h`; TW §D.5).
 const ACTION_INTERRUPT: u32 = 1;
 const ACTION_RESET_CPU: u32 = 2;
@@ -537,26 +534,9 @@ impl Timg {
     }
 
     /// Lets the main watchdog go through the stages whose timeout the count has reached, and
-    /// returns the instant of the next expiry. The walk follows these rules:
-    ///
-    /// 1. A stage lasts at least one count (see [`Timg::stage_timeout`]).
-    /// 2. A write that leaves the count at or past the timeout of the current stage expires that
-    ///    stage at the write, and the next stage counts from 0 (TRM §12.2.2.2; TW §B.3: "the
-    ///    counter returns to 0 and the next stage becomes current"): the first expiry of such a
-    ///    call carries nothing.
-    /// 3. An expiry found because time passed (a wake-up, a clock change, a reset, the construction)
-    ///    carries the counts elapsed since the expiry into the next stage (`count - timeout`). The
-    ///    fraction of a count is lost at each transition: the counter is anchored at the present
-    ///    time with a whole number of counts, so the loss is less than one count per transition,
-    ///    and deterministic.
-    /// 4. The walk is bounded whatever firmware wrote: after four expiries in one call every stage
-    ///    has acted once, so the remaining count is reduced modulo the sum of the four timeouts
-    ///    (whole turns change neither the stage nor which actions fired), which leaves at most four
-    ///    more expiries. One call costs at most [`WALK_STEPS`] iterations, with no trip count that
-    ///    depends on a register value.
-    /// 5. The walk goes on after a reset request: the reset it asks for does not stop the
-    ///    watchdog, and [`Ctx::request_reset`] keeps the deepest request, the first between equal
-    ///    levels.
+    /// returns the instant of the next expiry. The walk and its rules are those of every
+    /// watchdog of the chip ([`stages::walk`]); what is this device's own is the action of a
+    /// stage that ended.
     fn walk_stages(
         &mut self,
         ctx: &mut Ctx,
@@ -564,33 +544,19 @@ impl Timg {
         from_register_write: bool,
     ) -> Option<Cycles> {
         let timeouts: [u64; STAGES] = std::array::from_fn(|stage| self.stage_timeout(stage));
-        let turn: u64 = timeouts.iter().sum();
-        let mut count = self.wdt.value(now);
-        let mut carries = !from_register_write;
-        let mut expiries = 0;
-        for _ in 0..WALK_STEPS {
-            let timeout = timeouts[self.wdt_stage];
-            // ASSUMPTION: a stage expires when the counter is at or past its timeout. The hardware
-            // may compare for equality, which would let a timeout lowered below the present count
-            // never expire until the next feed; QEMU's model says so, no document does (TW §G row
-            // 7, §I question 5). At-or-past makes such a watchdog fire, which is visible. Lowering
-            // a timeout below the count on a chip, and seeing whether the stage fires, settles it.
-            if count < timeout {
-                return self.wdt.instant_in(timeout - count, now);
-            }
-            let action = self.stage_action(self.wdt_stage);
-            // The counter returns to 0 (or keeps the counts beyond the timeout, rule 3) and the
-            // next stage becomes current; stages loop 0 to 3 (TRM §12.2.2.2).
-            count = if carries { count - timeout } else { 0 };
-            carries = true;
-            self.wdt_stage = (self.wdt_stage + 1) % STAGES;
-            expiries += 1;
-            if expiries == STAGES {
-                count %= turn;
-            }
-            self.wdt.set(count, now);
-            match (action, self.group) {
-                (ACTION_INTERRUPT, _) => self.int_raw |= INT_WDT,
+        // The actions as they are when the walk begins: no expiry changes a register they are
+        // read from.
+        let actions: [u32; STAGES] = std::array::from_fn(|stage| self.stage_action(stage));
+        let group = self.group;
+        let int_raw = &mut self.int_raw;
+        stages::walk(
+            &mut self.wdt,
+            &mut self.wdt_stage,
+            timeouts,
+            now,
+            from_register_write,
+            |ended| match (actions[ended], group) {
+                (ACTION_INTERRUPT, _) => *int_raw |= INT_WDT,
                 // ASSUMPTION: action 2 resets the CPU whatever `PROCPU_RESET_EN` (`WDTCONFIG0`
                 // bit 13) holds, as for the RTC watchdog (TW §D.5, §I question 5). Clearing the
                 // bit on a chip whose stage resets the CPU, and seeing whether the CPU still
@@ -599,16 +565,11 @@ impl Timg {
                 (ACTION_RESET_CPU, Group::Timg1) => ctx.request_reset(ResetCause::Mwdt1Cpu),
                 (ACTION_RESET_SYSTEM, Group::Timg0) => ctx.request_reset(ResetCause::Mwdt0Core),
                 (ACTION_RESET_SYSTEM, Group::Timg1) => ctx.request_reset(ResetCause::Mwdt1Core),
-                // ASSUMPTION: a stage whose action is "off" is waited for like the others and
-                // does nothing when it ends (QEMU's reading; TW §B.3, §I question 5). A chip with
-                // stage 0 off and stage 1 resetting, timed, settles it.
+                // An "off" stage was waited for and does nothing when it ends: the assumption is
+                // marked on the walk.
                 _ => {}
-            }
-        }
-        // INVARIANT: unreachable. After the reduction the count is below the sum of the four
-        // timeouts, so at most four more stages expire and the walk returns above. A wake-up one
-        // count away keeps the watchdog alive if that were ever wrong.
-        self.wdt.instant_in(1, now)
+            },
+        )
     }
 
     /// Both interrupts are levels: `INT_RAW & INT_ENA` (TW §B.1).

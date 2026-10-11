@@ -9,6 +9,7 @@
 use crate::ctx::{Ctx, Deadline, Event, Source};
 use crate::diag::Unsupported;
 use crate::periph::counter::{Counter, Rate};
+use crate::periph::stages::{self, STAGES as WDT_STAGES};
 use crate::periph::{Accepted, RTC_CNTL_BASE, Storage, half_of};
 use crate::reset::{CAUSE_POWER_ON, ResetCause};
 use emu_core::{Cycles, Peripheral};
@@ -78,10 +79,6 @@ const WDT_TIMEOUT_RESET: [u32; WDT_STAGES] = [200_000, 80_000, 0xFFF, 0xFFF];
 /// (`RTC_CNTL_WDT_WKEY`, default `0x50d83aa1`, `rtc_cntl_reg.h:1700`): unlocked out of reset. The
 /// SVD gives 0 for this register and is wrong on this point.
 const WDT_KEY: u32 = 0x50D8_3AA1;
-const WDT_STAGES: usize = 4;
-/// The most iterations one evaluation of the stage walk takes: four expiries, the reduction of
-/// the count modulo a turn of the four stages, at most four more expiries, and the wait.
-const WALK_STEPS: usize = 2 * WDT_STAGES + 1;
 /// `EFUSE_WDT_DELAY_SEL` is two bits wide.
 const WDT_DELAY_SEL_MASK: u32 = 0b11;
 /// `WDTCONFIG0`: bit 31 `EN` (`rwdt_ll_enable`, `rwdt_ll.h:66`), three bits per stage from
@@ -410,22 +407,8 @@ impl RtcCntl {
     }
 
     /// Lets the RTC watchdog go through the stages whose timeout the count has reached, and returns
-    /// the instant of the next expiry. The walk follows these rules:
-    ///
-    /// 1. A stage lasts at least one count (see [`RtcCntl::stage_timeout`]).
-    /// 2. A write that leaves the count at or past the timeout of the current stage expires that
-    ///    stage at the write, and the next stage counts from 0 (TW §B.3: "the counter returns to
-    ///    0 and the next stage becomes current"): the first expiry of such a call carries nothing.
-    /// 3. An expiry found because time passed carries the counts elapsed since the expiry into the
-    ///    next stage (`count - timeout`). The fraction of a count is lost at each transition: at
-    ///    most one count per transition, and deterministic.
-    /// 4. The walk is bounded whatever firmware wrote: after four expiries in one call every stage
-    ///    has acted once, so the remaining count is reduced modulo the sum of the four timeouts
-    ///    (whole turns change neither the stage nor which actions fired), which leaves at most four
-    ///    more expiries. One call costs at most [`WALK_STEPS`] iterations.
-    /// 5. The walk goes on after a reset request: the reset it asks for does not stop the RTC
-    ///    watchdog, and [`Ctx::request_reset`] keeps the deepest request (system over core over
-    ///    CPU), the first between requests of the same level.
+    /// the instant of the next expiry. The walk and its rules are those of every watchdog of the
+    /// chip ([`stages::walk`]); what is this device's own is the action of a stage that ended.
     fn walk_stages(
         &mut self,
         ctx: &mut Ctx,
@@ -433,45 +416,29 @@ impl RtcCntl {
         from_register_write: bool,
     ) -> Option<Cycles> {
         let timeouts: [u64; WDT_STAGES] = std::array::from_fn(|stage| self.stage_timeout(stage));
-        let turn: u64 = timeouts.iter().sum();
-        let mut count = self.wdt.value(now);
-        let mut carries = !from_register_write;
-        let mut expiries = 0;
-        for _ in 0..WALK_STEPS {
-            let timeout = timeouts[self.wdt_stage];
-            // A stage expires when the count is at or past its timeout, not only when it equals
-            // it (decision E27): the difference shows when a timeout is lowered below the count
-            // (TW §I question 5). ASSUMPTION: lowering a timeout below the count on a chip, and
-            // seeing whether the stage fires, settles it.
-            if count < timeout {
-                return self.wdt.instant_in(timeout - count, now);
-            }
-            let action = self.stage_action(self.wdt_stage);
-            count = if carries { count - timeout } else { 0 };
-            carries = true;
-            self.wdt_stage = (self.wdt_stage + 1) % WDT_STAGES;
-            expiries += 1;
-            if expiries == WDT_STAGES {
-                count %= turn;
-            }
-            self.wdt.set(count, now);
-            match action {
-                ACTION_INTERRUPT => self.int_raw |= INT_WDT,
+        // The actions as they are when the walk begins: no expiry changes a register they are
+        // read from.
+        let actions: [u32; WDT_STAGES] = std::array::from_fn(|stage| self.stage_action(stage));
+        let int_raw = &mut self.int_raw;
+        stages::walk(
+            &mut self.wdt,
+            &mut self.wdt_stage,
+            timeouts,
+            now,
+            from_register_write,
+            |ended| match actions[ended] {
+                ACTION_INTERRUPT => *int_raw |= INT_WDT,
                 // ASSUMPTION: action 2 resets the CPU whatever `PROCPU_RESET_EN` (`WDTCONFIG0` bit
                 // 11) holds (TW §D.5, §I question 5). Clearing the bit on a chip whose stage
                 // resets the CPU, and seeing whether the CPU still resets, settles it.
                 ACTION_RESET_CPU => ctx.request_reset(ResetCause::RtcWatchdogCpu),
                 ACTION_RESET_SYSTEM => ctx.request_reset(ResetCause::RtcWatchdogCore),
                 ACTION_RESET_RTC => ctx.request_reset(ResetCause::RtcWatchdogSystem),
-                // ASSUMPTION: an "off" stage is waited for, and does nothing (TW §B.3, §I question
-                // 5). A chip with stage 0 off and stage 1 resetting, timed, settles it.
+                // An "off" stage was waited for and does nothing when it ends: the assumption is
+                // marked on the walk.
                 _ => {}
-            }
-        }
-        // INVARIANT: unreachable. After the reduction the count is below the sum of the four
-        // timeouts, so at most four more stages expire and the walk returns above. A wake-up one
-        // count away keeps the watchdog alive if that were ever wrong.
-        self.wdt.instant_in(1, now)
+            },
+        )
     }
 
     /// The super watchdog at the present time; returns the instant it next needs a call.

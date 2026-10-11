@@ -19,6 +19,7 @@ pub mod rtc_cntl;
 pub mod sensitive;
 pub mod sha;
 pub mod spi_mem;
+pub(crate) mod stages;
 pub mod system;
 pub mod systimer;
 pub mod timg;
