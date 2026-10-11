@@ -10,7 +10,10 @@
 cargo build --release
 
 # Boot a virtual Xteink X4 from a full flash image: mask ROM, 2nd-stage bootloader, application.
+# Stop after 50 million cycles of the CPU clock...
 target/release/inkemu run --device x4 --flash flash.bin --max-cycles 50000000
+# ...or after five seconds of device time.
+target/release/inkemu run --device x4 --flash flash.bin --max-time 5
 ```
 
 This is the console of the reference image (the stock ESP-IDF v5.5.2 bootloader and its `hello_world` example, see [Third-party material](#third-party-material)). The timestamps are those of the emulated device:
@@ -51,23 +54,70 @@ The reference image (`hello_world` of ESP-IDF v5.5.2, saved as `flash_hello.bin`
 
 ```text
 inkemu: Xteink X4 (ESP32-C3 v0.3, mask ROM rev3); timing model datasheet-uncalibrated (not calibrated); flash: flash_hello.bin (16777216 bytes in 16 MiB)
+inkemu: reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x3fc8eb10
 inkemu: cycle limit reached; raise --max-cycles to run longer
 inkemu: stopped at pc 0x4004c0d4 after 50000000 cycles (33222007 instructions)
 inkemu: 11459206 us of device time; CPU clock at 160 MHz
 ```
 
-With `--strict-mmio` the same run touches no register inkemu does not model and takes no CPU exception, across the restart.
+The second line is the restart the application asked for: inkemu reports every reset with its cause, the program counter and the stack pointer it found. With `--strict-mmio` the same run touches no register inkemu does not model and takes no CPU exception, across the restart.
+
+With `--max-time 5` instead, the run stops in the middle of the countdown, while the CPU sleeps between two lines; the console ends with `Restarting in 6 seconds...` and standard error reads:
+
+```text
+inkemu: Xteink X4 (ESP32-C3 v0.3, mask ROM rev3); timing model datasheet-uncalibrated (not calibrated); flash: flash_hello.bin (16777216 bytes in 16 MiB)
+inkemu: device-time limit reached; raise --max-time to run longer
+inkemu: stopped at pc 0x40381d1a after 27292718 cycles (18157194 instructions)
+inkemu: 5000000 us of device time; CPU clock at 160 MHz; the CPU is asleep, waiting for an interrupt
+```
 
 Things worth knowing:
 
-- **`--max-cycles` counts CPU cycles, and a sleeping CPU executes none.** A firmware that sleeps for ever while a timer keeps counting never reaches the limit: stop it with Ctrl-C, which ends the run with the same summary as the limit, with exit code 0. A second Ctrl-C before the run has stopped exits at once, with code 130 and no summary; a plain `kill` is not handled and ends the process without a summary either. With `--trace-hash`, the hash of an interrupted run covers what ran up to the cut, which depends on host timing: it is not reproducible. A firmware that waits for an interrupt nothing can raise ends the run by itself, with exit code 4.
-- **The watchdogs are real.** Without `--flash`, the ROM prints `invalid header: 0xffffffff` until the watchdog the chip arms at reset expires, 1.3 s later, and boots again with `rst:0x7 (TG0WDT_SYS_RST)`, as a blank chip does. A firmware that stops feeding its watchdogs is reset the same way, and the next boot names the watchdog and the address it was caught at (`Saved PC`).
-- **The console is as slow as the UART.** A byte leaves at the baud rate the firmware programmed; when a run stops, what was still in the UART is printed too. If that last write fails, the run ends with exit code 2 (a closed pipe ends it with code 0); a `--strict-mmio` stop keeps its code.
+- **Two limits, two clocks.** `--max-cycles N` stops the run when the CPU has executed N cycles of its clock; `--max-time S` stops it when S seconds of device time have elapsed since power-on (a decimal number: `30`, `2.5`, `0.001`). A sleeping CPU executes no cycle while device time goes on, as it does across resets, so a firmware that sleeps — any firmware that waits for a timer or a button — is bounded by `--max-time` only. Both may be given; the first one reached ends the run, with exit code 0. The stop is exact and the same on every host: the first instruction boundary at or after the limit, or the limit itself when the CPU is asleep. A firmware that waits for an interrupt nothing can raise ends the run by itself, with exit code 4.
+- **Ctrl-C and `kill`.** Without a limit a run ends with Ctrl-C, which prints the same summary as a limit, with exit code 0. A second Ctrl-C before the run has stopped exits at once, with code 130 and no summary. A plain `kill` is not handled and ends the process without a summary either. With `--trace-hash`, the hash of an interrupted run covers what ran up to the cut, which depends on host timing: it is not reproducible; the hash of a run ended by a limit is.
+- **The watchdogs are real.** Without `--flash`, the ROM prints `invalid header: 0xffffffff` until the watchdog the chip arms at reset expires, 1.3 s later, and boots again with `rst:0x7 (TG0WDT_SYS_RST)`, as a blank chip does. A firmware that stops feeding its watchdogs is reset the same way, and the next boot names the watchdog and the address it was caught at (`Saved PC`). inkemu's own `reset by …` line gives the cause, the program counter and the stack pointer of every reset, also after a system reset, where the ROM prints no `Saved PC`.
+- **The console is as slow as the UART, and output only.** A byte leaves at the baud rate the firmware programmed; when a run stops, what was still in the UART is printed too. `--console` chooses which serial output of the device goes to standard output: `uart0` (the default), `uart1` or `usb-serial-jtag`; the ROM prints on the first and on the last. Nothing can be sent to the device yet: there is no UART reception and no host side of USB-Serial-JTAG (sub-project 1b-3b).
+- **Pipes and redirections.** `inkemu run … | head -5` ends when `head` has its lines: a run whose reader went away says so and ends with exit code 0. On Unix this also holds when the firmware prints nothing more: between two slices that had nothing to print, inkemu asks whether its reader is still there. On other systems such a silent run goes on to its limit or to Ctrl-C. When standard output cannot be written for another reason (a full disk), the run ends with exit code 2; a `--strict-mmio` stop keeps its code whatever happened to the console. A closed standard output (`>&-`) cannot be told from `/dev/null`, because the Rust runtime reopens it on the null device before the program starts: it behaves like `/dev/null`, the console is dropped and the run ends as it would have, with exit code 0.
+- **What is not emulated yet.** Deep sleep and light sleep: a firmware that asks for either keeps running (sub-project 1b-3b). There is no radio, no display and no button yet. The first line of standard error says `timing model datasheet-uncalibrated (not calibrated)`: the cycle cost of each instruction comes from documents, not from a measurement on a device, so a device time is plausible, not exact (the calibration bench is sub-project 8).
 - **The flash is read-only.** On the first boot of a layout with OTA slots and a blank `otadata` partition, which is the layout of the Xteink X4, the bootloader records the slot it chose. inkemu reports the refused sector erase and page program (`flash command 0x20 is not modeled`, then `0x02`) and the boot goes on to the application; with `--strict-mmio` the run stops at the first of the two. Flash writes arrive with sub-project 1b-3b.
 - **Memory protection is not enforced.** The PMP entries, the permission registers and the stack guard are stored and never raise a fault (sub-project 1b-4).
-- **Exit codes**, as `inkemu run --help` prints them: 0 when the run ended normally (the cycle limit was reached, Ctrl-C was pressed, or the reader of standard output went away); 2 for an error (unknown device, missing or invalid ROM, refused flash image, or standard output that cannot be written); 3 for a stop by `--strict-mmio`; 4 when the CPU waits for an interrupt and none can come; 130 for a second Ctrl-C.
 
-The device console goes to standard output. Everything inkemu has to say goes to standard error: the device, the timing model and the flash in use, then one `warning:` line for each thing it cannot do faithfully — an unmodelled register read or write (with the peripheral, the register, its address and the program counter), an 8- or 16-bit write to a peripheral register, an operation it cannot perform faithfully (a flash command other than identification and status: a program, an erase, a data read; an SPI flash transfer whose command is not 8 bits long; SHA through DMA; a SHA mode the chip does not have; a clock source it cannot turn into a frequency; an RTC slow clock other than the RC oscillator; a byte written to a UART whose transmit FIFO is full), an access to flash that no MMU entry maps, a CPU exception — and, at the end, the most repeated ones, the device time elapsed and the CPU clock. `--strict-mmio` turns the first of these (CPU exceptions excepted) into a stop with exit code 3, for CI. Registers that inkemu stores without modelling their effect are listed in [docs/registers-accepted-without-effect.md](docs/registers-accepted-without-effect.md).
+The options and the exit codes, as `inkemu run --help` prints them:
+
+```text
+Boot a device from its mask ROM and print its console
+
+Usage: inkemu run [OPTIONS] --device <DEVICE>
+
+Options:
+      --device <DEVICE>          Device profile id; an unknown id prints the available ones
+      --flash <FLASH>            Full flash image to boot: a dump of a device (`esptool.py read_flash 0 ALL flash.bin`), or the output of `esptool.py merge_bin`. Its bootloader, partition table and application run as on the device. Without it the flash is erased and the ROM reports an invalid header, as a blank chip does
+      --max-cycles <MAX_CYCLES>  Stop when the CPU has executed this many cycles of its clock. A sleeping CPU executes none: a firmware that sleeps never reaches this limit, use --max-time to bound it
+      --max-time <SECONDS>       Stop when this many seconds of device time have elapsed since power-on (a decimal number: 30, 2.5, 0.001). Device time goes on while the CPU sleeps and across resets
+      --strict-mmio              Stop at the first access to a register the emulator does not model, 8/16-bit write to a peripheral register, operation the emulator cannot perform faithfully, or access to flash that is not mapped (exit code 3)
+      --console <CONSOLE>        Which console of the device goes to standard output [default: uart0] [possible values: uart0, uart1, usb-serial-jtag]
+      --rom-dir <ROM_DIR>        Use the ROM ELF files of this directory and never download
+      --trace-hash               Print the execution trace hash at the end (determinism checks)
+  -h, --help                     Print help
+
+Exit codes:
+  0  the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was
+     pressed, or the reader of standard output went away
+  2  error: unknown device, missing or invalid ROM, refused flash image, or standard output cannot be written
+  3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
+     emulator cannot perform faithfully, or flash that is not mapped)
+  4  the CPU waits for an interrupt and none can come: no interrupt line is pending and no device
+     has anything scheduled
+130  Ctrl-C was pressed a second time before the run had stopped: no summary was printed
+```
+
+The device console goes to standard output. Everything inkemu has to say goes to standard error:
+
+- first, the device, the timing model and the flash in use;
+- as the run goes, one `warning:` line for each thing it cannot do faithfully or that the firmware got wrong — an unmodelled register read or write (with the peripheral, the register, its address and the program counter), an 8- or 16-bit write to a peripheral register, an operation it cannot perform faithfully (a flash command other than identification and status: a program, an erase, a data read; an SPI flash transfer whose command is not 8 bits long; SHA through DMA; a SHA mode the chip does not have; a clock source it cannot turn into a frequency; an RTC slow clock other than the RC oscillator; a byte written to a UART whose transmit FIFO is full; a UART byte sent on a source clock it has no frequency for, such as the RC fast clock), an access to flash that no MMU entry maps, a CPU exception (named in words, with its program counter and stack pointer) — and one `inkemu:` line for each reset, which is an event of the run and not a warning;
+- at the end, why the run stopped, where (program counter, cycles, instructions), the device time elapsed and the CPU clock, followed by `; the CPU is asleep, waiting for an interrupt` when it is, then the most repeated lines with their count.
+
+Each distinct warning and each distinct reset is listed once, however often it comes. `--strict-mmio` turns the first warning into a stop with exit code 3, for CI; CPU exceptions and resets are excepted, because they are what the firmware does on the device. Registers that inkemu stores without modelling their effect are listed in [docs/registers-accepted-without-effect.md](docs/registers-accepted-without-effect.md).
 
 To build the reference image yourself (it needs Docker; nothing is executed on the host), see [tools/reference-firmware/README.md](tools/reference-firmware/README.md).
 
@@ -116,13 +166,70 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 - [Design specification](docs/superpowers/specs/2026-10-11-inkemu-design.md) (French)
 - [Xteink hardware research](docs/research/xteink-hardware.md), with a source for every fact
 - [Registers accepted without effect](docs/registers-accepted-without-effect.md): what is stored but not modelled, and the plan that makes each real
-- [ADR 0002](docs/adr/0002-flash-model-and-cache-windows.md): the flash model and the cache windows
+- [ADR 0002](docs/adr/0002-flash-model-and-cache-windows.md): the flash model and the cache windows (French)
+- [ADR 0003](docs/adr/0003-contexte-des-peripheriques.md): the context every peripheral access receives, device time, and the three levels of reset (French)
 
 ## Français
 
-inkemu est un émulateur **au niveau binaire** d'appareils embarqués à écran e-ink. Il exécute le firmware réel, sans recompilation, sur une réplique virtuelle du matériel : mémoire exacte, modèle de cycles, rendu e-ink fidèle (ghosting, niveaux de gris, durées de rafraîchissement), Wi-Fi avec accès Internet réel, BLE, débogage GDB et tests automatisés. Il tourne sur Linux, macOS, Windows et dans le navigateur. Les liseuses Xteink sont les premières cibles ; d'autres appareils suivront.
+Cette partie reprend le document en français, section par section et en plus court ; les exemples de sortie et les tableaux sont dans la partie anglaise. Les messages de la commande sont en anglais.
 
-**État :** inkemu démarre la vraie ROM masquée de l'ESP32-C3 depuis son vecteur de reset. À partir d'une image flash complète (`--flash`), la ROM charge le bootloader de second niveau, qui lance l'application ; celle-ci vit toute sa vie — ordonnanceur FreeRTOS, interruption de tick, timers, watchdogs — et, quand elle redémarre, la puce démarre de nouveau. Le cœur RV32IMC est validé contre riscv-tests puis, avec RISCOF, contre le modèle de référence Sail ; les commandes `inkemu inspect` et `inkemu rvtest` sont en place. Les écritures en flash et le démarrage d'un firmware fourni seul sont la prochaine étape (sous-projet 1b-3b), puis le lockstep avec QEMU (1b-4).
+**inkemu est un émulateur au niveau binaire d'appareils embarqués à écran e-ink.** Il exécute l'image réelle d'un firmware, sans la modifier, sur une réplique virtuelle du matériel : on peut vérifier ce qu'un firmware affiche et comment il se comporte avant de le flasher.
+
+**État : début du développement.** inkemu démarre la vraie ROM masquée de l'ESP32-C3 depuis son vecteur de reset. À partir d'une image flash complète, la ROM charge le bootloader de second niveau d'ESP-IDF, qui lance l'application ; celle-ci vit toute sa vie — ordonnanceur FreeRTOS, interruption de tick, timers, watchdogs — et, quand elle redémarre, la puce démarre de nouveau. Le cœur RV32IMC est validé contre riscv-tests puis, avec RISCOF, contre le modèle de référence Sail. Les écritures en flash et le démarrage d'un firmware fourni seul sont la prochaine étape (sous-projet 1b-3b), puis le lockstep avec QEMU (1b-4).
+
+### Construire et essayer
+
+`cargo build --release`, puis `target/release/inkemu run --device x4 --flash flash.bin --max-cycles 50000000`, ou `--max-time 5` pour s'arrêter après cinq secondes d'appareil. `--flash` attend une **image flash complète** : le dump d'un appareil (`esptool.py read_flash 0 ALL flash.bin`) ou la sortie d'`esptool.py merge_bin`. Le fichier peut être plus court que la flash de l'appareil ; le reste se lit comme effacé. Un fichier qui ne peut pas être la flash de l'appareil est refusé avant toute exécution, avec la cause et le remède (code de sortie 2) : un `.xota` chiffré, une application seule, une image pour une autre puce, une image qui déclare plus de flash que l'appareil n'en a, un fichier plus long que la flash, un fichier vide. Sans `--flash`, la flash est effacée et la ROM affiche `invalid header: 0xffffffff` en boucle, comme une puce vierge. Il n'y a pas encore d'option pour démarrer un `.bin` d'application seul (sous-projet 1b-3b).
+
+L'image de référence (`hello_world` d'ESP-IDF v5.5.2) vit toute sa vie : `Hello world!`, onze secondes de compte à rebours, `esp_restart()`, puis un second démarrage que la ROM annonce par `rst:0xc (RTC_SW_CPU_RST)`. Les secondes d'attente ne sont pas exécutées : le CPU dort dans `wfi` et le temps de l'appareil saute au prochain événement de timer, si bien que les onze secondes prennent environ une seconde de temps d'hôte. Avec `--strict-mmio`, la même exécution ne touche aucun registre qu'inkemu ne modélise pas et ne prend aucune exception, redémarrage compris.
+
+À savoir :
+
+- **Deux limites, deux horloges.** `--max-cycles N` arrête l'exécution quand le CPU a exécuté N cycles de son horloge ; `--max-time S` l'arrête quand S secondes du temps de l'appareil se sont écoulées depuis la mise sous tension (un nombre décimal : `30`, `2.5`, `0.001`). Un CPU qui dort n'exécute aucun cycle alors que le temps de l'appareil continue, comme à travers les resets : un firmware qui dort — tout firmware qui attend un timer ou un bouton — n'est borné que par `--max-time`. Les deux peuvent être données ; la première atteinte termine l'exécution, avec le code de sortie 0. L'arrêt est exact et le même sur tout hôte : la première frontière d'instruction à la limite ou après, ou la limite elle-même quand le CPU dort. Un firmware qui attend une interruption que rien ne peut lever termine l'exécution de lui-même, avec le code 4.
+- **Ctrl-C et `kill`.** Sans limite, une exécution se termine par Ctrl-C, qui affiche le même résumé qu'une limite, avec le code 0. Un second Ctrl-C avant l'arrêt sort aussitôt, avec le code 130 et sans résumé. Un simple `kill` n'est pas géré et termine le processus sans résumé non plus. Avec `--trace-hash`, l'empreinte d'une exécution interrompue couvre ce qui a tourné jusqu'à la coupure, qui dépend de l'hôte : elle n'est pas reproductible ; celle d'une exécution terminée par une limite l'est.
+- **Les watchdogs sont réels.** Sans `--flash`, la ROM affiche `invalid header: 0xffffffff` jusqu'à l'expiration du watchdog que la puce arme au reset, 1,3 s plus tard, et redémarre avec `rst:0x7 (TG0WDT_SYS_RST)`, comme une puce vierge. Un firmware qui cesse de nourrir ses watchdogs est réinitialisé de la même façon, et le démarrage suivant nomme le watchdog et l'adresse où il a été pris (`Saved PC`). La ligne `reset by …` d'inkemu donne la cause, le compteur de programme et le pointeur de pile de chaque reset, y compris après un reset système, où la ROM n'affiche pas de `Saved PC`.
+- **La console est aussi lente que l'UART, et en sortie seulement.** Un octet part au débit que le firmware a programmé ; quand une exécution s'arrête, ce qui restait dans l'UART est affiché aussi. `--console` choisit quelle sortie série de l'appareil va sur la sortie standard : `uart0` (par défaut), `uart1` ou `usb-serial-jtag` ; la ROM écrit sur la première et sur la dernière. Rien ne peut encore être envoyé à l'appareil : ni réception UART, ni côté hôte de l'USB-Serial-JTAG (sous-projet 1b-3b).
+- **Tubes et redirections.** `inkemu run … | head -5` se termine quand `head` a ses lignes : une exécution dont le lecteur est parti le dit et finit avec le code 0. Sous Unix, c'est vrai aussi quand le firmware n'affiche plus rien : entre deux tranches qui n'avaient rien à afficher, inkemu demande si son lecteur est encore là. Ailleurs, une telle exécution muette continue jusqu'à sa limite ou jusqu'à Ctrl-C. Quand la sortie standard ne peut pas être écrite pour une autre raison (un disque plein), l'exécution finit avec le code 2 ; un arrêt par `--strict-mmio` garde son code quoi qu'il soit arrivé à la console. Une sortie standard fermée (`>&-`) ne se distingue pas de `/dev/null`, parce que l'exécutable Rust la rouvre sur le périphérique nul avant que le programme ne commence : elle se comporte comme `/dev/null`, la console est abandonnée et l'exécution finit comme elle l'aurait fait, avec le code 0.
+- **Ce qui n'est pas encore émulé.** Le sommeil profond et le sommeil léger : un firmware qui demande l'un ou l'autre continue de tourner (sous-projet 1b-3b). Il n'y a encore ni radio, ni écran, ni bouton. La première ligne de l'erreur standard dit `timing model datasheet-uncalibrated (not calibrated)` : le coût en cycles de chaque instruction vient de documents, pas d'une mesure sur un appareil, donc un temps d'appareil est plausible, pas exact (le banc de calibration est le sous-projet 8).
+- **La flash est en lecture seule.** Au premier démarrage d'une disposition à emplacements OTA dont la partition `otadata` est vierge, celle du Xteink X4, le bootloader enregistre l'emplacement qu'il a choisi. inkemu signale l'effacement de secteur et la programmation de page refusés (`flash command 0x20 is not modeled`, puis `0x02`) et le démarrage continue jusqu'à l'application ; avec `--strict-mmio`, l'exécution s'arrête au premier des deux. Les écritures en flash arrivent avec le sous-projet 1b-3b.
+- **La protection mémoire n'est pas appliquée.** Les entrées PMP, les registres de permission et le garde-pile sont mémorisés et ne lèvent jamais de faute (sous-projet 1b-4).
+- **Codes de sortie** : 0 quand l'exécution s'est terminée normalement (limite de cycles ou limite en temps de l'appareil atteinte, Ctrl-C, ou lecteur de la sortie standard parti) ; 2 pour une erreur (appareil inconnu, ROM absente ou invalide, image flash refusée, sortie standard impossible à écrire) ; 3 pour un arrêt par `--strict-mmio` ; 4 quand le CPU attend une interruption et qu'aucune ne peut venir ; 130 pour un second Ctrl-C.
+
+La console de l'appareil va sur la sortie standard. Tout ce qu'inkemu a à dire va sur l'erreur standard : d'abord l'appareil, le modèle de temps et la flash utilisée ; au fil de l'exécution, une ligne `warning:` pour chaque chose qu'il ne sait pas faire fidèlement ou que le firmware a mal faite (lecture ou écriture d'un registre non modélisé, écriture de 8 ou 16 bits dans un registre de périphérique, opération qu'il ne peut pas exécuter fidèlement, accès à de la flash qu'aucune entrée MMU ne projette, exception CPU) et une ligne `inkemu:` pour chaque reset, qui est un événement de l'exécution et non un avertissement ; à la fin, la raison de l'arrêt, l'endroit, le temps d'appareil écoulé et l'horloge du CPU, puis les lignes les plus répétées. Chaque avertissement et chaque reset distinct n'est listé qu'une fois. `--strict-mmio` fait du premier avertissement un arrêt avec le code 3, pour la CI ; les exceptions CPU et les resets font exception, parce qu'ils sont ce que le firmware fait sur l'appareil. Les registres mémorisés sans que leur effet soit modélisé sont listés dans [docs/registers-accepted-without-effect.md](docs/registers-accepted-without-effect.md).
+
+Pour construire soi-même l'image de référence (il faut Docker ; rien n'est exécuté sur l'hôte), voir [tools/reference-firmware/README.md](tools/reference-firmware/README.md). Le premier lancement télécharge la ROM (4,9 Mo) depuis la version `20260528` d'`esp-rom-elfs` d'Espressif et vérifie son SHA-256 avant de s'en servir ; pour travailler hors ligne, extraire l'archive soi-même et passer `--rom-dir <répertoire>`, ou remplir un répertoire à l'avance avec `inkemu rom fetch --all [--rom-dir <répertoire>]`. Autres commandes : `inkemu inspect <app.bin>` décrit une image d'application ESP-IDF et explique ce qui ne va pas quand il refuse un fichier ; `inkemu rvtest <elf>` exécute un test de conformité RISC-V sans système ([tools/conformance/README.md](tools/conformance/README.md)).
+
+### Pourquoi
+
+Les simulateurs existants pour petits appareils e-ink recompilent les sources du firmware contre un faux pilote d'écran : cela ne marche qu'avec les sources, et cache les bogues du vrai chemin matériel. inkemu fait l'inverse : il émule le SoC, le bus et chaque puce de la carte, puis démarre le binaire du fabricant par sa vraie chaîne de démarrage.
+
+### Objectifs
+
+Ce qui est visé, pas ce qui existe déjà (voir « État » et la feuille de route) : n'importe quel binaire de firmware, sans sources ni symboles ; la fidélité au matériel (carte mémoire et taille de RAM exactes, modèle de temps au cycle, watchdogs, sommeil profond) ; un rendu e-ink réaliste, contrôleur émulé commande par commande et état optique par pixel (flash de rafraîchissement complet, ghosting, niveaux de gris, durées de rafraîchissement) ; des appareils décrits par des données, un profil TOML par appareil ; le déterminisme, toute session pouvant être enregistrée et rejouée bit pour bit, trafic réseau compris ; l'outillage (console série, serveur GDB, moniteur de ressources, CLI sans écran avec scripts d'entrée et régression visuelle pour la CI) ; la connectivité (Wi-Fi émulé avec accès Internet réel, BLE) ; partout, un seul cœur Rust compilé pour Linux, macOS et Windows et en WebAssembly pour le navigateur, interface en anglais et en français.
+
+### Matériel visé (prévu)
+
+Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtensa LX7, deux cœurs) : Xteink X4 Pro et X4C. Les appareils Xteink sont les premières cibles ; l'architecture ne leur est pas liée, d'autres appareils et d'autres SoC suivront.
+
+### Feuille de route
+
+1. Cœur RV32IMC, ESP32-C3 minimal, chargeur de firmware, CLI : démarrer un firmware jusqu'à ses journaux de console. *1a fait ; 1b-1, squelette du SoC et démarrage de la ROM, fait ; 1b-2, flash et bootloader, fait ; 1b-3a, interruptions, timers, watchdogs et reset, fait ; 1b-3b, écritures en flash et firmware fourni seul, est le suivant.*
+2. Périphériques du X4, interface de bureau, rendu e-ink : **premier jalon visuel**
+3. Prise en charge du X3 (dalle UC8253, capteurs I2C)
+4. Débogage, moniteur de ressources, exécution de tests sans écran
+5. Wi-Fi (accès Internet réel) et BLE
+6. Version WebAssembly et interface web
+7. Cœur Xtensa LX7 et ESP32-S3 : X4 Pro (tactile, PSRAM, SDMMC) et X4C
+8. Banc de calibration du temps
+9. Paquets de version signés
+
+### Documentation
+
+La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) et [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
+
+### Matériel tiers et licence
+
+La ROM masquée de l'ESP32-C3 est le code d'Espressif et n'est pas libre : inkemu ne la distribue jamais, il télécharge les fichiers ELF qu'Espressif publie sous Apache-2.0 dans `esp-rom-elfs` et les vérifie contre des empreintes épinglées. Le firmware de référence (bootloader ESP-IDF et exemple `hello_world`, Apache-2.0) est construit dans Docker et vérifié de même ; aucun binaire de firmware n'est stocké dans ce dépôt. `third_party/espressif-svd/` contient une copie non modifiée du `esp32c3.svd` d'Espressif (Apache-2.0), dont `crates/svd-regs` est généré. Voir l'[ADR 0001](docs/adr/0001-espressif-rom-and-svd-licensing.md). inkemu est sous [licence Apache 2.0](LICENSE). Xteink est une marque de son propriétaire ; ce projet n'est affilié ni à Xteink ni à Espressif.
 
 ## Third-party material
 
