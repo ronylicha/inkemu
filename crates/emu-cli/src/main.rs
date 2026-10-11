@@ -37,6 +37,8 @@ enum Command {
         #[arg(long)]
         allow_misaligned: bool,
     },
+    /// Describe a firmware image and check that inkemu can load it.
+    Inspect { file: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -54,6 +56,31 @@ fn main() -> ExitCode {
             trace_hash,
             allow_misaligned,
         ),
+        Command::Inspect { file } => run_inspect(&file),
+    }
+}
+
+fn run_inspect(path: &Path) -> ExitCode {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {e}", path.display());
+            return ExitCode::from(EXIT_ERROR);
+        }
+    };
+    match firmware::FirmwareImage::parse(&bytes) {
+        Ok(img) => {
+            let name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            print!("{}", emu_cli::inspect::render(&img, &name, bytes.len()));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {}: {e}", path.display());
+            ExitCode::from(EXIT_ERROR)
+        }
     }
 }
 
