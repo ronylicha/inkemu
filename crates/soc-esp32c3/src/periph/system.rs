@@ -50,8 +50,8 @@ const RESETS_1: [(u32, Module); 1] = [(1 << 2, Module::Sha)];
 /// 0 at `APP@0x40381b50`: report IR §3.3, §5).
 ///
 /// ASSUMPTION: registers 1 to 3 behave as register 0 does, each with its own source (51 to 53).
-/// Only register 0 is written on the measured paths; the SVD and `system_reg.h` describe the four
-/// alike, and the three others are modelled by that analogy. Setting bit 0 of
+/// Only register 0 is written on the measured paths; the SVD names the four alike, with a map
+/// register each, and the three others are modelled by that analogy. Setting bit 0 of
 /// `CPU_INTR_FROM_CPU_1` on a chip, with its source routed to an enabled line, and seeing the
 /// interrupt, settles it.
 const CPU_INTR_FROM_CPU_0: u32 =

@@ -549,9 +549,9 @@ impl Timg {
             // ASSUMPTION: an alarm that was already past when it was enabled has no such instant
             // and reloads at the present time: the counter restarts from the reload value with
             // a fresh phase, the fraction of a count it had counted being dropped. Whether the
-            // divider counter is restarted by a reload on silicon is not documented (TRM §11.2
-            // gives the value, not the phase). Reading the counter in a tight loop around an
-            // alarm with `AUTORELOAD`, on a chip with a large divider, settles it.
+            // divider counter is restarted by a reload on silicon is not documented (TW §B.2
+            // gives the value reloaded, not the phase). Reading the counter in a tight loop
+            // around an alarm with `AUTORELOAD`, on a chip with a large divider, settles it.
             let reached = self.t0_alarm_at.map_or(now, |at| at.min(now));
             self.set_t0(self.t0_load, reached);
         }
@@ -744,8 +744,8 @@ impl Peripheral<Ctx> for Timg {
             //
             // ASSUMPTION: the reload anchors the counter at the write: it reads the reload value
             // now and its next count comes one whole count later, the fraction of a count gone
-            // by being dropped (as if the divider counter restarted with it). The TRM says the
-            // counter takes the value "immediately" (§11.2) and nothing of the divider. Reading
+            // by being dropped (as if the divider counter restarted with it). The sources say that
+            // any write reloads (report TW §B.2) and nothing of the divider counter. Reading
             // the counter around a write of `T0LOAD` on a chip with a large divider settles it.
             T0LOAD => {
                 self.set_t0(self.t0_load, now);
