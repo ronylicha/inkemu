@@ -23,6 +23,12 @@ const UNPACK_ENTRY_BYTES: u64 = 16;
 /// The real tables hold 31 to 33 entries; this bounds the loop on a hostile file.
 const MAX_UNPACK_TABLE_BYTES: u64 = 0x1000;
 const BTDM_DATA_SECTION: &str = ".data_btdm";
+/// Plausibility cap on non-empty `PT_LOAD` headers. The real ROM ELFs have 29 of them; a hostile file
+/// could otherwise make every segment rewrite up to 384 KiB of the image from the same file bytes.
+const MAX_LOAD_SEGMENTS: usize = 128;
+/// Plausibility cap on non-empty `PROGBITS` sections. The real ROM ELFs have about 75; section
+/// placement scans the segments and sections for each of them, so the work grows with the product.
+const MAX_PROGBITS_SECTIONS: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RomError {
@@ -121,7 +127,23 @@ impl<'a> Source<'a> {
         if elf.entry != u64::from(ROM_BASE) {
             return Err(RomError::WrongEntry { entry: elf.entry });
         }
-        Ok(Self { file, elf })
+        let source = Self { file, elf };
+        source.check_plausible_size()?;
+        Ok(source)
+    }
+
+    /// Bounds the work done on a hostile file before any placement starts.
+    fn check_plausible_size(&self) -> Result<(), RomError> {
+        let (loads, sections) = (self.loads().count(), self.progbits().count());
+        if loads > MAX_LOAD_SEGMENTS || sections > MAX_PROGBITS_SECTIONS {
+            return Err(RomError::UnexpectedLayout {
+                detail: format!(
+                    "the ELF has {loads} loadable segments and {sections} data sections, \
+                     more than the {MAX_LOAD_SEGMENTS} and {MAX_PROGBITS_SECTIONS} any ESP32-C3 ROM needs"
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn symbol(&self, name: &'static str) -> Result<u64, RomError> {
@@ -157,15 +179,26 @@ impl<'a> Source<'a> {
     }
 
     /// 1. Loadable segments whose LOAD address is in the ROM. This drops the linker artefact that
-    ///    carries the ELF header itself (LOAD address in RAM).
+    ///    carries the ELF header itself (LOAD address entirely in RAM). A segment that touches the
+    ///    ROM window without fitting in it is a damaged file, not an artefact.
     fn place_segments(&self, layout: &mut Layout) -> Result<(), RomError> {
+        let rom_start = u64::from(ROM_BASE);
+        let rom_end = rom_start + u64::from(ROM_SIZE);
         for ph in self.loads() {
-            if let Some(range) = rom_range(ph.p_paddr, ph.p_filesz) {
-                layout.put(
-                    range,
-                    self.file_range(ph.p_offset, ph.p_filesz, "a loadable segment")?,
-                );
+            if ph.p_paddr >= rom_end || ph.p_paddr + ph.p_filesz <= rom_start {
+                continue;
             }
+            let range =
+                rom_range(ph.p_paddr, ph.p_filesz).ok_or_else(|| RomError::UnexpectedLayout {
+                    detail: format!(
+                        "the loadable segment at {:#010x} ({:#x} bytes) overruns the ROM",
+                        ph.p_paddr, ph.p_filesz
+                    ),
+                })?;
+            layout.put(
+                range,
+                self.file_range(ph.p_offset, ph.p_filesz, "a loadable segment")?,
+            );
         }
         Ok(())
     }
@@ -332,7 +365,8 @@ impl RomImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::rom_elf;
+    use crate::memmap::DROM_BASE;
+    use crate::test_support::{ElfBuilder, UNPACK_TABLE, rom_elf};
 
     #[test]
     fn converts_segments_sections_and_initial_data() {
@@ -424,6 +458,219 @@ mod tests {
         for cut in [0, 10, 52, 60, full.len() / 2, full.len() - 1] {
             assert!(RomImage::from_elf(&full[..cut]).is_err(), "cut at {cut}");
         }
+    }
+
+    // Forging helpers: the builder always writes a consistent file, so these patch one header field
+    // of the built bytes (ELF32 layout: 52-byte header, 32-byte program headers, 40-byte section headers).
+    const E_SHOFF: usize = 32;
+    const PROGRAM_HEADERS: usize = 52;
+    const PROGRAM_HEADER_LEN: usize = 32;
+    const P_OFFSET: usize = 4;
+    const SECTION_HEADER_LEN: usize = 40;
+    const SH_OFFSET: usize = 16;
+
+    fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    fn forge_segment_offset(elf: &mut [u8], segment: usize, offset: u32) {
+        let at = PROGRAM_HEADERS + PROGRAM_HEADER_LEN * segment + P_OFFSET;
+        elf[at..at + 4].copy_from_slice(&offset.to_le_bytes());
+    }
+
+    /// `section` counts the builder's own sections (the null section is skipped).
+    fn forge_section_offset(elf: &mut [u8], section: usize, offset: u32) {
+        let first = usize::try_from(u32_at(elf, E_SHOFF)).unwrap();
+        let at = first + SECTION_HEADER_LEN * (section + 1) + SH_OFFSET;
+        elf[at..at + 4].copy_from_slice(&offset.to_le_bytes());
+    }
+
+    fn set_unpack_word(elf: &mut ElfBuilder, word: usize, value: u32) {
+        let at = UNPACK_TABLE + 4 * word;
+        elf.segments[1].2[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn past_the_end(elf: &[u8]) -> u32 {
+        u32::try_from(elf.len()).unwrap()
+    }
+
+    #[test]
+    fn segment_data_beyond_the_file_is_truncated() {
+        let mut elf = rom_elf().build();
+        let end = past_the_end(&elf);
+        forge_segment_offset(&mut elf, 1, end);
+        assert_eq!(
+            RomImage::from_elf(&elf),
+            Err(RomError::Truncated {
+                what: "a loadable segment"
+            })
+        );
+    }
+
+    #[test]
+    fn data_bus_section_beyond_the_file_is_truncated() {
+        let mut elf = rom_elf().build();
+        let end = past_the_end(&elf);
+        forge_section_offset(&mut elf, 3, end); // .rodata.interface
+        assert_eq!(
+            RomImage::from_elf(&elf),
+            Err(RomError::Truncated {
+                what: "a read-only data section"
+            })
+        );
+    }
+
+    #[test]
+    fn initial_data_section_beyond_the_file_is_truncated() {
+        let mut elf = rom_elf().build();
+        let end = past_the_end(&elf);
+        forge_section_offset(&mut elf, 0, end); // .data_x
+        assert_eq!(
+            RomImage::from_elf(&elf),
+            Err(RomError::Truncated {
+                what: "an initial-data section"
+            })
+        );
+    }
+
+    #[test]
+    fn btdm_section_beyond_the_file_is_truncated() {
+        let mut elf = rom_elf().build();
+        let end = past_the_end(&elf);
+        forge_section_offset(&mut elf, 2, end); // .data_btdm
+        assert_eq!(
+            RomImage::from_elf(&elf),
+            Err(RomError::Truncated {
+                what: BTDM_DATA_SECTION
+            })
+        );
+    }
+
+    #[test]
+    fn unpack_table_that_is_not_whole_entries_is_a_layout_error() {
+        let mut elf = rom_elf();
+        elf.symbols
+            .iter_mut()
+            .find(|s| s.0 == "_data_end")
+            .unwrap()
+            .1 = ROM_BASE + 0x118; // 0x18 bytes
+        let err = RomImage::from_elf(&elf.build()).unwrap_err();
+        assert!(
+            matches!(&err, RomError::UnexpectedLayout { detail } if detail.contains("malformed")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unpack_table_larger_than_any_real_one_is_a_layout_error() {
+        let mut elf = rom_elf();
+        let end = ROM_BASE + 0x100 + u32::try_from(MAX_UNPACK_TABLE_BYTES).unwrap() + 0x10;
+        elf.symbols
+            .iter_mut()
+            .find(|s| s.0 == "_data_end")
+            .unwrap()
+            .1 = end;
+        let err = RomImage::from_elf(&elf.build()).unwrap_err();
+        assert!(
+            matches!(&err, RomError::UnexpectedLayout { detail } if detail.contains("malformed")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unpack_source_outside_the_rom_is_a_layout_error() {
+        let mut elf = rom_elf();
+        set_unpack_word(&mut elf, 2, 0x5000_0000); // entry 0, source
+        let err = RomImage::from_elf(&elf.build()).unwrap_err();
+        assert!(
+            matches!(&err, RomError::UnexpectedLayout { detail } if detail.contains("unpack source")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unpack_destination_that_no_section_holds_is_a_layout_error() {
+        let mut elf = rom_elf();
+        set_unpack_word(&mut elf, 0, 0x3FCE_0000); // entry 0, destination start
+        set_unpack_word(&mut elf, 1, 0x3FCE_0004); // entry 0, destination end
+        let err = RomImage::from_elf(&elf.build()).unwrap_err();
+        assert!(
+            matches!(&err, RomError::UnexpectedLayout { detail } if detail.contains("no section holds")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn data_bus_section_overrunning_its_window_is_a_layout_error() {
+        let mut elf = rom_elf();
+        elf.sections[3].1 = DROM_BASE + 0x1_FFFE; // 4 bytes, 2 of them past the window
+        let err = RomImage::from_elf(&elf.build()).unwrap_err();
+        assert!(
+            matches!(&err, RomError::UnexpectedLayout { detail } if detail.contains("overruns the data-bus window")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn segment_overrunning_the_end_of_the_rom_is_a_layout_error() {
+        let mut elf = rom_elf();
+        let start = ROM_BASE + crate::memmap::ROM_SIZE - 2;
+        elf.segments.push((start, start, vec![0; 4]));
+        let err = RomImage::from_elf(&elf.build()).unwrap_err();
+        assert!(
+            matches!(&err, RomError::UnexpectedLayout { detail } if detail.contains("0x4005fffe")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn segment_reaching_into_the_rom_from_below_is_a_layout_error() {
+        let mut elf = rom_elf();
+        elf.segments.push((ROM_BASE - 2, ROM_BASE - 2, vec![0; 4]));
+        let err = RomImage::from_elf(&elf.build()).unwrap_err();
+        assert!(
+            matches!(&err, RomError::UnexpectedLayout { detail } if detail.contains("0x3ffffffe")),
+            "{err}"
+        );
+    }
+
+    fn with_extra_segments(count: usize) -> ElfBuilder {
+        let mut elf = rom_elf();
+        // Entirely in RAM, so ignored by the placement: only their number matters.
+        elf.segments
+            .extend((0..count).map(|_| (0x3FCC_0000, 0x3FCC_0000, vec![0])));
+        elf
+    }
+
+    fn with_extra_sections(count: usize) -> ElfBuilder {
+        let mut elf = rom_elf();
+        elf.sections
+            .extend((0..count).map(|_| ("pad", 0x3FCD_0000, vec![0])));
+        elf
+    }
+
+    #[test]
+    fn segment_count_cap_is_inclusive_and_exceeding_it_is_a_layout_error() {
+        let present = rom_elf().segments.len();
+        assert!(
+            RomImage::from_elf(&with_extra_segments(MAX_LOAD_SEGMENTS - present).build()).is_ok()
+        );
+        let err = RomImage::from_elf(&with_extra_segments(MAX_LOAD_SEGMENTS - present + 1).build())
+            .unwrap_err();
+        assert!(matches!(err, RomError::UnexpectedLayout { .. }), "{err}");
+    }
+
+    #[test]
+    fn section_count_cap_is_inclusive_and_exceeding_it_is_a_layout_error() {
+        let present = rom_elf().sections.len();
+        assert!(
+            RomImage::from_elf(&with_extra_sections(MAX_PROGBITS_SECTIONS - present).build())
+                .is_ok()
+        );
+        let err =
+            RomImage::from_elf(&with_extra_sections(MAX_PROGBITS_SECTIONS - present + 1).build())
+                .unwrap_err();
+        assert!(matches!(err, RomError::UnexpectedLayout { .. }), "{err}");
     }
 
     #[test]

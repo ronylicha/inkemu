@@ -237,7 +237,8 @@ impl ElfBuilder {
 /// `e_machine` of RISC-V.
 const RISCV: u16 = 243;
 const CODE_LEN: usize = 0x200;
-const UNPACK_TABLE: usize = 0x100;
+/// Offset of the `unpack` table inside the code segment of [`rom_elf`].
+pub const UNPACK_TABLE: usize = 0x100;
 
 /// A ROM laid out like the real ones, in miniature:
 /// code at `0x4000_0000` (0x200 bytes, zero-filled segment up to 0x300), an unpack table with two
