@@ -9,12 +9,12 @@ use std::fmt;
 /// An erased NOR flash byte.
 pub const ERASED: u8 = 0xFF;
 /// The unit of a sector erase, and of the "modified" state of the chip.
-pub const SECTOR_BYTES: u32 = 4 << 10;
+pub(crate) const SECTOR_BYTES: u32 = 4 << 10;
 /// The unit of a block erase (`D8`): 64 KiB for the ROM and for ESP-IDF alike (FW §A.1).
-pub const BLOCK_BYTES: u32 = 64 << 10;
+pub(crate) const BLOCK_BYTES: u32 = 64 << 10;
 /// The unit of a page program: a program that reaches the end of its page wraps to its start
 /// (FW §C).
-pub const PAGE_BYTES: u32 = 256;
+pub(crate) const PAGE_BYTES: u32 = 256;
 /// One mebibyte, the unit device profiles write flash sizes in.
 pub const MIB: u32 = 1 << 20;
 pub const MIN_FLASH_BYTES: u32 = MIB;
@@ -264,15 +264,15 @@ pub struct FlashCommand<'a> {
 /// ESP-IDF code sends such a transfer (the bootloader and ESP-IDF give a data-in length only to
 /// the commands that answer: FW §A.2, §A.3); one read against a device settles it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FlashFrame {
+pub(crate) struct FlashFrame {
     /// Bits of the address phase: 24, or 0 for a command without an address.
-    pub address_bits: u32,
+    pub(crate) address_bits: u32,
     /// Dummy clocks between the address and the data.
-    pub dummy_cycles: u32,
+    pub(crate) dummy_cycles: u32,
     /// The fewest bytes the controller sends after them.
-    pub data_out_min: u32,
+    pub(crate) data_out_min: u32,
     /// The most: `u32::MAX` for a page program, of which the chip keeps the last 256.
-    pub data_out_max: u32,
+    pub(crate) data_out_max: u32,
 }
 
 impl FlashFrame {
@@ -295,15 +295,23 @@ impl FlashFrame {
     /// - the data reads: a 24-bit address, then the dummy clocks each one takes (0 for `03`, 4
     ///   for `BB`, 6 for `EB`, 8 for `0B`, `3B` and `6B`);
     /// - `AB`, `9F`, `05`, `06`, `04`, `C7`/`60`: the opcode alone, as the hard-wired bits of
-    ///   `SPI1.CMD` send them (FW §A.1) and as the bootloader and ESP-IDF send `9F`, `05`, `7A`
-    ///   and `04` through `USR` (`USER = 0x90000080` or `0x80000000`: no address, no dummy
-    ///   clock, no data out; FW §A.2, §A.3, BA §2.2);
-    /// - `5A`: a 24-bit address and 8 dummy clocks (`USER1 = 23 << 26 | 7`, BA §2.2);
+    ///   `SPI1.CMD` send them (FW §A.1), and as the bootloader and ESP-IDF send `9F`, `05`,
+    ///   `7A` and `04` through `USR`: a command phase, then bytes in or none, with no address,
+    ///   no dummy clock and no data out. FW §A.2 gives ESP-IDF's `USER = 0x90000080` for `9F`
+    ///   and `05` (`USR_COMMAND`, `USR_MISO`, `CS_SETUP`); BA §2.2 gives the bootloader's
+    ///   frames in words (`9F` with 24 bits in, `05` with 8, `7A` and `04` alone, FW §A.3 the
+    ///   same list), which `USER = 0x90000080` and `USER = 0x80000000` (`USR_COMMAND` alone)
+    ///   encode;
+    /// - `5A`: a 24-bit address and 8 dummy clocks. BA §2.2 gives the frame in words (address
+    ///   `0x10`, 8 dummy bits, 8 bits in), which `USER1 = 23 << 26 | 7` encodes (address bits
+    ///   − 1 and dummy clocks − 1, FW §A.1). The width of the address is in no report: it is
+    ///   the one the reference boots send, and they run in strict mode, where another frame is
+    ///   refused;
     /// - `01`: one data byte (FW §C: this part has no second status byte);
     /// - `02`: a 24-bit address and at least one byte; `20`, `D8`: a 24-bit address (FW §A.2,
     ///   §A.3).
     #[must_use]
-    pub fn of(opcode: u8) -> Option<FlashFrame> {
+    pub(crate) fn of(opcode: u8) -> Option<FlashFrame> {
         if let Some(&(_, dummy_cycles)) = READS.iter().find(|(read, _)| *read == opcode) {
             return Some(FlashFrame::addressed(ADDRESS_BITS, dummy_cycles));
         }
@@ -371,7 +379,8 @@ impl fmt::Display for FlashFrame {
 pub enum FlashRefusal {
     /// The model does not implement this opcode.
     Unmodeled { opcode: u8 },
-    /// The opcode is known, but not sent in its frame ([`FlashFrame::of`]): an address that is
+    /// The opcode is known, but not sent in its frame (the one frame each command the model
+    /// runs takes, listed in the message of this refusal): an address that is
     /// not as long as the command takes (0 when there is none), other dummy clocks, or a number
     /// of data bytes it does not carry. What a chip does with such a frame is not modelled.
     Form {
@@ -432,7 +441,9 @@ impl FlashJournal {
         if self.writes.len() < JOURNAL_CAPACITY {
             self.writes.push(write);
         } else {
-            self.dropped += 1;
+            // A count that reached the largest number stays there, as the counts of commands
+            // do: it never wraps to a small one, and never stops the run.
+            self.dropped = self.dropped.saturating_add(1);
         }
     }
 
@@ -580,6 +591,14 @@ pub struct NorFlash {
     /// The status register, write-enable latch included. It is not part of the content: a chip
     /// that is built starts from the factory value `0x00` (FW §C).
     status: u8,
+    /// The version of the content: one more for every program that changed a byte and for
+    /// every sector an erase changed.
+    ///
+    /// It does not saturate as the counts do: a version that stopped moving would keep decoded
+    /// code of bytes that changed. Nor can it overflow: an erase changes only sectors that a
+    /// program or the image filled, so it moves at most twice for each program, plus once for
+    /// each sector of the image, and a program is at least one instruction. 2^63 instructions
+    /// take more than 1,800 years of device time at 160 MHz.
     generation: u64,
     /// The sectors whose content changed.
     modified: SectorSet,
@@ -2445,5 +2464,17 @@ mod tests {
         assert_eq!(journal.take(), [entry(7)]);
         assert_eq!(journal.take(), []);
         assert_eq!(journal.dropped(), 6);
+    }
+
+    #[test]
+    fn a_count_of_lost_entries_that_reached_the_largest_number_stays_there() {
+        let mut journal = FlashJournal {
+            writes: vec![FlashWrite::Erase { start: 0, len: 0 }; JOURNAL_CAPACITY],
+            dropped: u64::MAX - 1,
+        };
+        for start in 0..3 {
+            journal.record(FlashWrite::Erase { start, len: 0 });
+        }
+        assert_eq!(journal.dropped(), u64::MAX);
     }
 }

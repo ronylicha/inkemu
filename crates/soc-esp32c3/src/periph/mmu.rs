@@ -52,7 +52,7 @@ impl MmuTable {
     /// The 64 KiB flash page entry `index` maps; `None` when the entry is invalid or `index` lies
     /// past the table.
     #[must_use]
-    pub fn flash_page(&self, index: usize) -> Option<u32> {
+    pub(crate) fn flash_page(&self, index: usize) -> Option<u32> {
         self.entry(index)
             .filter(|content| content & MMU_ENTRY_INVALID == 0)
             .map(|content| content & PAGE_NUMBER_MASK)

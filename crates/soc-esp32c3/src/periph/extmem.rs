@@ -194,6 +194,8 @@ pub struct Extmem {
     access_enable: u32,
     fault_content: u32,
     fault_vaddr: u32,
+    /// See [`Extmem::generation`]. A version does not saturate (it must move at every change)
+    /// and cannot overflow: it moves at most once per register write, one instruction at least.
     generation: u64,
     /// The flash pages read through a window since the cache was last invalidated for them: the
     /// pages a device may hold lines of.
