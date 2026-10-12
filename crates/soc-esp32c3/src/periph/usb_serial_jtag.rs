@@ -1,7 +1,7 @@
 //! USB-Serial-JTAG, device-to-host serial path. Register layout: `usb_serial_jtag_reg.h` (report §G.3).
 //!
 //! The model behaves like a board with a host attached and reading: the IN endpoint always has
-//! room. Reception, interrupts and host attach/detach arrive in SP1b-3b.
+//! room. Reception, interrupts and host attach/detach arrive in SP1b-3d.
 use crate::ctx::Ctx;
 use emu_core::Peripheral;
 
@@ -131,7 +131,7 @@ mod tests {
         assert_eq!(
             usb.read(ctx, 0x08),
             None,
-            "INT_RAW arrives with interrupts (SP1b-3b)"
+            "INT_RAW arrives with interrupts (SP1b-3d)"
         );
         assert!(!usb.write(ctx, 0x18, 0), "CONF0");
         assert_eq!(usb.read(ctx, 0x00), None, "no host-to-device data yet");

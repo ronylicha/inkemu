@@ -133,7 +133,7 @@ const ACCEPTED: [Accepted; 9] = [
         "SYSTEM",
         "MEM_PD_MASK",
         "memory power-down mask in light sleep",
-        "SP1b-3b",
+        "SP1b-3f",
     ),
 ];
 

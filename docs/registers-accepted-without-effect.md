@@ -31,18 +31,19 @@ then rewrites the table below, and nothing else; review the diff before committi
 
 "Count" is 1 for a single register, or the number of consecutive registers the row stands for.
 "Made real by" names the plan that gives the register its effect. Each plan inherits the rows that
-name it. The table has six heirs: SP1b-3b, SP1b-4, SP2, SP5a, SP5b and SP8. The carry-over note
-`docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` names the rows of each heir one by one, as
-the table stood at the end of plan SP1b-3a, in its section "Lignes de la table des registres
-acceptés, par héritier".
+name it. The table has eight heirs: SP1b-3b (flash writes), SP1b-3d (the serial consoles in both
+directions), SP1b-3f (deep sleep), SP1b-4, SP2, SP5a, SP5b and SP8. The carry-over note
+`docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` names the rows one by one, as the table
+stood at the end of plan SP1b-3a, when one plan, "SP1b-3b", was to take what five plans now share;
+its first section says which plan takes what.
 
 <!-- generated table -->
 | Address | Register | Count | Hardware effect not modelled | Made real by |
 |---|---|---|---|---|
-| `0x6000000c` | `UART0.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3b |
-| `0x60000010` | `UART0.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3b |
-| `0x60000020` | `UART0.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3b |
-| `0x60000024` | `UART0.CONF1` | 1 | FIFO thresholds | SP1b-3b |
+| `0x6000000c` | `UART0.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3d |
+| `0x60000010` | `UART0.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3d |
+| `0x60000020` | `UART0.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3d |
+| `0x60000024` | `UART0.CONF1` | 1 | FIFO thresholds | SP1b-3d |
 | `0x60002008` | `SPI1.CTRL` | 1 | read mode, dummy output, WP level | SP8 |
 | `0x6000200c` | `SPI1.CTRL1` | 1 | CS hold delay after a release-from-power-down | SP8 |
 | `0x60002010` | `SPI1.CTRL2` | 1 | CS setup and hold times | SP8 |
@@ -73,19 +74,19 @@ acceptés, par héritier".
 | `0x60004168` | `GPIO.FUNC5_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x600050f0` | `FE2.FE2_TX_INTERP_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60006090` | `FE.FE_GEN_CTRL` | 1 | radio memory power: there is no radio | SP5a |
-| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits act) | SP1b-3b |
-| `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays | SP1b-3b |
-| `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP1b-3b |
-| `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing | SP1b-3b |
-| `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time | SP1b-3b |
-| `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing | SP1b-3b |
+| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits act) | SP1b-3f |
+| `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays | SP1b-3f |
+| `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP1b-3f |
+| `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing | SP1b-3f |
+| `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time | SP1b-3f |
+| `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing | SP1b-3f |
 | `0x60008034` | `RTC_CNTL.ANA_CONF` | 1 | analog configuration, glitch reset | SP8 |
 | `0x60008070` | `RTC_CNTL.CLK_CONF` | 1 | RTC fast clock source and dividers (a slow clock other than the RC oscillator is refused) | SP8 |
 | `0x60008074` | `RTC_CNTL.SLOW_CLK_CONF` | 1 | RTC slow clock divider | SP8 |
 | `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP8 |
-| `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control | SP1b-3b |
-| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power-domain control | SP1b-3b |
-| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation | SP1b-3b |
+| `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control | SP1b-3f |
+| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power-domain control | SP1b-3f |
+| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation | SP1b-3f |
 | `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | pad hold | SP2 |
 | `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | digital pad hold | SP2 |
 | `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector: the supply is always good | SP2 |
@@ -98,10 +99,10 @@ acceptés, par héritier".
 | `0x6000e040` | `ANA_I2C.I2C_MST_ANA_CONF0` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6000e044` | `ANA_I2C.ANA_CONFIG` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6000e048` | `ANA_I2C.ANA_CONFIG2` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
-| `0x6001000c` | `UART1.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3b |
-| `0x60010010` | `UART1.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3b |
-| `0x60010020` | `UART1.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3b |
-| `0x60010024` | `UART1.CONF1` | 1 | FIFO thresholds | SP1b-3b |
+| `0x6001000c` | `UART1.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3d |
+| `0x60010010` | `UART1.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3d |
+| `0x60010020` | `UART1.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3d |
+| `0x60010024` | `UART1.CONF1` | 1 | FIFO thresholds | SP1b-3d |
 | `0x6001ccd4` | `NRX.NRXPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x6001d054` | `BB.BBPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60026014` | `APB_CTRL.WIFI_CLK_EN` | 1 | radio clock gates: there is no radio | SP5a |
@@ -118,7 +119,7 @@ acceptés, par héritier".
 | `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals: a gated module keeps answering | SP8 |
 | `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals (the debug assistant) | SP1b-4 |
 | `0x600c0008` | `SYSTEM.CPU_PER_CONF` | 1 | PLL_FREQ_SEL and the CPU wait-mode bits (CPUPERIOD_SEL is used by the clock model) | SP8 |
-| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep | SP1b-3b |
+| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep | SP1b-3f |
 | `0x600c0010` | `SYSTEM.PERIP_CLK_EN0` | 1 | peripheral clock gates: a gated module keeps answering | SP8 |
 | `0x600c0014` | `SYSTEM.PERIP_CLK_EN1` | 1 | peripheral clock gates: a gated module keeps answering | SP8 |
 | `0x600c0020` | `SYSTEM.BT_LPCK_DIV_INT` | 1 | Bluetooth low-power clock divider: there is no radio | SP5b |
