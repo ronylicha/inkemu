@@ -3,11 +3,11 @@
 A register listed here **accepts a write without a diagnostic**, but the emulator does not model
 what the hardware does with the value. Most of them store what the firmware writes and read it back;
 some keep only their configuration bits, beside a status bit the model answers
-(`EXTMEM.ICACHE_PRELOAD_CTRL`, `ICACHE_AUTOLOAD_CTRL`, `ICACHE_FREEZE`, the masked fields of
-`INTERRUPT_CORE0`). Two kinds do not store anything:
+(`EXTMEM.ICACHE_PRELOAD_CTRL`, `ICACHE_AUTOLOAD_CTRL`, `ICACHE_FREEZE`). Two kinds do not store
+anything:
 
-- the write-only strobes `UART0.INT_CLR`, `UART1.INT_CLR` and `INTERRUPT_CORE0.CPU_INT_CLEAR`: the
-  write is accepted and dropped, since nothing is pending; **reading** one is reported as unmodelled;
+- the write-only strobes `UART0.INT_CLR` and `UART1.INT_CLR`: the write is accepted and dropped,
+  since nothing is pending; **reading** one is reported as unmodelled;
 - `EXTMEM.ICACHE_SYNC_CTRL`: the write is accepted and the register always reads its `SYNC_DONE`
   bit, because the operation it starts completes at once.
 
@@ -17,7 +17,7 @@ No other memory-mapped register is silent: it is either modelled or reported by 
 The PMP CSRs (`pmpcfg0` to `pmpcfg3`, `pmpaddr0` to `pmpaddr15`) are accepted without effect too,
 and are not in the table because they are CSRs, not memory-mapped registers: on the ESP32-C3 core
 they are stored with their lock rules and **never enforced** — no access is refused because of them
-(decision D18 of plan SP1b-2). Plan SP1b-3 enforces them.
+(decision D18 of plan SP1b-2). Plan SP1b-4 enforces them (decision E31 of plan SP1b-3a).
 
 The table is generated: the lists live next to each peripheral model (`accepted()` in
 `crates/soc-esp32c3/src/periph/*.rs`). A model that is plain storage is built from its list; a model
@@ -31,24 +31,27 @@ then rewrites the table below, and nothing else; review the diff before committi
 
 "Count" is 1 for a single register, or the number of consecutive registers the row stands for.
 "Made real by" names the plan that gives the register its effect. Each plan inherits the rows that
-name it: the carry-over note `docs/superpowers/notes/2026-10-11-sp1b-2-carryover.md` says so under
-SP1b-3, SP1b-4, SP2, SP5a and SP8.
+name it. The table has six heirs: SP1b-3b, SP1b-4, SP2, SP5a, SP5b and SP8. The carry-over note
+`docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` names the rows of each heir one by one, as
+the table stood at the end of plan SP1b-3a, in its section "Lignes de la table des registres
+acceptés, par héritier".
 
 <!-- generated table -->
 | Address | Register | Count | Hardware effect not modelled | Made real by |
 |---|---|---|---|---|
-| `0x6000000c` | `UART0.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3 |
-| `0x60000010` | `UART0.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3 |
-| `0x60000014` | `UART0.CLKDIV` | 1 | baud rate: bytes leave at once | SP1b-3 |
-| `0x60000020` | `UART0.CONF0` | 1 | frame format | SP1b-3 |
-| `0x60000024` | `UART0.CONF1` | 1 | FIFO thresholds | SP1b-3 |
-| `0x60000078` | `UART0.CLK_CONF` | 1 | clock source and divider | SP1b-3 |
+| `0x6000000c` | `UART0.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3b |
+| `0x60000010` | `UART0.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3b |
+| `0x60000020` | `UART0.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3b |
+| `0x60000024` | `UART0.CONF1` | 1 | FIFO thresholds | SP1b-3b |
 | `0x60002008` | `SPI1.CTRL` | 1 | read mode, dummy output, WP level | SP8 |
 | `0x6000200c` | `SPI1.CTRL1` | 1 | CS hold delay after a release-from-power-down | SP8 |
 | `0x60002010` | `SPI1.CTRL2` | 1 | CS setup and hold times | SP8 |
 | `0x60002014` | `SPI1.CLOCK` | 1 | SPI clock divider: a transfer takes no time | SP8 |
-| `0x600020a4` | `SPI1.SUS_STATUS` | 1 | program/erase suspend state | SP1b-3 |
-| `0x600020dc` | `SPI1.CLOCK_GATE` | 1 | register clock gate | SP1b-3 |
+| `0x60002034` | `SPI1.MISC` | 1 | chip-select idle level and enables | SP8 |
+| `0x60002098` | `SPI1.FLASH_WAITI_CTRL` | 1 | automatic wait for the chip to be idle after a program or an erase | SP1b-3b |
+| `0x6000209c` | `SPI1.FLASH_SUS_CTRL` | 1 | automatic program/erase suspend and resume | SP1b-3b |
+| `0x600020a4` | `SPI1.SUS_STATUS` | 1 | program/erase suspend state | SP1b-3b |
+| `0x600020dc` | `SPI1.CLOCK_GATE` | 1 | register clock gate | SP8 |
 | `0x60003008` | `SPI0.CTRL` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
 | `0x60003010` | `SPI0.CTRL2` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
 | `0x60003014` | `SPI0.CLOCK` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
@@ -59,37 +62,34 @@ SP1b-3, SP1b-4, SP2, SP5a and SP8.
 | `0x60003028` | `SPI0.MISO_DLEN` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
 | `0x60003034` | `SPI0.MISC` | 1 | chip-select enables | SP1b-4 |
 | `0x6000303c` | `SPI0.CACHE_FCTRL` | 1 | cache request enable | SP1b-4 |
-| `0x600030dc` | `SPI0.CLOCK_GATE` | 1 | register clock gate | SP1b-3 |
+| `0x600030dc` | `SPI0.CLOCK_GATE` | 1 | register clock gate | SP8 |
+| `0x600030e0` | `SPI0.CORE_CLK_SEL` | 1 | MSPI core clock selection: a transfer takes no time | SP8 |
 | `0x60004020` | `GPIO.ENABLE` | 1 | pin output enable | SP2 |
 | `0x60004154` | `GPIO.FUNC0_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x60004158` | `GPIO.FUNC1_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
+| `0x6000415c` | `GPIO.FUNC2_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
+| `0x60004160` | `GPIO.FUNC3_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
+| `0x60004164` | `GPIO.FUNC4_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
+| `0x60004168` | `GPIO.FUNC5_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x600050f0` | `FE2.FE2_TX_INTERP_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60006090` | `FE.FE_GEN_CTRL` | 1 | radio memory power: there is no radio | SP5a |
-| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing (software reset bits are refused) | SP1b-3 |
-| `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays | SP1b-3 |
-| `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP1b-3 |
-| `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing | SP1b-3 |
-| `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time | SP1b-3 |
-| `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing | SP1b-3 |
-| `0x60008034` | `RTC_CNTL.ANA_CONF` | 1 | analog configuration, glitch reset | SP1b-3 |
-| `0x60008040` | `RTC_CNTL.INT_ENA_RTC` | 1 | RTC interrupt enables: nothing is raised | SP1b-3 |
-| `0x6000804c` | `RTC_CNTL.INT_CLR_RTC` | 1 | RTC interrupt clear: nothing is pending | SP1b-3 |
-| `0x60008070` | `RTC_CNTL.CLK_CONF` | 1 | RTC fast and slow clock sources and dividers | SP1b-3 |
-| `0x60008074` | `RTC_CNTL.SLOW_CLK_CONF` | 1 | RTC slow clock divider | SP1b-3 |
-| `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP1b-3 |
-| `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control | SP1b-3 |
-| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power-domain control | SP1b-3 |
-| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation | SP1b-3 |
-| `0x60008090` | `RTC_CNTL.WDTCONFIG0` | 1 | RTC watchdog enable and stages: it never expires (D11) | SP1b-3 |
-| `0x60008094` | `RTC_CNTL.WDTCONFIG1` | 1 | RTC watchdog stage 0 timeout | SP1b-3 |
-| `0x600080a4` | `RTC_CNTL.WDTFEED` | 1 | RTC watchdog feed | SP1b-3 |
-| `0x600080a8` | `RTC_CNTL.WDTWPROTECT` | 1 | RTC watchdog write protection: writes are never locked out | SP1b-3 |
-| `0x600080ac` | `RTC_CNTL.SWD_CONF` | 1 | super watchdog: auto-feed, reset flag, strobes | SP1b-3 |
-| `0x600080b0` | `RTC_CNTL.SWD_WPROTECT` | 1 | super watchdog write protection | SP1b-3 |
+| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits act) | SP1b-3b |
+| `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays | SP1b-3b |
+| `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP1b-3b |
+| `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing | SP1b-3b |
+| `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time | SP1b-3b |
+| `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing | SP1b-3b |
+| `0x60008034` | `RTC_CNTL.ANA_CONF` | 1 | analog configuration, glitch reset | SP8 |
+| `0x60008070` | `RTC_CNTL.CLK_CONF` | 1 | RTC fast clock source and dividers (a slow clock other than the RC oscillator is refused) | SP8 |
+| `0x60008074` | `RTC_CNTL.SLOW_CLK_CONF` | 1 | RTC slow clock divider | SP8 |
+| `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP8 |
+| `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control | SP1b-3b |
+| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power-domain control | SP1b-3b |
+| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation | SP1b-3b |
 | `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | pad hold | SP2 |
 | `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | digital pad hold | SP2 |
-| `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector | SP1b-3 |
-| `0x6000810c` | `RTC_CNTL.FIB_SEL` | 1 | brown-out and glitch reset selection | SP1b-3 |
+| `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector: the supply is always good | SP2 |
+| `0x6000810c` | `RTC_CNTL.FIB_SEL` | 1 | brown-out and glitch reset selection (the super watchdog bit acts) | SP2 |
 | `0x6000811c` | `RTC_CNTL.SENSOR_CTRL` | 1 | SAR ADC power forcing | SP2 |
 | `0x60009000` | `IO_MUX.PIN_CTRL` | 23 | pad function, pulls, drive strength, input enable | SP2 |
 | `0x600090fc` | `IO_MUX.DATE` | 1 | none: the version date of the block, stored as written | SP2 |
@@ -98,16 +98,14 @@ SP1b-3, SP1b-4, SP2, SP5a and SP8.
 | `0x6000e040` | `ANA_I2C.I2C_MST_ANA_CONF0` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6000e044` | `ANA_I2C.ANA_CONFIG` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6000e048` | `ANA_I2C.ANA_CONFIG2` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
-| `0x6001000c` | `UART1.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3 |
-| `0x60010010` | `UART1.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3 |
-| `0x60010014` | `UART1.CLKDIV` | 1 | baud rate: bytes leave at once | SP1b-3 |
-| `0x60010020` | `UART1.CONF0` | 1 | frame format | SP1b-3 |
-| `0x60010024` | `UART1.CONF1` | 1 | FIFO thresholds | SP1b-3 |
-| `0x60010078` | `UART1.CLK_CONF` | 1 | clock source and divider | SP1b-3 |
+| `0x6001000c` | `UART1.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3b |
+| `0x60010010` | `UART1.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3b |
+| `0x60010020` | `UART1.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3b |
+| `0x60010024` | `UART1.CONF1` | 1 | FIFO thresholds | SP1b-3b |
 | `0x6001ccd4` | `NRX.NRXPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x6001d054` | `BB.BBPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
-| `0x6001f048` | `TIMG0.WDTCONFIG0` | 1 | main watchdog 0 enable and stages: it never expires (D11) | SP1b-3 |
-| `0x6001f064` | `TIMG0.WDTWPROTECT` | 1 | main watchdog 0 write protection | SP1b-3 |
+| `0x60026014` | `APB_CTRL.WIFI_CLK_EN` | 1 | radio clock gates: there is no radio | SP5a |
+| `0x60026018` | `APB_CTRL.WIFI_RST_EN` | 1 | radio resets: there is no radio | SP5a |
 | `0x6002609c` | `APB_CTRL.FRONT_END_MEM_PD` | 1 | radio front-end memory power | SP5a |
 | `0x600260ac` | `APB_CTRL.MEM_POWER_UP` | 1 | radio memory power | SP5a |
 | `0x60040000` | `APB_SARADC.CTRL` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
@@ -117,23 +115,17 @@ SP1b-3, SP1b-4, SP2, SP5a and SP8.
 | `0x6004001c` | `APB_SARADC.SAR_PATT_TAB2` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
 | `0x60040050` | `APB_SARADC.DMA_CONF` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
 | `0x60040054` | `APB_SARADC.CLKM_CONF` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
-| `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals | SP1b-3 |
-| `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals | SP1b-3 |
+| `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals: a gated module keeps answering | SP8 |
+| `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals (the debug assistant) | SP1b-4 |
 | `0x600c0008` | `SYSTEM.CPU_PER_CONF` | 1 | PLL_FREQ_SEL and the CPU wait-mode bits (CPUPERIOD_SEL is used by the clock model) | SP8 |
-| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep | SP1b-3 |
-| `0x600c0010` | `SYSTEM.PERIP_CLK_EN0` | 1 | peripheral clock gates | SP1b-3 |
-| `0x600c0014` | `SYSTEM.PERIP_CLK_EN1` | 1 | peripheral clock gates | SP1b-3 |
-| `0x600c0018` | `SYSTEM.PERIP_RST_EN0` | 1 | peripheral reset pulses | SP1b-3 |
-| `0x600c001c` | `SYSTEM.PERIP_RST_EN1` | 1 | peripheral reset pulses | SP1b-3 |
+| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep | SP1b-3b |
+| `0x600c0010` | `SYSTEM.PERIP_CLK_EN0` | 1 | peripheral clock gates: a gated module keeps answering | SP8 |
+| `0x600c0014` | `SYSTEM.PERIP_CLK_EN1` | 1 | peripheral clock gates: a gated module keeps answering | SP8 |
+| `0x600c0020` | `SYSTEM.BT_LPCK_DIV_INT` | 1 | Bluetooth low-power clock divider: there is no radio | SP5b |
+| `0x600c0024` | `SYSTEM.BT_LPCK_DIV_FRAC` | 1 | Bluetooth low-power clock source: there is no radio | SP5b |
 | `0x600c0040` | `SYSTEM.CACHE_CONTROL` | 1 | cache clock enable and reset | SP1b-4 |
-| `0x600c101c` | `SENSITIVE.INTERNAL_SRAM_USAGE_1` | 1 | SRAM0 handed to the cache as line storage | SP1b-4 |
-| `0x600c2000` | `INTERRUPT_CORE0.MAC_INTR_MAP` | 62 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c2100` | `INTERRUPT_CORE0.CLOCK_GATE` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c2104` | `INTERRUPT_CORE0.CPU_INT_ENABLE` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c2108` | `INTERRUPT_CORE0.CPU_INT_TYPE` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c210c` | `INTERRUPT_CORE0.CPU_INT_CLEAR` | 1 | edge-interrupt acknowledge: nothing is pending | SP1b-3 |
-| `0x600c2114` | `INTERRUPT_CORE0.CPU_INT_PRI_0` | 32 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
-| `0x600c2194` | `INTERRUPT_CORE0.CPU_INT_THRESH` | 1 | interrupt routing: nothing is delivered to the CPU | SP1b-3 |
+| `0x600c1000` | `SENSITIVE.ROM_TABLE_LOCK` | 93 | permission management: no access is checked, no violation is raised | SP1b-4 |
+| `0x600c2100` | `INTERRUPT_CORE0.CLOCK_GATE` | 1 | clock gate of the controller's registers: they always answer | SP8 |
 | `0x600c4000` | `EXTMEM.ICACHE_CTRL` | 1 | cache enable: the flash windows are always readable (D5) | SP1b-4 |
 | `0x600c4004` | `EXTMEM.ICACHE_CTRL1` | 1 | bus gating of the flash windows (SHUT_IBUS, SHUT_DBUS; D5) | SP1b-4 |
 | `0x600c4008` | `EXTMEM.ICACHE_TAG_POWER_CTRL` | 1 | tag memory power | SP8 |
@@ -142,10 +134,12 @@ SP1b-3, SP1b-4, SP2, SP5a and SP8.
 | `0x600c4030` | `EXTMEM.ICACHE_SYNC_SIZE` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
 | `0x600c4034` | `EXTMEM.ICACHE_PRELOAD_CTRL` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
 | `0x600c4040` | `EXTMEM.ICACHE_AUTOLOAD_CTRL` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
-| `0x600c4078` | `EXTMEM.CACHE_ILG_INT_ENA` | 1 | cache error interrupt: the status is latched, no interrupt is raised | SP1b-3 |
-| `0x600c4084` | `EXTMEM.CORE0_ACS_CACHE_INT_ENA` | 1 | cache error interrupt: the status is latched, no interrupt is raised | SP1b-3 |
 | `0x600c40a8` | `EXTMEM.CACHE_WRAP_AROUND_CTRL` | 1 | wrap-around read mode | SP1b-4 |
 | `0x600c40ac` | `EXTMEM.CACHE_MMU_POWER_CTRL` | 1 | MMU memory power | SP8 |
 | `0x600c40c4` | `EXTMEM.CACHE_MMU_OWNER` | 1 | MMU ownership bits | SP1b-4 |
 | `0x600c40cc` | `EXTMEM.ICACHE_FREEZE` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
-| `0x600ce044` | `ASSIST_DEBUG.CORE_0_RCD_EN` | 1 | PC/SP recording at reset | SP1b-3 |
+| `0x600ce000` | `ASSIST_DEBUG.CORE_0_MONTR_ENA` | 1 | stack guard: the stack pointer is not compared with the bounds | SP1b-4 |
+| `0x600ce008` | `ASSIST_DEBUG.CORE_0_INTR_ENA` | 1 | stack guard: the stack pointer is not compared with the bounds | SP1b-4 |
+| `0x600ce00c` | `ASSIST_DEBUG.CORE_0_INTR_CLR` | 1 | stack guard: the stack pointer is not compared with the bounds | SP1b-4 |
+| `0x600ce038` | `ASSIST_DEBUG.CORE_0_SP_MIN` | 1 | stack guard: the stack pointer is not compared with the bounds | SP1b-4 |
+| `0x600ce03c` | `ASSIST_DEBUG.CORE_0_SP_MAX` | 1 | stack guard: the stack pointer is not compared with the bounds | SP1b-4 |

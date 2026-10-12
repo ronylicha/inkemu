@@ -25,7 +25,7 @@ group name and expected vs actual).
 - **Excluded: `pmp32`.** RISCOF selects it for any DUT with Zicsr (the tests carry no PMP feature
   check) but the generic hart this bench runs has no PMP CSRs and the ISA YAML does not advertise
   them. The ESP32-C3 hart stores the PMP registers (`pmpcfg0..3`, `pmpaddr0..15`) since SP1b-2 and
-  does not enforce them; enforcement arrives in SP1b-3. To re-enable `pmp32` then: add
+  does not enforce them; enforcement arrives in SP1b-4. To re-enable `pmp32` then: add
   `pmp32=<count>` to `ARCH_TEST_EXPECTED` and update `ARCH_TEST_TOTAL` in `versions.env`; the script
   copies exactly the groups listed there.
 - **No Zicsr group.** riscv-arch-test 3.10.0 has no `Zicsr` directory: CSR instructions are covered

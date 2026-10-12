@@ -1,4 +1,6 @@
-//! What the emulator has to tell the user about the run: accesses it does not model, CPU exceptions.
+//! What the emulator has to tell the user about the run: accesses it does not model, CPU
+//! exceptions, resets.
+use crate::reset::ResetCause;
 use cpu_rv32::Exception;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -32,8 +34,17 @@ pub enum Unsupported {
     ShaMode { mode: u32 },
     /// A clock selection without a known CPU frequency (D22).
     ClockSource { sysclk_conf: u32, cpu_per_conf: u32 },
-    /// A reset requested through `RTC_CNTL.OPTIONS0` (D27).
-    SoftwareReset { options0: u32 },
+    /// `RTC_CNTL.CLK_CONF` selects a slow clock other than the RC oscillator, the only one modelled.
+    SlowClock { clk_conf: u32 },
+    /// A byte written to a UART whose transmit FIFO was full.
+    /// ASSUMPTION: the byte is dropped. No source says what the silicon does with such a write;
+    /// writing 129 bytes or more without waiting on `TXFIFO_CNT` on a real chip and reading what
+    /// comes out would settle it.
+    UartOverflow { uart: u8 },
+    /// A byte sent by a UART whose `CLK_CONF.SCLK_SEL` selects a source clock the model has no
+    /// frequency for: the RC fast clock (2), or no documented source (0). The byte is timed with
+    /// the crystal.
+    UartClock { uart: u8, sclk_sel: u32 },
 }
 
 impl Unsupported {
@@ -75,9 +86,17 @@ impl Unsupported {
                 f,
                 "the clock registers select a CPU clock inkemu cannot model (SYSCLK_CONF {sysclk_conf:#010x}, CPU_PER_CONF {cpu_per_conf:#010x}, pc {pc:#010x}), so emulated time keeps the previous frequency; select the crystal or the PLL at 80 or 160 MHz"
             ),
-            Unsupported::SoftwareReset { options0 } => write!(
+            Unsupported::SlowClock { clk_conf } => write!(
                 f,
-                "a software reset was requested through RTC_CNTL.OPTIONS0 (value {options0:#010x}, pc {pc:#010x}) but resets are not emulated yet, so the write was ignored; restart inkemu to reset the device"
+                "RTC_CNTL.CLK_CONF selects an RTC slow clock inkemu does not model (value {clk_conf:#010x}, pc {pc:#010x}), so the RTC timer and the RTC watchdog keep counting the 136 kHz RC oscillator; select the RC oscillator (ANA_CLK_RTC_SEL = 0) or expect their durations to differ from the device"
+            ),
+            Unsupported::UartOverflow { uart } => write!(
+                f,
+                "a byte was written to UART{uart} while its 128-byte transmit FIFO was full (pc {pc:#010x}), so inkemu dropped the byte; wait for room in the FIFO (UART.STATUS TXFIFO_CNT) before writing"
+            ),
+            Unsupported::UartClock { uart, sclk_sel } => write!(
+                f,
+                "UART{uart} sent a byte with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = {sclk_sel}, pc {pc:#010x}), so the byte was timed with the 40 MHz crystal and its duration differs from the device; select the crystal (SCLK_SEL = 3) or APB_CLK (SCLK_SEL = 1)"
             ),
         }
     }
@@ -115,10 +134,30 @@ pub enum Diagnostic {
         fault: MappingFault,
         pc: u32,
     },
+    /// A synchronous exception the CPU took. It is no error of the emulator: the firmware's trap
+    /// handler runs, as on the device.
     Exception {
         cause: Exception,
         tval: u32,
         pc: u32,
+        /// The stack pointer when the instruction started. An exception is listed once per cause
+        /// and PC: when the same instruction faults again with another stack pointer, the entry
+        /// that is shown keeps the stack pointer of the first occurrence.
+        sp: u32,
+    },
+    /// The chip was reset while it ran, by a watchdog or at the firmware's request: the entry of
+    /// the journal spec §7 asks for, with the program counter and the stack. It is no fault of
+    /// the emulator and none it can judge of the firmware (`esp_restart` ends with one): it never
+    /// stops a strict run, and a front end lists it as an event of the run, not as a warning.
+    Reset {
+        cause: ResetCause,
+        /// The instruction the reset kept from executing: where a watchdog caught the program,
+        /// or the instruction after the store that asked for the reset.
+        pc: u32,
+        /// The stack pointer at that instant. A reset is listed once per cause and PC: when the
+        /// same one comes again with another stack pointer (a boot loop), the entry that is shown
+        /// keeps the stack pointer of the first occurrence.
+        sp: u32,
     },
     /// Emitted once when [`MAX_DISTINCT_DIAGNOSTICS`] is reached.
     Suppressed,
@@ -151,17 +190,21 @@ impl Diagnostic {
                     sysclk_conf,
                     cpu_per_conf,
                 } => (8, sysclk_conf, cpu_per_conf),
-                Unsupported::SoftwareReset { .. } => (9, 0, 0),
+                Unsupported::SlowClock { .. } => (9, 0, 0),
+                Unsupported::UartOverflow { uart } => (12, u32::from(uart), 0),
+                Unsupported::UartClock { uart, sclk_sel } => (13, u32::from(uart), sclk_sel),
                 // A command is 1 to 16 bits long, so 0 is free for "no command phase".
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
                 }
             },
             Diagnostic::FlashMapping { entry, fault, .. } => (10, entry, fault as u32),
+            Diagnostic::Reset { cause, pc, .. } => (14, pc, cause.code()),
         }
     }
 
-    /// Whether `--strict-mmio` stops the run on this diagnostic.
+    /// Whether `--strict-mmio` stops the run on this diagnostic. A CPU exception and a reset do
+    /// not: both are what the firmware does on the device.
     const fn stops_a_strict_run(&self) -> bool {
         matches!(
             self,
@@ -229,9 +272,21 @@ impl fmt::Display for Diagnostic {
                     "access to the flash window at {vaddr:#010x} through MMU entry {entry} (content {content:#05x}, pc {pc:#010x}), which names a page beyond the end of the flash: 0 was returned; check the flash size of the device profile"
                 ),
             },
-            Diagnostic::Exception { cause, tval, pc } => write!(
+            Diagnostic::Exception {
+                cause,
+                tval,
+                pc,
+                sp,
+            } => write!(
                 f,
-                "CPU exception {cause:?} at pc {pc:#010x} (tval {tval:#010x})"
+                "CPU exception: {cause} at pc {pc:#010x} (tval {tval:#010x}, sp {sp:#010x}); the firmware's trap handler takes it, as on the device"
+            ),
+            // The code as the ROM prints it at the next boot (`rst:0x7`), so that the two lines
+            // of one reset can be matched by eye.
+            Diagnostic::Reset { cause, pc, sp } => write!(
+                f,
+                "reset by {cause} (rst:{code:#x}) at pc {pc:#010x}, sp {sp:#010x}",
+                code = cause.code()
             ),
             Diagnostic::Suppressed => write!(
                 f,
@@ -460,6 +515,7 @@ mod tests {
             cause: cpu_rv32::Exception::IllegalInstr,
             tval: 0,
             pc: 4,
+            sp: 0,
         });
         assert_eq!(
             strict.take_violation(),
@@ -502,8 +558,13 @@ mod tests {
                 sysclk_conf: 0xC00,
                 cpu_per_conf: 0xC,
             }),
-            unsupported(Unsupported::SoftwareReset {
-                options0: 0x8000_0000,
+            unsupported(Unsupported::SlowClock {
+                clk_conf: 0x4000_0000,
+            }),
+            unsupported(Unsupported::UartOverflow { uart: 0 }),
+            unsupported(Unsupported::UartClock {
+                uart: 1,
+                sclk_sel: 2,
             }),
             mapping(3, MappingFault::InvalidEntry),
             mapping(3, MappingFault::BeyondFlash),
@@ -529,8 +590,76 @@ mod tests {
             cause: cpu_rv32::Exception::IllegalInstr,
             tval: 0,
             pc: 4,
+            sp: 0,
         });
         assert_eq!(d.take_violation(), None);
+    }
+
+    fn reset_at(cause: ResetCause, pc: u32, sp: u32) -> Diagnostic {
+        Diagnostic::Reset { cause, pc, sp }
+    }
+
+    #[test]
+    fn a_reset_is_an_entry_of_the_journal_and_never_a_strict_violation() {
+        let reset = reset_at(ResetCause::Mwdt0Core, 0x4004_c0d4, 0x3FCD_E710);
+        let mut strict = Diagnostics::new(true);
+        strict.record(reset.clone());
+        assert_eq!(
+            strict.take_violation(),
+            None,
+            "a strict run goes on across a reset"
+        );
+        assert_eq!(strict.drain(), vec![reset]);
+    }
+
+    #[test]
+    fn a_reset_names_its_cause_in_words_with_the_code_the_rom_prints_its_pc_and_its_stack() {
+        for (cause, pc, sp, text) in [
+            (
+                ResetCause::Mwdt0Core,
+                0x4004_c0d4,
+                0x3FCD_E710,
+                "reset by main watchdog 0, a core reset (rst:0x7) at pc 0x4004c0d4, sp 0x3fcde710",
+            ),
+            (
+                ResetCause::SoftwareCpu,
+                0x4004_8b92,
+                0x3FC9_0000,
+                "reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x3fc90000",
+            ),
+            (
+                ResetCause::RtcWatchdogSystem,
+                0x10,
+                0,
+                "reset by the RTC watchdog, a system reset (rst:0x10) at pc 0x00000010, sp 0x00000000",
+            ),
+        ] {
+            assert_eq!(reset_at(cause, pc, sp).to_string(), text);
+        }
+    }
+
+    #[test]
+    fn resets_are_listed_once_per_cause_and_pc_and_counted() {
+        let mut d = Diagnostics::new(false);
+        let first = reset_at(ResetCause::Mwdt0Core, 0x4004_c0d4, 0x3FCD_E710);
+        d.record(first.clone());
+        // The loop of a blank chip: the same watchdog at the same instruction, another stack.
+        d.record(reset_at(ResetCause::Mwdt0Core, 0x4004_c0d4, 0x3FCD_E700));
+        // Another cause at the same instruction, and the same cause at another one.
+        d.record(reset_at(
+            ResetCause::RtcWatchdogSystem,
+            0x4004_c0d4,
+            0x3FCD_E710,
+        ));
+        d.record(reset_at(ResetCause::Mwdt0Core, 0x4004_c0d8, 0x3FCD_E710));
+        let listed = d.drain();
+        assert_eq!(listed.len(), 3, "{listed:?}");
+        assert_eq!(
+            listed[0], first,
+            "the entry shown is the first occurrence, with its stack pointer"
+        );
+        assert_eq!(d.occurrences(&first), 2, "the second one is counted");
+        assert_eq!(d.most_repeated(4), vec![(first, 2)]);
     }
 
     #[test]
@@ -550,6 +679,28 @@ mod tests {
             d.occurrences(&unsupported(Unsupported::FlashCommand { opcode: 0x02 })),
             2
         );
+
+        // A byte sent on a clock that is not modelled is about its UART and the selection, not
+        // about the instruction that wrote it: a firmware prints from many places.
+        let uart_clock = |uart: u8, sclk_sel: u32, pc: u32| Diagnostic::Unsupported {
+            what: Unsupported::UartClock { uart, sclk_sel },
+            pc,
+        };
+        d.record(uart_clock(0, 2, 0x4038_1000));
+        d.record(uart_clock(0, 2, 0x4200_0000));
+        assert_eq!(d.distinct(), 5, "one entry for two call sites");
+        assert_eq!(d.occurrences(&uart_clock(0, 2, 0x4038_2000)), 2);
+        d.record(uart_clock(0, 0, 0x4038_1000));
+        assert_eq!(d.distinct(), 6, "another selection is another entry");
+        d.record(uart_clock(1, 2, 0x4038_1000));
+        assert_eq!(d.distinct(), 7, "another UART is another entry");
+        for (uart, sclk_sel, count) in [(0, 2, 2), (0, 0, 1), (1, 2, 1), (1, 0, 0)] {
+            assert_eq!(
+                d.occurrences(&uart_clock(uart, sclk_sel, 0x4038_1000)),
+                count,
+                "UART{uart}, SCLK_SEL {sclk_sel}"
+            );
+        }
     }
 
     #[test]
@@ -569,10 +720,17 @@ mod tests {
                 "SYSCLK_CONF 0x00000c00",
             ),
             (
-                unsupported(Unsupported::SoftwareReset {
-                    options0: 0x8000_0000,
+                unsupported(Unsupported::SlowClock {
+                    clk_conf: 0x4000_0000,
                 }),
-                "software reset",
+                "RTC slow clock",
+            ),
+            (
+                unsupported(Unsupported::UartClock {
+                    uart: 1,
+                    sclk_sel: 2,
+                }),
+                "UART1 sent a byte with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = 2",
             ),
             (mapping(3, MappingFault::InvalidEntry), "MMU entry 3"),
             (
@@ -706,5 +864,51 @@ mod tests {
             nowhere.to_string().contains("no register is documented"),
             "{nowhere}"
         );
+    }
+
+    #[test]
+    fn an_exception_names_its_pc_its_tval_and_the_stack_pointer() {
+        let text = Diagnostic::Exception {
+            cause: cpu_rv32::Exception::LoadAccessFault,
+            tval: 0x0000_0010,
+            pc: 0x4200_1234,
+            sp: 0x3FC9_0000,
+        }
+        .to_string();
+        assert_eq!(
+            text,
+            "CPU exception: load access fault at pc 0x42001234 (tval 0x00000010, sp 0x3fc90000); the firmware's trap handler takes it, as on the device"
+        );
+        assert!(
+            !text.contains("LoadAccessFault"),
+            "words for the user, not the identifier of the code"
+        );
+    }
+
+    #[test]
+    fn the_same_exception_at_the_same_pc_is_listed_once_whatever_the_stack_pointer() {
+        let mut d = Diagnostics::new(false);
+        for sp in [0x3FC9_0000, 0x3FC9_0010] {
+            d.record(Diagnostic::Exception {
+                cause: cpu_rv32::Exception::IllegalInstr,
+                tval: 0,
+                pc: 4,
+                sp,
+            });
+        }
+        let listed = d.drain();
+        assert_eq!(listed.len(), 1, "one line per cause and PC (decision E12)");
+        assert!(
+            matches!(
+                listed[0],
+                Diagnostic::Exception {
+                    sp: 0x3FC9_0000,
+                    ..
+                }
+            ),
+            "the entry shown is the first occurrence, with its stack pointer: {:?}",
+            listed[0]
+        );
+        assert_eq!(d.occurrences(&listed[0]), 2, "the second one is counted");
     }
 }

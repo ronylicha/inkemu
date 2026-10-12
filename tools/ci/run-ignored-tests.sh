@@ -5,7 +5,9 @@
 # nothing. The expected count is deliberate: adding or removing a test is an edit of the call site.
 #
 # Usage: tools/ci/run-ignored-tests.sh <expected-passed> <cargo test arguments...>
-# Example: tools/ci/run-ignored-tests.sh 16 --release -p soc-esp32c3 --test real_rom -- --ignored
+# Example, for a test binary with three ignored tests:
+#   tools/ci/run-ignored-tests.sh 3 --release -p <crate> --test <binary> -- --ignored
+# The calls that are run, with their counts, are in .github/workflows/ci.yml.
 set -euo pipefail
 # The result line is matched as plain text below: colour codes around it would defeat the match,
 # so colour is switched off here rather than left to the caller's environment.

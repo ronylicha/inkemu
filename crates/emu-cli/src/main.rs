@@ -2,12 +2,12 @@
 use boards::{DeviceProfile, MachineOptions, SocFamily};
 use clap::{Parser, Subcommand};
 use cpu_rv32::{HartConfig, MisalignedPolicy};
-use emu_cli::exit::{EXIT_ERROR, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
+use emu_cli::exit::{EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
 use emu_cli::flash_file;
 use emu_cli::rom_store::{
     self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
 };
-use emu_cli::run::{RunOptions, execute, relay};
+use emu_cli::run::{RunOptions, execute, parse_device_seconds, relay};
 use emu_cli::rvtest::{RunResult, TestMachine};
 use emu_cli::term::sanitize;
 use firmware::ChipId;
@@ -17,6 +17,8 @@ use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Parser)]
 #[command(
@@ -60,9 +62,22 @@ enum Command {
         /// an invalid header, as a blank chip does.
         #[arg(long)]
         flash: Option<PathBuf>,
-        /// Stop when the CPU has executed this many clock cycles.
+        /// Stop when the CPU has executed this many cycles of its clock. The limit counts executed
+        /// cycles, not device time: a sleeping CPU executes none, so a firmware that sleeps
+        /// reaches it late, and one whose sleep nothing interrupts never does; --max-time bounds
+        /// both.
         #[arg(long)]
         max_cycles: Option<u64>,
+        /// Stop when this many seconds of device time have elapsed since power-on (a decimal
+        /// number: 30, 2.5, 0.001). Device time goes on while the CPU sleeps and across resets.
+        // A negative number is a value, so that it is refused by the parser, with its message.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            value_parser = parse_device_seconds,
+            allow_negative_numbers = true
+        )]
+        max_time: Option<u64>,
         /// Stop at the first access to a register the emulator does not model, 8/16-bit write to a
         /// peripheral register, operation the emulator cannot perform faithfully, or access to flash
         /// that is not mapped (exit code 3).
@@ -88,6 +103,7 @@ enum Command {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum ConsoleArg {
     Uart0,
+    Uart1,
     UsbSerialJtag,
 }
 
@@ -95,6 +111,7 @@ impl From<ConsoleArg> for ConsoleChannel {
     fn from(arg: ConsoleArg) -> ConsoleChannel {
         match arg {
             ConsoleArg::Uart0 => ConsoleChannel::Uart0,
+            ConsoleArg::Uart1 => ConsoleChannel::Uart1,
             ConsoleArg::UsbSerialJtag => ConsoleChannel::UsbSerialJtag,
         }
     }
@@ -136,6 +153,7 @@ fn main() -> ExitCode {
             device,
             flash,
             max_cycles,
+            max_time,
             strict_mmio,
             console,
             rom_dir,
@@ -150,6 +168,7 @@ fn main() -> ExitCode {
             },
             &RunOptions {
                 max_cycles,
+                max_device_nanos: max_time,
                 console: console.into(),
             },
         ),
@@ -164,9 +183,20 @@ fn main() -> ExitCode {
     }
 }
 
+/// Writes `line` and a newline to `stream`, standard error or standard output, and goes on if
+/// that fails.
+///
+/// `eprintln!` and `println!` panic when the write fails (`2>/dev/full`, a pipe whose reader
+/// left), and the process then ends with the code of a panic, 101, instead of the code that says
+/// what happened. Standard error is where failures are reported: when it fails itself there is
+/// nowhere left to say so, and the exit code must still be the right one.
+fn write_line(mut stream: impl io::Write, line: &dyn std::fmt::Display) {
+    let _ = writeln!(stream, "{line}");
+}
+
 /// Prints `error: {message}` and yields the input-error exit code.
 fn fail(message: &dyn std::fmt::Display) -> ExitCode {
-    eprintln!("error: {message}");
+    write_line(io::stderr(), &format_args!("error: {message}"));
     ExitCode::from(EXIT_ERROR)
 }
 
@@ -266,14 +296,65 @@ fn run_device(
         },
         None => profile.instantiate(rom, machine_options),
     };
-    eprintln!("{}; {flash_note}", header(&profile, entry, &machine));
+    write_line(
+        io::stderr(),
+        &format_args!("{}; {flash_note}", header(&profile, entry, &machine)),
+    );
+    let interrupt = Arc::new(AtomicBool::new(false));
+    if let Err(e) = watch_ctrl_c(&interrupt) {
+        write_line(
+            io::stderr(),
+            &format_args!(
+                "warning: cannot watch for Ctrl-C: {e}; the run is not affected, but interrupting it will not print its summary: use --max-cycles or --max-time to bound it"
+            ),
+        );
+    }
     let end = execute(
         &mut machine,
         run_options,
+        &interrupt,
+        &stdout_reader_gone,
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     );
     ExitCode::from(end.exit_code())
+}
+
+/// Whether whoever was reading standard output went away (`inkemu run | head`, once `head` has
+/// what it wanted). A run that prints learns it from the write that fails; this is for the run
+/// whose firmware prints nothing, which would otherwise go on for nobody.
+#[cfg(unix)]
+fn stdout_reader_gone() -> bool {
+    use std::os::fd::AsFd as _;
+    emu_cli::reader::is_gone(io::stdout().as_fd())
+}
+
+/// On the systems where the question cannot be asked without writing, the answer is always no: a
+/// run that prints nothing and whose reader left goes on until `--max-cycles`, `--max-time` or
+/// Ctrl-C ends it.
+#[cfg(not(unix))]
+fn stdout_reader_gone() -> bool {
+    false
+}
+
+/// Makes Ctrl-C end the run at the next slice, with its summary. A second Ctrl-C ends the process
+/// at once, for a run that does not come back to the slice boundary.
+///
+/// The handler runs on a thread of its own, not in the signal context; it only sets the flag.
+fn watch_ctrl_c(interrupt: &Arc<AtomicBool>) -> Result<(), ctrlc::Error> {
+    let requested = Arc::clone(interrupt);
+    ctrlc::set_handler(move || {
+        if second_request(&requested) {
+            std::process::exit(i32::from(EXIT_SECOND_INTERRUPT));
+        }
+    })
+}
+
+/// Records in `requested` that the user asked the run to stop, and says whether that had already
+/// been asked: the first request is left to the run, which ends with its summary; a second one
+/// means that the run has not come back, and the process is ended at once.
+fn second_request(requested: &AtomicBool) -> bool {
+    requested.swap(true, Ordering::Relaxed)
 }
 
 /// The one line that says what is being emulated and how much to trust its timing.
@@ -354,8 +435,9 @@ fn run_inspect(path: &Path) -> ExitCode {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("error: cannot read {shown}: {e}; check the path and read permissions");
-            return ExitCode::from(EXIT_ERROR);
+            return fail(&format_args!(
+                "cannot read {shown}: {e}; check the path and read permissions"
+            ));
         }
     };
     match firmware::FirmwareImage::parse(&bytes) {
@@ -369,10 +451,7 @@ fn run_inspect(path: &Path) -> ExitCode {
                 ControlFlow::Break(code) => code,
             }
         }
-        Err(e) => {
-            eprintln!("error: {shown}: {e}");
-            ExitCode::from(EXIT_ERROR)
-        }
+        Err(e) => fail(&format_args!("{shown}: {e}")),
     }
 }
 
@@ -401,22 +480,21 @@ fn run_rvtest(
         .and_then(|bytes| TestMachine::from_elf(&bytes, config).map_err(|e| e.to_string()));
     let mut machine = match machine {
         Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(EXIT_ERROR);
-        }
+        Err(e) => return fail(&e),
     };
     let result = machine.run(max_steps);
+    // What goes to standard output here is for a person: the verdict of the test is the exit
+    // code, which must not depend on who reads the lines.
     if trace_hash {
-        println!("trace-hash {:016x}", machine.trace_hash());
+        write_line(
+            io::stdout(),
+            &format_args!("trace-hash {:016x}", machine.trace_hash()),
+        );
     }
     if let Some(path) = signature {
         let words = match machine.signature() {
             Ok(w) => w,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::from(EXIT_ERROR);
-            }
+            Err(e) => return fail(&e),
         };
         let text = words.iter().fold(String::new(), |mut acc, w| {
             // Writing to a String cannot fail.
@@ -424,28 +502,24 @@ fn run_rvtest(
             acc
         });
         if let Err(e) = std::fs::write(path, text) {
-            eprintln!(
-                "error: cannot write {}: {e}; check that the directory exists and is writable",
+            return fail(&format_args!(
+                "cannot write {}: {e}; check that the directory exists and is writable",
                 path.display()
-            );
-            return ExitCode::from(EXIT_ERROR);
+            ));
         }
     }
     match result {
         RunResult::Passed => {
-            println!("Passed");
+            write_line(io::stdout(), &"Passed");
             ExitCode::SUCCESS
         }
         RunResult::Failed { test_number } => {
-            println!("FAILED at test #{test_number}");
+            write_line(io::stdout(), &format_args!("FAILED at test #{test_number}"));
             ExitCode::from(EXIT_TEST_FAILURE)
         }
-        RunResult::Timeout => {
-            eprintln!(
-                "error: no verdict after {max_steps} steps; raise --max-steps or check that the test writes to tohost"
-            );
-            ExitCode::from(EXIT_ERROR)
-        }
+        RunResult::Timeout => fail(&format_args!(
+            "no verdict after {max_steps} steps; raise --max-steps or check that the test writes to tohost"
+        )),
     }
 }
 
@@ -475,6 +549,31 @@ mod tests {
             remedy.contains("--device <id>") && remedy.contains("--all"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn the_first_request_to_stop_is_left_to_the_run_and_the_second_ends_the_process() {
+        let requested = AtomicBool::new(false);
+        assert!(!second_request(&requested));
+        assert!(
+            requested.load(Ordering::Relaxed),
+            "the run reads the request at its next pass"
+        );
+        assert!(second_request(&requested));
+        assert!(second_request(&requested), "and so does every one after it");
+    }
+
+    #[test]
+    fn every_console_of_the_device_can_be_asked_for() {
+        use clap::ValueEnum as _;
+        for channel in ConsoleChannel::ALL {
+            assert!(
+                ConsoleArg::value_variants()
+                    .iter()
+                    .any(|arg| ConsoleChannel::from(*arg) == channel),
+                "no value of --console selects {channel:?}"
+            );
+        }
     }
 
     #[test]

@@ -335,3 +335,62 @@ pub fn load_register(addr: u32) -> [u32; 2] {
     let offset = addr.wrapping_sub(page).cast_signed();
     [asm::lui(T0, page), asm::lw(T1, T0, offset)]
 }
+
+/// Stores `value` in the register at `addr`, through `T0` and `T1`.
+#[must_use]
+pub fn store_register(addr: u32, value: u32) -> [u32; 4] {
+    // `addi` and `sw` sign-extend their 12 bits: the upper part is rounded so the sum is the word.
+    let split = |word: u32| {
+        let upper = word.wrapping_add(0x800) & 0xFFFF_F000;
+        (upper, word.wrapping_sub(upper).cast_signed())
+    };
+    let (page, offset) = split(addr);
+    let (upper, lower) = split(value);
+    [
+        asm::lui(T0, page),
+        asm::lui(T1, upper),
+        asm::addi(T1, T1, lower),
+        asm::sw(T1, T0, offset),
+    ]
+}
+
+/// What a program does first when it must outlive the flash-boot protection: it clears
+/// `WDTCONFIG0` of main watchdog 0 and of the RTC watchdog, as the bootloader does
+/// (`bootloader_config_wdt`). Both are unlocked at reset: their key registers reset to the key.
+#[must_use]
+pub fn stop_watchdogs() -> Vec<u32> {
+    let mut program = Vec::new();
+    for (peripheral, register) in [("TIMG0", "WDTCONFIG0"), ("RTC_CNTL", "WDTCONFIG0")] {
+        program.extend(store_register(
+            svd_regs::esp32c3::addr(peripheral, register),
+            0,
+        ));
+    }
+    program
+}
+
+/// Runs `work` on its own thread and waits at most `limit` for its result: a test of a loop that
+/// must end, which would otherwise hang the whole suite if the loop did not. On a timeout the
+/// test fails with `unbounded`; the thread is left to spin until the test process ends. A panic of
+/// `work` is the panic of the caller.
+///
+/// `work` builds what it needs itself (a machine is not `Send`) and returns plain data.
+pub fn within<T: Send + 'static>(
+    limit: std::time::Duration,
+    unbounded: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        // A closed channel means the caller gave up: nobody needs the result.
+        let _ = sender.send(work());
+    });
+    match receiver.recv_timeout(limit) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{unbounded}"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match thread.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => panic!("the thread ended without a result"),
+        },
+    }
+}

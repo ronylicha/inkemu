@@ -1,7 +1,9 @@
-//! `APB_CTRL` (`SYSCON`): the hardware random number generator and two radio memory power registers.
-//! Sources: report BA §2 row 88, §2.3 item 1, §3 rows 29 and 34.
+//! `APB_CTRL` (`SYSCON`): the hardware random number generator, and four registers of a radio
+//! this model does not have (two memory power registers, the clock gates, the resets).
+//! Sources: report BA §2 row 88, §2.3 item 1, §3 rows 29 and 34, §9.
 use super::{APB_CTRL_BASE, Accepted, Storage};
 use crate::config::DEFAULT_RNG_SEED;
+use crate::ctx::Ctx;
 use emu_core::Peripheral;
 use svd_regs::esp32c3::addr;
 
@@ -11,7 +13,7 @@ const RND_DATA: u32 = addr("RNG", "DATA") - APB_CTRL_BASE;
 /// xorshift generators, scrambled", 2016).
 const XORSHIFT_STAR: u64 = 0x2545_F491_4F6C_DD1D;
 
-const ACCEPTED: [Accepted; 2] = [
+const ACCEPTED: [Accepted; 4] = [
     Accepted::svd(
         "APB_CTRL",
         "FRONT_END_MEM_PD",
@@ -19,6 +21,22 @@ const ACCEPTED: [Accepted; 2] = [
         "SP5a",
     ),
     Accepted::svd("APB_CTRL", "MEM_POWER_UP", "radio memory power", "SP5a"),
+    // `esp_perip_clk_init` gates the radio clocks at start-up
+    // (`IDF:esp_system/port/soc/esp32c3/clk.c:317`) and touches the radio resets in the same
+    // pass (report BA §9, the row of `esp_perip_clk_init`); the resets are pulsed again by
+    // `esp_system_reset_modules_on_exit` at a restart (trace F1).
+    Accepted::svd(
+        "APB_CTRL",
+        "WIFI_CLK_EN",
+        "radio clock gates: there is no radio",
+        "SP5a",
+    ),
+    Accepted::svd(
+        "APB_CTRL",
+        "WIFI_RST_EN",
+        "radio resets: there is no radio",
+        "SP5a",
+    ),
 ];
 
 pub(crate) fn accepted() -> Vec<Accepted> {
@@ -26,8 +44,8 @@ pub(crate) fn accepted() -> Vec<Accepted> {
 }
 
 /// The `APB_CTRL` block as far as the boot uses it: the random number register, which answers the
-/// next value of a seeded sequence on every read, and the two radio memory power registers, which
-/// are storage.
+/// next value of a seeded sequence on every read, and the four radio registers (memory power,
+/// clock gates, resets), which are storage.
 #[derive(Clone, Debug)]
 pub struct ApbCtrl {
     /// State of the generator; never zero.
@@ -47,6 +65,12 @@ impl ApbCtrl {
         }
     }
 
+    /// A core reset returns the registers to their reset values. The generator is no register: its
+    /// sequence goes on, so a boot after a reset does not replay the numbers of the one before.
+    pub(crate) fn reset(&mut self) {
+        self.power = Storage::accepted(APB_CTRL_BASE, &ACCEPTED);
+    }
+
     fn next_random(&mut self) -> u32 {
         let mut state = self.rng;
         state ^= state >> 12;
@@ -58,15 +82,15 @@ impl ApbCtrl {
     }
 }
 
-impl Peripheral for ApbCtrl {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for ApbCtrl {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
         if offset == RND_DATA {
             return Some(self.next_random());
         }
         self.power.read(offset)
     }
 
-    fn write(&mut self, offset: u32, value: u32) -> bool {
+    fn write(&mut self, _ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         // `RND_DATA` is read-only: it is deliberately not handled here, so a write to it is refused
         // and the bus reports it as unmodelled instead of pretending the generator was seeded.
         self.power.write(offset, value)
@@ -80,16 +104,21 @@ mod tests {
 
     #[test]
     fn the_generator_is_deterministic_and_never_repeats_a_value_on_the_boot_path() {
+        let ctx = &mut Ctx::default();
         let mut first = ApbCtrl::new(DEFAULT_RNG_SEED);
         // Pinned: a recorded session replays only if the sequence never changes.
-        assert_eq!(first.read(RND_DATA), Some(0x2B0E_D4C7));
-        assert_eq!(first.read(RND_DATA), Some(0xC0B1_3AB1));
-        assert_eq!(first.read(RND_DATA), Some(0x73D5_9E4D));
+        assert_eq!(first.read(ctx, RND_DATA), Some(0x2B0E_D4C7));
+        assert_eq!(first.read(ctx, RND_DATA), Some(0xC0B1_3AB1));
+        assert_eq!(first.read(ctx, RND_DATA), Some(0x73D5_9E4D));
         let mut second = ApbCtrl::new(DEFAULT_RNG_SEED);
         let mut third = ApbCtrl::new(DEFAULT_RNG_SEED ^ 1);
         // 1,604 reads in the measured bootloader (BA §2 row 88).
-        let a: Vec<u32> = (0..1604).map(|_| second.read(RND_DATA).unwrap()).collect();
-        let b: Vec<u32> = (0..1604).map(|_| third.read(RND_DATA).unwrap()).collect();
+        let a: Vec<u32> = (0..1604)
+            .map(|_| second.read(ctx, RND_DATA).unwrap())
+            .collect();
+        let b: Vec<u32> = (0..1604)
+            .map(|_| third.read(ctx, RND_DATA).unwrap())
+            .collect();
         assert_eq!(a[..3], [0x2B0E_D4C7, 0xC0B1_3AB1, 0x73D5_9E4D]);
         assert_ne!(a, b, "the seed matters");
         let mut sorted = a.clone();
@@ -101,34 +130,42 @@ mod tests {
     #[test]
     fn an_even_number_of_reads_does_not_cancel_out() {
         // BA §2.3 item 1: each word is the XOR of many reads and the bootloader loops while it is 0.
+        let ctx = &mut Ctx::default();
         let mut apb = ApbCtrl::new(DEFAULT_RNG_SEED);
         for reads in [2usize, 802, 1604] {
-            let word = (0..reads).fold(0, |acc, _| acc ^ apb.read(RND_DATA).unwrap());
+            let word = (0..reads).fold(0, |acc, _| acc ^ apb.read(ctx, RND_DATA).unwrap());
             assert_ne!(word, 0, "{reads} reads");
         }
     }
 
     #[test]
     fn a_zero_seed_does_not_lock_the_generator() {
+        let ctx = &mut Ctx::default();
         let mut apb = ApbCtrl::new(0);
-        assert_ne!(apb.read(RND_DATA), apb.read(RND_DATA));
+        assert_ne!(apb.read(ctx, RND_DATA), apb.read(ctx, RND_DATA));
     }
 
     #[test]
-    fn the_generator_is_read_only_and_the_two_power_registers_are_stored() {
+    fn the_generator_is_read_only_and_the_four_radio_registers_are_stored() {
+        let ctx = &mut Ctx::default();
         let mut apb = ApbCtrl::new(DEFAULT_RNG_SEED);
-        assert!(!apb.write(RND_DATA, 0));
-        for (name, reset) in [("FRONT_END_MEM_PD", 0x15), ("MEM_POWER_UP", 0x3F)] {
+        assert!(!apb.write(ctx, RND_DATA, 0));
+        for (name, reset) in [
+            ("FRONT_END_MEM_PD", 0x15),
+            ("MEM_POWER_UP", 0x3F),
+            ("WIFI_CLK_EN", 0xFFFC_E030),
+            ("WIFI_RST_EN", 0),
+        ] {
             let offset = svd_regs::esp32c3::addr("APB_CTRL", name) - APB_CTRL_BASE;
-            assert_eq!(apb.read(offset), Some(reset), "{name}");
-            assert!(apb.write(offset, 1));
-            assert_eq!(apb.read(offset), Some(1));
+            assert_eq!(apb.read(ctx, offset), Some(reset), "{name}");
+            assert!(apb.write(ctx, offset, 1));
+            assert_eq!(apb.read(ctx, offset), Some(1));
         }
-        let wifi_clk_en = svd_regs::esp32c3::addr("APB_CTRL", "WIFI_CLK_EN") - APB_CTRL_BASE;
+        let clk_out_en = svd_regs::esp32c3::addr("APB_CTRL", "CLK_OUT_EN") - APB_CTRL_BASE;
         assert_eq!(
-            apb.read(wifi_clk_en),
+            apb.read(ctx, clk_out_en),
             None,
-            "WIFI_CLK_EN belongs to a later plan"
+            "CLK_OUT_EN is not modelled"
         );
     }
 }

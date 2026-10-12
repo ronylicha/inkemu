@@ -2,9 +2,13 @@
 //! default ROM cache: every run names its ROM directory.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
 use assert_cmd::Command;
+use cpu_rv32::asm::wfi;
 use firmware::builder::{ImageSpec, build_flash_image, build_image};
 use predicates::prelude::*;
 use predicates::str::contains;
+use soc_esp32c3::test_support::{
+    HANG, load_register, stop_watchdogs, store_register, unmodeled_register,
+};
 
 fn inkemu() -> Command {
     Command::new(env!("CARGO_BIN_EXE_inkemu"))
@@ -27,6 +31,24 @@ fn unknown_device_name_is_echoed_with_control_characters_escaped() {
         .code(2)
         .stderr(predicate::function(|err: &[u8]| !err.contains(&0x1b)))
         .stderr(contains("x\\u{1b}[31m9"));
+}
+
+/// `/dev/full` refuses every write: the error message cannot be printed, and the exit code must
+/// still say that the command was refused, not that the program crashed (101).
+#[cfg(target_os = "linux")]
+#[test]
+fn an_error_that_cannot_be_written_to_standard_error_keeps_its_exit_code() {
+    // The path of the binary is `$0` of the shell, so that no quoting of it is needed.
+    for command in [
+        r#""$0" run --device x9 2>/dev/full"#,
+        r#""$0" inspect /nonexistent/firmware.bin 2>/dev/full"#,
+        r#""$0" rvtest /nonexistent/test.elf 2>/dev/full"#,
+    ] {
+        Command::new("sh")
+            .args(["-c", command, env!("CARGO_BIN_EXE_inkemu")])
+            .assert()
+            .code(2);
+    }
 }
 
 #[test]
@@ -66,9 +88,9 @@ fn tampered_rom_is_refused_before_anything_runs() {
 fn run_help_lists_every_exit_code() {
     let help = inkemu().args(["run", "--help"]).assert().success();
     let out = String::from_utf8_lossy(&help.get_output().stdout).into_owned();
-    for code in ["0", "2", "3", "4"] {
+    for code in [0, 2, 3, 4, 130] {
         assert!(
-            out.contains(&format!("\n  {code}  ")),
+            out.contains(&format!("\n{code:>3}  ")),
             "exit code {code} missing from:\n{out}"
         );
     }
@@ -76,6 +98,78 @@ fn run_help_lists_every_exit_code() {
         !out.contains("x4 or x3"),
         "the help must not enumerate device ids:\n{out}"
     );
+}
+
+#[test]
+fn a_time_limit_that_is_not_a_number_of_seconds_exits_2_and_says_what_to_write() {
+    // A negative number included: it is a value of the option, refused for what it is, and not
+    // an unknown flag.
+    for value in ["abc", "-1", "1e3"] {
+        inkemu()
+            .args(["run", "--device", "x4", "--max-time", value])
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(contains("'--max-time <SECONDS>'").and(contains(format!(
+                "`{value}` is not a number of seconds; write digits with an optional fraction, like 30 or 0.25"
+            ))));
+    }
+}
+
+#[test]
+fn a_time_limit_too_fine_or_too_long_exits_2_and_says_which() {
+    for (value, message) in [
+        (
+            "1.0000000001",
+            "has more than 9 digits after the point, which is finer than a nanosecond; give at most 9",
+        ),
+        (
+            "18446744074",
+            "seconds is more than device time can count (584 years); give a smaller number",
+        ),
+    ] {
+        inkemu()
+            .args(["run", "--device", "x4", "--max-time", value])
+            .assert()
+            .code(2)
+            .stderr(
+                contains("'--max-time <SECONDS>'").and(contains(format!("`{value}` {message}"))),
+            );
+    }
+}
+
+#[test]
+fn run_help_tells_the_two_limits_apart() {
+    let help = inkemu().args(["run", "--help"]).assert().success();
+    // The help is wrapped to the terminal: compared with every run of white space as one space.
+    let out = String::from_utf8_lossy(&help.get_output().stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for expected in [
+        "--max-cycles <MAX_CYCLES> Stop when the CPU has executed this many cycles of its clock. The limit counts executed cycles, not device time: a sleeping CPU executes none, so a firmware that sleeps reaches it late, and one whose sleep nothing interrupts never does; --max-time bounds both",
+        "--max-time <SECONDS> Stop when this many seconds of device time have elapsed since power-on (a decimal number: 30, 2.5, 0.001). Device time goes on while the CPU sleeps and across resets",
+        "0 the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was pressed, or the reader of standard output went away",
+    ] {
+        assert!(
+            out.contains(expected),
+            "`{expected}` is missing from:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn a_console_the_device_does_not_have_exits_2_and_lists_the_three_it_has() {
+    inkemu()
+        .args(["run", "--device", "x4", "--console", "uart2"])
+        .assert()
+        .code(2)
+        .stderr(
+            contains("'--console <CONSOLE>'")
+                .and(contains("uart0"))
+                .and(contains("uart1"))
+                .and(contains("usb-serial-jtag")),
+        );
 }
 
 #[test]
@@ -221,6 +315,7 @@ fn x4_boots_the_real_rom_to_its_banner() {
                 "--rom-dir",
                 &dir,
             ])
+            .timeout(std::time::Duration::from_secs(60))
             .assert()
             .code(0)
             .get_output()
@@ -432,6 +527,7 @@ fn x4_boots_a_flash_image_through_the_real_rom() {
             "--flash",
         ])
         .arg(&path)
+        .timeout(std::time::Duration::from_secs(60))
         .assert()
         .code(0)
         .get_output()
@@ -465,6 +561,7 @@ fn x4_without_a_flash_image_loops_on_the_invalid_header_of_an_erased_chip() {
             "--rom-dir",
             &rom_dir,
         ])
+        .timeout(std::time::Duration::from_secs(60))
         .assert()
         .code(0)
         .get_output()
@@ -480,12 +577,168 @@ fn x4_without_a_flash_image_loops_on_the_invalid_header_of_an_erased_chip() {
     );
 }
 
-/// The milestone through the real command: ROM, bootloader, first application line, strict stop.
+/// Where the ROM loads and enters the second stage of the images built here: the internal RAM.
+const STUB_ENTRY: u32 = 0x4038_0000;
+
+/// A flash image whose second stage is `program`, in a directory that lives as long as the value.
+fn flash_image_of(program: &[u32]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let spec = ImageSpec {
+        entry: STUB_ENTRY,
+        segments: vec![(
+            STUB_ENTRY,
+            program.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        )],
+        ..ImageSpec::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("flash.bin");
+    std::fs::write(&path, build_flash_image(&spec)).unwrap();
+    (dir, path)
+}
+
+/// A second stage that stops the watchdogs the ROM left running, then sleeps for ever under a
+/// period alarm of one millisecond (16 000 counts of the 16 MHz counter; `TARGET0_CONF` bit 30
+/// is `PERIOD_MODE`, `CONF` bit 24 `TARGET0_WORK_EN`) whose interrupt is not enabled: the CPU
+/// executes nothing more, and device time goes on.
+fn sleeping_for_ever() -> Vec<u32> {
+    const PERIOD_MODE: u32 = 1 << 30;
+    const MILLISECOND: u32 = 16_000;
+    let systimer = |register| svd_regs::esp32c3::addr("SYSTIMER", register);
+    let mut program = stop_watchdogs();
+    program.extend(store_register(
+        systimer("TARGET0_CONF"),
+        PERIOD_MODE | MILLISECOND,
+    ));
+    program.extend(store_register(systimer("COMP0_LOAD"), 1));
+    program.extend(store_register(systimer("CONF"), 0x4600_0000 | (1 << 24)));
+    program.extend([wfi(), HANG]);
+    program
+}
+
+/// The microseconds of the summary line `inkemu: N us of device time; ...`.
+fn device_micros(log: &str) -> u64 {
+    log.lines()
+        .find_map(|line| {
+            line.strip_prefix("inkemu: ")?
+                .split_once(" us of device time")?
+                .0
+                .parse()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no device-time line in:\n{log}"))
+}
+
+fn trace_hash_line(log: &str) -> Option<&str> {
+    log.lines().find(|line| line.starts_with("trace-hash "))
+}
+
+/// A blank chip is reset by main watchdog 0 after 1.3 s of device time: a limit of 1.5 s shows
+/// one reset through the real command, and the run it ends is the same run every time.
 #[test]
-#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
-fn x4_boots_the_reference_firmware_to_its_first_application_line() {
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_reset() {
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
-    let flash = std::env::var("INKEMU_REF_FLASH").expect("set INKEMU_REF_FLASH");
+    let run = || {
+        inkemu()
+            .args([
+                "run",
+                "--device",
+                "x4",
+                "--strict-mmio",
+                "--max-time",
+                "1.5",
+                "--trace-hash",
+                "--rom-dir",
+                &rom_dir,
+            ])
+            // A blank chip prints and resets for ever: were the limit to stop ending the run,
+            // this ends the test.
+            .timeout(std::time::Duration::from_secs(60))
+            .assert()
+            .code(0)
+            .get_output()
+            .clone()
+    };
+    let first = run();
+    let console = String::from_utf8_lossy(&first.stdout).replace('\r', "");
+    assert_eq!(console.matches("rst:0x7 ").count(), 1, "{console}");
+    let log = String::from_utf8_lossy(&first.stderr).into_owned();
+    assert!(
+        log.contains("inkemu: device-time limit reached; raise --max-time to run longer\n"),
+        "{log}"
+    );
+    // The CPU executes when the limit is reached: the run stops at the first instruction
+    // boundary at or past it.
+    let micros = device_micros(&log);
+    assert!((1_500_000..=1_500_010).contains(&micros), "{log}");
+    assert!(!log.contains("the CPU is asleep"), "{log}");
+    // The journal says what the ROM's `rst:0x7` line does, with the stack pointer besides.
+    assert!(
+        log.contains(
+            "\ninkemu: reset by main watchdog 0, a core reset (rst:0x7) at pc 0x4004c0d4, sp 0x"
+        ) && !log.contains("warning:"),
+        "{log}"
+    );
+    let second = run();
+    assert_eq!(
+        first.stdout, second.stdout,
+        "two runs print the same console"
+    );
+    assert!(trace_hash_line(&log).is_some(), "{log}");
+    assert_eq!(
+        trace_hash_line(&log),
+        trace_hash_line(&String::from_utf8_lossy(&second.stderr))
+    );
+}
+
+/// Nothing interrupts the sleep of this firmware: it executes no cycle more, and only the
+/// device-time limit ends its run.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_device_time_limit_ends_the_run_of_a_firmware_that_sleeps() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (_dir, flash) = flash_image_of(&sleeping_for_ever());
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--max-time",
+            "2",
+            "--rom-dir",
+            &rom_dir,
+            "--flash",
+        ])
+        .arg(&flash)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        log.contains("inkemu: device-time limit reached; raise --max-time to run longer\n"),
+        "{log}"
+    );
+    assert!(
+        log.contains("inkemu: 2000000 us of device time; ")
+            && log.contains("; the CPU is asleep, waiting for an interrupt\n"),
+        "the limit instant exactly, with the CPU asleep: {log}"
+    );
+    let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    assert!(console.ends_with("entry 0x40380000\n"), "{console}");
+}
+
+/// Exit code 3 through the real command: a second stage that reads a register the emulator does
+/// not model, under `--strict-mmio`.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_strict_stop_exits_3_and_names_the_register() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let mut program = stop_watchdogs();
+    program.extend(load_register(unmodeled_register().addr));
+    program.push(HANG);
+    let (_dir, flash) = flash_image_of(&program);
     let output = inkemu()
         .args([
             "run",
@@ -495,34 +748,347 @@ fn x4_boots_the_reference_firmware_to_its_first_application_line() {
             "--rom-dir",
             &rom_dir,
             "--flash",
-            &flash,
         ])
+        .arg(&flash)
+        .timeout(std::time::Duration::from_secs(60))
         .assert()
         .code(3)
+        .stderr(contains("inkemu: stopped by --strict-mmio: ").and(contains("LEDC.")))
         .get_output()
         .clone();
     let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
-    assert!(console.contains("entry 0x403cbf1a\n"), "{console}");
+    assert!(console.ends_with("entry 0x40380000\n"), "{console}");
+}
+
+/// Exit code 4 through the real command: a second stage that stops the watchdogs and waits for
+/// an interrupt nothing can raise. No limit is given: the run ends by itself.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_wait_for_an_interrupt_nothing_can_raise_exits_4() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let mut program = stop_watchdogs();
+    program.extend([wfi(), HANG]);
+    let (_dir, flash) = flash_image_of(&program);
+    inkemu()
+        .args(["run", "--device", "x4", "--rom-dir", &rom_dir, "--flash"])
+        .arg(&flash)
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .code(4)
+        .stderr(
+            contains("inkemu: the CPU waits for an interrupt and none can come")
+                .and(contains("; the CPU is asleep, waiting for an interrupt\n")),
+        );
+}
+
+/// A run of the binary whose output is read while it goes on, for the tests that act on a run in
+/// progress. Every wait has a limit, and a run still going when its test ends is killed.
+#[cfg(unix)]
+mod live {
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    pub struct Live {
+        child: Child,
+        /// The lines of standard output, as they come.
+        lines: Receiver<String>,
+        stderr: Option<JoinHandle<String>>,
+    }
+
+    /// Starts `command`. Its standard output is read line by line on a thread of its own; the
+    /// thread stops reading, and closes its end of the pipe, after the first line for which
+    /// `reader_leaves_after` says yes: from then on the run has no reader.
+    pub fn start(
+        mut command: Command,
+        reader_leaves_after: impl Fn(&str) -> bool + Send + 'static,
+    ) -> Live {
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, lines) = channel();
+        std::thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let mut line = Vec::new();
+                if stdout.read_until(b'\n', &mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let line = String::from_utf8_lossy(&line).into_owned();
+                let leaves = reader_leaves_after(&line);
+                // A test that stopped listening does not need the line.
+                let _ = sender.send(line);
+                if leaves {
+                    return;
+                }
+            }
+        });
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr = std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = stderr.read_to_end(&mut text);
+            String::from_utf8_lossy(&text).into_owned()
+        });
+        Live {
+            child,
+            lines,
+            stderr: Some(stderr),
+        }
+    }
+
+    impl Live {
+        /// Sends the run the signal a terminal sends for Ctrl-C.
+        pub fn interrupt(&self) {
+            let sent = Command::new("kill")
+                .args(["-INT", &self.child.id().to_string()])
+                .status()
+                .unwrap();
+            assert!(sent.success(), "kill -INT {}: {sent}", self.child.id());
+        }
+
+        /// Waits until a line of standard output contains `text`.
+        pub fn wait_for_line(&self, text: &str, limit: Duration) {
+            let deadline = Instant::now() + limit;
+            let mut seen = String::new();
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.lines.recv_timeout(left) {
+                    Ok(line) if line.contains(text) => return,
+                    Ok(line) => seen.push_str(&line),
+                    Err(RecvTimeoutError::Timeout) => {
+                        panic!("no line with `{text}` within {limit:?}; standard output:\n{seen}")
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        panic!("standard output ended without a line with `{text}`:\n{seen}")
+                    }
+                }
+            }
+        }
+
+        /// Waits for the run to end by itself: its exit code and what it wrote on standard error.
+        pub fn finish(mut self, limit: Duration) -> (Option<i32>, String) {
+            let deadline = Instant::now() + limit;
+            let status = loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the run did not end within {limit:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let log = self.stderr.take().unwrap().join().unwrap();
+            (status.code(), log)
+        }
+    }
+
+    impl Drop for Live {
+        fn drop(&mut self) {
+            // Nothing to do for a run that has ended; one that has not must not outlive its test.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// `inkemu run --device x4` on `flash` with the real ROM, to be started by [`live::start`].
+#[cfg(unix)]
+fn run_of(rom_dir: &str, flash: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_inkemu"));
+    command
+        .args(["run", "--device", "x4", "--rom-dir", rom_dir, "--flash"])
+        .arg(flash);
+    command
+}
+
+/// Ctrl-C through the real command, with a real `SIGINT`: a blank chip prints and resets for ever,
+/// no limit is given, and the signal ends the run with its summary and exit code 0.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn ctrl_c_ends_a_run_without_a_limit_with_its_summary_and_exit_code_0() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_inkemu"));
+    command.args(["run", "--device", "x4", "--rom-dir", &rom_dir]);
+    // The reader stays to the end: the run must not end for having lost it.
+    let run = live::start(command, |_| false);
+    let limit = std::time::Duration::from_secs(60);
+    // The banner is on standard output: the handler is installed and the run is under way.
+    run.wait_for_line("ESP-ROM:esp32c3-api1-20210207", limit);
+    run.interrupt();
+    let (code, log) = run.finish(limit);
+    assert_eq!(code, Some(0), "{log}");
+    let interrupted = log
+        .find("inkemu: interrupted by the user\n")
+        .unwrap_or_else(|| panic!("no line for the interrupt in:\n{log}"));
     assert!(
-        console.contains(") boot: ESP-IDF v5.5.2 2nd stage bootloader\n"),
-        "{console}"
+        log[interrupted..].contains("\ninkemu: stopped at pc ")
+            && log[interrupted..].contains(" us of device time; "),
+        "the summary follows the interrupt: {log}"
     );
+}
+
+/// `inkemu run firmware.bin | head`, with a firmware that prints nothing: no write ever fails,
+/// and the run must still end once nobody reads it. No limit is given: only the reader that
+/// went away can end this run.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_run_that_prints_nothing_more_ends_when_the_reader_of_its_output_goes_away() {
+    const LAST_ROM_LINE: &str = "entry 0x40380000";
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    // A second stage that stops the watchdogs and spins: silent and busy for ever.
+    let mut program = stop_watchdogs();
+    program.push(HANG);
+    let (_dir, flash) = flash_image_of(&program);
+    let run = live::start(run_of(&rom_dir, &flash), |line| {
+        line.contains(LAST_ROM_LINE)
+    });
+    let limit = std::time::Duration::from_secs(60);
+    run.wait_for_line(LAST_ROM_LINE, limit);
+    let (code, log) = run.finish(limit);
+    assert_eq!(code, Some(0), "{log}");
     assert!(
-        console.contains(") boot.esp32c3: SPI Mode       : DIO\n"),
-        "{console}"
+        log.contains("inkemu: the reader of standard output went away\ninkemu: stopped at pc "),
+        "{log}"
     );
-    assert!(
-        console.contains(") boot: Disabling RNG early entropy source...\n"),
-        "{console}"
-    );
-    assert!(console.contains(") cpu_start: Unicore app\n"), "{console}");
+}
+
+/// The milestone through the real command: ROM, bootloader, the whole life of the application,
+/// its restart and the first line of the second boot, with nothing unmodelled.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn x4_boots_the_reference_firmware_through_its_restart_into_a_second_boot() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let flash = std::env::var("INKEMU_REF_FLASH").expect("set INKEMU_REF_FLASH");
+    // One life of the application is 28 million cycles and 11 s of device time; 40 million reach
+    // the second boot.
+    let run = || {
+        inkemu()
+            .args([
+                "run",
+                "--device",
+                "x4",
+                "--strict-mmio",
+                "--max-cycles",
+                "40000000",
+                "--trace-hash",
+                "--rom-dir",
+                &rom_dir,
+                "--flash",
+                &flash,
+            ])
+            .timeout(std::time::Duration::from_secs(120))
+            .assert()
+            .code(0)
+            .get_output()
+            .clone()
+    };
+    let output = run();
+    let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    let mut from = 0;
+    for expected in [
+        "entry 0x403cbf1a\n",
+        ") boot: ESP-IDF v5.5.2 2nd stage bootloader\n",
+        ") cpu_start: Unicore app\n",
+        "Hello world!\n",
+        "Restarting in 10 seconds...\n",
+        "Restarting in 0 seconds...\n",
+        "Restarting now.\n",
+        "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        "Saved PC:0x40048b92\n",
+        ") boot: ESP-IDF v5.5.2 2nd stage bootloader\n",
+        ") cpu_start: Unicore app\n",
+    ] {
+        let at = console[from..]
+            .find(expected)
+            .unwrap_or_else(|| panic!("`{expected}` is missing, or out of order:\n{console}"));
+        from += at + expected.len();
+    }
     let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(log.contains("cycle limit reached"), "{log}");
+    // The restart is an event of the run, said in inkemu's own voice with its cause, PC and
+    // stack: not a warning.
     assert!(
-        log.contains("stopped by --strict-mmio") && log.contains("TIMG0.RTCCALICFG"),
+        log.contains(
+            "\ninkemu: reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x"
+        ),
         "{log}"
     );
     assert!(
-        !log.contains("warning:"),
-        "nothing was reported before the stop: {log}"
+        !log.contains("warning:") && !log.contains("stopped by --strict-mmio"),
+        "nothing was reported in a whole life cycle: {log}"
     );
+    // The trace covers what ran before the restart as well as after it: a second process, given
+    // the same image and the same limit, prints the same console and the same hash.
+    let second = run();
+    assert_eq!(
+        output.stdout, second.stdout,
+        "two runs print the same console"
+    );
+    assert!(trace_hash_line(&log).is_some(), "{log}");
+    assert_eq!(
+        trace_hash_line(&log),
+        trace_hash_line(&String::from_utf8_lossy(&second.stderr))
+    );
+}
+
+/// The application counts down a line a second and sleeps in between: five seconds of device
+/// time end the run inside its countdown, with the CPU asleep. The name starts as the test above
+/// does, so that the CI job that has the reference image runs both.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn x4_boots_the_reference_firmware_and_a_device_time_limit_ends_its_countdown_asleep() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let flash = std::env::var("INKEMU_REF_FLASH").expect("set INKEMU_REF_FLASH");
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--strict-mmio",
+            "--max-time",
+            "5",
+            "--rom-dir",
+            &rom_dir,
+            "--flash",
+            &flash,
+        ])
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    // The line of ten seconds is printed a quarter of a second after power-on, then one a
+    // second: the last one due before five seconds is the line of six.
+    for seconds in 6..=10 {
+        assert!(
+            console.contains(&format!("Restarting in {seconds} seconds...\n")),
+            "{console}"
+        );
+    }
+    assert!(
+        console.ends_with("Restarting in 6 seconds...\n"),
+        "{console}"
+    );
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        log.contains("inkemu: device-time limit reached; raise --max-time to run longer\n"),
+        "{log}"
+    );
+    let micros = device_micros(&log);
+    assert!((5_000_000..=5_000_100).contains(&micros), "{log}");
+    assert!(
+        log.contains("; the CPU is asleep, waiting for an interrupt\n"),
+        "{log}"
+    );
+    assert!(!log.contains("warning:"), "{log}");
 }

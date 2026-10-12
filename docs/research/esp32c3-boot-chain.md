@@ -486,3 +486,19 @@ These supersede the matching "unknown" entries of sections B.1, G.3 and K.
 3. **Measured ROM path to the banner** (strict mode, nothing unmodelled, no CPU exception): the banner completes after 25,637 CPU cycles / 17,196 instructions (rev0), 26,681 / 17,932 (rev3), 26,775 / 17,994 (rev101), with the uncalibrated timing model and an UART that transmits instantly. These three counts were measured with the default v0.3 eFuse image for every ROM; the test suite now boots rev0 on a v0.0 chip and rev101 on a v1.1 chip, and the counts were not measured again on those. The first register the rev3 ROM touches after its banner that inkemu does not model is `GPIO.ENABLE` (`0x60004020`) at pc `0x40051b08` (`gpio_output_disable`, flash-boot path, section J row 14).
 4. **One register beyond section J rows 0–12 is needed before the banner**: `EXTMEM.ICACHE_CTRL1` (`0x600C4004`), read-modify-written by `Cache_Mask_All` (row 2 lists it; it is plain read/write with reset value 3).
 5. **eFuse read mirror**: the SVD documents 91 registers in `0x2C..=0x1C4`; the 12 other offsets of that window (`0x18C`, `0x194`–`0x1BC`) are reserved holes.
+
+## Corrections (2026-10-11)
+
+Established after this report was written, by `esp32c3-interrupts-and-reset.md` (§9) and `esp32c3-timers-and-watchdogs.md` (§K). The text above is left as it was; where it disagrees with an entry below, the entry is right.
+
+- BC §B.1 "Interrupt arbitration (several pending): Unknown": settled by `TRM §1.5.2`, highest priority then lowest line (§1.2). QEMU's lowest-line rule is a divergence.
+- BC §B.3: the delivery condition also requires a non-zero priority (§1.2); `CPU_INT_CLEAR` is toggled (1 then 0), not written once; QEMU decodes the priority registers of lines 1 to 30 only (in the current `esp-develop` source), not 1 to 31.
+- BC §B.1 "`mie`/`mip` […] recommended model: ignore `mie` for lines 1..31, treat `mie`/`mip` as plain registers": the first half stands; the second is an assumption among two (§2.4). QEMU does **not** ignore `mie`: writing 0 blocks delivery.
+- BC §B.1 "WFI […] Whether C3 wakes with `mstatus.MIE=0` is unknown": still unknown for silicon; the two QEMU builds disagree (§2.6).
+- BC §E.2 "enabling a 1 s RWDT with flashboot protection": the RWDT is configured with two 1 s stages and `FLASHBOOT_MOD_EN`, but `wdt_hal_init` has cleared its enable bit and nothing sets it again (§4.1). BC §K.4 (hardware flash-boot watchdog timeout): after an `esp_restart` the stage values are these.
+
+| Place | Statement there | Established here |
+|---|---|---|
+| `esp32c3-boot-chain.md` §E.3, §K.4; `esp32c3-rom-flash-boot.md` §L.2; `esp32c3-bootloader-accesses.md` §10.8 | "Exact hardware timeout/stage action of the auto-armed WDT: unknown" | MWDT0: 26,000,000 APB cycles, core reset, cause `0x07`; RWDT: 400,000 slow-clock cycles, system reset, cause `0x10`; proven absent from the ROM; both seen on real chips (§D.4, §H) |
+| `esp32c3-boot-chain.md` §E.2 | RTC timer "ticks at the RTC slow clock (RC ≈ 150 kHz)" | 136 kHz nominal once the bootloader has set `SCK_DCAP` = 255 (`SOC_CLK_RC_SLOW_FREQ_APPROX`) |
+| `esp32c3-boot-chain.md` §F.2 | "`RTCCALICFG2.TIMEOUT` as an escape" | also the exit of a first wait that runs when `START_CYCLING` is set, which is the reset state (§B.4 step 1); `RTCCALICFG2` resets to `0xFFFFFF98` |

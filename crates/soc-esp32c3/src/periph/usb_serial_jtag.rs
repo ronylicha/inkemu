@@ -1,7 +1,8 @@
 //! USB-Serial-JTAG, device-to-host serial path. Register layout: `usb_serial_jtag_reg.h` (report §G.3).
 //!
 //! The model behaves like a board with a host attached and reading: the IN endpoint always has
-//! room. Reception, interrupts and host attach/detach arrive in SP1b-3.
+//! room. Reception, interrupts and host attach/detach arrive in SP1b-3b.
+use crate::ctx::Ctx;
 use emu_core::Peripheral;
 
 const EP1: u32 = 0x00;
@@ -32,6 +33,11 @@ impl UsbSerialJtag {
         }
     }
 
+    /// A core reset empties the packet being filled; what was sent stays for the console.
+    pub(crate) fn reset(&mut self) {
+        self.packet.clear();
+    }
+
     /// The bytes sent to the host since the last call.
     pub fn take_tx(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.tx)
@@ -42,12 +48,12 @@ impl UsbSerialJtag {
     }
 }
 
-impl Peripheral for UsbSerialJtag {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for UsbSerialJtag {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
         (offset == EP1_CONF).then_some(SERIAL_IN_EP_DATA_FREE)
     }
 
-    fn write(&mut self, offset: u32, value: u32) -> bool {
+    fn write(&mut self, _ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         match offset {
             EP1 => {
                 self.packet.push(value.to_le_bytes()[0]);
@@ -72,16 +78,17 @@ mod tests {
     use super::*;
     use emu_core::Peripheral;
 
-    fn send(usb: &mut UsbSerialJtag, text: &[u8]) {
+    fn send(ctx: &mut Ctx, usb: &mut UsbSerialJtag, text: &[u8]) {
         for &byte in text {
-            assert!(usb.write(0x00, u32::from(byte)));
+            assert!(usb.write(ctx, 0x00, u32::from(byte)));
         }
     }
 
     #[test]
     fn endpoint_always_has_room_and_no_received_data() {
+        let ctx = &mut Ctx::default();
         let mut usb = UsbSerialJtag::new();
-        let conf = usb.read(0x04).unwrap();
+        let conf = usb.read(ctx, 0x04).unwrap();
         assert_eq!(
             conf & 0b010,
             0b010,
@@ -96,34 +103,37 @@ mod tests {
 
     #[test]
     fn bytes_reach_the_host_when_the_packet_is_committed() {
+        let ctx = &mut Ctx::default();
         let mut usb = UsbSerialJtag::new();
-        send(&mut usb, b"boot\n");
+        send(ctx, &mut usb, b"boot\n");
         assert_eq!(usb.take_tx(), [], "nothing is sent before WR_DONE");
-        assert!(usb.write(0x04, 1));
+        assert!(usb.write(ctx, 0x04, 1));
         assert_eq!(usb.take_tx(), b"boot\n");
         assert_eq!(usb.take_tx(), []);
     }
 
     #[test]
     fn full_packet_is_sent_without_waiting_for_a_commit() {
+        let ctx = &mut Ctx::default();
         let mut usb = UsbSerialJtag::new();
-        send(&mut usb, &[b'x'; 64]);
+        send(ctx, &mut usb, &[b'x'; 64]);
         assert_eq!(usb.take_tx().len(), 64);
-        send(&mut usb, b"y");
+        send(ctx, &mut usb, b"y");
         assert_eq!(usb.take_tx(), []);
     }
 
     #[test]
     fn committing_an_empty_packet_sends_nothing_and_other_registers_are_unmodeled() {
+        let ctx = &mut Ctx::default();
         let mut usb = UsbSerialJtag::new();
-        assert!(usb.write(0x04, 1));
+        assert!(usb.write(ctx, 0x04, 1));
         assert_eq!(usb.take_tx(), []);
         assert_eq!(
-            usb.read(0x08),
+            usb.read(ctx, 0x08),
             None,
-            "INT_RAW arrives with interrupts (SP1b-3)"
+            "INT_RAW arrives with interrupts (SP1b-3b)"
         );
-        assert!(!usb.write(0x18, 0), "CONF0");
-        assert_eq!(usb.read(0x00), None, "no host-to-device data yet");
+        assert!(!usb.write(ctx, 0x18, 0), "CONF0");
+        assert_eq!(usb.read(ctx, 0x00), None, "no host-to-device data yet");
     }
 }

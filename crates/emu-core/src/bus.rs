@@ -71,6 +71,15 @@ pub trait Bus {
     /// Decode caches compare it to detect self-modifying code and DMA writes.
     fn page_version(&self, addr: u32) -> u64;
 
+    /// Whether the `len` bytes a fetch at `addr` returned are memory content, which stays the same
+    /// until [`Bus::page_version`] changes. A `SoC` answers `false` when the fetch was served
+    /// without memory behind it (a flash window page no MMU entry maps): the instruction is then
+    /// decoded again at every execution, so the bus sees, and reports, each faulty fetch.
+    fn fetch_is_memory(&self, addr: u32, len: u32) -> bool {
+        let _ = (addr, len);
+        true
+    }
+
     /// Timing-only hook called when an instruction is served from a decode cache:
     /// the `SoC` charges what the fetch would have cost (e.g. flash-cache hit or miss) without moving data.
     fn fetch_stall(&mut self, addr: u32, len: u32) -> u32 {

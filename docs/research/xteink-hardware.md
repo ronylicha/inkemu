@@ -3,7 +3,7 @@
 # Xteink X3 / X4 / X4 Pro — hardware research for a firmware-level emulator
 
 Research date: 2026-10-11. Local clones used as primary evidence live in
-`/tmp/claude-1000/-home-rony-projects-xteink-emulator/efaa7359-51e8-4dc3-82f3-80b5b3bb7f32/scratchpad/repos/`
+a scratch directory outside the repository
 (abbreviated `R/` below). Image headers were parsed locally with `scratchpad/tools/imginfo.py` and `appdesc.py`.
 
 Confidence tags: **[HW]** confirmed on hardware / schematic by a project author, **[RE]** reverse-engineered from OEM firmware,

@@ -27,13 +27,13 @@ pub const PCMR_ENABLE: u32 = 1 << 0;
 
 /// Physical memory protection: 16 entries (ESP-IDF `SOC_CPU_PMP_REGION_GRANULARITY`, `cpu_region_protect.c`;
 /// report BC §B.2). The registers are stored and the lock bit is honoured; **the protection is not
-/// enforced** (decision D18): enforcement arrives with the application's memory protection in SP1b-3.
+/// enforced** (decision D18): enforcement arrives with the application's memory protection in SP1b-4.
 ///
 /// ASSUMPTION: a `pmpcfg` byte is stored verbatim. The privileged specification makes its fields
 /// WARL — bits 5 and 6 are reserved, and so is the combination R = 0 with W = 1 — and what this core
 /// keeps of them is not established; nothing reads them back on the measured paths. A readback on a
-/// real chip, or the SP1b-4 lockstep, settles it. A lock is also never cleared, because no hart
-/// reset exists yet: the reset of SP1b-3 must clear the whole PMP state.
+/// real chip, or the SP1b-4 lockstep, settles it. Software cannot clear a lock; a reset does:
+/// `Hart::reset` builds a new CSR file, and the whole PMP state with it.
 pub const PMPCFG0: u16 = 0x3A0;
 pub const PMPADDR0: u16 = 0x3B0;
 pub const PMP_ENTRIES: usize = 16;

@@ -440,3 +440,12 @@ Container: `docker run -d --name inkemu-flashboot --network none --entrypoint sl
 
 Checksums: `out/t1_mmio.txt` sha256 `7a4723b7…463a`, `out/t2_access.txt` `7a07a8c4…a2e0`, `out/t2_calls.txt` `7cfff674…16b1`.
 Licence hygiene: QEMU source was read for behaviour only (two files, cited by line); no code or comment was copied. ROM facts come from the Apache-2.0 `esp-rom-elfs` ELF; register names and bit positions from the Apache-2.0 ESP-IDF headers and the vendored SVD.
+
+## Corrections (2026-10-11)
+
+Established after this report was written, by `esp32c3-interrupts-and-reset.md` (§9) and `esp32c3-timers-and-watchdogs.md` (§K). The text above is left as it was; where it disagrees with an entry below, the entry is right.
+
+| Place | Statement there | Established here |
+|---|---|---|
+| `esp32c3-boot-chain.md` §E.3, §K.4; `esp32c3-rom-flash-boot.md` §L.2; `esp32c3-bootloader-accesses.md` §10.8 | "Exact hardware timeout/stage action of the auto-armed WDT: unknown" | MWDT0: 26,000,000 APB cycles, core reset, cause `0x07`; RWDT: 400,000 slow-clock cycles, system reset, cause `0x10`; proven absent from the ROM; both seen on real chips (§D.4, §H) |
+| `esp32c3-rom-flash-boot.md` §H | real-chip behaviour known "second-hand" from search-engine summaries | first-hand logs in seven GitHub issues; `rst:0x10 (RTCWDT_RTC_RST)` also occurs in the loop; the `j .` hang gives `Saved PC:0x40047ed2` (§H.1) |

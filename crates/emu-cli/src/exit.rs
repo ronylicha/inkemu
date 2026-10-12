@@ -8,29 +8,61 @@ pub const EXIT_TEST_FAILURE: u8 = 1;
 pub const EXIT_ERROR: u8 = 2;
 /// `inkemu run`: stopped by `--strict-mmio`.
 pub const EXIT_STRICT_MMIO: u8 = 3;
-/// `inkemu run`: the CPU waits for an interrupt and nothing can raise one.
+/// `inkemu run`: the CPU waits for an interrupt and none can come.
 pub const EXIT_IDLE: u8 = 4;
+
+/// `inkemu run`: a second Ctrl-C ended the process before the first one had ended the run. The
+/// value shells give a process ended by `SIGINT` (128 + 2).
+pub const EXIT_SECOND_INTERRUPT: u8 = 130;
 
 /// The exit codes of `inkemu run`, for its `--help`.
 pub const RUN_EXIT_CODES_HELP: &str = "\
 Exit codes:
-  0  the run ended normally: the cycle limit was reached, or the reader of standard output went away
+  0  the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was
+     pressed, or the reader of standard output went away
   2  error: unknown device, missing or invalid ROM, refused flash image, or standard output cannot be written
   3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
      emulator cannot perform faithfully, or flash that is not mapped)
-  4  the CPU is waiting for an interrupt and nothing can raise one (interrupts are not emulated yet)";
+  4  the CPU waits for an interrupt and none can come: no interrupt line is pending and no device
+     has anything scheduled
+130  Ctrl-C was pressed a second time before the run had stopped: no summary was printed";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::RunEnd;
 
     #[test]
     fn the_run_help_lists_every_exit_code_a_run_can_end_with() {
-        for code in [EXIT_OK, EXIT_ERROR, EXIT_STRICT_MMIO, EXIT_IDLE] {
+        // The code of every end of a run, and the one the handler of Ctrl-C exits with.
+        let codes = RunEnd::ALL
+            .iter()
+            .map(|end| (format!("{end:?}"), end.exit_code()))
+            .chain([("a second Ctrl-C".to_owned(), EXIT_SECOND_INTERRUPT)]);
+        for (end, code) in codes {
             assert!(
-                RUN_EXIT_CODES_HELP.contains(&format!("\n  {code}  ")),
-                "{code} missing from the help"
+                format!("\n{RUN_EXIT_CODES_HELP}").contains(&format!("\n{code:>3}  ")),
+                "{code}, the exit code of {end}, is missing from the help"
             );
+        }
+    }
+
+    #[test]
+    fn every_end_of_a_run_is_listed_once() {
+        // The `match` has no wildcard: an end added to the enum does not compile here until
+        // someone gives it a place, which is the moment to add it to the list; the place of each
+        // end is the one it has there.
+        let place = |end: RunEnd| match end {
+            RunEnd::Budget => 0,
+            RunEnd::TimeLimit => 1,
+            RunEnd::ConsoleClosed => 2,
+            RunEnd::ConsoleError => 3,
+            RunEnd::StrictMmio => 4,
+            RunEnd::Idle => 5,
+            RunEnd::Interrupted => 6,
+        };
+        for (index, end) in RunEnd::ALL.into_iter().enumerate() {
+            assert_eq!(place(end), index, "{end:?}");
         }
     }
 }

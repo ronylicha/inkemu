@@ -1,10 +1,12 @@
 //! eFuse read mirror of a production chip. Layout: `efuse_reg.h` (report §H).
 //! The mirror answers only the read registers the SVD documents between `RD_WR_DIS` and `RD_RS_ERR1`
-//! (`svd_regs::esp32c3`, peripheral `EFUSE`): the reserved holes between them (such as 0x18C and
-//! 0x194..=0x1BC) are not registers, so they stay unmodelled and surface as diagnostics (spec §5.2).
+//! (`svd_regs::esp32c3`, peripheral `EFUSE`) and the one hole the application reads (`0x18C`, see
+//! `RD_REPEAT_ERR_GAP`): the other reserved holes (such as 0x194..=0x1BC) are not registers, so they
+//! stay unmodelled and surface as diagnostics (spec §5.2).
 //! The content is that of a production chip (decision D9); programming registers stay unmodelled
-//! until a firmware needs them (SP1b-3).
+//! until a firmware needs them (SP1b-3b).
 use crate::chip::ChipRevision;
+use crate::ctx::Ctx;
 use crate::periph::EFUSE_BASE;
 use emu_core::Peripheral;
 
@@ -16,6 +18,18 @@ const fn reg(name: &str) -> u32 {
 /// First and last register of the read mirror: `RD_WR_DIS` to `RD_RS_ERR1`.
 const RD_FIRST: u32 = reg("RD_WR_DIS");
 const RD_LAST: u32 = reg("RD_RS_ERR1");
+/// `RD_REPEAT_DATA1` bits [17:16]: `WDT_DELAY_SEL`.
+const RD_REPEAT_DATA1: u32 = reg("RD_REPEAT_DATA1");
+const WDT_DELAY_SEL_SHIFT: u32 = 16;
+const WDT_DELAY_SEL_MASK: u32 = 0b11;
+/// The word between `RD_REPEAT_ERR3` (`+0x188`) and `RD_REPEAT_ERR4` (`+0x190`). No register is
+/// documented there, in the SVD or in ESP-IDF `efuse_reg.h`; the application reads it all the
+/// same, as the fifth word of the repeat-error block, at every start
+/// (`APP:esp_efuse_utility_check_errors@0x420003f8`, the load at `0x4200045c`).
+///
+/// ASSUMPTION: it reads 0, like the error registers around it on a chip without eFuse errors. A
+/// read on a real chip settles it.
+const RD_REPEAT_ERR_GAP: u32 = reg("RD_REPEAT_ERR3") + svd_regs::REGISTER_BYTES;
 /// `RD_MAC_SPI_SYS_3` bits [20:18]: `WAFER_VERSION_MINOR_LO`.
 const RD_MAC_SPI_SYS_3: u32 = reg("RD_MAC_SPI_SYS_3");
 const WAFER_MINOR_LO_SHIFT: u32 = 18;
@@ -100,17 +114,32 @@ impl Efuse {
             .collect();
         Efuse { read_mirror }
     }
+
+    /// `WDT_DELAY_SEL`, `RD_REPEAT_DATA1[17:16]`: the multiplier of the stage 0 timeout of the RTC
+    /// watchdog (`IDF:hal/esp32c3/include/hal/rwdt_ll.h:119`; report TW §C.3).
+    #[must_use]
+    pub fn wdt_delay_sel(&self) -> u32 {
+        let word = self
+            .read_mirror
+            .iter()
+            .find(|&&(offset, _)| offset == RD_REPEAT_DATA1)
+            .map_or(0, |&(_, value)| value);
+        (word >> WDT_DELAY_SEL_SHIFT) & WDT_DELAY_SEL_MASK
+    }
 }
 
-impl Peripheral for Efuse {
-    fn read(&mut self, offset: u32) -> Option<u32> {
+impl Peripheral<Ctx> for Efuse {
+    fn read(&mut self, _ctx: &mut Ctx, offset: u32) -> Option<u32> {
+        if offset == RD_REPEAT_ERR_GAP {
+            return Some(0);
+        }
         self.read_mirror
             .binary_search_by_key(&offset, |&(o, _)| o)
             .ok()
             .map(|i| self.read_mirror[i].1)
     }
 
-    fn write(&mut self, _offset: u32, _value: u32) -> bool {
+    fn write(&mut self, _ctx: &mut Ctx, _offset: u32, _value: u32) -> bool {
         false
     }
 }
@@ -120,9 +149,9 @@ mod tests {
     use super::*;
     use emu_core::Peripheral;
 
-    fn revision(efuse: &mut Efuse) -> (u32, u32) {
-        let sys3 = efuse.read(0x50).unwrap();
-        let sys5 = efuse.read(0x58).unwrap();
+    fn revision(ctx: &mut Ctx, efuse: &mut Efuse) -> (u32, u32) {
+        let sys3 = efuse.read(ctx, 0x50).unwrap();
+        let sys5 = efuse.read(ctx, 0x58).unwrap();
         let minor = (((sys5 >> 23) & 1) << 3) | ((sys3 >> 18) & 7);
         ((sys5 >> 24) & 3, minor)
     }
@@ -138,15 +167,16 @@ mod tests {
             .collect()
     }
 
-    fn word(efuse: &mut Efuse, name: &str) -> u32 {
+    fn word(ctx: &mut Ctx, efuse: &mut Efuse, name: &str) -> u32 {
         efuse
-            .read(svd_regs::esp32c3::addr("EFUSE", name) - EFUSE_BASE)
+            .read(ctx, svd_regs::esp32c3::addr("EFUSE", name) - EFUSE_BASE)
             .unwrap()
     }
 
     #[test]
     fn the_mirror_holds_the_dump_of_a_production_v0_3_chip() {
         // BA §8, raw words of the three blocks.
+        let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::V0_3);
         let expected = [
             ("RD_WR_DIS", 0),
@@ -171,7 +201,7 @@ mod tests {
             ("RD_SYS_PART1_DATA7", 0x0000_0009),
         ];
         for (name, value) in expected {
-            assert_eq!(word(&mut efuse, name), value, "{name}");
+            assert_eq!(word(ctx, &mut efuse, name), value, "{name}");
         }
         let listed: Vec<u32> = expected
             .iter()
@@ -182,7 +212,7 @@ mod tests {
             .filter(|o| !listed.contains(o))
         {
             assert_eq!(
-                efuse.read(offset),
+                efuse.read(ctx, offset),
                 Some(0),
                 "{offset:#x}: keys, user data and error flags are blank"
             );
@@ -191,21 +221,22 @@ mod tests {
 
     #[test]
     fn the_fields_the_boot_chain_decodes_have_the_values_it_needs() {
+        let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::V0_3);
         assert_eq!(
-            revision(&mut efuse),
+            revision(ctx, &mut efuse),
             (0, 3),
             "chip revision v0.3: the image headers require at least v0.3"
         );
-        let sys3 = word(&mut efuse, "RD_MAC_SPI_SYS_3");
-        let part1_4 = word(&mut efuse, "RD_SYS_PART1_DATA4");
+        let sys3 = word(ctx, &mut efuse, "RD_MAC_SPI_SYS_3");
+        let part1_4 = word(ctx, &mut efuse, "RD_SYS_PART1_DATA4");
         assert_eq!(
             (part1_4 & 3, (sys3 >> 24) & 7),
             (1, 2),
             "eFuse block revision v1.2"
         );
-        let mac_low = word(&mut efuse, "RD_MAC_SPI_SYS_0").to_be_bytes();
-        let mac_high = word(&mut efuse, "RD_MAC_SPI_SYS_1").to_be_bytes();
+        let mac_low = word(ctx, &mut efuse, "RD_MAC_SPI_SYS_0").to_be_bytes();
+        let mac_high = word(ctx, &mut efuse, "RD_MAC_SPI_SYS_1").to_be_bytes();
         assert_eq!(
             [
                 mac_high[2],
@@ -219,12 +250,12 @@ mod tests {
         );
         // What the ROM decides on (FB §C rows 2 to 4): default SPI pads, no secure boot, no flash
         // power-up delay, no forced resume, direct boot not disabled.
-        assert_eq!(word(&mut efuse, "RD_MAC_SPI_SYS_1") >> 16, 0);
-        assert_eq!(word(&mut efuse, "RD_MAC_SPI_SYS_2"), 0);
-        let data2 = word(&mut efuse, "RD_REPEAT_DATA2");
+        assert_eq!(word(ctx, &mut efuse, "RD_MAC_SPI_SYS_1") >> 16, 0);
+        assert_eq!(word(ctx, &mut efuse, "RD_MAC_SPI_SYS_2"), 0);
+        let data2 = word(ctx, &mut efuse, "RD_REPEAT_DATA2");
         assert_eq!((data2 >> 20) & 1, 0, "SECURE_BOOT_EN");
         assert_eq!(data2 >> 28, 0, "FLASH_TPUW");
-        let data3 = word(&mut efuse, "RD_REPEAT_DATA3");
+        let data3 = word(ctx, &mut efuse, "RD_REPEAT_DATA3");
         assert_eq!(
             data3 & ((1 << 13) | (1 << 1)),
             0,
@@ -232,60 +263,95 @@ mod tests {
         );
         assert_eq!(data3 >> 31, 1, "ERR_RST_ENABLE (BA §11)");
         assert_eq!(
-            (word(&mut efuse, "RD_REPEAT_DATA1") >> 16) & 3,
+            (word(ctx, &mut efuse, "RD_REPEAT_DATA1") >> 16) & 3,
             0,
             "WDT_DELAY_SEL"
         );
     }
 
     #[test]
+    fn the_watchdog_delay_is_bits_17_and_16_of_repeat_data_1() {
+        let mut efuse = Efuse::new(ChipRevision::V0_3);
+        assert_eq!(efuse.wdt_delay_sel(), 0, "a production chip");
+        // Each word has its neighbours set the other way round from the field, so that a wrong
+        // shift or mask reads another value.
+        for (word, delay) in [
+            (0x0000_0000, 0),
+            (0x0001_0000, 1),
+            (0x0002_0000, 2),
+            (0x0003_0000, 3),
+            (0xFFFC_FFFF, 0),
+            (0xFFFD_FFFF, 1),
+            (0xFFFE_FFFF, 2),
+            (0xFFFF_FFFF, 3),
+            (0x0000_FFFF, 0),
+            (0xFFFC_0000, 0),
+        ] {
+            let entry = efuse
+                .read_mirror
+                .iter_mut()
+                .find(|(offset, _)| *offset == RD_REPEAT_DATA1)
+                .expect("RD_REPEAT_DATA1 is in the mirror");
+            entry.1 = word;
+            assert_eq!(efuse.wdt_delay_sel(), delay, "{word:#010x}");
+        }
+    }
+
+    #[test]
     fn the_profile_revision_replaces_the_wafer_version_and_nothing_else() {
+        let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::new(1, 9).unwrap());
-        assert_eq!(revision(&mut efuse), (1, 9));
+        assert_eq!(revision(ctx, &mut efuse), (1, 9));
         let untouched_3 = !(0x7 << 18);
         let untouched_5 = !((0x3 << 24) | (1 << 23));
         assert_eq!(
-            word(&mut efuse, "RD_MAC_SPI_SYS_3") & untouched_3,
+            word(ctx, &mut efuse, "RD_MAC_SPI_SYS_3") & untouched_3,
             0x020C_0000 & untouched_3
         );
         assert_eq!(
-            word(&mut efuse, "RD_MAC_SPI_SYS_5") & untouched_5,
+            word(ctx, &mut efuse, "RD_MAC_SPI_SYS_5") & untouched_5,
             0x0047_D2F2 & untouched_5
         );
         let mut v0_0 = Efuse::new(ChipRevision::new(0, 0).unwrap());
         assert_eq!(
-            revision(&mut v0_0),
+            revision(ctx, &mut v0_0),
             (0, 0),
             "the rev0 ROM tests boot a v0.0 chip"
         );
     }
 
     #[test]
-    fn reserved_holes_between_documented_registers_are_unmodeled() {
+    fn the_holes_between_documented_registers_are_unmodeled_but_for_the_one_esp_idf_reads() {
+        let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::V0_3);
-        assert_eq!(efuse.read(0x18C), None, "hole");
-        assert_eq!(efuse.read(0x194), None, "hole");
+        assert_eq!(
+            efuse.read(ctx, 0x18C),
+            Some(0),
+            "the hole ESP-IDF reads as a fifth repeat-error word"
+        );
+        assert_eq!(efuse.read(ctx, 0x194), None, "hole");
         let answered = (0x2C..=0x1C4)
             .step_by(4)
-            .filter(|&o| efuse.read(o).is_some())
+            .filter(|&o| efuse.read(ctx, o).is_some())
             .count();
         assert_eq!(
             answered,
-            svd_read_offsets().len(),
-            "the mirror answers exactly the documented registers"
+            svd_read_offsets().len() + 1,
+            "the mirror answers exactly the documented registers, and the one hole ESP-IDF reads"
         );
         assert_eq!(
-            answered, 91,
-            "103 words in the window minus 12 reserved holes; a changed count means the SVD changed"
+            answered, 92,
+            "103 words in the window minus 11 unanswered holes; a changed count means the SVD changed"
         );
     }
 
     #[test]
     fn programming_registers_and_writes_are_not_modelled() {
+        let ctx = &mut Ctx::default();
         let mut efuse = Efuse::new(ChipRevision::V0_3);
-        assert_eq!(efuse.read(0x00), None, "PGM_DATA0");
-        assert_eq!(efuse.read(0x1C8), None, "CLK");
-        assert_eq!(efuse.read(0x1D4), None, "CMD");
-        assert!(!efuse.write(0x30, 1), "the read mirror is read-only");
+        assert_eq!(efuse.read(ctx, 0x00), None, "PGM_DATA0");
+        assert_eq!(efuse.read(ctx, 0x1C8), None, "CLK");
+        assert_eq!(efuse.read(ctx, 0x1D4), None, "CMD");
+        assert!(!efuse.write(ctx, 0x30, 1), "the read mirror is read-only");
     }
 }

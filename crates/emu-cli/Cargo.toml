@@ -17,6 +17,7 @@ emu-core.workspace = true
 cpu-rv32.workspace = true
 firmware.workspace = true
 clap.workspace = true
+ctrlc.workspace = true
 goblin.workspace = true
 thiserror.workspace = true
 soc-esp32c3.workspace = true
@@ -26,6 +27,10 @@ ureq.workspace = true
 flate2.workspace = true
 tar.workspace = true
 etcetera.workspace = true
+
+# `poll`, to learn that the reader of standard output went away while a run prints nothing.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
