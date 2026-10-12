@@ -389,7 +389,8 @@ fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
 }
 
 /// Runs `machine` until it stops, sending the firmware console to `console` and everything else
-/// (warnings, the reason the run ended, the summary) to `log`.
+/// (warnings, then the summary, whose first line says why the run ended — or, when the console
+/// failed, that it did) to `log`.
 ///
 /// Output is relayed every [`SLICE_CYCLES`] cycles so a long run shows progress. Both limits of
 /// `options` are given to every call of the machine: the cycle limit ends a run whose CPU
@@ -690,6 +691,41 @@ mod tests {
             Some("inkemu: interrupted by the user\n")
         );
         assert!(lines.iter().all(|(begun, _)| *begun), "{lines:?}");
+    }
+
+    #[test]
+    fn the_console_error_line_is_the_first_of_the_summary() {
+        // A console that fails ends the run, and the line that says so comes before the reason:
+        // the summary has begun when it is written.
+        let interrupt = Interrupt::new();
+        let mut m = machine(
+            &printing(UART0, b"hello\n", &[HANG]),
+            MachineOptions::default(),
+        );
+        let mut log = Noting {
+            interrupt: &interrupt,
+            lines: Vec::new(),
+            in_a_line: false,
+        };
+        let end = execute(
+            &mut m,
+            &options(BACKSTOP),
+            &interrupt,
+            &reader_stays,
+            &mut Failing,
+            &mut log,
+        );
+        assert_eq!(end, RunEnd::ConsoleError);
+        let first = log
+            .lines
+            .iter()
+            .position(|(_, line)| line.contains("disk full"))
+            .unwrap_or_else(|| panic!("{:?}", log.lines));
+        assert!(
+            log.lines[first..].iter().all(|(begun, _)| *begun),
+            "{:?}",
+            log.lines
+        );
     }
 
     #[test]

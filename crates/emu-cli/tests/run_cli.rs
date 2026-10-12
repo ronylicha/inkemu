@@ -2173,7 +2173,7 @@ fn a_second_run_on_a_flash_file_is_refused_while_the_first_goes_on_and_ctrl_c_sa
 /// The test cannot fail on a sound binary, whenever the signal arrives: the line comes after the
 /// run has returned. What it cannot do is make sure the signal arrives before the save ends; a
 /// handler that ended the process there would fail it only when it does (the save takes tens of
-/// milliseconds, the signal one or two). The rule itself is held by the unit tests of `main.rs`.
+/// milliseconds, the signal one or two). The rule itself is held by the unit tests of `run.rs`.
 #[cfg(unix)]
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR"]
