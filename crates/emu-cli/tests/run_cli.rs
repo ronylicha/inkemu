@@ -1707,7 +1707,7 @@ fn the_flash_file_keeps_the_flash_of_the_device_from_one_run_to_the_next() {
     assert!(
         first
             .log
-            .contains("; 1 of its 4 KiB sectors were modified; saved to "),
+            .contains("; 1 of its 4 KiB sectors was modified; saved to "),
         "{}",
         first.log
     );
@@ -1802,7 +1802,7 @@ fn a_run_without_a_flash_file_says_what_it_does_not_keep_and_leaves_the_image_as
         );
         assert!(
             run.log.contains(
-                "inkemu: flash at end: 1 of its 4 KiB sectors were modified and are not kept, since the run has no flash file; pass --flash-file <path> to keep the flash of the device from one run to the next\n"
+                "inkemu: flash at end: 1 of its 4 KiB sectors was modified and is not kept, since the run has no flash file; pass --flash-file <path> to keep the flash of the device from one run to the next\n"
             ),
             "{}",
             run.log

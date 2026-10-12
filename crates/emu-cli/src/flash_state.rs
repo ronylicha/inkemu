@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// What is appended to the name of a flash file to name its lock file.
-pub const LOCK_SUFFIX: &str = ".lock";
+const LOCK_SUFFIX: &str = ".lock";
 
 /// The mode of a flash file a run creates, on Unix: read and written by its owner, and nothing
 /// for anyone else.
@@ -80,8 +80,12 @@ pub enum FlashStateError {
         "the flash file {path} is not a regular file (a link is not followed: the file is replaced when the run ends, not written through); give the path of the file itself, or a new path"
     )]
     NotAFile { path: String },
-    #[error("cannot read the flash file {path}: {detail}; check its read permissions")]
-    Read { path: String, detail: String },
+    #[error("cannot read the flash file {path}: {detail}; {remedy}")]
+    Read {
+        path: String,
+        detail: String,
+        remedy: &'static str,
+    },
     #[error(
         "the flash file {path} cannot be opened for writing: {detail}; make it writable for you, since a run replaces its flash file when it ends, or keep it as it is and give it to --flash, which is only read, with another path for --flash-file"
     )]
@@ -285,9 +289,21 @@ fn check(shown: &str, size: u32, metadata: &std::fs::Metadata) -> Result<(), Fla
 }
 
 fn read_error(shown: &str, error: &std::io::Error) -> FlashStateError {
+    use std::io::ErrorKind;
     FlashStateError::Read {
         path: shown.to_owned(),
         detail: sanitize(&error.to_string()),
+        remedy: match error.kind() {
+            ErrorKind::NotADirectory => {
+                "check the path: a part of it that should be a directory is not one"
+            }
+            // It was there when it was looked at: something removed it since.
+            ErrorKind::NotFound => "make sure nothing else uses it, then run again",
+            ErrorKind::PermissionDenied => {
+                "check its read permissions, and those of the directories that lead to it"
+            }
+            _ => "check the path and its read permissions",
+        },
     }
 }
 
@@ -326,6 +342,12 @@ fn read_exactly(source: impl Read, size: u32) -> std::io::Result<Result<Vec<u8>,
     } else {
         Err(len)
     })
+}
+
+/// How many sectors of the flash a run modified, as a clause of its summary.
+fn sectors_modified(modified: u32) -> String {
+    let were = if modified == 1 { "was" } else { "were" };
+    format!("{modified} of its 4 KiB sectors {were} modified")
 }
 
 /// The flash file of one run, locked against other runs for as long as this value lives.
@@ -489,6 +511,15 @@ impl FlashState {
         judge(&self.path, &self.shown, self.size)
     }
 
+    /// Whether nothing at all is at the path of the flash file. What is there is not judged:
+    /// a file that is no flash of the device is there.
+    fn is_gone(&self) -> bool {
+        matches!(
+            std::fs::symlink_metadata(&self.path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
     /// The content of the flash file: exactly the bytes of the flash of the device. The size is
     /// judged before anything is read, and no more than one byte past it is ever read.
     ///
@@ -637,12 +668,6 @@ impl RunFlash {
         ))
     }
 
-    /// The flash file of the run, when it has one.
-    #[must_use]
-    pub const fn state(&self) -> Option<&FlashState> {
-        self.state.as_ref()
-    }
-
     /// Whether the run starts from the content of its flash file.
     #[must_use]
     pub const fn starts_from_the_file(&self) -> bool {
@@ -650,8 +675,9 @@ impl RunFlash {
     }
 
     /// Ends the run for its flash: says in `log` what it started from and what became of it,
-    /// and writes the flash file when there is one and it does not already hold the content
-    /// (it did not exist, it is being replaced, or the run modified the flash).
+    /// and writes the flash file when there is one and it does not hold the content the run
+    /// ends with: it is absent (a first run, or a file removed while the run went on), it is
+    /// being replaced, or the run modified the flash.
     ///
     /// Returns `false` when the flash file had to be written and could not be: the error is in
     /// `log`, and what the run wrote to the flash is lost. A failing log writer does not keep
@@ -663,12 +689,18 @@ impl RunFlash {
             if modified > 0 {
                 let _ = writeln!(
                     log,
-                    "inkemu: flash at end: {modified} of its 4 KiB sectors were modified and are not kept, since the run has no flash file; pass --flash-file <path> to keep the flash of the device from one run to the next"
+                    "inkemu: flash at end: {} and {} not kept, since the run has no flash file; pass --flash-file <path> to keep the flash of the device from one run to the next",
+                    sectors_modified(modified),
+                    if modified == 1 { "is" } else { "are" }
                 );
             }
             return true;
         };
-        if self.from_file && modified == 0 {
+        let unchanged = self.from_file && modified == 0;
+        // The file the run started from held this content; whether it still does is for the
+        // file to say. One that is gone holds nothing, and the content is in memory.
+        let removed = unchanged && state.is_gone();
+        if unchanged && !removed {
             let _ = writeln!(
                 log,
                 "inkemu: flash at end: not modified; {} is left as it is",
@@ -679,12 +711,20 @@ impl RunFlash {
         let content = machine.flash_contents();
         match state.save(&content) {
             Ok(()) => {
-                let _ = writeln!(
-                    log,
-                    "inkemu: flash at end: sha256 {}; {modified} of its 4 KiB sectors were modified; saved to {}",
-                    content_sha256(&content, self.size),
-                    state.shown()
-                );
+                let sha256 = content_sha256(&content, self.size);
+                let path = state.shown();
+                let _ = if removed {
+                    writeln!(
+                        log,
+                        "inkemu: flash at end: sha256 {sha256}; not modified; {path} was removed while the run went on and is written again"
+                    )
+                } else {
+                    writeln!(
+                        log,
+                        "inkemu: flash at end: sha256 {sha256}; {}; saved to {path}",
+                        sectors_modified(modified)
+                    )
+                };
                 true
             }
             Err(e) => {
@@ -1314,7 +1354,74 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let err = state.load().unwrap_err();
         assert!(matches!(err, FlashStateError::Read { .. }), "{err}");
-        assert!(err.to_string().contains("; check its read permissions"));
+        assert!(
+            err.to_string()
+                .contains("; make sure nothing else uses it, then run again"),
+            "a file that is gone has no permissions to check: {err}"
+        );
+    }
+
+    #[test]
+    fn a_path_that_goes_through_a_file_is_refused_with_the_path_to_check_not_its_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("firmware.bin"), b"a file").unwrap();
+        let path = dir.path().join("firmware.bin").join("x4.bin");
+        let err = FlashState::open(&path, SIZE).unwrap_err();
+        // Unix says so of the look at the flash file; elsewhere the creation of the lock file
+        // fails, with its own remedy.
+        #[cfg(unix)]
+        {
+            assert!(matches!(err, FlashStateError::Read { .. }), "{err}");
+            let text = err.to_string();
+            assert!(
+                text.contains("; check the path") && !text.contains("permissions"),
+                "{text}"
+            );
+        }
+        assert_eq!(names(dir.path()), ["firmware.bin"], "{err}");
+    }
+
+    #[test]
+    fn the_count_of_modified_sectors_agrees_with_its_verb() {
+        assert_eq!(sectors_modified(0), "0 of its 4 KiB sectors were modified");
+        assert_eq!(sectors_modified(1), "1 of its 4 KiB sectors was modified");
+        assert_eq!(sectors_modified(2), "2 of its 4 KiB sectors were modified");
+        assert_eq!(
+            sectors_modified(4096),
+            "4096 of its 4 KiB sectors were modified"
+        );
+    }
+
+    #[test]
+    fn a_flash_file_removed_while_the_run_went_on_is_written_again_though_nothing_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x4.bin");
+        let held = vec![0x11u8; MIB as usize];
+        std::fs::write(&path, &held).unwrap();
+        let (flash, content) = RunFlash::begin(Some(&path), false, None, MIB).unwrap();
+        assert!(flash.starts_from_the_file());
+        std::fs::remove_file(&path).unwrap();
+        let (kept, log) = finish(&flash, &ran(content, &[]));
+        assert!(kept, "{log}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            held,
+            "the flash of the device is in its file again"
+        );
+        let shown = sanitize(&path.display().to_string());
+        assert!(
+            log.ends_with(&format!(
+                "inkemu: flash at end: sha256 {}; not modified; {shown} was removed while the run went on and is written again\n",
+                hex(&Sha256::digest(&held))
+            )),
+            "{log}"
+        );
+        // Written again, it is there: the next end of a run that changed nothing leaves it.
+        let before = identity(&path);
+        let (kept, log) = finish(&flash, &ran(Some(held), &[]));
+        assert!(kept && log.contains("not modified; "), "{log}");
+        assert!(log.contains("is left as it is"), "{log}");
+        assert_eq!(identity(&path), before);
     }
 
     #[test]
@@ -1410,7 +1517,7 @@ mod tests {
     fn without_a_flash_file_the_run_starts_from_the_seed_and_says_what_it_does_not_keep() {
         let (flash, content) = RunFlash::begin(None, false, Some(seed()), MIB).unwrap();
         assert_eq!(content, Some(seed()));
-        assert!(flash.state().is_none() && !flash.starts_from_the_file());
+        assert!(flash.state.is_none() && !flash.starts_from_the_file());
         let start = format!(
             "inkemu: flash at start: sha256 {}\n",
             content_sha256(&seed(), MIB)
@@ -1424,7 +1531,7 @@ mod tests {
         assert_eq!(
             log,
             format!(
-                "{start}inkemu: flash at end: 1 of its 4 KiB sectors were modified and are not kept, since the run has no flash file; pass --flash-file <path> to keep the flash of the device from one run to the next\n"
+                "{start}inkemu: flash at end: 1 of its 4 KiB sectors was modified and is not kept, since the run has no flash file; pass --flash-file <path> to keep the flash of the device from one run to the next\n"
             )
         );
         // No seed: an erased flash, whose hash is the one of a file of erased bytes.
@@ -1459,7 +1566,7 @@ mod tests {
         let first_hash = hex(&Sha256::digest(&first));
         assert!(
             log.ends_with(&format!(
-                "inkemu: flash at end: sha256 {first_hash}; 1 of its 4 KiB sectors were modified; saved to {}\n",
+                "inkemu: flash at end: sha256 {first_hash}; 1 of its 4 KiB sectors was modified; saved to {}\n",
                 sanitize(&path.display().to_string())
             )),
             "{log}"
