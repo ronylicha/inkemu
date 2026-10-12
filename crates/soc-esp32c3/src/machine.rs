@@ -51,8 +51,9 @@ pub enum StopReason {
     Idle,
     /// The call has slept through [`SLEEP_SLICE`] of device time, or [`MAX_FRUITLESS_WAKES`]
     /// times, and gives control back: the cycle counter stands still while the CPU sleeps, so
-    /// the cycle limit alone would never end a call of a firmware that sleeps. The caller calls
-    /// again to go on, and bounds such a run with the device-time limit.
+    /// the cycle limit alone ends a call of a firmware that sleeps late, or never when nothing
+    /// interrupts its sleep. The caller calls again to go on, and bounds such a run with the
+    /// device-time limit.
     ///
     /// Both bounds are counted over the whole call, the sleeps an interrupt ended included. The
     /// reason therefore says what the call did, not the state it leaves: the sleep that reaches a

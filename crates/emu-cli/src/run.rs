@@ -16,8 +16,9 @@ const MAX_REPEATED_SHOWN: usize = 3;
 /// Passes that wrote nothing to the console between two questions about its reader, when they
 /// execute little: a firmware that sleeps between far-apart wake-ups goes through a pass in a
 /// fraction of a microsecond of host time, and a system call in each was about half the host
-/// time of such a run. The reader's disappearance is still noticed within a fraction of a second
-/// of host time ([`ReaderWatch`] says what bounds the delay).
+/// time of such a run, measured on one host. The reader's disappearance is still noticed after
+/// this many silent passes at most ([`ReaderWatch`] says what bounds the delay); how long that
+/// is in host time depends on the host and on what the firmware does.
 const SILENT_PASSES_PER_QUESTION: u32 = 64;
 
 /// Decides which of the passes that wrote nothing to the console ask whether its reader is still
@@ -35,6 +36,11 @@ const SILENT_PASSES_PER_QUESTION: u32 = 64;
 /// cycles. A pass is one call of the machine, which ends on its slice of cycles or after
 /// [`soc_esp32c3::machine::SLEEP_SLICE`] of device time or
 /// [`soc_esp32c3::machine::MAX_FRUITLESS_WAKES`] sleeps.
+///
+/// A run that ends by itself inside that delay — on a limit, or because nothing can wake the
+/// CPU — ends as what it is, not as a run whose reader left: the end the device reached is the
+/// same on every host, and whether the reader had left a moment earlier is host timing. No last
+/// question is asked when a run ends.
 #[derive(Debug, Default)]
 struct ReaderWatch {
     /// Passes that wrote nothing still to go before one asks; 0 at the start: the first asks.
@@ -407,9 +413,11 @@ pub fn execute(
     end
 }
 
-/// A frequency in the largest unit that states it exactly: `80 MHz`, `625 kHz`, `39062 Hz`. Never a
-/// rounded figure: the crystal divider can bring the CPU clock far below 1 MHz, where a number of
-/// MHz would read 0.
+/// A frequency in the largest unit that states its number of hertz exactly: `80 MHz`, `625 kHz`,
+/// `39062 Hz`. This function never rounds: the crystal divider can bring the CPU clock far below
+/// 1 MHz, where a number of MHz would read 0. The number of hertz it is given is itself a whole
+/// number: a clock whose period does not divide the time base (40 MHz / 3) arrives truncated, as
+/// `13333333 Hz`.
 fn frequency_text(hz: u64) -> String {
     const KILO: u64 = 1_000;
     const MEGA: u64 = 1_000_000;
