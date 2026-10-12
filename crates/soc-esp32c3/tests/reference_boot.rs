@@ -485,14 +485,19 @@ fn reference_image_behind_the_stock_x4_table() -> Vec<u8> {
     image
 }
 
-/// What the first boot of an OTA layout with a blank `otadata` writes (report FW §E, first row;
-/// SF §B.1): one sector erase, then one program of the entry — sequence 1, a blank label, state
-/// valid (2), CRC.
-fn the_otadata_update() -> [FlashWrite; 2] {
+/// The `otadata` entry the bootloader writes on the first boot of an OTA layout (report FW §E,
+/// first row): sequence 1, a blank label, state valid (2), CRC.
+fn the_otadata_entry() -> Vec<u8> {
     let mut entry = vec![0xFF; 32];
     entry[..4].copy_from_slice(&[1, 0, 0, 0]);
     entry[24..28].copy_from_slice(&[2, 0, 0, 0]);
     entry[28..].copy_from_slice(&[0x9A, 0x98, 0x43, 0x47]);
+    entry
+}
+
+/// What the first boot of an OTA layout with a blank `otadata` writes (report FW §E, first row;
+/// SF §B.1): one sector erase, then one program of the entry.
+fn the_otadata_update() -> [FlashWrite; 2] {
     [
         FlashWrite::Erase {
             start: OTADATA_OFFSET,
@@ -500,9 +505,28 @@ fn the_otadata_update() -> [FlashWrite; 2] {
         },
         FlashWrite::Program {
             address: OTADATA_OFFSET,
-            data: entry,
+            data: the_otadata_entry(),
         },
     ]
+}
+
+/// Asserts that the first `otadata` sector of `flash`, the content of the chip when a run ended,
+/// holds the entry of [`the_otadata_entry`] and erased bytes after it: what the chip holds, not
+/// what it was asked to do.
+fn assert_otadata_holds_the_entry_and_nothing_else(flash: &[u8]) {
+    let entry = the_otadata_entry();
+    let sector = OTADATA_OFFSET as usize;
+    assert_eq!(
+        flash[sector..sector + entry.len()],
+        entry[..],
+        "the entry, as measured (FW §E)"
+    );
+    let rest = &flash[sector + entry.len()..sector + 0x1000];
+    assert_eq!(
+        rest.iter().position(|&byte| byte != 0xFF),
+        None,
+        "the rest of the sector is erased"
+    );
 }
 
 /// Asserts that `expected` are lines of `console`, in that order.
@@ -572,6 +596,8 @@ fn the_stock_x4_ota_layout_boots_and_writes_otadata_on_its_first_boot_only() {
         the_otadata_update(),
         "two boots, one erase and one program: the update of the first boot"
     );
+    assert_otadata_holds_the_entry_and_nothing_else(&life.flash);
+    assert_eq!(life.flash_modified_sectors, 1, "the otadata sector");
     assert_only_the_restart_is_reported(&life.diagnostics);
     assert!(
         matches!(life.stop, StopReason::CycleBudget | StopReason::Asleep),
@@ -611,7 +637,35 @@ fn a_strict_run_of_the_stock_x4_ota_layout_writes_otadata_and_reaches_the_applic
         ],
     );
     assert_eq!(boot.flash_writes, the_otadata_update());
+    assert_otadata_holds_the_entry_and_nothing_else(&boot.flash);
     assert_eq!(boot.resets, 0);
+}
+
+/// The same layout with an `otadata` sector that is not blank. Its first entry still reads
+/// "never written" (a sequence number of `FFFFFFFF`), so the bootloader takes the same path; the
+/// rest of the sector holds zeroes, which only an erase removes. Behind a blank sector the erase
+/// of the bootloader changes nothing and nothing here could tell whether it took place; behind
+/// this one, an erase that erased nothing would leave the entry AND-ed into the zeroes.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn the_bootloader_erases_an_otadata_sector_that_is_not_blank_before_it_programs_the_entry() {
+    let mut image = reference_image_behind_the_stock_x4_table();
+    let sector = OTADATA_OFFSET as usize;
+    image[sector + 4..sector + 0x1000].fill(0x00);
+    let life = run_image(image, SocConfig::default(), |console, _| {
+        application_starts(console) == 2
+    });
+    assert_eq!(
+        count_lines(&life.console, NO_FACTORY_IMAGE),
+        1,
+        "the first boot finds no valid entry, the second finds the one the first wrote:\n{}",
+        life.console
+    );
+    assert_eq!(count_lines(&life.console, OTADATA_SET), 1);
+    assert_eq!(life.flash_writes, the_otadata_update());
+    assert_otadata_holds_the_entry_and_nothing_else(&life.flash);
+    assert_eq!(life.flash_modified_sectors, 1, "the otadata sector");
+    assert_only_the_restart_is_reported(&life.diagnostics);
 }
 
 /// Milestone point 6: two runs of a whole life cycle, the reset included, are the same run.

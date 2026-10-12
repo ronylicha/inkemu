@@ -144,5 +144,5 @@ jobs:
           INKEMU_NVS_OTA_FLASH: ${{ runner.temp }}/reference-firmware/flash_nvs_ota.bin
         # Exact test counts, as in rom-boot: see tools/ci/run-ignored-tests.sh.
         run: |
-          tools/ci/run-ignored-tests.sh 12 --release -p soc-esp32c3 --test reference_boot -- --ignored
+          tools/ci/run-ignored-tests.sh 13 --release -p soc-esp32c3 --test reference_boot -- --ignored
           tools/ci/run-ignored-tests.sh 3 --release -p emu-cli --test run_cli reference_firmware -- --ignored
