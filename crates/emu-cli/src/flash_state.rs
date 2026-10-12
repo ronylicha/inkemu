@@ -18,6 +18,11 @@ use std::path::{Path, PathBuf};
 /// What is appended to the name of a flash file to name its lock file.
 pub const LOCK_SUFFIX: &str = ".lock";
 
+/// The mode of a flash file a run creates, on Unix: read and written by its owner, and nothing
+/// for anyone else.
+#[cfg(unix)]
+const NEW_FLASH_FILE_MODE: u32 = 0o600;
+
 /// Why a flash file cannot be used, read or written. The messages state the cause, then the
 /// remedy; the paths they echo have their control characters escaped.
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +82,10 @@ pub enum FlashStateError {
     NotAFile { path: String },
     #[error("cannot read the flash file {path}: {detail}; check its read permissions")]
     Read { path: String, detail: String },
+    #[error(
+        "the flash file {path} cannot be opened for writing: {detail}; make it writable for you, since a run replaces its flash file when it ends, or keep it as it is and give it to --flash, which is only read, with another path for --flash-file"
+    )]
+    NotWritable { path: String, detail: String },
     #[error(
         "the flash file {path} is {len} bytes and the flash of the device is {size} bytes: the file is not the flash of this device, and it is never padded or cut; use it with the device it was written for, pass a firmware image with --flash instead, or give a new path"
     )]
@@ -184,13 +193,31 @@ fn open_lock_file(
 }
 
 /// Whether what is at `path` can be the flash file of a device whose flash is `size` bytes:
-/// `Ok(false)` when nothing is there, `Ok(true)` for a regular file of exactly that size.
-/// Nothing is opened: a link is not followed, and a pipe is not waited on.
+/// `Ok(false)` when nothing is there, `Ok(true)` for a regular file of exactly that size that
+/// the user can write. What is no regular file is not opened: a link is not followed, and a
+/// pipe is not waited on.
+///
+/// A flash file is replaced, not written in place, and replacing a file asks nothing of its
+/// mode: a file its owner made read-only would be replaced all the same. A flash image is
+/// often an only copy, so the mode is taken at its word and such a file is refused. Whether it
+/// can be written is asked of the system, by opening it for writing (nothing is written, the
+/// file is closed at once), not read from the mode: the system knows who runs, and what the
+/// filesystem allows.
 fn judge(path: &Path, shown: &str, size: u32) -> Result<bool, FlashStateError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => check(shown, size, &metadata).map(|()| true),
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(read_error(shown, &e)),
+    };
+    check(shown, size, &metadata)?;
+    match open_in_place(OpenOptions::new().write(true), path) {
+        Ok(_) => Ok(true),
+        // Removed since the look: there is no flash file.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(read_error(shown, &e)),
+        Err(e) => Err(FlashStateError::NotWritable {
+            path: shown.to_owned(),
+            detail: sanitize(&e.to_string()),
+        }),
     }
 }
 
@@ -339,11 +366,38 @@ impl FlashState {
     }
 
     fn create_temporary(&self) -> std::io::Result<File> {
+        let mut options = OpenOptions::new();
         // `create_new` never follows a link and never reuses a file planted at the name.
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.temporary)
+        options.write(true).create_new(true);
+        // A flash holds what the firmware keeps, the credentials of a network among it: on
+        // Unix the file is for its owner alone from its first byte, and a flash file created
+        // by a run stays so. Elsewhere a new file has the access rights its directory gives
+        // it, as any file the standard library creates.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(NEW_FLASH_FILE_MODE);
+        }
+        options.open(&self.temporary)
+    }
+
+    /// Gives `temporary`, which holds the new content, the permission bits of the flash file it
+    /// is about to replace, when there is one: a file the user opened to a group, or closed to
+    /// everyone else, stays as the user set it. Only the read, write and execute bits are kept.
+    /// With nothing to replace the file is a new one, and keeps the mode it was created with.
+    #[cfg(unix)]
+    fn keep_the_mode_of_the_replaced_file(&self, temporary: &File) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        const ACCESS_BITS: u32 = 0o777;
+        let replaced = match std::fs::symlink_metadata(&self.path) {
+            Ok(replaced) if replaced.is_file() => replaced.permissions().mode() & ACCESS_BITS,
+            _ => return Ok(()),
+        };
+        // Not asked for when there is nothing to change: some filesystems refuse any request.
+        if temporary.metadata()?.permissions().mode() & ACCESS_BITS == replaced {
+            return Ok(());
+        }
+        temporary.set_permissions(std::fs::Permissions::from_mode(replaced))
     }
 
     /// Removes the temporary file a save that was killed left behind (no run is writing it:
@@ -448,7 +502,15 @@ impl FlashState {
         }
         .map_err(|e| failed("create", &self.temporary, &e))?;
         file.write_all(content)
-            .and_then(|()| file.sync_all())
+            .map_err(|e| failed("write", &self.temporary, &e))?;
+        // Where a file has no mode there is none to keep: the new file has the access rights
+        // its directory gives it.
+        #[cfg(unix)]
+        {
+            self.keep_the_mode_of_the_replaced_file(&file)
+                .map_err(|e| failed("set the permissions of", &self.temporary, &e))?;
+        }
+        file.sync_all()
             .map_err(|e| failed("write", &self.temporary, &e))?;
         drop(file);
         std::fs::rename(&self.temporary, &self.path)
@@ -745,6 +807,99 @@ mod tests {
                 && text.contains("; make it writable for you"),
             "{text}"
         );
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_flash_file_that_a_run_creates_is_for_its_owner_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x4.bin");
+        let state = FlashState::open(&path, SIZE).unwrap();
+        state.save(&content(1)).unwrap();
+        assert_eq!(mode_of(&path), 0o600, "{:o}", mode_of(&path));
+        // The same for a file that was removed while the run went on: it is a new file.
+        set_mode(&path, 0o644);
+        std::fs::remove_file(&path).unwrap();
+        state.save(&content(2)).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_flash_file_that_is_replaced_keeps_the_mode_its_owner_gave_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x4.bin");
+        let state = FlashState::open(&path, SIZE).unwrap();
+        state.save(&content(0)).unwrap();
+        for (seed, mode) in [(1, 0o640), (2, 0o664), (3, 0o600), (4, 0o660)] {
+            set_mode(&path, mode);
+            state.save(&content(seed)).unwrap();
+            assert_eq!(mode_of(&path), mode, "{:o}", mode_of(&path));
+            assert_eq!(std::fs::read(&path).unwrap(), content(seed));
+        }
+        // The access bits, and nothing a flash has no use for.
+        set_mode(&path, 0o4640);
+        state.save(&content(5)).unwrap();
+        assert_eq!(mode_of(&path), 0o640, "{:o}", mode_of(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_flash_file_the_user_cannot_write_is_refused_and_left_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x4.bin");
+        let only_copy = vec![0x33u8; MIB as usize];
+        std::fs::write(&path, &only_copy).unwrap();
+        set_mode(&path, 0o400);
+        assert!(
+            OpenOptions::new().write(true).open(&path).is_err(),
+            "this test needs a user whom a read-only file stops; run it as one"
+        );
+        // With or without a reset: the file would be replaced in both cases.
+        for reset in [false, true] {
+            let err = RunFlash::begin(Some(&path), reset, None, MIB).unwrap_err();
+            assert!(
+                matches!(err, FlashStateError::NotWritable { .. }),
+                "{reset}: {err}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains("x4.bin")
+                    && text.contains("cannot be opened for writing")
+                    && text.contains("; make it writable for you")
+                    && text.contains("give it to --flash, which is only read"),
+                "{text}"
+            );
+        }
+        assert_eq!(names(dir.path()), ["x4.bin"], "not even a lock file");
+        assert_eq!(mode_of(&path), 0o400);
+        assert_eq!(std::fs::read(&path).unwrap(), only_copy);
+
+        // Made read-only by a run before this one, between the look that comes before the
+        // lock and the one that counts, under it: refused all the same.
+        set_mode(&path, 0o600);
+        let state = FlashState::open(&path, MIB).unwrap();
+        set_mode(&path, 0o400);
+        assert!(matches!(
+            state.exists(),
+            Err(FlashStateError::NotWritable { .. })
+        ));
     }
 
     #[test]

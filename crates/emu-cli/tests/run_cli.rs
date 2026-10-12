@@ -1147,6 +1147,16 @@ fn set_mode(path: &std::path::Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+#[cfg(unix)]
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
 /// Makes a named pipe at `path`: opening one for writing waits for a reader that never comes.
 #[cfg(unix)]
 fn make_fifo(path: &std::path::Path) {
@@ -1162,6 +1172,7 @@ fn run_help_documents_the_flash_file_its_lock_and_its_reset() {
     inkemu().args(["run", "--help"]).assert().code(0).stdout(
         contains("--flash-file <FILE>")
             .and(contains("FILE.lock"))
+            .and(contains("by its owner only"))
             .and(contains("--reset-flash"))
             .and(contains("The image is only read"))
             .and(contains(
@@ -1410,6 +1421,34 @@ fn a_lock_file_that_cannot_be_opened_for_writing_is_said_to_be_there() {
                 .and(contains("cannot create").not())
                 .and(contains(MISSING_ROM).not()),
         );
+}
+
+/// A flash file is replaced when a run ends, which the mode of the file does not prevent: one
+/// its owner made read-only (an only copy) is refused, with or without a reset, and left alone.
+#[cfg(unix)]
+#[test]
+fn a_flash_file_that_cannot_be_written_is_refused_before_boot_and_left_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("x4.bin");
+    sparse_file(&file, X4_FLASH_BYTES);
+    set_mode(&file, 0o400);
+    let administrator = std::fs::OpenOptions::new().write(true).open(&file).is_ok();
+    assert!(
+        !administrator,
+        "this test needs a user whom a read-only file stops; run it as one"
+    );
+    for more in [&[][..], &["--reset-flash"][..]] {
+        run_with_flash_file(&file, more).code(2).stderr(
+            contains("x4.bin")
+                .and(contains("cannot be opened for writing"))
+                .and(contains("; make it writable for you"))
+                .and(contains("--flash"))
+                .and(contains(MISSING_ROM).not()),
+        );
+        assert_eq!(mode_of(&file), 0o400);
+        assert_eq!(std::fs::metadata(&file).unwrap().len(), X4_FLASH_BYTES);
+        assert_eq!(names_in(dir.path()), ["x4.bin"], "and no lock file");
+    }
 }
 
 /// What a save that was killed left behind is removed by the next run on the same flash file,

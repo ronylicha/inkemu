@@ -70,7 +70,10 @@ enum Command {
         /// at the first Ctrl-C, at a --strict-mmio stop, when the CPU waits for ever. The file
         /// is replaced in one step, never written while the run goes on, so a run that is
         /// killed leaves the file of before. A lock file beside it (FILE.lock) refuses a second
-        /// run on the same file; it is left in place.
+        /// run on the same file; it is left in place. A flash holds what the firmware keeps,
+        /// network credentials among it: on Unix a file created here is readable and writable
+        /// by its owner only, one that is replaced keeps its mode, and one that cannot be
+        /// written is refused.
         #[arg(long, value_name = "FILE")]
         flash_file: Option<PathBuf>,
         /// Start from the --flash image, or from an erased flash, although the flash file
