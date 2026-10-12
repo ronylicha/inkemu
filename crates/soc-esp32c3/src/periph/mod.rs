@@ -430,7 +430,16 @@ impl Peripherals {
     /// watchdog 0 and of the RTC watchdog when the chip is strapped to boot from flash.
     ///
     /// Only this crate can call it, for the reason [`SocBus::new`](crate::bus::SocBus) gives: the
-    /// chip is the one [`SocConfig::flash`] describes.
+    /// chip is the one [`SocConfig::flash`] describes. Every type below is public; the only
+    /// thing that does not compile is the call:
+    ///
+    /// ```compile_fail
+    /// use soc_esp32c3::{FlashDevice, SocConfig, ctx::Ctx};
+    /// fn peripherals_around_my_own_chip(config: &SocConfig, flash: Box<dyn FlashDevice>) {
+    ///     let mut ctx = Ctx::new(false);
+    ///     let _ = soc_esp32c3::periph::Peripherals::new(config, flash, &mut ctx);
+    /// }
+    /// ```
     #[must_use]
     pub(crate) fn new(
         config: &SocConfig,
