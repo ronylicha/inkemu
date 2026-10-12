@@ -1133,6 +1133,58 @@ fn x4_boots_the_reference_firmware_and_a_device_time_limit_ends_its_countdown_as
     assert!(!log.contains("warning:"), "{log}");
 }
 
+/// The trace hash of the milestone run is pinned, with the device time it ends at.
+///
+/// The hash is the fingerprint of every PC the CPU executed, in order: here over one whole life
+/// of the reference `hello_world` (ROM, bootloader, application, countdown, restart) and the
+/// start of the second, 40,000,001 cycles in all. Two runs that agree on it took the same path,
+/// instruction for instruction. The device time is how long that path lasted on the device.
+///
+/// Nothing but a change of the model moves either number: what an instruction or a register
+/// does, or when an interrupt arrives, which the timing decides. A change that is meant to alter
+/// the path or the timing changes them **on purpose**, and the commit that changes them here
+/// says why. A change that was not meant to (a cache of the emulator, a diagnostic, the flash
+/// file) and moves them has changed what the firmware sees: that is a regression to find, not a
+/// value to pin again.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn x4_runs_the_reference_firmware_along_its_pinned_trace() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let flash = std::env::var("INKEMU_REF_FLASH").expect("set INKEMU_REF_FLASH");
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--strict-mmio",
+            "--max-cycles",
+            "40000001",
+            "--trace-hash",
+            "--rom-dir",
+            &rom_dir,
+            "--flash",
+            &flash,
+        ])
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        trace_hash_line(&log),
+        Some("trace-hash 10174cc2726c3d77"),
+        "{log}"
+    );
+    assert_eq!(device_micros(&log), 11_396_706, "{log}");
+    assert!(
+        log.contains("after 40000001 cycles (26562395 instructions)"),
+        "{log}"
+    );
+}
+
 /// The flash of the X4, the device every test here runs.
 const X4_FLASH_BYTES: u64 = 16 << 20;
 
