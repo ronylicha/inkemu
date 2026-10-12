@@ -1093,3 +1093,599 @@ fn x4_boots_the_reference_firmware_and_a_device_time_limit_ends_its_countdown_as
     );
     assert!(!log.contains("warning:"), "{log}");
 }
+
+/// The flash of the X4, the device every test here runs.
+const X4_FLASH_BYTES: u64 = 16 << 20;
+
+/// `inkemu run --device x4 --flash-file <file> <more>` with a ROM directory that holds nothing:
+/// a refusal of the flash file must come before any attempt to load a ROM.
+fn run_with_flash_file(file: &std::path::Path, more: &[&str]) -> assert_cmd::assert::Assert {
+    let empty = tempfile::tempdir().unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--max-cycles", "1000", "--rom-dir"])
+        .arg(empty.path())
+        .arg("--flash-file")
+        .arg(file)
+        .args(more)
+        .assert()
+}
+
+/// A file of `len` zero bytes, sparse: nothing that large is written to the disk.
+fn sparse_file(path: &std::path::Path, len: u64) {
+    std::fs::File::create(path).unwrap().set_len(len).unwrap();
+}
+
+#[test]
+fn run_help_documents_the_flash_file_its_lock_and_its_reset() {
+    inkemu().args(["run", "--help"]).assert().code(0).stdout(
+        contains("--flash-file <FILE>")
+            .and(contains("FILE.lock"))
+            .and(contains("--reset-flash"))
+            .and(contains("The image is only read"))
+            .and(contains(
+                "the flash file could not be written when the run ended",
+            )),
+    );
+}
+
+#[test]
+fn a_reset_of_the_flash_without_a_flash_file_is_a_usage_error() {
+    // An empty ROM directory and a limit: were the option accepted, the command would end on the
+    // ROM it does not have, and never download one or run for ever.
+    let empty = tempfile::tempdir().unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--max-cycles", "1000", "--rom-dir"])
+        .arg(empty.path())
+        .arg("--reset-flash")
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .code(2)
+        .stderr(
+            contains("--flash-file <FILE>")
+                .and(contains("required arguments were not provided"))
+                .and(contains("esp32c3_rev3_rom.elf").not()),
+        );
+}
+
+#[test]
+fn a_flash_file_of_another_size_is_refused_before_boot_with_both_sizes_and_left_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("x4.bin");
+    // A firmware image given to the wrong option: with or without a reset, it must survive.
+    let image = build_flash_image(&ImageSpec::default());
+    std::fs::write(&file, &image).unwrap();
+    for more in [&[][..], &["--reset-flash"][..]] {
+        run_with_flash_file(&file, more).code(2).stderr(
+            contains("x4.bin")
+                .and(contains(format!("is {} bytes", image.len())))
+                .and(contains("16777216 bytes"))
+                .and(contains("never padded or cut"))
+                .and(contains("; use it with the device it was written for"))
+                .and(contains("esp32c3_rev3_rom.elf").not()),
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), image);
+    }
+}
+
+#[test]
+fn an_image_together_with_a_flash_file_that_exists_is_refused_before_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("x4.bin");
+    sparse_file(&file, X4_FLASH_BYTES);
+    let image = dir.path().join("flash.bin");
+    std::fs::write(&image, build_flash_image(&ImageSpec::default())).unwrap();
+    run_with_flash_file(&file, &["--flash", image.to_str().unwrap()])
+        .code(2)
+        .stderr(
+            contains("both --flash and the flash file")
+                .and(contains("x4.bin"))
+                .and(contains("; drop --flash to go on from the flash file"))
+                .and(contains("--reset-flash"))
+                .and(contains("esp32c3_rev3_rom.elf").not()),
+        );
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), X4_FLASH_BYTES);
+}
+
+#[test]
+fn a_flash_file_that_another_run_holds_is_refused_before_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("x4.bin");
+    // This process is the other run: it holds the lock a run of inkemu takes.
+    let held = emu_cli::flash_state::FlashState::open(&file, 16 << 20).unwrap();
+    run_with_flash_file(&file, &[]).code(2).stderr(
+        contains("is in use by another inkemu run")
+            .and(contains("x4.bin.lock"))
+            .and(contains("; wait for that run to end"))
+            .and(contains("esp32c3_rev3_rom.elf").not()),
+    );
+    drop(held);
+    // The lock is free again: the same command now gets as far as the ROM it does not have.
+    run_with_flash_file(&file, &[])
+        .code(2)
+        .stderr(contains("esp32c3_rev3_rom.elf").and(contains("in use").not()));
+    assert!(!file.exists(), "a run that never started writes nothing");
+}
+
+#[test]
+fn a_flash_file_in_a_directory_that_does_not_exist_is_refused_before_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("missing").join("x4.bin");
+    run_with_flash_file(&file, &[]).code(2).stderr(
+        contains("cannot create the lock file")
+            .and(contains(
+                "; check that the directory exists and is writable",
+            ))
+            .and(contains("esp32c3_rev3_rom.elf").not()),
+    );
+}
+
+/// Code that waits until the transmit FIFO of UART0 is empty. A second stage that prints must
+/// start with it: the ROM has just filled the FIFO with its last lines, and a byte written to a
+/// full FIFO is lost, on the device as here. `UART.STATUS` [25:16] is `TXFIFO_CNT`: the upper
+/// half of the register, modulo 1024.
+fn wait_for_uart0_to_drain() -> [u32; 5] {
+    use cpu_rv32::asm::{addi, bne, lhu, lui, remu};
+    use soc_esp32c3::test_support::{T0, T1};
+    const T2: u8 = 7;
+    let status = svd_regs::esp32c3::addr("UART0", "STATUS");
+    let page = status & 0xFFFF_F000;
+    [
+        lui(T0, page),
+        addi(T2, 0, 1024),
+        lhu(T1, T0, (status - page + 2).cast_signed()),
+        remu(T1, T1, T2),
+        bne(T1, 0, -8),
+    ]
+}
+
+/// A second stage that keeps in the flash the number of times it booted, and prints it: `boot 1`
+/// on an erased flash, `boot 2` on the flash that boot left, and so on. The count is the byte at
+/// flash offset 0x20000, past everything the images built here hold; each boot erases its sector
+/// and programs the next value. The byte is read through the data window (MMU entry 0), once,
+/// before it is written.
+fn counting_its_boots() -> Vec<u32> {
+    use cpu_rv32::asm::{addi, lbu, lui, sb, sw};
+    use soc_esp32c3::test_support::{T0, flash_erase_sector, print_program};
+    const A0: u8 = 10;
+    const A1: u8 = 11;
+    const S0: u8 = 8;
+    const COUNT_AT: u32 = 0x2_0000;
+    let spi1 = |register| svd_regs::esp32c3::addr("SPI1", register);
+    let mut program = stop_watchdogs();
+    program.extend(store_register(
+        soc_esp32c3::periph::mmu::MMU_TABLE_BASE,
+        COUNT_AT >> 16,
+    ));
+    program.extend([
+        lui(S0, soc_esp32c3::memmap::FLASH_DBUS_BASE),
+        lbu(A0, S0, 0), // the count the flash holds: 0xFF when erased
+        addi(A0, A0, 1),
+        // Through a byte of RAM, to keep the low byte: 0xFF + 1 is the count 0.
+        lui(S0, soc_esp32c3::memmap::SRAM_DBUS_BASE),
+        sb(A0, S0, 0),
+        lbu(A0, S0, 0),
+    ]);
+    program.extend(wait_for_uart0_to_drain());
+    program.extend(print_program(
+        svd_regs::esp32c3::addr("UART0", "FIFO"),
+        b"boot ",
+    ));
+    // `T0` still holds the address of the FIFO: the digit, then the end of the line.
+    program.extend([
+        addi(A1, A0, i32::from(b'1')),
+        sw(A1, T0, 0),
+        addi(A1, 0, i32::from(b'\n')),
+        sw(A1, T0, 0),
+    ]);
+    program.extend(flash_erase_sector(COUNT_AT));
+    // Write enable, the count in `W0`, one byte of it programmed at `COUNT_AT`.
+    program.extend(store_register(spi1("CMD"), 1 << 30));
+    let w0 = spi1("W0");
+    let page = w0.wrapping_add(0x800) & 0xFFFF_F000;
+    program.extend([
+        lui(T0, page),
+        sw(A0, T0, w0.wrapping_sub(page).cast_signed()),
+    ]);
+    program.extend(store_register(spi1("ADDR"), (1 << 24) | COUNT_AT));
+    program.extend(store_register(spi1("CMD"), 1 << 25));
+    program.push(HANG);
+    program
+}
+
+/// What a run of [`counting_its_boots`] left: its exit code, its console and its log.
+struct Counted {
+    code: Option<i32>,
+    console: String,
+    log: String,
+}
+
+impl Counted {
+    /// The hexadecimal digest of the summary line that starts with `prefix`.
+    fn sha256(&self, prefix: &str) -> String {
+        self.log
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("no line `{prefix}` in:\n{}", self.log))
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect()
+    }
+}
+
+const FLASH_AT_START: &str = "inkemu: flash at start: sha256 ";
+const FLASH_AT_END: &str = "inkemu: flash at end: sha256 ";
+
+/// Runs `inkemu run --device x4 --strict-mmio --trace-hash` with the real ROM and `more`, for the
+/// cycles the ROM and [`counting_its_boots`] need.
+fn count_a_boot(more: &[&std::ffi::OsStr]) -> Counted {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let output = inkemu()
+        .args(["run", "--device", "x4", "--strict-mmio", "--trace-hash"])
+        .args(["--max-cycles", "5000000", "--rom-dir", &rom_dir])
+        .args(more)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    Counted {
+        code: output.status.code(),
+        console: String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        log: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+fn sha256_of(path: &std::path::Path) -> String {
+    use sha2::Digest as _;
+    emu_cli::term::hex(&sha2::Sha256::digest(std::fs::read(path).unwrap()))
+}
+
+/// Persistence through the real command: the flash file is created by the first run, the second
+/// run goes on from it, an image is refused next to it, and a reset starts again.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn the_flash_file_keeps_the_flash_of_the_device_from_one_run_to_the_next() {
+    let (dir, image) = flash_image_of(&counting_its_boots());
+    let image_bytes = std::fs::read(&image).unwrap();
+    let file = dir.path().join("x4.bin");
+    let (flash, flash_file) = (
+        std::ffi::OsStr::new("--flash"),
+        std::ffi::OsStr::new("--flash-file"),
+    );
+
+    let first = count_a_boot(&[flash, image.as_os_str(), flash_file, file.as_os_str()]);
+    assert_eq!(first.code, Some(0), "{}", first.log);
+    assert!(
+        first.console.ends_with("entry 0x40380000\nboot 1\n"),
+        "{}",
+        first.console
+    );
+    assert!(
+        first.log.contains("flash: flash.bin (") && first.log.contains("), kept in x4.bin\n"),
+        "{}",
+        first.log
+    );
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), X4_FLASH_BYTES);
+    assert_eq!(first.sha256(FLASH_AT_END), sha256_of(&file));
+    assert!(
+        first
+            .log
+            .contains("; 1 of its 4 KiB sectors were modified; saved to "),
+        "{}",
+        first.log
+    );
+    assert!(!first.log.contains("warning:"), "{}", first.log);
+    assert_eq!(
+        std::fs::read(&image).unwrap(),
+        image_bytes,
+        "--flash is only read"
+    );
+
+    // The second run is given the file alone: a power-on from the flash the first one left.
+    let second = count_a_boot(&[flash_file, file.as_os_str()]);
+    assert_eq!(second.code, Some(0), "{}", second.log);
+    assert!(
+        second.console.ends_with("entry 0x40380000\nboot 2\n"),
+        "{}",
+        second.console
+    );
+    assert!(
+        second.log.contains("flash: x4.bin (flash file, 16 MiB)\n"),
+        "{}",
+        second.log
+    );
+    assert_eq!(
+        second.sha256(FLASH_AT_START),
+        first.sha256(FLASH_AT_END),
+        "what the second run starts from is what the first one saved"
+    );
+    assert_eq!(second.sha256(FLASH_AT_END), sha256_of(&file));
+    assert_ne!(second.sha256(FLASH_AT_END), second.sha256(FLASH_AT_START));
+    let after_second = std::fs::read(&file).unwrap();
+    assert_eq!(after_second[0x2_0000], 1, "the count of two boots, from 0");
+
+    // The image next to the file that exists: refused, and nothing is written.
+    let refused = count_a_boot(&[flash, image.as_os_str(), flash_file, file.as_os_str()]);
+    assert_eq!(refused.code, Some(2), "{}", refused.log);
+    assert!(
+        refused.log.contains("both --flash and the flash file"),
+        "{}",
+        refused.log
+    );
+    assert!(
+        refused.console.is_empty(),
+        "nothing ran: {}",
+        refused.console
+    );
+    assert_eq!(sha256_of(&file), second.sha256(FLASH_AT_END));
+
+    // A reset starts again from the image and replaces the file.
+    let reset = count_a_boot(&[
+        flash,
+        image.as_os_str(),
+        flash_file,
+        file.as_os_str(),
+        std::ffi::OsStr::new("--reset-flash"),
+    ]);
+    assert_eq!(reset.code, Some(0), "{}", reset.log);
+    assert!(reset.console.ends_with("boot 1\n"), "{}", reset.console);
+    assert_eq!(reset.sha256(FLASH_AT_END), first.sha256(FLASH_AT_END));
+    assert_eq!(sha256_of(&file), first.sha256(FLASH_AT_END));
+    assert_eq!(
+        std::fs::read(&image).unwrap(),
+        image_bytes,
+        "--flash is only read"
+    );
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["flash.bin", "x4.bin", "x4.bin.lock"],
+        "and nothing else is left"
+    );
+}
+
+/// Without a flash file nothing is kept, the summary says how much, and the image is not written.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_run_without_a_flash_file_says_what_it_does_not_keep_and_leaves_the_image_as_it_is() {
+    let (dir, image) = flash_image_of(&counting_its_boots());
+    let image_bytes = std::fs::read(&image).unwrap();
+    let flash = std::ffi::OsStr::new("--flash");
+    for _ in 0..2 {
+        let run = count_a_boot(&[flash, image.as_os_str()]);
+        assert_eq!(run.code, Some(0), "{}", run.log);
+        assert!(
+            run.console.ends_with("boot 1\n"),
+            "every run is the first: {}",
+            run.console
+        );
+        assert!(
+            run.log.contains(
+                "inkemu: flash at end: 1 of its 4 KiB sectors were modified and are not kept, since the run has no flash file; pass --flash-file <path> to keep the flash of the device from one run to the next\n"
+            ),
+            "{}",
+            run.log
+        );
+        assert!(!run.log.contains(FLASH_AT_END), "{}", run.log);
+        assert_eq!(std::fs::read(&image).unwrap(), image_bytes);
+    }
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "the image alone"
+    );
+}
+
+/// Determinism with a flash file: the content a run starts from is an input, and nothing else
+/// about the file is. Two runs from the same content have the same trace and leave the same file.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn the_same_starting_flash_file_gives_the_same_trace_and_the_same_final_file() {
+    let (dir, image) = flash_image_of(&counting_its_boots());
+    let (flash, flash_file) = (
+        std::ffi::OsStr::new("--flash"),
+        std::ffi::OsStr::new("--flash-file"),
+    );
+    // A flash file to start from: the one a first run leaves.
+    let origin = dir.path().join("origin.bin");
+    let made = count_a_boot(&[flash, image.as_os_str(), flash_file, origin.as_os_str()]);
+    assert_eq!(made.code, Some(0), "{}", made.log);
+    let run_from_a_copy = |name: &str| {
+        let file = dir.path().join(name);
+        std::fs::copy(&origin, &file).unwrap();
+        let run = count_a_boot(&[flash_file, file.as_os_str()]);
+        assert_eq!(run.code, Some(0), "{}", run.log);
+        assert!(run.console.ends_with("boot 2\n"), "{}", run.console);
+        (run, sha256_of(&file))
+    };
+    let (one, file_one) = run_from_a_copy("one.bin");
+    let (two, file_two) = run_from_a_copy("two.bin");
+    assert!(trace_hash_line(&one.log).is_some(), "{}", one.log);
+    assert_eq!(trace_hash_line(&one.log), trace_hash_line(&two.log));
+    assert_eq!(one.console, two.console);
+    assert_eq!(file_one, file_two, "the same final flash file");
+    assert_eq!(one.sha256(FLASH_AT_END), file_one);
+    assert_eq!(one.sha256(FLASH_AT_START), sha256_of(&origin));
+    // The first run of the image, with and without a flash file, is the same run: keeping the
+    // flash is no part of the trace.
+    let without = count_a_boot(&[flash, image.as_os_str()]);
+    assert_eq!(trace_hash_line(&without.log), trace_hash_line(&made.log));
+    assert_eq!(without.sha256(FLASH_AT_START), made.sha256(FLASH_AT_START));
+    // The trace hash is the path the CPU took, and this firmware takes the same path whatever
+    // count it reads: the second boot has the trace hash of the first. What tells the two runs
+    // apart is the flash each started from, which is why the summary says it.
+    assert_eq!(trace_hash_line(&without.log), trace_hash_line(&one.log));
+    assert_ne!(without.sha256(FLASH_AT_START), one.sha256(FLASH_AT_START));
+    assert_ne!(without.console, one.console);
+}
+
+/// A second stage that stops the watchdogs, prints `ready` and spins: a run that goes on until
+/// something from outside ends it.
+#[cfg(unix)]
+fn ready_then_busy() -> Vec<u32> {
+    let mut program = stop_watchdogs();
+    program.extend(wait_for_uart0_to_drain());
+    program.extend(soc_esp32c3::test_support::print_program(
+        svd_regs::esp32c3::addr("UART0", "FIFO"),
+        b"ready\n",
+    ));
+    program.push(HANG);
+    program
+}
+
+/// [`run_of`] with a flash file.
+#[cfg(unix)]
+fn run_with_file(
+    rom_dir: &str,
+    image: &std::path::Path,
+    file: &std::path::Path,
+) -> std::process::Command {
+    let mut command = run_of(rom_dir, image);
+    command.arg("--flash-file").arg(file);
+    command
+}
+
+/// Two processes on one flash file: the second is refused while the first runs, and the first
+/// Ctrl-C ends the first with its flash file written.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_second_run_on_a_flash_file_is_refused_while_the_first_goes_on_and_ctrl_c_saves_it() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (dir, image) = flash_image_of(&ready_then_busy());
+    let file = dir.path().join("x4.bin");
+    let limit = std::time::Duration::from_secs(60);
+    let first = live::start(run_with_file(&rom_dir, &image, &file), |_| false);
+    first.wait_for_line("ready", limit);
+    assert!(
+        !file.exists(),
+        "the flash file is not written while the run goes on"
+    );
+
+    // A limit: were the second run let in, it would end by itself, with exit code 0, instead of
+    // spinning beside the first for ever.
+    let second = run_with_file(&rom_dir, &image, &file)
+        .args(["--max-cycles", "3000000"])
+        .output()
+        .unwrap();
+    assert_eq!(second.status.code(), Some(2));
+    let refusal = String::from_utf8_lossy(&second.stderr).into_owned();
+    assert!(
+        refusal.contains("is in use by another inkemu run") && refusal.contains("x4.bin.lock"),
+        "{refusal}"
+    );
+    assert!(second.stdout.is_empty(), "the second run never started");
+    assert!(!file.exists(), "and it wrote nothing");
+
+    first.interrupt();
+    let (code, log) = first.finish(limit);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("inkemu: interrupted by the user\n")
+            && log.contains("; 0 of its 4 KiB sectors were modified; saved to "),
+        "{log}"
+    );
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), X4_FLASH_BYTES);
+    // The first run is over: its lock is free, and the file it left is taken as it is.
+    let third = live::start(
+        {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_inkemu"));
+            command
+                .args([
+                    "run",
+                    "--device",
+                    "x4",
+                    "--rom-dir",
+                    &rom_dir,
+                    "--flash-file",
+                ])
+                .arg(&file);
+            command
+        },
+        |_| false,
+    );
+    third.wait_for_line("ready", limit);
+    third.interrupt();
+    let (code, log) = third.finish(limit);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("inkemu: flash at end: not modified; "),
+        "{log}"
+    );
+}
+
+/// The flash file cannot be written when the run ends, because its directory is gone: the run
+/// says so, says what is lost, and exits 2.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_flash_file_whose_directory_vanished_during_the_run_exits_2_and_says_what_is_lost() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (dir, image) = flash_image_of(&ready_then_busy());
+    let kept_in = dir.path().join("flash");
+    std::fs::create_dir(&kept_in).unwrap();
+    let limit = std::time::Duration::from_secs(60);
+    let run = live::start(
+        run_with_file(&rom_dir, &image, &kept_in.join("x4.bin")),
+        |_| false,
+    );
+    run.wait_for_line("ready", limit);
+    std::fs::remove_dir_all(&kept_in).unwrap();
+    run.interrupt();
+    let (code, log) = run.finish(limit);
+    assert_eq!(code, Some(2), "{log}");
+    assert!(
+        log.contains("\ninkemu: stopped at pc ")
+            && log.contains("\nerror: cannot write the flash file ")
+            && log.contains(
+                "what this run wrote to the flash is lost; check that the directory still exists"
+            ),
+        "the summary, then the error: {log}"
+    );
+}
+
+/// The same with a directory that became read-only: nothing can be created in it.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_flash_file_whose_directory_became_read_only_exits_2_and_leaves_no_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (dir, image) = flash_image_of(&ready_then_busy());
+    let kept_in = dir.path().join("flash");
+    std::fs::create_dir(&kept_in).unwrap();
+    let read_only = |yes: bool| {
+        let mode = if yes { 0o555 } else { 0o755 };
+        std::fs::set_permissions(&kept_in, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    // The administrator writes where the mode says nobody can: the case cannot be made then.
+    read_only(true);
+    let probe = std::fs::File::create(kept_in.join("probe")).is_ok();
+    read_only(false);
+    assert!(
+        !probe,
+        "this test needs a user whom a read-only directory stops; run it as one"
+    );
+    let limit = std::time::Duration::from_secs(60);
+    let run = live::start(
+        run_with_file(&rom_dir, &image, &kept_in.join("x4.bin")),
+        |_| false,
+    );
+    run.wait_for_line("ready", limit);
+    read_only(true);
+    run.interrupt();
+    let (code, log) = run.finish(limit);
+    read_only(false);
+    assert_eq!(code, Some(2), "{log}");
+    assert!(
+        log.contains("\nerror: cannot write the flash file ") && log.contains("cannot create "),
+        "{log}"
+    );
+    let left: Vec<_> = std::fs::read_dir(&kept_in)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["x4.bin.lock"], "no flash file, no temporary file");
+}

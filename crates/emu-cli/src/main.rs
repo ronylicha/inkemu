@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use cpu_rv32::{HartConfig, MisalignedPolicy};
 use emu_cli::exit::{EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
 use emu_cli::flash_file;
+use emu_cli::flash_state::RunFlash;
 use emu_cli::rom_store::{
     self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
 };
@@ -59,9 +60,23 @@ enum Command {
         /// Full flash image to boot: a dump of a device (`esptool.py read_flash 0 ALL flash.bin`),
         /// or the output of `esptool.py merge_bin`. Its bootloader, partition table and
         /// application run as on the device. Without it the flash is erased and the ROM reports
-        /// an invalid header, as a blank chip does.
+        /// an invalid header, as a blank chip does. The image is only read: what the firmware
+        /// writes to the flash is kept by --flash-file, or lost when the run ends.
         #[arg(long)]
         flash: Option<PathBuf>,
+        /// Keep the flash of the device in this file from one run to the next: a raw image of
+        /// exactly the size of the flash. A run starts from the file when it exists (--flash is
+        /// then refused unless --reset-flash is given) and writes it when it ends: at a limit,
+        /// at the first Ctrl-C, at a --strict-mmio stop, when the CPU waits for ever. The file
+        /// is replaced in one step, never written while the run goes on, so a run that is
+        /// killed leaves the file of before. A lock file beside it (FILE.lock) refuses a second
+        /// run on the same file; it is left in place.
+        #[arg(long, value_name = "FILE")]
+        flash_file: Option<PathBuf>,
+        /// Start from the --flash image, or from an erased flash, although the flash file
+        /// exists, and replace the file when the run ends.
+        #[arg(long, requires = "flash_file")]
+        reset_flash: bool,
         /// Stop when the CPU has executed this many cycles of its clock. The limit counts executed
         /// cycles, not device time: a sleeping CPU executes none, so a firmware that sleeps
         /// reaches it late, and one whose sleep nothing interrupts never does; --max-time bounds
@@ -153,6 +168,8 @@ fn main() -> ExitCode {
         Command::Run {
             device,
             flash,
+            flash_file,
+            reset_flash,
             max_cycles,
             max_time,
             strict_mmio,
@@ -161,7 +178,11 @@ fn main() -> ExitCode {
             trace_hash,
         } => run_device(
             &device,
-            flash.as_deref(),
+            &FlashOptions {
+                image: flash.as_deref(),
+                file: flash_file.as_deref(),
+                reset: reset_flash,
+            },
             rom_dir,
             MachineOptions {
                 strict_mmio,
@@ -235,9 +256,28 @@ const fn image_chip(profile: &DeviceProfile) -> ChipId {
     }
 }
 
+/// What `inkemu run` was told about the flash of the device.
+struct FlashOptions<'a> {
+    /// `--flash`: the image a run starts from, never written.
+    image: Option<&'a Path>,
+    /// `--flash-file`: where the flash is kept from one run to the next.
+    file: Option<&'a Path>,
+    /// `--reset-flash`: start again from the image and replace the file.
+    reset: bool,
+}
+
+/// The last component of `path`, for a line that names a file the user gave: escaped, since it
+/// comes straight from the command line.
+fn file_name(path: &Path) -> String {
+    sanitize(&path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    ))
+}
+
 fn run_device(
     device: &str,
-    flash: Option<&Path>,
+    flash: &FlashOptions<'_>,
     rom_dir: Option<PathBuf>,
     machine_options: MachineOptions,
     run_options: &RunOptions,
@@ -246,14 +286,39 @@ fn run_device(
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
-    // The flash file is checked first: refusing it needs no ROM, and no download should start for a
-    // run that cannot happen.
-    let flash_image = match flash {
-        Some(path) => match flash_file::load(path, image_chip(&profile), profile.flash.size()) {
-            Ok(bytes) => Some((path, bytes)),
+    let flash_size = profile.flash.size();
+    // The flash image and the flash file are checked first: refusing them needs no ROM, and no
+    // download should start for a run that cannot happen.
+    let image = match flash.image {
+        Some(path) => match flash_file::load(path, image_chip(&profile), flash_size) {
+            Ok(bytes) => Some(bytes),
             Err(e) => return fail(&e),
         },
         None => None,
+    };
+    // What the flash holds when nothing is kept from an earlier run.
+    let fresh_note = match (flash.image, &image) {
+        (Some(path), Some(bytes)) => format!(
+            "{} ({} bytes in {} MiB)",
+            file_name(path),
+            bytes.len(),
+            flash_size >> 20
+        ),
+        _ => format!("erased ({} MiB)", flash_size >> 20),
+    };
+    // From here on the flash file is locked, until the process ends.
+    let (run_flash, content) = match RunFlash::begin(flash.file, flash.reset, image, flash_size) {
+        Ok(begun) => begun,
+        Err(e) => return fail(&e),
+    };
+    let flash_note = match flash.file {
+        Some(path) if run_flash.starts_from_the_file() => format!(
+            "flash: {} (flash file, {} MiB)",
+            file_name(path),
+            flash_size >> 20
+        ),
+        Some(path) => format!("flash: {fresh_note}, kept in {}", file_name(path)),
+        None => format!("flash: {fresh_note}"),
     };
     let entry = rom_store::rom_entry_for(profile.chip_revision);
     let http = HttpFetch;
@@ -278,20 +343,8 @@ fn run_device(
         Ok(rom) => rom,
         Err(e) => return fail(&e),
     };
-    let flash_note = match &flash_image {
-        Some((path, bytes)) => format!(
-            "flash: {} ({} bytes in {} MiB)",
-            sanitize(&path.file_name().map_or_else(
-                || path.display().to_string(),
-                |name| name.to_string_lossy().into_owned()
-            )),
-            bytes.len(),
-            profile.flash.size() >> 20
-        ),
-        None => format!("flash: erased ({} MiB)", profile.flash.size() >> 20),
-    };
-    let mut machine = match flash_image {
-        Some((_, bytes)) => match profile.instantiate_with_flash(rom, bytes, machine_options) {
+    let mut machine = match content {
+        Some(bytes) => match profile.instantiate_with_flash(rom, bytes, machine_options) {
             Ok(machine) => machine,
             Err(e) => return fail(&e),
         },
@@ -318,7 +371,14 @@ fn run_device(
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     );
-    ExitCode::from(end.exit_code())
+    // The run is over: what follows is no part of it, and of no trace. A second Ctrl-C from
+    // here on still ends the process at once, and the flash file is then the one of before.
+    let code = if run_flash.finish(&machine, &mut io::stderr().lock()) {
+        end.exit_code()
+    } else {
+        end.exit_code_without_its_flash()
+    };
+    ExitCode::from(code)
 }
 
 /// Whether whoever was reading standard output went away (`inkemu run | head`, once `head` has

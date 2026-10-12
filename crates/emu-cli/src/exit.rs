@@ -20,7 +20,9 @@ pub const RUN_EXIT_CODES_HELP: &str = "\
 Exit codes:
   0  the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was
      pressed, or the reader of standard output went away
-  2  error: unknown device, missing or invalid ROM, refused flash image, or standard output cannot be written
+  2  error: unknown device, missing or invalid ROM, refused flash image or flash file, standard
+     output cannot be written, or the flash file could not be written when the run ended (what
+     the firmware wrote to the flash is then lost)
   3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
      emulator cannot perform faithfully, flash that is not mapped, or a read through a flash
      window that may differ from the device)
