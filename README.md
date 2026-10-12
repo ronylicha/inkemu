@@ -221,7 +221,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 - [Registers accepted without effect](docs/registers-accepted-without-effect.md): what is stored but not modelled, and the plan that makes each real
 - [ADR 0002](docs/adr/0002-flash-model-and-cache-windows.md): the flash model and the cache windows (French)
 - [ADR 0003](docs/adr/0003-contexte-des-peripheriques.md): the context every peripheral access receives, device time, and the three levels of reset (French)
-- [ADR 0004](docs/adr/0004-entrees-d-un-run-et-fichier-de-flash.md): what an input of a run is, and the life of the flash file (French)
+- [ADR 0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md): what an input of a run is, and the life of the flash file (French)
 
 ## Français
 
@@ -291,7 +291,7 @@ Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtens
 
 ### Documentation
 
-La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) et [0004](docs/adr/0004-entrees-d-un-run-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
+La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) et [0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
 
 ### Matériel tiers et licence
 
