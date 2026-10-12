@@ -32,6 +32,18 @@ Run the tests that need the images, those of the machine and those of the `inkem
     cargo test --release -p soc-esp32c3 --test reference_boot -- --ignored
     cargo test --release -p emu-cli --test run_cli reference_firmware -- --ignored
 
+The tests of `inkemu run --firmware` boot the application images alone: they take them out of the
+merged images, from 0x10000, and check them against `SHA256SUMS.inputs` and `SHA256SUMS.inputs-nvs`
+before they run them. To boot one by hand, cut it out the same way (`hello_world.bin` is the 136,160
+bytes from 65,536 of `flash_hello.bin`, `nvs_rw_value_cxx.bin` the 161,312 bytes from 65,536 of
+`flash_nvs.bin`):
+
+    dd if=target/reference-firmware/flash_hello.bin of=hello_world.bin bs=4096 skip=65536 count=136160 iflag=skip_bytes,count_bytes
+    cargo run --release -p emu-cli -- run --device x4 --firmware hello_world.bin --max-time 12
+
+The bootloader of this build is the one inkemu ships (`third_party/esp-idf-bootloader/`): a test
+compares the first bytes of `flash_hello.bin` with it.
+
 The paths are absolute because each test binary runs in the directory of its own crate. Every test
 checks the SHA-256 of the image it is given before it runs it, and fails by naming the variable or
 the file when the image is missing or is not the pinned one.

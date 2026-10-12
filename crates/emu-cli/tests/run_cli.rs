@@ -2911,3 +2911,295 @@ fn run_help_documents_the_firmware_and_the_bootloader() {
         assert!(out.contains(expected), "`{expected}` is missing:\n{out}");
     }
 }
+
+/// `hello_world.bin` and `nvs_rw_value_cxx.bin`, the application images the reference build
+/// merges at 0x10000 (`tools/reference-firmware/SHA256SUMS.inputs`, `SHA256SUMS.inputs-nvs`).
+const HELLO_APPLICATION_SHA256: &str =
+    "4b82d73e37d10969d660eba95984cbe7f053212d39306cc54bfce6c366d0f04b";
+const NVS_APPLICATION_SHA256: &str =
+    "44523a2fd8f7dc0a3eaad17a8991c647ab663ad993dc0db2e31235806b516ff2";
+/// The flash composed for the X4 from each application: the reference images merged under the
+/// stock table of the X4, `flash_hello_ota.bin` (docs/research/sp1b-test-oracle.md, section 2) and
+/// `flash_nvs_ota.bin` (`SHA256SUMS.output`).
+const HELLO_COMPOSED_SHA256: &str =
+    "9ddacb60b8b7338731b52edee1ecae47c7f45470d8db6fa8d1fbc5a20011bc89";
+const NVS_COMPOSED_SHA256: &str =
+    "87832c6d5d15672fb3892bfad281688fc7486b360a25b495bdb6a27d04f28fec";
+
+/// The application image of the pinned merged image `variable` names, written to a file of its
+/// own: the bytes the reference build merged at 0x10000, checked against `application_sha256`.
+fn reference_application(
+    variable: &str,
+    file: &str,
+    sha256: &str,
+    application_sha256: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use sha2::Digest as _;
+    let merged = std::fs::read(pinned_image(variable, file, sha256)).unwrap();
+    let from = &merged[0x1_0000..];
+    let len = firmware::FirmwareImage::parse(from).unwrap().len;
+    let application = &from[..len];
+    assert_eq!(
+        emu_cli::term::hex(&sha2::Sha256::digest(application)),
+        application_sha256,
+        "the application merged at 0x10000 of {file}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(file.replace("flash_", "app_"));
+    std::fs::write(&path, application).unwrap();
+    (dir, path)
+}
+
+/// A console with the timestamps of ESP-IDF's log lines masked: `I (123) boot: …` → `I (#) boot: …`.
+fn masked(console: &str) -> String {
+    console
+        .lines()
+        .map(|line| match line.split_once(") ") {
+            Some((head, rest))
+                if head.len() > 3
+                    && head[..3].ends_with(" (")
+                    && head[3..].bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                format!("{} (#) {rest}", &head[..1])
+            }
+            _ => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The first boot of the application behind the stock table of the X4: the lines of the QEMU
+/// capture of the same flash (`golden_hello_ota_boot.log`, docs/research/sp1b-test-oracle.md,
+/// section 2), with the two documented differences of inkemu's chip: eFuse block revision v1.2
+/// and SPI mode DIO.
+const OTA_FIRST_BOOT_LINES: [&str; 26] = [
+    "I (#) boot: ESP-IDF v5.5.2 2nd stage bootloader",
+    "I (#) boot: chip revision: v0.3",
+    "I (#) boot: efuse block revision: v1.2",
+    "I (#) boot.esp32c3: SPI Speed      : 80MHz",
+    "I (#) boot.esp32c3: SPI Mode       : DIO",
+    "I (#) boot.esp32c3: SPI Flash Size : 16MB",
+    "I (#) boot: Enabling RNG early entropy source...",
+    "I (#) boot: Partition Table:",
+    "I (#) boot: ## Label            Usage          Type ST Offset   Length",
+    "I (#) boot:  0 nvs              WiFi data        01 02 00009000 00005000",
+    "I (#) boot:  1 otadata          OTA data         01 00 0000e000 00002000",
+    "I (#) boot:  2 app0             OTA app          00 10 00010000 00640000",
+    "I (#) boot:  3 app1             OTA app          00 11 00650000 00640000",
+    "I (#) boot:  4 spiffs           Unknown data     01 82 00c90000 00360000",
+    "I (#) boot:  5 coredump         Unknown data     01 03 00ff0000 00010000",
+    "I (#) boot: End of partition table",
+    "I (#) boot: No factory image, trying OTA 0",
+    "I (#) esp_image: segment 0: paddr=00010020 vaddr=3c010020 size=0656ch ( 25964) map",
+    "I (#) esp_image: segment 1: paddr=00016594 vaddr=3fc8b600 size=011d8h (  4568) load",
+    "I (#) esp_image: segment 2: paddr=00017774 vaddr=40380000 size=088a4h ( 34980) load",
+    "I (#) esp_image: segment 3: paddr=00020020 vaddr=42000020 size=0e6fch ( 59132) map",
+    "I (#) esp_image: segment 4: paddr=0002e724 vaddr=403888a4 size=02c70h ( 11376) load",
+    "I (#) esp_image: segment 5: paddr=0003139c vaddr=50000000 size=00020h (    32) load",
+    "I (#) boot: Loaded app from partition at offset 0x10000",
+    "I (#) boot: Set actual ota_seq=1 in otadata[0]",
+    "I (#) boot: Disabling RNG early entropy source...",
+];
+
+/// The milestone of an application image: `--firmware hello_world.bin`, the application alone,
+/// boots behind the bootloader inkemu ships and the stock table of the X4, in strict mode,
+/// through its whole life, its restart and the second boot; the bootloader writes `otadata` on
+/// the first boot and on that one only.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn x4_boots_the_reference_firmware_from_its_application_image_through_a_second_boot() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (_dir, application) = reference_application(
+        "INKEMU_REF_FLASH",
+        "flash_hello.bin",
+        HELLO_IMAGE_SHA256,
+        HELLO_APPLICATION_SHA256,
+    );
+    // One life is 40 million cycles here; 44 million reach the application of the second boot.
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--strict-mmio",
+            "--max-cycles",
+            "44000000",
+        ])
+        .args(["--rom-dir", &rom_dir, "--firmware"])
+        .arg(&application)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = masked(&String::from_utf8_lossy(&output.stdout).replace('\r', ""));
+    let first_boot = OTA_FIRST_BOOT_LINES.join("\n");
+    assert!(console.contains(&first_boot), "{console}");
+    let mut from = 0;
+    for expected in [
+        "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        "entry 0x403cbf1a\n",
+        first_boot.as_str(),
+        "I (#) cpu_start: Unicore app\n",
+        "Hello world!\n",
+        "Restarting in 0 seconds...\n",
+        "Restarting now.\n",
+        "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        "I (#) boot: End of partition table\nI (#) esp_image: segment 0:",
+        "I (#) boot: Loaded app from partition at offset 0x10000\nI (#) boot: Disabling RNG early entropy source...\n",
+        "I (#) cpu_start: Unicore app\n",
+    ] {
+        let at = console[from..]
+            .find(expected)
+            .unwrap_or_else(|| panic!("`{expected}` is missing, or out of order:\n{console}"));
+        from += at + expected.len();
+    }
+    // The second boot finds otadata written: it neither looks for a factory image nor writes.
+    assert_eq!(
+        console
+            .matches("Set actual ota_seq=1 in otadata[0]")
+            .count(),
+        1
+    );
+    assert_eq!(console.matches("No factory image, trying OTA 0").count(), 1);
+    assert_eq!(console.matches("2nd stage bootloader").count(), 2);
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        log.contains(
+            "flash: app_hello.bin (hello_world 1, ESP-IDF v5.5.2) in app0 at 0x10000, behind the ESP-IDF v5.5.2 bootloader inkemu ships (esp-idf-v5.5.2-esp32c3-dio), under the partition table of the profile (16 MiB)\n"
+        ),
+        "{log}"
+    );
+    assert!(
+        !log.contains("warning:") && !log.contains("stopped by --strict-mmio"),
+        "nothing was reported in a whole life cycle: {log}"
+    );
+}
+
+/// The trace hash of the application image's life, pinned like the one of the merged image
+/// (`x4_runs_the_reference_firmware_along_its_pinned_trace`), with its device time and the flash
+/// it starts from. The two differ from those of the merged image: the table is the X4's, so the
+/// bootloader takes the OTA path and writes `otadata`.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn x4_runs_the_reference_firmware_from_its_application_image_along_its_pinned_trace() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (_dir, application) = reference_application(
+        "INKEMU_REF_FLASH",
+        "flash_hello.bin",
+        HELLO_IMAGE_SHA256,
+        HELLO_APPLICATION_SHA256,
+    );
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--strict-mmio",
+            "--max-cycles",
+            "40000001",
+        ])
+        .args(["--trace-hash", "--rom-dir", &rom_dir, "--firmware"])
+        .arg(&application)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        trace_hash_line(&log),
+        Some("trace-hash c6b24a1cc226ed4a"),
+        "{log}"
+    );
+    assert_eq!(device_micros(&log), 11_403_054, "{log}");
+    assert!(
+        log.contains("after 40000001 cycles (26637404 instructions)"),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("{FLASH_AT_START}{HELLO_COMPOSED_SHA256}\n")),
+        "the composed flash is the merged image under the X4 table: {log}"
+    );
+}
+
+/// The NVS example from its application image, kept in a flash file: the first run composes the
+/// flash (it is `flash_nvs_ota.bin`, byte for byte), the second goes on from the file and counts.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_NVS_FLASH"]
+fn the_nvs_reference_firmware_counts_on_from_its_application_image_across_two_runs() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (dir, application) = reference_application(
+        "INKEMU_NVS_FLASH",
+        "flash_nvs.bin",
+        NVS_IMAGE_SHA256,
+        NVS_APPLICATION_SHA256,
+    );
+    let file = dir.path().join("x4.bin");
+    let run = |more: &[&std::ffi::OsStr]| {
+        let output = inkemu()
+            .args(["run", "--device", "x4", "--strict-mmio", "--max-time", "5"])
+            .args(["--rom-dir", &rom_dir])
+            .args(more)
+            .arg("--flash-file")
+            .arg(&file)
+            .timeout(HANG_LIMIT)
+            .output()
+            .unwrap();
+        Counted {
+            code: output.status.code(),
+            console: String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+            log: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    };
+    let first = run(&[std::ffi::OsStr::new("--firmware"), application.as_os_str()]);
+    assert_eq!(first.code, Some(0), "{}", first.log);
+    assert_eq!(first.sha256(FLASH_AT_START), NVS_COMPOSED_SHA256);
+    assert!(
+        first
+            .console
+            .contains("boot: Set actual ota_seq=1 in otadata[0]\n")
+            && first.console.contains(
+                "Reading restart counter from NVS ... The value is not initialized yet!\n"
+            ),
+        "{}",
+        first.console
+    );
+    assert_eq!(first.sha256(FLASH_AT_END), sha256_of(&file));
+    let second = run(&[]);
+    assert_eq!(second.code, Some(0), "{}", second.log);
+    assert_eq!(second.sha256(FLASH_AT_START), first.sha256(FLASH_AT_END));
+    assert!(
+        second.console.contains("rst:0x1 (POWERON)")
+            && !second.console.contains("Set actual ota_seq")
+            && second
+                .console
+                .contains("Reading restart counter from NVS ... Done\nRestart counter = 1\n"),
+        "{}",
+        second.console
+    );
+    for log in [&first.log, &second.log] {
+        assert!(!log.contains("warning:"), "{log}");
+    }
+    assert_eq!(
+        sha256_of(&application),
+        NVS_APPLICATION_SHA256,
+        "--firmware is only read"
+    );
+}
+
+/// The bootloader inkemu ships is the one the reference build produces: the first bytes of the
+/// pinned merged image, which the build checks against the same SHA-256.
+#[test]
+#[ignore = "needs INKEMU_REF_FLASH"]
+fn the_shipped_bootloader_is_the_one_the_reference_firmware_build_produced() {
+    let merged = std::fs::read(reference_image()).unwrap();
+    let shipped = firmware::SHIPPED[0].bytes;
+    assert_eq!(&merged[..shipped.len()], shipped);
+    assert!(
+        merged[shipped.len()..0x8000]
+            .iter()
+            .all(|&byte| byte == 0xFF),
+        "nothing follows the bootloader before the table"
+    );
+}

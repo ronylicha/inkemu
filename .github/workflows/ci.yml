@@ -96,7 +96,8 @@ jobs:
   reference-boot:
     # Boots the reference firmware (stock ESP-IDF bootloader + hello_world) from the real mask ROM
     # and runs it through a whole life: the application, its countdown, the restart it asks for
-    # and the second boot. A second example, nvs_rw_value_cxx, keeps a restart counter in NVS:
+    # and the second boot; then the same application alone, behind the bootloader inkemu ships,
+    # whose bytes a test compares with those of this build. A second example, nvs_rw_value_cxx, keeps a restart counter in NVS:
     # it is built next to the first, once under its own partition table and once under the stock
     # table of the X4. The firmware is built here, inside the pinned ESP-IDF image, and checked
     # against pinned SHA-256 values; it is never stored in this repository. The cache saves the
@@ -146,4 +147,4 @@ jobs:
         # Exact test counts, as in rom-boot: see tools/ci/run-ignored-tests.sh.
         run: |
           tools/ci/run-ignored-tests.sh 13 --release -p soc-esp32c3 --test reference_boot -- --ignored
-          tools/ci/run-ignored-tests.sh 4 --release -p emu-cli --test run_cli reference_firmware -- --ignored
+          tools/ci/run-ignored-tests.sh 8 --release -p emu-cli --test run_cli reference_firmware -- --ignored
