@@ -825,7 +825,7 @@ fn a_wait_for_an_interrupt_nothing_can_raise_exits_4() {
 /// progress. Every wait has a limit, and a run still going when its test ends is killed.
 #[cfg(unix)]
 mod live {
-    use std::io::{BufRead, BufReader, Read};
+    use std::io::{BufRead, BufReader};
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
     use std::thread::JoinHandle;
@@ -835,6 +835,8 @@ mod live {
         child: Child,
         /// The lines of standard output, as they come.
         lines: Receiver<String>,
+        /// The lines of standard error, as they come.
+        log_lines: Receiver<String>,
         stderr: Option<JoinHandle<String>>,
     }
 
@@ -869,16 +871,46 @@ mod live {
                 }
             }
         });
-        let mut stderr = child.stderr.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (log_sender, log_lines) = channel();
+        // Read to its end, whoever listens: a full pipe would stop the run.
         let stderr = std::thread::spawn(move || {
-            let mut text = Vec::new();
-            let _ = stderr.read_to_end(&mut text);
-            String::from_utf8_lossy(&text).into_owned()
+            let mut stderr = BufReader::new(stderr);
+            let mut text = String::new();
+            loop {
+                let mut line = Vec::new();
+                if stderr.read_until(b'\n', &mut line).unwrap_or(0) == 0 {
+                    return text;
+                }
+                let line = String::from_utf8_lossy(&line).into_owned();
+                text.push_str(&line);
+                let _ = log_sender.send(line);
+            }
         });
         Live {
             child,
             lines,
+            log_lines,
             stderr: Some(stderr),
+        }
+    }
+
+    /// Waits until a line of `lines` contains `text`; `what` names the stream in the failure.
+    fn wait_for(lines: &Receiver<String>, what: &str, text: &str, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        let mut seen = String::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match lines.recv_timeout(left) {
+                Ok(line) if line.contains(text) => return,
+                Ok(line) => seen.push_str(&line),
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("no line with `{text}` within {limit:?}; {what}:\n{seen}")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("{what} ended without a line with `{text}`:\n{seen}")
+                }
+            }
         }
     }
 
@@ -894,21 +926,12 @@ mod live {
 
         /// Waits until a line of standard output contains `text`.
         pub fn wait_for_line(&self, text: &str, limit: Duration) {
-            let deadline = Instant::now() + limit;
-            let mut seen = String::new();
-            loop {
-                let left = deadline.saturating_duration_since(Instant::now());
-                match self.lines.recv_timeout(left) {
-                    Ok(line) if line.contains(text) => return,
-                    Ok(line) => seen.push_str(&line),
-                    Err(RecvTimeoutError::Timeout) => {
-                        panic!("no line with `{text}` within {limit:?}; standard output:\n{seen}")
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        panic!("standard output ended without a line with `{text}`:\n{seen}")
-                    }
-                }
-            }
+            wait_for(&self.lines, "standard output", text, limit);
+        }
+
+        /// Waits until a line of standard error contains `text`.
+        pub fn wait_for_log_line(&self, text: &str, limit: Duration) {
+            wait_for(&self.log_lines, "standard error", text, limit);
         }
 
         /// Waits for the run to end by itself: its exit code and what it wrote on standard error.
@@ -2131,6 +2154,43 @@ fn a_second_run_on_a_flash_file_is_refused_while_the_first_goes_on_and_ctrl_c_sa
     assert!(
         log.contains("inkemu: flash at end: not modified; "),
         "{log}"
+    );
+}
+
+/// Once the run has returned, Ctrl-C ends nothing: a second `SIGINT`, sent as soon as the first
+/// line after the run is printed, leaves the summary and the save of the flash file to complete,
+/// and the exit code is the one of the first Ctrl-C. The flash file is new here, so the save
+/// writes and flushes the whole 16 MiB after that line.
+///
+/// The test cannot fail on a sound binary, whenever the signal arrives: the line comes after the
+/// run has returned. What it cannot do is make sure the signal arrives before the save ends; a
+/// handler that ended the process there would fail it only when it does (the save takes tens of
+/// milliseconds, the signal one or two). The rule itself is held by the unit tests of `main.rs`.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_second_ctrl_c_once_the_run_has_returned_leaves_the_save_and_the_summary_to_complete() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (dir, image) = flash_image_of(&ready_then_busy());
+    let file = dir.path().join("x4.bin");
+    let limit = std::time::Duration::from_secs(60);
+    let run = live::start(run_with_file(&rom_dir, &image, &file), |_| false);
+    run.wait_for_line("ready", limit);
+    run.interrupt();
+    run.wait_for_log_line("inkemu: flash at start: sha256 ", limit);
+    run.interrupt();
+    let (code, log) = run.finish(limit);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("inkemu: interrupted by the user\n")
+            && log.contains("; 0 of its 4 KiB sectors were modified; saved to "),
+        "{log}"
+    );
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), X4_FLASH_BYTES);
+    assert_eq!(
+        names_in(dir.path()),
+        ["flash.bin", "x4.bin", "x4.bin.lock"],
+        "no temporary file is left"
     );
 }
 

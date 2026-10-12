@@ -11,8 +11,9 @@ pub const EXIT_STRICT_MMIO: u8 = 3;
 /// `inkemu run`: the CPU waits for an interrupt and none can come.
 pub const EXIT_IDLE: u8 = 4;
 
-/// `inkemu run`: a second Ctrl-C ended the process before the first one had ended the run. The
-/// value shells give a process ended by `SIGINT` (128 + 2).
+/// `inkemu run`: a second Ctrl-C ended the process before the first one had ended the run; once
+/// the run has ended, Ctrl-C ends nothing. The value shells give a process ended by `SIGINT`
+/// (128 + 2).
 pub const EXIT_SECOND_INTERRUPT: u8 = 130;
 
 /// The exit codes of `inkemu run`, for its `--help`.
@@ -28,7 +29,9 @@ Exit codes:
      window that may differ from the device)
   4  the CPU waits for an interrupt and none can come: no interrupt line is pending and no device
      has anything scheduled
-130  Ctrl-C was pressed a second time before the run had stopped: no summary was printed";
+130  Ctrl-C was pressed a second time before the run had stopped: no summary was printed, and the
+     flash file is the one of before. Once the run has stopped, Ctrl-C ends nothing: the summary
+     and the save of the flash file complete, with the exit code of the end of the run";
 
 #[cfg(test)]
 mod tests {

@@ -370,7 +370,8 @@ fn run_device(
         &format_args!("{}; {flash_note}", header(&profile, entry, &machine)),
     );
     let interrupt = Arc::new(AtomicBool::new(false));
-    if let Err(e) = watch_ctrl_c(&interrupt) {
+    let returned = Arc::new(AtomicBool::new(false));
+    if let Err(e) = watch_ctrl_c(&interrupt, &returned) {
         write_line(
             io::stderr(),
             &format_args!(
@@ -386,8 +387,10 @@ fn run_device(
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     );
-    // The run is over: what follows is no part of it, and of no trace. A second Ctrl-C from
-    // here on still ends the process at once, and the flash file is then the one of before.
+    // The run is over: what follows is no part of it, and of no trace. From here on Ctrl-C ends
+    // nothing: the summary and the save of the flash file are bounded (one write of the flash
+    // and one flush to the disk), and they complete; the exit code is the one of the end above.
+    returned.store(true, Ordering::SeqCst);
     let code = if run_flash.finish(&machine, &mut io::stderr().lock()) {
         end.exit_code()
     } else {
@@ -414,23 +417,31 @@ fn stdout_reader_gone() -> bool {
 }
 
 /// Makes Ctrl-C end the run at the next slice, with its summary. A second Ctrl-C ends the process
-/// at once, for a run that does not come back to the slice boundary.
+/// at once, for a run that does not come back to the slice boundary, as long as the run has not
+/// come back: `returned` says it has, and from then on Ctrl-C ends nothing.
 ///
-/// The handler runs on a thread of its own, not in the signal context; it only sets the flag.
-fn watch_ctrl_c(interrupt: &Arc<AtomicBool>) -> Result<(), ctrlc::Error> {
+/// The handler runs on a thread of its own, not in the signal context; it only reads and sets
+/// the two flags.
+fn watch_ctrl_c(
+    interrupt: &Arc<AtomicBool>,
+    returned: &Arc<AtomicBool>,
+) -> Result<(), ctrlc::Error> {
     let requested = Arc::clone(interrupt);
+    let returned = Arc::clone(returned);
     ctrlc::set_handler(move || {
-        if second_request(&requested) {
+        if ends_the_process(&requested, &returned) {
             std::process::exit(i32::from(EXIT_SECOND_INTERRUPT));
         }
     })
 }
 
-/// Records in `requested` that the user asked the run to stop, and says whether that had already
-/// been asked: the first request is left to the run, which ends with its summary; a second one
-/// means that the run has not come back, and the process is ended at once.
-fn second_request(requested: &AtomicBool) -> bool {
-    requested.swap(true, Ordering::Relaxed)
+/// Records in `requested` that the user asked the run to stop, and says whether the process must
+/// end at once. The first request is left to the run, which ends with its summary. A second one,
+/// while the run has not `returned`, means that it does not come back, and the process is ended.
+/// Once the run has returned, no request ends it: what is left is its summary and the save of
+/// its flash file, which a request would cut in two.
+fn ends_the_process(requested: &AtomicBool, returned: &AtomicBool) -> bool {
+    requested.swap(true, Ordering::SeqCst) && !returned.load(Ordering::SeqCst)
 }
 
 /// The one line that says what is being emulated and how much to trust its timing.
@@ -630,13 +641,37 @@ mod tests {
     #[test]
     fn the_first_request_to_stop_is_left_to_the_run_and_the_second_ends_the_process() {
         let requested = AtomicBool::new(false);
-        assert!(!second_request(&requested));
+        let returned = AtomicBool::new(false);
+        assert!(!ends_the_process(&requested, &returned));
         assert!(
-            requested.load(Ordering::Relaxed),
+            requested.load(Ordering::SeqCst),
             "the run reads the request at its next pass"
         );
-        assert!(second_request(&requested));
-        assert!(second_request(&requested), "and so does every one after it");
+        assert!(ends_the_process(&requested, &returned));
+        assert!(
+            ends_the_process(&requested, &returned),
+            "and so does every one after it"
+        );
+    }
+
+    #[test]
+    fn once_the_run_has_returned_no_request_ends_the_process() {
+        // A first request, then the run returns: a second one leaves the summary and the save.
+        let requested = AtomicBool::new(false);
+        let returned = AtomicBool::new(false);
+        assert!(!ends_the_process(&requested, &returned));
+        returned.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            assert!(!ends_the_process(&requested, &returned));
+        }
+        // The run returned for another cause (a limit): a first request after it is not left to
+        // a run that no longer reads it, and does not end the process either; nor do the next.
+        let requested = AtomicBool::new(false);
+        let returned = AtomicBool::new(true);
+        for _ in 0..3 {
+            assert!(!ends_the_process(&requested, &returned));
+        }
+        assert!(requested.load(Ordering::SeqCst));
     }
 
     #[test]
