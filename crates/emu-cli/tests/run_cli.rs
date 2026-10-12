@@ -1689,3 +1689,102 @@ fn a_flash_file_whose_directory_became_read_only_exits_2_and_leaves_no_file() {
         .collect();
     assert_eq!(left, ["x4.bin.lock"], "no flash file, no temporary file");
 }
+
+/// `flash_nvs.bin` of `tools/reference-firmware/build.sh` and the whole flash after the first and
+/// the second life of its application (docs/research/esp-idf-storage-flash-traffic.md, §A.3, §B.2).
+const NVS_IMAGE_SHA256: &str = "c3f0eed129d85de6c0f959d481bb99101d14d18ec6fab8bfd11c541128ec757f";
+const NVS_AFTER_LIFE_1: &str = "cfab4ffe5187eeea8ec2ee6e9794886289282f0242ce56aad2842144a6ffb17b";
+const NVS_AFTER_LIFE_2: &str = "7ad0acf62e5a4e20aa6d47be0f1d922a7b89cb204941feac1ab2fea71363b709";
+
+/// The milestone of the flash file through the real command, with a firmware nobody wrote for
+/// the test: ESP-IDF's NVS example keeps a restart counter, and a second `inkemu run` on the
+/// same flash file goes on counting where the first one stopped. One life of the example is
+/// 11.2 s of device time; its writes are done in the first second.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_NVS_FLASH"]
+fn the_nvs_reference_firmware_goes_on_counting_in_a_second_run_on_the_same_flash_file() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let image =
+        std::path::PathBuf::from(std::env::var("INKEMU_NVS_FLASH").expect("set INKEMU_NVS_FLASH"));
+    assert_eq!(
+        sha256_of(&image),
+        NVS_IMAGE_SHA256,
+        "{} is not the pinned flash_nvs.bin; rebuild it with tools/reference-firmware/build.sh",
+        image.display()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("x4.bin");
+    let run = |seconds: &str, flash: &[&std::ffi::OsStr]| {
+        let output = inkemu()
+            .args(["run", "--device", "x4", "--strict-mmio", "--trace-hash"])
+            .args(["--max-time", seconds, "--rom-dir", &rom_dir])
+            .args(flash)
+            .arg("--flash-file")
+            .arg(&file)
+            .timeout(std::time::Duration::from_secs(120))
+            .output()
+            .unwrap();
+        Counted {
+            code: output.status.code(),
+            console: String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+            log: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    };
+
+    // First run: from the image, five seconds of the first life.
+    let first = run("5", &[std::ffi::OsStr::new("--flash"), image.as_os_str()]);
+    assert_eq!(first.code, Some(0), "{}", first.log);
+    assert!(
+        first.console.contains("rst:0x1 (POWERON)")
+            && first.console.contains(
+                "Reading restart counter from NVS ... The value is not initialized yet!\n"
+            )
+            && !first.console.contains("Restart counter = "),
+        "{}",
+        first.console
+    );
+    assert_eq!(first.sha256(FLASH_AT_START), NVS_IMAGE_SHA256);
+    assert_eq!(first.sha256(FLASH_AT_END), NVS_AFTER_LIFE_1);
+    assert_eq!(sha256_of(&file), NVS_AFTER_LIFE_1);
+    assert!(!first.log.contains("warning:"), "{}", first.log);
+
+    // Second run: the file alone. A power-on, and the counter the first run wrote.
+    let second = run("5", &[]);
+    assert_eq!(second.code, Some(0), "{}", second.log);
+    assert!(
+        second.console.contains("rst:0x1 (POWERON)")
+            && !second.console.contains("rst:0xc")
+            && second
+                .console
+                .contains("Reading restart counter from NVS ... Done\nRestart counter = 1\n")
+            && !second.console.contains("not initialized"),
+        "{}",
+        second.console
+    );
+    assert_eq!(second.sha256(FLASH_AT_START), NVS_AFTER_LIFE_1);
+    assert_eq!(second.sha256(FLASH_AT_END), NVS_AFTER_LIFE_2);
+    assert_eq!(sha256_of(&file), NVS_AFTER_LIFE_2);
+    assert!(!second.log.contains("warning:"), "{}", second.log);
+    // This firmware takes another path when it finds a counter: the two runs differ in their
+    // trace as in the flash they started from.
+    assert!(trace_hash_line(&first.log).is_some(), "{}", first.log);
+    assert_ne!(trace_hash_line(&first.log), trace_hash_line(&second.log));
+
+    // Third run: long enough for a restart. The counter goes on inside the run, then across it.
+    let third = run("12.5", &[]);
+    assert_eq!(third.code, Some(0), "{}", third.log);
+    let counted = third
+        .console
+        .find("Restart counter = 2\n")
+        .unwrap_or_else(|| panic!("no second count in:\n{}", third.console));
+    let after_the_restart = &third.console[counted..];
+    assert!(
+        after_the_restart.contains("rst:0xc (RTC_SW_CPU_RST)")
+            && after_the_restart.contains("Restart counter = 3\n"),
+        "{}",
+        third.console
+    );
+    assert_eq!(third.sha256(FLASH_AT_START), NVS_AFTER_LIFE_2);
+    assert_eq!(third.sha256(FLASH_AT_END), sha256_of(&file));
+    assert_eq!(sha256_of(&image), NVS_IMAGE_SHA256, "--flash is only read");
+}

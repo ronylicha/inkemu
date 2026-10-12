@@ -91,7 +91,7 @@ jobs:
         # un-ignored test would otherwise leave this job green with nothing proven.
         run: |
           tools/ci/run-ignored-tests.sh 18 --release -p soc-esp32c3 --test real_rom -- --ignored
-          tools/ci/run-ignored-tests.sh 16 --release -p emu-cli --test run_cli -- --ignored --skip x4_boots_the_reference_firmware
+          tools/ci/run-ignored-tests.sh 16 --release -p emu-cli --test run_cli -- --ignored --skip reference_firmware
   reference-boot:
     # Boots the reference firmware (stock ESP-IDF bootloader + hello_world) from the real mask ROM
     # and runs it through a whole life: the application, its countdown, the restart it asks for
@@ -145,4 +145,4 @@ jobs:
         # Exact test counts, as in rom-boot: see tools/ci/run-ignored-tests.sh.
         run: |
           tools/ci/run-ignored-tests.sh 12 --release -p soc-esp32c3 --test reference_boot -- --ignored
-          tools/ci/run-ignored-tests.sh 2 --release -p emu-cli --test run_cli x4_boots_the_reference_firmware -- --ignored
+          tools/ci/run-ignored-tests.sh 3 --release -p emu-cli --test run_cli reference_firmware -- --ignored
