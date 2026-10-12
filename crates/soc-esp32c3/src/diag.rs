@@ -1,6 +1,6 @@
 //! What the emulator has to tell the user about the run: accesses it does not model, CPU
 //! exceptions, resets.
-use crate::flash::FlashRefusal;
+use crate::flash::{FlashFrame, FlashRefusal};
 use crate::periph::mmu::MMU_PAGE_BYTES;
 use crate::reset::ResetCause;
 use cpu_rv32::Exception;
@@ -119,10 +119,21 @@ impl Unsupported {
                 address_bits,
                 dummy_cycles,
                 data_bytes,
-            } => write!(
-                f,
-                "flash command {opcode:#04x} was sent in a form the virtual flash does not know ({address_bits} address bits, {dummy_cycles} dummy clocks, {data_bytes} data bytes, pc {pc:#010x}) and what a chip makes of it is not modeled, so nothing was read or changed; send the command with a 24-bit address where it takes one, and with the dummy clocks and data bytes it takes"
-            ),
+            } => {
+                write!(
+                    f,
+                    "flash command {opcode:#04x} was sent in a form the virtual flash does not know ({address_bits} address bits, {dummy_cycles} dummy clocks, {data_bytes} bytes of data out, pc {pc:#010x}) and what a chip makes of it is not modeled, so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; "
+                )?;
+                // The chip refuses the form of a command it knows, so the command has a frame;
+                // a value built by hand for another opcode gets the general remedy.
+                match FlashFrame::of(opcode) {
+                    Some(frame) => write!(f, "send {opcode:#04x} with {frame}"),
+                    None => write!(
+                        f,
+                        "send the command with the address, the dummy clocks and the data its datasheet gives it"
+                    ),
+                }
+            }
             Unsupported::FlashRange {
                 opcode,
                 address,
@@ -1097,7 +1108,7 @@ mod tests {
             ),
             (
                 unsupported(FORM),
-                "flash command 0x02 was sent in a form the virtual flash does not know (32 address bits, 0 dummy clocks, 4 data bytes",
+                "flash command 0x02 was sent in a form the virtual flash does not know (32 address bits, 0 dummy clocks, 4 bytes of data out",
             ),
             (
                 unsupported(RANGE),
@@ -1143,6 +1154,59 @@ mod tests {
             assert!(
                 !text.contains("read-only"),
                 "the flash is no longer read-only: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_in_a_form_the_flash_does_not_know_is_told_the_frame_it_takes() {
+        let form = |opcode, address_bits, dummy_cycles, data_bytes| {
+            unsupported(Unsupported::FlashCommandForm {
+                opcode,
+                address_bits,
+                dummy_cycles,
+                data_bytes,
+            })
+            .to_string()
+        };
+        // (the refusal, what was sent, the frame to send instead)
+        let cases = [
+            (
+                form(0xBB, 24, 8, 0),
+                "(24 address bits, 8 dummy clocks, 0 bytes of data out, pc 0x40381000)",
+                "; send 0xbb with a 24-bit address, 4 dummy clocks and no data out",
+            ),
+            (
+                form(0x06, 24, 0, 3),
+                "(24 address bits, 0 dummy clocks, 3 bytes of data out, pc 0x40381000)",
+                "; send 0x06 with no address, no dummy clock and no data out",
+            ),
+            (
+                form(0x01, 0, 0, 2),
+                "(0 address bits, 0 dummy clocks, 2 bytes of data out, pc 0x40381000)",
+                "; send 0x01 with no address, no dummy clock and 1 byte of data out",
+            ),
+            (
+                form(0x02, 32, 0, 4),
+                "(32 address bits, 0 dummy clocks, 4 bytes of data out, pc 0x40381000)",
+                "; send 0x02 with a 24-bit address, no dummy clock and 1 byte of data out or more",
+            ),
+            // The chip never refuses the form of an opcode it does not know; a value built by
+            // hand still gets a message with a remedy.
+            (
+                form(0x35, 0, 0, 1),
+                "flash command 0x35 was sent in a form",
+                "; send the command with the address, the dummy clocks and the data its datasheet gives it",
+            ),
+        ];
+        for (text, sent, remedy) in cases {
+            assert!(text.contains(sent), "{text}");
+            assert!(text.ends_with(remedy), "{text}");
+            assert!(
+                text.contains(
+                    "so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; "
+                ),
+                "{text}"
             );
         }
     }

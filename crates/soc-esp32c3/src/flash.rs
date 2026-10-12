@@ -27,8 +27,10 @@ const OP_RES: u8 = 0xAB;
 const OP_RDID: u8 = 0x9F;
 /// Read status register 1 (FB §D.1).
 const OP_RDSR: u8 = 0x05;
-/// Read SFDP; the bootloader reads one byte at address 0x10 (BA §2.2, SPI1 row).
+/// Read SFDP; the bootloader reads one byte at address 0x10, after 8 dummy clocks (BA §2.2, SPI1
+/// row).
 const OP_SFDP: u8 = 0x5A;
+const SFDP_DUMMY_CYCLES: u32 = 8;
 /// Program/erase resume, sent once by the bootloader (BA §2.2, SPI1 row).
 const OP_RESUME: u8 = 0x7A;
 /// Write enable and write disable (ESP-IDF `spi_flash_defs.h`; BC §D.2 item 6).
@@ -236,14 +238,131 @@ pub struct FlashCommand<'a> {
     pub data_out: &'a [u8],
 }
 
-/// Why the chip did not run a command: nothing was read and nothing changed.
+/// What a command the model knows takes after its opcode: the one frame the model runs it in.
+///
+/// A part judges a command on everything it received while its chip select was low: it drops
+/// one whose chip select rises off a byte boundary (report FW §C, row "Framing"). What it makes
+/// of an opcode followed by bytes its datasheet does not draw for it — a write enable followed
+/// by an address, a status read after dummy clocks — is in no report, so the model runs none of
+/// them: [`FlashRefusal::Form`]. The frames of [`FlashFrame::of`] are the only ones the ROM,
+/// the bootloader and ESP-IDF send.
+///
+/// ASSUMPTION: the bytes a controller clocks *in* are not part of the frame that is judged. A
+/// command that answers nothing (`06`, `04`, `AB`, `7A`, a program, an erase, a status write)
+/// runs whatever the length of the data-in phase the controller adds, and leaves those bytes as
+/// the controller gave them. On a part those clocks are more bytes of the command. No ROM or
+/// ESP-IDF code sends such a transfer (the bootloader and ESP-IDF give a data-in length only to
+/// the commands that answer: FW §A.2, §A.3); one read against a device settles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashFrame {
+    /// Bits of the address phase: 24, or 0 for a command without an address.
+    pub address_bits: u32,
+    /// Dummy clocks between the address and the data.
+    pub dummy_cycles: u32,
+    /// The fewest bytes the controller sends after them.
+    pub data_out_min: u32,
+    /// The most: `u32::MAX` for a page program, of which the chip keeps the last 256.
+    pub data_out_max: u32,
+}
+
+impl FlashFrame {
+    /// An opcode and nothing else on the way out.
+    const OPCODE_ALONE: FlashFrame = FlashFrame::addressed(0, 0);
+
+    /// `address_bits` of address, `dummy_cycles` dummy clocks, no data out.
+    const fn addressed(address_bits: u32, dummy_cycles: u32) -> FlashFrame {
+        FlashFrame {
+            address_bits,
+            dummy_cycles,
+            data_out_min: 0,
+            data_out_max: 0,
+        }
+    }
+
+    /// The frame of `opcode`; `None` for an opcode the model does not implement.
+    ///
+    /// Each frame is the one a measured boot or the ROM and ESP-IDF sources send:
+    /// - the data reads: a 24-bit address, then the dummy clocks of [`READS`];
+    /// - `AB`, `9F`, `05`, `06`, `04`, `C7`/`60`: the opcode alone, as the hard-wired bits of
+    ///   `SPI1.CMD` send them (FW §A.1) and as the bootloader and ESP-IDF send `9F`, `05`, `7A`
+    ///   and `04` through `USR` (`USER = 0x90000080` or `0x80000000`: no address, no dummy
+    ///   clock, no data out; FW §A.2, §A.3, BA §2.2);
+    /// - `5A`: a 24-bit address and 8 dummy clocks (`USER1 = 23 << 26 | 7`, BA §2.2);
+    /// - `01`: one data byte (FW §C: this part has no second status byte);
+    /// - `02`: a 24-bit address and at least one byte; `20`, `D8`: a 24-bit address (FW §A.2,
+    ///   §A.3).
+    #[must_use]
+    pub fn of(opcode: u8) -> Option<FlashFrame> {
+        if let Some(&(_, dummy_cycles)) = READS.iter().find(|(read, _)| *read == opcode) {
+            return Some(FlashFrame::addressed(ADDRESS_BITS, dummy_cycles));
+        }
+        match opcode {
+            OP_RES | OP_RESUME | OP_RDID | OP_RDSR | OP_WREN | OP_WRDI | OP_CE | OP_CE_ALT => {
+                Some(FlashFrame::OPCODE_ALONE)
+            }
+            OP_SFDP => Some(FlashFrame::addressed(ADDRESS_BITS, SFDP_DUMMY_CYCLES)),
+            OP_SE | OP_BE => Some(FlashFrame::addressed(ADDRESS_BITS, 0)),
+            OP_WRSR => Some(FlashFrame {
+                data_out_min: 1,
+                data_out_max: 1,
+                ..FlashFrame::OPCODE_ALONE
+            }),
+            OP_PP => Some(FlashFrame {
+                data_out_min: 1,
+                data_out_max: u32::MAX,
+                ..FlashFrame::addressed(ADDRESS_BITS, 0)
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether `command` has this frame.
+    fn admits(self, command: &FlashCommand<'_>) -> bool {
+        let data_out = u32::try_from(command.data_out.len()).unwrap_or(u32::MAX);
+        command.address.map_or(0, |address| address.bits) == self.address_bits
+            && command.dummy_cycles == self.dummy_cycles
+            && (self.data_out_min..=self.data_out_max).contains(&data_out)
+    }
+}
+
+/// The frame in words, for the remedy of a refusal: "a 24-bit address, 4 dummy clocks and no
+/// data out".
+impl fmt::Display for FlashFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.address_bits {
+            0 => write!(f, "no address, ")?,
+            bits => write!(f, "a {bits}-bit address, ")?,
+        }
+        match self.dummy_cycles {
+            0 => write!(f, "no dummy clock and ")?,
+            cycles => write!(f, "{cycles} dummy clocks and ")?,
+        }
+        match (self.data_out_min, self.data_out_max) {
+            (0, 0) => write!(f, "no data out"),
+            (1, 1) => write!(f, "1 byte of data out"),
+            (min, max) if min == max => write!(f, "{min} bytes of data out"),
+            (min, u32::MAX) => write!(f, "{min} byte of data out or more"),
+            (min, max) => write!(f, "{min} to {max} bytes of data out"),
+        }
+    }
+}
+
+/// Why the chip did not run a command: nothing was read and nothing changed, the write-enable
+/// latch included.
+///
+/// A write (a program, an erase, a status write) is judged in this order:
+/// 1. its frame: a frame the model does not know is refused whether or not the latch is set,
+///    because the model cannot say what command a chip would see in it;
+/// 2. the write-enable latch: without it a chip ignores the write wherever it points and whatever
+///    is protected (FW §C), so the model does too, and reports nothing;
+/// 3. its range, then the block protection: refused by name, and the latch stays set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlashRefusal {
     /// The model does not implement this opcode.
     Unmodeled { opcode: u8 },
-    /// The opcode is known, but not sent like this: an address that is not 24 bits long (0 when
-    /// there is none), dummy clocks the command does not take, or a number of data bytes it cannot
-    /// carry. What a chip does with such a frame is not modelled.
+    /// The opcode is known, but not sent in its frame ([`FlashFrame::of`]): an address that is
+    /// not as long as the command takes (0 when there is none), other dummy clocks, or a number
+    /// of data bytes it does not carry. What a chip does with such a frame is not modelled.
     Form {
         opcode: u8,
         address_bits: u32,
@@ -389,16 +508,6 @@ impl NorFlash {
         })
     }
 
-    /// The address of a command that must carry one on 24 bits, with no dummy clock.
-    fn address_of(command: &FlashCommand<'_>) -> Result<u32, FlashRefusal> {
-        match command.address {
-            Some(address) if address.bits == ADDRESS_BITS && command.dummy_cycles == 0 => {
-                Ok(address.value)
-            }
-            _ => Err(NorFlash::form(command)),
-        }
-    }
-
     fn form(command: &FlashCommand<'_>) -> FlashRefusal {
         FlashRefusal::Form {
             opcode: command.opcode,
@@ -410,7 +519,8 @@ impl NorFlash {
 
     /// Refuses a write the model cannot place or cannot judge: past the end of the chip, or
     /// under a protection it has no map of. Called once the latch is known to be set: a chip
-    /// ignores a write without it, wherever it points.
+    /// ignores a write without it, wherever it points (the order is the one of
+    /// [`FlashRefusal`]).
     fn writable(&self, opcode: u8, address: u32, len: u32) -> Result<(), FlashRefusal> {
         if address >= self.config.size {
             return Err(FlashRefusal::OutOfRange {
@@ -439,21 +549,21 @@ impl NorFlash {
 
     /// `02`: ANDs the data into the page of the address (FW §C: a program only clears bits),
     /// wrapping at the end of the page; of more than a page of data the last 256 bytes are kept.
-    fn program(&mut self, command: &FlashCommand<'_>) -> Result<Option<FlashWrite>, FlashRefusal> {
-        let address = NorFlash::address_of(command)?;
+    fn program(
+        &mut self,
+        address: u32,
+        data_out: &[u8],
+    ) -> Result<Option<FlashWrite>, FlashRefusal> {
         // Of more than a page of data the chip keeps the last 256 bytes (FW §C): the first
         // `skip` bytes are dropped, and the loop below is bounded by `PAGE_BYTES` whatever the
         // caller sends. The SPI1 controller sends 64 bytes at most.
-        let skip = command.data_out.len().saturating_sub(index(PAGE_BYTES));
-        let data = &command.data_out[skip..];
-        if data.is_empty() {
-            return Err(NorFlash::form(command));
-        }
+        let skip = data_out.len().saturating_sub(index(PAGE_BYTES));
+        let data = &data_out[skip..];
         if self.status & STATUS_WEL == 0 {
             return Ok(None);
         }
         let len = u32::try_from(data.len()).unwrap_or(PAGE_BYTES);
-        self.writable(command.opcode, address, len)?;
+        self.writable(OP_PP, address, len)?;
         let page = address & !(PAGE_BYTES - 1);
         // Where the first byte kept lands: the page counter after the bytes that were dropped.
         let dropped = u32::try_from(skip % index(PAGE_BYTES)).unwrap_or(0);
@@ -509,17 +619,18 @@ impl NorFlash {
     /// ignored (FW §G).
     fn erase(
         &mut self,
-        command: &FlashCommand<'_>,
+        opcode: u8,
+        address: u32,
         unit: u32,
     ) -> Result<Option<FlashWrite>, FlashRefusal> {
-        let address = NorFlash::address_of(command)?;
-        if !command.data_out.is_empty() {
-            return Err(NorFlash::form(command));
-        }
         if self.status & STATUS_WEL == 0 {
             return Ok(None);
         }
-        self.writable(command.opcode, address, unit)?;
+        self.writable(opcode, address, unit)?;
+        // INVARIANT: the unit that holds an address inside the chip ends inside it too:
+        // `writable` checked `address < size`, and the size is a power of two from 1 MiB
+        // (`FlashConfig::new`), so a multiple of the 4 KiB and of the 64 KiB unit. The range
+        // the journal names is therefore the range that was erased.
         let start = address & !(unit - 1);
         self.fill_erased(start, unit);
         self.status &= !STATUS_WEL;
@@ -527,17 +638,11 @@ impl NorFlash {
     }
 
     /// `C7` and `60`: erases the whole chip.
-    fn erase_chip(
-        &mut self,
-        command: &FlashCommand<'_>,
-    ) -> Result<Option<FlashWrite>, FlashRefusal> {
-        if command.address.is_some() || command.dummy_cycles != 0 || !command.data_out.is_empty() {
-            return Err(NorFlash::form(command));
-        }
+    fn erase_chip(&mut self, opcode: u8) -> Result<Option<FlashWrite>, FlashRefusal> {
         if self.status & STATUS_WEL == 0 {
             return Ok(None);
         }
-        self.writable(command.opcode, 0, self.config.size)?;
+        self.writable(opcode, 0, self.config.size)?;
         self.fill_erased(0, self.config.size);
         self.image.clear();
         self.status &= !STATUS_WEL;
@@ -561,24 +666,16 @@ impl NorFlash {
     /// device, settles it.
     fn read_data(
         &self,
-        command: &FlashCommand<'_>,
-        dummy_cycles: u32,
+        opcode: u8,
+        address: u32,
         data_in: &mut [u8],
     ) -> Result<Option<FlashWrite>, FlashRefusal> {
-        let address = match command.address {
-            Some(address)
-                if address.bits == ADDRESS_BITS
-                    && command.dummy_cycles == dummy_cycles
-                    && command.data_out.is_empty() =>
-            {
-                address.value
-            }
-            _ => return Err(NorFlash::form(command)),
-        };
         let len = u32::try_from(data_in.len()).unwrap_or(u32::MAX);
+        // A read of no byte at the end of the chip reaches no byte past it, and is refused all
+        // the same: an address is inside the chip or it is not, whatever is read from it.
         if address >= self.config.size || len > self.config.size - address {
             return Err(FlashRefusal::OutOfRange {
-                opcode: command.opcode,
+                opcode,
                 address,
                 len,
             });
@@ -597,12 +694,10 @@ impl NorFlash {
         &mut self,
         command: &FlashCommand<'_>,
     ) -> Result<Option<FlashWrite>, FlashRefusal> {
+        // The frame of `01` is one data byte: `execute` let no other number through.
         let [value] = *command.data_out else {
             return Err(NorFlash::form(command));
         };
-        if command.address.is_some() || command.dummy_cycles != 0 {
-            return Err(NorFlash::form(command));
-        }
         if self.status & STATUS_WEL == 0 {
             return Ok(None);
         }
@@ -643,8 +738,19 @@ impl FlashDevice for NorFlash {
         command: &FlashCommand<'_>,
         data_in: &mut [u8],
     ) -> Result<Option<FlashWrite>, FlashRefusal> {
-        if let Some(&(_, dummy_cycles)) = READS.iter().find(|(read, _)| *read == command.opcode) {
-            return self.read_data(command, dummy_cycles, data_in);
+        // The frame is judged first, for every command: see [`FlashFrame`] and the order of
+        // [`FlashRefusal`].
+        let Some(frame) = FlashFrame::of(command.opcode) else {
+            return Err(FlashRefusal::Unmodeled {
+                opcode: command.opcode,
+            });
+        };
+        if !frame.admits(command) {
+            return Err(NorFlash::form(command));
+        }
+        let address = command.address.map_or(0, |address| address.value);
+        if READS.iter().any(|(read, _)| *read == command.opcode) {
+            return self.read_data(command.opcode, address, data_in);
         }
         match command.opcode {
             // Nothing to wake up or resume: the chip is never powered down or suspended.
@@ -667,10 +773,11 @@ impl FlashDevice for NorFlash {
             OP_WREN => self.status |= STATUS_WEL,
             OP_WRDI => self.status &= !STATUS_WEL,
             OP_WRSR => return self.write_status(command),
-            OP_PP => return self.program(command),
-            OP_SE => return self.erase(command, SECTOR_BYTES),
-            OP_BE => return self.erase(command, BLOCK_BYTES),
-            OP_CE | OP_CE_ALT => return self.erase_chip(command),
+            OP_PP => return self.program(address, command.data_out),
+            OP_SE => return self.erase(OP_SE, address, SECTOR_BYTES),
+            OP_BE => return self.erase(OP_BE, address, BLOCK_BYTES),
+            opcode @ (OP_CE | OP_CE_ALT) => return self.erase_chip(opcode),
+            // No opcode with a frame is left: this arm keeps the match total.
             opcode => return Err(FlashRefusal::Unmodeled { opcode }),
         }
         Ok(None)
@@ -969,6 +1076,167 @@ mod tests {
     }
 
     #[test]
+    fn a_command_without_address_or_data_is_refused_in_any_frame_but_its_own() {
+        // `06` now opens every write: what a chip does with a write enable followed by an
+        // address or a byte is not established, so the model does not set the latch on one.
+        let at = |bits| Some(FlashAddress { value: 0x10, bits });
+        let frames: [(Option<FlashAddress>, u32, &[u8]); 5] = [
+            (at(24), 0, &[]),
+            (at(32), 0, &[]),
+            (None, 8, &[]),
+            (None, 0, &[0x00]),
+            (at(32), 8, &[1, 2, 3, 4]),
+        ];
+        for opcode in [0x06u8, 0x04, 0x05, 0x9F, 0xAB, 0x7A] {
+            for latch in [false, true] {
+                let mut flash = NorFlash::blank(FlashConfig::default());
+                if latch {
+                    run(&mut flash, 0x06, &mut []).unwrap();
+                }
+                for (address, dummy_cycles, data_out) in frames {
+                    let command = FlashCommand {
+                        opcode,
+                        address,
+                        dummy_cycles,
+                        data_out,
+                    };
+                    let mut data_in = [0xA5u8; 3];
+                    assert_eq!(
+                        flash.execute(&command, &mut data_in),
+                        Err(FlashRefusal::Form {
+                            opcode,
+                            address_bits: address.map_or(0, |a| a.bits),
+                            dummy_cycles,
+                            data_bytes: u32::try_from(data_out.len()).unwrap(),
+                        }),
+                        "{command:?}"
+                    );
+                    assert_eq!(data_in, [0xA5; 3], "nothing was clocked in: {command:?}");
+                    assert_eq!(
+                        status(&mut flash),
+                        if latch { 0x02 } else { 0x00 },
+                        "the latch is as it was: {command:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_sfdp_read_is_refused_in_any_frame_but_the_measured_one() {
+        // BA §2.2: a 24-bit address, 8 dummy clocks, nothing sent after them.
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        let at = |bits| Some(FlashAddress { value: 0x10, bits });
+        let frames: [(Option<FlashAddress>, u32, &[u8]); 5] = [
+            (None, 8, &[]),
+            (at(32), 8, &[]),
+            (at(24), 0, &[]),
+            (at(24), 4, &[]),
+            (at(24), 8, &[0]),
+        ];
+        for (address, dummy_cycles, data_out) in frames {
+            let command = FlashCommand {
+                opcode: 0x5A,
+                address,
+                dummy_cycles,
+                data_out,
+            };
+            let mut byte = [0xA5u8];
+            assert_eq!(
+                flash.execute(&command, &mut byte),
+                Err(FlashRefusal::Form {
+                    opcode: 0x5A,
+                    address_bits: address.map_or(0, |a| a.bits),
+                    dummy_cycles,
+                    data_bytes: u32::try_from(data_out.len()).unwrap(),
+                }),
+                "{command:?}"
+            );
+            assert_eq!(byte, [0xA5]);
+        }
+    }
+
+    #[test]
+    fn every_opcode_the_model_runs_has_one_frame_and_the_others_have_none() {
+        let frame = |address_bits, dummy_cycles, data_out_min, data_out_max| {
+            Some(FlashFrame {
+                address_bits,
+                dummy_cycles,
+                data_out_min,
+                data_out_max,
+            })
+        };
+        let known = [
+            (
+                0xABu8,
+                frame(0, 0, 0, 0),
+                "no address, no dummy clock and no data out",
+            ),
+            (0x7A, frame(0, 0, 0, 0), ""),
+            (0x9F, frame(0, 0, 0, 0), ""),
+            (0x05, frame(0, 0, 0, 0), ""),
+            (0x06, frame(0, 0, 0, 0), ""),
+            (0x04, frame(0, 0, 0, 0), ""),
+            (0xC7, frame(0, 0, 0, 0), ""),
+            (0x60, frame(0, 0, 0, 0), ""),
+            (
+                0x5A,
+                frame(24, 8, 0, 0),
+                "a 24-bit address, 8 dummy clocks and no data out",
+            ),
+            (
+                0x01,
+                frame(0, 0, 1, 1),
+                "no address, no dummy clock and 1 byte of data out",
+            ),
+            (
+                0x02,
+                frame(24, 0, 1, u32::MAX),
+                "a 24-bit address, no dummy clock and 1 byte of data out or more",
+            ),
+            (
+                0x20,
+                frame(24, 0, 0, 0),
+                "a 24-bit address, no dummy clock and no data out",
+            ),
+            (0xD8, frame(24, 0, 0, 0), ""),
+            (0x03, frame(24, 0, 0, 0), ""),
+            (0x0B, frame(24, 8, 0, 0), ""),
+            (0x3B, frame(24, 8, 0, 0), ""),
+            (
+                0xBB,
+                frame(24, 4, 0, 0),
+                "a 24-bit address, 4 dummy clocks and no data out",
+            ),
+            (0x6B, frame(24, 8, 0, 0), ""),
+            (
+                0xEB,
+                frame(24, 6, 0, 0),
+                "a 24-bit address, 6 dummy clocks and no data out",
+            ),
+        ];
+        for opcode in 0..=u8::MAX {
+            let expected = known.iter().find(|(known, ..)| *known == opcode);
+            assert_eq!(
+                FlashFrame::of(opcode),
+                expected.and_then(|&(_, frame, _)| frame),
+                "{opcode:#04x}"
+            );
+            if let Some(&(_, Some(frame), words)) = expected
+                && !words.is_empty()
+            {
+                assert_eq!(frame.to_string(), words, "{opcode:#04x}");
+            }
+            // A command is run exactly when it has a frame: the chip refuses the others by
+            // their opcode, whatever comes with them.
+            let mut flash = NorFlash::blank(FlashConfig::default());
+            let refused_by_opcode =
+                run(&mut flash, opcode, &mut []) == Err(FlashRefusal::Unmodeled { opcode });
+            assert_eq!(refused_by_opcode, expected.is_none(), "{opcode:#04x}");
+        }
+    }
+
+    #[test]
     fn opcodes_the_model_does_not_know_are_refused_by_opcode() {
         // What no measured boot sends: a second status register (`31`, `35`), a 32 KiB erase
         // (`52`: no caller in ESP-IDF, SF §C), reset (`66`, `99`), suspend (`75`), deep
@@ -1112,6 +1380,36 @@ mod tests {
         assert_eq!(
             read_at(&mut flash, 0x03, 0x0F_FFFF, 0, &mut [0u8; 1]),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_read_of_no_byte_is_judged_on_its_address_like_any_other() {
+        // A transfer without a data-in phase reads no byte. Its address is inside the chip or
+        // it is not: the first address past the end is refused, the last one inside is not.
+        let small = FlashConfig::new(MIN_FLASH_BYTES, id_with(0x14)).unwrap();
+        let mut flash = NorFlash::blank(small);
+        assert_eq!(read_at(&mut flash, 0xBB, 0x0F_FFFF, 4, &mut []), Ok(None));
+        assert_eq!(
+            read_at(&mut flash, 0xBB, 0x10_0000, 4, &mut []),
+            Err(FlashRefusal::OutOfRange {
+                opcode: 0xBB,
+                address: 0x10_0000,
+                len: 0
+            })
+        );
+        // One byte at the last address is the last byte; two reach past the end.
+        assert_eq!(
+            read_at(&mut flash, 0xBB, 0x0F_FFFF, 4, &mut [0u8; 1]),
+            Ok(None)
+        );
+        assert_eq!(
+            read_at(&mut flash, 0xBB, 0x0F_FFFF, 4, &mut [0u8; 2]),
+            Err(FlashRefusal::OutOfRange {
+                opcode: 0xBB,
+                address: 0x0F_FFFF,
+                len: 2
+            })
         );
     }
 
@@ -1507,11 +1805,9 @@ mod tests {
 
     #[test]
     fn a_write_command_in_a_form_the_chip_does_not_know_is_refused_by_name() {
-        let mut flash = NorFlash::with_image(vec![0x0F; 16], FlashConfig::default()).unwrap();
-        run(&mut flash, 0x06, &mut []).unwrap();
         let at = |bits| Some(FlashAddress { value: 0, bits });
         // (opcode, address, dummy clocks, data): each differs from the form of its command.
-        let frames: [(u8, Option<FlashAddress>, u32, &[u8]); 11] = [
+        let frames: [(u8, Option<FlashAddress>, u32, &[u8]); 17] = [
             (0x02, None, 0, &[0]),    // a program without an address
             (0x02, at(32), 0, &[0]),  // with a 4-byte address
             (0x02, at(16), 0, &[0]),  // with a 2-byte address
@@ -1519,31 +1815,46 @@ mod tests {
             (0x02, at(24), 0, &[]),   // without a byte
             (0x20, None, 0, &[]),     // an erase without an address
             (0x20, at(24), 0, &[0]),  // with data
+            (0x20, at(24), 8, &[]),   // with dummy clocks
             (0xD8, at(32), 0, &[]),   // a block erase with a 4-byte address
+            (0xD8, at(24), 0, &[0]),  // with data
             (0xC7, at(24), 0, &[]),   // a chip erase with an address
+            (0xC7, None, 8, &[]),     // with dummy clocks
+            (0x60, None, 0, &[0]),    // with data
             (0x01, None, 0, &[0, 0]), // a status write of two bytes
-            (0x01, at(24), 0, &[0]),  // a status write with an address
+            (0x01, None, 0, &[]),     // of no byte
+            (0x01, at(24), 0, &[0]),  // with an address
+            (0x01, None, 8, &[0]),    // with dummy clocks
         ];
-        for (opcode, address, dummy_cycles, data_out) in frames {
-            let command = FlashCommand {
-                opcode,
-                address,
-                dummy_cycles,
-                data_out,
-            };
-            assert_eq!(
-                flash.execute(&command, &mut []),
-                Err(FlashRefusal::Form {
+        // The frame is judged before the write-enable latch: a frame the model does not know is
+        // refused with the latch set and without it, and the latch stays as it was.
+        for latch in [0x02u8, 0x00] {
+            let mut flash = NorFlash::with_image(vec![0x0F; 16], FlashConfig::default()).unwrap();
+            if latch != 0 {
+                run(&mut flash, 0x06, &mut []).unwrap();
+            }
+            for (opcode, address, dummy_cycles, data_out) in frames {
+                let command = FlashCommand {
                     opcode,
-                    address_bits: address.map_or(0, |a| a.bits),
+                    address,
                     dummy_cycles,
-                    data_bytes: u32::try_from(data_out.len()).unwrap(),
-                }),
-                "{command:?}"
-            );
+                    data_out,
+                };
+                assert_eq!(
+                    flash.execute(&command, &mut []),
+                    Err(FlashRefusal::Form {
+                        opcode,
+                        address_bits: address.map_or(0, |a| a.bits),
+                        dummy_cycles,
+                        data_bytes: u32::try_from(data_out.len()).unwrap(),
+                    }),
+                    "{command:?} with status {latch:#04x}"
+                );
+                assert_eq!(status(&mut flash), latch, "the latch is as it was");
+            }
+            assert_eq!(content(&flash, 0, 16), [0x0F; 16]);
+            assert_eq!((flash.generation(), flash.modified_sectors()), (0, 0));
         }
-        assert_eq!(content(&flash, 0, 16), [0x0F; 16]);
-        assert_eq!(status(&mut flash), 0x02, "the latch is as it was");
     }
 
     #[test]

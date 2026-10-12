@@ -1527,6 +1527,38 @@ mod tests {
     }
 
     #[test]
+    fn a_command_that_takes_no_address_and_no_data_is_refused_when_a_transfer_gives_it_some() {
+        // A write enable, a status read, a read-id: each with a 4-byte address, 8 dummy clocks
+        // and 4 bytes sent, a frame no ROM or ESP-IDF code gives them.
+        let ctx = &mut Ctx::default();
+        let mut spi = spi1();
+        for opcode in [0x06u32, 0x04, 0x05, 0x9F, 0xAB, 0x7A] {
+            spi.write(ctx, USER, USR_COMMAND | USR_ADDR | USR_DUMMY | USR_MOSI);
+            spi.write(ctx, USER1, (31 << 26) | 7);
+            spi.write(ctx, USER2, 0x7000_0000 | opcode);
+            spi.write(ctx, MOSI_DLEN, 31);
+            spi.write(ctx, CMD, CMD_USR);
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::FlashCommandForm {
+                    opcode: opcode.to_le_bytes()[0],
+                    address_bits: 32,
+                    dummy_cycles: 8,
+                    data_bytes: 4
+                })
+            );
+            assert_eq!(spi.read(ctx, CMD), Some(0), "self-clears: no hang");
+        }
+        spi.write(ctx, CMD, CMD_RDSR);
+        assert_eq!(
+            spi.read(ctx, RD_STATUS),
+            Some(0),
+            "the refused write enable did not set the latch"
+        );
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
     fn a_suspend_or_resume_request_is_refused_by_name_and_the_measured_configuration_is_stored() {
         let ctx = &mut Ctx::default();
         let (mut spi, seen) = recording_spi1();
