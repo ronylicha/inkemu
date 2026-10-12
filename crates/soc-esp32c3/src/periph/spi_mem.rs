@@ -246,6 +246,18 @@ fn cache_pages(write: &FlashWrite) -> Option<(u32, u32)> {
     }
 }
 
+/// SPI1, the controller that runs the flash commands software asks for.
+///
+/// It keeps the journal of what the run wrote to the chip and the count of the commands it
+/// sent, for the machine: a front end reads both from [`crate::machine::Esp32C3`], which owns
+/// the controller, not from here.
+///
+/// ```compile_fail
+/// // The journal is taken from the machine: `Esp32C3::take_flash_writes`.
+/// fn journal(spi1: &mut soc_esp32c3::periph::spi_mem::Spi1) -> usize {
+///     spi1.take_flash_writes().len()
+/// }
+/// ```
 #[derive(Debug)]
 pub struct Spi1 {
     registers: Storage,
@@ -293,21 +305,21 @@ impl Spi1 {
     }
 
     /// The programs, erases and status writes the chip performed since the last call, oldest
-    /// first: see [`FlashJournal`].
-    pub fn take_flash_writes(&mut self) -> Vec<FlashWrite> {
+    /// first: see [`FlashJournal`]. For the machine, which is where a front end takes them
+    /// ([`Esp32C3::take_flash_writes`](crate::machine::Esp32C3::take_flash_writes)).
+    pub(crate) fn take_flash_writes(&mut self) -> Vec<FlashWrite> {
         self.journal.take()
     }
 
-    /// The operations the journal did not keep because it was full.
-    #[must_use]
-    pub const fn flash_writes_dropped(&self) -> u64 {
+    /// The operations the journal did not keep because it was full. For the machine, like the
+    /// journal.
+    pub(crate) const fn flash_writes_dropped(&self) -> u64 {
         self.journal.dropped()
     }
 
     /// How many commands of `opcode` the controller sent to the chip since power-on, those the
-    /// chip model refused included.
-    #[must_use]
-    pub fn commands_sent(&self, opcode: u8) -> u64 {
+    /// chip model refused included. For the machine, like the journal.
+    pub(crate) fn commands_sent(&self, opcode: u8) -> u64 {
         self.sent.get(usize::from(opcode)).copied().unwrap_or(0)
     }
 

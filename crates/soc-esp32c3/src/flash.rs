@@ -284,7 +284,8 @@ impl FlashFrame {
     /// The frame of `opcode`; `None` for an opcode the model does not implement.
     ///
     /// Each frame is the one a measured boot or the ROM and ESP-IDF sources send:
-    /// - the data reads: a 24-bit address, then the dummy clocks of [`READS`];
+    /// - the data reads: a 24-bit address, then the dummy clocks each one takes (0 for `03`, 4
+    ///   for `BB`, 6 for `EB`, 8 for `0B`, `3B` and `6B`);
     /// - `AB`, `9F`, `05`, `06`, `04`, `C7`/`60`: the opcode alone, as the hard-wired bits of
     ///   `SPI1.CMD` send them (FW §A.1) and as the bootloader and ESP-IDF send `9F`, `05`, `7A`
     ///   and `04` through `USR` (`USER = 0x90000080` or `0x80000000`: no address, no dummy
@@ -392,14 +393,28 @@ pub enum FlashWrite {
     Status { value: u8 },
 }
 
-/// The most entries a [`FlashJournal`] holds between two calls of [`FlashJournal::take`].
+/// The most entries the journal of a run holds between two calls of
+/// [`Esp32C3::take_flash_writes`](crate::machine::Esp32C3::take_flash_writes); the operations
+/// performed while it is full are counted by
+/// [`Esp32C3::flash_writes_dropped`](crate::machine::Esp32C3::flash_writes_dropped).
+///
+/// The journal itself stays inside the crate: the SPI1 controller owns it and records into it,
+/// and a front end takes its entries from the machine.
+///
+/// ```compile_fail
+/// // No caller builds or holds a journal: only its entries leave the crate.
+/// let journal = soc_esp32c3::flash::FlashJournal::default();
+/// ```
 pub const JOURNAL_CAPACITY: usize = 1024;
 
 /// The operations that wrote the chip during a run, oldest first. The firmware decides how many
 /// there are: the journal keeps the first [`JOURNAL_CAPACITY`] that nobody took and counts the
 /// others, so that its memory does not grow with what the firmware does.
+///
+/// Its one owner is the SPI1 controller ([`crate::periph::spi_mem::Spi1`]); what it holds
+/// leaves the crate through the machine.
 #[derive(Clone, Debug, Default)]
-pub struct FlashJournal {
+pub(crate) struct FlashJournal {
     writes: Vec<FlashWrite>,
     dropped: u64,
 }
@@ -414,13 +429,12 @@ impl FlashJournal {
     }
 
     /// The entries recorded since the last call, which leaves the journal empty.
-    pub fn take(&mut self) -> Vec<FlashWrite> {
+    pub(crate) fn take(&mut self) -> Vec<FlashWrite> {
         std::mem::take(&mut self.writes)
     }
 
     /// How many operations were not recorded because the journal was full: since power-on.
-    #[must_use]
-    pub const fn dropped(&self) -> u64 {
+    pub(crate) const fn dropped(&self) -> u64 {
         self.dropped
     }
 }

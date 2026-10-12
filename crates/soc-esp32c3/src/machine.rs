@@ -488,18 +488,27 @@ impl Esp32C3 {
     }
 
     /// The programs, erases and status writes the flash chip performed since the last call,
-    /// oldest first: the journal of what the run wrote, for whoever wants to show or check it.
+    /// oldest first: the journal of what the run wrote.
+    ///
+    /// Its callers are a front end that shows or checks what a firmware writes, and the tests
+    /// that compare the writes of a reference firmware with the ones measured on a chip
+    /// (`tests/reference_boot.rs`). The command line does not take it: it keeps the content of
+    /// the flash ([`Esp32C3::flash_contents`]), not the operations.
     ///
     /// The journal holds at most [`JOURNAL_CAPACITY`](crate::flash::JOURNAL_CAPACITY) entries
-    /// between two calls; the operations performed while it was full are counted by
-    /// [`Esp32C3::flash_writes_dropped`]. A caller that needs every one takes them as often as
-    /// it takes the console.
+    /// between two calls, the first ones; the operations performed while it was full are not
+    /// in it and are counted by [`Esp32C3::flash_writes_dropped`]. A caller that needs every
+    /// one takes them as often as it takes the console, and reads that count when the run
+    /// ends: 0 says that the entries it took are all of them. A caller that never takes the
+    /// journal costs the machine those entries at most (64 bytes of data each through the
+    /// controller) and loses nothing else.
     pub fn take_flash_writes(&mut self) -> Vec<FlashWrite> {
         self.bus.periph.spi1.take_flash_writes()
     }
 
     /// How many flash operations the journal did not keep since power-on, because nobody had
-    /// taken the ones before them.
+    /// taken the ones before them: what a caller of [`Esp32C3::take_flash_writes`] reads to
+    /// know whether what it took is the whole of what the run wrote.
     #[must_use]
     pub const fn flash_writes_dropped(&self) -> u64 {
         self.bus.periph.spi1.flash_writes_dropped()
@@ -507,8 +516,12 @@ impl Esp32C3 {
 
     /// How many flash commands of `opcode` the SPI1 controller sent to the chip since power-on
     /// (`0x02` page program, `0x06` write enable, `0x04` write disable, `0x05` read status, and
-    /// so on), those the chip model refused included: what a test compares with the commands a
-    /// firmware sends to a real chip.
+    /// so on), those the chip model refused included.
+    ///
+    /// Its callers are the tests that compare the commands a firmware sends here with the
+    /// ones it sends to a real chip (`tests/reference_boot.rs`: one write enable per write, no
+    /// write disable), and a front end that wants the same numbers. The counters are 256 `u64`
+    /// whatever the firmware sends.
     #[must_use]
     pub fn flash_commands_sent(&self, opcode: u8) -> u64 {
         self.bus.periph.spi1.commands_sent(opcode)
