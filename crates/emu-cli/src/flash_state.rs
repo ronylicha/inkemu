@@ -35,6 +35,18 @@ pub enum FlashStateError {
         detail: String,
         remedy: &'static str,
     },
+    #[error(
+        "{lock}, where the lock file of the flash file {path} goes, is not a regular file (a link is not followed); remove it or move it away, or give this run another --flash-file"
+    )]
+    LockNotAFile { path: String, lock: String },
+    #[error(
+        "cannot open for writing the lock file {lock} of the flash file {path}, which is there: {detail}; make it writable for you, or remove it once no run uses the flash file"
+    )]
+    LockOpen {
+        path: String,
+        lock: String,
+        detail: String,
+    },
     /// Found when the run starts, before anything runs: the file the content goes through when
     /// the run ends cannot be made now.
     #[error(
@@ -105,6 +117,69 @@ fn creation_remedy(error: &std::io::Error) -> &'static str {
         "give the flash file a shorter name: its lock file and its temporary file are named after it, with 5 bytes more"
     } else {
         "check that the directory exists and is writable, or give a path in one that is"
+    }
+}
+
+/// Opens the file at `path` as `options` say, and never anything else that would be there in its
+/// place a moment after it was looked at. On Unix a link at the name fails the open instead of
+/// leading it elsewhere (`O_NOFOLLOW`), and a pipe fails or opens at once instead of making the
+/// process wait for its other end (`O_NONBLOCK`, which changes nothing for a regular file).
+/// Elsewhere the standard library has no such request: the open is the plain one, and what was
+/// opened is judged by its caller, as everywhere.
+fn open_in_place(options: &mut OpenOptions, path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+/// Opens the lock file at `lock_path`, creating it if there is none. Nothing is ever written to
+/// it, and an existing one is not truncated.
+///
+/// What sits at the name and is no regular file is refused by name without being opened: a
+/// link would have the file it names created, a pipe would be waited on. What was opened is
+/// judged again, for a name that changed hands in between.
+fn open_lock_file(
+    lock_path: &Path,
+    shown_path: &str,
+    shown_lock: &str,
+) -> Result<File, FlashStateError> {
+    let not_a_file = || FlashStateError::LockNotAFile {
+        path: shown_path.to_owned(),
+        lock: shown_lock.to_owned(),
+    };
+    let is_there = match std::fs::symlink_metadata(lock_path) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => return Err(not_a_file()),
+        // Nothing there, or nothing that can be looked at: the open says which.
+        Err(_) => false,
+    };
+    let lock = open_in_place(
+        OpenOptions::new().write(true).create(true).truncate(false),
+        lock_path,
+    )
+    .map_err(|e| {
+        let detail = sanitize(&e.to_string());
+        if is_there {
+            FlashStateError::LockOpen {
+                path: shown_path.to_owned(),
+                lock: shown_lock.to_owned(),
+                detail,
+            }
+        } else {
+            FlashStateError::LockCreate {
+                path: shown_path.to_owned(),
+                lock: shown_lock.to_owned(),
+                detail,
+                remedy: creation_remedy(&e),
+            }
+        }
+    })?;
+    match lock.metadata() {
+        Ok(metadata) if metadata.is_file() => Ok(lock),
+        _ => Err(not_a_file()),
     }
 }
 
@@ -234,18 +309,7 @@ impl FlashState {
         judge(path, &shown_path, size)?;
         let lock_path = sibling("", LOCK_SUFFIX);
         let shown_lock = shown(&lock_path);
-        // Nothing is ever written to it, and an existing one is not truncated.
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| FlashStateError::LockCreate {
-                path: shown_path.clone(),
-                lock: shown_lock.clone(),
-                detail: sanitize(&e.to_string()),
-                remedy: creation_remedy(&e),
-            })?;
+        let lock = open_lock_file(&lock_path, &shown_path, &shown_lock)?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -603,6 +667,84 @@ mod tests {
         ));
         drop(first);
         FlashState::open(&path, SIZE).unwrap();
+    }
+
+    #[test]
+    fn what_is_where_the_lock_file_goes_and_is_no_regular_file_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = |name: &str| {
+            let err = FlashState::open(&dir.path().join(name), SIZE).unwrap_err();
+            assert!(matches!(err, FlashStateError::LockNotAFile { .. }), "{err}");
+            let text = err.to_string();
+            assert!(
+                text.contains(&format!("{name}.lock"))
+                    && text.contains("is not a regular file")
+                    && text.contains("; remove it or move it away"),
+                "{text}"
+            );
+        };
+        std::fs::create_dir(dir.path().join("dir.bin.lock")).unwrap();
+        refused("dir.bin");
+        #[cfg(unix)]
+        {
+            // A link to nothing: followed, it would have the file it names created.
+            let link = dir.path().join("link.bin.lock");
+            std::os::unix::fs::symlink(dir.path().join("planted"), &link).unwrap();
+            refused("link.bin");
+            // A link to a file that is there: the lock of this run would be taken on that file.
+            std::fs::remove_file(&link).unwrap();
+            std::fs::write(dir.path().join("other.lock"), b"").unwrap();
+            std::os::unix::fs::symlink(dir.path().join("other.lock"), &link).unwrap();
+            refused("link.bin");
+            std::fs::remove_file(dir.path().join("other.lock")).unwrap();
+            std::fs::remove_file(&link).unwrap();
+        }
+        assert_eq!(names(dir.path()), ["dir.bin.lock"], "nothing was created");
+    }
+
+    /// What closes the instant between the look at a name and its opening: the open itself
+    /// refuses a link, whatever the link names.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_in_place_never_follows_a_link_and_takes_a_regular_file_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, link) = (dir.path().join("file"), dir.path().join("link"));
+        let creating = || {
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(false);
+            options
+        };
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        open_in_place(&mut creating(), &link).unwrap_err();
+        assert!(!file.exists(), "what the link names was not created");
+        std::fs::write(&file, b"kept").unwrap();
+        open_in_place(&mut creating(), &link).unwrap_err();
+        open_in_place(&mut creating(), &file).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_that_is_there_and_cannot_be_opened_is_not_said_to_be_impossible_to_create() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("x4.bin.lock");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(
+            OpenOptions::new().write(true).open(&lock).is_err(),
+            "this test needs a user whom a read-only file stops; run it as one"
+        );
+        let err = FlashState::open(&dir.path().join("x4.bin"), SIZE).unwrap_err();
+        assert!(matches!(err, FlashStateError::LockOpen { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("cannot open for writing the lock file")
+                && text.contains("x4.bin.lock")
+                && text.contains("which is there")
+                && text.contains("; make it writable for you"),
+            "{text}"
+        );
     }
 
     #[test]

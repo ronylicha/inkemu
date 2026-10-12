@@ -1349,6 +1349,69 @@ fn a_flash_file_in_a_directory_that_takes_no_new_file_is_refused_before_boot() {
     assert_eq!(left, ["x4.bin.lock"]);
 }
 
+/// The place of the lock file gets the care the flash file gets: what is there and is no
+/// regular file is refused by name, without being opened. A pipe opened for writing would wait
+/// for ever for a reader, and a link would have the file it names created.
+#[cfg(unix)]
+#[test]
+fn what_is_where_the_lock_file_goes_and_is_no_regular_file_is_refused_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let refused = |name: &str| {
+        // The limit: before this was refused, the command waited on the pipe for ever.
+        inkemu()
+            .args(["run", "--device", "x4", "--max-cycles", "1000", "--rom-dir"])
+            .arg(dir.path().join("no-rom"))
+            .arg("--flash-file")
+            .arg(dir.path().join(name))
+            .timeout(std::time::Duration::from_secs(20))
+            .assert()
+            .code(2)
+            .stderr(
+                contains(format!("{name}.lock"))
+                    .and(contains("is not a regular file"))
+                    .and(contains("; remove it or move it away"))
+                    .and(contains(MISSING_ROM).not()),
+            );
+    };
+    make_fifo(&dir.path().join("pipe.bin.lock"));
+    refused("pipe.bin");
+    std::os::unix::fs::symlink(dir.path().join("planted"), dir.path().join("link.bin.lock"))
+        .unwrap();
+    refused("link.bin");
+    std::fs::create_dir(dir.path().join("dir.bin.lock")).unwrap();
+    refused("dir.bin");
+    assert_eq!(
+        names_in(dir.path()),
+        ["dir.bin.lock", "link.bin.lock", "pipe.bin.lock"],
+        "nothing was created: not what the link names, not a flash file"
+    );
+}
+
+/// A lock file that is there and cannot be opened is not one that "cannot be created".
+#[cfg(unix)]
+#[test]
+fn a_lock_file_that_cannot_be_opened_for_writing_is_said_to_be_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("x4.bin.lock");
+    std::fs::write(&lock, b"").unwrap();
+    set_mode(&lock, 0o444);
+    let administrator = std::fs::OpenOptions::new().write(true).open(&lock).is_ok();
+    assert!(
+        !administrator,
+        "this test needs a user whom a read-only file stops; run it as one"
+    );
+    run_with_flash_file(&dir.path().join("x4.bin"), &[])
+        .code(2)
+        .stderr(
+            contains("cannot open for writing the lock file")
+                .and(contains("x4.bin.lock"))
+                .and(contains("which is there"))
+                .and(contains("; make it writable"))
+                .and(contains("cannot create").not())
+                .and(contains(MISSING_ROM).not()),
+        );
+}
+
 /// What a save that was killed left behind is removed by the next run on the same flash file,
 /// which holds the lock: no run is writing it.
 #[test]
