@@ -6,14 +6,19 @@ pub mod bootloader;
 #[cfg(any(test, feature = "test-support"))]
 pub mod builder;
 pub mod chip;
+pub mod device;
 pub mod error;
 pub mod flash_image;
 pub mod image;
 pub mod partition;
 
 pub use app_desc::AppDesc;
-pub use bootloader::{BootloaderDesc, SHIPPED, ShippedBootloader};
+pub use bootloader::{
+    BootloaderDesc, BootloaderError, BootloaderIdentity, BootloaderReport, BootloaderWarning,
+    SHIPPED, ShippedBootloader, check_bootloader,
+};
 pub use chip::{ChipId, FlashSize, SpiMode};
+pub use device::Device;
 pub use error::FirmwareError;
 pub use flash_image::{FlashImageInfo, check_flash_image, has_partition_table};
 pub use image::{FirmwareImage, Segment};

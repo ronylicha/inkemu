@@ -6,7 +6,12 @@
 //! flash is composed (`docs/research/shipped-bootloader-and-firmware-composition.md`, **SB** in
 //! the comments of this crate, §B).
 use crate::chip::{ChipId, FlashSize, SpiMode};
+use crate::device::{Device, revision};
+use crate::error::FirmwareError;
+use crate::image::{FirmwareImage, HEADER_LEN, IMAGE_MAGIC, XOTA_MAGIC};
+use crate::partition::PARTITION_TABLE_OFFSET;
 use sha2::{Digest, Sha256};
+use std::fmt;
 
 /// `ESP_BOOTLOADER_DESC_MAGIC_BYTE` (`esp_bootloader_desc.h`): the first byte of
 /// `esp_bootloader_desc_t`, which starts the first segment of a bootloader built by ESP-IDF.
@@ -22,6 +27,21 @@ const SIZE_FREQ_OFFSET: usize = 3;
 /// Header byte 23: non-zero when a SHA-256 digest ends the image.
 const HASH_APPENDED_OFFSET: usize = 23;
 const SHA256_LEN: usize = 32;
+/// Header byte 2: the SPI mode. A bootloader runs in QIO, QOUT, DIO or DOUT (0 to 3).
+const SPI_MODE_OFFSET: usize = 2;
+const LAST_BOOTLOADER_MODE: u8 = 3;
+/// Speed codes the mask ROM accepts in the low nibble of byte 3: 0 to 2, and 15
+/// (`docs/research/esp32c3-rom-flash-boot.md`, **RFB** below, §F step 1).
+const ROM_SPEEDS: [u8; 4] = [0, 1, 2, 0xF];
+/// The longest segment the ROM loads (RFB §F step 4).
+const MAX_SEGMENT_LEN: usize = 0x10_0000;
+/// The ROM's stack and data, where it refuses to load a segment (RFB §F step 5).
+const ROM_RESERVED: (u32, u32) = (0x3FCD_E160, 0x3FCD_F664);
+/// Where a bootloader's segments are loaded: internal SRAM, through its data bus (DRAM) or its
+/// instruction bus (IRAM) (ESP32-C3 Technical Reference Manual, "System and Memory").
+const RAM: [(u32, u32); 2] = [(0x3FC8_0000, 0x3FCE_0000), (0x4037_C000, 0x403E_0000)];
+/// The two windows the cache maps the flash to: an application's code and read-only data.
+const FLASH_WINDOWS: [(u32, u32); 2] = [(0x3C00_0000, 0x3C80_0000), (0x4200_0000, 0x4280_0000)];
 
 /// What `esp_bootloader_desc_t` says of the build of a bootloader.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,9 +158,283 @@ impl ShippedBootloader {
     }
 }
 
+/// A bootloader inkemu recognises by its SHA-256, and neither ships nor fetches
+/// (`docs/research/flash-writes-and-crosspoint-boot.md`, §N).
+#[derive(Debug, PartialEq, Eq)]
+pub struct KnownBootloader {
+    pub name: &'static str,
+    /// SHA-256 of the file, in lower-case hexadecimal.
+    pub sha256: &'static str,
+}
+
+/// Bootloaders a user is likely to give, named in the summary of a run.
+pub static KNOWN: [KnownBootloader; 1] = [KnownBootloader {
+    name: "the Arduino-ESP32 prebuilt bootloader of the CrossPoint web flasher (ESP-IDF v5.5.2-729-g87912cd291)",
+    sha256: "6e6b0d386095f0783e9f0513ea29ea2ce413790e7f7153a06a2b04e2b5f59fb6",
+}];
+
+/// What a bootloader is known as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BootloaderIdentity {
+    /// One inkemu ships.
+    Shipped(&'static ShippedBootloader),
+    /// One of [`KNOWN`].
+    Known(&'static KnownBootloader),
+    /// Another, as its descriptor describes it.
+    Described {
+        idf_ver: String,
+        date_time: String,
+        sha256: String,
+    },
+    /// Another, without a descriptor (ESP-IDF before v5.1, or not ESP-IDF).
+    Unknown { sha256: String },
+}
+
+impl fmt::Display for BootloaderIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BootloaderIdentity::Shipped(entry) => write!(
+                f,
+                "the ESP-IDF {} bootloader inkemu ships ({})",
+                entry.idf_version, entry.id
+            ),
+            BootloaderIdentity::Known(known) => f.write_str(known.name),
+            BootloaderIdentity::Described {
+                idf_ver,
+                date_time,
+                sha256,
+            } if date_time.is_empty() => {
+                write!(f, "a bootloader of ESP-IDF {idf_ver}, sha256 {sha256}")
+            }
+            BootloaderIdentity::Described {
+                idf_ver,
+                date_time,
+                sha256,
+            } => write!(
+                f,
+                "a bootloader of ESP-IDF {idf_ver} built {date_time}, sha256 {sha256}"
+            ),
+            BootloaderIdentity::Unknown { sha256 } => {
+                write!(f, "a bootloader without a descriptor, sha256 {sha256}")
+            }
+        }
+    }
+}
+
+/// What may not go as the user expects, and does not stop the run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BootloaderWarning {
+    #[error(
+        "the SHA-256 appended to the bootloader does not match it; the mask ROM boots it anyway, as a chip without secure boot does, and prints four lines that say so; rebuild the bootloader if it was not changed on purpose"
+    )]
+    DigestMismatch,
+    #[error(
+        "the header of the bootloader says {header} MB of flash and the device has {device} MB; the application is told {header} MB and uses no more; rebuild the bootloader for {device} MB to use the whole flash"
+    )]
+    SmallerFlash { header: u32, device: u32 },
+}
+
+/// What the check of a bootloader found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootloaderReport {
+    pub identity: BootloaderIdentity,
+    pub warnings: Vec<BootloaderWarning>,
+}
+
+/// Imperatives that open the remedy clause of a [`BootloaderError`] (`"; <verb> ..."`).
+pub const BOOTLOADER_REMEDY_VERBS: [&str; 4] = ["use", "give", "rebuild", "choose"];
+
+/// Why a file cannot be the bootloader of a device. The messages name the option of `inkemu run`
+/// that takes what the file is.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BootloaderError {
+    #[error(
+        "the bootloader is an encrypted OTA update (.xota), not a bootloader; give the bootloader.bin of a build, or no bootloader to use the one inkemu ships"
+    )]
+    EncryptedOta,
+    #[error(
+        "the bootloader is a whole flash image (a partition table follows it at 0x8000), not a bootloader alone; use the file as the flash (`inkemu run --flash`)"
+    )]
+    FlashImage,
+    #[error(
+        "the bootloader is {len} bytes, more than the 32768 bytes below the partition table; give the bootloader.bin of a build, or no bootloader to use the one inkemu ships"
+    )]
+    TooLong { len: usize },
+    #[error(
+        "the bootloader is empty or shorter than an image header ({len} bytes); give the bootloader.bin of a build, or no bootloader to use the one inkemu ships"
+    )]
+    TooShort { len: usize },
+    #[error(
+        "the bootloader is not an ESP-IDF image: its first byte is {found:#04x}, expected 0xe9; give the bootloader.bin of a build, or no bootloader to use the one inkemu ships"
+    )]
+    NotAnImage { found: u8 },
+    #[error(
+        "the bootloader is an application image (it carries an application descriptor at 0x20); use it as the firmware (`--firmware`), and give no bootloader or the bootloader.bin of its build"
+    )]
+    Application,
+    #[error(
+        "the bootloader declares SPI mode {raw}, which no bootloader runs in (0 to 3: QIO, QOUT, DIO, DOUT); rebuild it, or use the one inkemu ships"
+    )]
+    BadMode { raw: u8 },
+    #[error(
+        "the bootloader declares flash speed code {raw}, which the mask ROM refuses (0, 1, 2 or 15); rebuild it, or use the one inkemu ships"
+    )]
+    BadSpeed { raw: u8 },
+    #[error("the bootloader is damaged: {0}")]
+    Damaged(FirmwareError),
+    #[error(
+        "segment {index} of the bootloader is loaded at {addr:#010x}, in a window of the flash, as an application's code is; use the file as the firmware (`--firmware`), with the bootloader of its build"
+    )]
+    FlashMapped { index: usize, addr: u32 },
+    #[error(
+        "segment {index} of the bootloader ({len} bytes at {addr:#010x}) is not where the mask ROM loads a bootloader (word-aligned, at most 1 MiB, in internal RAM, clear of 0x3fcde160-0x3fcdf663); rebuild it, or use the one inkemu ships"
+    )]
+    Unloadable { index: usize, addr: u32, len: usize },
+    #[error(
+        "the bootloader is built for {found}, and the device uses {expected}; give a bootloader built for {expected}, or no bootloader to use the one inkemu ships"
+    )]
+    ChipMismatch { expected: ChipId, found: ChipId },
+    #[error(
+        "the bootloader requires chip revision {} or later and the device is {}: it would reset the chip for ever; give a bootloader built for {} (CONFIG_ESP32C3_REV_MIN), or choose a device of revision {} or later",
+        revision(*required), revision(*device), revision(*device), revision(*required)
+    )]
+    RevisionTooHigh { required: u16, device: u16 },
+    #[error(
+        "the header of the bootloader says {header} MB of flash and the device has {device} MB: the application would abort when it finds the smaller chip; give a bootloader built for {device} MB, or no bootloader to use the one inkemu ships"
+    )]
+    LargerFlash { header: u32, device: u32 },
+}
+
+fn within(range: (u32, u32), addr: u32, len: usize) -> bool {
+    let end = u64::from(addr) + len as u64;
+    u64::from(range.0) <= u64::from(addr) && end <= u64::from(range.1)
+}
+
+fn overlaps(range: (u32, u32), addr: u32, len: usize) -> bool {
+    let end = u64::from(addr) + len as u64;
+    u64::from(addr) < u64::from(range.1) && end > u64::from(range.0)
+}
+
+/// What `bytes` is known as: shipped, known, or described by its descriptor.
+fn identify(bytes: &[u8], image: &FirmwareImage) -> BootloaderIdentity {
+    let sha256 = sha256_hex(bytes);
+    if let Some(entry) = SHIPPED.iter().find(|entry| entry.sha256 == sha256) {
+        return BootloaderIdentity::Shipped(entry);
+    }
+    if let Some(known) = KNOWN.iter().find(|known| known.sha256 == sha256) {
+        return BootloaderIdentity::Known(known);
+    }
+    match image
+        .segments
+        .first()
+        .and_then(|s| BootloaderDesc::parse(&s.data))
+    {
+        Some(desc) => BootloaderIdentity::Described {
+            idf_ver: desc.idf_ver,
+            date_time: desc.date_time,
+            sha256,
+        },
+        None => BootloaderIdentity::Unknown { sha256 },
+    }
+}
+
+/// Checks a bootloader given by the user before it is written at offset 0 of the flash of
+/// `device`: what the mask ROM would refuse, what would make the bootloader reset the chip or
+/// the application abort, and a file that is something else (SB §G). It is never rewritten.
+///
+/// # Errors
+/// [`BootloaderError`]: the cause, then what to give instead.
+pub fn check_bootloader(
+    bytes: &[u8],
+    device: &Device,
+) -> Result<BootloaderReport, BootloaderError> {
+    if bytes.starts_with(XOTA_MAGIC) {
+        return Err(BootloaderError::EncryptedOta);
+    }
+    if crate::flash_image::has_partition_table(bytes) {
+        return Err(BootloaderError::FlashImage);
+    }
+    if bytes.len() > PARTITION_TABLE_OFFSET as usize {
+        return Err(BootloaderError::TooLong { len: bytes.len() });
+    }
+    if bytes.len() < HEADER_LEN {
+        return Err(BootloaderError::TooShort { len: bytes.len() });
+    }
+    // INVARIANT: every index below is under HEADER_LEN, which the length check just covered.
+    if bytes[0] != IMAGE_MAGIC {
+        return Err(BootloaderError::NotAnImage { found: bytes[0] });
+    }
+    if bytes[SPI_MODE_OFFSET] > LAST_BOOTLOADER_MODE {
+        return Err(BootloaderError::BadMode {
+            raw: bytes[SPI_MODE_OFFSET],
+        });
+    }
+    let speed = bytes[SIZE_FREQ_OFFSET] & 0x0F;
+    if !ROM_SPEEDS.contains(&speed) {
+        return Err(BootloaderError::BadSpeed { raw: speed });
+    }
+    let (image, digest_matches) =
+        FirmwareImage::parse_reporting_digest(bytes).map_err(BootloaderError::Damaged)?;
+    if image.app_desc.is_some() {
+        return Err(BootloaderError::Application);
+    }
+    for (index, segment) in image.segments.iter().enumerate() {
+        let (addr, len) = (segment.load_addr, segment.data.len());
+        if FLASH_WINDOWS
+            .iter()
+            .any(|&window| overlaps(window, addr, len))
+        {
+            return Err(BootloaderError::FlashMapped { index, addr });
+        }
+        let loadable = addr % 4 == 0
+            && len <= MAX_SEGMENT_LEN
+            && RAM.iter().any(|&ram| within(ram, addr, len))
+            && !overlaps(ROM_RESERVED, addr, len);
+        if !loadable {
+            return Err(BootloaderError::Unloadable { index, addr, len });
+        }
+    }
+    if image.chip != device.chip {
+        return Err(BootloaderError::ChipMismatch {
+            expected: device.chip,
+            found: image.chip,
+        });
+    }
+    if image.min_chip_rev_full > device.chip_revision {
+        return Err(BootloaderError::RevisionTooHigh {
+            required: image.min_chip_rev_full,
+            device: device.chip_revision,
+        });
+    }
+    let (header, flash) = (image.flash_size.megabytes(), device.flash_size.megabytes());
+    if header > flash {
+        return Err(BootloaderError::LargerFlash {
+            header,
+            device: flash,
+        });
+    }
+    let mut warnings = Vec::new();
+    if header < flash {
+        warnings.push(BootloaderWarning::SmallerFlash {
+            header,
+            device: flash,
+        });
+    }
+    if !digest_matches {
+        warnings.push(BootloaderWarning::DigestMismatch);
+    }
+    Ok(BootloaderReport {
+        identity: identify(bytes, &image),
+        warnings,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builder::{
+        ImageSpec, app_desc_bytes, bootloader_spec, build_flash_image, build_image, refresh_digest,
+    };
     use crate::image::FirmwareImage;
 
     #[test]
@@ -232,5 +526,292 @@ mod tests {
         let mut other = first_segment.to_vec();
         other[0] = 0x51;
         assert!(BootloaderDesc::parse(&other).is_none());
+    }
+
+    const X4: Device = Device {
+        chip: ChipId::Esp32C3,
+        chip_revision: 3,
+        efuse_block_revision: 102,
+        flash_size: FlashSize::Mb16,
+    };
+
+    fn shipped_bytes() -> &'static [u8] {
+        SHIPPED[0].bytes
+    }
+
+    fn refusal(bytes: &[u8]) -> BootloaderError {
+        check_bootloader(bytes, &X4).unwrap_err()
+    }
+
+    #[test]
+    fn the_shipped_bootloader_passes_and_is_named() {
+        let report = check_bootloader(shipped_bytes(), &X4).unwrap();
+        assert_eq!(report.identity, BootloaderIdentity::Shipped(&SHIPPED[0]));
+        assert_eq!(report.warnings, []);
+        assert_eq!(
+            report.identity.to_string(),
+            "the ESP-IDF v5.5.2 bootloader inkemu ships (esp-idf-v5.5.2-esp32c3-dio)"
+        );
+    }
+
+    #[test]
+    fn another_bootloader_is_named_by_its_descriptor_or_its_hash() {
+        let built = build_image(&bootloader_spec());
+        let report = check_bootloader(&built, &X4).unwrap();
+        let sha256 = sha256_hex(&built);
+        assert_eq!(
+            report.identity,
+            BootloaderIdentity::Described {
+                idf_ver: "v5.5.2-test".into(),
+                date_time: "Oct 13 2026 10:00:00".into(),
+                sha256: sha256.clone()
+            }
+        );
+        assert_eq!(
+            report.identity.to_string(),
+            format!(
+                "a bootloader of ESP-IDF v5.5.2-test built Oct 13 2026 10:00:00, sha256 {sha256}"
+            )
+        );
+        let mut spec = bootloader_spec();
+        spec.segments[0].1[0] = 0; // no descriptor
+        let bare = build_image(&spec);
+        assert_eq!(
+            check_bootloader(&bare, &X4).unwrap().identity,
+            BootloaderIdentity::Unknown {
+                sha256: sha256_hex(&bare)
+            }
+        );
+    }
+
+    #[test]
+    fn a_whole_flash_image_an_ota_update_or_a_long_file_is_not_a_bootloader() {
+        assert_eq!(
+            refusal(&build_flash_image(&bootloader_spec())),
+            BootloaderError::FlashImage
+        );
+        let mut xota = b"XOTA".to_vec();
+        xota.resize(512, 0);
+        assert_eq!(refusal(&xota), BootloaderError::EncryptedOta);
+        let mut long = build_image(&bootloader_spec());
+        long.resize(0x8001, 0xFF);
+        assert_eq!(refusal(&long), BootloaderError::TooLong { len: 0x8001 });
+        long.truncate(0x8000);
+        assert!(
+            check_bootloader(&long, &X4).is_ok(),
+            "erased bytes up to the table"
+        );
+        assert_eq!(refusal(&[]), BootloaderError::TooShort { len: 0 });
+        assert_eq!(refusal(&[0xE9; 23]), BootloaderError::TooShort { len: 23 });
+        assert_eq!(
+            refusal(&[0x7F; 64]),
+            BootloaderError::NotAnImage { found: 0x7F }
+        );
+    }
+
+    #[test]
+    fn an_application_given_as_the_bootloader_is_named_as_one() {
+        assert_eq!(
+            refusal(&build_image(&ImageSpec::default())),
+            BootloaderError::Application
+        );
+        // Without its descriptor, its flash-mapped segment still gives it away.
+        let spec = ImageSpec {
+            segments: vec![(0x4200_0020, vec![0; 8])],
+            ..ImageSpec::default()
+        };
+        assert_eq!(
+            refusal(&build_image(&spec)),
+            BootloaderError::FlashMapped {
+                index: 0,
+                addr: 0x4200_0020
+            }
+        );
+    }
+
+    #[test]
+    fn a_segment_the_rom_would_not_load_is_refused() {
+        for (addr, len) in [
+            (0x3FCD_E15C, 8),    // ends inside the ROM's stack
+            (0x3FCD_F660, 8),    // starts inside it
+            (0x5000_0000, 8),    // RTC memory
+            (0x3FCD_FFFC, 0x8),  // runs past the end of DRAM
+            (0x403D_FFF8, 0x10), // runs past the end of IRAM
+            (0x3FC8_0002, 8),    // not word-aligned
+        ] {
+            let mut spec = bootloader_spec();
+            spec.segments.push((addr, vec![0; len]));
+            let index = spec.segments.len() - 1;
+            assert_eq!(
+                refusal(&build_image(&spec)),
+                BootloaderError::Unloadable { index, addr, len },
+                "{addr:#x}+{len:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_the_rom_or_the_device_would_refuse_is_refused() {
+        let with = |at: usize, value: u8| {
+            let mut bytes = build_image(&bootloader_spec());
+            bytes[at] = value;
+            refresh_digest(&mut bytes);
+            bytes
+        };
+        assert_eq!(refusal(&with(2, 4)), BootloaderError::BadMode { raw: 4 });
+        assert_eq!(
+            refusal(&with(3, 0x43)),
+            BootloaderError::BadSpeed { raw: 3 }
+        );
+        assert!(matches!(
+            refusal(&with(1, 17)),
+            BootloaderError::Damaged(FirmwareError::TooManySegments { .. })
+        ));
+        assert_eq!(
+            refusal(&with(12, 9)),
+            BootloaderError::ChipMismatch {
+                expected: ChipId::Esp32C3,
+                found: ChipId::Esp32S3
+            }
+        );
+        assert_eq!(
+            refusal(&with(3, 0x5F)),
+            BootloaderError::LargerFlash {
+                header: 32,
+                device: 16
+            }
+        );
+    }
+
+    #[test]
+    fn a_bootloader_that_requires_a_later_chip_is_refused_before_it_resets_for_ever() {
+        let mut bytes = build_image(&bootloader_spec());
+        bytes[15..17].copy_from_slice(&4u16.to_le_bytes());
+        refresh_digest(&mut bytes);
+        let err = refusal(&bytes);
+        assert_eq!(
+            err,
+            BootloaderError::RevisionTooHigh {
+                required: 4,
+                device: 3
+            }
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("requires chip revision v0.4 or later and the device is v0.3")
+                && text.contains("reset the chip for ever"),
+            "{text}"
+        );
+        bytes[15..17].copy_from_slice(&3u16.to_le_bytes());
+        refresh_digest(&mut bytes);
+        assert!(check_bootloader(&bytes, &X4).is_ok(), "v0.3 on v0.3");
+    }
+
+    #[test]
+    fn a_smaller_flash_and_a_wrong_digest_are_warnings() {
+        let mut bytes = build_image(&bootloader_spec());
+        bytes[3] = 0x2F;
+        refresh_digest(&mut bytes);
+        assert_eq!(
+            check_bootloader(&bytes, &X4).unwrap().warnings,
+            [BootloaderWarning::SmallerFlash {
+                header: 4,
+                device: 16
+            }]
+        );
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        assert_eq!(
+            check_bootloader(&bytes, &X4).unwrap().warnings,
+            [
+                BootloaderWarning::SmallerFlash {
+                    header: 4,
+                    device: 16
+                },
+                BootloaderWarning::DigestMismatch
+            ]
+        );
+        // A checksum is never a warning: the ROM refuses the image.
+        let spec = ImageSpec {
+            hash_appended: false,
+            ..bootloader_spec()
+        };
+        let mut bytes = build_image(&spec);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        assert!(matches!(
+            refusal(&bytes),
+            BootloaderError::Damaged(FirmwareError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_known_bootloader_is_named() {
+        assert_eq!(
+            KNOWN[0].sha256,
+            "6e6b0d386095f0783e9f0513ea29ea2ce413790e7f7153a06a2b04e2b5f59fb6"
+        );
+        let identity = BootloaderIdentity::Known(&KNOWN[0]);
+        assert!(identity.to_string().contains("Arduino-ESP32"), "{identity}");
+        // A descriptor with an application's magic is an application, whatever else it holds.
+        let mut spec = bootloader_spec();
+        spec.segments[0].1 = app_desc_bytes("1", "demo", "v5.5.2");
+        assert_eq!(refusal(&build_image(&spec)), BootloaderError::Application);
+    }
+
+    #[test]
+    fn every_refusal_and_warning_states_a_remedy() {
+        let errors = [
+            BootloaderError::EncryptedOta,
+            BootloaderError::FlashImage,
+            BootloaderError::TooLong { len: 1 },
+            BootloaderError::TooShort { len: 1 },
+            BootloaderError::NotAnImage { found: 1 },
+            BootloaderError::Application,
+            BootloaderError::BadMode { raw: 4 },
+            BootloaderError::BadSpeed { raw: 3 },
+            BootloaderError::Damaged(FirmwareError::HashMismatch),
+            BootloaderError::FlashMapped { index: 0, addr: 0 },
+            BootloaderError::Unloadable {
+                index: 0,
+                addr: 0,
+                len: 0,
+            },
+            BootloaderError::ChipMismatch {
+                expected: ChipId::Esp32C3,
+                found: ChipId::Esp32S3,
+            },
+            BootloaderError::RevisionTooHigh {
+                required: 4,
+                device: 3,
+            },
+            BootloaderError::LargerFlash {
+                header: 32,
+                device: 16,
+            },
+        ];
+        let verbs: Vec<&str> = BOOTLOADER_REMEDY_VERBS
+            .iter()
+            .chain(crate::error::REMEDY_VERBS.iter())
+            .copied()
+            .collect();
+        for message in errors.iter().map(ToString::to_string).chain(
+            [
+                BootloaderWarning::DigestMismatch,
+                BootloaderWarning::SmallerFlash {
+                    header: 4,
+                    device: 16,
+                },
+            ]
+            .iter()
+            .map(ToString::to_string),
+        ) {
+            assert!(
+                verbs
+                    .iter()
+                    .any(|verb| message.contains(&format!("; {verb} "))),
+                "no remedy in: {message}"
+            );
+        }
     }
 }
