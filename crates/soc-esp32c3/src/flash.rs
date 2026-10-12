@@ -47,6 +47,19 @@ const OP_BE: u8 = 0xD8;
 /// (FW §A.1, §A.3); ESP-IDF erases a chip block by block.
 const OP_CE: u8 = 0xC7;
 const OP_CE_ALT: u8 = 0x60;
+/// The data reads, each with the dummy clocks it takes after its 24-bit address: slow read,
+/// fast read, dual output, dual I/O, quad output, quad I/O
+/// (`IDF:spi_flash/include/spi_flash/spi_flash_defs.h:29-39, 60-71`; FW §A.2). The image header
+/// chooses the one an application uses; `BB` is the one measured (DIO: FW key result 3, SF §C:
+/// `USER1 = 0x5C000003`, 24 address bits and 4 dummy clocks).
+const READS: [(u8, u32); 6] = [
+    (0x03, 0),
+    (0x0B, 8),
+    (0x3B, 8),
+    (0xBB, 4),
+    (0x6B, 8),
+    (0xEB, 6),
+];
 /// Status register (FW §C): bit 0 write-in-progress (never set here), bit 1 the write-enable
 /// latch, bits 5:2 block protection `BP3..BP0`, bit 6 quad enable, bit 7 `SRWD`.
 const STATUS_WEL: u8 = 1 << 1;
@@ -534,6 +547,46 @@ impl NorFlash {
         }))
     }
 
+    /// A data read: the content from the address on, as many bytes as the controller clocks in.
+    ///
+    /// A read that would reach past the end of the chip is refused whole: the part of the
+    /// datasheet rolls its address counter over to 0 there (FW §C), a smaller part ignores the
+    /// address bits it does not have, and neither the ROM nor ESP-IDF ever asks (both reject the
+    /// range first: FW §A.2, §A.3).
+    ///
+    /// ASSUMPTION: the quad reads (`6B`, `EB`) answer whatever the quad-enable bit of the status
+    /// register holds. On the part they need it set (FW §C), and ESP-IDF sets it before it
+    /// selects a quad mode (`IDF:spi_flash/spi_flash_chip_issi.c:39-47`); what the chip clocks
+    /// out without it is not documented. An image whose header says QIO or QOUT, read against a
+    /// device, settles it.
+    fn read_data(
+        &self,
+        command: &FlashCommand<'_>,
+        dummy_cycles: u32,
+        data_in: &mut [u8],
+    ) -> Result<Option<FlashWrite>, FlashRefusal> {
+        let address = match command.address {
+            Some(address)
+                if address.bits == ADDRESS_BITS
+                    && command.dummy_cycles == dummy_cycles
+                    && command.data_out.is_empty() =>
+            {
+                address.value
+            }
+            _ => return Err(NorFlash::form(command)),
+        };
+        let len = u32::try_from(data_in.len()).unwrap_or(u32::MAX);
+        if address >= self.config.size || len > self.config.size - address {
+            return Err(FlashRefusal::OutOfRange {
+                opcode: command.opcode,
+                address,
+                len,
+            });
+        }
+        self.read(address, data_in);
+        Ok(None)
+    }
+
     /// `01`: stores the writable bits of the one status byte this part has (FW §C: no status
     /// register 2). The stored bits last as long as the chip model: they are not in an image.
     ///
@@ -588,6 +641,9 @@ impl FlashDevice for NorFlash {
         command: &FlashCommand<'_>,
         data_in: &mut [u8],
     ) -> Result<Option<FlashWrite>, FlashRefusal> {
+        if let Some(&(_, dummy_cycles)) = READS.iter().find(|(read, _)| *read == command.opcode) {
+            return self.read_data(command, dummy_cycles, data_in);
+        }
         match command.opcode {
             // Nothing to wake up or resume: the chip is never powered down or suspended.
             OP_RES | OP_RESUME => {}
@@ -882,14 +938,16 @@ mod tests {
     }
 
     #[test]
-    fn data_reads_and_opcodes_the_model_does_not_know_are_refused_by_opcode() {
-        // The data reads, and what no measured boot sends: a second status register (`31`,
-        // `35`), a 32 KiB erase (`52`: no caller in ESP-IDF, SF §C), reset (`66`, `99`),
-        // suspend (`75`), deep power-down (`B9`).
+    fn opcodes_the_model_does_not_know_are_refused_by_opcode() {
+        // What no measured boot sends: a second status register (`31`, `35`), a 32 KiB erase
+        // (`52`: no caller in ESP-IDF, SF §C), reset (`66`, `99`), suspend (`75`), deep
+        // power-down (`B9`), and the commands that take a 4-byte address (`12`, `13`, `0C`,
+        // `BC`, `21`, `DC`: ESP-IDF sends them above 16 MiB, FW §A.2).
         let mut flash = NorFlash::with_image(vec![1, 2, 3, 4], FlashConfig::default()).unwrap();
         run(&mut flash, 0x06, &mut []).unwrap();
         for opcode in [
-            0x03, 0x0B, 0xBB, 0x31, 0x35, 0x52, 0x66, 0x99, 0x75, 0xB9, 0x00, 0xFF,
+            0x31, 0x35, 0x52, 0x66, 0x99, 0x75, 0xB9, 0x12, 0x13, 0x0C, 0xBC, 0x21, 0xDC, 0x00,
+            0xFF,
         ] {
             assert_eq!(
                 run(&mut flash, opcode, &mut [0u8; 4]),
@@ -913,10 +971,146 @@ mod tests {
         let mut flash = NorFlash::blank(FlashConfig::default());
         let mut data_in = [0x5A, 0xA5, 0x3C];
         assert_eq!(
-            run(&mut flash, 0x03, &mut data_in),
-            Err(FlashRefusal::Unmodeled { opcode: 0x03 })
+            run(&mut flash, 0x35, &mut data_in),
+            Err(FlashRefusal::Unmodeled { opcode: 0x35 })
         );
         assert_eq!(data_in, [0x5A, 0xA5, 0x3C], "nothing was clocked in");
+    }
+
+    /// A data read: `opcode` with a 24-bit address and `dummy_cycles`.
+    fn read_at(
+        flash: &mut NorFlash,
+        opcode: u8,
+        address: u32,
+        dummy_cycles: u32,
+        data_in: &mut [u8],
+    ) -> Done {
+        flash.execute(
+            &FlashCommand {
+                opcode,
+                address: Some(FlashAddress {
+                    value: address,
+                    bits: 24,
+                }),
+                dummy_cycles,
+                data_out: &[],
+            },
+            data_in,
+        )
+    }
+
+    #[test]
+    fn every_data_read_returns_the_content_from_its_address_with_its_own_dummy_clocks() {
+        let image: Vec<u8> = (0u8..=255).cycle().take(0x400).collect();
+        let mut flash = NorFlash::with_image(image.clone(), FlashConfig::default()).unwrap();
+        for (opcode, dummy_cycles) in [
+            (0x03u8, 0u32),
+            (0x0B, 8),
+            (0x3B, 8),
+            (0xBB, 4),
+            (0x6B, 8),
+            (0xEB, 6),
+        ] {
+            let mut data = [0u8; 64];
+            assert_eq!(
+                read_at(&mut flash, opcode, 0x123, dummy_cycles, &mut data),
+                Ok(None),
+                "{opcode:#04x}"
+            );
+            assert_eq!(data, image[0x123..0x163], "{opcode:#04x}");
+            // Another number of dummy clocks is another frame: the model does not shift the
+            // data by guessing.
+            let mut untouched = [0xA5u8; 4];
+            assert_eq!(
+                read_at(&mut flash, opcode, 0x123, dummy_cycles + 2, &mut untouched),
+                Err(FlashRefusal::Form {
+                    opcode,
+                    address_bits: 24,
+                    dummy_cycles: dummy_cycles + 2,
+                    data_bytes: 0
+                })
+            );
+            assert_eq!(untouched, [0xA5; 4]);
+        }
+        // What the image does not hold reads erased, inside the chip.
+        let mut erased = [0u8; 4];
+        read_at(&mut flash, 0xBB, 0x3FE, 4, &mut erased).unwrap();
+        assert_eq!(erased, [0xFE, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn a_read_sees_what_a_program_wrote_before_it() {
+        // SF §G item 6: on its second boot the application reads 0x9060 between two programs.
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        write(&mut flash, 0x02, 0x9060, &[0x01, 0x14, 0x01]).unwrap();
+        let mut entry = [0u8; 4];
+        read_at(&mut flash, 0xBB, 0x9060, 4, &mut entry).unwrap();
+        assert_eq!(entry, [0x01, 0x14, 0x01, 0xFF]);
+    }
+
+    #[test]
+    fn a_read_that_reaches_past_the_end_of_the_chip_is_refused_and_reads_nothing() {
+        let mut flash = NorFlash::with_image(vec![0x11; 16 << 20], FlashConfig::default()).unwrap();
+        let mut last = [0u8; 2];
+        assert_eq!(read_at(&mut flash, 0xBB, 0xFF_FFFE, 4, &mut last), Ok(None));
+        assert_eq!(last, [0x11; 2], "the last two bytes of the chip");
+        let mut past = [0xA5u8; 3];
+        assert_eq!(
+            read_at(&mut flash, 0xBB, 0xFF_FFFE, 4, &mut past),
+            Err(FlashRefusal::OutOfRange {
+                opcode: 0xBB,
+                address: 0xFF_FFFE,
+                len: 3
+            }),
+            "no roll-over to address 0 is guessed"
+        );
+        assert_eq!(past, [0xA5; 3]);
+        // A smaller chip does not have the upper address bits.
+        let small = FlashConfig::new(MIN_FLASH_BYTES, id_with(0x14)).unwrap();
+        let mut flash = NorFlash::blank(small);
+        for address in [0x10_0000, 0xFF_FFFF] {
+            assert_eq!(
+                read_at(&mut flash, 0x03, address, 0, &mut [0u8; 1]),
+                Err(FlashRefusal::OutOfRange {
+                    opcode: 0x03,
+                    address,
+                    len: 1
+                })
+            );
+        }
+        assert_eq!(
+            read_at(&mut flash, 0x03, 0x0F_FFFF, 0, &mut [0u8; 1]),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_data_read_in_a_form_the_chip_does_not_know_is_refused_by_name() {
+        let mut flash = NorFlash::with_image(vec![0x22; 64], FlashConfig::default()).unwrap();
+        let at = |bits| Some(FlashAddress { value: 0, bits });
+        // (address, data sent): no address, a 4-byte address, a 2-byte address, data after it.
+        let frames: [(Option<FlashAddress>, &[u8]); 4] =
+            [(None, &[]), (at(32), &[]), (at(16), &[]), (at(24), &[0])];
+        for (address, data_out) in frames {
+            let command = FlashCommand {
+                opcode: 0xBB,
+                address,
+                dummy_cycles: 4,
+                data_out,
+            };
+            let mut data_in = [0xA5u8; 4];
+            assert_eq!(
+                flash.execute(&command, &mut data_in),
+                Err(FlashRefusal::Form {
+                    opcode: 0xBB,
+                    address_bits: address.map_or(0, |a| a.bits),
+                    dummy_cycles: 4,
+                    data_bytes: u32::try_from(data_out.len()).unwrap(),
+                }),
+                "{command:?}"
+            );
+            assert_eq!(data_in, [0xA5; 4]);
+        }
     }
 
     #[test]

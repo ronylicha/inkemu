@@ -19,8 +19,7 @@ pub enum Direction {
 /// An operation the emulator cannot perform faithfully: it is reported, and `--strict-mmio` stops on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unsupported {
-    /// An SPI flash command the flash model does not implement: a data read, or an opcode it does
-    /// not know.
+    /// An SPI flash command whose opcode the flash model does not implement.
     FlashCommand { opcode: u8 },
     /// A flash command the model knows, in a frame it does not: see
     /// [`FlashRefusal::Form`](crate::flash::FlashRefusal::Form).
@@ -106,7 +105,7 @@ impl Unsupported {
         match self {
             Unsupported::FlashCommand { opcode } => write!(
                 f,
-                "flash command {opcode:#04x} is not modeled (pc {pc:#010x}): the virtual flash knows the identification and status commands, the page program (0x02), the erases (0x20, 0xd8, 0x60, 0xc7) and the status write (0x01), so nothing was read or changed; use firmware that sends no other flash command until SPI1 data reads are emulated"
+                "flash command {opcode:#04x} is not modeled (pc {pc:#010x}): the virtual flash knows the identification and status commands, the data reads (0x03, 0x0b, 0x3b, 0xbb, 0x6b, 0xeb), the page program (0x02), the erases (0x20, 0xd8, 0x60, 0xc7) and the status write (0x01), so nothing was read or changed; use firmware that sends only these flash commands"
             ),
             Unsupported::FlashCommandForm {
                 opcode,
@@ -925,9 +924,9 @@ mod tests {
 
     #[test]
     fn a_refused_flash_command_is_described_truthfully_whatever_the_command_does() {
-        // The same text serves a data read (0x03, 0x0B, 0xBB: how `esp_flash` reads NVS), deep
-        // power-down (0xB9), a 4-byte-address program (0x12) and an opcode no chip has (0x00).
-        for opcode in [0x03, 0x0B, 0xBB, 0xB9, 0x12, 0x00] {
+        // The same text serves a 4-byte-address read (0x0C) or program (0x12), deep power-down
+        // (0xB9) and an opcode no chip has (0x00).
+        for opcode in [0x0C, 0x12, 0xB9, 0x00] {
             let text = unsupported(Unsupported::FlashCommand { opcode }).to_string();
             assert!(
                 text.contains(&format!("flash command {opcode:#04x} is not modeled")),
@@ -935,7 +934,7 @@ mod tests {
             );
             assert!(
                 text.contains(
-                    "the virtual flash knows the identification and status commands, the page program (0x02), the erases (0x20, 0xd8, 0x60, 0xc7) and the status write (0x01), so nothing was read or changed"
+                    "the virtual flash knows the identification and status commands, the data reads (0x03, 0x0b, 0x3b, 0xbb, 0x6b, 0xeb), the page program (0x02), the erases (0x20, 0xd8, 0x60, 0xc7) and the status write (0x01), so nothing was read or changed; use firmware that sends only these flash commands"
                 ),
                 "{text}"
             );

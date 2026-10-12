@@ -428,9 +428,12 @@ impl Spi1 {
         let address = (user & USR_ADDR != 0).then(|| {
             // The field can ask for up to 64 bits; the register holds 32.
             let bits = (((user1 >> ADDR_BITLEN_SHIFT) & ADDR_BITLEN_MASK) + 1).min(u32::BITS);
-            // ASSUMPTION: the address is the low `bits` bits of ADDR, unshifted (ESP-IDF
-            // `spimem_flash_ll_set_usr_address` stores it as is). Only the SFDP read uses an address
-            // on the measured paths and its answer does not depend on it; the lockstep settles it.
+            // The address is the low `bits` bits of ADDR, unshifted: ESP-IDF's
+            // `spimem_flash_ll_set_usr_address` stores it as it is whatever the bit length
+            // (`spimem_flash_ll.h:570`), and a measured 24-bit read of flash offset 0xFF0000
+            // has `ADDR = 0x00FF0000` (reports FW §A.1, §P; SF §C). 24 bits is the only length
+            // the chip takes for a data command; it refuses the others by name, so nothing
+            // rests on this rule for them.
             FlashAddress {
                 value: self.register(ADDR)
                     & u32::MAX.checked_shr(u32::BITS - bits).unwrap_or(u32::MAX),
@@ -1070,6 +1073,92 @@ mod tests {
         assert_eq!(spi.read(ctx, W0), Some(0xA3A2_A1A0));
         assert_eq!(spi.read(ctx, W0 + 4), Some(0x0000_A5A4));
         assert_eq!(spi.read(ctx, CMD), Some(0));
+        // On the chip it is the slow read: the content at that address.
+        let mut chip = spi_with_image((0u8..=255).cycle().take(0x200).collect());
+        chip.write(ctx, ADDR, 0x101);
+        chip.write(ctx, MISO_DLEN, 8 * 4 - 1);
+        chip.write(ctx, CMD, CMD_READ);
+        assert_eq!(chip.read(ctx, W0), Some(0x0403_0201));
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    fn spi_with_image(image: Vec<u8>) -> Spi1 {
+        Spi1::new(Box::new(
+            NorFlash::with_image(image, FlashConfig::default()).unwrap(),
+        ))
+    }
+
+    /// The registers of ESP-IDF's dual I/O read of `bytes` bytes at `address` (SF §C, measured):
+    /// `USER2 = 0x700000BB`, `USER1 = 0x5C000003` (24 address bits, 4 dummy clocks),
+    /// `USER = 0xF0000080`, `ADDR` = the flash offset, `MISO_DLEN = 8 × bytes − 1`.
+    fn dio_read(ctx: &mut Ctx, spi: &mut Spi1, address: u32, bytes: u32) {
+        spi.write(ctx, USER2, 0x7000_00BB);
+        spi.write(ctx, USER1, 0x5C00_0003);
+        spi.write(ctx, USER, 0xF000_0080);
+        spi.write(ctx, ADDR, address);
+        spi.write(ctx, MISO_DLEN, 8 * bytes - 1);
+        spi.write(ctx, CMD, CMD_USR);
+    }
+
+    #[test]
+    fn the_measured_dual_io_read_fills_the_data_registers_from_the_flash() {
+        let ctx = &mut Ctx::default();
+        let image: Vec<u8> = (0u8..=255).cycle().take(0xA000).collect();
+        let mut spi = spi_with_image(image.clone());
+        let words = |spi: &mut Spi1, ctx: &mut Ctx| -> Vec<u8> {
+            (0..DATA_WORDS)
+                .flat_map(|word| spi.read(ctx, W0 + 4 * word).unwrap().to_le_bytes())
+                .collect()
+        };
+        // 64, 32 and 4 bytes: `MISO_DLEN` 0x1FF, 0xFF and 0x1F, the three lengths NVS reads.
+        dio_read(ctx, &mut spi, 0x9000, 64);
+        assert_eq!(words(&mut spi, ctx), image[0x9000..0x9040]);
+        dio_read(ctx, &mut spi, 0x9123, 32);
+        assert_eq!(words(&mut spi, ctx)[..32], image[0x9123..0x9143]);
+        dio_read(ctx, &mut spi, 0x9020, 4);
+        assert_eq!(spi.read(ctx, W0), Some(0x2322_2120));
+        assert_eq!(ctx.take_unsupported(), None);
+        assert_eq!(spi.read(ctx, CMD), Some(0));
+        assert_eq!(spi.take_flash_writes(), [], "a read writes nothing");
+    }
+
+    #[test]
+    fn a_read_the_chip_cannot_place_or_frame_is_refused_by_name_and_clocks_nothing_in() {
+        let ctx = &mut Ctx::default();
+        let mut spi = spi_with_image(vec![0x11; 64]);
+        spi.write(ctx, W0, 0xDEAD_BEEF);
+        // 64 bytes from the last byte of the chip: 63 of them are past its end.
+        dio_read(ctx, &mut spi, 0xFF_FFFF, 64);
+        assert_eq!(
+            ctx.take_unsupported(),
+            Some(Unsupported::FlashRange {
+                opcode: 0xBB,
+                address: 0xFF_FFFF,
+                len: 64
+            })
+        );
+        // The same read with 8 dummy clocks, which `BB` does not take.
+        spi.write(ctx, USER2, 0x7000_00BB);
+        spi.write(ctx, USER1, 0x5C00_0007);
+        spi.write(ctx, USER, 0xF000_0080);
+        spi.write(ctx, ADDR, 0);
+        spi.write(ctx, MISO_DLEN, 31);
+        spi.write(ctx, CMD, CMD_USR);
+        assert_eq!(
+            ctx.take_unsupported(),
+            Some(Unsupported::FlashCommandForm {
+                opcode: 0xBB,
+                address_bits: 24,
+                dummy_cycles: 8,
+                data_bytes: 0
+            })
+        );
+        assert_eq!(ctx.take_unsupported(), None);
+        assert_eq!(
+            spi.read(ctx, W0),
+            Some(0xDEAD_BEEF),
+            "nothing was clocked in"
+        );
     }
 
     #[test]
