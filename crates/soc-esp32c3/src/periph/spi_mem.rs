@@ -60,10 +60,22 @@ const HARD_WIRED: [(u32, u8); 13] = [
 const COMMAND_BITS: u32 = !0 << 18;
 const JEDEC_ID_BYTES: usize = 3;
 const STATUS_BYTE_MASK: u32 = 0xFF;
-/// A hard-wired command sends the low 24 bits of `ADDR`: `addr & 0xffffff` for an erase, the
-/// same under the byte count for a program (`ROM3:SPI_sector_erase@0x4004d294`,
-/// `ROM3:SPI_page_program@0x4004d6b4`; `IDF:hal/esp32c3/include/hal/spimem_flash_ll.h:81-95,
-/// 377-389`; measured: report FW §A.2, §A.3).
+/// What the callers of a hard-wired command put in `ADDR`: the address in its low 24 bits,
+/// `addr & 0xffffff` for an erase, the same under the byte count for a program
+/// (`ROM3:SPI_sector_erase@0x4004d294`, `ROM3:SPI_page_program@0x4004d6b4`;
+/// `IDF:hal/esp32c3/include/hal/spimem_flash_ll.h:81-95, 377-389`; measured: report FW §A.2,
+/// §A.3).
+///
+/// ASSUMPTION: a hard-wired command clocks out 24 address bits and no dummy clock whatever
+/// `USER1.USR_ADDR_BITLEN` and `USER.USR_DUMMY` hold: its frame is fixed in the controller, as
+/// its opcode is. The sources show what the callers write, not what the controller sends, and
+/// every one of them prepares the frame a user transfer would need: `SPI_sector_erase` rewrites
+/// `USER` and `USER1` with 24 address bits before `CMD = 0x01020000`,
+/// `esp_rom_spiflash_read_status` clears `USR_DUMMY` before the hard-wired status read (report
+/// FW §A.3), and ESP-IDF writes `USER1 = 0x5C000003` before `CMD = 0x01000000` (FW §A.2). So no
+/// measured boot tells a controller that follows `USER1` from one that does not. A hard-wired
+/// erase issued with another `USER1[31:26]` on a device (which sector is erased), or under the
+/// SP1b-4 lockstep, settles it.
 const HARD_WIRED_ADDRESS_BITS: u32 = 24;
 const HARD_WIRED_ADDRESS_MASK: u32 = 0x00FF_FFFF;
 /// `ADDR` [31:24] of a hard-wired page program: the number of bytes (`0x20009000` is 32 bytes at
@@ -589,7 +601,9 @@ impl Spi1 {
             1 if commands == CMD_USR => self.run_user(ctx),
             1 => {
                 // INVARIANT: `HARD_WIRED` has an entry for each of the bits 31 to 19, and
-                // `commands` is one of them.
+                // `commands` is one of them. The test
+                // `each_of_the_thirteen_hard_wired_bits_sends_its_own_opcode_once` holds it: a
+                // bit without an entry would start nothing and report nothing.
                 if let Some(&(bit, opcode)) = HARD_WIRED.iter().find(|(bit, _)| *bit == commands) {
                     self.run_hard_wired(ctx, bit, opcode);
                 }
@@ -1287,6 +1301,71 @@ mod tests {
     fn recording_spi1() -> (Spi1, Rc<RefCell<Vec<Seen>>>) {
         let seen = Rc::new(RefCell::new(Vec::new()));
         (Spi1::new(Box::new(Recorder(Rc::clone(&seen)))), seen)
+    }
+
+    #[test]
+    fn each_of_the_thirteen_hard_wired_bits_sends_its_own_opcode_once() {
+        // `CMD` bits 31 to 19 and the opcode each one sends (FW §A.1; `B9` is the JEDEC deep
+        // power-down). The table is written out here: a bit missing from the controller's, or
+        // mapped to the opcode of another, sends nothing or the wrong command in silence.
+        let opcodes: [(u32, u8); 13] = [
+            (31, 0x03),
+            (30, 0x06),
+            (29, 0x04),
+            (28, 0x9F),
+            (27, 0x05),
+            (26, 0x01),
+            (25, 0x02),
+            (24, 0x20),
+            (23, 0xD8),
+            (22, 0xC7),
+            (21, 0xB9),
+            (20, 0xAB),
+            (19, 0xA3),
+        ];
+        for (bit, opcode) in opcodes {
+            let ctx = &mut Ctx::default();
+            let (mut spi, seen) = recording_spi1();
+            // One byte for the program, four for the read: lengths both commands carry.
+            spi.write(ctx, ADDR, 0x0100_0000);
+            spi.write(ctx, MISO_DLEN, 31);
+            assert!(spi.write(ctx, CMD, 1 << bit));
+            let sent: Vec<u8> = seen.borrow().iter().map(|command| command.0).collect();
+            assert_eq!(sent, [opcode], "CMD bit {bit}");
+            assert_eq!(spi.commands_sent(opcode), 1, "CMD bit {bit}");
+            assert_eq!(ctx.take_unsupported(), None, "CMD bit {bit}");
+            assert_eq!(spi.read(ctx, CMD), Some(0), "CMD bit {bit}");
+        }
+        // Bits 31 to 19 are all of them: with `USR`, bit 18, they are the command bits.
+        let all = opcodes
+            .iter()
+            .fold(CMD_USR, |bits, (bit, _)| bits | 1 << bit);
+        assert_eq!(all, COMMAND_BITS);
+    }
+
+    #[test]
+    fn a_hard_wired_command_sends_its_own_frame_whatever_user_and_user1_describe() {
+        // Pins the ASSUMPTION documented on `HARD_WIRED_ADDRESS_BITS`: a 32-bit address and 8
+        // dummy clocks in `USER`/`USER1` do not reach a hard-wired erase, program or status read.
+        let ctx = &mut Ctx::default();
+        let (mut spi, seen) = recording_spi1();
+        spi.write(ctx, USER, USR_COMMAND | USR_ADDR | USR_DUMMY | USR_MISO);
+        spi.write(ctx, USER1, (31 << 26) | 7);
+        spi.write(ctx, W0, 0x0000_00A5);
+        spi.write(ctx, ADDR, 0x0100_E000);
+        for cmd in [CMD_SE, CMD_BE, CMD_PP, CMD_RDSR] {
+            spi.write(ctx, CMD, cmd);
+        }
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [
+                (0x20, Some(at(0xE000)), 0, Vec::new()),
+                (0xD8, Some(at(0xE000)), 0, Vec::new()),
+                (0x02, Some(at(0xE000)), 0, vec![0xA5]),
+                (0x05, None, 0, Vec::new()),
+            ]
+        );
+        assert_eq!(ctx.take_unsupported(), None);
     }
 
     #[test]
