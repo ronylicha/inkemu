@@ -372,14 +372,21 @@ impl Bus for SocBus {
             Some(Region::Sram(dbus_addr)) => self.sram.page_version(dbus_addr),
             Some(Region::Sram0) => self.sram0.page_version(addr),
             Some(Region::Rtc) => self.rtc.page_version(addr),
-            // Flash content cannot change (the flash is read-only, D3); what an address shows changes
-            // with the MMU table and with the cache enables. Both counters only grow, so their sum
-            // changes whenever either does (decision D6). Both restart at 0 when a core reset
-            // rebuilds the MMU and the cache registers, so a version can repeat with another
-            // mapping: that is safe only because `Hart::reset` builds a new decode cache, at
-            // every level (`Esp32C3::reset`).
+            // What an address of a flash window shows changes with the MMU table, with the cache
+            // enables and with the content of the chip: a program or an erase that changes a byte
+            // moves the generation of the chip, so the code decoded from the flash before it is
+            // decoded again (spec §4.1: the decode cache is invalidated when the flash is
+            // rewritten). The three counters only grow, so their sum changes whenever one does
+            // (decision D6). The first two restart at 0 when a core reset rebuilds the MMU and the
+            // cache registers, so a version can repeat with another mapping: that is safe only
+            // because `Hart::reset` builds a new decode cache, at every level (`Esp32C3::reset`).
+            // The version is one number for both windows, not one per flash page: a write
+            // anywhere in the chip drops all the decoded flash code, which costs a decode and
+            // can never keep a stale instruction.
             Some(Region::Flash { .. }) => {
-                self.periph.mmu.generation() + self.periph.extmem.generation()
+                self.periph.mmu.generation()
+                    + self.periph.extmem.generation()
+                    + self.periph.spi1.flash().generation()
             }
             Some(Region::Rom(_) | Region::Periph) | None => 0,
         }
@@ -1076,6 +1083,52 @@ mod tests {
             sram,
             "RAM versions are untouched"
         );
+    }
+
+    #[test]
+    fn a_program_or_an_erase_that_changes_the_flash_changes_the_version_of_both_windows() {
+        // `SPI1.CMD` bits: write enable, page program, sector erase.
+        const WREN: u32 = 1 << 30;
+        const PP: u32 = 1 << 25;
+        const SE: u32 = 1 << 24;
+        let mut b = bus_with_flash(SocConfig::default());
+        let versions = |b: &SocBus| {
+            (
+                b.page_version(FLASH_IBUS_BASE + 0x2000),
+                b.page_version(FLASH_DBUS_BASE + 0x7F_0000),
+            )
+        };
+        let spi1 = |b: &mut SocBus, register: &str, value: u32| {
+            b.write(svd_regs::esp32c3::addr("SPI1", register), Word, value)
+                .unwrap();
+        };
+        let start = versions(&b);
+        let sram = b.page_version(SRAM_IBUS_BASE);
+        // One byte, 0x00, at flash offset 0x10000, which holds 0xE9. Without the write-enable
+        // latch the chip ignores the program: nothing changed, nothing is dropped.
+        spi1(&mut b, "W0", 0);
+        spi1(&mut b, "ADDR", 0x0101_0000);
+        spi1(&mut b, "CMD", PP);
+        assert_eq!(versions(&b), start);
+        spi1(&mut b, "CMD", WREN);
+        spi1(&mut b, "CMD", PP);
+        let programmed = versions(&b);
+        assert_ne!(programmed, start, "a program changed a byte");
+        assert_eq!(programmed.0, programmed.1, "one version for both windows");
+        // The same program again changes no byte.
+        spi1(&mut b, "CMD", WREN);
+        spi1(&mut b, "CMD", PP);
+        assert_eq!(versions(&b), programmed);
+        spi1(&mut b, "CMD", WREN);
+        spi1(&mut b, "ADDR", 0x1_0000);
+        spi1(&mut b, "CMD", SE);
+        assert_ne!(versions(&b), programmed, "an erase changed a byte");
+        assert_eq!(
+            b.page_version(SRAM_IBUS_BASE),
+            sram,
+            "RAM versions are untouched"
+        );
+        assert_eq!(b.ctx.diag.drain(), Vec::new());
     }
 
     #[test]

@@ -1099,6 +1099,79 @@ mod tests {
         );
     }
 
+    /// A machine whose flash holds `li a0, 3; ret` at offset 0 and whose ROM maps flash page 0
+    /// at the start of the instruction window, calls that function, stores what it returned at
+    /// the start of the SRAM, runs `between`, then calls the function again and stores the result
+    /// in the next word.
+    fn calls_flash_code_around(between: &[u32]) -> Esp32C3 {
+        use cpu_rv32::asm::jalr;
+        const A0: u8 = 10;
+        const RA: u8 = 1;
+        const T2: u8 = 7;
+        const S0: u8 = 8;
+        let image: Vec<u8> = [addi(A0, 0, 3), jalr(0, RA, 0)]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut program = vec![
+            lui(T0, crate::periph::mmu::MMU_TABLE_BASE),
+            lui(T2, crate::memmap::FLASH_IBUS_BASE),
+            lui(S0, SRAM_DBUS_BASE),
+            sw(0, T0, 0),    // entry 0 = flash page 0
+            jalr(RA, T2, 0), // decodes the function: a0 = 3
+            sw(A0, S0, 0),
+        ];
+        program.extend_from_slice(between);
+        program.extend([jalr(RA, T2, 0), sw(A0, S0, 4), HANG]);
+        Esp32C3::with_flash(flat_rom(&program), image, &SocConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn code_decoded_from_the_flash_is_decoded_again_once_the_flash_is_programmed() {
+        // A program only clears bits: `li a0, 3` becomes `li a0, 1` (immediate 0b11 to 0b01).
+        const A0: u8 = 10;
+        let mut m = calls_flash_code_around(&flash_program(0, &addi(A0, 0, 1).to_le_bytes()));
+        m.run_until(Cycles(600));
+        assert_eq!(m.drain_diagnostics(), Vec::new());
+        assert_eq!(
+            (
+                bus_word(&mut m, SRAM_DBUS_BASE),
+                bus_word(&mut m, SRAM_DBUS_BASE + 4)
+            ),
+            (3, 1),
+            "the second call runs what the flash holds now"
+        );
+    }
+
+    #[test]
+    fn code_decoded_from_the_flash_is_decoded_again_once_the_flash_is_erased() {
+        // After the erase the function is `FF FF FF FF`, which is no instruction: the second
+        // call must fault there. Code kept decoded would return 3 a second time.
+        let mut m = calls_flash_code_around(&flash_erase_sector(0));
+        m.run_until(Cycles(600));
+        let exceptions: Vec<(Exception, u32)> = m
+            .drain_diagnostics()
+            .into_iter()
+            .filter_map(|diagnostic| match diagnostic {
+                Diagnostic::Exception { cause, pc, .. } => Some((cause, pc)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exceptions.first(),
+            Some(&(Exception::IllegalInstr, crate::memmap::FLASH_IBUS_BASE)),
+            "{exceptions:?}"
+        );
+        assert_eq!(
+            (
+                bus_word(&mut m, SRAM_DBUS_BASE),
+                bus_word(&mut m, SRAM_DBUS_BASE + 4)
+            ),
+            (3, 0),
+            "the first call returned 3; the second never returned"
+        );
+    }
+
     /// Where the tests that take traps put their vector table: a page boundary, which `lui` can
     /// load (`mtvec.BASE` only has to be aligned to 256 bytes).
     const VECTORS: u32 = ROM_BASE + 0x1000;
