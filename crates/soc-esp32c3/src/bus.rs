@@ -1167,6 +1167,58 @@ mod tests {
         assert_eq!(b.ctx.diag.drain(), Vec::new());
     }
 
+    #[test]
+    fn the_version_of_the_flash_windows_grows_whichever_of_its_terms_move_between_two_looks() {
+        // The decode cache keeps code while the version it was decoded under is the version it
+        // finds: a version must never come back once the mapping, the cache or the content of
+        // the chip has changed, whichever of them changed and however many at once. The three
+        // counters only grow and are added, so the version only grows.
+        let mut b = bus_with_flash(SocConfig::default());
+        let vaddr = FLASH_DBUS_BASE + 0x3_0000;
+        let mut last = b.page_version(FLASH_IBUS_BASE);
+        let mut grew = |b: &SocBus, what: &str| {
+            let version = b.page_version(FLASH_IBUS_BASE);
+            assert_eq!(
+                version,
+                b.page_version(vaddr),
+                "one version for both windows"
+            );
+            assert!(version > last, "{what}: {version} after {last}");
+            last = version;
+        };
+        // Two terms move between two looks, from the same value: the mapping and the content.
+        map(&mut b, 3, 1);
+        program_byte(&mut b, 0x1_0000, 0x00);
+        grew(&b, "an MMU write and a program");
+        // Each term alone, in turn.
+        program_byte(&mut b, 0x1_0001, 0x00);
+        grew(&b, "a program");
+        map(&mut b, 4, 2);
+        grew(&b, "an MMU write");
+        b.write(svd_regs::esp32c3::addr("EXTMEM", "ICACHE_CTRL"), Word, 1)
+            .unwrap();
+        grew(&b, "a cache enable");
+        erase_sector(&mut b, 0x1_0000);
+        grew(&b, "an erase");
+        load(&mut b, vaddr);
+        invalidate(&mut b, vaddr, 0x800);
+        grew(&b, "an invalidation of a page that was read");
+        // The three at once, then two of them, the cache and the content.
+        map(&mut b, 5, 0);
+        load(&mut b, vaddr);
+        invalidate(&mut b, 0, 0);
+        program_byte(&mut b, 0x2_0000, 0x00);
+        grew(&b, "an MMU write, an invalidation and a program");
+        load(&mut b, vaddr);
+        invalidate(&mut b, vaddr, 0x800);
+        erase_sector(&mut b, 0x2_0000);
+        grew(&b, "an invalidation and an erase");
+        // What changes nothing leaves the version where it is.
+        program_byte(&mut b, 0x2_0000, 0xFF);
+        invalidate(&mut b, vaddr, 0x800);
+        assert_eq!(b.page_version(FLASH_IBUS_BASE), last);
+    }
+
     fn spi1(b: &mut SocBus, register: &str, value: u32) {
         b.write(svd_regs::esp32c3::addr("SPI1", register), Word, value)
             .unwrap();
