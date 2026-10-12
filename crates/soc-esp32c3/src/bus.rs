@@ -755,9 +755,9 @@ mod tests {
             ..SocConfig::default()
         });
         b.set_pc(0x4038_0010);
-        b.write(cmd, Word, 1 << 24).unwrap(); // sector erase
+        b.write(cmd, Word, 1 << 19).unwrap(); // high-performance mode, which the chip does not know
         let expected = Diagnostic::Unsupported {
-            what: crate::diag::Unsupported::FlashCommand { opcode: 0x20 },
+            what: crate::diag::Unsupported::FlashCommand { opcode: 0xA3 },
             pc: 0x4038_0010,
         };
         assert_eq!(b.ctx.diag.drain(), vec![expected.clone()]);

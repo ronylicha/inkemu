@@ -4,7 +4,7 @@ use crate::clock;
 use crate::config::SocConfig;
 use crate::ctx::Event;
 use crate::diag::{Diagnostic, Unsupported};
-use crate::flash::{FlashDevice, FlashImageError, NorFlash};
+use crate::flash::{FlashDevice, FlashImageError, FlashWrite, NorFlash};
 use crate::memmap::RESET_PC;
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
@@ -487,6 +487,24 @@ impl Esp32C3 {
         }
     }
 
+    /// The programs, erases and status writes the flash chip performed since the last call,
+    /// oldest first: the journal of what the run wrote, for whoever wants to show or check it.
+    ///
+    /// The journal holds at most [`JOURNAL_CAPACITY`](crate::flash::JOURNAL_CAPACITY) entries
+    /// between two calls; the operations performed while it was full are counted by
+    /// [`Esp32C3::flash_writes_dropped`]. A caller that needs every one takes them as often as
+    /// it takes the console.
+    pub fn take_flash_writes(&mut self) -> Vec<FlashWrite> {
+        self.bus.periph.spi1.take_flash_writes()
+    }
+
+    /// How many flash operations the journal did not keep since power-on, because nobody had
+    /// taken the ones before them.
+    #[must_use]
+    pub const fn flash_writes_dropped(&self) -> u64 {
+        self.bus.periph.spi1.flash_writes_dropped()
+    }
+
     /// Diagnostics seen for the first time since the last call.
     pub fn drain_diagnostics(&mut self) -> Vec<Diagnostic> {
         self.bus.ctx.diag.drain()
@@ -525,8 +543,8 @@ mod tests {
     use crate::memmap::ROM_BASE;
     use crate::memmap::SRAM_DBUS_BASE;
     use crate::test_support::{
-        HANG, T0, T1, flat_rom, load_register, print_program as print, stop_watchdogs,
-        store_register, unmodeled_register, within,
+        HANG, T0, T1, flash_erase_sector, flash_program, flat_rom, load_register,
+        print_program as print, stop_watchdogs, store_register, unmodeled_register, within,
     };
     use cpu_rv32::asm::{addi, csrrs, csrrwi, jal, lui, lw, sw, wfi};
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
@@ -566,6 +584,45 @@ mod tests {
             matches!(err, crate::flash::FlashImageError::TooLong { .. }),
             "{err}"
         );
+    }
+
+    #[test]
+    fn what_a_program_writes_to_the_flash_is_in_the_journal_of_the_run_once() {
+        // An erase, then the bitmap word NVS programs twice in place (SF §B.2).
+        let mut program = flash_erase_sector(0x9000);
+        program.extend(flash_program(0x9020, &[0xFE, 0xFF, 0xFF, 0xFF]));
+        program.extend(flash_program(0x9020, &[0xFA]));
+        program.push(HANG);
+        let strict = SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        };
+        let mut m = Esp32C3::with_flash(flat_rom(&program), vec![0u8; 0xA000], &strict).unwrap();
+        assert_eq!(
+            m.run_until(Cycles(400)),
+            StopReason::CycleBudget,
+            "a flash write is nothing a strict run stops on"
+        );
+        assert_eq!(
+            m.take_flash_writes(),
+            [
+                FlashWrite::Erase {
+                    start: 0x9000,
+                    len: 0x1000
+                },
+                FlashWrite::Program {
+                    address: 0x9020,
+                    data: vec![0xFE, 0xFF, 0xFF, 0xFF]
+                },
+                FlashWrite::Program {
+                    address: 0x9020,
+                    data: vec![0xFA]
+                },
+            ]
+        );
+        assert_eq!(m.take_flash_writes(), [], "taken once");
+        assert_eq!(m.flash_writes_dropped(), 0);
+        assert_eq!(m.drain_diagnostics(), []);
     }
 
     #[test]
@@ -917,8 +974,9 @@ mod tests {
         assert_eq!(m.cpu_frequency().hz(), 20_000_000);
     }
 
-    /// A flash chip whose content the test can change behind the machine's back, which the real
-    /// read-only chip never does: the only way to see decoded code being dropped.
+    /// A flash chip whose content the test can change behind the machine's back, without its
+    /// generation moving, which the real chip never does: the way to see that a write to a cache
+    /// control register drops the decoded code by itself.
     #[derive(Debug)]
     struct SharedFlash(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
 
@@ -936,10 +994,16 @@ mod tests {
             &mut self,
             command: &crate::flash::FlashCommand<'_>,
             _data_in: &mut [u8],
-        ) -> Result<(), crate::flash::UnmodeledCommand> {
-            Err(crate::flash::UnmodeledCommand {
+        ) -> Result<Option<crate::flash::FlashWrite>, crate::flash::FlashRefusal> {
+            Err(crate::flash::FlashRefusal::Unmodeled {
                 opcode: command.opcode,
             })
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+        fn modified_sectors(&self) -> u32 {
+            0
         }
     }
 

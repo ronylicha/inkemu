@@ -4,7 +4,7 @@
 use super::{Accepted, SPI0_BASE, SPI1_BASE, Storage};
 use crate::ctx::Ctx;
 use crate::diag::Unsupported;
-use crate::flash::{FlashAddress, FlashCommand, FlashDevice};
+use crate::flash::{FlashAddress, FlashCommand, FlashDevice, FlashJournal, FlashWrite};
 use emu_core::Peripheral;
 use svd_regs::esp32c3::addr;
 
@@ -220,6 +220,9 @@ impl Peripheral<Ctx> for Spi0 {
 pub struct Spi1 {
     registers: Storage,
     flash: Box<dyn FlashDevice>,
+    /// What the commands of the run wrote to the chip. It belongs to the run, not to the
+    /// controller: a reset of the controller keeps it.
+    journal: FlashJournal,
 }
 
 impl Spi1 {
@@ -228,6 +231,7 @@ impl Spi1 {
         Spi1 {
             registers: Spi1::reset_registers(),
             flash,
+            journal: FlashJournal::default(),
         }
     }
 
@@ -250,12 +254,25 @@ impl Spi1 {
         self.flash.as_ref()
     }
 
+    /// The programs, erases and status writes the chip performed since the last call, oldest
+    /// first: see [`FlashJournal`].
+    pub fn take_flash_writes(&mut self) -> Vec<FlashWrite> {
+        self.journal.take()
+    }
+
+    /// The operations the journal did not keep because it was full.
+    #[must_use]
+    pub const fn flash_writes_dropped(&self) -> u64 {
+        self.journal.dropped()
+    }
+
     fn register(&self, offset: u32) -> u32 {
         self.registers.read(offset).unwrap_or(0)
     }
 
     /// Runs `command`; `Some(bytes)` are the `data_in_len` bytes read, `None` when the chip model
-    /// does not implement the opcode (the refusal is reported through the context).
+    /// refuses the command (the refusal is reported through the context). What the command
+    /// wrote, if anything, goes to the journal.
     fn transfer(
         &mut self,
         ctx: &mut Ctx,
@@ -264,11 +281,14 @@ impl Spi1 {
     ) -> Option<Vec<u8>> {
         let mut data_in = vec![0u8; data_in_len.min(DATA_BYTES)];
         match self.flash.execute(command, &mut data_in) {
-            Ok(()) => Some(data_in),
-            Err(refused) => {
-                ctx.unsupported(Unsupported::FlashCommand {
-                    opcode: refused.opcode,
-                });
+            Ok(written) => {
+                if let Some(write) = written {
+                    self.journal.record(write);
+                }
+                Some(data_in)
+            }
+            Err(refusal) => {
+                ctx.unsupported(Unsupported::from(refusal));
                 None
             }
         }
@@ -529,7 +549,7 @@ impl Peripheral<Ctx> for Spi1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flash::{FlashConfig, NorFlash, UnmodeledCommand};
+    use crate::flash::{FlashConfig, FlashRefusal, NorFlash};
     use std::{cell::RefCell, rc::Rc};
 
     /// `CMD` bit 17, `FLASH_PE`: a flag that accompanies a command bit (see `Spi1::run`).
@@ -639,34 +659,172 @@ mod tests {
         assert_eq!(ctx.take_unsupported(), None);
     }
 
+    const CMD_WREN: u32 = 1 << 30;
+    /// `W0..W15` hold the bytes 1 to 64.
+    fn fill_data_registers(ctx: &mut Ctx, spi: &mut Spi1) {
+        for word in 0..DATA_WORDS {
+            spi.write(ctx, W0 + 4 * word, 0x0403_0201 + 0x0404_0404 * word);
+        }
+    }
+    fn flash_bytes(spi: &Spi1, offset: u32, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        spi.flash().read(offset, &mut bytes);
+        bytes
+    }
+
     #[test]
-    fn program_and_erase_are_reported_by_opcode() {
+    fn both_encodings_of_an_erase_and_of_a_program_write_the_chip_once_per_write_of_cmd() {
+        // The ROM erases with `FLASH_SE | FLASH_PE` and programs 32 bytes at most (FW §A.3);
+        // ESP-IDF erases with `FLASH_SE` alone and programs up to 64 (FW §A.2).
         let ctx = &mut Ctx::default();
         let mut spi = spi1();
-        spi.write(ctx, ADDR, 0x0400_E000); // a program of 4 bytes
-        for (command_bit, opcode) in [
-            (1u32 << 25, 0x02u8), // PP
-            (1 << 24, 0x20),      // SE
-            (1 << 23, 0xD8),      // BE
-            (1 << 22, 0xC7),      // CE
-            (1 << 26, 0x01),      // WRSR
-            (1 << 31, 0x03),      // FLASH_READ
-        ] {
-            assert!(
-                spi.write(ctx, CMD, command_bit),
-                "the write is handled: it is reported, not dropped"
-            );
+        fill_data_registers(ctx, &mut spi);
+        let pattern: Vec<u8> = (1..=64u8).collect();
+        for (erase, len) in [(0x0102_0000u32, 32usize), (0x0100_0000, 64)] {
+            spi.write(ctx, CMD, CMD_WREN);
+            spi.write(ctx, ADDR, 0xE000);
+            spi.write(ctx, CMD, erase);
+            assert_eq!(flash_bytes(&spi, 0xE000, 68), vec![0xFF; 68]);
+            spi.write(ctx, CMD, CMD_WREN);
+            spi.write(ctx, ADDR, (u32::try_from(len).unwrap() << 24) | 0xE000);
+            spi.write(ctx, CMD, CMD_PP);
+            let content = flash_bytes(&spi, 0xE000, 68);
+            assert_eq!(content[..len], pattern[..len]);
+            assert!(content[len..].iter().all(|&byte| byte == 0xFF));
             assert_eq!(
-                ctx.take_unsupported(),
-                Some(Unsupported::FlashCommand { opcode })
+                spi.take_flash_writes(),
+                [
+                    FlashWrite::Erase {
+                        start: 0xE000,
+                        len: 0x1000
+                    },
+                    FlashWrite::Program {
+                        address: 0xE000,
+                        data: pattern[..len].to_vec()
+                    }
+                ],
+                "one chip operation for each write of CMD (erase {erase:#010x})"
             );
-            assert_eq!(ctx.take_unsupported(), None, "taken once");
+            spi.write(ctx, CMD, CMD_RDSR);
             assert_eq!(
-                spi.read(ctx, CMD),
+                spi.read(ctx, RD_STATUS).map(|status| status & 0xFF),
                 Some(0),
-                "no hang on an unmodelled command"
+                "the latch is clear after the operation"
             );
         }
+        assert_eq!(ctx.take_unsupported(), None);
+        assert_eq!(spi.flash().modified_sectors(), 1);
+    }
+
+    #[test]
+    fn a_program_or_an_erase_without_write_enable_changes_nothing_and_is_no_refusal() {
+        // What the part does (FW §C): it ignores the command. Nothing is unfaithful here, so
+        // nothing is reported.
+        let ctx = &mut Ctx::default();
+        let image = vec![0x5A; 0x2_0000];
+        let mut spi = Spi1::new(Box::new(
+            NorFlash::with_image(image.clone(), FlashConfig::default()).unwrap(),
+        ));
+        fill_data_registers(ctx, &mut spi);
+        spi.write(ctx, ADDR, 0x0400_0000);
+        for command in [CMD_PP, CMD_SE, CMD_BE, 1 << 22, CMD_WRSR] {
+            assert!(spi.write(ctx, CMD, command));
+            assert_eq!(spi.read(ctx, CMD), Some(0));
+        }
+        assert_eq!(flash_bytes(&spi, 0, 0x2_0000), image);
+        assert_eq!(spi.take_flash_writes(), []);
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
+    fn a_refusal_of_the_chip_is_reported_as_what_it_is_and_cmd_reads_idle() {
+        let ctx = &mut Ctx::default();
+        let mut spi = spi1();
+        // High-performance mode, `A3`: an opcode the chip model does not know.
+        assert!(spi.write(ctx, CMD, 1 << 19));
+        assert_eq!(
+            ctx.take_unsupported(),
+            Some(Unsupported::FlashCommand { opcode: 0xA3 })
+        );
+        assert_eq!(ctx.take_unsupported(), None, "taken once");
+        assert_eq!(spi.read(ctx, CMD), Some(0), "no hang on a refused command");
+        // A program while block-protect bits are set: status 0x3C, written through the registers.
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, RD_STATUS, 0x3C);
+        spi.write(ctx, CMD, CMD_WRSR);
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, ADDR, 0x0100_9000);
+        spi.write(ctx, CMD, CMD_PP);
+        assert_eq!(
+            ctx.take_unsupported(),
+            Some(Unsupported::FlashProtected {
+                opcode: 0x02,
+                status: 0x3E
+            })
+        );
+        // A program through `USR` with a 4-byte address: the frame ESP-IDF uses above 16 MiB,
+        // with the 3-byte opcode.
+        spi.write(ctx, USER, USR_COMMAND | USR_ADDR | USR_MOSI);
+        spi.write(ctx, USER1, 31 << 26);
+        spi.write(ctx, USER2, 0x7000_0002);
+        spi.write(ctx, MOSI_DLEN, 31);
+        spi.write(ctx, CMD, CMD_USR);
+        assert_eq!(
+            ctx.take_unsupported(),
+            Some(Unsupported::FlashCommandForm {
+                opcode: 0x02,
+                address_bits: 32,
+                dummy_cycles: 0,
+                data_bytes: 4
+            })
+        );
+        assert_eq!(
+            spi.take_flash_writes(),
+            [FlashWrite::Status { value: 0x3C }],
+            "only the status write was performed"
+        );
+        // An erase past the end of a 1 MiB chip.
+        let small = FlashConfig::new(1 << 20, crate::flash::JedecId::from_u24(0x9D_6014).unwrap());
+        let mut spi = Spi1::new(Box::new(NorFlash::blank(small.unwrap())));
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, ADDR, 0x10_0000);
+        spi.write(ctx, CMD, CMD_SE);
+        assert_eq!(
+            ctx.take_unsupported(),
+            Some(Unsupported::FlashRange {
+                opcode: 0x20,
+                address: 0x10_0000,
+                len: 0x1000
+            })
+        );
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
+    fn a_reset_of_the_controller_keeps_the_chip_and_the_journal_of_the_run() {
+        let ctx = &mut Ctx::default();
+        let mut spi = spi1();
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, W0, 0x1234_5600);
+        spi.write(ctx, ADDR, 0x0100_9000);
+        spi.write(ctx, CMD, CMD_PP);
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.reset();
+        assert_eq!(spi.read(ctx, ADDR), Some(0), "the registers are reset");
+        assert_eq!(flash_bytes(&spi, 0x9000, 1), [0x00], "the content is kept");
+        spi.write(ctx, CMD, CMD_RDSR);
+        assert_eq!(
+            spi.read(ctx, RD_STATUS),
+            Some(0x02),
+            "the chip is another component: its latch is as the firmware left it"
+        );
+        assert_eq!(
+            spi.take_flash_writes(),
+            [FlashWrite::Program {
+                address: 0x9000,
+                data: vec![0x00]
+            }]
+        );
     }
 
     #[test]
@@ -674,13 +832,13 @@ mod tests {
         let ctx = &mut Ctx::default();
         let mut spi = spi1();
         spi.write(ctx, W0, 0xDEAD_BEEF);
-        spi.write(ctx, USER, USR_COMMAND | USR_ADDR | USR_MOSI);
-        spi.write(ctx, USER2, 0x7000_0002); // page program
-        spi.write(ctx, MOSI_DLEN, 31);
+        spi.write(ctx, USER, USR_COMMAND | USR_MISO);
+        spi.write(ctx, USER2, 0x7000_0035); // a second status register this part does not have
+        spi.write(ctx, MISO_DLEN, 7);
         spi.write(ctx, CMD, CMD_USR);
         assert_eq!(
             ctx.take_unsupported(),
-            Some(Unsupported::FlashCommand { opcode: 0x02 })
+            Some(Unsupported::FlashCommand { opcode: 0x35 })
         );
         assert_eq!(
             spi.read(ctx, W0),
@@ -738,7 +896,7 @@ mod tests {
             &mut self,
             command: &FlashCommand<'_>,
             data_in: &mut [u8],
-        ) -> Result<(), UnmodeledCommand> {
+        ) -> Result<Option<FlashWrite>, FlashRefusal> {
             for (byte, answer) in data_in.iter_mut().zip(0xA0u8..) {
                 *byte = answer;
             }
@@ -748,7 +906,13 @@ mod tests {
                 command.dummy_cycles,
                 command.data_out.to_vec(),
             ));
-            Ok(())
+            Ok(None)
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+        fn modified_sectors(&self) -> u32 {
+            0
         }
     }
 
@@ -1068,15 +1232,20 @@ mod tests {
             [(0x20, Some(at(0xE000)), 0, Vec::new())]
         );
         assert_eq!(spi.read(ctx, CMD), Some(0), "self-clears");
-        // On the read-only chip the erase is refused once, by its own opcode: `USER2` (0x00 in its low
-        // byte at reset) is not a second command.
-        let mut refused = spi1();
-        refused.write(ctx, CMD, ROM_SECTOR_ERASE);
+        // On the chip it is one erase: `USER2` (0x00 in its low byte at reset) is not a second
+        // command, and nothing is reported.
+        let mut chip = spi1();
+        chip.write(ctx, CMD, CMD_WREN);
+        chip.write(ctx, ADDR, 0xE000);
+        chip.write(ctx, CMD, ROM_SECTOR_ERASE);
         assert_eq!(
-            ctx.take_unsupported(),
-            Some(Unsupported::FlashCommand { opcode: 0x20 })
+            chip.take_flash_writes(),
+            [FlashWrite::Erase {
+                start: 0xE000,
+                len: 0x1000
+            }]
         );
-        assert_eq!(ctx.take_unsupported(), None, "one command, one report");
+        assert_eq!(ctx.take_unsupported(), None);
     }
 
     #[test]
@@ -1089,7 +1258,7 @@ mod tests {
         const USER_START_PE: u32 = 0x0006_0000;
         assert_eq!(USER_START_PE, CMD_USR | CMD_FLASH_PE);
         let ctx = &mut Ctx::default();
-        let mut page_program = |spi: &mut Spi1| {
+        let page_program = |ctx: &mut Ctx, spi: &mut Spi1| {
             spi.write(ctx, W0, 0x0403_0201);
             spi.write(ctx, USER, USR_COMMAND | USR_ADDR | USR_MOSI);
             spi.write(ctx, USER1, 23 << 26);
@@ -1099,19 +1268,24 @@ mod tests {
             spi.write(ctx, CMD, USER_START_PE);
         };
         let (mut spi, seen) = recording_spi1();
-        page_program(&mut spi);
+        page_program(ctx, &mut spi);
         assert_eq!(
             seen.borrow().as_slice(),
             [(0x02, Some(at(0xE000)), 0, vec![1, 2, 3, 4])],
             "one transfer, with its address and its data"
         );
-        let mut refused = spi1();
-        page_program(&mut refused);
+        // On the chip, once its latch is set: one program.
+        let mut chip = spi1();
+        chip.write(ctx, CMD, CMD_WREN);
+        page_program(ctx, &mut chip);
         assert_eq!(
-            ctx.take_unsupported(),
-            Some(Unsupported::FlashCommand { opcode: 0x02 })
+            chip.take_flash_writes(),
+            [FlashWrite::Program {
+                address: 0xE000,
+                data: vec![1, 2, 3, 4]
+            }]
         );
-        assert_eq!(ctx.take_unsupported(), None, "one command, one report");
+        assert_eq!(ctx.take_unsupported(), None);
     }
 
     #[test]

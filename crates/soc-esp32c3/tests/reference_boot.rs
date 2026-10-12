@@ -8,10 +8,11 @@ mod common;
 
 use emu_core::Cycles;
 use sha2::{Digest, Sha256};
-use soc_esp32c3::diag::Unsupported;
-use soc_esp32c3::memmap::{ROM_BASE, ROM_SIZE, SRAM_DBUS_BASE, SRAM_SIZE};
+use soc_esp32c3::memmap::{SRAM_DBUS_BASE, SRAM_SIZE};
 use soc_esp32c3::reset::ResetCause;
-use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason};
+use soc_esp32c3::{
+    ConsoleChannel, Diagnostic, Esp32C3, FlashWrite, RomImage, SocConfig, StopReason,
+};
 
 /// SHA-256 of the merged reference image (`docs/research/sp1b-test-oracle.md`, §2).
 const REFERENCE_SHA256: &str = "fc05ef5dbe85372e1da52abdec3bfcbbb110738a60163734666095fcd8c39bf2";
@@ -128,8 +129,8 @@ const SECOND_NS: u64 = 1_000_000_000;
 const X4_STOCK_TABLE: &[u8] = include_bytes!("../../../tests/fixtures/partitions/x4-stock.bin");
 /// Flash offset of the partition table (ESP-IDF default, `CONFIG_PARTITION_TABLE_OFFSET`).
 const PARTITION_TABLE_OFFSET: usize = 0x8000;
-/// The instruction-bus addresses of the mask ROM (report BC §A.1).
-const MASK_ROM: std::ops::Range<u32> = ROM_BASE..ROM_BASE + ROM_SIZE;
+/// Flash offset of the `otadata` partition in the stock X4 table, and of its first entry.
+const OTADATA_OFFSET: u32 = 0xE000;
 
 /// The ESP32-C3 (rev 3) mask ROM named by `INKEMU_ROM_ELF_DIR`; every failure says why and what to do.
 fn rom() -> RomImage {
@@ -188,6 +189,8 @@ fn mask_timestamp(line: &str) -> String {
 struct Run {
     console: String,
     diagnostics: Vec<Diagnostic>,
+    /// Every program, erase and status write the flash chip performed, in order.
+    flash_writes: Vec<FlashWrite>,
     stop: StopReason,
     trace_hash: Option<u64>,
     resets: u64,
@@ -234,6 +237,7 @@ fn run(config: SocConfig, done: impl Fn(&str) -> bool) -> Run {
 fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic]) -> bool) -> Run {
     let mut machine = Esp32C3::with_flash(rom(), image, &config).unwrap();
     let (mut uart0, mut diagnostics) = (Vec::new(), Vec::new());
+    let mut flash_writes = Vec::new();
     let mut stop = StopReason::CycleBudget;
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
     // `Asleep` is the CPU waiting for its next interrupt: device time goes on, the run too.
@@ -246,7 +250,13 @@ fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic
         uart0.extend(machine.take_console(ConsoleChannel::Uart0));
         let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
         diagnostics.extend(machine.drain_diagnostics());
+        flash_writes.extend(machine.take_flash_writes());
     }
+    assert_eq!(
+        machine.flash_writes_dropped(),
+        0,
+        "the journal was taken at every slice: it never filled"
+    );
     assert!(
         machine.device_time_nanos() < DEVICE_TIME_BUDGET_NS || done(&text(&uart0), &diagnostics),
         "device time ran out ({} ns) after {} CPU cycles before the run was done: the CPU sleeps and nothing wakes it?\nconsole:\n{}",
@@ -259,6 +269,7 @@ fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic
     Run {
         console: text(&uart0),
         diagnostics,
+        flash_writes,
         stop,
         trace_hash: machine.trace_hash(),
         resets: machine.resets(),
@@ -458,69 +469,106 @@ fn reference_image_behind_the_stock_x4_table() -> Vec<u8> {
     image
 }
 
-/// Spec §5.1: "Reset → ROM → bootloader → table de partitions → `otadata` → application". The
-/// reference image has a factory application; the target device has none. Behind the stock X4
-/// table the unmodified bootloader finds a blank `otadata`, falls back to OTA slot 0 and records
-/// that choice: the mask ROM's sector-erase and page-program functions run. The flash is still
-/// read-only (plan SP1b-3b makes it writable), so both are refused, each once and by its own
-/// opcode, and nothing else is reported before the application says hello.
-#[test]
-#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
-fn the_stock_x4_ota_layout_boots_and_only_the_otadata_update_is_refused() {
-    let boot = run_image(
-        reference_image_behind_the_stock_x4_table(),
-        SocConfig::default(),
-        |console, _| console.contains("Hello world!\n"),
-    );
-    assert!(
-        boot.console.starts_with(ROM_LINES),
-        "ROM part:\n{}",
-        boot.console
-    );
-    let lines: Vec<String> = boot.console.lines().map(mask_timestamp).collect();
+/// What the first boot of an OTA layout with a blank `otadata` writes (report FW §E, first row;
+/// SF §B.1): one sector erase, then one program of the entry — sequence 1, a blank label, state
+/// valid (2), CRC.
+fn the_otadata_update() -> [FlashWrite; 2] {
+    let mut entry = vec![0xFF; 32];
+    entry[..4].copy_from_slice(&[1, 0, 0, 0]);
+    entry[24..28].copy_from_slice(&[2, 0, 0, 0]);
+    entry[28..].copy_from_slice(&[0x9A, 0x98, 0x43, 0x47]);
+    [
+        FlashWrite::Erase {
+            start: OTADATA_OFFSET,
+            len: 0x1000,
+        },
+        FlashWrite::Program {
+            address: OTADATA_OFFSET,
+            data: entry,
+        },
+    ]
+}
+
+/// Asserts that `expected` are lines of `console`, in that order.
+fn assert_lines_in_order(console: &str, expected: &[&str]) {
+    let lines: Vec<String> = console.lines().map(mask_timestamp).collect();
     let mut from = 0;
-    for expected in [
-        "I (#) boot: No factory image, trying OTA 0",
-        "I (#) boot: Loaded app from partition at offset 0x10000",
-        "I (#) boot: Set actual ota_seq=1 in otadata[0]",
-        FIRST_APPLICATION_LINE,
-        "Hello world!",
-    ] {
+    for expected in expected {
         let at = lines[from..]
             .iter()
             .position(|line| line == expected)
             .unwrap_or_else(|| panic!("`{expected}` is missing, or out of order:\n{lines:#?}"));
         from += at + 1;
     }
-    let reported: Vec<(Unsupported, bool)> = boot
-        .diagnostics
-        .iter()
-        .map(|diagnostic| match diagnostic {
-            Diagnostic::Unsupported { what, pc } => (*what, MASK_ROM.contains(pc)),
-            other => panic!("unexpected diagnostic: {other}"),
-        })
-        .collect();
-    assert_eq!(
-        reported,
-        [
-            (Unsupported::FlashCommand { opcode: 0x20 }, true),
-            (Unsupported::FlashCommand { opcode: 0x02 }, true),
-        ],
-        "exactly the sector erase and the page program of the otadata update, each run by the mask ROM"
+}
+
+/// How many lines of `console` are `line`, timestamps masked.
+fn count_lines(console: &str, line: &str) -> usize {
+    console
+        .lines()
+        .map(mask_timestamp)
+        .filter(|found| found == line)
+        .count()
+}
+
+const NO_FACTORY_IMAGE: &str = "I (#) boot: No factory image, trying OTA 0";
+const OTADATA_SET: &str = "I (#) boot: Set actual ota_seq=1 in otadata[0]";
+
+/// Spec §5.1: "Reset → ROM → bootloader → table de partitions → `otadata` → application". The
+/// reference image has a factory application; the target device has none. Behind the stock X4
+/// table the unmodified bootloader finds a blank `otadata`, falls back to OTA slot 0 and records
+/// that choice with the mask ROM's sector erase and page program. The chip takes both: the
+/// operations are counted, the bytes are the measured ones, and the second boot, which reads
+/// `otadata` through the cache window, finds the entry valid and writes nothing.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn the_stock_x4_ota_layout_boots_and_writes_otadata_on_its_first_boot_only() {
+    let life = run_image(
+        reference_image_behind_the_stock_x4_table(),
+        SocConfig::default(),
+        |console, _| application_starts(console) == 2,
     );
     assert!(
-        matches!(boot.stop, StopReason::CycleBudget | StopReason::Asleep),
+        life.console.starts_with(ROM_LINES),
+        "ROM part:\n{}",
+        life.console
+    );
+    assert_lines_in_order(
+        &life.console,
+        &[
+            NO_FACTORY_IMAGE,
+            "I (#) boot: Loaded app from partition at offset 0x10000",
+            OTADATA_SET,
+            FIRST_APPLICATION_LINE,
+            "Hello world!",
+            "Restarting now.",
+            "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)",
+            "I (#) boot: Loaded app from partition at offset 0x10000",
+            FIRST_APPLICATION_LINE,
+        ],
+    );
+    // SF §B.3: both lines are printed on the first boot only. A second boot that printed them
+    // again would not have read back what the first one wrote.
+    assert_eq!(count_lines(&life.console, NO_FACTORY_IMAGE), 1);
+    assert_eq!(count_lines(&life.console, OTADATA_SET), 1);
+    assert_eq!(
+        life.flash_writes,
+        the_otadata_update(),
+        "two boots, one erase and one program: the update of the first boot"
+    );
+    assert_only_the_restart_is_reported(&life.diagnostics);
+    assert!(
+        matches!(life.stop, StopReason::CycleBudget | StopReason::Asleep),
         "nothing stops a lenient run: {:?}",
-        boot.stop
+        life.stop
     );
 }
 
-/// The same layout in strict mode: the run stops on the first thing the model refuses, the sector
-/// erase with which the bootloader starts its `otadata` update, and the stop names the operation
-/// and the instruction. Nothing was reported before it, and the application did not start.
+/// The same layout in strict mode: the `otadata` update is nothing the model refuses any more.
+/// The run crosses it without a stop and without a single report, and the application starts.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
-fn a_strict_run_of_the_stock_x4_ota_layout_stops_at_the_first_flash_command_it_refuses() {
+fn a_strict_run_of_the_stock_x4_ota_layout_writes_otadata_and_reaches_the_application() {
     let strict = SocConfig {
         strict_mmio: true,
         ..SocConfig::default()
@@ -530,47 +578,23 @@ fn a_strict_run_of_the_stock_x4_ota_layout_stops_at_the_first_flash_command_it_r
         strict,
         |console, _| console.contains("Hello world!\n"),
     );
-    let StopReason::StrictMmio(violation) = &boot.stop else {
-        panic!(
-            "a strict run of this layout must stop, got {:?}\nconsole:\n{}",
-            boot.stop, boot.console
-        );
-    };
-    let Diagnostic::Unsupported {
-        what: Unsupported::FlashCommand { opcode: 0x20 },
-        pc,
-    } = violation
-    else {
-        panic!("the stop is not the sector erase: {violation}");
-    };
     assert!(
-        MASK_ROM.contains(pc),
-        "the erase is run by the mask ROM: pc {pc:#010x}"
-    );
-    let text = violation.to_string();
-    assert!(
-        text.contains("flash command 0x20 is not modeled") && text.contains(&format!("{pc:#010x}")),
-        "the stop names the operation and the instruction: {text}"
-    );
-    assert_eq!(
-        boot.diagnostics,
-        std::slice::from_ref(violation),
-        "nothing was reported before the stop, and the stop is in the journal once"
-    );
-    assert!(
-        boot.console
-            .lines()
-            .map(mask_timestamp)
-            .any(|line| line == "I (#) boot: No factory image, trying OTA 0"),
-        "the bootloader had chosen the OTA slot:\n{}",
+        matches!(boot.stop, StopReason::CycleBudget | StopReason::Asleep),
+        "a strict run of this layout does not stop: {:?}\nconsole:\n{}",
+        boot.stop,
         boot.console
     );
-    assert_eq!(
-        application_starts(&boot.console),
-        0,
-        "the run stopped in the bootloader:\n{}",
-        boot.console
+    assert_eq!(boot.diagnostics, [], "nothing unmodelled, no exception");
+    assert_lines_in_order(
+        &boot.console,
+        &[
+            NO_FACTORY_IMAGE,
+            OTADATA_SET,
+            FIRST_APPLICATION_LINE,
+            "Hello world!",
+        ],
     );
+    assert_eq!(boot.flash_writes, the_otadata_update());
     assert_eq!(boot.resets, 0);
 }
 

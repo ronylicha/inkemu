@@ -1,5 +1,6 @@
 //! What the emulator has to tell the user about the run: accesses it does not model, CPU
 //! exceptions, resets.
+use crate::flash::FlashRefusal;
 use crate::reset::ResetCause;
 use cpu_rv32::Exception;
 use std::collections::BTreeMap;
@@ -18,9 +19,21 @@ pub enum Direction {
 /// An operation the emulator cannot perform faithfully: it is reported, and `--strict-mmio` stops on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unsupported {
-    /// An SPI flash command the flash model does not implement: a program, an erase, a data read,
-    /// or an opcode it does not know (D3).
+    /// An SPI flash command the flash model does not implement: a data read, or an opcode it does
+    /// not know.
     FlashCommand { opcode: u8 },
+    /// A flash command the model knows, in a frame it does not: see
+    /// [`FlashRefusal::Form`](crate::flash::FlashRefusal::Form).
+    FlashCommandForm {
+        opcode: u8,
+        address_bits: u32,
+        dummy_cycles: u32,
+        data_bytes: u32,
+    },
+    /// A flash command that addresses a byte past the end of the chip.
+    FlashRange { opcode: u8, address: u32, len: u32 },
+    /// A program or an erase while a block-protect bit of the flash status register is set.
+    FlashProtected { opcode: u8, status: u8 },
     /// An SPI1 user transfer whose command phase is not the 8-bit one the controller model
     /// implements: no command phase at all (`None`), or a command of `command_bits` bits.
     FlashTransfer {
@@ -55,6 +68,37 @@ pub enum Unsupported {
     UartClock { uart: u8, sclk_sel: u32 },
 }
 
+impl From<FlashRefusal> for Unsupported {
+    fn from(refusal: FlashRefusal) -> Unsupported {
+        match refusal {
+            FlashRefusal::Unmodeled { opcode } => Unsupported::FlashCommand { opcode },
+            FlashRefusal::Form {
+                opcode,
+                address_bits,
+                dummy_cycles,
+                data_bytes,
+            } => Unsupported::FlashCommandForm {
+                opcode,
+                address_bits,
+                dummy_cycles,
+                data_bytes,
+            },
+            FlashRefusal::OutOfRange {
+                opcode,
+                address,
+                len,
+            } => Unsupported::FlashRange {
+                opcode,
+                address,
+                len,
+            },
+            FlashRefusal::Protected { opcode, status } => {
+                Unsupported::FlashProtected { opcode, status }
+            }
+        }
+    }
+}
+
 impl Unsupported {
     /// The message of the diagnostic: what the instruction at `pc` asked for and why it was not
     /// done, then what the user can do.
@@ -62,7 +106,28 @@ impl Unsupported {
         match self {
             Unsupported::FlashCommand { opcode } => write!(
                 f,
-                "flash command {opcode:#04x} is not modeled (pc {pc:#010x}): only the identification and status commands of the virtual flash are modeled, so nothing was read or changed; use firmware that sends no other flash command until SPI1 data reads and flash writes are emulated"
+                "flash command {opcode:#04x} is not modeled (pc {pc:#010x}): the virtual flash knows the identification and status commands, the page program (0x02), the erases (0x20, 0xd8, 0x60, 0xc7) and the status write (0x01), so nothing was read or changed; use firmware that sends no other flash command until SPI1 data reads are emulated"
+            ),
+            Unsupported::FlashCommandForm {
+                opcode,
+                address_bits,
+                dummy_cycles,
+                data_bytes,
+            } => write!(
+                f,
+                "flash command {opcode:#04x} was sent in a form the virtual flash does not know ({address_bits} address bits, {dummy_cycles} dummy clocks, {data_bytes} data bytes, pc {pc:#010x}) and what a chip makes of it is not modeled, so nothing was read or changed; send the command with a 24-bit address where it takes one, and with the dummy clocks and data bytes it takes"
+            ),
+            Unsupported::FlashRange {
+                opcode,
+                address,
+                len,
+            } => write!(
+                f,
+                "flash command {opcode:#04x} addresses {len} bytes at {address:#08x}, past the end of the flash of the device (pc {pc:#010x}): a chip wraps there or ignores the address bits it lacks, and inkemu does not guess which, so nothing was read or changed; keep flash accesses inside the flash size of the device profile"
+            ),
+            Unsupported::FlashProtected { opcode, status } => write!(
+                f,
+                "flash command {opcode:#04x} would program or erase while block-protect bits of the flash status register are set (status {status:#04x}, pc {pc:#010x}): which blocks they protect depends on the flash part and is not modeled, so nothing was changed; clear the protection with a status write of 0x00 before the program or the erase"
             ),
             Unsupported::FlashTransfer {
                 command_bits,
@@ -218,6 +283,10 @@ impl Diagnostic {
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
                 }
+                // One line per opcode for each kind of refusal of the chip.
+                Unsupported::FlashCommandForm { opcode, .. } => (18, u32::from(opcode), 0),
+                Unsupported::FlashRange { opcode, .. } => (19, u32::from(opcode), 0),
+                Unsupported::FlashProtected { opcode, .. } => (20, u32::from(opcode), 0),
                 // One line per byte count, per set of command bits, and one for suspend requests.
                 Unsupported::FlashProgramLength { addr } => (15, addr >> 24, 0),
                 Unsupported::FlashCommandBits { cmd } => (16, cmd, 0),
@@ -573,6 +642,56 @@ mod tests {
         }
     }
 
+    /// The three refusals of the flash chip that are not an unknown opcode.
+    const FORM: Unsupported = Unsupported::FlashCommandForm {
+        opcode: 0x02,
+        address_bits: 32,
+        dummy_cycles: 0,
+        data_bytes: 4,
+    };
+    const RANGE: Unsupported = Unsupported::FlashRange {
+        opcode: 0x20,
+        address: 0x10_0000,
+        len: 0x1000,
+    };
+    const PROTECTED: Unsupported = Unsupported::FlashProtected {
+        opcode: 0xD8,
+        status: 0x3E,
+    };
+
+    #[test]
+    fn a_refusal_of_the_flash_chip_becomes_the_unsupported_operation_of_the_same_kind() {
+        use crate::flash::FlashRefusal;
+        assert_eq!(
+            Unsupported::from(FlashRefusal::Unmodeled { opcode: 0x35 }),
+            Unsupported::FlashCommand { opcode: 0x35 }
+        );
+        assert_eq!(
+            Unsupported::from(FlashRefusal::Form {
+                opcode: 0x02,
+                address_bits: 32,
+                dummy_cycles: 0,
+                data_bytes: 4
+            }),
+            FORM
+        );
+        assert_eq!(
+            Unsupported::from(FlashRefusal::OutOfRange {
+                opcode: 0x20,
+                address: 0x10_0000,
+                len: 0x1000
+            }),
+            RANGE
+        );
+        assert_eq!(
+            Unsupported::from(FlashRefusal::Protected {
+                opcode: 0xD8,
+                status: 0x3E
+            }),
+            PROTECTED
+        );
+    }
+
     #[test]
     fn strict_mode_stops_on_the_events_that_cannot_be_right_silently() {
         for diagnostic in [
@@ -594,6 +713,9 @@ mod tests {
             unsupported(Unsupported::FlashProgramLength { addr: 0x4100_9000 }),
             unsupported(Unsupported::FlashCommandBits { cmd: 0x0300_0000 }),
             unsupported(Unsupported::FlashSuspend { sus_ctrl: 0x20 }),
+            unsupported(FORM),
+            unsupported(RANGE),
+            unsupported(PROTECTED),
             mapping(3, MappingFault::InvalidEntry),
             mapping(3, MappingFault::BeyondFlash),
         ] {
@@ -772,6 +894,18 @@ mod tests {
                 unsupported(Unsupported::FlashSuspend { sus_ctrl: 0x20 }),
                 "program/erase suspend or resume (value 0x00000020",
             ),
+            (
+                unsupported(FORM),
+                "flash command 0x02 was sent in a form the virtual flash does not know (32 address bits, 0 dummy clocks, 4 data bytes",
+            ),
+            (
+                unsupported(RANGE),
+                "flash command 0x20 addresses 4096 bytes at 0x100000, past the end of the flash",
+            ),
+            (
+                unsupported(PROTECTED),
+                "flash command 0xd8 would program or erase while block-protect bits of the flash status register are set (status 0x3e",
+            ),
             (mapping(3, MappingFault::InvalidEntry), "MMU entry 3"),
             (
                 mapping(3, MappingFault::BeyondFlash),
@@ -791,9 +925,9 @@ mod tests {
 
     #[test]
     fn a_refused_flash_command_is_described_truthfully_whatever_the_command_does() {
-        // The same text serves a program (0x02), an erase (0x20), a data read (0x03, 0x0B, 0xBB: how
-        // `esp_flash` reads NVS), deep power-down (0xB9) and an opcode no chip has (0x00).
-        for opcode in [0x02, 0x20, 0x03, 0x0B, 0xBB, 0xB9, 0x00] {
+        // The same text serves a data read (0x03, 0x0B, 0xBB: how `esp_flash` reads NVS), deep
+        // power-down (0xB9), a 4-byte-address program (0x12) and an opcode no chip has (0x00).
+        for opcode in [0x03, 0x0B, 0xBB, 0xB9, 0x12, 0x00] {
             let text = unsupported(Unsupported::FlashCommand { opcode }).to_string();
             assert!(
                 text.contains(&format!("flash command {opcode:#04x} is not modeled")),
@@ -801,13 +935,13 @@ mod tests {
             );
             assert!(
                 text.contains(
-                    "only the identification and status commands of the virtual flash are modeled, so nothing was read or changed"
+                    "the virtual flash knows the identification and status commands, the page program (0x02), the erases (0x20, 0xd8, 0x60, 0xc7) and the status write (0x01), so nothing was read or changed"
                 ),
                 "{text}"
             );
             assert!(
-                !text.contains("read-only") && !text.contains("program or erase"),
-                "a refused read is not a write: {text}"
+                !text.contains("read-only"),
+                "the flash is no longer read-only: {text}"
             );
         }
     }

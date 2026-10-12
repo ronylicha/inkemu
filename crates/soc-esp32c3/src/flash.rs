@@ -1,9 +1,20 @@
-//! The SPI NOR flash chip behind the MSPI controllers. Read-only in this plan (decision D3):
-//! the commands that would change its content are not modelled and are reported by their opcode.
+//! The SPI NOR flash chip behind the MSPI controllers: its content, its status register, and the
+//! commands the boot chain and an ESP-IDF application send it (reports FW §C and §G, SF §B to §D).
+//!
+//! A program or an erase completes inside the command that asks for it: the write-in-progress bit
+//! is never read set (FW §A.5: every measured poll ends on its first read). The durations of a
+//! real part (FW §A.6) belong to the plan that calibrates time.
 use std::fmt;
 
 /// An erased NOR flash byte.
 pub const ERASED: u8 = 0xFF;
+/// The unit of a sector erase, and of the "modified" state of the chip.
+pub const SECTOR_BYTES: u32 = 4 << 10;
+/// The unit of a block erase (`D8`): 64 KiB for the ROM and for ESP-IDF alike (FW §A.1).
+pub const BLOCK_BYTES: u32 = 64 << 10;
+/// The unit of a page program: a program that reaches the end of its page wraps to its start
+/// (FW §C).
+pub const PAGE_BYTES: u32 = 256;
 /// One mebibyte, the unit device profiles write flash sizes in.
 pub const MIB: u32 = 1 << 20;
 pub const MIN_FLASH_BYTES: u32 = MIB;
@@ -23,8 +34,30 @@ const OP_RESUME: u8 = 0x7A;
 /// Write enable and write disable (ESP-IDF `spi_flash_defs.h`; BC §D.2 item 6).
 const OP_WREN: u8 = 0x06;
 const OP_WRDI: u8 = 0x04;
-/// Status register 1: bit 0 write-in-progress (always clear: nothing ever writes), bit 1 write-enable latch.
+/// Write the status register: one data byte (FW §C; ISSI IS25LP128F §8).
+const OP_WRSR: u8 = 0x01;
+/// Page program (FW §A.2, §A.3: the only opcode a measured boot writes data with).
+const OP_PP: u8 = 0x02;
+/// Sector erase, 4 KiB (FW §A.2, §A.3).
+const OP_SE: u8 = 0x20;
+/// Block erase, 64 KiB: what ESP-IDF sends for a step of an erase that covers a whole block
+/// (`IDF:spi_flash/esp_flash_api.c:728-742`; SF §D), and the ROM's `esp_rom_spiflash_erase_block`.
+const OP_BE: u8 = 0xD8;
+/// Chip erase: both opcodes of the datasheet. The ROM's `SPI_chip_erase` is their only sender
+/// (FW §A.1, §A.3); ESP-IDF erases a chip block by block.
+const OP_CE: u8 = 0xC7;
+const OP_CE_ALT: u8 = 0x60;
+/// Status register (FW §C): bit 0 write-in-progress (never set here), bit 1 the write-enable
+/// latch, bits 5:2 block protection `BP3..BP0`, bit 6 quad enable, bit 7 `SRWD`.
 const STATUS_WEL: u8 = 1 << 1;
+const STATUS_BP: u8 = 0b0011_1100;
+/// The bits a status write stores: `SRWD`, `QE` and `BP3..BP0`.
+const STATUS_WRITABLE: u8 = 0b1111_1100;
+/// The address length of every command that takes an address: three bytes. The 4-byte-address
+/// opcodes ESP-IDF sends above 16 MiB (`12`, `21`, `DC`: FW §A.2) are other opcodes, not modelled.
+const ADDRESS_BITS: u32 = 24;
+/// One bit per sector of the largest chip.
+const SECTOR_WORDS: usize = (MAX_FLASH_BYTES / SECTOR_BYTES / u64::BITS) as usize;
 /// Largest exponent `1 << capacity` fits a `u32`.
 const MAX_CAPACITY_EXPONENT: u8 = 31;
 
@@ -190,10 +223,72 @@ pub struct FlashCommand<'a> {
     pub data_out: &'a [u8],
 }
 
-/// The chip model does not implement this opcode: nothing happened.
+/// Why the chip did not run a command: nothing was read and nothing changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UnmodeledCommand {
-    pub opcode: u8,
+pub enum FlashRefusal {
+    /// The model does not implement this opcode.
+    Unmodeled { opcode: u8 },
+    /// The opcode is known, but not sent like this: an address that is not 24 bits long (0 when
+    /// there is none), dummy clocks the command does not take, or a number of data bytes it cannot
+    /// carry. What a chip does with such a frame is not modelled.
+    Form {
+        opcode: u8,
+        address_bits: u32,
+        dummy_cycles: u32,
+        data_bytes: u32,
+    },
+    /// The command addresses a byte past the end of the chip. A real part wraps, or ignores the
+    /// address bits it does not have (FW §C); the model does not guess which.
+    OutOfRange { opcode: u8, address: u32, len: u32 },
+    /// A program or an erase while a block-protect bit of the status register is set. Which
+    /// blocks the bits protect depends on the part, and the part of a retail device is not
+    /// established (FW §C, §O.2): no protection map is modelled.
+    Protected { opcode: u8, status: u8 },
+}
+
+/// One operation that wrote the chip: an entry of the journal of a run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FlashWrite {
+    /// `data` was programmed from `address` on: each byte could only clear bits of the content
+    /// (`new = old AND data`), and the address wrapped at the end of its 256-byte page.
+    Program { address: u32, data: Vec<u8> },
+    /// The `len` bytes from `start` were set to `0xFF`: a sector, a block or the whole chip.
+    Erase { start: u32, len: u32 },
+    /// The status register received `value` (its writable bits).
+    Status { value: u8 },
+}
+
+/// The most entries a [`FlashJournal`] holds between two calls of [`FlashJournal::take`].
+pub const JOURNAL_CAPACITY: usize = 1024;
+
+/// The operations that wrote the chip during a run, oldest first. The firmware decides how many
+/// there are: the journal keeps the first [`JOURNAL_CAPACITY`] that nobody took and counts the
+/// others, so that its memory does not grow with what the firmware does.
+#[derive(Clone, Debug, Default)]
+pub struct FlashJournal {
+    writes: Vec<FlashWrite>,
+    dropped: u64,
+}
+
+impl FlashJournal {
+    pub(crate) fn record(&mut self, write: FlashWrite) {
+        if self.writes.len() < JOURNAL_CAPACITY {
+            self.writes.push(write);
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    /// The entries recorded since the last call, which leaves the journal empty.
+    pub fn take(&mut self) -> Vec<FlashWrite> {
+        std::mem::take(&mut self.writes)
+    }
+
+    /// How many operations were not recorded because the journal was full: since power-on.
+    #[must_use]
+    pub const fn dropped(&self) -> u64 {
+        self.dropped
+    }
 }
 
 /// The flash chip as its two users see it: the cache (content) and the SPI1 controller (commands).
@@ -201,23 +296,37 @@ pub trait FlashDevice: fmt::Debug {
     fn size(&self) -> u32;
     /// Content at `offset`; bytes the image does not hold, or past the chip, read erased.
     fn read(&self, offset: u32, out: &mut [u8]);
-    /// Runs one transaction; `data_in` receives the bytes the chip clocks out.
+    /// Runs one transaction; `data_in` receives the bytes the chip clocks out. `Ok(Some(_))`
+    /// says what a program, an erase or a status write did; `Ok(None)` is every other command,
+    /// and a write the chip ignored because its write-enable latch was clear.
     /// # Errors
-    /// [`UnmodeledCommand`] when the opcode is not implemented; `data_in` is then untouched.
+    /// [`FlashRefusal`] when the model cannot run the command; `data_in` and the chip are then
+    /// untouched.
     fn execute(
         &mut self,
         command: &FlashCommand<'_>,
         data_in: &mut [u8],
-    ) -> Result<(), UnmodeledCommand>;
+    ) -> Result<Option<FlashWrite>, FlashRefusal>;
+    /// A number that changes whenever a byte of the content does: the version of what was
+    /// decoded or read from it.
+    fn generation(&self) -> u64;
+    /// How many 4 KiB sectors hold a byte a program or an erase changed since the chip was built.
+    fn modified_sectors(&self) -> u32;
 }
 
-/// A NOR flash holding the image it was given. The image is kept as supplied: what lies past it is
-/// erased, so a blank chip costs no memory (decision D19).
+/// A NOR flash holding the image it was given. The image is kept as supplied and grows only as
+/// far as a program reaches: what lies past it is erased, so a blank chip costs no memory
+/// (decision D19).
 #[derive(Clone)]
 pub struct NorFlash {
     image: Vec<u8>,
     config: FlashConfig,
-    write_enabled: bool,
+    /// The status register, write-enable latch included. It is not part of the content: a chip
+    /// that is built starts from the factory value `0x00` (FW §C).
+    status: u8,
+    generation: u64,
+    /// One bit per 4 KiB sector whose content changed.
+    modified: [u64; SECTOR_WORDS],
 }
 
 impl fmt::Debug for NorFlash {
@@ -225,9 +334,16 @@ impl fmt::Debug for NorFlash {
         f.debug_struct("NorFlash")
             .field("image_bytes", &self.image.len())
             .field("config", &self.config)
-            .field("write_enabled", &self.write_enabled)
-            .finish()
+            .field("status", &self.status)
+            .field("generation", &self.generation)
+            .field("modified_sectors", &self.modified_sectors())
+            .finish_non_exhaustive()
     }
+}
+
+/// `offset` as an index; an offset no slice can hold indexes nothing.
+fn index(offset: u32) -> usize {
+    usize::try_from(offset).unwrap_or(usize::MAX)
 }
 
 impl NorFlash {
@@ -237,7 +353,9 @@ impl NorFlash {
         NorFlash {
             image: Vec::new(),
             config,
-            write_enabled: false,
+            status: 0,
+            generation: 0,
+            modified: [0; SECTOR_WORDS],
         }
     }
 
@@ -254,15 +372,204 @@ impl NorFlash {
         }
         Ok(NorFlash {
             image,
-            config,
-            write_enabled: false,
+            ..NorFlash::blank(config)
         })
+    }
+
+    /// The address of a command that must carry one on 24 bits, with no dummy clock.
+    fn address_of(command: &FlashCommand<'_>) -> Result<u32, FlashRefusal> {
+        match command.address {
+            Some(address) if address.bits == ADDRESS_BITS && command.dummy_cycles == 0 => {
+                Ok(address.value)
+            }
+            _ => Err(NorFlash::form(command)),
+        }
+    }
+
+    fn form(command: &FlashCommand<'_>) -> FlashRefusal {
+        FlashRefusal::Form {
+            opcode: command.opcode,
+            address_bits: command.address.map_or(0, |address| address.bits),
+            dummy_cycles: command.dummy_cycles,
+            data_bytes: u32::try_from(command.data_out.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Refuses a write the model cannot place or cannot judge: past the end of the chip, or
+    /// under a protection it has no map of. Called once the latch is known to be set: a chip
+    /// ignores a write without it, wherever it points.
+    fn writable(&self, opcode: u8, address: u32, len: u32) -> Result<(), FlashRefusal> {
+        if address >= self.config.size {
+            return Err(FlashRefusal::OutOfRange {
+                opcode,
+                address,
+                len,
+            });
+        }
+        if self.status & STATUS_BP != 0 {
+            return Err(FlashRefusal::Protected {
+                opcode,
+                status: self.status,
+            });
+        }
+        Ok(())
+    }
+
+    /// Records that the sector holding `offset` changed.
+    fn mark_modified(&mut self, offset: u32) {
+        let sector = index(offset / SECTOR_BYTES);
+        if let Some(word) = self.modified.get_mut(sector / 64) {
+            *word |= 1 << (sector % 64);
+        }
+        self.generation += 1;
+    }
+
+    /// `02`: ANDs the data into the page of the address (FW §C: a program only clears bits),
+    /// wrapping at the end of the page; of more than a page of data the last 256 bytes are kept.
+    fn program(&mut self, command: &FlashCommand<'_>) -> Result<Option<FlashWrite>, FlashRefusal> {
+        let address = NorFlash::address_of(command)?;
+        // Of more than a page of data the chip keeps the last 256 bytes (FW §C): the first
+        // `skip` bytes are dropped, and the loop below is bounded by `PAGE_BYTES` whatever the
+        // caller sends. The SPI1 controller sends 64 bytes at most.
+        let skip = command.data_out.len().saturating_sub(index(PAGE_BYTES));
+        let data = &command.data_out[skip..];
+        if data.is_empty() {
+            return Err(NorFlash::form(command));
+        }
+        if self.status & STATUS_WEL == 0 {
+            return Ok(None);
+        }
+        let len = u32::try_from(data.len()).unwrap_or(PAGE_BYTES);
+        self.writable(command.opcode, address, len)?;
+        let page = address & !(PAGE_BYTES - 1);
+        // Where the first byte kept lands: the page counter after the bytes that were dropped.
+        let dropped = u32::try_from(skip % index(PAGE_BYTES)).unwrap_or(0);
+        let first = (address - page + dropped) % PAGE_BYTES;
+        // The image grows to the end of the page it is programmed in, never past the chip:
+        // `writable` checked that the page starts inside it, and the size is a multiple of a page.
+        let page_end = index(page + PAGE_BYTES);
+        if self.image.len() < page_end {
+            self.image.resize(page_end, ERASED);
+        }
+        let mut changed = false;
+        for (position, &byte) in (first..).zip(data) {
+            let at = index(page + position % PAGE_BYTES);
+            if let Some(cell) = self.image.get_mut(at) {
+                let programmed = *cell & byte;
+                changed |= programmed != *cell;
+                *cell = programmed;
+            }
+        }
+        if changed {
+            self.mark_modified(page);
+        }
+        // "After the completion of any Write Non-Volatile Register, Program and Erase operation"
+        // the latch is clear (FW §C); ESP-IDF takes a latch still set for a command the chip
+        // did not accept (`IDF:spi_flash/spi_flash_chip_generic.c:462-468`; FW key result 5).
+        self.status &= !STATUS_WEL;
+        Ok(Some(FlashWrite::Program {
+            address: page + first,
+            data: data.to_vec(),
+        }))
+    }
+
+    /// Sets `len` bytes from `start` to `0xFF` and records the sectors whose content changed.
+    /// `start` and `len` are multiples of a sector.
+    fn fill_erased(&mut self, start: u32, len: u32) {
+        // What lies past the image is erased already. The loop is bounded by the number of
+        // sectors of the chip, 4096 at most.
+        let end = index(start.saturating_add(len)).min(self.image.len());
+        let mut sector = start;
+        while index(sector) < end {
+            let next = index(sector + SECTOR_BYTES).min(end);
+            if let Some(bytes) = self.image.get_mut(index(sector)..next)
+                && bytes.iter().any(|&byte| byte != ERASED)
+            {
+                bytes.fill(ERASED);
+                self.mark_modified(sector);
+            }
+            sector += SECTOR_BYTES;
+        }
+    }
+
+    /// `20` and `D8`: erases the sector or the block that holds the address, whose low bits are
+    /// ignored (FW §G).
+    fn erase(
+        &mut self,
+        command: &FlashCommand<'_>,
+        unit: u32,
+    ) -> Result<Option<FlashWrite>, FlashRefusal> {
+        let address = NorFlash::address_of(command)?;
+        if !command.data_out.is_empty() {
+            return Err(NorFlash::form(command));
+        }
+        if self.status & STATUS_WEL == 0 {
+            return Ok(None);
+        }
+        self.writable(command.opcode, address, unit)?;
+        let start = address & !(unit - 1);
+        self.fill_erased(start, unit);
+        self.status &= !STATUS_WEL;
+        Ok(Some(FlashWrite::Erase { start, len: unit }))
+    }
+
+    /// `C7` and `60`: erases the whole chip.
+    fn erase_chip(
+        &mut self,
+        command: &FlashCommand<'_>,
+    ) -> Result<Option<FlashWrite>, FlashRefusal> {
+        if command.address.is_some() || command.dummy_cycles != 0 || !command.data_out.is_empty() {
+            return Err(NorFlash::form(command));
+        }
+        if self.status & STATUS_WEL == 0 {
+            return Ok(None);
+        }
+        self.writable(command.opcode, 0, self.config.size)?;
+        self.fill_erased(0, self.config.size);
+        self.image.clear();
+        self.status &= !STATUS_WEL;
+        Ok(Some(FlashWrite::Erase {
+            start: 0,
+            len: self.config.size,
+        }))
+    }
+
+    /// `01`: stores the writable bits of the one status byte this part has (FW §C: no status
+    /// register 2). The stored bits last as long as the chip model: they are not in an image.
+    ///
+    /// ASSUMPTION: `SRWD` is stored and locks nothing. On the part it makes the register
+    /// read-only while the `WP#` pin is low, and the level of that pin on a device is not
+    /// established; the pin model of the board (SP2), or a schematic, settles it.
+    fn write_status(
+        &mut self,
+        command: &FlashCommand<'_>,
+    ) -> Result<Option<FlashWrite>, FlashRefusal> {
+        let [value] = *command.data_out else {
+            return Err(NorFlash::form(command));
+        };
+        if command.address.is_some() || command.dummy_cycles != 0 {
+            return Err(NorFlash::form(command));
+        }
+        if self.status & STATUS_WEL == 0 {
+            return Ok(None);
+        }
+        // Storing the byte without its latch bit is the latch cleared at completion.
+        self.status = value & STATUS_WRITABLE;
+        Ok(Some(FlashWrite::Status { value: self.status }))
     }
 }
 
 impl FlashDevice for NorFlash {
     fn size(&self) -> u32 {
         self.config.size
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn modified_sectors(&self) -> u32 {
+        self.modified.iter().map(|word| word.count_ones()).sum()
     }
 
     fn read(&self, offset: u32, out: &mut [u8]) {
@@ -280,7 +587,7 @@ impl FlashDevice for NorFlash {
         &mut self,
         command: &FlashCommand<'_>,
         data_in: &mut [u8],
-    ) -> Result<(), UnmodeledCommand> {
+    ) -> Result<Option<FlashWrite>, FlashRefusal> {
         match command.opcode {
             // Nothing to wake up or resume: the chip is never powered down or suspended.
             OP_RES | OP_RESUME => {}
@@ -293,17 +600,22 @@ impl FlashDevice for NorFlash {
                     *byte = id;
                 }
             }
-            OP_RDSR => data_in.fill(if self.write_enabled { STATUS_WEL } else { 0 }),
+            OP_RDSR => data_in.fill(self.status),
             // ASSUMPTION: the modelled part exposes no SFDP table and answers erased bytes. The
             // bootloader only checks that byte 0x10 is not the XMC manufacturer id (BA §2.2). The
             // flash of the QEMU oracle rejects the command (`Unknown cmd 5a`), so the lockstep must
             // mask this read; the SFDP table of the real part, read on a device, settles the bytes.
             OP_SFDP => data_in.fill(ERASED),
-            OP_WREN => self.write_enabled = true,
-            OP_WRDI => self.write_enabled = false,
-            opcode => return Err(UnmodeledCommand { opcode }),
+            OP_WREN => self.status |= STATUS_WEL,
+            OP_WRDI => self.status &= !STATUS_WEL,
+            OP_WRSR => return self.write_status(command),
+            OP_PP => return self.program(command),
+            OP_SE => return self.erase(command, SECTOR_BYTES),
+            OP_BE => return self.erase(command, BLOCK_BYTES),
+            OP_CE | OP_CE_ALT => return self.erase_chip(command),
+            opcode => return Err(FlashRefusal::Unmodeled { opcode }),
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -313,7 +625,10 @@ mod tests {
 
     const MIB: usize = 1 << 20;
 
-    fn run(flash: &mut NorFlash, opcode: u8, data_in: &mut [u8]) -> Result<(), UnmodeledCommand> {
+    /// What [`FlashDevice::execute`] returns.
+    type Done = Result<Option<FlashWrite>, FlashRefusal>;
+
+    fn run(flash: &mut NorFlash, opcode: u8, data_in: &mut [u8]) -> Done {
         flash.execute(
             &FlashCommand {
                 opcode,
@@ -323,6 +638,63 @@ mod tests {
             },
             data_in,
         )
+    }
+
+    /// A command with a 24-bit address and data, no dummy clock: the form of a program and of
+    /// an erase.
+    fn send(flash: &mut NorFlash, opcode: u8, address: u32, data: &[u8]) -> Done {
+        flash.execute(
+            &FlashCommand {
+                opcode,
+                address: Some(FlashAddress {
+                    value: address,
+                    bits: 24,
+                }),
+                dummy_cycles: 0,
+                data_out: data,
+            },
+            &mut [],
+        )
+    }
+
+    /// Write enable, then the command: how the ROM and ESP-IDF send every program and erase.
+    fn write(flash: &mut NorFlash, opcode: u8, address: u32, data: &[u8]) -> Done {
+        run(flash, 0x06, &mut []).unwrap();
+        send(flash, opcode, address, data)
+    }
+
+    /// A command without an address that carries `data`: the status write.
+    fn send_data(flash: &mut NorFlash, opcode: u8, data: &[u8]) -> Done {
+        flash.execute(
+            &FlashCommand {
+                opcode,
+                address: None,
+                dummy_cycles: 0,
+                data_out: data,
+            },
+            &mut [],
+        )
+    }
+
+    fn content(flash: &NorFlash, offset: u32, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        flash.read(offset, &mut bytes);
+        bytes
+    }
+
+    fn status(flash: &mut NorFlash) -> u8 {
+        let mut status = [0u8];
+        run(flash, 0x05, &mut status).unwrap();
+        status[0]
+    }
+
+    /// The bytes written as hexadecimal pairs; spaces are ignored.
+    fn hex(text: &str) -> Vec<u8> {
+        let digits: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        digits
+            .chunks(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
     }
 
     #[test]
@@ -510,19 +882,30 @@ mod tests {
     }
 
     #[test]
-    fn commands_that_would_change_or_read_the_content_are_not_modeled() {
+    fn data_reads_and_opcodes_the_model_does_not_know_are_refused_by_opcode() {
+        // The data reads, and what no measured boot sends: a second status register (`31`,
+        // `35`), a 32 KiB erase (`52`: no caller in ESP-IDF, SF §C), reset (`66`, `99`),
+        // suspend (`75`), deep power-down (`B9`).
         let mut flash = NorFlash::with_image(vec![1, 2, 3, 4], FlashConfig::default()).unwrap();
+        run(&mut flash, 0x06, &mut []).unwrap();
         for opcode in [
-            0x02, 0x20, 0xD8, 0xC7, 0x01, 0x31, 0x35, 0x03, 0xBB, 0x00, 0xFF,
+            0x03, 0x0B, 0xBB, 0x31, 0x35, 0x52, 0x66, 0x99, 0x75, 0xB9, 0x00, 0xFF,
         ] {
             assert_eq!(
                 run(&mut flash, opcode, &mut [0u8; 4]),
-                Err(UnmodeledCommand { opcode })
+                Err(FlashRefusal::Unmodeled { opcode })
+            );
+            assert_eq!(
+                send(&mut flash, opcode, 0, &[0]),
+                Err(FlashRefusal::Unmodeled { opcode })
             );
         }
-        let mut bytes = [0u8; 4];
-        flash.read(0, &mut bytes);
-        assert_eq!(bytes, [1, 2, 3, 4], "the content did not change");
+        assert_eq!(
+            content(&flash, 0, 4),
+            [1, 2, 3, 4],
+            "the content did not change"
+        );
+        assert_eq!(status(&mut flash), 0x02, "nor did the latch");
     }
 
     #[test]
@@ -531,9 +914,411 @@ mod tests {
         let mut data_in = [0x5A, 0xA5, 0x3C];
         assert_eq!(
             run(&mut flash, 0x03, &mut data_in),
-            Err(UnmodeledCommand { opcode: 0x03 })
+            Err(FlashRefusal::Unmodeled { opcode: 0x03 })
         );
         assert_eq!(data_in, [0x5A, 0xA5, 0x3C], "nothing was clocked in");
+    }
+
+    #[test]
+    fn a_program_needs_the_write_enable_latch_and_clears_it_when_it_completes() {
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        // Without the latch a program is ignored, as the datasheet says (FW §C).
+        assert_eq!(send(&mut flash, 0x02, 0x9000, &[0x12]), Ok(None));
+        assert_eq!(content(&flash, 0x9000, 1), [0xFF]);
+        assert_eq!(
+            write(&mut flash, 0x02, 0x9000, &[0x12]),
+            Ok(Some(FlashWrite::Program {
+                address: 0x9000,
+                data: vec![0x12]
+            }))
+        );
+        assert_eq!(content(&flash, 0x9000, 1), [0x12]);
+        assert_eq!(
+            status(&mut flash),
+            0,
+            "WEL reads 0 after a program (FW key result 5)"
+        );
+        // The latch served once: a second program needs a second write enable.
+        assert_eq!(send(&mut flash, 0x02, 0x9001, &[0x34]), Ok(None));
+        assert_eq!(content(&flash, 0x9001, 1), [0xFF]);
+    }
+
+    #[test]
+    fn a_program_only_clears_bits() {
+        // NVS rewrites its bitmap word in place: `FE`, then `FA` (SF §B.2).
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        write(&mut flash, 0x02, 0x9020, &[0xFE, 0xFF, 0xFF, 0xFF]).unwrap();
+        write(&mut flash, 0x02, 0x9020, &[0xFA, 0xFF, 0xFF, 0xFF]).unwrap();
+        assert_eq!(content(&flash, 0x9020, 4), [0xFA, 0xFF, 0xFF, 0xFF]);
+        // No program sets a bit again: `FA AND FF`, then `FA AND 0F`.
+        write(&mut flash, 0x02, 0x9020, &[0xFF]).unwrap();
+        assert_eq!(content(&flash, 0x9020, 1), [0xFA]);
+        write(&mut flash, 0x02, 0x9020, &[0x0F]).unwrap();
+        assert_eq!(content(&flash, 0x9020, 1), [0x0A]);
+    }
+
+    #[test]
+    fn a_program_wraps_inside_its_256_byte_page() {
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        write(&mut flash, 0x02, 0x10FE, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(content(&flash, 0x10FE, 2), [1, 2]);
+        assert_eq!(
+            content(&flash, 0x1000, 2),
+            [3, 4],
+            "the page counter wraps to the start of the page"
+        );
+        assert_eq!(
+            content(&flash, 0x1100, 2),
+            [0xFF, 0xFF],
+            "the next page is not reached"
+        );
+    }
+
+    #[test]
+    fn of_more_than_a_page_of_data_the_last_256_bytes_are_programmed() {
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        // 300 bytes that cycle through 0 to 254, so none of them is `FF`: 44 are dropped.
+        let data: Vec<u8> = (0u8..=254).cycle().take(300).collect();
+        assert_eq!(
+            write(&mut flash, 0x02, 0x2010, &data),
+            Ok(Some(FlashWrite::Program {
+                address: 0x203C,
+                data: data[44..].to_vec()
+            })),
+            "the first byte kept, byte 44, lands at 0x10 + 44"
+        );
+        assert_eq!(content(&flash, 0x203C, 1), [data[44]]);
+        assert_eq!(
+            content(&flash, 0x2000, 1),
+            [data[240]],
+            "0x10 + 240 wraps to 0"
+        );
+        assert_eq!(
+            content(&flash, 0x203B, 1),
+            [data[299]],
+            "the last byte ends the page turn"
+        );
+        assert!(
+            content(&flash, 0x2000, 256)
+                .iter()
+                .all(|&byte| byte != 0xFF),
+            "every position of the page was programmed once"
+        );
+        assert_eq!(content(&flash, 0x2100, 1), [0xFF]);
+    }
+
+    /// The `otadata` entry the stock bootloader writes on the first boot of an OTA layout
+    /// (FW §E, first row): sequence 1, a blank label, state valid, CRC.
+    fn otadata_entry() -> Vec<u8> {
+        let mut entry = vec![0xFF; 32];
+        entry[..4].copy_from_slice(&[1, 0, 0, 0]);
+        entry[24..28].copy_from_slice(&[2, 0, 0, 0]);
+        entry[28..].copy_from_slice(&[0x9A, 0x98, 0x43, 0x47]);
+        entry
+    }
+
+    #[test]
+    fn the_otadata_update_of_the_bootloader_leaves_the_measured_bytes() {
+        // FW §E: the ROM's sector erase at 0xE000, then its 32-byte program at 0xE000.
+        let mut flash = NorFlash::with_image(vec![0x55; 0x1_0000], FlashConfig::default()).unwrap();
+        assert_eq!(
+            write(&mut flash, 0x20, 0xE000, &[]),
+            Ok(Some(FlashWrite::Erase {
+                start: 0xE000,
+                len: 0x1000
+            }))
+        );
+        assert_eq!(
+            write(&mut flash, 0x02, 0xE000, &otadata_entry()),
+            Ok(Some(FlashWrite::Program {
+                address: 0xE000,
+                data: otadata_entry()
+            }))
+        );
+        assert_eq!(content(&flash, 0xE000, 32), otadata_entry());
+        assert_eq!(
+            content(&flash, 0xE020, 0xFE0),
+            vec![0xFF; 0xFE0],
+            "the rest of the sector is erased"
+        );
+        assert_eq!(content(&flash, 0xDFFC, 4), [0x55; 4], "the sector before");
+        assert_eq!(content(&flash, 0xF000, 4), [0x55; 4], "the sector after");
+        assert_eq!(flash.modified_sectors(), 1);
+    }
+
+    #[test]
+    fn the_nvs_programs_of_a_first_boot_leave_the_measured_rows() {
+        // SF §B.2, boot 1: five programs on an erased partition, no erase. The bitmap word at
+        // 0x9020 is programmed twice.
+        let header = format!("feffffff 00000000 fe {} 842dbab9", "ff".repeat(19));
+        let namespace = "000101ff 09a95007 73746f72 61676500 00000000 00000000 01ffffff ffffffff";
+        let counter = "011401ff 81a8ff42 72657374 6172745f 636f756e 74657200 01000000 ffffffff";
+        let programs = [
+            (0x9000, hex(&header)),
+            (0x9040, hex(namespace)),
+            (0x9020, hex("feffffff")),
+            (0x9060, hex(counter)),
+            (0x9020, hex("faffffff")),
+        ];
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        for (address, data) in &programs {
+            assert_eq!(
+                write(&mut flash, 0x02, *address, data),
+                Ok(Some(FlashWrite::Program {
+                    address: *address,
+                    data: data.clone()
+                }))
+            );
+        }
+        let bitmap = format!("faffffff {}", "ff".repeat(28));
+        let rows = [hex(&header), hex(&bitmap), hex(namespace), hex(counter)].concat();
+        assert_eq!(
+            content(&flash, 0x9000, 0x80),
+            rows,
+            "the four rows of SF §B.2"
+        );
+        assert_eq!(content(&flash, 0x9080, 0x80), vec![0xFF; 0x80]);
+        assert_eq!(flash.modified_sectors(), 1, "all in flash sector 9");
+    }
+
+    #[test]
+    fn a_sector_erase_and_a_block_erase_set_their_whole_unit_and_nothing_else() {
+        let mut flash = NorFlash::with_image(vec![0u8; 0x4_0000], FlashConfig::default()).unwrap();
+        // The low address bits are ignored (FW §G): 0x12345 is in the sector of 0x12000.
+        assert_eq!(
+            write(&mut flash, 0x20, 0x1_2345, &[]),
+            Ok(Some(FlashWrite::Erase {
+                start: 0x1_2000,
+                len: 0x1000
+            }))
+        );
+        assert_eq!(content(&flash, 0x1_1FFF, 1), [0]);
+        assert_eq!(content(&flash, 0x1_2000, 0x1000), vec![0xFF; 0x1000]);
+        assert_eq!(content(&flash, 0x1_3000, 1), [0]);
+        assert_eq!(flash.modified_sectors(), 1);
+        assert_eq!(
+            write(&mut flash, 0xD8, 0x2_FFFF, &[]),
+            Ok(Some(FlashWrite::Erase {
+                start: 0x2_0000,
+                len: 0x1_0000
+            }))
+        );
+        assert_eq!(content(&flash, 0x1_FFFF, 1), [0]);
+        assert_eq!(content(&flash, 0x2_0000, 0x1_0000), vec![0xFF; 0x1_0000]);
+        assert_eq!(content(&flash, 0x3_0000, 1), [0]);
+        assert_eq!(
+            flash.modified_sectors(),
+            17,
+            "one sector, then the sixteen of a block"
+        );
+        assert_eq!(status(&mut flash), 0, "the latch is clear after an erase");
+    }
+
+    #[test]
+    fn a_chip_erase_erases_everything_under_either_opcode() {
+        for opcode in [0xC7, 0x60] {
+            let mut flash =
+                NorFlash::with_image(vec![0u8; 0x2800], FlashConfig::default()).unwrap();
+            run(&mut flash, 0x06, &mut []).unwrap();
+            assert_eq!(
+                run(&mut flash, opcode, &mut []),
+                Ok(Some(FlashWrite::Erase {
+                    start: 0,
+                    len: 16 << 20
+                })),
+                "{opcode:#04x}"
+            );
+            assert_eq!(content(&flash, 0, 0x2800), vec![0xFF; 0x2800]);
+            assert_eq!(
+                flash.modified_sectors(),
+                3,
+                "the three sectors that held something"
+            );
+            assert_eq!(status(&mut flash), 0);
+        }
+    }
+
+    #[test]
+    fn an_erase_without_the_latch_changes_nothing() {
+        let mut flash = NorFlash::with_image(vec![0u8; 0x2_0000], FlashConfig::default()).unwrap();
+        assert_eq!(send(&mut flash, 0x20, 0, &[]), Ok(None));
+        assert_eq!(send(&mut flash, 0xD8, 0x1_0000, &[]), Ok(None));
+        assert_eq!(run(&mut flash, 0xC7, &mut []), Ok(None));
+        assert_eq!(run(&mut flash, 0x60, &mut []), Ok(None));
+        assert_eq!(content(&flash, 0, 0x2_0000), vec![0u8; 0x2_0000]);
+        assert_eq!((flash.generation(), flash.modified_sectors()), (0, 0));
+    }
+
+    #[test]
+    fn an_operation_that_changes_no_byte_is_performed_and_modifies_nothing() {
+        // An erase of an erased sector and a program of `FF` are operations of the journal; the
+        // content, its generation and the modified sectors do not move.
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        assert!(matches!(
+            write(&mut flash, 0x20, 0x9000, &[]),
+            Ok(Some(FlashWrite::Erase { .. }))
+        ));
+        assert!(matches!(
+            write(&mut flash, 0x02, 0x9000, &[0xFF, 0xFF]),
+            Ok(Some(FlashWrite::Program { .. }))
+        ));
+        assert_eq!((flash.generation(), flash.modified_sectors()), (0, 0));
+        write(&mut flash, 0x02, 0x9000, &[0xFE]).unwrap();
+        let after_a_change = flash.generation();
+        assert_ne!(after_a_change, 0);
+        assert_eq!(flash.modified_sectors(), 1);
+        // The same bytes again: nothing changes.
+        write(&mut flash, 0x02, 0x9000, &[0xFE]).unwrap();
+        assert_eq!(flash.generation(), after_a_change);
+        write(&mut flash, 0x20, 0x9000, &[]).unwrap();
+        assert_ne!(
+            flash.generation(),
+            after_a_change,
+            "the erase changed a byte"
+        );
+        assert_eq!(flash.modified_sectors(), 1, "the same sector");
+        // The image now reaches 0x9100, and what it holds below sector 9 is erased: erasing
+        // that again, or sector 9 a second time, changes no byte.
+        let erased = flash.generation();
+        write(&mut flash, 0x20, 0x8000, &[]).unwrap();
+        write(&mut flash, 0x20, 0x9000, &[]).unwrap();
+        write(&mut flash, 0xD8, 0x0000, &[]).unwrap();
+        assert_eq!((flash.generation(), flash.modified_sectors()), (erased, 1));
+    }
+
+    #[test]
+    fn the_status_register_stores_its_writable_bits_and_its_write_needs_and_clears_the_latch() {
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        assert_eq!(send_data(&mut flash, 0x01, &[0x40]), Ok(None), "no latch");
+        assert_eq!(status(&mut flash), 0);
+        run(&mut flash, 0x06, &mut []).unwrap();
+        assert_eq!(
+            send_data(&mut flash, 0x01, &[0xFF]),
+            Ok(Some(FlashWrite::Status { value: 0xFC })),
+            "WIP and WEL are not stored"
+        );
+        assert_eq!(
+            status(&mut flash),
+            0xFC,
+            "the latch is clear, the rest reads back"
+        );
+        run(&mut flash, 0x06, &mut []).unwrap();
+        assert_eq!(status(&mut flash), 0xFE);
+        send_data(&mut flash, 0x01, &[0x00]).unwrap();
+        assert_eq!(status(&mut flash), 0);
+    }
+
+    #[test]
+    fn a_program_or_an_erase_under_a_block_protect_bit_is_refused_by_name() {
+        for bp in [0x04u8, 0x08, 0x10, 0x20, 0x3C] {
+            let mut flash = NorFlash::with_image(vec![0x0F; 16], FlashConfig::default()).unwrap();
+            run(&mut flash, 0x06, &mut []).unwrap();
+            send_data(&mut flash, 0x01, &[bp]).unwrap();
+            let protected = |opcode| {
+                Err(FlashRefusal::Protected {
+                    opcode,
+                    status: bp | 0x02,
+                })
+            };
+            assert_eq!(write(&mut flash, 0x02, 0, &[0x00]), protected(0x02));
+            assert_eq!(write(&mut flash, 0x20, 0, &[]), protected(0x20));
+            assert_eq!(write(&mut flash, 0xD8, 0, &[]), protected(0xD8));
+            assert_eq!(run(&mut flash, 0xC7, &mut []), protected(0xC7));
+            assert_eq!(content(&flash, 0, 16), [0x0F; 16], "status {bp:#04x}");
+            assert_eq!(flash.modified_sectors(), 0);
+            // The status write is how the protection is lifted: it is not protected itself.
+            send_data(&mut flash, 0x01, &[0x00]).unwrap();
+            assert!(write(&mut flash, 0x02, 0, &[0x00]).unwrap().is_some());
+            assert_eq!(content(&flash, 0, 1), [0x00]);
+        }
+        // Quad enable and SRWD protect nothing.
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        run(&mut flash, 0x06, &mut []).unwrap();
+        send_data(&mut flash, 0x01, &[0xC0]).unwrap();
+        assert!(write(&mut flash, 0x02, 0, &[0x00]).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_write_past_the_end_of_a_smaller_chip_is_refused_by_name() {
+        let small = FlashConfig::new(MIN_FLASH_BYTES, id_with(0x14)).unwrap();
+        let mut flash = NorFlash::blank(small);
+        for (opcode, data, len) in [
+            (0x02u8, &[0u8, 1][..], 2u32),
+            (0x20, &[][..], 0x1000),
+            (0xD8, &[][..], 0x1_0000),
+        ] {
+            for address in [0x10_0000, 0xFF_FFFF] {
+                assert_eq!(
+                    write(&mut flash, opcode, address, data),
+                    Err(FlashRefusal::OutOfRange {
+                        opcode,
+                        address,
+                        len
+                    })
+                );
+            }
+        }
+        assert_eq!(flash.modified_sectors(), 0);
+        run(&mut flash, 0x04, &mut []).unwrap();
+        assert_eq!(
+            send(&mut flash, 0x02, 0x10_0000, &[0]),
+            Ok(None),
+            "without the latch a chip ignores the command wherever it points"
+        );
+        // The last byte of the chip is inside it: the image grows to the size of the chip and
+        // no further.
+        write(&mut flash, 0x02, 0x0F_FFFF, &[0x00, 0x11]).unwrap();
+        assert_eq!(content(&flash, 0x0F_FFFF, 1), [0x00]);
+        assert_eq!(
+            content(&flash, 0x0F_FF00, 1),
+            [0x11],
+            "wrapped inside the last page"
+        );
+        assert!(
+            format!("{flash:?}").contains("image_bytes: 1048576"),
+            "{flash:?}"
+        );
+    }
+
+    #[test]
+    fn a_write_command_in_a_form_the_chip_does_not_know_is_refused_by_name() {
+        let mut flash = NorFlash::with_image(vec![0x0F; 16], FlashConfig::default()).unwrap();
+        run(&mut flash, 0x06, &mut []).unwrap();
+        let at = |bits| Some(FlashAddress { value: 0, bits });
+        // (opcode, address, dummy clocks, data): each differs from the form of its command.
+        let frames: [(u8, Option<FlashAddress>, u32, &[u8]); 11] = [
+            (0x02, None, 0, &[0]),    // a program without an address
+            (0x02, at(32), 0, &[0]),  // with a 4-byte address
+            (0x02, at(16), 0, &[0]),  // with a 2-byte address
+            (0x02, at(24), 8, &[0]),  // with dummy clocks
+            (0x02, at(24), 0, &[]),   // without a byte
+            (0x20, None, 0, &[]),     // an erase without an address
+            (0x20, at(24), 0, &[0]),  // with data
+            (0xD8, at(32), 0, &[]),   // a block erase with a 4-byte address
+            (0xC7, at(24), 0, &[]),   // a chip erase with an address
+            (0x01, None, 0, &[0, 0]), // a status write of two bytes
+            (0x01, at(24), 0, &[0]),  // a status write with an address
+        ];
+        for (opcode, address, dummy_cycles, data_out) in frames {
+            let command = FlashCommand {
+                opcode,
+                address,
+                dummy_cycles,
+                data_out,
+            };
+            assert_eq!(
+                flash.execute(&command, &mut []),
+                Err(FlashRefusal::Form {
+                    opcode,
+                    address_bits: address.map_or(0, |a| a.bits),
+                    dummy_cycles,
+                    data_bytes: u32::try_from(data_out.len()).unwrap(),
+                }),
+                "{command:?}"
+            );
+        }
+        assert_eq!(content(&flash, 0, 16), [0x0F; 16]);
+        assert_eq!(status(&mut flash), 0x02, "the latch is as it was");
     }
 
     #[test]
@@ -558,6 +1343,31 @@ mod tests {
     #[test]
     fn debug_output_does_not_dump_the_image() {
         let flash = NorFlash::with_image(vec![0xAB; 4096], FlashConfig::default()).unwrap();
-        assert!(format!("{flash:?}").len() < 200);
+        assert!(format!("{flash:?}").len() < 300);
+    }
+
+    #[test]
+    fn the_journal_keeps_the_first_entries_nobody_took_and_counts_the_others() {
+        let mut journal = FlashJournal::default();
+        let entry = |start| FlashWrite::Erase {
+            start,
+            len: SECTOR_BYTES,
+        };
+        for start in 0..u32::try_from(JOURNAL_CAPACITY).unwrap() + 6 {
+            journal.record(entry(start));
+        }
+        assert_eq!(journal.dropped(), 6);
+        let taken = journal.take();
+        assert_eq!(taken.len(), JOURNAL_CAPACITY);
+        assert_eq!(
+            (taken.first(), taken.last()),
+            (Some(&entry(0)), Some(&entry(1023))),
+            "the oldest are kept"
+        );
+        // Once taken, there is room again; the count of what was lost stays.
+        journal.record(entry(7));
+        assert_eq!(journal.take(), [entry(7)]);
+        assert_eq!(journal.take(), []);
+        assert_eq!(journal.dropped(), 6);
     }
 }

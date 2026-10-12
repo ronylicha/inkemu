@@ -369,6 +369,46 @@ pub fn stop_watchdogs() -> Vec<u32> {
     program
 }
 
+/// `SPI1.CMD` bits of the hard-wired commands the two helpers below use (report FW §A.1).
+const SPI1_CMD_WREN: u32 = 1 << 30;
+const SPI1_CMD_PP: u32 = 1 << 25;
+const SPI1_CMD_SE: u32 = 1 << 24;
+
+/// Code that programs `data` (1 to 64 bytes) into the flash at `address`, the way the ROM and
+/// ESP-IDF do: write enable, the bytes in `W0..`, `ADDR = len << 24 | address`, `CMD = FLASH_PP`
+/// (reports FW §A.2, §A.3).
+#[must_use]
+pub fn flash_program(address: u32, data: &[u8]) -> Vec<u32> {
+    assert!((1..=64).contains(&data.len()), "1 to 64 bytes");
+    assert!(address < 1 << 24, "a 24-bit address");
+    let spi1 = |register| svd_regs::esp32c3::addr("SPI1", register);
+    let mut program = store_register(spi1("CMD"), SPI1_CMD_WREN).to_vec();
+    for (word, chunk) in (0u32..).zip(data.chunks(4)) {
+        let mut le = [0u8; 4];
+        le[..chunk.len()].copy_from_slice(chunk);
+        program.extend(store_register(
+            spi1("W0") + 4 * word,
+            u32::from_le_bytes(le),
+        ));
+    }
+    let len = u32::try_from(data.len()).unwrap();
+    program.extend(store_register(spi1("ADDR"), (len << 24) | address));
+    program.extend(store_register(spi1("CMD"), SPI1_CMD_PP));
+    program
+}
+
+/// Code that erases the 4 KiB flash sector holding `address`: write enable, `ADDR`,
+/// `CMD = FLASH_SE`, as ESP-IDF does (report FW §A.2).
+#[must_use]
+pub fn flash_erase_sector(address: u32) -> Vec<u32> {
+    assert!(address < 1 << 24, "a 24-bit address");
+    let spi1 = |register| svd_regs::esp32c3::addr("SPI1", register);
+    let mut program = store_register(spi1("CMD"), SPI1_CMD_WREN).to_vec();
+    program.extend(store_register(spi1("ADDR"), address));
+    program.extend(store_register(spi1("CMD"), SPI1_CMD_SE));
+    program
+}
+
 /// Runs `work` on its own thread and waits at most `limit` for its result: a test of a loop that
 /// must end, which would otherwise hang the whole suite if the loop did not. On a timeout the
 /// test fails with `unbounded`; the thread is left to spin until the test process ends. A panic of
