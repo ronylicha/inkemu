@@ -1418,6 +1418,63 @@ fn an_image_that_is_also_the_flash_file_is_refused_before_boot_by_every_route_to
     .stderr(contains(MISSING_ROM));
 }
 
+/// The temporary name of a flash file is where an interrupted save leaves the flash, and the
+/// one file a user would hand to `--flash` to get it back; an accepted run removes what is there.
+/// The lock file is opened and locked by every run. An image at either name, by any route to it,
+/// is refused before boot, and stays byte for byte what it was, with nothing created beside it.
+#[test]
+fn an_image_at_the_temporary_name_or_the_lock_file_of_the_flash_file_is_refused_before_boot() {
+    let mut bytes = build_flash_image(&ImageSpec::default());
+    bytes.resize(usize::try_from(X4_FLASH_BYTES).unwrap(), 0xFF);
+    for (owned, role) in [
+        (".x4.bin.tmp", "temporary file"),
+        ("x4.bin.lock", "lock file"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join(owned);
+        std::fs::write(&image, &bytes).unwrap();
+        let digest = sha256_of(&image);
+        let mut routes = vec![
+            ("the same path", image.clone()),
+            ("another spelling", dir.path().join(".").join(owned)),
+        ];
+        #[cfg(unix)]
+        {
+            let hard_link = dir.path().join("hard-link.bin");
+            std::fs::hard_link(&image, &hard_link).unwrap();
+            routes.push(("a hard link", hard_link));
+            let link = dir.path().join("link.bin");
+            std::os::unix::fs::symlink(&image, &link).unwrap();
+            routes.push(("a symbolic link", link));
+        }
+        let before = names_in(dir.path());
+        for (route, flash) in routes {
+            for more in [&[][..], &["--reset-flash"][..]] {
+                let mut arguments = vec!["--flash", flash.to_str().unwrap()];
+                arguments.extend(more);
+                run_with_flash_file(&dir.path().join("x4.bin"), &arguments)
+                    .code(2)
+                    .stderr(
+                        contains(format!("which is the {role} of the flash file"))
+                            .and(contains("x4.bin"))
+                            .and(contains("the image of --flash is only read"))
+                            .and(contains(
+                                "; copy the image to another name, then give that copy to --flash",
+                            ))
+                            .and(contains("inkemu: removed").not())
+                            .and(contains(MISSING_ROM).not()),
+                    );
+                assert_eq!(sha256_of(&image), digest, "{owned}, {route} {more:?}");
+                assert_eq!(
+                    names_in(dir.path()),
+                    before,
+                    "{owned}, {route} {more:?}: nothing created, nothing removed"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn a_flash_file_that_another_run_holds_is_refused_before_boot() {
     let dir = tempfile::tempdir().unwrap();

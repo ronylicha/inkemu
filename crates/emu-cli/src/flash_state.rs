@@ -114,6 +114,15 @@ pub enum FlashStateError {
     )]
     SameFile { image: String, path: String },
     #[error(
+        "--flash names {image}, which is the {role} of the flash file {path}: {why}, and the image of --flash is only read; copy the image to another name, then give that copy to --flash"
+    )]
+    ImageIsTheRunsOwn {
+        image: String,
+        role: &'static str,
+        path: String,
+        why: &'static str,
+    },
+    #[error(
         "cannot write the flash file {path}: cannot {action} {target}: {detail}; what this run wrote to the flash is lost; check that the directory still exists, is writable and has {size} bytes free, then run again"
     )]
     Write {
@@ -140,12 +149,37 @@ fn creation_remedy(error: &std::io::Error) -> &'static str {
     }
 }
 
-/// Refuses `image`, the file given to `--flash`, as the flash file of the same run: the image is
-/// only read, the flash file is replaced when the run ends, and one file cannot be both. Asked
-/// before anything is created: a refused run leaves no lock file beside the image.
+/// The file beside `path` named after it: `prefix`, the name of `path`, then `suffix`. `None`
+/// when `path` names no file, which [`FlashState::open`] refuses.
+fn sibling(path: &Path, prefix: &str, suffix: &str) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let mut sibling = OsString::from(prefix);
+    sibling.push(name);
+    sibling.push(suffix);
+    Some(path.with_file_name(sibling))
+}
+
+/// The lock file of the flash file at `path`.
+fn lock_path(path: &Path) -> Option<PathBuf> {
+    sibling(path, "", LOCK_SUFFIX)
+}
+
+/// The name the content of the flash file at `path` is written to before it takes the name of
+/// the flash file. One name per flash file: the lock leaves a run alone with it.
+fn temporary_path(path: &Path) -> Option<PathBuf> {
+    sibling(path, ".", ".tmp")
+}
+
+/// Refuses `image`, the file given to `--flash`, as a file the run writes: the flash file, which
+/// is replaced when the run ends, its temporary file, where an accepted run removes what it finds
+/// and writes the content, and its lock file, which the run opens and locks. The image is only
+/// read. Asked before anything is created: a refused run leaves no lock file beside the image,
+/// and what sits at the temporary name is left as it is.
 ///
 /// # Errors
-/// [`FlashStateError::SameFile`] when the two paths lead to one file.
+/// [`FlashStateError::SameFile`] when the image is the flash file,
+/// [`FlashStateError::ImageIsTheRunsOwn`] when it is the temporary file or the lock file of the
+/// flash file, by whatever route the two paths lead to one file.
 pub fn refuse_the_image_as_flash_file(
     image: &Path,
     flash_file: &Path,
@@ -155,6 +189,30 @@ pub fn refuse_the_image_as_flash_file(
             image: shown(image),
             path: shown(flash_file),
         });
+    }
+    let owned = [
+        (
+            temporary_path(flash_file),
+            "temporary file",
+            "what is there is removed when the run starts, and the new content is written there when it ends",
+        ),
+        (
+            lock_path(flash_file),
+            "lock file",
+            "the run opens it and holds it locked, and other runs open it too",
+        ),
+    ];
+    for (path, role, why) in owned {
+        if let Some(path) = path
+            && same_file(image, &path)
+        {
+            return Err(FlashStateError::ImageIsTheRunsOwn {
+                image: shown(image),
+                role,
+                path: shown(flash_file),
+                why,
+            });
+        }
     }
     Ok(())
 }
@@ -400,16 +458,13 @@ impl FlashState {
         {
             return Err(FlashStateError::NamesADirectory { path: shown_path });
         }
-        let sibling = |prefix: &str, suffix: &str| {
-            let mut sibling = OsString::from(prefix);
-            sibling.push(name);
-            sibling.push(suffix);
-            path.with_file_name(sibling)
+        // Both exist: the path has a file name.
+        let (Some(lock_path), Some(temporary)) = (lock_path(path), temporary_path(path)) else {
+            return Err(FlashStateError::NoFileName { path: shown_path });
         };
         // Before the lock file exists. The judgement that counts is made again under the lock,
         // by whoever asks whether the file exists.
         judge(path, &shown_path, size)?;
-        let lock_path = sibling("", LOCK_SUFFIX);
         let shown_lock = shown(&lock_path);
         let lock = open_lock_file(&lock_path, &shown_path, &shown_lock)?;
         match lock.try_lock() {
@@ -429,8 +484,7 @@ impl FlashState {
             }
         }
         let state = FlashState {
-            // One name per flash file: the lock leaves this run alone with it.
-            temporary: sibling(".", ".tmp"),
+            temporary,
             path: path.to_path_buf(),
             shown: shown_path,
             size,
