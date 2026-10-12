@@ -312,6 +312,8 @@ impl Spi1 {
         command: &FlashCommand<'_>,
         data_in_len: usize,
     ) -> Option<Vec<u8>> {
+        // The callers ask for 64 bytes at most (`Spi1::phase_bytes`); the `min` is what bounds
+        // the allocation whatever a caller does.
         let mut data_in = vec![0u8; data_in_len.min(DATA_BYTES)];
         if let Some(count) = self.sent.get_mut(usize::from(command.opcode)) {
             *count += 1;
@@ -426,7 +428,14 @@ impl Spi1 {
                 // names the bit and nothing more, and no ROM or ESP-IDF v5.5.2 code writes it
                 // (report FW §A.1: "nobody"; the ROM reads through `USR`). A firmware that uses
                 // it, read against a device, settles the encoding.
-                let len = self.data_len(MISO_DLEN);
+                let miso_bits = self.data_bits(MISO_DLEN);
+                let Some(len) = Spi1::phase_bytes(miso_bits) else {
+                    ctx.unsupported(Unsupported::FlashTransferLength {
+                        mosi_bits: 0,
+                        miso_bits,
+                    });
+                    return;
+                };
                 if let Some(data) = self.transfer(ctx, &FlashCommand { address, ..command }, len) {
                     self.store_data_in(&data);
                 }
@@ -437,17 +446,27 @@ impl Spi1 {
         }
     }
 
-    /// Bytes a `xxx_DLEN` register asks for: its field is the bit length minus one.
+    /// The bits a `xxx_DLEN` register asks for, 1 to 1024: its field is the bit length minus one.
+    fn data_bits(&self, register: u32) -> u32 {
+        (self.register(register) & DLEN_MASK) + 1
+    }
+
+    /// The bytes of a data phase of `bits` bits, 0 for a phase the transfer does not have; `None`
+    /// for a phase the model cannot carry, which the caller refuses by name:
     ///
-    /// ASSUMPTION: a length that is not a whole number of bytes is rounded up, the bits past it
-    /// being transferred like the others. Every measured transfer is a whole number of bytes (FB
-    /// §B.2, BA §2.2); what the controller does with a partial byte is not established. The SP1b-4
-    /// lockstep settles it.
-    fn data_len(&self, register: u32) -> usize {
-        let bits = (self.register(register) & DLEN_MASK) + 1;
-        usize::try_from(bits.div_ceil(8))
-            .unwrap_or(DATA_BYTES)
-            .min(DATA_BYTES)
+    /// - more than the 512 bits `W0..W15` hold. Where the controller would take or put the bytes
+    ///   past `W15` is not established, and a transfer cut to 64 bytes would be judged by the
+    ///   chip on a length the firmware did not ask for;
+    /// - a number of bits that is not a whole number of bytes. A chip drops a command whose chip
+    ///   select rises off a byte boundary (report FW §C, row "Framing"), and where the bits of a
+    ///   partial byte read would land in `W0..` is not established.
+    ///
+    /// Every measured transfer is a whole number of bytes that fits: 8, 24, 32, 256 and 512 bits
+    /// in (`MISO_DLEN` 7, 23, `0x1F`, `0xFF`, `0x1FF`: reports FW §A.2, SF §C, §F.1, BA §2.2), 128
+    /// for the ROM's `SPI_read_data` (FW §A.3); no measured `USR` transfer has a data-out phase.
+    fn phase_bytes(bits: u32) -> Option<usize> {
+        let bytes = usize::try_from(bits / u8::BITS).ok()?;
+        (bits.is_multiple_of(u8::BITS) && bytes <= DATA_BYTES).then_some(bytes)
     }
 
     /// The length of the command phase `USER` and `USER2` describe: `None` without one.
@@ -471,6 +490,29 @@ impl Spi1 {
             });
             return;
         }
+        // The two data phases are judged before anything is sent: a refused transfer reaches
+        // the chip neither whole nor cut short. A length register belongs to its phase: without
+        // `USR_MOSI` or `USR_MISO` its value means nothing (ESP-IDF reads the status with
+        // `MOSI_DLEN = 0`, one bit, and no data-out phase: FW §A.2).
+        let mosi_bits = if user & USR_MOSI == 0 {
+            0
+        } else {
+            self.data_bits(MOSI_DLEN)
+        };
+        let miso_bits = if user & USR_MISO == 0 {
+            0
+        } else {
+            self.data_bits(MISO_DLEN)
+        };
+        let (Some(data_out_len), Some(data_in_len)) =
+            (Spi1::phase_bytes(mosi_bits), Spi1::phase_bytes(miso_bits))
+        else {
+            ctx.unsupported(Unsupported::FlashTransferLength {
+                mosi_bits,
+                miso_bits,
+            });
+            return;
+        };
         let opcode = self.user_opcode();
         let address = (user & USR_ADDR != 0).then(|| {
             // The field can ask for up to 64 bits; the register holds 32.
@@ -492,16 +534,7 @@ impl Spi1 {
         } else {
             (user1 & DUMMY_CYCLES_MASK) + 1
         };
-        let data_out: Vec<u8> = if user & USR_MOSI == 0 {
-            Vec::new()
-        } else {
-            self.data_out(self.data_len(MOSI_DLEN))
-        };
-        let data_in_len = if user & USR_MISO == 0 {
-            0
-        } else {
-            self.data_len(MISO_DLEN)
-        };
+        let data_out = self.data_out(data_out_len);
         let command = FlashCommand {
             opcode,
             address,
@@ -1012,11 +1045,11 @@ mod tests {
     }
 
     #[test]
-    fn transfer_lengths_are_bounded_by_the_sixteen_data_registers() {
-        // MISO_DLEN can ask for 1024 bits (128 bytes); the data buffer is W0..W15, 64 bytes.
+    fn a_data_phase_of_512_bits_fills_the_sixteen_data_registers_and_nothing_past_them() {
+        // `MISO_DLEN = 0x1FF`, the longest measured read (SF §C): 64 bytes, the whole of W0..W15.
         let ctx = &mut Ctx::default();
         let mut spi = spi1();
-        user_read(ctx, &mut spi, 0x9F, 1024);
+        user_read(ctx, &mut spi, 0x9F, 512);
         let w15 = svd_regs::esp32c3::addr("SPI1", "W15") - SPI1_BASE;
         // 64 bytes of the repeating id 9D 60 18: byte 60 is 9D (60 % 3 == 0).
         assert_eq!(spi.read(ctx, w15), Some(0x9D18_609D));
@@ -1025,6 +1058,177 @@ mod tests {
             Some(0x14),
             "FLASH_WAITI_CTRL keeps its reset value: nothing was stored past W15"
         );
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    /// A `USR` page program at `0x9000` whose data phase is `mosi_dlen` (bits minus one).
+    fn user_program(ctx: &mut Ctx, spi: &mut Spi1, mosi_dlen: u32) {
+        spi.write(ctx, USER, USR_COMMAND | USR_ADDR | USR_MOSI);
+        spi.write(ctx, USER1, 23 << 26);
+        spi.write(ctx, USER2, 0x7000_0002);
+        spi.write(ctx, ADDR, 0x9000);
+        spi.write(ctx, MOSI_DLEN, mosi_dlen);
+        spi.write(ctx, CMD, CMD_USR);
+    }
+
+    #[test]
+    fn a_data_phase_longer_than_the_data_registers_is_refused_by_name_and_sends_nothing() {
+        // The length fields hold 10 bits: up to 1024 bits, twice what W0..W15 hold. 513 bits is
+        // the first length past them, 520 the first whole number of bytes, 1024 the longest.
+        for bits in [513u32, 520, 768, 1024] {
+            let ctx = &mut Ctx::default();
+            let (mut spi, seen) = recording_spi1();
+            fill_data_registers(ctx, &mut spi);
+            user_program(ctx, &mut spi, bits - 1);
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::FlashTransferLength {
+                    mosi_bits: bits,
+                    miso_bits: 0
+                }),
+                "{bits} bits out"
+            );
+            assert_eq!(spi.read(ctx, CMD), Some(0), "self-clears: no hang");
+            user_read(ctx, &mut spi, 0x9F, bits);
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::FlashTransferLength {
+                    mosi_bits: 0,
+                    miso_bits: bits
+                }),
+                "{bits} bits in"
+            );
+            assert_eq!(ctx.take_unsupported(), None, "one write, one report");
+            assert_eq!(seen.borrow().as_slice(), [], "nothing reached the chip");
+            assert_eq!(spi.commands_sent(0x02) + spi.commands_sent(0x9F), 0);
+        }
+        // The longest phase that fits is sent whole: 64 bytes, W0 first.
+        let ctx = &mut Ctx::default();
+        let (mut spi, seen) = recording_spi1();
+        fill_data_registers(ctx, &mut spi);
+        user_program(ctx, &mut spi, 511);
+        let sent: Vec<u8> = (1..=64).collect();
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [(0x02, Some(at(0x9000)), 0, sent)]
+        );
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
+    fn a_read_asked_past_the_end_of_the_chip_through_too_long_a_phase_reads_nothing() {
+        // 128 bytes asked from 64 bytes before the end of the chip: 64 of them are past it. The
+        // request is refused as it was made, not judged on the 64 bytes the registers could hold.
+        let ctx = &mut Ctx::default();
+        let mut spi = spi_with_image(vec![0x11; 64]);
+        spi.write(ctx, W0, 0xDEAD_BEEF);
+        dio_read(ctx, &mut spi, 0xFF_FFC0, 128);
+        assert_eq!(
+            ctx.take_unsupported(),
+            Some(Unsupported::FlashTransferLength {
+                mosi_bits: 0,
+                miso_bits: 1024
+            })
+        );
+        assert_eq!(
+            spi.read(ctx, W0),
+            Some(0xDEAD_BEEF),
+            "nothing was clocked in"
+        );
+        assert_eq!(spi.commands_sent(0xBB), 0, "nothing was sent");
+    }
+
+    #[test]
+    fn a_data_phase_that_is_not_whole_bytes_is_refused_by_name_and_changes_nothing() {
+        // A chip drops a command whose chip select rises off a byte boundary (FW §C): a program
+        // of 9 bits programs nothing, and neither does the model.
+        for bits in [1u32, 7, 9, 12, 31, 33, 511] {
+            let ctx = &mut Ctx::default();
+            let mut spi = spi1();
+            spi.write(ctx, CMD, CMD_WREN);
+            spi.write(ctx, W0, 0x0000_1200);
+            user_program(ctx, &mut spi, bits - 1);
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::FlashTransferLength {
+                    mosi_bits: bits,
+                    miso_bits: 0
+                }),
+                "{bits} bits out"
+            );
+            assert_eq!(flash_bytes(&spi, 0x9000, 4), [0xFF; 4], "{bits} bits out");
+            assert_eq!(spi.take_flash_writes(), []);
+            spi.write(ctx, CMD, CMD_RDSR);
+            assert_eq!(
+                spi.read(ctx, RD_STATUS),
+                Some(0x02),
+                "nothing reached the chip: its latch is still set"
+            );
+            // A read of a partial byte: where its bits would land in W0 is not established.
+            spi.write(ctx, USER, USR_COMMAND | USR_MISO);
+            spi.write(ctx, USER2, 0x7000_009F);
+            spi.write(ctx, MISO_DLEN, bits - 1);
+            spi.write(ctx, W0, 0xDEAD_BEEF);
+            spi.write(ctx, CMD, CMD_USR);
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::FlashTransferLength {
+                    mosi_bits: 0,
+                    miso_bits: bits
+                }),
+                "{bits} bits in"
+            );
+            assert_eq!(
+                spi.read(ctx, W0),
+                Some(0xDEAD_BEEF),
+                "nothing was clocked in"
+            );
+            assert_eq!(spi.read(ctx, CMD), Some(0), "self-clears: no hang");
+        }
+    }
+
+    #[test]
+    fn the_length_of_a_phase_the_transfer_does_not_have_is_not_judged() {
+        // ESP-IDF reads the status with `USER = 0x90000080` (command and data in), `MOSI_DLEN = 0`
+        // (one bit) and `MISO_DLEN = 7` (FW §A.2): the data-out length belongs to no phase.
+        let ctx = &mut Ctx::default();
+        let mut spi = spi1();
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, USER, 0x9000_0080);
+        spi.write(ctx, USER2, 0x7000_0005);
+        spi.write(ctx, MOSI_DLEN, 0);
+        spi.write(ctx, MISO_DLEN, 7);
+        spi.write(ctx, CMD, CMD_USR);
+        assert_eq!(spi.read(ctx, W0), Some(0x02));
+        // And the other way round: a write disable while `MISO_DLEN` holds 1024 bits.
+        spi.write(ctx, USER, USR_COMMAND);
+        spi.write(ctx, USER2, 0x7000_0004);
+        spi.write(ctx, MISO_DLEN, 1023);
+        spi.write(ctx, MOSI_DLEN, 1023);
+        spi.write(ctx, CMD, CMD_USR);
+        assert_eq!(spi.commands_sent(0x04), 1);
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
+    fn the_hard_wired_read_refuses_a_length_the_data_registers_cannot_hold() {
+        let ctx = &mut Ctx::default();
+        for (miso_dlen, bits) in [(1023u32, 1024u32), (512, 513), (8, 9)] {
+            let (mut spi, seen) = recording_spi1();
+            spi.write(ctx, ADDR, 0x101);
+            spi.write(ctx, MISO_DLEN, miso_dlen);
+            spi.write(ctx, W0, 0xDEAD_BEEF);
+            assert!(spi.write(ctx, CMD, CMD_READ));
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::FlashTransferLength {
+                    mosi_bits: 0,
+                    miso_bits: bits
+                })
+            );
+            assert_eq!(seen.borrow().as_slice(), [], "nothing reached the chip");
+            assert_eq!(spi.read(ctx, W0), Some(0xDEAD_BEEF));
+        }
     }
 
     #[test]
@@ -1359,29 +1563,6 @@ mod tests {
     }
 
     #[test]
-    fn a_mosi_length_past_the_buffer_sends_the_sixty_four_bytes_of_w0_to_w15() {
-        let ctx = &mut Ctx::default();
-        let (mut spi, seen) = recording_spi1();
-        for word in 0..DATA_WORDS {
-            spi.write(ctx, W0 + 4 * word, 0x0403_0201 + 0x0404_0404 * word);
-        }
-        spi.write(ctx, USER, USR_COMMAND | USR_MOSI);
-        spi.write(ctx, USER2, 0x7000_0002);
-        spi.write(ctx, MOSI_DLEN, 1023);
-        spi.write(ctx, CMD, CMD_USR);
-        let seen = seen.borrow();
-        assert_eq!(seen.len(), 1);
-        let sent = &seen[0].3;
-        assert_eq!(sent.len(), DATA_BYTES, "1024 bits asked, 64 bytes exist");
-        assert_eq!(
-            sent[..4],
-            [1, 2, 3, 4],
-            "W0 first, least significant byte first"
-        );
-        assert_eq!(sent[60..], [0x3D, 0x3E, 0x3F, 0x40], "W15 last");
-    }
-
-    #[test]
     fn the_address_is_the_low_bits_of_addr_as_wide_as_user1_says() {
         let ctx = &mut Ctx::default();
         let (mut spi, seen) = recording_spi1();
@@ -1448,23 +1629,6 @@ mod tests {
             );
             assert_eq!(spi.read(ctx, CMD), Some(0), "self-clears: no hang");
         }
-    }
-
-    #[test]
-    fn data_lengths_round_up_to_whole_bytes() {
-        // Pins the ASSUMPTION documented on `Spi1::data_len`: 9 bits asked, 2 bytes transferred.
-        let ctx = &mut Ctx::default();
-        let (mut spi, seen) = recording_spi1();
-        spi.write(ctx, W0, 0x0403_0201);
-        spi.write(ctx, USER, USR_COMMAND | USR_MOSI);
-        spi.write(ctx, USER2, 0x7000_0002);
-        spi.write(ctx, MOSI_DLEN, 8);
-        spi.write(ctx, CMD, CMD_USR);
-        assert_eq!(seen.borrow()[0].3, [1, 2]);
-        let mut read = spi1();
-        read.write(ctx, W0, 0xFFFF_FFFF);
-        user_read(ctx, &mut read, 0x9F, 9);
-        assert_eq!(read.read(ctx, W0), Some(0x0000_609D), "two bytes of the id");
     }
 
     #[test]
@@ -1548,6 +1712,83 @@ mod tests {
         assert_eq!(seen.borrow().as_slice(), []);
         assert_eq!(spi.read(ctx, CMD), Some(0), "self-clears");
         assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
+    fn a_firmware_that_writes_thousands_of_distinct_values_cannot_fill_the_diagnostics() {
+        // 20,000 rounds of registers filled with numbers no firmware would choose, then a
+        // command: every refusal the controller and the chip have is reached thousands of times
+        // with other values, and the table of distinct diagnostics stays far from full.
+        let mut numbers = crate::test_support::Lcg::new(0x1B_F1A5);
+        let ctx = &mut Ctx::default();
+        // A 1 MiB chip: most 24-bit addresses are past its end.
+        let small = FlashConfig::new(1 << 20, crate::flash::JedecId::from_u24(0x9D_6014).unwrap());
+        let mut spi = Spi1::new(Box::new(NorFlash::blank(small.unwrap())));
+        let mut seen = [0u32; 9];
+        for _ in 0..20_000 {
+            let n = &mut numbers;
+            for register in [ADDR, RD_STATUS, CTRL, W0, USER, USER1, USER2] {
+                spi.write(ctx, register, n.next_u32());
+            }
+            // Half of the rounds describe a transfer the controller can send: an 8-bit command,
+            // a 24-bit address, whole bytes.
+            if n.below(2) == 0 {
+                spi.write(ctx, USER, USR_COMMAND | n.next_u32());
+                spi.write(ctx, USER1, (23 << 26) | (n.next_u32() & DUMMY_CYCLES_MASK));
+                spi.write(ctx, USER2, 0x7000_0000 | (n.next_u32() & OPCODE_MASK));
+                spi.write(ctx, MOSI_DLEN, 8 * (1 + n.below(64)) - 1);
+                spi.write(ctx, MISO_DLEN, 8 * (1 + n.below(64)) - 1);
+            } else {
+                spi.write(ctx, MOSI_DLEN, n.next_u32());
+                spi.write(ctx, MISO_DLEN, n.next_u32());
+            }
+            spi.write(ctx, FLASH_SUS_CTRL, n.next_u32());
+            spi.write(ctx, CMD, CMD_WREN);
+            let flag_and_state = n.next_u32() & !COMMAND_BITS;
+            let cmd = match n.below(4) {
+                0 => n.next_u32(),
+                1 => CMD_USR | flag_and_state,
+                _ => (CMD_USR << (1 + n.below(13))) | flag_and_state,
+            };
+            spi.write(ctx, CMD, cmd);
+            while let Some(refusal) = ctx.take_unsupported() {
+                let kind = match refusal {
+                    Unsupported::FlashCommand { .. } => 0,
+                    Unsupported::FlashCommandForm { .. } => 1,
+                    Unsupported::FlashRange { .. } => 2,
+                    Unsupported::FlashProtected { .. } => 3,
+                    Unsupported::FlashTransfer { .. } => 4,
+                    Unsupported::FlashTransferLength { .. } => 5,
+                    Unsupported::FlashProgramLength { .. } => 6,
+                    Unsupported::FlashCommandBits { .. } => 7,
+                    Unsupported::FlashSuspend { .. } => 8,
+                    other => panic!("not a refusal of the flash: {other:?}"),
+                };
+                seen[kind] += 1;
+            }
+            let _ = spi.take_flash_writes();
+        }
+        assert!(
+            seen.iter().all(|&count| count >= 100),
+            "every kind of refusal was reached: {seen:?}"
+        );
+        // An opcode for each of the four refusals of the chip, a byte count that is not 1 to 64
+        // for a program length, a command length for a transfer, and three single lines.
+        let most = 4 * 256 + 192 + 17 + 3;
+        assert!(
+            ctx.diag.distinct() <= most && most < crate::diag::MAX_DISTINCT_DIAGNOSTICS / 2,
+            "{} distinct diagnostics",
+            ctx.diag.distinct()
+        );
+        assert_eq!(
+            ctx.diag.suppressed(),
+            0,
+            "nothing was dropped for lack of room"
+        );
+        // Whatever the firmware does next is still listed.
+        let _ = ctx.diag.drain();
+        ctx.unsupported(Unsupported::ShaDma);
+        assert_eq!(ctx.diag.drain().len(), 1);
     }
 
     #[test]

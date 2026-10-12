@@ -409,6 +409,37 @@ pub fn flash_erase_sector(address: u32) -> Vec<u32> {
     program
 }
 
+/// A fixed linear congruential generator (the constants of Knuth's MMIX): numbers for a test that
+/// wants many different inputs and the same ones at every run. No host randomness is involved.
+#[derive(Clone, Debug)]
+pub struct Lcg(u64);
+
+impl Lcg {
+    #[must_use]
+    pub const fn new(seed: u64) -> Lcg {
+        Lcg(seed)
+    }
+
+    /// The next number: the high half of the state, whose low bits have short periods.
+    pub fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let [.., a, b, c, d] = self.0.to_le_bytes();
+        u32::from_le_bytes([a, b, c, d])
+    }
+
+    pub fn next_u8(&mut self) -> u8 {
+        self.next_u32().to_le_bytes()[3]
+    }
+
+    /// A number below `bound`, which is not 0.
+    pub fn below(&mut self, bound: u32) -> u32 {
+        self.next_u32() % bound
+    }
+}
+
 /// Runs `work` on its own thread and waits at most `limit` for its result: a test of a loop that
 /// must end, which would otherwise hang the whole suite if the loop did not. On a timeout the
 /// test fails with `unbounded`; the thread is left to spin until the test process ends. A panic of

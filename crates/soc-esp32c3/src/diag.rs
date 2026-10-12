@@ -41,10 +41,16 @@ pub enum Unsupported {
         user: u32,
         user2: u32,
     },
+    /// An SPI1 transfer whose data phase the controller model cannot carry: more than the 512 bits
+    /// `W0..W15` hold, or a number of bits that is not a whole number of bytes. `mosi_bits` and
+    /// `miso_bits` are the lengths asked for, 0 for a phase the transfer does not have (a phase
+    /// has 1 to 1024 bits).
+    FlashTransferLength { mosi_bits: u32, miso_bits: u32 },
     /// A hard-wired page program (`SPI1.CMD` bit `FLASH_PP`) whose byte count, `ADDR[31:24]`, is 0
     /// or more than the 64 bytes `W0..W15` hold; `addr` is the whole register.
     FlashProgramLength { addr: u32 },
     /// One write of `SPI1.CMD` with more than one command bit set; `cmd` is the value written.
+    /// Listed once for the run, with the first value: see the deduplication key.
     FlashCommandBits { cmd: u32 },
     /// A write of `SPI1.FLASH_SUS_CTRL` that sends a suspend or a resume, or enables the automatic
     /// ones; `sus_ctrl` is the value written.
@@ -144,6 +150,13 @@ impl Unsupported {
                     " (USER {user:#010x}, USER2 {user2:#010x}, pc {pc:#010x}) but only transfers with an 8-bit command are modeled, so nothing was sent to the flash; use firmware whose flash commands are 8 bits long until other transfers are emulated"
                 )
             }
+            Unsupported::FlashTransferLength {
+                mosi_bits,
+                miso_bits,
+            } => write!(
+                f,
+                "SPI1 was asked for a flash transfer with a data phase of {mosi_bits} bits out and {miso_bits} bits in (pc {pc:#010x}) but only whole bytes are modeled, 64 at most, what W0..W15 hold, so nothing was sent to the flash and SPI1.W0..W15 keep the bytes they held; give MOSI_DLEN and MISO_DLEN the value 8 × bytes − 1 for 1 to 64 bytes"
+            ),
             Unsupported::FlashProgramLength { addr } => write!(
                 f,
                 "SPI1 was asked to program {len} bytes with one FLASH_PP command (ADDR {addr:#010x}, pc {pc:#010x}) but one command carries 1 to 64 bytes, what W0..W15 hold, so nothing was sent to the flash; put the byte count, 1 to 64, in ADDR[31:24]",
@@ -288,13 +301,20 @@ impl Diagnostic {
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
                 }
+                // One line for every length: each of the two can take 1024 values.
+                Unsupported::FlashTransferLength { .. } => (22, 0, 0),
                 // One line per opcode for each kind of refusal of the chip.
                 Unsupported::FlashCommandForm { opcode, .. } => (18, u32::from(opcode), 0),
                 Unsupported::FlashRange { opcode, .. } => (19, u32::from(opcode), 0),
                 Unsupported::FlashProtected { opcode, .. } => (20, u32::from(opcode), 0),
-                // One line per byte count, per set of command bits, and one for suspend requests.
+                // One line per byte count, and one line each for suspend requests and for writes
+                // of several command bits: the 14 command bits alone make four times more sets
+                // than the table has entries, and the bits below them are no command at all. A
+                // key holds nothing the firmware can vary further than a byte: a firmware that
+                // is refused in a loop with other values each time must not fill the table and
+                // so hide every later diagnostic of the run.
                 Unsupported::FlashProgramLength { addr } => (15, addr >> 24, 0),
-                Unsupported::FlashCommandBits { cmd } => (16, cmd, 0),
+                Unsupported::FlashCommandBits { .. } => (16, 0, 0),
                 Unsupported::FlashSuspend { .. } => (17, 0, 0),
             },
             Diagnostic::FlashMapping { entry, fault, .. } => (10, entry, fault as u32),
@@ -731,6 +751,10 @@ mod tests {
             unsupported(Unsupported::FlashProgramLength { addr: 0x4100_9000 }),
             unsupported(Unsupported::FlashCommandBits { cmd: 0x0300_0000 }),
             unsupported(Unsupported::FlashSuspend { sus_ctrl: 0x20 }),
+            unsupported(Unsupported::FlashTransferLength {
+                mosi_bits: 9,
+                miso_bits: 0,
+            }),
             unsupported(FORM),
             unsupported(RANGE),
             unsupported(PROTECTED),
@@ -877,6 +901,153 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_of_the_flash_is_listed_once_per_what_it_is_about_whatever_its_numbers() {
+        // Each row: a refusal, the same one with every other number changed (one entry with the
+        // first), and one that is about something else (another entry), or `None` when the kind
+        // has a single line.
+        let form = |opcode, address_bits, dummy_cycles, data_bytes| Unsupported::FlashCommandForm {
+            opcode,
+            address_bits,
+            dummy_cycles,
+            data_bytes,
+        };
+        let range = |opcode, address, len| Unsupported::FlashRange {
+            opcode,
+            address,
+            len,
+        };
+        let protected = |opcode, status| Unsupported::FlashProtected { opcode, status };
+        let length = |mosi_bits, miso_bits| Unsupported::FlashTransferLength {
+            mosi_bits,
+            miso_bits,
+        };
+        let rows: [(Unsupported, Unsupported, Option<Unsupported>); 7] = [
+            // A firmware that retries a read at another address, with another length.
+            (
+                range(0xBB, 0x10_0000, 64),
+                range(0xBB, 0xFF_FFC0, 4),
+                Some(range(0x20, 0x10_0000, 64)),
+            ),
+            (
+                form(0xBB, 24, 8, 0),
+                form(0xBB, 32, 6, 3),
+                Some(form(0x02, 24, 8, 0)),
+            ),
+            (
+                protected(0x02, 0x3E),
+                protected(0x02, 0x06),
+                Some(protected(0xD8, 0x3E)),
+            ),
+            // 65 bytes at two addresses, then 66 bytes.
+            (
+                Unsupported::FlashProgramLength { addr: 0x4100_9000 },
+                Unsupported::FlashProgramLength { addr: 0x41FF_F000 },
+                Some(Unsupported::FlashProgramLength { addr: 0x4200_9000 }),
+            ),
+            (
+                Unsupported::FlashSuspend { sus_ctrl: 0x20 },
+                Unsupported::FlashSuspend {
+                    sus_ctrl: 0x0A00_0013,
+                },
+                None,
+            ),
+            // Two other command bits, and other bits below them.
+            (
+                Unsupported::FlashCommandBits { cmd: 0x0300_0000 },
+                Unsupported::FlashCommandBits { cmd: 0xC004_1234 },
+                None,
+            ),
+            (length(9, 0), length(0, 1024), None),
+        ];
+        for (first, same, other) in rows {
+            let mut d = Diagnostics::new(false);
+            d.record(unsupported(first));
+            d.record(Diagnostic::Unsupported {
+                what: same,
+                pc: 0x4200_0000,
+            });
+            assert_eq!(
+                d.drain(),
+                vec![unsupported(first)],
+                "{first:?} and {same:?}"
+            );
+            assert_eq!(d.occurrences(&unsupported(same)), 2, "{same:?}");
+            if let Some(other) = other {
+                d.record(unsupported(other));
+                assert_eq!(d.drain(), vec![unsupported(other)], "{other:?}");
+                assert_eq!(d.occurrences(&unsupported(first)), 2, "{first:?}");
+            }
+        }
+    }
+
+    /// The most entries the refusals of the flash can make, all kinds together: an opcode for
+    /// each of the four refusals of the chip, a byte count for a program length, a command
+    /// length (none, or 1 to 16 bits) for a transfer, and one line each for a data length, a
+    /// suspend request and several command bits.
+    const FLASH_REFUSAL_ENTRIES: usize = 4 * 256 + 256 + 17 + 3;
+
+    #[test]
+    fn no_refusal_of_the_flash_can_fill_the_table_whatever_values_the_firmware_writes() {
+        const {
+            assert!(FLASH_REFUSAL_ENTRIES < MAX_DISTINCT_DIAGNOSTICS / 2);
+        }
+        let mut d = Diagnostics::new(false);
+        let mut numbers = crate::test_support::Lcg::new(0x5EED);
+        for _ in 0..40_000 {
+            let n = &mut numbers;
+            let refusals = [
+                Unsupported::FlashCommand {
+                    opcode: n.next_u8(),
+                },
+                Unsupported::FlashCommandForm {
+                    opcode: n.next_u8(),
+                    address_bits: n.next_u32(),
+                    dummy_cycles: n.next_u32(),
+                    data_bytes: n.next_u32(),
+                },
+                Unsupported::FlashRange {
+                    opcode: n.next_u8(),
+                    address: n.next_u32(),
+                    len: n.next_u32(),
+                },
+                Unsupported::FlashProtected {
+                    opcode: n.next_u8(),
+                    status: n.next_u8(),
+                },
+                // `USER2[31:28]` plus one: a command phase has 1 to 16 bits, or does not exist.
+                Unsupported::FlashTransfer {
+                    command_bits: Some(n.below(17)).filter(|&bits| bits != 0),
+                    user: n.next_u32(),
+                    user2: n.next_u32(),
+                },
+                Unsupported::FlashTransferLength {
+                    mosi_bits: n.below(1025),
+                    miso_bits: n.below(1025),
+                },
+                Unsupported::FlashProgramLength { addr: n.next_u32() },
+                Unsupported::FlashCommandBits { cmd: n.next_u32() },
+                Unsupported::FlashSuspend {
+                    sus_ctrl: n.next_u32(),
+                },
+            ];
+            for what in refusals {
+                let pc = n.next_u32();
+                d.record(Diagnostic::Unsupported { what, pc });
+            }
+        }
+        assert_eq!(
+            d.distinct(),
+            FLASH_REFUSAL_ENTRIES,
+            "360,000 refusals with distinct numbers: every entry there can be, and no more"
+        );
+        assert_eq!(d.suppressed(), 0);
+        assert!(!d.drain().contains(&Diagnostic::Suppressed));
+        // Whatever comes next is still listed.
+        d.record(read_at(0x6001_9000, 0));
+        assert_eq!(d.drain(), vec![read_at(0x6001_9000, 0)]);
+    }
+
+    #[test]
     fn new_messages_state_the_cause_then_the_remedy() {
         let texts = [
             (
@@ -916,6 +1087,13 @@ mod tests {
             (
                 unsupported(Unsupported::FlashSuspend { sus_ctrl: 0x20 }),
                 "program/erase suspend or resume (value 0x00000020",
+            ),
+            (
+                unsupported(Unsupported::FlashTransferLength {
+                    mosi_bits: 9,
+                    miso_bits: 1024,
+                }),
+                "a data phase of 9 bits out and 1024 bits in (pc 0x40381000) but only whole bytes are modeled, 64 at most, what W0..W15 hold, so nothing was sent to the flash and SPI1.W0..W15 keep the bytes they held; give MOSI_DLEN and MISO_DLEN the value 8 × bytes − 1",
             ),
             (
                 unsupported(FORM),
