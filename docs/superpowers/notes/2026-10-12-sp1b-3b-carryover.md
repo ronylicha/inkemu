@@ -133,7 +133,7 @@ Ce que les tests n'affirment pas :
 
 ## Hypothèses nouvelles
 
-`grep -rn "ASSUMPTION:" crates --include='*.rs'` rend 84 lignes (77 à la fin de SP1b-3a) : neuf marqueurs s'ajoutent, deux disparaissent. Les profils gardent leurs quatre marqueurs. Entre parenthèses, ce qui trancherait.
+`grep -rn "ASSUMPTION:" crates --include='*.rs'` rend 86 lignes (77 à la fin de SP1b-3a) : onze marqueurs s'ajoutent, deux disparaissent. Les profils gardent leurs quatre marqueurs. Entre parenthèses, ce qui trancherait.
 
 Ajoutés :
 
@@ -146,6 +146,8 @@ Ajoutés :
 - `periph/extmem.rs`, `Extmem::invalidate` : une demande retire les lignes d'une page de flash quelle que soit l'adresse par laquelle elles ont été remplies, l'autre fenêtre de l'entrée ou une autre entrée projetée sur la même page. (Lire une page à son adresse `0x3C…`, la programmer, n'invalider son entrée qu'à son adresse `0x42…`, relire à `0x3C…` ; de même avec deux entrées sur une page.)
 - `periph/extmem.rs`, `Extmem::invalidate` : la plage commence à l'adresse telle que `ICACHE_SYNC_ADDR` la contient, sans être ramenée au début de sa ligne. (Lire une page, la programmer, invalider `0x800` lignes à partir d'un octet après le début de son entrée, relire.)
 - `periph/extmem.rs`, champs `cached` et `stale` : aucune ligne du cache n'est valide après un reset du cœur ou du système. (Un débogueur : lire une fenêtre, programmer ce qu'elle montrait, réinitialiser le cœur, s'arrêter au vecteur de reset, activer le cache sans la ROM et relire.)
+- `periph/spi_mem.rs`, `Spi1::reset` : aucun reset de l'ESP32-C3 n'atteint la puce de flash, quel que soit son niveau (CPU, cœur, système, contrôleur) : le verrou d'écriture et le registre d'état gardent ce qu'ils tenaient ; seule une mise sous tension remet le verrou à 0. Un test tient chaque niveau (autorisation d'écriture, reset, programmation). (Sur un appareil : autorisation d'écriture, puis `esp_restart` ou un reset par le chien de garde RTC, puis lecture du registre d'état avant toute autre autorisation d'écriture.)
+- `periph/spi_mem.rs`, `HARD_WIRED` : `FLASH_CE` envoie `C7`, l'opcode d'ESP-IDF pour l'effacement de toute la puce ; QEMU envoie `60` (FW §A.1), le silicium n'est pas documenté. (Un analyseur logique sur le bus de la flash pendant `SPI_chip_erase`, ou le lockstep contre QEMU de SP1b-4.)
 
 Retirés :
 
@@ -170,15 +172,15 @@ SP1b-3d : 8. SP1b-3f : 10. SP1b-4 : 28. SP2 : 26. SP5a : 8. SP5b : 2. SP8 : 22. 
 
 ## Tests et coût en CI
 
-`cargo test --workspace` : 991 tests passent, 59 sont ignorés (18 de `real_rom`, 13 de `reference_boot`, 27 de `run_cli`, 1 de `inspect_cli` qui demande un firmware tiers). Il se lance sous un utilisateur ordinaire, pas sous `root` (voir plus haut). La CI exécute les tests ignorés avec leur compte exact :
+`cargo test --workspace` : 1 003 tests passent, 60 sont ignorés (18 de `real_rom`, 13 de `reference_boot`, 28 de `run_cli`, 1 de `inspect_cli` qui demande un firmware tiers). Il se lance sous un utilisateur ordinaire, pas sous `root` (voir plus haut). La CI exécute les tests ignorés avec leur compte exact :
 
-- job `rom-boot` : `real_rom` 18, et les tests de la commande sans firmware de référence, passés de 10 à 23 ;
+- job `rom-boot` : `real_rom` 18, et les tests de la commande sans firmware de référence, passés de 10 à 24 ;
 - job `reference-boot` : `reference_boot` passe de 7 à 13 tests, les tests de la commande sur le firmware de référence de 2 à 4.
 
 Durées, mesurées sur la machine de développement et non sur un runner GitHub :
 
 - construction du firmware de référence, seulement quand le cache est manqué : 34 s pour `hello_world` et 32 s de plus pour `nvs_rw_value_cxx` dans le même conteneur lors d'une construction, 21 s et 30 s lors d'une autre (le script imprime ces durées dans le journal du job) ;
-- tests ignorés à la tête de la branche, en version optimisée, charge moyenne de 2 à 5 sur 16 cœurs, durée que le lanceur de tests affiche : `real_rom` 1,3 s, les 23 tests de la commande 1,8 s, `reference_boot` 6,2 s, les 4 tests de la commande sur le firmware de référence 3,1 s ;
+- tests ignorés à la tête de la branche, en version optimisée, charge moyenne de 2 à 5 sur 16 cœurs, durée que le lanceur de tests affiche : `real_rom` 1,3 s, les 24 tests de la commande 2,4 s, `reference_boot` 7,1 s, les 4 tests de la commande sur le firmware de référence 4,0 s (avant la dernière vague de corrections : 1,8 s pour les 23 tests de la commande d'alors, 6,2 s et 3,1 s) ;
 - les mêmes avant les dernières corrections, machine chargée par d'autres travaux (charge moyenne d'environ 20) : `real_rom` 6,2 s, les 22 tests de la commande d'alors 7,4 s, `reference_boot` 18,4 s, les 4 tests de la commande sur le firmware de référence 7,8 s. Mesures d'avant les corrections, dont la charge de la machine n'a pas été notée : `reference_boot` 8,4 s pour 12 tests, la commande 2,1 s pour 16 tests et 4,8 s pour 3. Ces séries, prises sous des charges différentes, ne se comparent donc pas entre elles.
 
 Le temps de compilation des jobs ne change pas : aucune dépendance n'est ajoutée. Les tests d'`emu-cli` activent, sous Unix, la fonctionnalité `fs` de `nix`, qui était déjà une dépendance (pour `mkfifo`) : `Cargo.lock` ne gagne aucun paquet et `cargo deny check` passe.
