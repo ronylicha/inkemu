@@ -5,7 +5,9 @@ use super::mmu::MMU_PAGE_BYTES;
 use super::{Accepted, SPI0_BASE, SPI1_BASE, Storage};
 use crate::ctx::{Ctx, Event};
 use crate::diag::Unsupported;
-use crate::flash::{FlashAddress, FlashCommand, FlashDevice, FlashJournal, FlashWrite};
+use crate::flash::{
+    FlashAddress, FlashCommand, FlashDevice, FlashJournal, FlashWrite, erases_whole_chip,
+};
 use emu_core::Peripheral;
 use svd_regs::esp32c3::addr;
 
@@ -391,18 +393,20 @@ impl Spi1 {
         // the allocation whatever a caller does.
         let mut data_in = vec![0u8; data_in_len.min(DATA_BYTES)];
         if let Some(count) = self.sent.get_mut(usize::from(command.opcode)) {
-            *count += 1;
+            // A count that reached the largest number stays there: it never wraps to a small
+            // one, and never stops the run.
+            *count = count.saturating_add(1);
         }
         let before = self.flash.generation();
         // A command that names an address changes bytes of the 64 KiB page of that address and
         // of no other: a program stays in its 256-byte page, a sector or a block erase in its
-        // unit of 4 or 64 KiB (FW §C, §G). One that names none may be the erase of the whole
-        // chip, which changes the pages that hold something and leaves the others as they
-        // were: the chip is asked which ones hold something before it runs such a command.
-        let held = command
-            .address
-            .is_none()
-            .then(|| pages_holding_data(self.flash.as_ref()));
+        // unit of 4 or 64 KiB (FW §C, §G). The erase of the whole chip changes the pages that
+        // hold something and leaves the others as they were: the chip is asked which ones hold
+        // something before it runs that command, and before no other. The 256 questions would
+        // cost many times a write enable or a status read, which accompany every program and
+        // every erase and change no content.
+        let held =
+            erases_whole_chip(command.opcode).then(|| pages_holding_data(self.flash.as_ref()));
         match self.flash.execute(command, &mut data_in) {
             Ok(written) => {
                 if let Some(write) = written {
@@ -714,7 +718,10 @@ impl Peripheral<Ctx> for Spi1 {
 mod tests {
     use super::*;
     use crate::flash::{FlashConfig, FlashRefusal, NorFlash};
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     /// `CMD` bit 17, `FLASH_PE`: a flag that accompanies a command bit (see `Spi1::run`).
     const CMD_FLASH_PE: u32 = 1 << 17;
@@ -997,6 +1004,8 @@ mod tests {
     struct ErasesThreePages {
         generation: u64,
         holds: Option<fn(u32) -> bool>,
+        /// How many times the controller asked what a page holds.
+        asked: Rc<Cell<u32>>,
     }
 
     impl FlashDevice for ErasesThreePages {
@@ -1029,6 +1038,7 @@ mod tests {
                 (0, MMU_PAGE_BYTES),
                 "asked page by page"
             );
+            self.asked.set(self.asked.get() + 1);
             self.holds.is_none_or(|holds| holds(start / MMU_PAGE_BYTES))
         }
     }
@@ -1041,6 +1051,7 @@ mod tests {
             let mut spi = Spi1::new(Box::new(ErasesThreePages {
                 generation: 0,
                 holds,
+                asked: Rc::default(),
             }));
             spi.write(ctx, ADDR, 0x1_0000);
             spi.write(ctx, CMD, command);
@@ -1056,8 +1067,8 @@ mod tests {
         };
         let only_page_2: Option<fn(u32) -> bool> = Some(|page| page == 2);
         let pages_0_to_2_and_4: Option<fn(u32) -> bool> = Some(|page| page <= 2 || page == 4);
-        // A command without an address: the chip was asked, and the pages it said held
-        // something are the ones told, inside the range of the erase only.
+        // The erase of the whole chip: the chip was asked, and the pages it said held something
+        // are the ones told, inside the range of the erase only.
         assert_eq!(told(only_page_2, CMD_CE), [(2, 2)]);
         assert_eq!(told(pages_0_to_2_and_4, CMD_CE), [(1, 2)]);
         assert_eq!(told(Some(|page| page != 2), CMD_CE), [(1, 1), (3, 3)]);
@@ -1068,9 +1079,71 @@ mod tests {
             Recorder(Rc::default()).holds_data(0, 1),
             "what a chip answers when it does not say otherwise"
         );
-        // A command that names an address is not expected to reach past its page, so the chip
-        // was not asked: the whole range is told, which is never less than what changed.
-        assert_eq!(told(only_page_2, CMD_SE), [(1, 3)]);
+        // No other command is expected to reach past one page, whether it names an address (a
+        // sector erase) or none (a write enable, a status read), so the chip was not asked: the
+        // whole range is told, which is never less than what changed.
+        for command in [CMD_SE, CMD_WREN, CMD_RDSR] {
+            assert_eq!(told(only_page_2, command), [(1, 3)], "{command:#010x}");
+        }
+    }
+
+    #[test]
+    fn the_chip_is_asked_what_its_pages_hold_before_an_erase_of_the_whole_chip_and_no_other() {
+        const CMD_CE: u32 = 1 << 22;
+        let ctx = &mut Ctx::default();
+        let asked = Rc::new(Cell::new(0));
+        let mut spi = Spi1::new(Box::new(ErasesThreePages {
+            generation: 0,
+            holds: None,
+            asked: Rc::clone(&asked),
+        }));
+        // The commands that accompany every program and every erase, hard-wired and through
+        // `USR`: write enable, write disable, the status read and write, the id read, the
+        // wake-up. Then the writes that name an address: a program of one byte and the erases
+        // of a sector and of a block.
+        spi.write(ctx, ADDR, 0x0100_0000);
+        for command in [
+            CMD_WREN,
+            1 << 29,
+            CMD_RDID,
+            CMD_RDSR,
+            CMD_WRSR,
+            1 << 20,
+            CMD_PP,
+            CMD_SE,
+            CMD_BE,
+        ] {
+            spi.write(ctx, CMD, command);
+        }
+        user_read(ctx, &mut spi, 0x05, 8);
+        user_read(ctx, &mut spi, 0x9F, 24);
+        for opcode in [0x06, 0x04, 0x7A] {
+            spi.write(ctx, USER, USR_COMMAND);
+            spi.write(ctx, USER2, 0x7000_0000 | opcode);
+            spi.write(ctx, CMD, CMD_USR);
+        }
+        assert_eq!(spi.commands_sent(0x06), 2, "they were sent");
+        assert_eq!(asked.get(), 0, "none of them can change more than one page");
+        // Both opcodes of the erase of the whole chip: one question per 64 KiB page, each time.
+        spi.write(ctx, CMD, CMD_CE);
+        assert_eq!(asked.get(), 256);
+        spi.write(ctx, USER, USR_COMMAND);
+        spi.write(ctx, USER2, 0x7000_0060);
+        spi.write(ctx, CMD, CMD_USR);
+        assert_eq!(asked.get(), 512);
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
+    fn a_count_of_commands_that_reached_the_largest_number_stays_there() {
+        let ctx = &mut Ctx::default();
+        let mut spi = spi1();
+        spi.sent[0x06] = u64::MAX - 1;
+        for _ in 0..3 {
+            spi.write(ctx, CMD, CMD_WREN);
+        }
+        assert_eq!(spi.commands_sent(0x06), u64::MAX);
+        assert_eq!(spi.commands_sent(0x04), 0, "each opcode has its own count");
     }
 
     #[test]
@@ -1415,8 +1488,11 @@ mod tests {
 
     #[test]
     fn the_hard_wired_read_refuses_a_length_the_data_registers_cannot_hold() {
+        // 1024 and 513 bits are more than `W0..W15` hold; 9 bits and 1 bit are no whole number
+        // of bytes. One bit is what `MISO_DLEN` asks for at its reset value, 0: a firmware that
+        // sets the bit without the length is refused, not answered with one byte.
         let ctx = &mut Ctx::default();
-        for (miso_dlen, bits) in [(1023u32, 1024u32), (512, 513), (8, 9)] {
+        for (miso_dlen, bits) in [(1023u32, 1024u32), (512, 513), (8, 9), (0, 1)] {
             let (mut spi, seen) = recording_spi1();
             spi.write(ctx, ADDR, 0x101);
             spi.write(ctx, MISO_DLEN, miso_dlen);

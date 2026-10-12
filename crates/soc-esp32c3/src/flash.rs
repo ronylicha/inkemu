@@ -49,6 +49,14 @@ const OP_BE: u8 = 0xD8;
 /// (FW §A.1, §A.3); ESP-IDF erases a chip block by block.
 const OP_CE: u8 = 0xC7;
 const OP_CE_ALT: u8 = 0x60;
+
+/// Whether `opcode` is an erase of the whole chip: of the commands that change the content, the
+/// only one that reaches past the 64 KiB page of an address it names. For the controller, which
+/// asks the chip what its pages hold before it sends one, and before no other command.
+pub(crate) const fn erases_whole_chip(opcode: u8) -> bool {
+    matches!(opcode, OP_CE | OP_CE_ALT)
+}
+
 /// The data reads, each with the dummy clocks it takes after its 24-bit address: slow read,
 /// fast read, dual output, dual I/O, quad output, quad I/O
 /// (`IDF:spi_flash/include/spi_flash/spi_flash_defs.h:29-39, 60-71`; FW §A.2). The image header
