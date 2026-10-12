@@ -112,7 +112,7 @@ impl Unsupported {
         match self {
             Unsupported::FlashCommand { opcode } => write!(
                 f,
-                "flash command {opcode:#04x} is not modeled (pc {pc:#010x}): the virtual flash knows the identification and status commands, the data reads (0x03, 0x0b, 0x3b, 0xbb, 0x6b, 0xeb), the page program (0x02), the erases (0x20, 0xd8, 0x60, 0xc7) and the status write (0x01), so nothing was read or changed; use firmware that sends only these flash commands"
+                "flash command {opcode:#04x} is not modeled (pc {pc:#010x}): the virtual flash knows write enable and disable (0x06, 0x04), the status read and write (0x05, 0x01), the identification (0x9f), the SFDP read (0x5a), release from power-down (0xab), resume (0x7a), the data reads (0x03, 0x0b, 0x3b, 0xbb, 0x6b, 0xeb), the page program (0x02) and the erases (0x20, 0xd8, 0x60, 0xc7), so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; use firmware that sends only these flash commands"
             ),
             Unsupported::FlashCommandForm {
                 opcode,
@@ -140,11 +140,11 @@ impl Unsupported {
                 len,
             } => write!(
                 f,
-                "flash command {opcode:#04x} addresses {len} bytes at {address:#08x}, past the end of the flash of the device (pc {pc:#010x}): a chip wraps there or ignores the address bits it lacks, and inkemu does not guess which, so nothing was read or changed; keep flash accesses inside the flash size of the device profile"
+                "flash command {opcode:#04x} addresses {len} bytes at {address:#08x}, past the end of the flash of the device (pc {pc:#010x}): a chip wraps there or ignores the address bits it lacks, and inkemu does not guess which, so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; keep flash accesses inside the flash size of the device profile"
             ),
             Unsupported::FlashProtected { opcode, status } => write!(
                 f,
-                "flash command {opcode:#04x} would program or erase while block-protect bits of the flash status register are set (status {status:#04x}, pc {pc:#010x}): which blocks they protect depends on the flash part and is not modeled, so nothing was changed; clear the protection with a status write of 0x00 before the program or the erase"
+                "flash command {opcode:#04x} would program or erase while block-protect bits of the flash status register are set (status {status:#04x}, pc {pc:#010x}): which blocks they protect depends on the flash part and is not modeled, so nothing was changed; clear the block-protect bits (bits 5:2 of the status register) with a status write that keeps its other bits, before the program or the erase"
             ),
             Unsupported::FlashTransfer {
                 command_bits,
@@ -179,7 +179,7 @@ impl Unsupported {
             ),
             Unsupported::FlashSuspend { sus_ctrl } => write!(
                 f,
-                "SPI1.FLASH_SUS_CTRL asks for a program/erase suspend or resume (value {sus_ctrl:#010x}, pc {pc:#010x}) but a flash operation completes at once here and is never suspended, so nothing was sent to the flash; keep flash auto-suspend off (CONFIG_SPI_FLASH_AUTO_SUSPEND=n, the ESP-IDF default)"
+                "SPI1.FLASH_SUS_CTRL asks for a program/erase suspend or resume (value {sus_ctrl:#010x}, pc {pc:#010x}) but a flash operation completes at once here and is never suspended, so nothing was sent to the flash; build the firmware without flash suspend: no auto-suspend (CONFIG_SPI_FLASH_AUTO_SUSPEND=n, the ESP-IDF default) and no suspend or resume sent by software (FLASH_PES and FLASH_PER, which ESP-IDF writes only with CONFIG_SPI_FLASH_SOFTWARE_RESUME)"
             ),
             Unsupported::ShaDma => write!(
                 f,
@@ -1147,7 +1147,7 @@ mod tests {
             );
             assert!(
                 text.contains(
-                    "the virtual flash knows the identification and status commands, the data reads (0x03, 0x0b, 0x3b, 0xbb, 0x6b, 0xeb), the page program (0x02), the erases (0x20, 0xd8, 0x60, 0xc7) and the status write (0x01), so nothing was read or changed; use firmware that sends only these flash commands"
+                    "the virtual flash knows write enable and disable (0x06, 0x04), the status read and write (0x05, 0x01), the identification (0x9f), the SFDP read (0x5a), release from power-down (0xab), resume (0x7a), the data reads (0x03, 0x0b, 0x3b, 0xbb, 0x6b, 0xeb), the page program (0x02) and the erases (0x20, 0xd8, 0x60, 0xc7), so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; use firmware that sends only these flash commands"
                 ),
                 "{text}"
             );
@@ -1156,6 +1156,61 @@ mod tests {
                 "the flash is no longer read-only: {text}"
             );
         }
+    }
+
+    #[test]
+    fn the_commands_a_refusal_lists_are_the_ones_the_chip_runs_all_of_them_and_no_other() {
+        // The opcode refused is one the list cannot hold: `0xb9` is in neither.
+        let text = unsupported(Unsupported::FlashCommand { opcode: 0xB9 }).to_string();
+        let (_, list) = text.split_once("the virtual flash knows").unwrap();
+        let (list, _) = list.split_once(", so nothing").unwrap();
+        let mut listed: Vec<u8> = list
+            .split("0x")
+            .skip(1)
+            .map(|rest| u8::from_str_radix(&rest[..2], 16).unwrap())
+            .collect();
+        listed.sort_unstable();
+        let run: Vec<u8> = (0..=u8::MAX)
+            .filter(|&opcode| FlashFrame::of(opcode).is_some())
+            .collect();
+        assert_eq!(listed, run, "{list}");
+    }
+
+    #[test]
+    fn the_remedies_of_the_flash_refusals_cover_every_cause_they_are_raised_for() {
+        // A suspend request is raised for the automatic suspend and for a suspend or a resume
+        // the firmware sends itself (`FLASH_PES`, `FLASH_PER`).
+        let suspend = unsupported(Unsupported::FlashSuspend { sus_ctrl: 0b10 }).to_string();
+        assert!(
+            suspend.ends_with(
+                "so nothing was sent to the flash; build the firmware without flash suspend: no auto-suspend (CONFIG_SPI_FLASH_AUTO_SUSPEND=n, the ESP-IDF default) and no suspend or resume sent by software (FLASH_PES and FLASH_PER, which ESP-IDF writes only with CONFIG_SPI_FLASH_SOFTWARE_RESUME)"
+            ),
+            "{suspend}"
+        );
+        // The remedy of a protected write clears the bits that protect and no other: a status
+        // write of 0x00 would clear quad enable too.
+        let protected = unsupported(PROTECTED).to_string();
+        assert!(
+            protected.ends_with(
+                "so nothing was changed; clear the block-protect bits (bits 5:2 of the status register) with a status write that keeps its other bits, before the program or the erase"
+            ),
+            "{protected}"
+        );
+        assert!(!protected.contains("0x00"), "{protected}");
+        // A refused read left the data registers as they were: the firmware goes on with the
+        // bytes of an earlier transfer.
+        let range = unsupported(Unsupported::FlashRange {
+            opcode: 0xBB,
+            address: 0x10_0000,
+            len: 64,
+        })
+        .to_string();
+        assert!(
+            range.contains(
+                "so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; keep flash accesses inside the flash size of the device profile"
+            ),
+            "{range}"
+        );
     }
 
     #[test]

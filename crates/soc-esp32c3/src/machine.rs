@@ -542,10 +542,12 @@ impl Esp32C3 {
         content
     }
 
-    /// How many 4 KiB sectors of the flash hold a byte the run changed since the machine was
+    /// How many 4 KiB sectors of the flash had a byte changed by the run since the machine was
     /// built: 0 says the content is the one the machine was given. A program or an erase that
     /// left every byte as it was counts for nothing, and a reset does not start the count again:
-    /// the chip is not reset with the rest.
+    /// the chip is not reset with the rest. A sector that was changed and changed back counts
+    /// (erased, then programmed with the bytes it held): a count above 0 says that the run wrote
+    /// other bytes at some point, not that the content differs now.
     #[must_use]
     pub fn flash_modified_sectors(&self) -> u32 {
         self.bus.periph.spi1.flash().modified_sectors()

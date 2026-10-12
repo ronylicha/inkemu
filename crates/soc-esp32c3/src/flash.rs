@@ -442,7 +442,10 @@ pub trait FlashDevice: fmt::Debug {
     /// A number that changes whenever a byte of the content does: the version of what was
     /// decoded or read from it.
     fn generation(&self) -> u64;
-    /// How many 4 KiB sectors hold a byte a program or an erase changed since the chip was built.
+    /// How many 4 KiB sectors had a byte changed by a program or an erase since the chip was
+    /// built. A sector whose bytes were changed and changed back counts (erased, then programmed
+    /// with the bytes it held): the count says which sectors were written with other bytes at
+    /// some point, not which ones differ from the content the chip started from.
     fn modified_sectors(&self) -> u32;
 }
 
@@ -1707,6 +1710,25 @@ mod tests {
         write(&mut flash, 0x20, 0x9000, &[]).unwrap();
         write(&mut flash, 0xD8, 0x0000, &[]).unwrap();
         assert_eq!((flash.generation(), flash.modified_sectors()), (erased, 1));
+    }
+
+    #[test]
+    fn a_sector_changed_and_changed_back_still_counts_as_modified() {
+        let image = vec![0x12, 0x34, 0x56];
+        let mut flash = NorFlash::with_image(image.clone(), FlashConfig::default()).unwrap();
+        write(&mut flash, 0x20, 0, &[]).unwrap();
+        write(&mut flash, 0x02, 0, &image).unwrap();
+        assert_eq!(content(&flash, 0, 3), image, "the content it started from");
+        assert_eq!(
+            flash.modified_sectors(),
+            1,
+            "written with other bytes at some point"
+        );
+        assert_eq!(
+            flash.generation(),
+            2,
+            "an erase and a program changed bytes"
+        );
     }
 
     #[test]
