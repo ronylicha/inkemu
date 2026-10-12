@@ -1312,6 +1312,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn flash_code_run_again_after_an_invalidation_counts_as_read_again_for_a_later_program() {
+        use cpu_rv32::asm::jalr;
+        const A0: u8 = 10;
+        const RA: u8 = 1;
+        const T2: u8 = 7;
+        const S0: u8 = 8;
+        let window = crate::memmap::FLASH_IBUS_BASE;
+        let extmem = |register| svd_regs::esp32c3::addr("EXTMEM", register);
+        // `Cache_Invalidate_ICache_All`: `ICACHE_SYNC_ADDR` and `ICACHE_SYNC_SIZE` hold 0 from
+        // reset, so the request is for every line (CM §4.1).
+        let everything = store_register(extmem("ICACHE_SYNC_CTRL"), 1).to_vec();
+        // `Cache_Invalidate_Addr(0x42000000, 0x10000)`: the `0x800` lines of the one entry that
+        // maps the function (CM §4.1).
+        let the_entry: Vec<u32> = [
+            store_register(extmem("ICACHE_SYNC_ADDR"), window),
+            store_register(extmem("ICACHE_SYNC_SIZE"), 0x800),
+            store_register(extmem("ICACHE_SYNC_CTRL"), 1),
+        ]
+        .concat();
+        // A program only clears bits: `li a0, 3` becomes `li a0, 1`.
+        let patch = flash_program(0, &addi(A0, 0, 1).to_le_bytes());
+        let results =
+            |m: &mut Esp32C3| [0, 8, 4].map(|offset| bus_word(m, SRAM_DBUS_BASE + offset));
+
+        for (request, invalidate) in [("everything", everything), ("the entry", the_entry)] {
+            // The function is called, the cache is invalidated, the function is called again,
+            // then programmed, then called. On a device the second call fills the line again
+            // and nothing drops it before the third: the third may run the function of before.
+            // The emulator must not have run the second call from the code it kept decoded,
+            // without the cache state seeing it.
+            let mut between = invalidate.clone();
+            between.extend([jalr(RA, T2, 0), sw(A0, S0, 8)]);
+            between.extend_from_slice(&patch);
+            let mut m = calls_flash_code_around(&between);
+            m.run_until(Cycles(800));
+            assert_eq!(
+                m.drain_diagnostics(),
+                vec![Diagnostic::StaleFlashWindow {
+                    vaddr: window,
+                    page: 0,
+                    pc: window,
+                }],
+                "{request}"
+            );
+            assert_eq!(results(&mut m), [3, 3, 1], "{request}");
+
+            // The control: without the call in between, no line holds the function when it
+            // is programmed, and the call after it reads the flash on a device too.
+            let mut between = invalidate;
+            between.extend_from_slice(&patch);
+            let mut m = calls_flash_code_around(&between);
+            m.run_until(Cycles(800));
+            assert_eq!(m.drain_diagnostics(), Vec::new(), "{request}");
+            assert_eq!(results(&mut m), [3, 0, 1], "{request}");
+        }
+    }
+
     /// Where the tests that take traps put their vector table: a page boundary, which `lui` can
     /// load (`mtvec.BASE` only has to be aligned to 256 bytes).
     const VECTORS: u32 = ROM_BASE + 0x1000;

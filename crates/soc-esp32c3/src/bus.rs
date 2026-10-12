@@ -407,8 +407,11 @@ impl Bus for SocBus {
             // enables and with the content of the chip: a program or an erase that changes a byte
             // moves the generation of the chip, so the code decoded from the flash before it is
             // decoded again (spec §4.1: the decode cache is invalidated when the flash is
-            // rewritten). The three counters only grow, so their sum changes whenever one does
-            // (decision D6). The first two restart at 0 when a core reset rebuilds the MMU and the
+            // rewritten). An invalidation that takes a page out of the cache moves the second
+            // counter too: it shows nothing new, but the code of that page must reach the bus
+            // again to be seen as read again (`Extmem::generation`). The three counters only
+            // grow, so their sum changes whenever one does (decision D6).
+            // The first two restart at 0 when a core reset rebuilds the MMU and the
             // cache registers, so a version can repeat with another mapping: that is safe only
             // because `Hart::reset` builds a new decode cache, at every level (`Esp32C3::reset`).
             // The version is one number for both windows, not one per flash page: a write

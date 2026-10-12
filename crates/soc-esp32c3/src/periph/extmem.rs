@@ -83,10 +83,17 @@ impl PageSet {
         }
     }
 
-    fn remove(&mut self, page: u32) {
-        if let Some((word, bit)) = self.slot(page) {
+    /// Takes `page` out of the set; whether it was in it.
+    fn remove(&mut self, page: u32) -> bool {
+        self.slot(page).is_some_and(|(word, bit)| {
+            let held = *word & bit != 0;
             *word &= !bit;
-        }
+            held
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0 == [0; PAGE_SET_WORDS]
     }
 }
 
@@ -190,6 +197,11 @@ pub struct Extmem {
     generation: u64,
     /// The flash pages read through a window since the cache was last invalidated for them: the
     /// pages a device may hold lines of.
+    ///
+    /// INVARIANT: a page whose code the CPU keeps decoded is in the set. The CPU runs decoded
+    /// code without a bus access, so the bus sees a page read once however often its code runs;
+    /// that is enough only while the page stays in the set. [`Extmem::invalidate`] therefore
+    /// moves the generation, which drops the decoded code, whenever it takes a page out.
     cached: PageSet,
     /// Those of `cached` a program or an erase has changed since: a device may still answer a
     /// window read of them with the bytes of before.
@@ -216,7 +228,11 @@ impl Extmem {
         }
     }
 
-    /// Changes when the cache or one of its buses is switched on or off (decision D6).
+    /// The version of the code the CPU decoded through the flash windows, as far as the cache
+    /// decides it. It changes when the cache or one of its buses is switched on or off (decision
+    /// D6), and when an invalidation takes a page out of the cache: the code of that page is
+    /// then fetched again the next time it runs, as a device fetches it from the flash again,
+    /// and the fetch is a window read like any other ([`Extmem::window_read`]).
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
@@ -266,12 +282,20 @@ impl Extmem {
     /// Reading a window, programming it, issuing such a request and reading again on a device
     /// settles both.
     ///
+    /// A request that takes a page out of the cache moves [`Extmem::generation`]: the CPU may
+    /// hold decoded code of that page, which it would go on running without the bus seeing a
+    /// read, while a device fills the line again at the next fetch. The cost is one decode of
+    /// the flash code that runs next; a request that drops nothing costs nothing.
+    ///
     /// The loop is bounded by the 128 entries of the table, whatever the two registers hold.
     pub(crate) fn invalidate(&mut self, mmu: &MmuTable) {
         let addr = self.registers.read(ICACHE_SYNC_ADDR).unwrap_or(0);
         let lines = self.registers.read(ICACHE_SYNC_SIZE).unwrap_or(0) & SYNC_LINES_MASK;
         if lines == 0 {
             if addr == 0 {
+                if !self.cached.is_empty() {
+                    self.generation += 1;
+                }
                 self.cached = PageSet::default();
                 self.stale = PageSet::default();
             }
@@ -287,14 +311,18 @@ impl Extmem {
         let page_bytes = u64::from(MMU_PAGE_BYTES);
         let end = u64::from(start) + u64::from(lines) * LINE_BYTES;
         let first = u64::from(start).div_ceil(page_bytes);
+        let mut dropped = false;
         for entry in (first..end / page_bytes).take(MMU_ENTRIES) {
             let page = usize::try_from(entry)
                 .ok()
                 .and_then(|index| mmu.flash_page(index));
             if let Some(page) = page {
-                self.cached.remove(page);
+                dropped |= self.cached.remove(page);
                 self.stale.remove(page);
             }
+        }
+        if dropped {
+            self.generation += 1;
         }
     }
 
@@ -562,9 +590,13 @@ mod tests {
         let before = x.generation();
         x.write(ctx, reg("ICACHE_CTRL1"), 0);
         assert_ne!(x.generation(), before);
+        // The registers of a request are no switch: what a request drops is decided when it is
+        // delivered (`an_invalidation_changes_the_generation_when_it_takes_a_page_out...`).
         let before = x.generation();
+        x.write(ctx, reg("ICACHE_SYNC_ADDR"), FLASH_IBUS_BASE);
+        x.write(ctx, reg("ICACHE_SYNC_SIZE"), 0x800);
         x.write(ctx, reg("ICACHE_SYNC_CTRL"), 1);
-        assert_eq!(x.generation(), before, "an invalidation maps nothing new");
+        assert_eq!(x.generation(), before);
     }
 
     #[test]
@@ -859,6 +891,55 @@ mod tests {
         // window and is still followed to the end of the table, no further.
         invalidate(&mut x, &mmu, FLASH_IBUS_BASE + 127 * PAGE, u32::MAX);
         assert!(!x.window_read(5));
+    }
+
+    #[test]
+    fn an_invalidation_changes_the_generation_when_it_takes_a_page_out_of_the_cache_only() {
+        // The CPU runs the code it decoded from a page without a bus access: the page must be
+        // fetched again, and seen as read again, once the cache was invalidated for it.
+        let mmu = mapping(&[(3, 5), (4, 6)]);
+        let mut x = Extmem::new();
+        let mut generation = x.generation();
+        let mut moved = |x: &Extmem| {
+            let moved = x.generation() != generation;
+            generation = x.generation();
+            moved
+        };
+        // Nothing was read: neither request takes anything out.
+        invalidate(&mut x, &mmu, 0, 0);
+        assert!(!moved(&x), "everything, nothing read");
+        invalidate(&mut x, &mmu, FLASH_IBUS_BASE + 3 * PAGE, PAGE_LINES);
+        assert!(!moved(&x), "an entry, its page not read");
+        // A page that was read, and not written since, leaves the cache.
+        x.window_read(5);
+        x.window_read(6);
+        invalidate(&mut x, &mmu, FLASH_IBUS_BASE + 3 * PAGE, PAGE_LINES);
+        assert!(moved(&x), "page 5 was read");
+        invalidate(&mut x, &mmu, FLASH_IBUS_BASE + 3 * PAGE, PAGE_LINES);
+        assert!(!moved(&x), "the same request again: page 5 is out already");
+        // Requests that drop nothing: one line short of the entry, outside the windows, no line
+        // at an address, an entry that maps nothing.
+        for (addr, lines) in [
+            (FLASH_DBUS_BASE + 4 * PAGE, PAGE_LINES - 1),
+            (0, PAGE_LINES),
+            (FLASH_DBUS_BASE + 4 * PAGE, 0),
+            (FLASH_DBUS_BASE + 5 * PAGE, PAGE_LINES),
+        ] {
+            invalidate(&mut x, &mmu, addr, lines);
+            assert!(!moved(&x), "{addr:#x} {lines:#x}");
+        }
+        // Page 6 is still in: the request for everything takes it out, once.
+        invalidate(&mut x, &mmu, 0, 0);
+        assert!(moved(&x), "everything, page 6 read");
+        invalidate(&mut x, &mmu, 0, 0);
+        assert!(!moved(&x), "everything again");
+        // A read does not move it, nor does a write of the flash: the chip has its own count.
+        x.window_read(5);
+        x.flash_written(5, 5);
+        assert!(!moved(&x));
+        // A stale page leaves the cache like any other.
+        invalidate(&mut x, &mmu, FLASH_DBUS_BASE + 3 * PAGE, PAGE_LINES);
+        assert!(moved(&x), "page 5, read then written");
     }
 
     #[test]
