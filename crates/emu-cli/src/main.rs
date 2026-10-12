@@ -70,8 +70,9 @@ enum Command {
         /// at the first Ctrl-C, at a --strict-mmio stop, when the CPU waits for ever. The file
         /// is replaced in one step, never written while the run goes on, so a run that is
         /// killed leaves the file of before. The new content goes through a temporary file
-        /// beside it (.FILE.tmp, the name of FILE after a dot): what an interrupted save left
-        /// at that name is removed by the next run that starts, which says so. A lock file
+        /// beside it (.FILE.tmp, the name of FILE after a dot): what is found at that name (an
+        /// interrupted save leaves its file there) is removed by the next run that starts, and
+        /// by the save, which say so. A lock file
         /// beside it (FILE.lock) refuses a second run on the same file; it is left in place. A
         /// flash holds what the firmware keeps, network credentials among it: on Unix a file
         /// created here is readable and writable by its owner only, one that is replaced keeps

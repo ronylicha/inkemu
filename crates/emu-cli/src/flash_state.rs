@@ -18,8 +18,21 @@ use std::path::{Path, PathBuf};
 /// What is appended to the name of a flash file to name its lock file.
 const LOCK_SUFFIX: &str = ".lock";
 
-/// What to do about something at the name of the temporary file that cannot be removed.
-const REMOVE_THE_TEMPORARY_FILE: &str = "remove it, then run again";
+/// What to do about something at the name of the temporary file that cannot be removed, by the
+/// cause the system gives. Removing a name asks for the right to change the directory, not the
+/// file: a directory that refuses it is the cause, and removing the thing by hand would be
+/// refused as well.
+fn removal_remedy(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            "the directory does not let you remove a name in it (it is not writable for you, or it keeps each file for its owner): make the directory writable for you, or give the flash file a path in a directory of yours"
+        }
+        std::io::ErrorKind::ReadOnlyFilesystem => {
+            "the directory is on a read-only filesystem: give the flash file a path on a writable one"
+        }
+        _ => "remove it, then run again",
+    }
+}
 
 /// The mode of a flash file a run creates, on Unix: read and written by its owner, and nothing
 /// for anyone else.
@@ -558,20 +571,21 @@ impl FlashState {
             Err(e) => return Err(self.unwritable("create", creation_remedy(&e), &e)),
         }
         std::fs::remove_file(&self.temporary)
-            .map_err(|e| self.unwritable("remove", REMOVE_THE_TEMPORARY_FILE, &e))
+            .map_err(|e| self.unwritable("remove", removal_remedy(&e), &e))
     }
 
     /// Removes what sits at the name of the temporary file, if anything does, and says whether
-    /// something did. No run is writing it, since this one holds the lock: it is what a save
-    /// that was interrupted left. A link is removed itself, never what it names.
+    /// something did. No run is writing it, since this one holds the lock: what a save that was
+    /// interrupted left is there, or whatever else was put at that name. A link is removed
+    /// itself, never what it names.
     ///
     /// For a run that is accepted, not for one that may still be refused: see
     /// [`RunFlash::accept`].
-    fn remove_what_an_interrupted_save_left(&self) -> Result<bool, FlashStateError> {
+    fn clear_the_temporary_name(&self) -> Result<bool, FlashStateError> {
         match std::fs::remove_file(&self.temporary) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(self.unwritable("remove", REMOVE_THE_TEMPORARY_FILE, &e)),
+            Err(e) => Err(self.unwritable("remove", removal_remedy(&e), &e)),
         }
     }
 
@@ -643,10 +657,14 @@ impl FlashState {
     /// of the flash file: whatever interrupts this, the path names the old content or the new
     /// one, never a part of either.
     ///
+    /// What sits at the name of the temporary file is removed first, and `log` says so: the name
+    /// was cleared when the run was accepted, and what was put there since is not this run's.
+    /// A failing log writer changes nothing of the save.
+    ///
     /// # Errors
     /// [`FlashStateError::Write`], which says what could not be done to which file; the flash
     /// file is then the one of before, and no temporary file is left.
-    pub fn save(&self, content: &[u8]) -> Result<(), FlashStateError> {
+    pub fn save(&self, content: &[u8], log: &mut dyn Write) -> Result<(), FlashStateError> {
         let failed = |action: &'static str, target: &Path, e: &std::io::Error| {
             // Best effort: the failure being reported is the one worth knowing.
             let _ = std::fs::remove_file(&self.temporary);
@@ -659,11 +677,17 @@ impl FlashState {
             }
         };
         // The name was free when the run was accepted. Whatever was put there since is not
-        // this run's: it is removed (a link itself, never what it points to), once.
+        // this run's: it is removed (a link itself, never what it points to), once, and said.
         let mut file = match self.create_temporary() {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 std::fs::remove_file(&self.temporary)
                     .map_err(|e| failed("remove", &self.temporary, &e))?;
+                let _ = writeln!(
+                    log,
+                    "inkemu: removed {}, put while the run went on at the name where a save of the flash file {} puts its temporary file; nothing to do: the flash file is saved through that name now",
+                    shown(&self.temporary),
+                    self.shown
+                );
                 self.create_temporary()
             }
             other => other,
@@ -776,10 +800,10 @@ impl RunFlash {
         let Some(state) = &self.state else {
             return Ok(());
         };
-        if state.remove_what_an_interrupted_save_left()? {
+        if state.clear_the_temporary_name()? {
             let _ = writeln!(
                 log,
-                "inkemu: removed {}, which a save of the flash file {} that was interrupted left behind; nothing to do: the flash file is as it was before that save, and that name is kept for the next save",
+                "inkemu: removed {}, found at the name where a save of the flash file {} puts its temporary file (an interrupted save leaves one there); nothing to do: the flash file itself is left as it is, and that name is kept for its saves",
                 shown(&state.temporary),
                 state.shown()
             );
@@ -822,7 +846,7 @@ impl RunFlash {
             return true;
         }
         let content = machine.flash_contents();
-        match state.save(&content) {
+        match state.save(&content, log) {
             Ok(()) => {
                 let sha256 = content_sha256(&content, self.size);
                 let path = state.shown();
@@ -886,7 +910,7 @@ mod tests {
         let path = dir.path().join("x4.bin");
         {
             let state = FlashState::open(&path, SIZE).unwrap();
-            state.save(&content(1)).unwrap();
+            save(&state, &content(1)).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), content(1), "no header");
             assert_eq!(
                 names(dir.path()),
@@ -895,7 +919,7 @@ mod tests {
             );
             assert!(state.exists().unwrap());
             assert_eq!(state.load().unwrap(), content(1));
-            state.save(&content(2)).unwrap();
+            save(&state, &content(2)).unwrap();
         }
         let next = FlashState::open(&path, SIZE).unwrap();
         assert!(next.exists().unwrap());
@@ -1075,7 +1099,7 @@ mod tests {
 
         // A link to a file of the size of the flash: followed, it would be read as the flash.
         std::fs::write(dir.path().join("other.bin"), content(7)).unwrap();
-        state.save(&content(1)).unwrap();
+        save(&state, &content(1)).unwrap();
         assert!(state.exists().unwrap());
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(dir.path().join("other.bin"), &path).unwrap();
@@ -1134,12 +1158,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x4.bin");
         let state = FlashState::open(&path, SIZE).unwrap();
-        state.save(&content(1)).unwrap();
+        save(&state, &content(1)).unwrap();
         assert_eq!(mode_of(&path), 0o600, "{:o}", mode_of(&path));
         // The same for a file that was removed while the run went on: it is a new file.
         set_mode(&path, 0o644);
         std::fs::remove_file(&path).unwrap();
-        state.save(&content(2)).unwrap();
+        save(&state, &content(2)).unwrap();
         assert_eq!(mode_of(&path), 0o600);
     }
 
@@ -1149,16 +1173,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x4.bin");
         let state = FlashState::open(&path, SIZE).unwrap();
-        state.save(&content(0)).unwrap();
+        save(&state, &content(0)).unwrap();
         for (seed, mode) in [(1, 0o640), (2, 0o664), (3, 0o600), (4, 0o660)] {
             set_mode(&path, mode);
-            state.save(&content(seed)).unwrap();
+            save(&state, &content(seed)).unwrap();
             assert_eq!(mode_of(&path), mode, "{:o}", mode_of(&path));
             assert_eq!(std::fs::read(&path).unwrap(), content(seed));
         }
         // The access bits, and nothing a flash has no use for.
         set_mode(&path, 0o4640);
-        state.save(&content(5)).unwrap();
+        save(&state, &content(5)).unwrap();
         assert_eq!(mode_of(&path), 0o640, "{:o}", mode_of(&path));
     }
 
@@ -1356,7 +1380,7 @@ mod tests {
         let longest = format!("{}.bin", "n".repeat(246));
         let path = dir.path().join(&longest);
         let state = FlashState::open(&path, SIZE).unwrap();
-        state.save(&content(1)).unwrap();
+        save(&state, &content(1)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), content(1));
         assert_eq!(
             names(dir.path()),
@@ -1446,7 +1470,7 @@ mod tests {
         std::fs::create_dir(&inner).unwrap();
         let state = FlashState::open(&inner.join("x4.bin"), SIZE).unwrap();
         std::fs::remove_dir_all(&inner).unwrap();
-        let err = state.save(&content(1)).unwrap_err();
+        let err = save(&state, &content(1)).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1476,7 +1500,7 @@ mod tests {
         // A directory took the place of the flash file during the run: the rename fails.
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("kept"), b"old").unwrap();
-        let err = state.save(&content(1)).unwrap_err();
+        let err = save(&state, &content(1)).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1493,6 +1517,11 @@ mod tests {
             ["x4.bin", "x4.bin.lock"],
             "no temporary file"
         );
+    }
+
+    /// [`FlashState::save`] with a log nobody reads.
+    fn save(state: &FlashState, content: &[u8]) -> Result<(), FlashStateError> {
+        state.save(content, &mut std::io::sink())
     }
 
     fn accept(flash: &RunFlash) -> (Result<(), FlashStateError>, String) {
@@ -1526,7 +1555,7 @@ mod tests {
         assert_eq!(
             log,
             format!(
-                "inkemu: removed {}, which a save of the flash file {} that was interrupted left behind; nothing to do: the flash file is as it was before that save, and that name is kept for the next save\n",
+                "inkemu: removed {}, found at the name where a save of the flash file {} puts its temporary file (an interrupted save leaves one there); nothing to do: the flash file itself is left as it is, and that name is kept for its saves\n",
                 sanitize(&temporary.display().to_string()),
                 sanitize(&path.display().to_string())
             )
@@ -1549,20 +1578,73 @@ mod tests {
         let temporary = dir.path().join(".x4.bin.tmp");
         let state = FlashState::open(&path, SIZE).unwrap();
         assert_eq!(state.temporary, temporary, "one name per flash file");
-        // What takes the name while the run goes on is not this run's: it is replaced.
+        let saved = |n: u8| {
+            let mut log = Vec::new();
+            state.save(&content(n), &mut log).unwrap();
+            String::from_utf8(log).unwrap()
+        };
+        let removal = format!(
+            "inkemu: removed {}, put while the run went on at the name where a save of the flash file {} puts its temporary file; nothing to do: the flash file is saved through that name now\n",
+            sanitize(&temporary.display().to_string()),
+            sanitize(&path.display().to_string())
+        );
+        // Nothing at the name: nothing is removed, nothing is said.
+        assert_eq!(saved(0), "");
+        // What takes the name while the run goes on is not this run's: it is replaced, and said.
         std::fs::write(&temporary, b"planted").unwrap();
-        state.save(&content(1)).unwrap();
+        assert_eq!(saved(1), removal);
         assert_eq!(std::fs::read(&path).unwrap(), content(1));
         #[cfg(unix)]
         {
             let victim = dir.path().join("victim");
             std::fs::write(&victim, b"untouched").unwrap();
             std::os::unix::fs::symlink(&victim, &temporary).unwrap();
-            state.save(&content(2)).unwrap();
+            assert_eq!(saved(2), removal, "a link is said as anything else");
             assert_eq!(std::fs::read(&path).unwrap(), content(2));
             assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
         }
         assert!(!temporary.exists());
+    }
+
+    /// A directory that lets nothing be removed, with something at the temporary name: the
+    /// cause given is the directory, which removing the thing by hand would meet as well.
+    #[cfg(unix)]
+    #[test]
+    fn what_sits_at_the_temporary_name_of_a_directory_that_takes_no_change_names_the_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let kept_in = dir.path().join("flash");
+        std::fs::create_dir(&kept_in).unwrap();
+        // An earlier run left its lock file, a killed save its temporary file.
+        std::fs::write(kept_in.join("x4.bin.lock"), b"").unwrap();
+        std::fs::write(kept_in.join(".x4.bin.tmp"), b"a part of a flash").unwrap();
+        let mode = |mode| {
+            std::fs::set_permissions(&kept_in, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o555);
+        let administrator = std::fs::File::create(kept_in.join("probe")).is_ok();
+        let begun = RunFlash::begin(Some(&kept_in.join("x4.bin")), false, None, MIB);
+        let accepted = begun.as_ref().map(|(flash, _)| accept(flash));
+        mode(0o755);
+        assert!(
+            !administrator,
+            "this test needs a user whom a read-only directory stops; run it as one"
+        );
+        let (accepted, log) = accepted.expect("the name is taken: nothing is tried at the start");
+        assert_eq!(log, "", "nothing was removed");
+        let text = accepted.unwrap_err().to_string();
+        assert!(
+            text.contains("cannot remove ")
+                && text.contains(".x4.bin.tmp")
+                && text.contains("; the directory does not let you remove a name in it")
+                && text.contains("make the directory writable for you")
+                && !text.contains("remove it, then run again"),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::read(kept_in.join(".x4.bin.tmp")).unwrap(),
+            b"a part of a flash"
+        );
     }
 
     #[test]
@@ -1596,7 +1678,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x4.bin");
         let state = FlashState::open(&path, SIZE).unwrap();
-        state.save(&content(1)).unwrap();
+        save(&state, &content(1)).unwrap();
         assert!(state.exists().unwrap());
         OpenOptions::new()
             .write(true)

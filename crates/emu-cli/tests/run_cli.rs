@@ -2582,8 +2582,12 @@ fn a_save_killed_by_a_file_size_limit_leaves_the_flash_file_of_before_and_the_ne
     let said = next.log.lines().next().unwrap_or_default();
     assert!(
         said.starts_with("inkemu: removed ")
-            && said.contains(".x4.bin.tmp, which a save of the flash file ")
-            && said.contains("x4.bin that was interrupted left behind; nothing to do: "),
+            && said.contains(
+                ".x4.bin.tmp, found at the name where a save of the flash file ",
+            )
+            && said.contains(
+                "x4.bin puts its temporary file (an interrupted save leaves one there); nothing to do: ",
+            ),
         "{}",
         next.log
     );
