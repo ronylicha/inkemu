@@ -10,7 +10,7 @@ Cette note, la table des registres acceptés et plusieurs commentaires du code a
 |---|---|
 | Écritures en flash (programmation, effacements, registre d'état), lectures de données par SPI1, adresse et données des commandes câblées, mise à jour d'`otadata` et comptage des écritures dans le test OTA | **SP1b-3b** (écritures en flash et fichier de flash de l'appareil) |
 | Fichier de flash qui survit aux exécutions, contenu rendu par la machine, état « modifié », troisième terme de `Bus::page_version`, vue en direct ou lignes de cache périmées (ADR 0002), règle de taille d'une `FlashDevice` externe | **SP1b-3b** |
-| Lignes `SPI1.FLASH_WAITI_CTRL`, `FLASH_SUS_CTRL` et `SUS_STATUS` de la table | **SP8**, par décision du plan SP1b-3b : l'attente automatique et la suspension n'ont de sens que lorsqu'une opération de flash dure |
+| Lignes `SPI1.FLASH_WAITI_CTRL`, `FLASH_SUS_CTRL` et `SUS_STATUS` de la table | **SP8** : l'attente automatique et la suspension n'ont de sens que lorsqu'une opération de flash dure |
 | `--firmware`, l'ADR sur le bootloader qui doit le précéder, les tables de partitions dans les profils, les retouches de forme de `boards` (`# Errors` de `from_named_toml`, `ProfileError::Parse`) | **SP1b-3c** |
 | Réception UART, interruptions UART, format de trame (les 8 lignes `INT_ENA`, `INT_CLR`, `CONF0`, `CONF1` des deux UART), côté hôte de l'USB-Serial-JTAG, pilote de console commun aux tests d'intégration et leur accès à `test_support` | **SP1b-3d** (les consoles série dans les deux sens) |
 | Le jalon « un firmware communautaire démarre » (CrossPoint) et son pilote de test | **SP1b-3e** |

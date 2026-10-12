@@ -1,14 +1,16 @@
 # SP1b-3b — Note de passation
 
-Plan : `docs/superpowers/plans/2026-10-12-sp1b-3b-flash-writes.md` (écritures en flash et fichier de flash de l'appareil). Décisions durables : ADR 0002, révisé (modèle de la flash et fenêtres de cache) et ADR 0004 (entrées d'un run et fichier de flash).
+Plan : `docs/superpowers/plans/2026-10-12-sp1b-3b-flash-writes.md` (écritures en flash et fichier de flash de l'appareil). Décisions durables : ADR 0002, révisé (modèle de la flash et fenêtres de cache) et ADR 0004 (entrées d'une exécution et fichier de flash).
+
+Les numéros de décision cités ici (G1 à G37) se résolvent dans le plan versionné, au tableau « Design decisions taken for this plan », pas dans les ADR ni dans le code : G1 à G18 ont été donnés au plan, G19 à G37 pris pendant son écriture. Les étiquettes de rapport (SF, FW, CM) sont celles que le plan définit dans son en-tête.
 
 ## Résultat
 
-- **La flash s'écrit comme sur l'appareil.** La puce programme (ET bit à bit, repli dans la page de 256 octets), efface un secteur, un bloc de 64 Kio ou tout, et reçoit son registre d'état, sous le verrou d'écriture, qui retombe à la fin de chaque opération. SPI1 transmet l'adresse et les données de ses commandes câblées ; une écriture de `CMD` exécute une commande et une seule. Les six lectures de données répondent.
+- **La flash s'écrit comme sur l'appareil.** La puce programme (ET bit à bit, rebouclage au début de la page de 256 octets), efface un secteur, un bloc de 64 Kio ou tout, et reçoit son registre d'état, sous le verrou d'écriture, qui retombe à la fin de chaque opération. SPI1 transmet l'adresse et les données de ses commandes câblées ; une écriture de `CMD` exécute une commande et une seule. Les six lectures de données répondent.
 - **Un firmware compilé depuis ses sources garde un compteur en NVS.** L'exemple `storage/nvs/nvs_rw_value_cxx` d'ESP-IDF v5.5.2, non modifié, vit trois vies en mode strict sur ses deux images : `The value is not initialized yet!`, puis `Restart counter = 1`, puis `= 2`. Les onze programmations sont celles mesurées sous QEMU, dans l'ordre et octet pour octet ; la flash finit comme l'image mesurée (`fc23c7ec…2143f5`, et `6c668205…89de5b` derrière la table du X4).
-- **La disposition OTA du X4 démarre en mode strict** : le bootloader efface puis programme `otadata` au premier démarrage, et à celui-là seulement ; les 32 octets sont ceux mesurés, l'effacement et la programmation sont comptés.
-- **`inkemu run --flash-file <chemin>` conserve la flash d'un appareil d'un run au suivant.** Un second run sur le même fichier démarre à froid (`rst:0x1 (POWERON)`) et affiche le compteur que le premier a écrit ; le fichier vaut alors l'image mesurée après la deuxième vie (`7ad0acf6…363b709`). `--flash` n'est jamais écrite. Sans fichier, le résumé dit combien de secteurs ont été modifiés et perdus.
-- **Déterminisme** : deux runs partis du même contenu ont le même hash de trace et laissent la même flash ; l'image `hello_world` garde son hash de trace `10174cc2726c3d77` (`--max-cycles 40000000`, mode strict).
+- **La disposition OTA du X4 démarre en mode strict** : le bootloader efface puis programme `otadata` au premier démarrage, et à celui-là seulement ; les 32 octets sont ceux mesurés, l'effacement et la programmation sont comptés, et le contenu du secteur est comparé.
+- **`inkemu run --flash-file <chemin>` conserve la flash d'un appareil d'une exécution à la suivante.** Une seconde exécution sur le même fichier démarre à froid (`rst:0x1 (POWERON)`) et affiche le compteur que la première a écrit ; le fichier vaut alors l'image mesurée après la deuxième vie (`7ad0acf6…363b709`). `--flash` n'est jamais écrite. Sans fichier, le résumé dit combien de secteurs ont été modifiés et perdus.
+- **Déterminisme** : deux exécutions parties du même contenu ont la même empreinte de trace et laissent la même flash. La vie de l'image `hello_world` garde son empreinte de trace, `10174cc2726c3d77`, désormais épinglée par un test avec son temps d'appareil (voir plus bas).
 - **Une lecture de fenêtre qui peut différer du silicium est signalée** (ADR 0002, point 6). Ni la ROM, ni le bootloader, ni ESP-IDF ne déclenchent ce diagnostic sur les images de référence.
 
 ## Ce que devient la note de SP1b-3a
@@ -24,45 +26,106 @@ Sa section « Reporté au plan SP1b-3b » a été partagée entre cinq plans par
 
 ## Décisions prises pendant l'écriture du plan
 
-Elles sont dans le tableau des décisions du plan, à partir de G19. Les principales :
+Elles sont dans le tableau des décisions du plan, de G19 à G37. Les principales :
 
-- Plusieurs bits de commande dans une même écriture de `SPI1.CMD` sont refusés en les nommant, plutôt qu'exécutés dans un ordre deviné.
-- SPI1 tient un journal borné (1 024 entrées, le surplus compté) de ce que la puce a écrit, et compte par opcode les commandes qu'il lui envoie : c'est ce que les tests comparent aux mesures.
-- « Secteurs modifiés » et la génération du contenu ne comptent que les octets réellement changés : une programmation qui laisse chaque octet tel quel ne modifie rien, n'invalide rien et ne fait rien écrire.
-- Les refus de la puce sont quatre diagnostics nommés (opcode inconnu, trame inconnue, hors de la puce, protégé) ; une écriture sans verrou est ignorée en silence, comme sur la pièce.
-- Le fichier de flash est verrouillé par un fichier voisin `<chemin>.lock`, jamais supprimé.
-- Un fichier de flash d'une autre taille est refusé même sous `--reset-flash` : une image de firmware donnée par erreur à `--flash-file` doit survivre.
-- Un fichier de flash impossible à écrire à la fin est une erreur de code 2, sauf après un arrêt de `--strict-mmio`, qui garde 3 ; aucun nouveau code de sortie.
-- Le SHA-256 du contenu de départ est imprimé à chaque run, avec ou sans fichier de flash (12 ms pour 16 Mio en version optimisée, mesuré).
-- Les tests du firmware de référence sont sélectionnés par le fragment de nom `reference_firmware` dans la CI.
+- Plusieurs bits de commande dans une même écriture de `SPI1.CMD` sont refusés en les nommant, plutôt qu'exécutés dans un ordre deviné (G19).
+- SPI1 tient un journal borné (1 024 entrées, le surplus compté) de ce que la puce a écrit, et compte par opcode les commandes qu'il lui envoie : c'est ce que les tests comparent aux mesures (G20).
+- « Secteurs modifiés » et la génération du contenu ne comptent que les octets réellement changés : une programmation qui laisse chaque octet tel quel ne modifie rien, n'invalide rien et ne fait rien écrire (G21).
+- Les refus de la puce sont quatre diagnostics nommés (opcode inconnu, trame inconnue, hors de la puce, protégé) ; une écriture sans verrou est ignorée en silence, comme sur une puce réelle (G22).
+- Le fichier de flash est verrouillé par un fichier voisin `<chemin>.lock`, jamais supprimé (G28).
+- Un fichier de flash d'une autre taille est refusé même sous `--reset-flash` : une image de firmware donnée par erreur à `--flash-file` doit survivre (G29).
+- Un fichier de flash impossible à écrire à la fin est une erreur de code 2, sauf après un arrêt de `--strict-mmio`, qui garde 3 ; aucun nouveau code de sortie (G30).
+- Le SHA-256 du contenu de départ est imprimé à chaque exécution, avec ou sans fichier de flash (12 ms pour 16 Mio en version optimisée, mesuré) (G31).
+- Les tests du firmware de référence sont sélectionnés par le fragment de nom `reference_firmware` dans la CI (G35).
 - Les deux exemples de documentation de `soc-esp32c3` (`SocBus::new`, `Esp32C3::flash_contents`) reçoivent leur `RomImage` en paramètre. `RomImage::from_flat` n'existe que sous la fonctionnalité `test-support` : un exemple qui l'appelait se compilait avec `cargo test --workspace`, où un autre crate active la fonctionnalité, et échouait avec `cargo test -p soc-esp32c3`. Pour l'exemple marqué `compile_fail`, c'était pire qu'un échec : il réussissait pour une mauvaise raison, quelle que soit la visibilité de `SocBus::new`. Un exemple `compile_fail` ne prouve que ce que sa mutation fait échouer.
 
 ## Décisions prises pendant l'exécution
 
-Aucune : le plan a été exécuté tel qu'il est écrit.
+Le code des quatorze tâches n'a pas été saisi de nouveau par un exécutant : il a été importé, commit par commit, du clone où l'auteur du plan avait compilé, testé et soumis à mutation chaque tâche, après avoir vérifié mécaniquement que les blocs du plan reconstruisent chacun de ces commits. Une nouvelle saisie aurait coûté sans rien apporter d'indépendant. Ce qui est indépendant, c'est la relecture : six relecteurs, un par domaine (contrôleur SPI1 ; puce ; génération du contenu et lectures périmées ; API de la machine, fichier de flash et CLI ; firmware de référence et CI ; héritiers, README et note), puis des corrections, chacune avec un test qui échoue avant elle et passe après, et avec ses mutations. Le plan n'est pas réécrit : les blocs de code de ses tâches ne sont plus le code de la branche. Ce que les corrections ont changé au comportement :
+
+**Contrôleur SPI1 et puce**
+
+- **Les phases de données que les registres ne peuvent pas porter sont refusées.** Un transfert `USR` dont la phase de données dépasse 512 bits, ou n'est pas un nombre entier d'octets, est refusé en le nommant avant tout envoi (`Unsupported::FlashTransferLength`). Auparavant la longueur était bornée et arrondie en silence, et cette supposition écrivait désormais en flash. La lecture câblée juge `MISO_DLEN` de la même façon : avec la valeur de reset de ce registre (0, soit un bit), elle est refusée, alors qu'elle lisait un octet ; ni la ROM ni ESP-IDF n'écrivent ce bit de commande. La longueur d'une phase que le transfert n'a pas n'est pas jugée : ESP-IDF lit le registre d'état avec `MOSI_DLEN = 0` et sans phase de sortie (FW §A.2).
+- **Une trame par commande.** Chaque commande que la puce exécute a une trame et une seule (`FlashFrame::of`), jugée en premier pour toute commande : l'opcode seul pour `06`, `04`, `05`, `9F`, `AB`, `7A`, `C7` et `60` ; une adresse de 24 bits et 8 cycles d'attente pour `5A` ; un octet pour `01` ; une adresse de 24 bits et au moins un octet pour `02` ; une adresse de 24 bits pour `20` et `D8` ; une adresse de 24 bits et leurs cycles d'attente pour les six lectures. Auparavant `06`, `04`, `05`, `9F`, `AB`, `7A` et `5A` étaient acceptées dans n'importe quelle trame. Les trames mesurées restent acceptées : les tests sur la vraie ROM et sur les images de référence passent, exécutions strictes comprises.
+- **Aucun refus de la flash ne peut remplir la table des diagnostics.** Chaque refus est listé une fois par opcode, par nombre d'octets ou par longueur de commande, et une fois par exécution pour les trois qui n'ont pas de tel nombre, soit 1 300 entrées au plus pour une table de 4 096 ; des tests le tiennent avec des valeurs tirées d'un générateur pseudo-aléatoire déterministe. « Plusieurs bits de commande » (G19) est de ces trois, et non listé une fois par ensemble de bits : `CMD` a 14 bits de commande, donc 16 369 ensembles de deux bits ou plus, quatre fois la table.
+- **Les messages des refus** disent ce que le firmware retrouve dans `W0..W15`, la trame que la commande attend, la liste complète des commandes connues, et un remède pour chaque cause (protection : remettre à 0 les bits 5:2 du registre d'état en gardant les autres ; suspension : ni suspension automatique, ni suspension demandée par logiciel).
+- **La puce tient l'ensemble exact de ses secteurs non vierges**, et un effacement coûte ce qu'il efface. Mesure sur le modèle de la puce seul, en version optimisée, machine chargée, 1 000 tours de « `06`, programmation d'un octet `00` à `0xFFFFFF`, `06`, `C7` » sur une puce de 16 Mio :
+
+  | | Avant | Après |
+  |---|---|---|
+  | Puce vierge, par tour | 9,0 à 11,5 ms | 11,6 à 12,3 µs (dont l'unique croissance de l'image à 16 Mio, environ 10 ms, répartie sur les 1 000 tours) |
+  | Puce construite depuis une image pleine de 16 Mio, par tour | 6,6 à 11,0 ms | 1,5 à 2,8 µs |
+  | 10 000 effacements de blocs déjà effacés | 225 à 305 ms | 1,3 à 2,4 ms |
+  | Construction de la puce, 16 Mio de `0x5A` / de `0xFF` | 0,2 µs (rien n'était lu) | 77 à 115 µs / 1,3 ms |
+
+  Avant la correction, un firmware qui répétait des effacements de toute la puce pouvait faire durer une tranche d'exécution plusieurs minutes, pendant lesquelles Ctrl-C n'était pas vu : une valeur écrite par le firmware décidait d'un coût sur l'hôte. Contrepartie : un effacement de toute la puce ne libère plus l'image ; dès qu'une page haute a été programmée, le modèle occupe jusqu'à la taille de la puce pour le reste de l'exécution. Le coût n'a pas été mesuré à travers la machine.
+- **Les démarrages OTA sont jugés sur le contenu de la flash**, pas seulement sur le journal, et un test de plus (`the_bootloader_erases_an_otadata_sector_that_is_not_blank_before_it_programs_the_entry`) prouve l'effacement sur le bootloader non modifié.
+- **Le journal des écritures ne quitte le crate que par la machine** (`Esp32C3::take_flash_writes`, `flash_writes_dropped`, `flash_commands_sent`) ; son type est interne. La CLI ne montre ni le journal ni le nombre d'entrées perdues.
+
+**Lectures périmées**
+
+- **Le code de flash exécuté de nouveau après une invalidation compte comme relu.** Le CPU exécute le code décodé sans repasser par le bus : une page lue, invalidée, exécutée de nouveau depuis le cache de décodage puis programmée n'était pas signalée. `Extmem::invalidate` fait maintenant avancer la génération quand elle retire une page du cache, ce qui fait décoder ce code de nouveau. Coût mesuré sur 120 millions de cycles de chaque image de référence, soit environ trois vies : 183, 179 et 175 demandes déplacent la génération, toutes pour tout le cache, et pas un décodage de plus (46 681, 122 703 et 112 450 lectures de code en flash, avec et sans la correction).
+- **Un effacement de toute la puce ne marque que les pages qu'il a changées** : la puce dit lesquelles contenaient quelque chose (`FlashDevice::holds_data`). Auparavant toute page lue devenait périmée, même vierge.
+- **Un accès à cheval sur deux pages périmées signale les deux** ; l'état du cache est interrogé une fois par page d'un accès.
+- **Ce qu'un reset fait de l'état périmé est écrit et tenu par un test** : un reset du CPU le garde, un reset du cœur ou du système le vide.
+- **Le remède du message** nomme ce qu'une invalidation prend : `invalidate the cache at the window addresses that map that flash after the write`.
+
+**Fichier de flash et CLI**
+
+- **Droits d'accès.** Sous Unix, un fichier de flash créé a le mode `0600`, un fichier remplacé garde son mode, et un fichier que l'utilisateur ne peut pas écrire est refusé au départ, avec ou sans `--reset-flash` (remède : le rendre modifiable, ou le donner à `--flash` avec un autre `--flash-file`).
+- **`--flash` et `--flash-file` ne peuvent pas désigner le même fichier** : refus avant le démarrage, avec ou sans `--reset-flash`, par le même chemin, une autre écriture du chemin, un lien symbolique ou un lien matériel. Sans ce refus, `--reset-flash` remplaçait l'image, que la documentation disait « jamais écrite ».
+- **Jugement au départ.** Ce qui empêcherait d'enregistrer le fichier et peut se savoir avant le démarrage est refusé avant le chargement de la ROM : un chemin qui finit comme celui d'un répertoire, un répertoire où rien ne peut être créé, un nom trop long. Ce qui se trouve au chemin est jugé avant la création du fichier de verrou : une exécution refusée pour ce motif n'en laisse pas.
+- **Le fichier de verrou n'est jamais suivi ni attendu** : un lien, un tube nommé ou un répertoire à `<chemin>.lock` sont refusés par leur nom (un tube bloquait l'exécution sans fin, un lien faisait créer le fichier qu'il désigne) ; un fichier de verrou qui existe et ne s'ouvre pas est signalé comme tel.
+- **Le fichier temporaire a un nom fixe**, `.<nom>.tmp` (il portait le numéro du processus) ; ce qu'une exécution tuée a laissé est supprimé au départ de la suivante, sous le verrou.
+- **Un fichier de flash supprimé pendant l'exécution est réécrit**, même si rien n'a été modifié, et le résumé le dit.
+- **Le résumé accorde son verbe** : `1 of its 4 KiB sectors was modified`, `… was modified and is not kept`. Une erreur de lecture du fichier de flash donne le remède de sa cause.
+- **Chaque fin d'exécution enregistre le fichier, et des tests le tiennent par la commande** : arrêt strict (code 3), CPU qui attend indéfiniment (code 4), lecteur parti, console impossible à écrire ; un arrêt strict dont le fichier ne peut pas être écrit garde 3.
+
+**Empreinte de trace épinglée.** `x4_runs_the_reference_firmware_along_its_pinned_trace` tient l'empreinte `10174cc2726c3d77` de la vie de `hello_world` (`--strict-mmio --max-cycles 40000001`), avec son temps d'appareil, 11 396 706 µs, et ses 40 000 001 cycles pour 26 562 395 instructions. Un changement de chemin ou de temps la change à dessein : le commit qui la modifie dit pourquoi. Aucune des corrections ne l'a changée.
 
 ## Ce que les tests prouvent, et ce qu'ils ne prouvent pas
 
-Chaque comportement que le plan affirme nomme la mutation qui doit faire échouer son test ; elles ont été essayées. Quatre mutations survivent aux tests du firmware de référence, et sont tuées ailleurs :
+Chaque comportement que le plan affirme nomme la mutation qui doit faire échouer son test ; elles ont été essayées, et chaque correction a essayé les siennes. Trois mutations survivent aux tests qui exécutent le code d'Espressif, et sont tuées ailleurs :
 
-- **ET ou écrasement.** NVS ne programme que des valeurs qui effacent des bits : le firmware de référence ne distingue pas une puce qui fait `ancien ET nouveau` d'une puce qui écrase. La règle est prouvée par le test unitaire `a_program_only_clears_bits`.
-- **Un effacement qui n'efface rien.** Le secteur d'`otadata` que le bootloader efface est déjà effacé dans les images. L'effacement est prouvé par les tests unitaires de la puce et, à travers la commande, par le compteur de démarrages de `the_flash_file_keeps_the_flash_of_the_device_from_one_run_to_the_next`.
+- **ET ou écrasement.** NVS ne programme que des valeurs qui mettent des bits à 0 : le firmware de référence ne distingue pas une puce qui fait `ancien ET nouveau` d'une puce qui écrase. La règle est prouvée par le test unitaire `a_program_only_clears_bits`.
 - **Le code décodé.** Aucun firmware de référence n'exécute du code qu'il vient de réécrire : le troisième terme de `page_version` est prouvé par des tests de la machine.
-- **L'invalidation d'une plage.** Les images de référence ne dépendent que de l'invalidation de tout le cache (au démarrage, et par `bootloader_mmap`) ; l'invalidation par plage de `spi_flash_check_and_flush_cache` n'est couverte que par des tests unitaires.
+- **L'invalidation d'une plage.** Les images de référence ne dépendent que de l'invalidation de tout le cache (au démarrage de la ROM, autour de `bootloader_mmap`, dans `esp_restart`) : avec toute invalidation par plage ignorée, les 18, 13 et 4 tests qui exécutent le code d'Espressif passent encore ; avec l'invalidation de tout le cache ignorée, 6 des 13 tests de `reference_boot` et 1 des 4 tests de la commande échouent. L'invalidation par plage de `spi_flash_check_and_flush_cache` n'est couverte que par des tests unitaires. Un firmware de référence qui projette une partition, l'écrit et la relit en ferait un test.
 
-Couverts par des tests unitaires seulement, faute d'un firmware de référence qui les exerce : un effacement demandé par une application, l'effacement de bloc `D8` (`CMD = 0x00800000`), les programmations de 64 octets et leur découpe à la frontière d'une page, `otadata` écrit par une application, le changement de page de NVS (il faut environ 125 vies par page).
+Une quatrième survivait et ne survit plus : **un effacement qui n'efface rien** est tué par le test du bootloader nommé plus haut (il écrit des zéros dans le secteur d'`otadata` avant le démarrage), en plus des tests unitaires de la puce et du compteur de démarrages de `the_flash_file_keeps_the_flash_of_the_device_from_one_run_to_the_next`.
 
-Non testable : le vidage sur le disque avant le renommage du fichier de flash (`sync_all`). Les refus du script de construction du firmware quand une empreinte ne correspond pas n'ont pas été rejoués dans Docker ; l'étape de vérification de la CI (`sha256sum -c`) l'a été sur une copie altérée.
+Ce que les tests n'affirment pas :
+
+- **Le nombre de resets après la dernière vie** des tests NVS (G36) : une exécution s'arrête à la première frontière de tranche après `Restarting now.`, quelques millisecondes avant ou après le redémarrage. Cela dépend du découpage en tranches, pas de l'appareil.
+- **Couverts par des tests unitaires seulement**, faute d'un firmware de référence qui les exerce : un effacement demandé par une application, l'effacement de bloc `D8` (`CMD = 0x00800000`), les programmations de 64 octets et leur découpe à la frontière d'une page, `otadata` écrit par une application, le changement de page de NVS (il faut environ 125 vies par page).
+- **Cas de l'état périmé sans test propre** (ADR 0002, limites du diagnostic) : les lignes qu'un appareil remplit sans lecture du CPU ; une ligne évincée ; une demande émise pendant que l'entrée projette une autre page ; des octets changés puis ramenés à leur valeur, au niveau du diagnostic ; une lecture de fenêtre cache désactivé.
+- **L'ouverture sans attente du fichier de verrou** (`O_NONBLOCK`) et la seconde vérification du type de ce qui a été ouvert ne sont atteignables que dans une course, entre le regard et l'ouverture : aucun test ne les tient. Vérifié à la main par une double mutation : sans le regard et sans `O_NONBLOCK`, le test du tube nommé reste bloqué ses 20 secondes ; sans le regard seul, le tube est refusé en quelques millisecondes.
+- **Les branches réservées aux systèmes qui ne sont pas Unix** n'ont pas été compilées (trois endroits de `flash_state.rs` : comparaison de deux fichiers par leurs chemins canoniques, ouverture du verrou sans options, fichier temporaire sans mode). Une compilation croisée pour Windows s'arrête dans le script de construction de `ring`, faute de compilateur C pour cette cible sur la machine.
+- **Six tests exigent un utilisateur qui n'est pas l'administrateur** (trois dans `flash_state.rs`, trois dans `run_cli.rs` : répertoire ou fichier en lecture seule) et échouent sous `root` avec un message qui le dit, plutôt que de passer sans rien prouver ; un septième, ignoré, fait de même. La CI tourne sous un utilisateur ordinaire.
+- **Un enregistrement tué par une limite de taille de fichier** (`ulimit -f` plus petite que la flash) : le noyau tue le processus pendant l'écriture (`SIGXFSZ`), sans message ni code de sortie d'inkemu ; le fichier de flash d'avant reste intact, un fichier temporaire partiel reste jusqu'à l'exécution suivante. Le test `a_save_killed_by_a_file_size_limit_leaves_the_flash_file_of_before_and_the_next_run_cleans_up` montre cette limite, il ne la corrige pas : recevoir une erreur ordinaire demanderait de changer la disposition du signal, donc du code `unsafe`, que le projet interdit.
+- **Non testable** : la synchronisation sur le disque avant le renommage du fichier de flash (`sync_all`) ; le répertoire n'est pas synchronisé après le renommage. Deux fichiers sur deux systèmes de fichiers ne peuvent pas être fabriqués dans un test : la comparaison du périphérique, dans le refus du même fichier, n'a pas sa mutation.
+- **Un test dépend du temps de l'hôte** : `an_erase_costs_what_it_erases_and_not_the_size_of_the_chip` borne à 30 secondes, en version de débogage, une boucle qui ne finissait pas dans ce délai avant la correction.
+- Les refus du script de construction du firmware quand une empreinte ne correspond pas n'ont pas été rejoués dans Docker ; l'étape de vérification de la CI (`sha256sum -c`) l'a été sur une copie altérée.
 
 ## Hypothèses nouvelles
 
-Quatre marqueurs `ASSUMPTION:` s'ajoutent, un disparaît : `grep -rn "ASSUMPTION:" crates --include=*.rs` rend 80 lignes (77 à la fin de SP1b-3a), et les profils gardent leurs quatre marqueurs.
+`grep -rn "ASSUMPTION:" crates --include='*.rs'` rend 84 lignes (77 à la fin de SP1b-3a) : neuf marqueurs s'ajoutent, deux disparaissent. Les profils gardent leurs quatre marqueurs. Entre parenthèses, ce qui trancherait.
 
+Ajoutés :
+
+- `flash.rs`, `FlashFrame` : les octets que le contrôleur lit en retour ne font pas partie de la trame jugée ; une commande qui ne répond rien (`06`, `04`, `AB`, `7A`, une programmation, un effacement, une écriture du registre d'état) s'exécute quelle que soit la longueur de la phase d'entrée. (Une lecture contre un appareil.)
 - `flash.rs`, `NorFlash::read_data` : les lectures quadruples (`6B`, `EB`) répondent quel que soit le bit QE du registre d'état. (Une image dont l'en-tête dit QIO ou QOUT, lue contre un appareil.)
 - `flash.rs`, `NorFlash::write_status` : `SRWD` est mémorisé et ne verrouille rien. (Le niveau de la broche `WP#` : le modèle de broches de SP2, ou un schéma.)
-- `periph/spi_mem.rs`, `Spi1::run_hard_wired` : la lecture câblée `FLASH_READ` envoie `ADDR[23:0]` et lit `MISO_DLEN` octets dans `W0..`. Ni la ROM ni ESP-IDF v5.5.2 n'écrivent ce bit. (Un firmware qui s'en sert, lu contre un appareil.)
+- `periph/spi_mem.rs`, `HARD_WIRED_ADDRESS_BITS` : une commande câblée envoie 24 bits d'adresse et aucun cycle d'attente, quoi que contiennent `USER1.USR_ADDR_BITLEN` et `USER.USR_DUMMY` ; tous les appelants mesurés préparent la trame qu'un transfert utilisateur demanderait. (Un effacement câblé émis avec un autre `USER1[31:26]` sur un appareil, ou le lockstep de SP1b-4.)
+- `periph/spi_mem.rs`, `Spi1::run_hard_wired` : la lecture câblée `FLASH_READ` envoie `ADDR[23:0]` et lit dans `W0..` les octets que `MISO_DLEN` demande. Ni la ROM ni ESP-IDF v5.5.2 n'écrivent ce bit. (Un firmware qui s'en sert, lu contre un appareil.)
 - `periph/extmem.rs`, `Extmem::invalidate` : une invalidation de taille nulle à une adresse non nulle, ou à une adresse hors des deux fenêtres, ne retire rien. (Lire une fenêtre, la programmer, émettre une telle demande et relire, sur un appareil.)
-- Retirée : l'adresse d'un transfert utilisateur prise non décalée dans `ADDR` (mesurée pour 24 bits : FW §A.1 et §P, SF §C).
+- `periph/extmem.rs`, `Extmem::invalidate` : une demande retire les lignes d'une page de flash quelle que soit l'adresse par laquelle elles ont été remplies, l'autre fenêtre de l'entrée ou une autre entrée projetée sur la même page. (Lire une page à son adresse `0x3C…`, la programmer, n'invalider son entrée qu'à son adresse `0x42…`, relire à `0x3C…` ; de même avec deux entrées sur une page.)
+- `periph/extmem.rs`, `Extmem::invalidate` : la plage commence à l'adresse telle que `ICACHE_SYNC_ADDR` la contient, sans être ramenée au début de sa ligne. (Lire une page, la programmer, invalider `0x800` lignes à partir d'un octet après le début de son entrée, relire.)
+- `periph/extmem.rs`, champs `cached` et `stale` : aucune ligne du cache n'est valide après un reset du cœur ou du système. (Un débogueur : lire une fenêtre, programmer ce qu'elle montrait, réinitialiser le cœur, s'arrêter au vecteur de reset, activer le cache sans la ROM et relire.)
+
+Retirés :
+
+- `periph/spi_mem.rs` : l'adresse d'un transfert utilisateur prise non décalée dans `ADDR` (mesurée pour 24 bits : FW §A.1 et §P, SF §C).
+- `periph/spi_mem.rs`, `Spi1::data_len` : une longueur qui n'est pas un nombre entier d'octets arrondie par excès (hypothèse 12 de la note SP1b-2). C'est maintenant un refus nommé.
 
 ## Reporté, par héritier
 
@@ -70,30 +133,34 @@ Quatre marqueurs `ASSUMPTION:` s'ajoutent, un disparaît : `grep -rn "ASSUMPTION
 - **SP1b-3d** : réception et interruptions UART, format de trame (8 lignes de la table), côté hôte de l'USB-Serial-JTAG, pilote de console commun aux tests d'intégration et leur accès à `test_support`.
 - **SP1b-3e** : le démarrage d'un firmware communautaire (CrossPoint).
 - **SP1b-3f** : sommeil profond et réveil par le timer RTC (10 lignes d'alimentation de la table), les bits 29:27 de `RTC_CNTL.TIME_UPDATE`, le découpage de `periph/timg.rs` et de `periph/rtc_cntl.rs` ; le sommeil léger y est refusé en le nommant.
-- **SP1b-4** : un cache fidèle à la ligne (ADR 0002 : limites du diagnostic, et lecture après un changement d'entrée MMU sans invalidation) avec le coût d'un défaut ; l'enregistrement et le rejeu, qui portent les entrées d'un run (ADR 0004) ; les hypothèses ci-dessus ; les 28 lignes de la table qui le nomment.
-- **SP2** : l'appareil virtuel doté d'une identité et l'endroit où ranger son fichier de flash ; une sauvegarde de la flash en cours de run si le besoin se confirme ; le niveau de `WP#` ; l'identifiant de `DeviceProfile` comme type validé.
-- **SP8** : les durées réelles des opérations de flash (le bit d'occupation ne se lève jamais : le premier démarrage d'une disposition OTA est plus court ici que sur l'appareil d'une centaine de millisecondes), l'attente automatique et la suspension (`SPI1.FLASH_WAITI_CTRL`, `FLASH_SUS_CTRL`, `SUS_STATUS` : la demande de suspension est refusée en la nommant), la carte de protection par blocs d'une pièce réelle (un programme ou un effacement sous un bit BP est refusé en le nommant). Le registre d'état n'est pas dans le fichier de flash : ses bits non volatils reviennent à leur valeur d'usine à chaque run.
-- **SP9** : Windows. Les tests du verrou et du répertoire disparu supposent un système de fichiers POSIX ; `File::try_lock` existe sur Windows mais n'y a pas été essayé.
-- **Aucun héritier** : les registres de programmation des eFuse restent des accès non modélisés, signalés par leur nom. Un fichier temporaire orphelin (`.<nom>.<pid>.tmp`) laissé par un processus tué pendant l'écriture finale n'est supprimé par aucun run.
+- **SP1b-4** : un cache fidèle à la ligne (ADR 0002 : les cinq cas où le diagnostic se tait et les neuf où il parle) avec le coût d'un défaut ; l'enregistrement et le rejeu, qui portent les entrées d'une exécution (ADR 0004) ; les hypothèses ci-dessus ; les 28 lignes de la table qui le nomment.
+- **SP2** : l'appareil virtuel doté d'une identité et l'endroit où ranger son fichier de flash ; un enregistrement de la flash en cours d'exécution si le besoin se confirme ; le niveau de `WP#` ; l'identifiant de `DeviceProfile` comme type validé. Le journal des écritures et le nombre d'entrées perdues sont à la disposition d'une interface, la CLI ne les montrant pas.
+- **SP8** : les durées réelles des opérations de flash (le bit d'occupation ne passe jamais à 1 : le premier démarrage d'une disposition OTA est plus court ici que sur l'appareil d'une centaine de millisecondes), l'attente automatique et la suspension (`SPI1.FLASH_WAITI_CTRL`, `FLASH_SUS_CTRL`, `SUS_STATUS` : la demande de suspension est refusée en la nommant), la carte de protection par blocs d'une puce réelle (une programmation ou un effacement sous un bit BP est refusé en le nommant). Le registre d'état n'est pas dans le fichier de flash : ses bits non volatils reviennent à leur valeur d'usine à chaque exécution.
+- **SP9** (distribution) : Windows, où le verrou et les droits d'accès du fichier de flash ne sont pas vérifiés. Les tests du verrou et du répertoire disparu supposent un système de fichiers POSIX ; `File::try_lock` existe sur Windows mais n'y a pas été essayé ; les branches du code réservées aux systèmes qui ne sont pas Unix n'ont pas été compilées, et le fichier de flash y reçoit les droits par défaut ; un lien matériel n'y est pas reconnu par le refus du même fichier.
+- **Aucun héritier** : les registres de programmation des eFuse restent des accès non modélisés, signalés par leur nom. La limite de taille de fichier qui tue l'enregistrement (`SIGXFSZ`) reste une limite déclarée (ADR 0004). Le firmware de référence qui ferait un test de l'invalidation par plage n'est attribué à aucun plan.
 
 ## Lignes de la table des registres acceptés, par héritier
 
-SP1b-3d : 8. SP1b-3f : 10. SP1b-4 : 28. SP2 : 26. SP5a : 8. SP5b : 2. SP8 : 22. Plus aucune ligne ne nomme SP1b-3b. Les trois lignes d'invalidation d'`EXTMEM` (`ICACHE_SYNC_CTRL`, `_ADDR`, `_SIZE`) disent désormais leur seul effet : mettre fin au diagnostic de lecture périmée des pages qu'elles couvrent.
+SP1b-3d : 8. SP1b-3f : 10. SP1b-4 : 28. SP2 : 26. SP5a : 8. SP5b : 2. SP8 : 22. Plus aucune ligne ne nomme SP1b-3b. Les trois lignes d'invalidation d'`EXTMEM` (`ICACHE_SYNC_CTRL`, `_ADDR`, `_SIZE`) disent désormais leur seul effet : mettre fin au diagnostic de lecture périmée des pages qu'elles couvrent. La liste `PLANS_TO_COME` du test de la table ne contient que les plans à venir qui possèdent au moins une ligne : SP1b-3c et SP1b-3e y entreront avec leur première ligne.
 
-## Coût en CI
+## Tests et coût en CI
 
-Mesuré sur la machine de développement, pas sur un runner GitHub :
+`cargo test --workspace` : 986 tests passent, 58 sont ignorés (18 de `real_rom`, 13 de `reference_boot`, 26 de `run_cli`, 1 de `inspect_cli` qui demande un firmware tiers). La CI exécute les tests ignorés avec leur compte exact :
+
+- job `rom-boot` : `real_rom` 18, et les tests de la commande sans firmware de référence, passés de 10 à 22 ;
+- job `reference-boot` : `reference_boot` passe de 7 à 13 tests, les tests de la commande sur le firmware de référence de 2 à 4.
+
+Durées, mesurées sur la machine de développement et non sur un runner GitHub :
 
 - construction du firmware de référence, seulement quand le cache est manqué : 34 s pour `hello_world` et 32 s de plus pour `nvs_rw_value_cxx` dans le même conteneur (le script imprime ces durées dans le journal du job) ;
-- job `reference-boot` : `reference_boot` passe de 7 à 12 tests (2,7 s à 8,4 s), les tests de la commande de 2 à 3 (4,8 s) ;
-- job `rom-boot` : les tests de la commande passent de 10 à 16 (2,1 s).
+- tests ignorés, en version optimisée, machine chargée par d'autres travaux (charge moyenne d'environ 20) : `real_rom` 6,2 s, les 22 tests de la commande 7,4 s, `reference_boot` 18,4 s, les 4 tests de la commande sur le firmware de référence 7,8 s. Mesures d'avant les corrections, dont la charge de la machine n'a pas été notée : `reference_boot` 8,4 s pour 12 tests, la commande 2,1 s pour 16 tests et 4,8 s pour 3. Les deux séries ne se comparent donc pas.
 
 Le temps de compilation des jobs ne change pas : aucune dépendance n'est ajoutée.
 
 ## À reporter dans la spec
 
-- **§5.1, persistance** : « chaque appareil virtuel possède son fichier flash » devient, dans la CLI, un fichier demandé par `--flash-file` ; sans l'option rien n'est conservé. Le fichier est écrit à la fin du run, pas au fil de l'eau : un run tué perd ses écritures. La « commande de remise à zéro explicite » est l'option `--reset-flash`. (ADR 0004.)
-- **§5.1, entrées acceptées** : un dump complet donné à `--flash` n'est jamais écrit ; c'est le fichier de `--flash-file` qui porte l'état.
-- **§3.1, déterminisme** : le contenu de la flash au départ est une entrée d'un run, nommée par son SHA-256 ; le hash de trace seul ne distingue pas deux runs partis de deux contenus quand le firmware suit le même chemin. (ADR 0004.)
+- **§5.1, persistance** : « chaque appareil virtuel possède son fichier flash » devient, dans la CLI, un fichier demandé par `--flash-file` ; sans l'option rien n'est conservé. Le fichier est écrit à la fin de l'exécution, pas au fil de l'eau : une exécution tuée perd ses écritures. La « commande de remise à zéro explicite » est l'option `--reset-flash`. (ADR 0004.)
+- **§5.1, entrées acceptées** : un dump complet donné à `--flash` n'est jamais écrit ; c'est le fichier de `--flash-file` qui porte l'état, et les deux options ne peuvent pas désigner le même fichier.
+- **§3.1, déterminisme** : le contenu de la flash au départ est une entrée d'une exécution, nommée par son SHA-256 ; l'empreinte de trace seule ne distingue pas deux exécutions parties de deux contenus quand le firmware suit le même chemin. (ADR 0004.)
 - **§7, erreurs** : un fichier de flash impossible à écrire à la fin donne le code de sortie 2 (3 après un arrêt strict).
 - **`--max-time`** : toujours absent de la spec (déjà signalé par la note SP1b-3a).
