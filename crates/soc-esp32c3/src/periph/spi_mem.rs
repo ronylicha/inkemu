@@ -241,7 +241,14 @@ pub struct Spi1 {
     /// What the commands of the run wrote to the chip. It belongs to the run, not to the
     /// controller: a reset of the controller keeps it.
     journal: FlashJournal,
+    /// How many commands of each opcode the controller sent to the chip, refused ones included.
+    /// Like the journal it belongs to the run. One counter per opcode a byte can hold: its size
+    /// does not depend on what the firmware sends.
+    sent: [u64; OPCODES],
 }
+
+/// The opcodes a command byte can hold.
+const OPCODES: usize = 256;
 
 impl Spi1 {
     #[must_use]
@@ -250,6 +257,7 @@ impl Spi1 {
             registers: Spi1::reset_registers(),
             flash,
             journal: FlashJournal::default(),
+            sent: [0; OPCODES],
         }
     }
 
@@ -284,6 +292,13 @@ impl Spi1 {
         self.journal.dropped()
     }
 
+    /// How many commands of `opcode` the controller sent to the chip since power-on, those the
+    /// chip model refused included.
+    #[must_use]
+    pub fn commands_sent(&self, opcode: u8) -> u64 {
+        self.sent.get(usize::from(opcode)).copied().unwrap_or(0)
+    }
+
     fn register(&self, offset: u32) -> u32 {
         self.registers.read(offset).unwrap_or(0)
     }
@@ -298,6 +313,9 @@ impl Spi1 {
         data_in_len: usize,
     ) -> Option<Vec<u8>> {
         let mut data_in = vec![0u8; data_in_len.min(DATA_BYTES)];
+        if let Some(count) = self.sent.get_mut(usize::from(command.opcode)) {
+            *count += 1;
+        }
         let before = self.flash.generation();
         match self.flash.execute(command, &mut data_in) {
             Ok(written) => {
@@ -935,6 +953,42 @@ mod tests {
                 data: vec![0x00]
             }]
         );
+    }
+
+    #[test]
+    fn every_command_sent_to_the_chip_is_counted_under_its_opcode_for_the_whole_run() {
+        let ctx = &mut Ctx::default();
+        let mut spi = spi1();
+        let sent =
+            |spi: &Spi1| [0x05, 0x06, 0x02, 0x04, 0x9F, 0x35].map(|op| spi.commands_sent(op));
+        assert_eq!(sent(&spi), [0; 6]);
+        // One program as ESP-IDF's driver sends it to a chip whose latch clears at completion:
+        // status, write enable, status, program, status (report SF §B.1). No write disable.
+        spi.write(ctx, CMD, CMD_RDSR);
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, CMD, CMD_RDSR);
+        spi.write(ctx, W0, 0xFFFF_FFFE);
+        spi.write(ctx, ADDR, 0x0400_9020);
+        spi.write(ctx, CMD, CMD_PP);
+        spi.write(ctx, CMD, CMD_RDSR);
+        assert_eq!(sent(&spi), [3, 1, 1, 0, 0, 0]);
+        // A user transfer counts under the opcode of `USER2`; one the chip refuses was sent too.
+        user_read(ctx, &mut spi, 0x9F, 24);
+        user_read(ctx, &mut spi, 0x35, 8);
+        assert_eq!(
+            ctx.take_unsupported(),
+            Some(Unsupported::FlashCommand { opcode: 0x35 })
+        );
+        assert_eq!(sent(&spi), [3, 1, 1, 0, 1, 1]);
+        // A program of no byte is refused by the controller: nothing was sent to the chip.
+        spi.write(ctx, ADDR, 0x9020);
+        spi.write(ctx, CMD, CMD_PP);
+        assert!(ctx.take_unsupported().is_some());
+        assert_eq!(sent(&spi), [3, 1, 1, 0, 1, 1]);
+        // The counts are those of the run: a reset of the controller keeps them.
+        spi.reset();
+        spi.write(ctx, CMD, 1 << 29); // FLASH_WRDI
+        assert_eq!(sent(&spi), [3, 1, 1, 1, 1, 1]);
     }
 
     #[test]

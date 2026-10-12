@@ -505,6 +505,15 @@ impl Esp32C3 {
         self.bus.periph.spi1.flash_writes_dropped()
     }
 
+    /// How many flash commands of `opcode` the SPI1 controller sent to the chip since power-on
+    /// (`0x02` page program, `0x06` write enable, `0x04` write disable, `0x05` read status, and
+    /// so on), those the chip model refused included: what a test compares with the commands a
+    /// firmware sends to a real chip.
+    #[must_use]
+    pub fn flash_commands_sent(&self, opcode: u8) -> u64 {
+        self.bus.periph.spi1.commands_sent(opcode)
+    }
+
     /// The whole content of the flash chip as it is now, erased bytes included: exactly
     /// [`FlashConfig::size`](crate::flash::FlashConfig::size) bytes, at most 16 MiB whatever the
     /// firmware did. It is what a caller keeps to let a later run go on from this one: given
