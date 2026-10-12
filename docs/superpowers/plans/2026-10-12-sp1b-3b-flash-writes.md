@@ -15,7 +15,7 @@
 > - **The trace hash of the `hello_world` life is a number the documents quote** → a test pins it, with its device time.
 > - **Ignored tests: 18, 16, 12 and 3** (Tasks 12 and 13) → 18, 24, 13 and 4; four mutations that survive Espressif's code → three, the erase being proven on the unmodified bootloader.
 > - **`--flash` is refused when it names the flash file** (Task 10) → also when it names the temporary file or the lock file of the flash file, by any route; **a second Ctrl-C always exits 130** → once the summary has begun, Ctrl-C ends nothing and the summary and the save complete; every removal at the temporary name is said, without presuming what was there; **the chip is asked what its pages hold before every chip erase** → only before one it would run. ADR 0004 is renamed `0004-entrees-d-une-execution-et-fichier-de-flash.md`.
-> - **`ASSUMPTION:` lines**: 77 at the base, 86 at the end of the branch; eleven added, two removed. The last two added mark the chip's latch and status across every reset of the ESP32-C3, and the opcode `FLASH_CE` sends. `cargo test --workspace`: 1,003 passed, 60 ignored.
+> - **`ASSUMPTION:` lines**: 77 at the base, 86 at the end of the branch; eleven added, two removed. The last two added mark the chip's latch and status across every reset of the ESP32-C3, and the opcode `FLASH_CE` sends. `cargo test --workspace`: 1,004 passed, 60 ignored.
 >
 > The code blocks of the tasks are not the code as it stands on the branch, and the test counts, messages and document texts they state are not those of the tree. See the hand-over note, `docs/superpowers/notes/2026-10-12-sp1b-3b-carryover.md`, section « Décisions prises pendant l'exécution ».
 
