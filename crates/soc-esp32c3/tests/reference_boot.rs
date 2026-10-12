@@ -1,7 +1,15 @@
-//! The milestones of plans SP1b-2 and SP1b-3a on the reference firmware (ESP-IDF v5.5.2 bootloader +
-//! `hello_world`): the boot, then the whole life of the application, its restart and a second boot.
-//! `INKEMU_ROM_ELF_DIR=<dir> INKEMU_REF_FLASH=<flash_hello.bin> cargo test -p soc-esp32c3 --test reference_boot -- --ignored`
-//! Build the image with `tools/reference-firmware/build.sh`.
+//! The milestones of plans SP1b-2, SP1b-3a and SP1b-3b on the reference firmware, three images
+//! behind the same ESP-IDF v5.5.2 bootloader:
+//! - `hello_world`: the boot, then the whole life of the application, its restart and a second
+//!   boot;
+//! - `nvs_rw_value_cxx`, which keeps a restart counter in NVS: three lives and the flash writes
+//!   of each, behind its own partition table and behind the stock table of the X4, where the
+//!   bootloader writes `otadata` first.
+//!
+//! Each image is named by its own variable, and a test whose variable is missing fails by naming
+//! it. The whole suite:
+//! `INKEMU_ROM_ELF_DIR=<dir> INKEMU_REF_FLASH=<flash_hello.bin> INKEMU_NVS_FLASH=<flash_nvs.bin> INKEMU_NVS_OTA_FLASH=<flash_nvs_ota.bin> cargo test --release -p soc-esp32c3 --test reference_boot -- --ignored`
+//! Build the three images with `tools/reference-firmware/build.sh`, which prints their paths.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
 
 mod common;
@@ -763,7 +771,19 @@ fn counter_entry(crc: [u8; 4], value: u8) -> Vec<u8> {
 }
 
 /// Where NVS keeps the state of the 126 entries of its first page, two bits each: the word the
-/// example programs again and again, clearing bits, with no erase (SF §B.2, §G assertion 3).
+/// example programs six times in three lives, with no erase in between (SF §B.2).
+///
+/// What the tests here tell of it: that it was programmed with the measured values in the
+/// measured order, that nothing erased it, and that it ends as measured. What they cannot tell:
+/// that a program stores the AND of the byte it is sent with the byte the cell holds. The six
+/// values, `FE FA EA E2 A2 82`, each only clear bits of the one before, and every cell starts
+/// at `FF`: a chip that stored the bytes as sent would leave the same word, the same journal
+/// and the same hashes, and every test of this file would pass on it. The rule is held by unit
+/// tests, which program bytes that would set bits again:
+/// `flash::tests::a_program_only_clears_bits`,
+/// `flash::tests::a_long_random_sequence_of_writes_leaves_what_the_plain_chip_holds_and_counts`
+/// and
+/// `machine::tests::the_content_of_the_flash_leaves_the_machine_whole_and_builds_the_same_flash_again`.
 const ENTRY_STATES: u32 = 0x9020;
 
 /// Every program of the three lives of the example on an erased NVS partition, in order: the
@@ -799,6 +819,46 @@ fn the_programs_of_the_three_lives() -> [Vec<FlashWrite>; 3] {
             states(0x82),
         ],
     ]
+}
+
+/// What the first life of the example says of the counter: there is none yet.
+const COUNTER_NOT_INITIALIZED: &str =
+    "Reading restart counter from NVS ... The value is not initialized yet!";
+
+/// The lines the application prints in one life, in order (SF §B.3): it opens NVS, says what it
+/// read of the counter (`reading`), writes the counter back, counts down eleven lines from 10 to
+/// 0 and restarts.
+fn the_lines_of_a_life(reading: &[&str]) -> Vec<String> {
+    let mut lines = vec!["Opening Non-Volatile Storage (NVS) handle... Done".to_owned()];
+    lines.extend(reading.iter().map(|&line| line.to_owned()));
+    lines.push("Updating restart counter in NVS ... Done".to_owned());
+    lines.push("Committing updates in NVS ... Done".to_owned());
+    lines.extend(
+        (0..=10)
+            .rev()
+            .map(|seconds| format!("Restarting in {seconds} seconds...")),
+    );
+    lines.push(RESTARTING_NOW.trim_end().to_owned());
+    lines
+}
+
+/// Asserts that `console` holds, in order, the lines of three lives of the example (SF §B.3,
+/// §G): a power-on whose life finds no counter, then two restarts whose lives read the counter
+/// the life before wrote, each life with every line of the first. `first_boot` are lines of the
+/// bootloader of the first boot, between the ROM banner and the application.
+fn assert_the_console_of_three_lives(console: &str, first_boot: &[&str]) {
+    let mut lines = vec!["rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)".to_owned()];
+    lines.extend(first_boot.iter().map(|&line| line.to_owned()));
+    lines.extend(the_lines_of_a_life(&[COUNTER_NOT_INITIALIZED]));
+    for counter in 1..=2 {
+        lines.push("rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)".to_owned());
+        lines.extend(the_lines_of_a_life(&[
+            "Reading restart counter from NVS ... Done",
+            &format!("Restart counter = {counter}"),
+        ]));
+    }
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    assert_lines_in_order(console, &lines);
 }
 
 /// What the journal of a strict run of the example may hold: the restart it asks for, and
@@ -838,34 +898,9 @@ fn the_nvs_example_counts_its_restarts_over_three_lives_and_programs_the_measure
         run.stop,
         run.console
     );
-    assert_lines_in_order(
-        &run.console,
-        &[
-            "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)",
-            "Opening Non-Volatile Storage (NVS) handle... Done",
-            "Reading restart counter from NVS ... The value is not initialized yet!",
-            "Updating restart counter in NVS ... Done",
-            "Committing updates in NVS ... Done",
-            "Restarting in 10 seconds...",
-            "Restarting in 0 seconds...",
-            "Restarting now.",
-            "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)",
-            "Reading restart counter from NVS ... Done",
-            "Restart counter = 1",
-            "Committing updates in NVS ... Done",
-            "Restarting now.",
-            "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)",
-            "Reading restart counter from NVS ... Done",
-            "Restart counter = 2",
-            "Committing updates in NVS ... Done",
-            "Restarting now.",
-        ],
-    );
+    assert_the_console_of_three_lives(&run.console, &[]);
     assert_eq!(
-        count_lines(
-            &run.console,
-            "Reading restart counter from NVS ... The value is not initialized yet!"
-        ),
+        count_lines(&run.console, COUNTER_NOT_INITIALIZED),
         1,
         "only the first life finds no counter"
     );
@@ -874,7 +909,7 @@ fn the_nvs_example_counts_its_restarts_over_three_lives_and_programs_the_measure
     assert_eq!(run.flash_modified_sectors, 1, "the first page of NVS");
     assert_eq!(
         run.flash[ENTRY_STATES as usize], 0x82,
-        "FF to 82 with no erase"
+        "the last of the six values programmed there; the journal above holds no erase"
     );
     assert!(run.resets >= 2, "two restarts were crossed: {}", run.resets);
     assert_nothing_but_the_restart_is_reported(&run.diagnostics);
@@ -893,19 +928,8 @@ fn the_nvs_example_behind_the_stock_x4_table_writes_otadata_once_and_counts_its_
         run.stop,
         run.console
     );
-    assert_lines_in_order(
-        &run.console,
-        &[
-            NO_FACTORY_IMAGE,
-            OTADATA_SET,
-            "Reading restart counter from NVS ... The value is not initialized yet!",
-            "Restarting now.",
-            "Restart counter = 1",
-            "Restarting now.",
-            "Restart counter = 2",
-            "Restarting now.",
-        ],
-    );
+    assert_the_console_of_three_lives(&run.console, &[NO_FACTORY_IMAGE, OTADATA_SET]);
+    assert_eq!(count_lines(&run.console, COUNTER_NOT_INITIALIZED), 1);
     assert_eq!(count_lines(&run.console, NO_FACTORY_IMAGE), 1);
     assert_eq!(count_lines(&run.console, OTADATA_SET), 1);
     let mut expected = the_otadata_update().to_vec();
@@ -943,13 +967,7 @@ fn a_cold_start_from_the_flash_the_first_life_left_goes_on_counting() {
             "Restarting now.",
         ],
     );
-    assert_eq!(
-        count_lines(
-            &second.console,
-            "Reading restart counter from NVS ... The value is not initialized yet!"
-        ),
-        0
-    );
+    assert_eq!(count_lines(&second.console, COUNTER_NOT_INITIALIZED), 0);
     assert_eq!(second.flash_writes, second_life);
     assert_eq!(sha256(&second.flash), NVS_AFTER_LIFE_2);
     assert_nothing_but_the_restart_is_reported(&second.diagnostics);
@@ -986,6 +1004,19 @@ fn three_lives_of_the_nvs_example_are_the_same_run_twice_and_leave_the_same_flas
 /// disable (`04`) after each one: 142 of them in FW §A.4. A chip clears the latch when the
 /// operation completes, and so does the model: the application sends none here. Status reads
 /// (`05`) are not counted: how many there are depends on how fast the chip answers.
+///
+/// Why a count of `04` is asserted here, when the numbers of `05` and `04` measured under QEMU
+/// are properties of QEMU's chip (SF §G assertion 1, §O question 1) and must not be pinned. The
+/// number asserted is not one QEMU gave. It is zero, in the application phase alone: a
+/// difference of two counts, which leaves out the write disable the bootloader sends whatever
+/// the chip does (BA §2.2). And it follows from the code of ESP-IDF, not from a capture: its
+/// driver sends a write disable after a program only when the chip, idle again, still shows the
+/// latch set (`IDF:spi_flash/spi_flash_chip_generic.c:462-468`; FW key result 5). A chip whose
+/// latch clears when the operation completes is sent none, however long its operations last and
+/// however many status reads they take. That the latch clears is what the datasheet states (FW
+/// §C, row "WEL cleared") and what ESP-IDF requires of a chip; it is read, not measured on a
+/// device. This test is the only one on a real firmware that fails when the latch stays set:
+/// the bytes written, the journal and the console are the same on both chips.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_NVS_OTA_FLASH"]
 fn a_first_boot_sends_one_write_enable_per_write_and_the_application_no_write_disable() {
