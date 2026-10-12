@@ -42,6 +42,14 @@ const CMD_BE: u32 = 1 << 23;
 ///
 /// `CMD` [7:0] are two read-only state fields (`SPI1_MST_ST`, `MSPI_ST`): no command lives
 /// there. Suspend and resume are bits 1 and 0 of `FLASH_SUS_CTRL`.
+///
+/// ASSUMPTION: `FLASH_CE` (bit 22) sends `C7`. FW §A.1 gives `60` for it, as QEMU's controller
+/// sends it, and says that the opcode of a hard-wired bit is fixed by the controller on silicon
+/// and not documented; `C7` is ESP-IDF's opcode of a chip erase (`spi_flash_defs.h`, report BC
+/// §D.2 item 6). The chip model runs both alike, so no content depends on the choice:
+/// only the count of commands per opcode does, and a comparison with QEMU. Settled by a logic
+/// analyser on the flash bus of a device while the ROM's `SPI_chip_erase` runs, or by the
+/// lockstep against QEMU of SP1b-4 (which would then see `60`).
 const HARD_WIRED: [(u32, u8); 13] = [
     (CMD_READ, 0x03),
     (1 << 30, 0x06), // WREN
@@ -347,6 +355,22 @@ impl Spi1 {
 
     /// The controller is reset (`SYSTEM.PERIP_RST_EN0` bit 1, or a core reset): its registers
     /// return to their reset values. The flash chip is another component: it keeps its content.
+    ///
+    /// ASSUMPTION: no reset of the ESP32-C3 reaches the chip, whatever its level (CPU, core,
+    /// system, or this controller): the write-enable latch and the status register keep what
+    /// they held, so a program sent after the reset runs on a write enable sent before it. The
+    /// datasheet clears the latch at power-up, by `04`, and when an operation completes (FW §C);
+    /// the chip's own reset, `66` then `99`, is no reset of the ESP32-C3 (FW §G). Nothing
+    /// measured says whether a device keeps the chip powered across `esp_restart` or a watchdog
+    /// reset, nor whether its flash pins are driven so as to reset the chip. Settled on a device: write
+    /// enable, then `esp_restart` or an RTC watchdog reset, then read the status register
+    /// before any other write enable. Neither the ROM nor ESP-IDF sends a program or an erase
+    /// without a write enable just before it (FW §A.2, §A.3), so no measured path depends on it.
+    ///
+    /// The generation of the chip is kept with its content. After a core or a system reset the
+    /// version of the flash windows is therefore lower than before it: the terms of the MMU and
+    /// of the cache restart at 0, that of the chip does not. `SocBus::page_version` says why a
+    /// version that goes down is safe: every reset builds a new decode cache.
     pub(crate) fn reset(&mut self) {
         self.registers = Spi1::reset_registers();
     }

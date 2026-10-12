@@ -1495,6 +1495,60 @@ mod tests {
     }
 
     #[test]
+    fn the_write_enable_latch_of_the_chip_survives_every_reset_of_the_soc_and_no_power_on() {
+        // The chip is outside the SoC: a reset of the CPU, of the core, of the system or of the
+        // SPI controller reaches none of its state. The ASSUMPTION is on `Spi1::reset`; the
+        // datasheet clears the latch at power-up only (FW §C), which a new bus is.
+        let byte = |b: &mut SocBus| {
+            // A core reset rebuilt the MMU table: the entry is written again in every case.
+            map(b, 3, 1);
+            load(b, FLASH_DBUS_BASE + 0x3_0000) & 0xFF
+        };
+        let program_without_write_enable = |b: &mut SocBus| {
+            spi1(b, "W0", 0x00);
+            spi1(b, "ADDR", (1 << 24) | 0x1_0000);
+            spi1(b, "CMD", 1 << 25);
+        };
+        let latch = |b: &mut SocBus| {
+            spi1(b, "CMD", 1 << 27); // FLASH_RDSR
+            load(b, svd_regs::esp32c3::addr("SPI1", "RD_STATUS")) & 0b10
+        };
+        // A CPU, a core and a system reset; `None` is the reset of SPI0/1 alone
+        // (`SYSTEM.PERIP_RST_EN0` bit 1).
+        for cause in [
+            Some(ResetCause::SoftwareCpu),
+            Some(ResetCause::Mwdt0Core),
+            Some(ResetCause::RtcWatchdogSystem),
+            None,
+        ] {
+            let what = format!("{cause:?}");
+            let mut b = bus_with_flash(SocConfig::default());
+            assert_eq!(byte(&mut b), 0xE9);
+            spi1(&mut b, "CMD", 1 << 30); // FLASH_WREN
+            if let Some(cause) = cause {
+                b.reset(cause, 0x4000_0000, 0);
+            } else {
+                let reset = svd_regs::esp32c3::addr("SYSTEM", "PERIP_RST_EN0");
+                b.write(reset, Word, 1 << 1).unwrap();
+                b.write(reset, Word, 0).unwrap();
+            }
+            assert_eq!(latch(&mut b), 0b10, "{what}: the latch is still set");
+            program_without_write_enable(&mut b);
+            assert_eq!(
+                byte(&mut b),
+                0x00,
+                "{what}: the program ran on the latch of before"
+            );
+            assert_eq!(latch(&mut b), 0, "{what}: the program cleared it");
+        }
+        // A power-on is a new bus on the content: the latch is clear, the program is ignored.
+        let mut b = bus_with_flash(SocConfig::default());
+        assert_eq!(latch(&mut b), 0);
+        program_without_write_enable(&mut b);
+        assert_eq!(byte(&mut b), 0xE9, "no write enable since power-on");
+    }
+
+    #[test]
     fn the_memories_keep_their_content_at_every_level_of_reset() {
         // TRM §6.1.1: a reset leaves the memories as they are. The RTC memory is the case the
         // manual states least plainly for a system reset: ASSUMPTION in `SocBus::reset`.
