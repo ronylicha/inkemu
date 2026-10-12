@@ -49,7 +49,8 @@ pub struct MachineOptions {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProfileError {
-    #[error("{origin}: {detail}; correct the device profile")]
+    /// `detail` ends with a remedy: its own, or the general one ([`parse_detail`]).
+    #[error("{origin}: {detail}")]
     Parse { origin: String, detail: String },
     #[error(
         "{origin}: the profile has no [flash] table; add one with its two keys: size_mib ({sizes}) and jedec_id (0xMMTTCC, the three bytes the chip answers to a read-id command)",
@@ -226,6 +227,23 @@ fn chip_revision<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 
+/// What a refusal of the TOML says, with one remedy. The deserializers of this crate end their
+/// message with a remedy of their own (`…; write size_mib as …`); the parser's messages (an unknown
+/// key, a missing one, broken TOML) have none and get the general one. The message is the last
+/// line: the lines above it show where in the file the problem is.
+fn parse_detail(error: &toml::de::Error) -> String {
+    let detail = error.to_string().trim_end().to_owned();
+    let has_remedy = detail
+        .lines()
+        .next_back()
+        .is_some_and(|message| message.contains("; "));
+    if has_remedy {
+        detail
+    } else {
+        format!("{detail}; correct the device profile")
+    }
+}
+
 #[must_use]
 pub fn builtin_ids() -> &'static [&'static str] {
     &BUILTIN_IDS
@@ -251,7 +269,7 @@ impl DeviceProfile {
     pub fn from_toml(origin: &str, text: &str) -> Result<DeviceProfile, ProfileError> {
         let raw: RawProfile = toml::from_str(text).map_err(|e| ProfileError::Parse {
             origin: origin.to_owned(),
-            detail: e.to_string().trim_end().to_owned(),
+            detail: parse_detail(&e),
         })?;
         let RawFlash(flash) = raw.flash.ok_or_else(|| ProfileError::MissingFlash {
             origin: origin.to_owned(),
@@ -268,7 +286,8 @@ impl DeviceProfile {
     /// Like [`DeviceProfile::from_toml`], and checks that the profile carries the id it is loaded under.
     ///
     /// # Errors
-    /// [`ProfileError::Parse`], or [`ProfileError::IdMismatch`] when the ids differ.
+    /// [`ProfileError::Parse`] or [`ProfileError::MissingFlash`] as [`DeviceProfile::from_toml`]
+    /// says, or [`ProfileError::IdMismatch`] when the ids differ.
     pub fn from_named_toml(
         expected_id: &str,
         origin: &str,
@@ -374,6 +393,28 @@ mod tests {
         DeviceProfile::from_toml("demo.toml", text)
             .unwrap_err()
             .to_string()
+    }
+
+    #[test]
+    fn a_refused_profile_states_one_remedy() {
+        // A refusal of this crate carries its own remedy, and no other is added after it.
+        let size = error_for(&VALID.replace("size_mib = 4", "size_mib = 3"));
+        assert!(
+            size.ends_with("; write size_mib as 1, 2, 4, 8 or 16"),
+            "{size}"
+        );
+        assert!(!size.contains("correct the device profile"), "{size}");
+        // A refusal of the parser has none, and gets the general one, once.
+        let key = error_for(&format!("{VALID}x = 1\n"));
+        assert!(
+            key.contains("unknown field `x`") && key.ends_with("; correct the device profile"),
+            "{key}"
+        );
+        assert_eq!(
+            key.matches("; correct the device profile").count(),
+            1,
+            "{key}"
+        );
     }
 
     #[test]
