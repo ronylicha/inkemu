@@ -13,10 +13,55 @@ const SLICE_CYCLES: u64 = 1_000_000;
 /// How many of the most repeated diagnostics the end-of-run summary lists.
 const MAX_REPEATED_SHOWN: usize = 3;
 
+/// Passes that wrote nothing to the console between two questions about its reader, when they
+/// execute little: a firmware that sleeps between far-apart wake-ups goes through a pass in a
+/// fraction of a microsecond of host time, and a system call in each was about half the host
+/// time of such a run. The reader's disappearance is still noticed within a fraction of a second
+/// of host time ([`ReaderWatch`] says what bounds the delay).
+const SILENT_PASSES_PER_QUESTION: u32 = 64;
+
+/// Decides which of the passes that wrote nothing to the console ask whether its reader is still
+/// there. It belongs to the run loop: the machine knows nothing of it, and it enters no trace.
+///
+/// The first such pass asks. After a question, the next one is asked by the
+/// [`SILENT_PASSES_PER_QUESTION`]th pass that wrote nothing, or sooner, by the first of them at
+/// which the CPU has executed a whole slice ([`SLICE_CYCLES`]) since the question: a pass that
+/// took the host milliseconds does not feel a system call. A pass that wrote changes nothing
+/// here: its write found the reader, or failed and ended the run. A firmware that prints in every
+/// pass is therefore never asked about, and need not be.
+///
+/// The delay before a reader that left is noticed, counted from the last write or question: at
+/// most [`SILENT_PASSES_PER_QUESTION`] passes, in which the CPU executes less than two slices of
+/// cycles. A pass is one call of the machine, which ends on its slice of cycles or after
+/// [`soc_esp32c3::machine::SLEEP_SLICE`] of device time or
+/// [`soc_esp32c3::machine::MAX_FRUITLESS_WAKES`] sleeps.
+#[derive(Debug, Default)]
+struct ReaderWatch {
+    /// Passes that wrote nothing still to go before one asks; 0 at the start: the first asks.
+    passes_left: u32,
+    /// [`Esp32C3::cycles`] at the last question.
+    asked_at: u64,
+}
+
+impl ReaderWatch {
+    /// Whether a pass that wrote nothing, ended with the CPU at `cycles`, asks.
+    fn asks(&mut self, cycles: u64) -> bool {
+        let asks = self.passes_left == 0 || cycles.saturating_sub(self.asked_at) >= SLICE_CYCLES;
+        if asks {
+            self.passes_left = SILENT_PASSES_PER_QUESTION - 1;
+            self.asked_at = cycles;
+        } else {
+            self.passes_left -= 1;
+        }
+        asks
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RunOptions {
-    /// Stop when the CPU cycle counter reaches this value; `None` is no limit. A sleeping CPU
-    /// executes no cycle: a firmware that sleeps never reaches it.
+    /// Stop when the CPU cycle counter reaches this value; `None` is no limit. It counts the
+    /// cycles the CPU executes, not device time: a sleeping CPU executes none, so a firmware that
+    /// sleeps reaches it late, and one whose sleep nothing interrupts never does.
     pub max_cycles: Option<u64>,
     /// Stop when this many nanoseconds of device time have elapsed since power-on; `None` is no
     /// limit. Device time goes on while the CPU sleeps and across resets
@@ -155,20 +200,23 @@ fn log_console_error(log: &mut dyn Write, outcome: &io::Result<bool>) {
 /// long as the firmware writes to them.
 ///
 /// `Ok(false)` when the reader of the console is gone. A write finds that out by itself; when the
-/// selected console has nothing to write, `reader_gone` is asked instead, once: a firmware that
-/// prints nothing would otherwise run on for a reader that left.
+/// selected console has nothing to write, `reader_gone` is asked instead, once, if `watch` says
+/// this pass is one that asks: a firmware that prints nothing would otherwise run on for a
+/// reader that left.
 fn relay_selected_console(
     machine: &mut Esp32C3,
     selected: ConsoleChannel,
     console: &mut dyn Write,
+    watch: &mut ReaderWatch,
     reader_gone: &dyn Fn() -> bool,
 ) -> io::Result<bool> {
+    let executed = machine.cycles().get();
     let mut outcome = Ok(true);
     for channel in ConsoleChannel::ALL {
         let bytes = machine.take_console(channel);
         if channel == selected {
             outcome = if bytes.is_empty() {
-                Ok(!reader_gone())
+                Ok(!(watch.asks(executed) && reader_gone()))
             } else {
                 relay(console, &bytes)
             };
@@ -226,10 +274,11 @@ fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
 ///   the previous pass ended on (a sleeping CPU included, which can go on for ever without the
 ///   cycle count advancing): once it is set (Ctrl-C), the run ends with the same summary as a run
 ///   that reached a limit.
-/// - The state of its reader. A write to a console whose reader went away says so by failing; a
-///   pass that had nothing to write asks `reader_gone` instead, once, and a yes ends the run as
-///   [`RunEnd::ConsoleClosed`]. A caller that cannot tell passes a function that always says no:
-///   the limits then bound a run that prints nothing.
+/// - The state of its reader. A write to a console whose reader went away says so by failing;
+///   the passes that had nothing to write ask `reader_gone` instead, the first of them and then
+///   one in [`SILENT_PASSES_PER_QUESTION`] or one per slice of executed cycles ([`ReaderWatch`]),
+///   and a yes ends the run as [`RunEnd::ConsoleClosed`]. A caller that cannot tell passes a
+///   function that always says no: the limits then bound a run that prints nothing.
 ///
 /// A run that is not interrupted and whose reader stays is therefore the same run on every host:
 /// same console, same summary, same trace hash.
@@ -245,6 +294,7 @@ pub fn execute(
     // reader went away, is not written to again: a strict stop goes on to its own end after it,
     // and must not report the same failure a second time.
     let mut console_usable = true;
+    let mut reader = ReaderWatch::default();
     let mut end = loop {
         if interrupt.load(Ordering::Relaxed) {
             let _ = writeln!(log, "inkemu: interrupted by the user");
@@ -256,7 +306,8 @@ pub fn execute(
             .max_cycles
             .map_or(slice_end, |max| max.min(slice_end));
         let stop = machine.run_within(Cycles(limit), options.max_device_nanos);
-        let console_open = relay_selected_console(machine, options.console, console, reader_gone);
+        let console_open =
+            relay_selected_console(machine, options.console, console, &mut reader, reader_gone);
         console_usable = matches!(console_open, Ok(true));
         // The stop line carries the violation: listing it as a warning too would print it twice.
         let violation = match &stop {
@@ -1017,7 +1068,9 @@ mod tests {
     fn a_cpu_asleep_while_a_watchdog_counts_does_not_end_the_run() {
         // Each life of this firmware is one byte and a `wfi`; main watchdog 0, armed by the reset
         // values, resets the chip every 1.3 s of device time (TW §D.4). The run goes on through
-        // the sleeps and the resets until its cycle limit.
+        // the sleeps and the resets until its cycle limit. Only the resets bring a sleeping CPU
+        // to that limit: the device-time limit, twice the time the run takes, is there for a run
+        // whose resets would stop, which would otherwise sleep for ever instead of failing.
         let mut m = machine(
             &printing(UART0, b"a", &[wfi(), HANG]),
             MachineOptions::default(),
@@ -1025,7 +1078,10 @@ mod tests {
         let (mut console, mut log) = (Vec::new(), Vec::new());
         let end = execute(
             &mut m,
-            &options(300),
+            &RunOptions {
+                max_device_nanos: Some(100 * SECOND_NS),
+                ..options(300)
+            },
             &NOT_INTERRUPTED,
             &reader_stays,
             &mut console,
@@ -1061,12 +1117,16 @@ mod tests {
     fn a_reset_is_reported_as_an_event_of_the_run_and_not_as_a_warning() {
         // The same firmware, under `--strict-mmio`: a watchdog reset is neither a fault of the
         // emulation nor a violation. Each (cause, PC) pair is one line of the journal, the
-        // repeats are counted in the summary, and the run goes on to its limit.
+        // repeats are counted in the summary, and the run goes on to its cycle limit, with the
+        // same device-time limit behind it for a run whose resets would stop.
         let mut m = machine(&printing(UART0, b"a", &[wfi(), HANG]), STRICT);
         let (mut console, mut log) = (Vec::new(), Vec::new());
         let end = execute(
             &mut m,
-            &options(300),
+            &RunOptions {
+                max_device_nanos: Some(100 * SECOND_NS),
+                ..options(300)
+            },
             &NOT_INTERRUPTED,
             &reader_stays,
             &mut console,
@@ -1433,8 +1493,11 @@ mod tests {
     fn an_interrupt_ends_a_run_whose_cpu_sleeps_for_ever() {
         // An alarm at every count of the 16 MHz counter. The flag, raised once the byte printed
         // before the sleep has reached the console, must be read on the path of a sleeping CPU
-        // too. A cycle limit could not end this run if the flag were no longer read; ten
-        // seconds of device time do, as `TimeLimit`, and the assertion on the end fails.
+        // too. A cycle limit could not end this run if the flag were no longer read; a quarter
+        // of a second of device time does, as `TimeLimit`, and the assertion on the end fails.
+        // The flag is raised by the first pass, 6.25 ms of device time into the run (a hundred
+        // thousand alarms), and read at the start of the second: the limit is forty passes away,
+        // and near enough for a run that lost its end to fail in seconds, not minutes.
         let mut m = machine(&sleeping_for_ever(1), MachineOptions::default());
         let interrupt = AtomicBool::new(false);
         let mut console = RaisesInterrupt {
@@ -1445,7 +1508,7 @@ mod tests {
         let end = execute(
             &mut m,
             &RunOptions {
-                max_device_nanos: Some(10 * SECOND_NS),
+                max_device_nanos: Some(SECOND_NS / 4),
                 ..UNLIMITED
             },
             &interrupt,
@@ -1597,6 +1660,107 @@ mod tests {
         assert_eq!(end, RunEnd::Budget);
         assert_eq!(console, b"x");
         assert!(!asked.get());
+    }
+
+    #[test]
+    fn the_reader_is_asked_for_by_the_first_silent_pass_then_once_in_64_or_once_a_slice() {
+        let mut watch = ReaderWatch::default();
+        let mut asked = |cycles: u64| watch.asks(cycles);
+        assert!(asked(100), "the first pass that wrote nothing asks");
+        // Passes that execute next to nothing: 63 go by, the 64th asks.
+        let quiet: Vec<bool> = (0..64).map(|pass| asked(101 + pass)).collect();
+        assert_eq!(quiet.iter().filter(|asks| **asks).count(), 1);
+        assert_eq!(quiet.last(), Some(&true), "{quiet:?}");
+        // A whole slice executed since the question: the pass asks without waiting for its turn,
+        // and the count of passes starts again from it.
+        let last = 164;
+        assert!(!asked(last + SLICE_CYCLES - 1));
+        assert!(asked(last + SLICE_CYCLES));
+        let after: Vec<bool> = (1..=64)
+            .map(|pass| asked(last + SLICE_CYCLES + pass))
+            .collect();
+        assert_eq!(after.iter().filter(|asks| **asks).count(), 1);
+        assert_eq!(after.last(), Some(&true), "{after:?}");
+    }
+
+    /// Sleeps without printing, its watchdogs stopped, under a period alarm every half second
+    /// (8 000 000 counts of the 16 MHz counter) whose interrupt is not enabled: a call of the
+    /// machine sleeps through a second of device time and returns `Asleep`, for ever, having
+    /// executed nothing.
+    fn sleeping_silently() -> Vec<u32> {
+        const HALF_A_SECOND: u32 = 8_000_000;
+        let mut program = stop_watchdogs();
+        program.extend(store_register(
+            systimer("TARGET0_CONF"),
+            (1 << 30) | HALF_A_SECOND,
+        ));
+        program.extend(store_register(systimer("COMP0_LOAD"), 1));
+        program.extend(store_register(systimer("CONF"), SYSTIMER_ALARM0_ON));
+        program.extend([wfi(), HANG]);
+        program
+    }
+
+    #[test]
+    fn a_firmware_that_sleeps_without_printing_is_asked_about_its_reader_one_pass_in_64() {
+        const LIMIT: RunOptions = RunOptions {
+            max_device_nanos: Some(200 * SECOND_NS),
+            ..UNLIMITED
+        };
+        // The passes of the run, counted on a twin driven as `execute` drives it.
+        let passes = {
+            let mut twin = machine(&sleeping_silently(), MachineOptions::default());
+            let mut passes = 0u32;
+            loop {
+                passes += 1;
+                assert!(passes < 1_000, "the device-time limit is never reached");
+                let slice_end = Cycles(twin.cycles().get() + SLICE_CYCLES);
+                match twin.run_within(slice_end, LIMIT.max_device_nanos) {
+                    StopReason::Asleep => {}
+                    StopReason::TimeBudget => break passes,
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        assert!(
+            (190..=210).contains(&passes),
+            "a pass for each second slept: {passes}"
+        );
+
+        let run = |gone_from: u32| {
+            let mut m = machine(&sleeping_silently(), MachineOptions::default());
+            let asked = std::cell::Cell::new(0u32);
+            let (mut console, mut log) = (Vec::new(), Vec::new());
+            let end = execute(
+                &mut m,
+                &LIMIT,
+                &NOT_INTERRUPTED,
+                &|| {
+                    asked.set(asked.get() + 1);
+                    asked.get() >= gone_from
+                },
+                &mut console,
+                &mut log,
+            );
+            assert_eq!(console, b"");
+            assert!(m.cycles().get() < SLICE_CYCLES, "{:?}", m.cycles());
+            (end, asked.get(), m.device_time_nanos())
+        };
+        // A reader that stays: asked for by the first pass and by every 64th after it.
+        let (end, asked, _) = run(u32::MAX);
+        assert_eq!(end, RunEnd::TimeLimit);
+        assert_eq!(asked, passes.div_ceil(SILENT_PASSES_PER_QUESTION));
+        assert_eq!(asked, 4, "{passes} passes");
+        // A reader gone from the start of the run, or from just after the first question: the
+        // run ends at the next question, 64 passes of a second each later at most.
+        let (end, asked, device_nanos) = run(1);
+        assert_eq!((end, asked), (RunEnd::ConsoleClosed, 1));
+        assert!(device_nanos < 2 * SECOND_NS, "{device_nanos} ns");
+        let (end, asked, device_nanos) = run(2);
+        assert_eq!((end, asked), (RunEnd::ConsoleClosed, 2));
+        assert!(
+            (64 * SECOND_NS..66 * SECOND_NS).contains(&device_nanos),
+            "the 65th pass asks: {device_nanos} ns"
+        );
     }
 
     #[test]

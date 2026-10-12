@@ -147,7 +147,7 @@ fn run_help_tells_the_two_limits_apart() {
         .collect::<Vec<_>>()
         .join(" ");
     for expected in [
-        "--max-cycles <MAX_CYCLES> Stop when the CPU has executed this many cycles of its clock. A sleeping CPU executes none: a firmware that sleeps never reaches this limit, use --max-time to bound it",
+        "--max-cycles <MAX_CYCLES> Stop when the CPU has executed this many cycles of its clock. The limit counts executed cycles, not device time: a sleeping CPU executes none, so a firmware that sleeps reaches it late, and one whose sleep nothing interrupts never does; --max-time bounds both",
         "--max-time <SECONDS> Stop when this many seconds of device time have elapsed since power-on (a decimal number: 30, 2.5, 0.001). Device time goes on while the CPU sleeps and across resets",
         "0 the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was pressed, or the reader of standard output went away",
     ] {
@@ -315,6 +315,7 @@ fn x4_boots_the_real_rom_to_its_banner() {
                 "--rom-dir",
                 &dir,
             ])
+            .timeout(std::time::Duration::from_secs(60))
             .assert()
             .code(0)
             .get_output()
@@ -526,6 +527,7 @@ fn x4_boots_a_flash_image_through_the_real_rom() {
             "--flash",
         ])
         .arg(&path)
+        .timeout(std::time::Duration::from_secs(60))
         .assert()
         .code(0)
         .get_output()
@@ -559,6 +561,7 @@ fn x4_without_a_flash_image_loops_on_the_invalid_header_of_an_erased_chip() {
             "--rom-dir",
             &rom_dir,
         ])
+        .timeout(std::time::Duration::from_secs(60))
         .assert()
         .code(0)
         .get_output()
@@ -648,6 +651,9 @@ fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_res
                 "--rom-dir",
                 &rom_dir,
             ])
+            // A blank chip prints and resets for ever: were the limit to stop ending the run,
+            // this ends the test.
+            .timeout(std::time::Duration::from_secs(60))
             .assert()
             .code(0)
             .get_output()
@@ -685,7 +691,8 @@ fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_res
     );
 }
 
-/// A firmware that sleeps executes no cycle: only the device-time limit ends its run.
+/// Nothing interrupts the sleep of this firmware: it executes no cycle more, and only the
+/// device-time limit ends its run.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR"]
 fn a_device_time_limit_ends_the_run_of_a_firmware_that_sleeps() {
@@ -963,23 +970,28 @@ fn x4_boots_the_reference_firmware_through_its_restart_into_a_second_boot() {
     let flash = std::env::var("INKEMU_REF_FLASH").expect("set INKEMU_REF_FLASH");
     // One life of the application is 28 million cycles and 11 s of device time; 40 million reach
     // the second boot.
-    let output = inkemu()
-        .args([
-            "run",
-            "--device",
-            "x4",
-            "--strict-mmio",
-            "--max-cycles",
-            "40000000",
-            "--rom-dir",
-            &rom_dir,
-            "--flash",
-            &flash,
-        ])
-        .assert()
-        .code(0)
-        .get_output()
-        .clone();
+    let run = || {
+        inkemu()
+            .args([
+                "run",
+                "--device",
+                "x4",
+                "--strict-mmio",
+                "--max-cycles",
+                "40000000",
+                "--trace-hash",
+                "--rom-dir",
+                &rom_dir,
+                "--flash",
+                &flash,
+            ])
+            .timeout(std::time::Duration::from_secs(120))
+            .assert()
+            .code(0)
+            .get_output()
+            .clone()
+    };
+    let output = run();
     let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
     let mut from = 0;
     for expected in [
@@ -1013,6 +1025,18 @@ fn x4_boots_the_reference_firmware_through_its_restart_into_a_second_boot() {
     assert!(
         !log.contains("warning:") && !log.contains("stopped by --strict-mmio"),
         "nothing was reported in a whole life cycle: {log}"
+    );
+    // The trace covers what ran before the restart as well as after it: a second process, given
+    // the same image and the same limit, prints the same console and the same hash.
+    let second = run();
+    assert_eq!(
+        output.stdout, second.stdout,
+        "two runs print the same console"
+    );
+    assert!(trace_hash_line(&log).is_some(), "{log}");
+    assert_eq!(
+        trace_hash_line(&log),
+        trace_hash_line(&String::from_utf8_lossy(&second.stderr))
     );
 }
 

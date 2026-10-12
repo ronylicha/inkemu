@@ -62,8 +62,10 @@ enum Command {
         /// an invalid header, as a blank chip does.
         #[arg(long)]
         flash: Option<PathBuf>,
-        /// Stop when the CPU has executed this many cycles of its clock. A sleeping CPU executes
-        /// none: a firmware that sleeps never reaches this limit, use --max-time to bound it.
+        /// Stop when the CPU has executed this many cycles of its clock. The limit counts executed
+        /// cycles, not device time: a sleeping CPU executes none, so a firmware that sleeps
+        /// reaches it late, and one whose sleep nothing interrupts never does; --max-time bounds
+        /// both.
         #[arg(long)]
         max_cycles: Option<u64>,
         /// Stop when this many seconds of device time have elapsed since power-on (a decimal
