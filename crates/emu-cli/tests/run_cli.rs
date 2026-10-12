@@ -14,6 +14,16 @@ fn inkemu() -> Command {
     Command::new(env!("CARGO_BIN_EXE_inkemu"))
 }
 
+/// How long one command of these tests, or one wait on a run in progress, may take on the host
+/// before the test fails instead of hanging. It turns a hang into a failure and says nothing of
+/// speed, so it is wide. Measured beside a release build and 16 spinning processes on 16 cores:
+/// a command refused before boot took up to 2.9 s instrumented by `cargo llvm-cov` (the hash of
+/// a 16 MiB flash in a debug build), and the slowest command the CI runs in release, the third
+/// run of the NVS reference firmware (12.5 s of device time), 7.9 s, at a load average of 20 to
+/// 44 on 16 cores. The limit is fifteen minutes, more than a hundred times either, and under the
+/// timeout of the CI jobs that run these tests.
+const HANG_LIMIT: std::time::Duration = std::time::Duration::from_mins(15);
+
 #[test]
 fn unknown_device_exits_2_and_lists_the_known_ones() {
     inkemu()
@@ -315,7 +325,7 @@ fn x4_boots_the_real_rom_to_its_banner() {
                 "--rom-dir",
                 &dir,
             ])
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(HANG_LIMIT)
             .assert()
             .code(0)
             .get_output()
@@ -567,7 +577,7 @@ fn x4_boots_a_flash_image_through_the_real_rom() {
             "--flash",
         ])
         .arg(&path)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(HANG_LIMIT)
         .assert()
         .code(0)
         .get_output()
@@ -601,7 +611,7 @@ fn x4_without_a_flash_image_loops_on_the_invalid_header_of_an_erased_chip() {
             "--rom-dir",
             &rom_dir,
         ])
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(HANG_LIMIT)
         .assert()
         .code(0)
         .get_output()
@@ -693,7 +703,7 @@ fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_res
             ])
             // A blank chip prints and resets for ever: were the limit to stop ending the run,
             // this ends the test.
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(HANG_LIMIT)
             .assert()
             .code(0)
             .get_output()
@@ -750,7 +760,7 @@ fn a_device_time_limit_ends_the_run_of_a_firmware_that_sleeps() {
             "--flash",
         ])
         .arg(&flash)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(HANG_LIMIT)
         .assert()
         .code(0)
         .get_output()
@@ -790,7 +800,7 @@ fn a_strict_stop_exits_3_and_names_the_register() {
             "--flash",
         ])
         .arg(&flash)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(HANG_LIMIT)
         .assert()
         .code(3)
         .stderr(contains("inkemu: stopped by --strict-mmio: ").and(contains("LEDC.")))
@@ -812,7 +822,7 @@ fn a_wait_for_an_interrupt_nothing_can_raise_exits_4() {
     inkemu()
         .args(["run", "--device", "x4", "--rom-dir", &rom_dir, "--flash"])
         .arg(&flash)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(HANG_LIMIT)
         .assert()
         .code(4)
         .stderr(
@@ -982,7 +992,7 @@ fn ctrl_c_ends_a_run_without_a_limit_with_its_summary_and_exit_code_0() {
     command.args(["run", "--device", "x4", "--rom-dir", &rom_dir]);
     // The reader stays to the end: the run must not end for having lost it.
     let run = live::start(command, |_| false);
-    let limit = std::time::Duration::from_secs(60);
+    let limit = HANG_LIMIT;
     // The banner is on standard output: the handler is installed and the run is under way.
     run.wait_for_line("ESP-ROM:esp32c3-api1-20210207", limit);
     run.interrupt();
@@ -1014,7 +1024,7 @@ fn a_run_that_prints_nothing_more_ends_when_the_reader_of_its_output_goes_away()
     let run = live::start(run_of(&rom_dir, &flash), |line| {
         line.contains(LAST_ROM_LINE)
     });
-    let limit = std::time::Duration::from_secs(60);
+    let limit = HANG_LIMIT;
     run.wait_for_line(LAST_ROM_LINE, limit);
     let (code, log) = run.finish(limit);
     assert_eq!(code, Some(0), "{log}");
@@ -1070,7 +1080,7 @@ fn x4_boots_the_reference_firmware_through_its_restart_into_a_second_boot() {
                 "--flash",
                 &flash,
             ])
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(HANG_LIMIT)
             .assert()
             .code(0)
             .get_output()
@@ -1146,7 +1156,7 @@ fn x4_boots_the_reference_firmware_and_a_device_time_limit_ends_its_countdown_as
             "--flash",
             &flash,
         ])
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(HANG_LIMIT)
         .assert()
         .code(0)
         .get_output()
@@ -1212,7 +1222,7 @@ fn x4_runs_the_reference_firmware_along_its_pinned_trace() {
             "--flash",
             &flash,
         ])
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(HANG_LIMIT)
         .assert()
         .code(0)
         .get_output()
@@ -1243,8 +1253,9 @@ fn run_with_flash_file(file: &std::path::Path, more: &[&str]) -> assert_cmd::ass
         .arg("--flash-file")
         .arg(file)
         .args(more)
-        // A refusal takes milliseconds: a command that waits on what it was given ends the test.
-        .timeout(std::time::Duration::from_secs(60))
+        // A refusal takes a few seconds at most: a command that waits on what it was given ends
+        // the test.
+        .timeout(HANG_LIMIT)
         .assert()
 }
 
@@ -1324,7 +1335,7 @@ fn a_reset_of_the_flash_without_a_flash_file_is_a_usage_error() {
         .args(["run", "--device", "x4", "--max-cycles", "1000", "--rom-dir"])
         .arg(empty.path())
         .arg("--reset-flash")
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(HANG_LIMIT)
         .assert()
         .code(2)
         .stderr(
@@ -1444,8 +1455,8 @@ fn an_image_that_is_also_the_flash_file_is_refused_before_boot_by_every_route_to
 /// is refused before boot, and stays byte for byte what it was, with nothing created beside it.
 #[test]
 fn an_image_at_the_temporary_name_or_the_lock_file_of_the_flash_file_is_refused_before_boot() {
-    let mut bytes = build_flash_image(&ImageSpec::default());
-    bytes.resize(usize::try_from(X4_FLASH_BYTES).unwrap(), 0xFF);
+    // An image of a few kilobytes: the refusal comes before the image is read, whatever its size.
+    let bytes = build_flash_image(&ImageSpec::default());
     for (owned, role) in [
         (".x4.bin.tmp", "temporary file"),
         ("x4.bin.lock", "lock file"),
@@ -1512,7 +1523,7 @@ fn a_flash_file_that_another_run_holds_is_refused_before_boot() {
     // A lock lives as long as a copy of its descriptor does, and a test beside this one that
     // starts a process holds one for an instant, between its fork and its exec: the command is
     // tried again until that instant has passed.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + HANG_LIMIT;
     let freed = loop {
         let run = run_with_flash_file(&file, &[]);
         let still_held = String::from_utf8_lossy(&run.get_output().stderr).contains("in use");
@@ -1861,7 +1872,7 @@ fn count_a_boot(more: &[&std::ffi::OsStr]) -> Counted {
         .args(["run", "--device", "x4", "--strict-mmio", "--trace-hash"])
         .args(["--max-cycles", "5000000", "--rom-dir", &rom_dir])
         .args(more)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(HANG_LIMIT)
         .output()
         .unwrap();
     Counted {
@@ -2094,7 +2105,7 @@ fn a_second_run_on_a_flash_file_is_refused_while_the_first_goes_on_and_ctrl_c_sa
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
     let (dir, image) = flash_image_of(&ready_then_busy());
     let file = dir.path().join("x4.bin");
-    let limit = std::time::Duration::from_secs(60);
+    let limit = HANG_LIMIT;
     let first = live::start(run_with_file(&rom_dir, &image, &file), |_| false);
     first.wait_for_line("ready", limit);
     assert!(
@@ -2170,7 +2181,7 @@ fn a_second_ctrl_c_once_the_run_has_returned_leaves_the_save_and_the_summary_to_
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
     let (dir, image) = flash_image_of(&ready_then_busy());
     let file = dir.path().join("x4.bin");
-    let limit = std::time::Duration::from_secs(60);
+    let limit = HANG_LIMIT;
     let run = live::start(run_with_file(&rom_dir, &image, &file), |_| false);
     run.wait_for_line("ready", limit);
     run.interrupt();
@@ -2201,7 +2212,7 @@ fn a_flash_file_whose_directory_vanished_during_the_run_exits_2_and_says_what_is
     let (dir, image) = flash_image_of(&ready_then_busy());
     let kept_in = dir.path().join("flash");
     std::fs::create_dir(&kept_in).unwrap();
-    let limit = std::time::Duration::from_secs(60);
+    let limit = HANG_LIMIT;
     let run = live::start(
         run_with_file(&rom_dir, &image, &kept_in.join("x4.bin")),
         |_| false,
@@ -2243,7 +2254,7 @@ fn a_flash_file_whose_directory_became_read_only_exits_2_and_leaves_no_file() {
         !probe,
         "this test needs a user whom a read-only directory stops; run it as one"
     );
-    let limit = std::time::Duration::from_secs(60);
+    let limit = HANG_LIMIT;
     let run = live::start(
         run_with_file(&rom_dir, &image, &kept_in.join("x4.bin")),
         |_| false,
@@ -2309,7 +2320,7 @@ fn run_x4(more: &[&std::ffi::OsStr]) -> Counted {
     let output = inkemu()
         .args(["run", "--device", "x4", "--rom-dir", &rom_dir])
         .args(more)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(HANG_LIMIT)
         .output()
         .unwrap();
     Counted {
@@ -2408,7 +2419,7 @@ fn a_reader_that_goes_away_ends_the_run_with_its_flash_file_saved() {
     let run = live::start(run_with_file(&rom_dir, &image, &file), |line| {
         line.contains("kept")
     });
-    let limit = std::time::Duration::from_secs(60);
+    let limit = HANG_LIMIT;
     run.wait_for_line("kept", limit);
     let (code, log) = run.finish(limit);
     assert_eq!(code, Some(0), "{log}");
@@ -2506,7 +2517,7 @@ fn a_strict_stop_whose_flash_file_cannot_be_written_keeps_exit_code_3_and_says_w
         }
         false
     });
-    let (code, log) = run.finish(std::time::Duration::from_secs(60));
+    let (code, log) = run.finish(HANG_LIMIT);
     assert_eq!(code, Some(3), "{log}");
     assert!(
         log.contains("inkemu: stopped by --strict-mmio: ")
@@ -2618,7 +2629,7 @@ fn the_nvs_reference_firmware_goes_on_counting_in_a_second_run_on_the_same_flash
             .args(flash)
             .arg("--flash-file")
             .arg(&file)
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(HANG_LIMIT)
             .output()
             .unwrap();
         Counted {

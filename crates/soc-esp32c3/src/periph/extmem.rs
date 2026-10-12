@@ -1119,34 +1119,22 @@ mod tests {
     }
 
     #[test]
-    fn the_largest_requests_cost_the_table_and_the_256_pages_at_most() {
-        // Each call below is the worst a firmware can ask of the two loops: a write of every
-        // page number there is, an invalidation of every line the register can name from the
-        // first entry. Within their bounds they walk 256 pages and 128 entries; followed past
-        // them, the first walks 2^32 pages and the second 4,095 entries, or 2^21 with the size
-        // register unmasked.
-        let (stale, kept) = crate::test_support::within(
-            std::time::Duration::from_secs(10),
-            "the largest writes and invalidations did not end in 10 s: a loop follows a number the firmware wrote past its bound",
-            || {
-                let mmu = mapping(&[(0, 5), (127, 6)]);
-                let mut x = Extmem::new();
-                let mut stale = true;
-                let mut kept = false;
-                for _ in 0..10_000 {
-                    x.window_read(5);
-                    x.window_read(6);
-                    x.flash_written(0, u32::MAX);
-                    stale &= x.window_read(5) && x.window_read(6);
-                    invalidate(&mut x, &mmu, FLASH_DBUS_BASE, u32::MAX);
-                    kept |= x.window_read(5) || x.window_read(6);
-                    invalidate(&mut x, &mmu, FLASH_IBUS_BASE, SYNC_LINES_MASK);
-                }
-                (stale, kept)
-            },
-        );
-        assert!(stale, "every write reached pages 5 and 6");
-        assert!(!kept, "every invalidation dropped both entries' pages");
+    fn the_largest_requests_reach_the_last_page_and_the_last_entry() {
+        // The worst a firmware can ask of the two loops, once each: a write of every page
+        // number there is, an invalidation of every line the register can name from the first
+        // entry. How far they go is the value of `written_pages` and `whole_entries`, pinned by
+        // the two tests above on the same inputs: a removed bound changes a value, not a time.
+        // Here the loops are seen to walk those ranges to their last element.
+        let mmu = mapping(&[(0, 5), (127, 255)]);
+        let mut x = Extmem::new();
+        x.window_read(5);
+        x.window_read(255);
+        x.flash_written(0, u32::MAX);
+        assert!(x.window_read(5), "the first page");
+        assert!(x.window_read(255), "the last page");
+        invalidate(&mut x, &mmu, FLASH_DBUS_BASE, u32::MAX);
+        assert!(!x.window_read(5), "the first entry");
+        assert!(!x.window_read(255), "the last entry");
     }
 
     #[test]

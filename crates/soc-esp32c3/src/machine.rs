@@ -2956,9 +2956,12 @@ mod tests {
         body.extend(store_register(reg("TIMG1", "WDTCONFIG0"), 0x8020_0000));
         body.push(HANG);
         // On a thread with a limit: if the delivery pass were not bounded the loop would never
-        // leave one instruction, and nothing in the run could stop it.
+        // leave one instruction, and nothing in the run could stop it. The limit only turns a
+        // hang into a failure, so it is wide: the test takes about 1.3 s instrumented by
+        // `cargo llvm-cov` beside a release build and 16 spinning processes on 16 cores, and the
+        // limit is ten minutes, under the timeout of the CI job that runs it.
         let (calls, resets, now) = within(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_mins(10),
             "the run did not return: a delivery pass is not bounded",
             move || {
                 let mut m = machine(&body);
