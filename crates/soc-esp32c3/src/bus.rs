@@ -766,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn every_refused_flash_command_of_one_write_is_reported_and_the_first_stops_a_strict_run() {
+    fn a_write_of_several_flash_command_bits_is_one_named_diagnostic_and_a_strict_violation() {
         let cmd = svd_regs::esp32c3::addr("SPI1", "CMD");
         let mut b = bus_with(SocConfig {
             strict_mmio: true,
@@ -774,12 +774,12 @@ mod tests {
         });
         b.set_pc(0x4038_0020);
         b.write(cmd, Word, (1 << 25) | (1 << 24)).unwrap(); // page program and sector erase
-        let refused = |opcode| Diagnostic::Unsupported {
-            what: crate::diag::Unsupported::FlashCommand { opcode },
+        let refused = Diagnostic::Unsupported {
+            what: crate::diag::Unsupported::FlashCommandBits { cmd: 0x0300_0000 },
             pc: 0x4038_0020,
         };
-        assert_eq!(b.ctx.diag.drain(), vec![refused(0x02), refused(0x20)]);
-        assert_eq!(b.ctx.diag.take_violation(), Some(refused(0x02)));
+        assert_eq!(b.ctx.diag.drain(), vec![refused.clone()]);
+        assert_eq!(b.ctx.diag.take_violation(), Some(refused));
     }
 
     #[test]

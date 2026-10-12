@@ -31,8 +31,8 @@ then rewrites the table below, and nothing else; review the diff before committi
 
 "Count" is 1 for a single register, or the number of consecutive registers the row stands for.
 "Made real by" names the plan that gives the register its effect. Each plan inherits the rows that
-name it. The table has eight heirs: SP1b-3b (flash writes), SP1b-3d (the serial consoles in both
-directions), SP1b-3f (deep sleep), SP1b-4, SP2, SP5a, SP5b and SP8. The carry-over note
+name it. The table has seven heirs: SP1b-3d (the serial consoles in both directions), SP1b-3f
+(deep sleep), SP1b-4, SP2, SP5a, SP5b and SP8. The carry-over note
 `docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` names the rows one by one, as the table
 stood at the end of plan SP1b-3a, when one plan, "SP1b-3b", was to take what five plans now share;
 its first section says which plan takes what.
@@ -44,14 +44,14 @@ its first section says which plan takes what.
 | `0x60000010` | `UART0.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3d |
 | `0x60000020` | `UART0.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3d |
 | `0x60000024` | `UART0.CONF1` | 1 | FIFO thresholds | SP1b-3d |
-| `0x60002008` | `SPI1.CTRL` | 1 | read mode, dummy output, WP level | SP8 |
+| `0x60002008` | `SPI1.CTRL` | 1 | read mode, dummy output, WP level (the two-byte status write bit acts) | SP8 |
 | `0x6000200c` | `SPI1.CTRL1` | 1 | CS hold delay after a release-from-power-down | SP8 |
 | `0x60002010` | `SPI1.CTRL2` | 1 | CS setup and hold times | SP8 |
 | `0x60002014` | `SPI1.CLOCK` | 1 | SPI clock divider: a transfer takes no time | SP8 |
 | `0x60002034` | `SPI1.MISC` | 1 | chip-select idle level and enables | SP8 |
-| `0x60002098` | `SPI1.FLASH_WAITI_CTRL` | 1 | automatic wait for the chip to be idle after a program or an erase | SP1b-3b |
-| `0x6000209c` | `SPI1.FLASH_SUS_CTRL` | 1 | automatic program/erase suspend and resume | SP1b-3b |
-| `0x600020a4` | `SPI1.SUS_STATUS` | 1 | program/erase suspend state | SP1b-3b |
+| `0x60002098` | `SPI1.FLASH_WAITI_CTRL` | 1 | automatic wait for the chip to be idle after a program or an erase: an operation completes at once | SP8 |
+| `0x6000209c` | `SPI1.FLASH_SUS_CTRL` | 1 | program/erase suspend and resume: an operation completes at once (a suspend or resume request is refused by name) | SP8 |
+| `0x600020a4` | `SPI1.SUS_STATUS` | 1 | program/erase suspend state: nothing is ever suspended | SP8 |
 | `0x600020dc` | `SPI1.CLOCK_GATE` | 1 | register clock gate | SP8 |
 | `0x60003008` | `SPI0.CTRL` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |
 | `0x60003010` | `SPI0.CTRL2` | 1 | cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly | SP1b-4 |

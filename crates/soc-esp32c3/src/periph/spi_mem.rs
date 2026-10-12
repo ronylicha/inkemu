@@ -4,12 +4,14 @@
 use super::{Accepted, SPI0_BASE, SPI1_BASE, Storage};
 use crate::ctx::Ctx;
 use crate::diag::Unsupported;
-use crate::flash::{FlashCommand, FlashDevice};
+use crate::flash::{FlashAddress, FlashCommand, FlashDevice};
 use emu_core::Peripheral;
 use svd_regs::esp32c3::addr;
 
 const CMD: u32 = addr("SPI1", "CMD") - SPI1_BASE;
 const ADDR: u32 = addr("SPI1", "ADDR") - SPI1_BASE;
+const CTRL: u32 = addr("SPI1", "CTRL") - SPI1_BASE;
+const FLASH_SUS_CTRL: u32 = addr("SPI1", "FLASH_SUS_CTRL") - SPI1_BASE;
 const USER: u32 = addr("SPI1", "USER") - SPI1_BASE;
 const USER1: u32 = addr("SPI1", "USER1") - SPI1_BASE;
 const USER2: u32 = addr("SPI1", "USER2") - SPI1_BASE;
@@ -24,29 +26,58 @@ const WORD_BYTES: usize = 4;
 
 /// `CMD` bit 18: run the transfer described by `USER`, `USER1`, `USER2`, `ADDR` and the lengths.
 const CMD_USR: u32 = 1 << 18;
+const CMD_READ: u32 = 1 << 31;
 const CMD_RDID: u32 = 1 << 28;
 const CMD_RDSR: u32 = 1 << 27;
-/// The hard-wired commands: `CMD` bit, the opcode the controller sends (ESP-IDF `spi_flash_defs.h`,
-/// report BC §D.2 item 6; `0xB9` deep power-down is the JEDEC opcode, it is not in the report).
-const HARD_WIRED: [(u32, u8); 15] = [
-    (1 << 31, 0x03), // FLASH_READ
+const CMD_WRSR: u32 = 1 << 26;
+const CMD_PP: u32 = 1 << 25;
+const CMD_SE: u32 = 1 << 24;
+const CMD_BE: u32 = 1 << 23;
+/// The hard-wired commands: `CMD` bit, the opcode the controller sends (report FW §A.1; ESP-IDF
+/// `spi_flash_defs.h`; `0xB9` deep power-down is the JEDEC opcode). `FLASH_BE` is the 64 KiB
+/// erase `D8`, whatever the header's "32KB" says: the ROM and ESP-IDF both use it for 64 KiB.
+///
+/// `CMD` [7:0] are two read-only state fields (`SPI1_MST_ST`, `MSPI_ST`): no command lives
+/// there. Suspend and resume are bits 1 and 0 of `FLASH_SUS_CTRL`.
+const HARD_WIRED: [(u32, u8); 13] = [
+    (CMD_READ, 0x03),
     (1 << 30, 0x06), // WREN
     (1 << 29, 0x04), // WRDI
     (CMD_RDID, 0x9F),
     (CMD_RDSR, 0x05),
-    (1 << 26, 0x01), // WRSR
-    (1 << 25, 0x02), // PP
-    (1 << 24, 0x20), // SE
-    (1 << 23, 0xD8), // BE
+    (CMD_WRSR, 0x01),
+    (CMD_PP, 0x02),
+    (CMD_SE, 0x20),
+    (CMD_BE, 0xD8),
     (1 << 22, 0xC7), // CE
     (1 << 21, 0xB9), // DP
     (1 << 20, 0xAB), // RES
     (1 << 19, 0xA3), // HPM
-    (1 << 1, 0x75),  // PES
-    (1 << 0, 0x7A),  // PER
 ];
+/// Every bit of `CMD` that starts a transfer: the hard-wired commands, bits 31 to 19, and `USR`.
+/// Bit 17, `FLASH_PE`, is below them: it is a flag (see [`Spi1::run`]).
+const COMMAND_BITS: u32 = !0 << 18;
 const JEDEC_ID_BYTES: usize = 3;
 const STATUS_BYTE_MASK: u32 = 0xFF;
+/// A hard-wired command sends the low 24 bits of `ADDR`: `addr & 0xffffff` for an erase, the
+/// same under the byte count for a program (`ROM3:SPI_sector_erase@0x4004d294`,
+/// `ROM3:SPI_page_program@0x4004d6b4`; `IDF:hal/esp32c3/include/hal/spimem_flash_ll.h:81-95,
+/// 377-389`; measured: report FW §A.2, §A.3).
+const HARD_WIRED_ADDRESS_BITS: u32 = 24;
+const HARD_WIRED_ADDRESS_MASK: u32 = 0x00FF_FFFF;
+/// `ADDR` [31:24] of a hard-wired page program: the number of bytes (`0x20009000` is 32 bytes at
+/// `0x9000`; reports FW key result 1, SF §B.2).
+const PP_LENGTH_SHIFT: u32 = 24;
+/// `CTRL` bit 22, `WRSR_2B`: the status write sends two bytes instead of one
+/// (`spi_mem_reg.h:158-161`). `ROM3:Enable_QMode` sets it (`CTRL |= 0x400000` at `0x4004d792` to
+/// `0x4004d7a0`) before it writes a 16-bit status with `esp_rom_spiflash_write_status`.
+const CTRL_WRSR_2B: u32 = 1 << 22;
+/// `FLASH_SUS_CTRL`: bit 0 `FLASH_PER` and bit 1 `FLASH_PES` send a resume and a suspend and clear
+/// themselves (`spimem_flash_ll_resume`, `spimem_flash_ll_suspend`); bit 4 `PES_PER_EN` and bit 5
+/// `FLASH_PES_EN` enable the automatic ones (`spimem_flash_ll_auto_resume_init`,
+/// `spimem_flash_ll_auto_suspend_init`: `spimem_flash_ll.h:102-139`, `spi_mem_reg.h:821-856`).
+const SUS_COMMANDS: u32 = 0b11;
+const SUS_REQUESTS: u32 = SUS_COMMANDS | (1 << 4) | (1 << 5);
 
 /// `USER` bit 31: the transfer has a command phase.
 const USR_COMMAND: u32 = 1 << 31;
@@ -70,10 +101,17 @@ const MODELED_COMMAND_BITS: u32 = 8;
 const DLEN_MASK: u32 = 0x3FF;
 
 /// Configuration of SPI1 that nothing acts on here: what shapes the electrical transfer, which
-/// is instantaneous, and the automatic wait, suspend and resume around a program or an erase,
-/// which arrive with the flash writes.
+/// is instantaneous, and the automatic wait, suspend and resume around a program or an erase.
+/// A flash operation completes at once (report FW §A.5: every measured poll ends on its first
+/// read), so there is nothing to wait for and nothing to suspend: these three rows wait for the
+/// plan that gives a flash operation its duration.
 const SPI1_ACCEPTED: [Accepted; 9] = [
-    Accepted::svd("SPI1", "CTRL", "read mode, dummy output, WP level", "SP8"),
+    Accepted::svd(
+        "SPI1",
+        "CTRL",
+        "read mode, dummy output, WP level (the two-byte status write bit acts)",
+        "SP8",
+    ),
     Accepted::svd(
         "SPI1",
         "CTRL1",
@@ -90,8 +128,8 @@ const SPI1_ACCEPTED: [Accepted; 9] = [
     Accepted::svd(
         "SPI1",
         "SUS_STATUS",
-        "program/erase suspend state",
-        "SP1b-3b",
+        "program/erase suspend state: nothing is ever suspended",
+        "SP8",
     ),
     Accepted::svd("SPI1", "CLOCK_GATE", "register clock gate", "SP8"),
     // `spi_flash_hal_device_config` and what it calls (`IDF:hal/spi_flash_hal_common.inc:45`; F1).
@@ -99,14 +137,14 @@ const SPI1_ACCEPTED: [Accepted; 9] = [
     Accepted::svd(
         "SPI1",
         "FLASH_WAITI_CTRL",
-        "automatic wait for the chip to be idle after a program or an erase",
-        "SP1b-3b",
+        "automatic wait for the chip to be idle after a program or an erase: an operation completes at once",
+        "SP8",
     ),
     Accepted::svd(
         "SPI1",
         "FLASH_SUS_CTRL",
-        "automatic program/erase suspend and resume",
-        "SP1b-3b",
+        "program/erase suspend and resume: an operation completes at once (a suspend or resume request is refused by name)",
+        "SP8",
     ),
 ];
 
@@ -241,7 +279,23 @@ impl Spi1 {
         (self.register(USER2) & OPCODE_MASK).to_le_bytes()[0]
     }
 
+    /// The first `len` bytes of `W0..W15`, the first byte in `W0[7:0]`; at most the 64 there are.
+    fn data_out(&self, len: usize) -> Vec<u8> {
+        (0..DATA_WORDS)
+            .flat_map(|word| self.register(W0 + 4 * word).to_le_bytes())
+            .take(len)
+            .collect()
+    }
+
+    /// Runs the hard-wired command of `command_bit`. The ROM and ESP-IDF write the same registers
+    /// for the same command (reports FW §A.2, §A.3; SF §B.1, §D): the address in `ADDR[23:0]`, for a
+    /// program its byte count in `ADDR[31:24]` and its bytes in `W0..`.
     fn run_hard_wired(&mut self, ctx: &mut Ctx, command_bit: u32, opcode: u8) {
+        let addr = self.register(ADDR);
+        let address = Some(FlashAddress {
+            value: addr & HARD_WIRED_ADDRESS_MASK,
+            bits: HARD_WIRED_ADDRESS_BITS,
+        });
         let command = FlashCommand {
             opcode,
             address: None,
@@ -261,6 +315,53 @@ impl Spi1 {
                     let low = status.first().copied().map_or(0, u32::from);
                     let kept = self.register(RD_STATUS) & !STATUS_BYTE_MASK;
                     self.registers.write(RD_STATUS, kept | low);
+                }
+            }
+            CMD_PP => {
+                // The byte count is one byte of a register the firmware writes: 0 to 255. The
+                // buffer holds 64 bytes, and neither the ROM (32 at most) nor ESP-IDF (64 at
+                // most) asks for more: what the controller would send for another count is not
+                // established, so such a program is refused rather than guessed (report FW §G).
+                let len = usize::from((addr >> PP_LENGTH_SHIFT).to_le_bytes()[0]);
+                if len == 0 || len > DATA_BYTES {
+                    ctx.unsupported(Unsupported::FlashProgramLength { addr });
+                    return;
+                }
+                let data = self.data_out(len);
+                let program = FlashCommand {
+                    address,
+                    data_out: &data,
+                    ..command
+                };
+                let _ = self.transfer(ctx, &program, 0);
+            }
+            CMD_SE | CMD_BE => {
+                let _ = self.transfer(ctx, &FlashCommand { address, ..command }, 0);
+            }
+            CMD_WRSR => {
+                // The value is `RD_STATUS[15:0]`, where `ROM3:esp_rom_spiflash_write_status`
+                // puts it (`0x4004d35e` to `0x4004d370`) before it writes `CMD = 0x04000000`.
+                let status = self.register(RD_STATUS).to_le_bytes();
+                let bytes = if self.register(CTRL) & CTRL_WRSR_2B == 0 {
+                    1
+                } else {
+                    2
+                };
+                let write = FlashCommand {
+                    data_out: &status[..bytes],
+                    ..command
+                };
+                let _ = self.transfer(ctx, &write, 0);
+            }
+            CMD_READ => {
+                // ASSUMPTION: the hard-wired read sends `ADDR[23:0]` as the erase commands do
+                // and clocks in the bytes `MISO_DLEN` asks for, into `W0..`. `spi_mem_reg.h:18`
+                // names the bit and nothing more, and no ROM or ESP-IDF v5.5.2 code writes it
+                // (report FW §A.1: "nobody"; the ROM reads through `USR`). A firmware that uses
+                // it, read against a device, settles the encoding.
+                let len = self.data_len(MISO_DLEN);
+                if let Some(data) = self.transfer(ctx, &FlashCommand { address, ..command }, len) {
+                    self.store_data_in(&data);
                 }
             }
             _ => {
@@ -310,7 +411,11 @@ impl Spi1 {
             // ASSUMPTION: the address is the low `bits` bits of ADDR, unshifted (ESP-IDF
             // `spimem_flash_ll_set_usr_address` stores it as is). Only the SFDP read uses an address
             // on the measured paths and its answer does not depend on it; the lockstep settles it.
-            self.register(ADDR) & u32::MAX.checked_shr(u32::BITS - bits).unwrap_or(u32::MAX)
+            FlashAddress {
+                value: self.register(ADDR)
+                    & u32::MAX.checked_shr(u32::BITS - bits).unwrap_or(u32::MAX),
+                bits,
+            }
         });
         let dummy_cycles = if user & USR_DUMMY == 0 {
             0
@@ -320,10 +425,7 @@ impl Spi1 {
         let data_out: Vec<u8> = if user & USR_MOSI == 0 {
             Vec::new()
         } else {
-            (0..DATA_WORDS)
-                .flat_map(|word| self.register(W0 + 4 * word).to_le_bytes())
-                .take(self.data_len(MOSI_DLEN))
-                .collect()
+            self.data_out(self.data_len(MOSI_DLEN))
         };
         let data_in_len = if user & USR_MISO == 0 {
             0
@@ -352,28 +454,44 @@ impl Spi1 {
         }
     }
 
-    /// Runs every command whose bit is set. Transfers complete at once, so `CMD` reads 0 afterwards.
+    /// Runs the command whose bit is set in a write of `CMD`: one write, one transfer. Transfers
+    /// complete at once, so `CMD` reads 0 afterwards.
     ///
     /// `CMD` bit 17, `FLASH_PE`, is not a command: "In user mode it is set to indicate that
     /// program/erase operation will be triggered. The bit is combined with `spi_mem_usr` bit" (ESP-IDF
     /// v5.5.2 `components/soc/esp32c3/register/soc/spi_mem_reg.h:113-116`). It accompanies the bit
-    /// that starts the transfer: the rev3 ROM's `SPI_sector_erase` stores `0x01020000`, `FLASH_SE |
-    /// FLASH_PE` (`lui a4,0x1020` at `0x4004d296`, store at `0x4004d29a`), and ESP-IDF's
-    /// `spimem_flash_ll_user_start(dev, pe_ops)` ORs in `0x60000`, `USR | FLASH_PE`, for every
-    /// program or erase (`components/hal/esp32c3/include/hal/spimem_flash_ll.h:391-395`). This model
-    /// has no use for the indication (program/erase suspend is not modelled: `SUS_STATUS` is
-    /// storage), so the flag changes nothing: the command bit it comes with runs once, as without it.
+    /// that starts the transfer, and not always: the rev3 ROM's `SPI_sector_erase` stores
+    /// `0x01020000`, `FLASH_SE | FLASH_PE` (`lui a4,0x1020` at `0x4004d296`, store at `0x4004d29a`),
+    /// and its page program `0x02000000`, `FLASH_PP` alone; ESP-IDF erases with `FLASH_SE` alone
+    /// (`0x01000000`) and programs with `FLASH_PP` alone and `ADDR = len << 24 | addr` (measured:
+    /// reports FW key result 1, SF key result 12). ESP-IDF's `spimem_flash_ll_user_start(dev,
+    /// pe_ops)` ORs in `0x60000`, `USR | FLASH_PE`, only for the program and erase commands that
+    /// take a 4-byte address, which it sends above 16 MiB
+    /// (`components/hal/esp32c3/include/hal/spimem_flash_ll.h:391-395`,
+    /// `components/spi_flash/spi_flash_chip_generic.c:118-151`; FW §B.1): no measured boot contains
+    /// that transfer. This model has no use for the indication (a flash operation is never
+    /// suspended), so the flag changes nothing: the command bit it comes with runs once, as
+    /// without it.
+    ///
+    /// Several command bits in one write are refused by name and nothing is sent: no ROM or ESP-IDF
+    /// code writes more than one, the order in which the controller would run them is not
+    /// documented, and a guess would now write the flash.
     ///
     /// ASSUMPTION: `FLASH_PE` written without any command bit starts no transfer and self-clears. No
     /// ROM or ESP-IDF v5.5.2 code writes it alone; the SP1b-4 lockstep, or a device, settles it.
-    fn run(&mut self, ctx: &mut Ctx, command_bits: u32) {
-        for (bit, opcode) in HARD_WIRED {
-            if command_bits & bit != 0 {
-                self.run_hard_wired(ctx, bit, opcode);
+    fn run(&mut self, ctx: &mut Ctx, value: u32) {
+        let commands = value & COMMAND_BITS;
+        match commands.count_ones() {
+            0 => {}
+            1 if commands == CMD_USR => self.run_user(ctx),
+            1 => {
+                // INVARIANT: `HARD_WIRED` has an entry for each of the bits 31 to 19, and
+                // `commands` is one of them.
+                if let Some(&(bit, opcode)) = HARD_WIRED.iter().find(|(bit, _)| *bit == commands) {
+                    self.run_hard_wired(ctx, bit, opcode);
+                }
             }
-        }
-        if command_bits & CMD_USR != 0 {
-            self.run_user(ctx);
+            _ => ctx.unsupported(Unsupported::FlashCommandBits { cmd: value }),
         }
     }
 }
@@ -391,6 +509,18 @@ impl Peripheral<Ctx> for Spi1 {
         if offset == CMD {
             self.run(ctx, value);
             return true;
+        }
+        if offset == FLASH_SUS_CTRL {
+            // Suspending is not modelled: an operation completes inside the write that starts
+            // it (report FW §A.5), so there is never one to suspend. ESP-IDF writes this register
+            // at every bus acquisition with every one of these bits clear and only a time-out
+            // count (`0x0A000000`: FW §A.2), and refuses to enable auto-suspend on the modelled
+            // chip (FW §B.2); a write that asks for a suspend or a resume is reported.
+            if value & SUS_REQUESTS != 0 {
+                ctx.unsupported(Unsupported::FlashSuspend { sus_ctrl: value });
+            }
+            // The two command bits clear themselves.
+            return self.registers.write(offset, value & !SUS_COMMANDS);
         }
         self.registers.write(offset, value)
     }
@@ -513,6 +643,7 @@ mod tests {
     fn program_and_erase_are_reported_by_opcode() {
         let ctx = &mut Ctx::default();
         let mut spi = spi1();
+        spi.write(ctx, ADDR, 0x0400_E000); // a program of 4 bytes
         for (command_bit, opcode) in [
             (1u32 << 25, 0x02u8), // PP
             (1 << 24, 0x20),      // SE
@@ -584,9 +715,15 @@ mod tests {
     }
 
     /// What a flash saw: `(opcode, address, dummy cycles, bytes sent)`.
-    type Seen = (u8, Option<u32>, u32, Vec<u8>);
+    type Seen = (u8, Option<FlashAddress>, u32, Vec<u8>);
+
+    /// A 24-bit address, the width of every hard-wired command.
+    const fn at(value: u32) -> FlashAddress {
+        FlashAddress { value, bits: 24 }
+    }
 
     /// A chip that accepts every command and remembers it, to look at what the controller sends.
+    /// It answers `A0 A1 A2 ...` to whatever is read.
     #[derive(Debug)]
     struct Recorder(Rc<RefCell<Vec<Seen>>>);
 
@@ -600,8 +737,11 @@ mod tests {
         fn execute(
             &mut self,
             command: &FlashCommand<'_>,
-            _data_in: &mut [u8],
+            data_in: &mut [u8],
         ) -> Result<(), UnmodeledCommand> {
+            for (byte, answer) in data_in.iter_mut().zip(0xA0u8..) {
+                *byte = answer;
+            }
             self.0.borrow_mut().push((
                 command.opcode,
                 command.address,
@@ -618,32 +758,190 @@ mod tests {
     }
 
     #[test]
-    fn several_refused_commands_in_one_write_are_all_reported_in_the_order_they_ran() {
+    fn one_write_of_cmd_with_several_command_bits_runs_none_and_says_so() {
         let ctx = &mut Ctx::default();
-        let mut spi = spi1();
-        assert!(spi.write(ctx, CMD, (1 << 25) | (1 << 24))); // PP and SE
-        assert_eq!(
-            ctx.take_unsupported(),
-            Some(Unsupported::FlashCommand { opcode: 0x02 })
-        );
-        assert_eq!(
-            ctx.take_unsupported(),
-            Some(Unsupported::FlashCommand { opcode: 0x20 })
-        );
-        assert_eq!(ctx.take_unsupported(), None, "drained");
-        // A refused hard-wired command and a refused user command in the same write.
+        let (mut spi, seen) = recording_spi1();
+        spi.write(ctx, ADDR, 0x0400_9000);
         spi.write(ctx, USER, USR_COMMAND);
-        spi.write(ctx, USER2, 0x7000_00D7);
-        spi.write(ctx, CMD, (1 << 23) | CMD_USR);
-        assert_eq!(
-            ctx.take_unsupported(),
-            Some(Unsupported::FlashCommand { opcode: 0xD8 })
-        );
-        assert_eq!(
-            ctx.take_unsupported(),
-            Some(Unsupported::FlashCommand { opcode: 0xD7 })
-        );
+        spi.write(ctx, USER2, 0x7000_0006);
+        for cmd in [
+            CMD_PP | CMD_SE,
+            CMD_BE | CMD_USR,
+            COMMAND_BITS,
+            (1 << 30) | (1 << 29) | CMD_FLASH_PE,
+        ] {
+            assert!(spi.write(ctx, CMD, cmd), "handled: reported, not dropped");
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::FlashCommandBits { cmd })
+            );
+            assert_eq!(ctx.take_unsupported(), None, "one write, one report");
+            assert_eq!(spi.read(ctx, CMD), Some(0), "self-clears: no hang");
+        }
+        assert_eq!(seen.borrow().as_slice(), [], "nothing reached the chip");
+        // The flag and the read-only state bits [7:0] are not commands: beside one command bit
+        // they change nothing.
+        assert!(spi.write(ctx, CMD, CMD_SE | CMD_FLASH_PE | 0xFF));
+        assert_eq!(seen.borrow().len(), 1);
         assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
+    fn a_hard_wired_program_sends_its_address_and_the_bytes_its_count_names() {
+        // The ROM's `otadata` program (FW §A.3: `ADDR = 0x2000E000`, `W0..W7`, `CMD = 0x02000000`)
+        // and ESP-IDF's (SF §B.2: `0x04009020` is 4 bytes at 0x9020; 64 bytes at most, FW §A.2).
+        let ctx = &mut Ctx::default();
+        let (mut spi, seen) = recording_spi1();
+        for word in 0..DATA_WORDS {
+            spi.write(ctx, W0 + 4 * word, 0x0403_0201 + 0x0404_0404 * word);
+        }
+        for (addr, address, len) in [
+            (0x2000_E000u32, 0xE000u32, 32usize),
+            (0x0400_9020, 0x9020, 4),
+            (0x40FF_FF00, 0xFF_FF00, 64),
+            (0x0100_0000, 0, 1),
+        ] {
+            spi.write(ctx, ADDR, addr);
+            assert!(spi.write(ctx, CMD, CMD_PP));
+            let last = seen.borrow().last().cloned();
+            let bytes: Vec<u8> = (1..=64u8).take(len).collect();
+            assert_eq!(
+                last,
+                Some((0x02, Some(at(address)), 0, bytes)),
+                "ADDR {addr:#010x}"
+            );
+        }
+        assert_eq!(seen.borrow().len(), 4, "one write of CMD, one transfer");
+        assert_eq!(ctx.take_unsupported(), None);
+        assert_eq!(spi.read(ctx, CMD), Some(0));
+    }
+
+    #[test]
+    fn a_hard_wired_program_of_no_byte_or_of_more_than_64_is_refused_and_sends_nothing() {
+        let ctx = &mut Ctx::default();
+        let (mut spi, seen) = recording_spi1();
+        for addr in [0x0000_9000u32, 0x4100_9000, 0xFF00_9000] {
+            spi.write(ctx, ADDR, addr);
+            assert!(spi.write(ctx, CMD, CMD_PP));
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::FlashProgramLength { addr }),
+                "ADDR {addr:#010x}"
+            );
+            assert_eq!(ctx.take_unsupported(), None);
+            assert_eq!(spi.read(ctx, CMD), Some(0), "self-clears: no hang");
+        }
+        assert_eq!(seen.borrow().as_slice(), [], "nothing reached the chip");
+    }
+
+    #[test]
+    fn sector_and_block_erase_send_the_low_24_bits_of_addr_with_or_without_the_flag() {
+        // ROM: `CMD = 0x01020000` and `0x00820000` (FW §A.3); ESP-IDF: `0x01000000` and
+        // `0x00800000` (FW §A.2, SF §D).
+        let ctx = &mut Ctx::default();
+        for (cmd, opcode) in [
+            (0x0102_0000u32, 0x20u8),
+            (0x0100_0000, 0x20),
+            (0x0082_0000, 0xD8),
+            (0x0080_0000, 0xD8),
+        ] {
+            let (mut spi, seen) = recording_spi1();
+            // Bits 31:24 belong to the byte count of a program, not to an erase address.
+            spi.write(ctx, ADDR, 0xAB00_E000);
+            assert!(spi.write(ctx, CMD, cmd));
+            assert_eq!(
+                seen.borrow().as_slice(),
+                [(opcode, Some(at(0xE000)), 0, Vec::new())],
+                "CMD {cmd:#010x}"
+            );
+            assert_eq!(ctx.take_unsupported(), None);
+            assert_eq!(spi.read(ctx, CMD), Some(0));
+        }
+    }
+
+    #[test]
+    fn chip_erase_and_the_latch_commands_send_an_opcode_and_nothing_else() {
+        let ctx = &mut Ctx::default();
+        let (mut spi, seen) = recording_spi1();
+        spi.write(ctx, ADDR, 0x2000_E000);
+        for (cmd, opcode) in [(1u32 << 22, 0xC7u8), (1 << 30, 0x06), (1 << 29, 0x04)] {
+            spi.write(ctx, CMD, cmd);
+            let last = seen.borrow().last().cloned();
+            assert_eq!(last, Some((opcode, None, 0, Vec::new())), "CMD {cmd:#010x}");
+        }
+    }
+
+    #[test]
+    fn the_status_write_sends_one_byte_of_rd_status_or_two_when_ctrl_says_so() {
+        // `esp_rom_spiflash_write_status`: `RD_STATUS[15:0]` = the status, `CMD = 0x04000000`.
+        let ctx = &mut Ctx::default();
+        let (mut spi, seen) = recording_spi1();
+        spi.write(ctx, RD_STATUS, 0xFFFF_3C9C);
+        spi.write(ctx, CMD, CMD_WRSR);
+        let ctrl = spi.register(CTRL);
+        spi.write(ctx, CTRL, ctrl | CTRL_WRSR_2B);
+        spi.write(ctx, CMD, CMD_WRSR);
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [
+                (0x01, None, 0, vec![0x9C]),
+                (0x01, None, 0, vec![0x9C, 0x3C])
+            ]
+        );
+    }
+
+    #[test]
+    fn the_hard_wired_read_sends_its_address_and_stores_what_the_chip_answers() {
+        // Pins the ASSUMPTION documented in `Spi1::run_hard_wired`.
+        let ctx = &mut Ctx::default();
+        let (mut spi, seen) = recording_spi1();
+        spi.write(ctx, ADDR, 0x7712_3456);
+        spi.write(ctx, MISO_DLEN, 8 * 6 - 1);
+        spi.write(ctx, W0 + 4, 0xFFFF_FFFF);
+        assert!(spi.write(ctx, CMD, CMD_READ));
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [(0x03, Some(at(0x12_3456)), 0, Vec::new())]
+        );
+        assert_eq!(spi.read(ctx, W0), Some(0xA3A2_A1A0));
+        assert_eq!(spi.read(ctx, W0 + 4), Some(0x0000_A5A4));
+        assert_eq!(spi.read(ctx, CMD), Some(0));
+    }
+
+    #[test]
+    fn a_suspend_or_resume_request_is_refused_by_name_and_the_measured_configuration_is_stored() {
+        let ctx = &mut Ctx::default();
+        let (mut spi, seen) = recording_spi1();
+        // What ESP-IDF writes at every bus acquisition (FW §A.2): no enable bit, a time-out count.
+        assert!(spi.write(ctx, FLASH_SUS_CTRL, 0x0A00_0000));
+        assert_eq!(spi.read(ctx, FLASH_SUS_CTRL), Some(0x0A00_0000));
+        // The two wait enables ask for nothing by themselves.
+        assert!(spi.write(ctx, FLASH_SUS_CTRL, 0b1100));
+        assert_eq!(ctx.take_unsupported(), None);
+        for (value, stored) in [
+            (1u32 << 5, 1u32 << 5), // FLASH_PES_EN: auto-suspend
+            (1 << 4, 1 << 4),       // PES_PER_EN: auto-resume
+            (0b10, 0),              // FLASH_PES: send a suspend
+            (0b01, 0),              // FLASH_PER: send a resume
+            (0x0A00_0023, 0x0A00_0020),
+        ] {
+            assert!(spi.write(ctx, FLASH_SUS_CTRL, value));
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::FlashSuspend { sus_ctrl: value }),
+                "{value:#x}"
+            );
+            assert_eq!(
+                spi.read(ctx, FLASH_SUS_CTRL),
+                Some(stored),
+                "the two command bits clear themselves"
+            );
+        }
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [],
+            "no suspend or resume opcode is sent"
+        );
     }
 
     #[test]
@@ -676,20 +974,21 @@ mod tests {
         spi.write(ctx, USER, USR_COMMAND | USR_ADDR);
         spi.write(ctx, USER2, 0x7000_005A);
         spi.write(ctx, ADDR, 0xDEAD_BEEF);
-        // (field value, address the flash must see): the field is the bit length minus one.
-        for (field, expected) in [
-            (0, 0x1),
-            (7, 0xEF),
-            (23, 0xAD_BEEF),
-            (31, 0xDEAD_BEEF),
-            (63, 0xDEAD_BEEF), // 64 bits asked, the register holds 32
+        // (field value, address the flash must see, on how many bits): the field is the bit
+        // length minus one.
+        for (field, value, bits) in [
+            (0, 0x1, 1),
+            (7, 0xEF, 8),
+            (23, 0xAD_BEEF, 24),
+            (31, 0xDEAD_BEEF, 32),
+            (63, 0xDEAD_BEEF, 32), // 64 bits asked, the register holds 32
         ] {
             spi.write(ctx, USER1, field << 26);
             spi.write(ctx, CMD, CMD_USR);
             let last = seen.borrow().last().cloned();
             assert_eq!(
                 last.map(|s| s.1),
-                Some(Some(expected)),
+                Some(Some(FlashAddress { value, bits })),
                 "address field {field}"
             );
         }
@@ -762,8 +1061,12 @@ mod tests {
         assert_eq!(ROM_SECTOR_ERASE, (1 << 24) | CMD_FLASH_PE);
         let ctx = &mut Ctx::default();
         let (mut spi, seen) = recording_spi1();
+        spi.write(ctx, ADDR, 0xE000);
         assert!(spi.write(ctx, CMD, ROM_SECTOR_ERASE));
-        assert_eq!(seen.borrow().as_slice(), [(0x20, None, 0, Vec::new())]);
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [(0x20, Some(at(0xE000)), 0, Vec::new())]
+        );
         assert_eq!(spi.read(ctx, CMD), Some(0), "self-clears");
         // On the read-only chip the erase is refused once, by its own opcode: `USER2` (0x00 in its low
         // byte at reset) is not a second command.
@@ -777,8 +1080,12 @@ mod tests {
     }
 
     #[test]
-    fn an_esp_idf_program_sets_the_flag_with_usr_and_its_opcode_runs_once() {
+    fn a_user_transfer_that_carries_the_program_erase_flag_runs_once() {
         // `spimem_flash_ll_user_start(dev, pe_ops = true)` ORs 0x60000 into CMD: `USR | FLASH_PE`.
+        // ESP-IDF v5.5.2 does it for the program and erase commands that take a 4-byte address,
+        // above 16 MiB (`spi_flash_chip_generic.c:118-151`); below, its program is the hard-wired
+        // `CMD = 0x02000000` (SF key result 12). What is pinned here is the flag beside `USR`,
+        // with a transfer the chip of this test understands: a 3-byte-address program.
         const USER_START_PE: u32 = 0x0006_0000;
         assert_eq!(USER_START_PE, CMD_USR | CMD_FLASH_PE);
         let ctx = &mut Ctx::default();
@@ -795,7 +1102,7 @@ mod tests {
         page_program(&mut spi);
         assert_eq!(
             seen.borrow().as_slice(),
-            [(0x02, Some(0xE000), 0, vec![1, 2, 3, 4])],
+            [(0x02, Some(at(0xE000)), 0, vec![1, 2, 3, 4])],
             "one transfer, with its address and its data"
         );
         let mut refused = spi1();
@@ -860,8 +1167,8 @@ mod tests {
         for name in ["MISC", "FLASH_SUS_CTRL", "FLASH_WAITI_CTRL"] {
             let offset = svd_regs::esp32c3::addr("SPI1", name) - SPI1_BASE;
             assert_eq!(spi1.read(ctx, offset), Some(reset("SPI1", name)), "{name}");
-            assert!(spi1.write(ctx, offset, 0x5), "{name}");
-            assert_eq!(spi1.read(ctx, offset), Some(0x5), "{name}");
+            assert!(spi1.write(ctx, offset, 0x0A00_0000), "{name}");
+            assert_eq!(spi1.read(ctx, offset), Some(0x0A00_0000), "{name}");
         }
         let mut spi0 = Spi0::new();
         for name in ["CORE_CLK_SEL", "MISC"] {

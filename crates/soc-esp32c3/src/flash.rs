@@ -171,11 +171,20 @@ pub enum FlashImageError {
     TooLong { len: usize, size: u32 },
 }
 
+/// The address phase of a transaction: the value the controller clocks out after the opcode, and
+/// on how many bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashAddress {
+    pub value: u32,
+    pub bits: u32,
+}
+
 /// One SPI transaction as the chip sees it.
 #[derive(Clone, Copy, Debug)]
 pub struct FlashCommand<'a> {
     pub opcode: u8,
-    pub address: Option<u32>,
+    /// `None` when the transaction has no address phase.
+    pub address: Option<FlashAddress>,
     pub dummy_cycles: u32,
     /// Bytes the controller sends after the address and the dummy cycles.
     pub data_out: &'a [u8],
@@ -489,7 +498,10 @@ mod tests {
         let mut byte = [0u8];
         let command = FlashCommand {
             opcode: 0x5A,
-            address: Some(0x10),
+            address: Some(FlashAddress {
+                value: 0x10,
+                bits: 24,
+            }),
             dummy_cycles: 8,
             data_out: &[],
         };

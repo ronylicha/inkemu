@@ -28,6 +28,14 @@ pub enum Unsupported {
         user: u32,
         user2: u32,
     },
+    /// A hard-wired page program (`SPI1.CMD` bit `FLASH_PP`) whose byte count, `ADDR[31:24]`, is 0
+    /// or more than the 64 bytes `W0..W15` hold; `addr` is the whole register.
+    FlashProgramLength { addr: u32 },
+    /// One write of `SPI1.CMD` with more than one command bit set; `cmd` is the value written.
+    FlashCommandBits { cmd: u32 },
+    /// A write of `SPI1.FLASH_SUS_CTRL` that sends a suspend or a resume, or enables the automatic
+    /// ones; `sus_ctrl` is the value written.
+    FlashSuspend { sus_ctrl: u32 },
     /// A write to `SHA.DMA_BLOCK_NUM`, `DMA_START` or `DMA_CONTINUE` (D7).
     ShaDma,
     /// A `SHA.MODE` the ESP32-C3 accelerator does not have.
@@ -71,6 +79,19 @@ impl Unsupported {
                     " (USER {user:#010x}, USER2 {user2:#010x}, pc {pc:#010x}) but only transfers with an 8-bit command are modeled, so nothing was sent to the flash; use firmware whose flash commands are 8 bits long until other transfers are emulated"
                 )
             }
+            Unsupported::FlashProgramLength { addr } => write!(
+                f,
+                "SPI1 was asked to program {len} bytes with one FLASH_PP command (ADDR {addr:#010x}, pc {pc:#010x}) but one command carries 1 to 64 bytes, what W0..W15 hold, so nothing was sent to the flash; put the byte count, 1 to 64, in ADDR[31:24]",
+                len = addr >> 24
+            ),
+            Unsupported::FlashCommandBits { cmd } => write!(
+                f,
+                "SPI1.CMD was written with several command bits at once (value {cmd:#010x}, pc {pc:#010x}) and the order in which the controller would run them is not documented, so none was run; start one flash command per write of SPI1.CMD"
+            ),
+            Unsupported::FlashSuspend { sus_ctrl } => write!(
+                f,
+                "SPI1.FLASH_SUS_CTRL asks for a program/erase suspend or resume (value {sus_ctrl:#010x}, pc {pc:#010x}) but a flash operation completes at once here and is never suspended, so nothing was sent to the flash; keep flash auto-suspend off (CONFIG_SPI_FLASH_AUTO_SUSPEND=n, the ESP-IDF default)"
+            ),
             Unsupported::ShaDma => write!(
                 f,
                 "SHA.DMA_BLOCK_NUM, DMA_START or DMA_CONTINUE was written (pc {pc:#010x}) but only the typical SHA mode is modeled, so DMA-SHA produces no digest; use firmware that hashes through SHA.START/CONTINUE until DMA-SHA is emulated"
@@ -197,6 +218,10 @@ impl Diagnostic {
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
                 }
+                // One line per byte count, per set of command bits, and one for suspend requests.
+                Unsupported::FlashProgramLength { addr } => (15, addr >> 24, 0),
+                Unsupported::FlashCommandBits { cmd } => (16, cmd, 0),
+                Unsupported::FlashSuspend { .. } => (17, 0, 0),
             },
             Diagnostic::FlashMapping { entry, fault, .. } => (10, entry, fault as u32),
             Diagnostic::Reset { cause, pc, .. } => (14, pc, cause.code()),
@@ -566,6 +591,9 @@ mod tests {
                 uart: 1,
                 sclk_sel: 2,
             }),
+            unsupported(Unsupported::FlashProgramLength { addr: 0x4100_9000 }),
+            unsupported(Unsupported::FlashCommandBits { cmd: 0x0300_0000 }),
+            unsupported(Unsupported::FlashSuspend { sus_ctrl: 0x20 }),
             mapping(3, MappingFault::InvalidEntry),
             mapping(3, MappingFault::BeyondFlash),
         ] {
@@ -731,6 +759,18 @@ mod tests {
                     sclk_sel: 2,
                 }),
                 "UART1 sent a byte with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = 2",
+            ),
+            (
+                unsupported(Unsupported::FlashProgramLength { addr: 0x4100_9000 }),
+                "program 65 bytes with one FLASH_PP command (ADDR 0x41009000",
+            ),
+            (
+                unsupported(Unsupported::FlashCommandBits { cmd: 0x0300_0000 }),
+                "several command bits at once (value 0x03000000",
+            ),
+            (
+                unsupported(Unsupported::FlashSuspend { sus_ctrl: 0x20 }),
+                "program/erase suspend or resume (value 0x00000020",
             ),
             (mapping(3, MappingFault::InvalidEntry), "MMU entry 3"),
             (
