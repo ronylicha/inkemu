@@ -1751,6 +1751,8 @@ mod tests {
         assert_eq!(status(&mut flash), 0xFE);
         send_data(&mut flash, 0x01, &[0x00]).unwrap();
         assert_eq!(status(&mut flash), 0);
+        // The status register is not content: the four status writes changed no byte of it.
+        assert_eq!((flash.generation(), flash.modified_sectors()), (0, 0));
     }
 
     #[test]
@@ -1765,12 +1767,32 @@ mod tests {
                     status: bp | 0x02,
                 })
             };
-            assert_eq!(write(&mut flash, 0x02, 0, &[0x00]), protected(0x02));
-            assert_eq!(write(&mut flash, 0x20, 0, &[]), protected(0x20));
-            assert_eq!(write(&mut flash, 0xD8, 0, &[]), protected(0xD8));
-            assert_eq!(run(&mut flash, 0xC7, &mut []), protected(0xC7));
+            // Without the latch a chip ignores the write, protected or not: nothing to report.
+            assert_eq!(status(&mut flash), bp, "the status write cleared the latch");
+            assert_eq!(send(&mut flash, 0x02, 0, &[0x00]), Ok(None));
+            assert_eq!(send(&mut flash, 0x20, 0, &[]), Ok(None));
+            assert_eq!(run(&mut flash, 0xC7, &mut []), Ok(None));
+            // One write enable for the five commands: a refusal changes nothing, the latch
+            // included, so each of them finds it set.
+            run(&mut flash, 0x06, &mut []).unwrap();
+            for (opcode, data) in [(0x02u8, &[0x00u8][..]), (0x20, &[]), (0xD8, &[])] {
+                assert_eq!(send(&mut flash, opcode, 0, data), protected(opcode));
+                assert_eq!(
+                    status(&mut flash),
+                    bp | 0x02,
+                    "{opcode:#04x} kept the latch"
+                );
+            }
+            for opcode in [0xC7, 0x60] {
+                assert_eq!(run(&mut flash, opcode, &mut []), protected(opcode));
+                assert_eq!(
+                    status(&mut flash),
+                    bp | 0x02,
+                    "{opcode:#04x} kept the latch"
+                );
+            }
             assert_eq!(content(&flash, 0, 16), [0x0F; 16], "status {bp:#04x}");
-            assert_eq!(flash.modified_sectors(), 0);
+            assert_eq!((flash.generation(), flash.modified_sectors()), (0, 0));
             // The status write is how the protection is lifted: it is not protected itself.
             send_data(&mut flash, 0x01, &[0x00]).unwrap();
             assert!(write(&mut flash, 0x02, 0, &[0x00]).unwrap().is_some());
@@ -1801,15 +1823,28 @@ mod tests {
                         len
                     })
                 );
+                assert_eq!(status(&mut flash), 0x02, "a refusal keeps the latch");
             }
         }
-        assert_eq!(flash.modified_sectors(), 0);
-        run(&mut flash, 0x04, &mut []).unwrap();
+        // The latch a refusal kept is the one the next command finds: no write enable here.
         assert_eq!(
-            send(&mut flash, 0x02, 0x10_0000, &[0]),
-            Ok(None),
-            "without the latch a chip ignores the command wherever it points"
+            send(&mut flash, 0x20, 0x10_0000, &[]),
+            Err(FlashRefusal::OutOfRange {
+                opcode: 0x20,
+                address: 0x10_0000,
+                len: 0x1000
+            })
         );
+        assert_eq!((flash.generation(), flash.modified_sectors()), (0, 0));
+        run(&mut flash, 0x04, &mut []).unwrap();
+        // The latch is judged before the range, for a program and for an erase alike.
+        for (opcode, data) in [(0x02u8, &[0u8][..]), (0x20, &[]), (0xD8, &[])] {
+            assert_eq!(
+                send(&mut flash, opcode, 0x10_0000, data),
+                Ok(None),
+                "{opcode:#04x}: without the latch a chip ignores the command wherever it points"
+            );
+        }
         // The last byte of the chip is inside it: the image grows to the size of the chip and
         // no further.
         write(&mut flash, 0x02, 0x0F_FFFF, &[0x00, 0x11]).unwrap();
