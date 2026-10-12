@@ -1001,13 +1001,35 @@ fn a_run_that_prints_nothing_more_ends_when_the_reader_of_its_output_goes_away()
     );
 }
 
+/// `flash_hello.bin` of `tools/reference-firmware/build.sh`, as
+/// `tools/reference-firmware/SHA256SUMS.output` pins it.
+const HELLO_IMAGE_SHA256: &str = "fc05ef5dbe85372e1da52abdec3bfcbbb110738a60163734666095fcd8c39bf2";
+
+/// The path the environment variable `variable` holds, accepted only when the file there is the
+/// pinned image `file`. A run of another image fails later, on a console line or on a trace
+/// hash, and says nothing of its cause.
+fn pinned_image(variable: &str, file: &str, sha256: &str) -> String {
+    let path = std::env::var(variable).unwrap_or_else(|_| panic!("set {variable}"));
+    assert_eq!(
+        sha256_of(std::path::Path::new(&path)),
+        sha256,
+        "{path} is not the pinned {file}; rebuild it with tools/reference-firmware/build.sh"
+    );
+    path
+}
+
+/// The reference `hello_world` image, named by `INKEMU_REF_FLASH`.
+fn reference_image() -> String {
+    pinned_image("INKEMU_REF_FLASH", "flash_hello.bin", HELLO_IMAGE_SHA256)
+}
+
 /// The milestone through the real command: ROM, bootloader, the whole life of the application,
 /// its restart and the first line of the second boot, with nothing unmodelled.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
 fn x4_boots_the_reference_firmware_through_its_restart_into_a_second_boot() {
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
-    let flash = std::env::var("INKEMU_REF_FLASH").expect("set INKEMU_REF_FLASH");
+    let flash = reference_image();
     // One life of the application is 28 million cycles and 11 s of device time; 40 million reach
     // the second boot.
     let run = || {
@@ -1087,7 +1109,7 @@ fn x4_boots_the_reference_firmware_through_its_restart_into_a_second_boot() {
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
 fn x4_boots_the_reference_firmware_and_a_device_time_limit_ends_its_countdown_asleep() {
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
-    let flash = std::env::var("INKEMU_REF_FLASH").expect("set INKEMU_REF_FLASH");
+    let flash = reference_image();
     let output = inkemu()
         .args([
             "run",
@@ -1152,7 +1174,7 @@ fn x4_boots_the_reference_firmware_and_a_device_time_limit_ends_its_countdown_as
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
 fn x4_runs_the_reference_firmware_along_its_pinned_trace() {
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
-    let flash = std::env::var("INKEMU_REF_FLASH").expect("set INKEMU_REF_FLASH");
+    let flash = reference_image();
     let output = inkemu()
         .args([
             "run",
@@ -1263,6 +1285,7 @@ fn run_help_documents_the_flash_file_its_lock_and_its_reset() {
     inkemu().args(["run", "--help"]).assert().code(0).stdout(
         contains("--flash-file <FILE>")
             .and(contains("FILE.lock"))
+            .and(contains(".FILE.tmp"))
             .and(contains("by its owner only"))
             .and(contains("--reset-flash"))
             .and(contains("The image is only read"))
@@ -1505,8 +1528,7 @@ fn a_flash_file_in_a_directory_that_takes_no_new_file_is_refused_before_boot() {
         "this test needs a user whom a read-only directory stops; run it as one"
     );
     refused.code(2).stderr(
-        contains("could not be written when this run ends")
-            .and(contains("cannot create "))
+        contains("x4.bin cannot be written when this run ends: cannot create ")
             .and(contains(".x4.bin.tmp"))
             .and(contains(
                 "; check that the directory exists and is writable",
@@ -1607,16 +1629,19 @@ fn a_flash_file_that_cannot_be_written_is_refused_before_boot_and_left_as_it_is(
     }
 }
 
-/// What a save that was killed left behind is removed by the next run on the same flash file,
-/// which holds the lock: no run is writing it.
+/// What sits at the name of the temporary file is removed by a run that runs, never by one that
+/// is refused, whatever refuses it: here the flash file was taken and the ROM is missing. (The
+/// removal by a run that runs, and what it says, is in the test of a save that was killed.)
 #[test]
-fn a_temporary_file_left_by_a_killed_save_is_removed_when_the_next_run_starts() {
+fn a_run_that_is_refused_leaves_what_sits_at_the_temporary_name_of_its_flash_file() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".x4.bin.tmp"), b"a part of a flash").unwrap();
+    let left = dir.path().join(".x4.bin.tmp");
+    std::fs::write(&left, b"a part of a flash").unwrap();
     run_with_flash_file(&dir.path().join("x4.bin"), &[])
         .code(2)
-        .stderr(contains(MISSING_ROM));
-    assert_eq!(names_in(dir.path()), ["x4.bin.lock"]);
+        .stderr(contains(MISSING_ROM).and(contains("removed").not()));
+    assert_eq!(names_in(dir.path()), [".x4.bin.tmp", "x4.bin.lock"]);
+    assert_eq!(std::fs::read(&left).unwrap(), b"a part of a flash");
 }
 
 /// A run refused for what sits at the path of its flash file creates nothing beside it.
@@ -2126,6 +2151,44 @@ fn a_flash_file_whose_directory_became_read_only_exits_2_and_leaves_no_file() {
     assert_eq!(left, ["x4.bin.lock"], "no flash file, no temporary file");
 }
 
+/// What sits at the name of the temporary file is looked at once nothing else can refuse the
+/// run. A directory there cannot be removed, the flash could not be saved through that name:
+/// the run is refused before its first instruction, with what to remove.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_directory_at_the_temporary_name_refuses_the_run_before_its_first_instruction() {
+    let (dir, image) = flash_image_of(&counting_its_boots());
+    let file = dir.path().join("x4.bin");
+    std::fs::create_dir(dir.path().join(".x4.bin.tmp")).unwrap();
+    let refused = count_a_boot(&[
+        "--flash".as_ref(),
+        image.as_os_str(),
+        "--flash-file".as_ref(),
+        file.as_os_str(),
+    ]);
+    assert_eq!(refused.code, Some(2), "{}", refused.log);
+    assert!(
+        refused.console.is_empty(),
+        "nothing ran: {}",
+        refused.console
+    );
+    assert!(
+        refused
+            .log
+            .contains("x4.bin cannot be written when this run ends: cannot remove ")
+            && refused.log.contains(".x4.bin.tmp")
+            && refused.log.contains("; remove it, then run again")
+            && !refused.log.contains("inkemu: "),
+        "the refusal and nothing of a run: {}",
+        refused.log
+    );
+    assert_eq!(
+        names_in(dir.path()),
+        [".x4.bin.tmp", "flash.bin", "x4.bin.lock"],
+        "the directory is left, and no flash file was written"
+    );
+}
+
 /// `inkemu run --device x4` with the real ROM and `more`, to its end.
 fn run_x4(more: &[&std::ffi::OsStr]) -> Counted {
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
@@ -2398,6 +2461,15 @@ fn a_save_killed_by_a_file_size_limit_leaves_the_flash_file_of_before_and_the_ne
         ["flash.bin", "x4.bin", "x4.bin.lock"],
         "the part left by the killed save is gone"
     );
+    // The run says what it removed and why, before anything else, and that nothing is to be done.
+    let said = next.log.lines().next().unwrap_or_default();
+    assert!(
+        said.starts_with("inkemu: removed ")
+            && said.contains(".x4.bin.tmp, which a save of the flash file ")
+            && said.contains("x4.bin that was interrupted left behind; nothing to do: "),
+        "{}",
+        next.log
+    );
 }
 
 /// `flash_nvs.bin` of `tools/reference-firmware/build.sh` and the whole flash after the first and
@@ -2414,14 +2486,11 @@ const NVS_AFTER_LIFE_2: &str = "7ad0acf62e5a4e20aa6d47be0f1d922a7b89cb204941feac
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_NVS_FLASH"]
 fn the_nvs_reference_firmware_goes_on_counting_in_a_second_run_on_the_same_flash_file() {
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
-    let image =
-        std::path::PathBuf::from(std::env::var("INKEMU_NVS_FLASH").expect("set INKEMU_NVS_FLASH"));
-    assert_eq!(
-        sha256_of(&image),
+    let image = std::path::PathBuf::from(pinned_image(
+        "INKEMU_NVS_FLASH",
+        "flash_nvs.bin",
         NVS_IMAGE_SHA256,
-        "{} is not the pinned flash_nvs.bin; rebuild it with tools/reference-firmware/build.sh",
-        image.display()
-    );
+    ));
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("x4.bin");
     let run = |seconds: &str, flash: &[&std::ffi::OsStr]| {

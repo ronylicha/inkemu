@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 /// What is appended to the name of a flash file to name its lock file.
 const LOCK_SUFFIX: &str = ".lock";
 
+/// What to do about something at the name of the temporary file that cannot be removed.
+const REMOVE_THE_TEMPORARY_FILE: &str = "remove it, then run again";
+
 /// The mode of a flash file a run creates, on Unix: read and written by its owner, and nothing
 /// for anyone else.
 #[cfg(unix)]
@@ -55,7 +58,7 @@ pub enum FlashStateError {
     /// Found when the run starts, before anything runs: the file the content goes through when
     /// the run ends cannot be made now.
     #[error(
-        "the flash file {path} could not be written when this run ends: cannot {action} {target}: {detail}; {remedy}"
+        "the flash file {path} cannot be written when this run ends: cannot {action} {target}: {detail}; {remedy}"
     )]
     Unwritable {
         path: String,
@@ -373,8 +376,11 @@ impl FlashState {
     /// now, is refused now: a run must not go to its end to learn that what it wrote to the
     /// flash is lost for a cause that was there before it started. What sits at the path is
     /// judged first, so that a run refused for it creates nothing beside it; then, under the
-    /// lock, what a save that was killed left behind is removed, and the temporary file of this
-    /// run is created and removed, to know that it can be.
+    /// lock, the temporary file of this run is created and removed, to know that it can be.
+    ///
+    /// What already sits at the name of the temporary file is not touched here: the run may
+    /// still be refused, and a refused run removes nothing. It is removed once the run is
+    /// accepted ([`RunFlash::accept`]).
     ///
     /// # Errors
     /// [`FlashStateError`] when the path names no file, what is at the path cannot be the flash
@@ -469,30 +475,50 @@ impl FlashState {
         temporary.set_permissions(std::fs::Permissions::from_mode(replaced))
     }
 
-    /// Removes the temporary file a save that was killed left behind (no run is writing it:
-    /// this one holds the lock), then creates and removes the one of this run: the directory
-    /// takes a new file and the name fits, now.
-    fn try_the_temporary_file(&self) -> Result<(), FlashStateError> {
-        const REMOVE_IT: &str = "remove it, then run again";
-        let failed = |action: &'static str, remedy: &'static str, e: &std::io::Error| {
-            FlashStateError::Unwritable {
-                path: self.shown.clone(),
-                action,
-                target: shown(&self.temporary),
-                detail: sanitize(&e.to_string()),
-                remedy,
-            }
-        };
-        match std::fs::remove_file(&self.temporary) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(failed("remove", REMOVE_IT, &e)),
+    /// What could not be done to the temporary file when the run starts, as the refusal of the
+    /// run.
+    fn unwritable(
+        &self,
+        action: &'static str,
+        remedy: &'static str,
+        error: &std::io::Error,
+    ) -> FlashStateError {
+        FlashStateError::Unwritable {
+            path: self.shown.clone(),
+            action,
+            target: shown(&self.temporary),
+            detail: sanitize(&error.to_string()),
+            remedy,
         }
-        drop(
-            self.create_temporary()
-                .map_err(|e| failed("create", creation_remedy(&e), &e))?,
-        );
-        std::fs::remove_file(&self.temporary).map_err(|e| failed("remove", REMOVE_IT, &e))
+    }
+
+    /// Creates and removes the temporary file of this run: the directory takes a new file and
+    /// the name fits, now. When something already sits at the name, nothing is created and
+    /// nothing is removed. The name fits, since it is taken; whether the directory still takes
+    /// a change is learnt when the run is accepted and the name is cleared, which asks of the
+    /// directory the right a creation asks.
+    fn try_the_temporary_file(&self) -> Result<(), FlashStateError> {
+        match self.create_temporary() {
+            Ok(created) => drop(created),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => return Err(self.unwritable("create", creation_remedy(&e), &e)),
+        }
+        std::fs::remove_file(&self.temporary)
+            .map_err(|e| self.unwritable("remove", REMOVE_THE_TEMPORARY_FILE, &e))
+    }
+
+    /// Removes what sits at the name of the temporary file, if anything does, and says whether
+    /// something did. No run is writing it, since this one holds the lock: it is what a save
+    /// that was interrupted left. A link is removed itself, never what it names.
+    ///
+    /// For a run that is accepted, not for one that may still be refused: see
+    /// [`RunFlash::accept`].
+    fn remove_what_an_interrupted_save_left(&self) -> Result<bool, FlashStateError> {
+        match std::fs::remove_file(&self.temporary) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(self.unwritable("remove", REMOVE_THE_TEMPORARY_FILE, &e)),
+        }
     }
 
     /// The path of the flash file, with its control characters escaped: for messages.
@@ -528,7 +554,17 @@ impl FlashState {
     /// the flash, or changes while it is read.
     pub fn load(&self) -> Result<Vec<u8>, FlashStateError> {
         let read_error = |e: std::io::Error| read_error(&self.shown, &e);
-        let file = File::open(&self.path).map_err(read_error)?;
+        // The file was judged under the lock, a moment ago. What took its name since is opened
+        // as the lock file is: a pipe is not waited on, and a link fails the open instead of
+        // having the file it names read as the flash of the device.
+        let file = open_in_place(OpenOptions::new().read(true), &self.path).map_err(|e| {
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(now_there) if !now_there.is_file() => FlashStateError::NotAFile {
+                    path: self.shown.clone(),
+                },
+                _ => read_error(e),
+            }
+        })?;
         // What was opened is judged, not what the path named a moment ago.
         check(
             &self.shown,
@@ -568,8 +604,8 @@ impl FlashState {
                 size: self.size,
             }
         };
-        // The name was free when the run started. Whatever was put there since is not this
-        // run's: it is removed (a link itself, never what it points to), once.
+        // The name was free when the run was accepted. Whatever was put there since is not
+        // this run's: it is removed (a link itself, never what it points to), once.
         let mut file = match self.create_temporary() {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 std::fs::remove_file(&self.temporary)
@@ -672,6 +708,29 @@ impl RunFlash {
     #[must_use]
     pub const fn starts_from_the_file(&self) -> bool {
         self.from_file
+    }
+
+    /// Clears the way for the save of a run that is accepted: every other refusal is behind
+    /// it, its machine is built and about to run. What sits at the name of the temporary file
+    /// is removed, and `log` says so. A run that is refused, for its flash file or for anything
+    /// else, never comes here, and removes nothing.
+    ///
+    /// # Errors
+    /// [`FlashStateError::Unwritable`] when something sits at the name and cannot be removed:
+    /// the content could not go through that name when the run ends.
+    pub fn accept(&self, log: &mut dyn Write) -> Result<(), FlashStateError> {
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+        if state.remove_what_an_interrupted_save_left()? {
+            let _ = writeln!(
+                log,
+                "inkemu: removed {}, which a save of the flash file {} that was interrupted left behind; nothing to do: the flash file is as it was before that save, and that name is kept for the next save",
+                shown(&state.temporary),
+                state.shown()
+            );
+        }
+        Ok(())
     }
 
     /// Ends the run for its flash: says in `log` what it started from and what became of it,
@@ -870,6 +929,109 @@ mod tests {
         open_in_place(&mut creating(), &link).unwrap_err();
         open_in_place(&mut creating(), &file).unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"kept");
+    }
+
+    /// Makes a named pipe at `path`. Nobody ever opens its other end: an open that waits for
+    /// one waits for ever.
+    #[cfg(unix)]
+    fn make_pipe(path: &Path) {
+        nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+    }
+
+    /// What `work` returns, or `None` when it has not returned after five seconds: it waits
+    /// for the other end of `pipe`. The test must then fail, not hang: both ends of the pipe
+    /// are opened, which lets `work` return, before the answer is given.
+    #[cfg(unix)]
+    fn unless_it_waits_on<T: Send + 'static>(
+        pipe: &Path,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let (answer, answered) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = answer.send(work());
+        });
+        let returned = answered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .ok();
+        let both_ends = returned.is_none().then(|| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(pipe)
+        });
+        worker.join().unwrap();
+        drop(both_ends);
+        returned
+    }
+
+    /// What keeps a run from waiting for ever on a pipe put where one of its files goes: the
+    /// open asks not to wait for the other end.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_in_place_does_not_wait_for_the_other_end_of_a_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipe = dir.path().join("pipe");
+        make_pipe(&pipe);
+        // For writing, as the lock file and the flash file are opened: with nobody to read,
+        // the open fails at once.
+        let opened = unless_it_waits_on(&pipe, {
+            let pipe = pipe.clone();
+            move || {
+                open_in_place(OpenOptions::new().write(true), &pipe).map_err(|e| e.raw_os_error())
+            }
+        });
+        match opened {
+            Some(Err(errno)) => assert_eq!(errno, Some(nix::libc::ENXIO)),
+            Some(Ok(_)) => panic!("a pipe nobody reads was opened for writing"),
+            None => panic!("the open for writing waited on the pipe"),
+        }
+        // For reading, as the flash file is loaded: the open returns at once, and what it
+        // opened is for its caller to judge.
+        let opened = unless_it_waits_on(&pipe, {
+            let pipe = pipe.clone();
+            move || open_in_place(OpenOptions::new().read(true), &pipe).map(|file| file.metadata())
+        });
+        match opened {
+            Some(Ok(Ok(metadata))) => assert!(!metadata.is_file()),
+            Some(other) => panic!("{other:?}"),
+            None => panic!("the open for reading waited on the pipe"),
+        }
+    }
+
+    /// The flash file is judged under the lock, then read. What takes its name in between is
+    /// not read as the flash of the device, and is not waited on.
+    #[cfg(unix)]
+    #[test]
+    fn what_took_the_place_of_the_flash_file_since_it_was_judged_is_refused_not_read() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x4.bin");
+        let state = Arc::new(FlashState::open(&path, SIZE).unwrap());
+        let not_a_file = |what: &str, loaded: Option<Result<Vec<u8>, FlashStateError>>| match loaded
+        {
+            None => panic!("the read waited on {what}"),
+            Some(Ok(read)) => panic!("{what} was read as a flash of {} bytes", read.len()),
+            Some(Err(err)) => assert!(
+                matches!(err, FlashStateError::NotAFile { .. }),
+                "{what}: {err}"
+            ),
+        };
+
+        // A link to a file of the size of the flash: followed, it would be read as the flash.
+        std::fs::write(dir.path().join("other.bin"), content(7)).unwrap();
+        state.save(&content(1)).unwrap();
+        assert!(state.exists().unwrap());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("other.bin"), &path).unwrap();
+        not_a_file("a link", Some(state.load()));
+
+        // A pipe: opened as a file is, the read would wait for a writer that never comes.
+        std::fs::remove_file(&path).unwrap();
+        make_pipe(&path);
+        let loading = Arc::clone(&state);
+        not_a_file("a pipe", unless_it_waits_on(&path, move || loading.load()));
     }
 
     #[cfg(unix)]
@@ -1191,7 +1353,7 @@ mod tests {
         );
         let text = err.to_string();
         assert!(
-            text.contains("could not be written when this run ends")
+            text.contains("x4.bin cannot be written when this run ends: cannot create ")
                 && text.contains(".x4.bin.tmp")
                 && text.contains("; check that the directory exists and is writable"),
             "{text}"
@@ -1279,23 +1441,60 @@ mod tests {
         );
     }
 
+    fn accept(flash: &RunFlash) -> (Result<(), FlashStateError>, String) {
+        let mut log = Vec::new();
+        let accepted = flash.accept(&mut log);
+        (accepted, String::from_utf8(log).unwrap())
+    }
+
     #[test]
-    fn what_a_killed_save_left_is_removed_at_the_start_and_a_link_planted_later_is_not_followed() {
+    fn what_an_interrupted_save_left_is_removed_by_a_run_that_is_accepted_which_says_so() {
+        const LEFT: &[u8] = b"a part of a flash, left by a save that was killed";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x4.bin");
         let temporary = dir.path().join(".x4.bin.tmp");
-        std::fs::write(
-            &temporary,
-            b"a part of a flash, left by a save that was killed",
-        )
-        .unwrap();
+        std::fs::write(&path, vec![0x11u8; MIB as usize]).unwrap();
+        std::fs::write(&temporary, LEFT).unwrap();
+
+        // A run that is refused, here for an image given next to a flash file that exists,
+        // leaves the directory as it found it but for its lock file.
+        let err = RunFlash::begin(Some(&path), false, Some(seed()), MIB).unwrap_err();
+        assert!(matches!(err, FlashStateError::BothGiven { .. }), "{err}");
+        assert_eq!(std::fs::read(&temporary).unwrap(), LEFT, "not removed");
+
+        // A run that takes the file does not touch it either until it is accepted: what comes
+        // after the flash file (the ROM, the machine) may still refuse it.
+        let (flash, _) = RunFlash::begin(Some(&path), false, None, MIB).unwrap();
+        assert_eq!(std::fs::read(&temporary).unwrap(), LEFT, "not removed yet");
+        let (accepted, log) = accept(&flash);
+        accepted.unwrap();
+        assert_eq!(names(dir.path()), ["x4.bin", "x4.bin.lock"], "removed");
+        assert_eq!(
+            log,
+            format!(
+                "inkemu: removed {}, which a save of the flash file {} that was interrupted left behind; nothing to do: the flash file is as it was before that save, and that name is kept for the next save\n",
+                sanitize(&temporary.display().to_string()),
+                sanitize(&path.display().to_string())
+            )
+        );
+        // With nothing at the name there is nothing to remove, and nothing to say.
+        let (accepted, log) = accept(&flash);
+        accepted.unwrap();
+        assert_eq!(log, "");
+        // Nor without a flash file.
+        let (no_file, _) = RunFlash::begin(None, false, None, MIB).unwrap();
+        let (accepted, log) = accept(&no_file);
+        accepted.unwrap();
+        assert_eq!(log, "");
+    }
+
+    #[test]
+    fn what_takes_the_temporary_name_while_the_run_goes_on_is_replaced_and_a_link_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x4.bin");
+        let temporary = dir.path().join(".x4.bin.tmp");
         let state = FlashState::open(&path, SIZE).unwrap();
         assert_eq!(state.temporary, temporary, "one name per flash file");
-        assert_eq!(
-            names(dir.path()),
-            ["x4.bin.lock"],
-            "removed by the run that holds the lock"
-        );
         // What takes the name while the run goes on is not this run's: it is replaced.
         std::fs::write(&temporary, b"planted").unwrap();
         state.save(&content(1)).unwrap();
@@ -1313,10 +1512,14 @@ mod tests {
     }
 
     #[test]
-    fn what_sits_at_the_temporary_name_and_cannot_be_removed_is_refused_when_the_run_starts() {
+    fn what_sits_at_the_temporary_name_and_cannot_be_removed_refuses_the_run_before_it_runs() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".x4.bin.tmp")).unwrap();
-        let err = FlashState::open(&dir.path().join("x4.bin"), SIZE).unwrap_err();
+        let (flash, _) = RunFlash::begin(Some(&dir.path().join("x4.bin")), false, None, MIB)
+            .expect("the name is taken: there is nothing to try, and nothing is removed yet");
+        let (accepted, log) = accept(&flash);
+        assert_eq!(log, "", "nothing was removed");
+        let err = accepted.unwrap_err();
         assert!(
             matches!(
                 err,

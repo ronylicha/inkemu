@@ -69,11 +69,13 @@ enum Command {
         /// then refused unless --reset-flash is given) and writes it when it ends: at a limit,
         /// at the first Ctrl-C, at a --strict-mmio stop, when the CPU waits for ever. The file
         /// is replaced in one step, never written while the run goes on, so a run that is
-        /// killed leaves the file of before. A lock file beside it (FILE.lock) refuses a second
-        /// run on the same file; it is left in place. A flash holds what the firmware keeps,
-        /// network credentials among it: on Unix a file created here is readable and writable
-        /// by its owner only, one that is replaced keeps its mode, and one that cannot be
-        /// written is refused.
+        /// killed leaves the file of before. The new content goes through a temporary file
+        /// beside it (.FILE.tmp, the name of FILE after a dot): what an interrupted save left
+        /// at that name is removed by the next run that starts, which says so. A lock file
+        /// beside it (FILE.lock) refuses a second run on the same file; it is left in place. A
+        /// flash holds what the firmware keeps, network credentials among it: on Unix a file
+        /// created here is readable and writable by its owner only, one that is replaced keeps
+        /// its mode, and one that cannot be written is refused.
         #[arg(long, value_name = "FILE")]
         flash_file: Option<PathBuf>,
         /// Start from the --flash image, or from an erased flash, although the flash file
@@ -358,6 +360,11 @@ fn run_device(
         },
         None => profile.instantiate(rom, machine_options),
     };
+    // Nothing refuses the run from here on but its flash file: only now is what an interrupted
+    // save left beside it removed. A run refused above left the directory as it found it.
+    if let Err(e) = run_flash.accept(&mut io::stderr().lock()) {
+        return fail(&e);
+    }
     write_line(
         io::stderr(),
         &format_args!("{}; {flash_note}", header(&profile, entry, &machine)),
