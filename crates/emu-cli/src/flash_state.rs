@@ -8,6 +8,7 @@
 //! over into a file.
 use crate::term::{hex, sanitize};
 use sha2::{Digest, Sha256};
+use soc_esp32c3::Esp32C3;
 use soc_esp32c3::flash::ERASED;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -61,6 +62,10 @@ pub enum FlashStateError {
         size: u32,
         found: String,
     },
+    #[error(
+        "both --flash and the flash file {path}, which exists, were given: the run cannot start from two flashes; drop --flash to go on from the flash file, or add --reset-flash to start again from the image and replace the file"
+    )]
+    BothGiven { path: String },
     #[error(
         "cannot write the flash file {path}: cannot {action} {target}: {detail}; what this run wrote to the flash is lost; check that the directory still exists, is writable and has {size} bytes free, then run again"
     )]
@@ -294,6 +299,136 @@ impl FlashState {
         FlashStateError::Read {
             path: self.shown.clone(),
             detail: sanitize(&error.to_string()),
+        }
+    }
+}
+
+/// The flash of one run of `inkemu run`: what it starts from, and what becomes of it when the
+/// run ends.
+///
+/// The content a run starts from is an input of the run, as the ROM and the device profile are:
+/// its SHA-256 is said in the summary. Writing the flash file is not part of the run: it happens
+/// after the last instruction, and enters no trace.
+#[derive(Debug)]
+pub struct RunFlash {
+    /// The flash file, locked, when the run was given one.
+    state: Option<FlashState>,
+    /// Whether the run starts from the content the flash file holds: the file then only has to
+    /// be written if the run modified the flash.
+    from_file: bool,
+    start_sha256: String,
+    size: u32,
+}
+
+impl RunFlash {
+    /// Decides what a run starts from and takes its flash file, before any machine exists.
+    ///
+    /// - No flash file: the run starts from `seed` (the `--flash` image) or from an erased
+    ///   flash, and nothing is kept when it ends.
+    /// - A flash file that exists: the run goes on from it. `seed` is then refused, since the
+    ///   run cannot start from both, unless `reset` asks to start again from the seed (or from
+    ///   an erased flash) and to replace the file.
+    /// - A flash file that does not exist yet: the run starts from `seed` or from an erased
+    ///   flash, and the file is created when it ends.
+    ///
+    /// Returns the content to build the machine from; `None` is an erased flash.
+    ///
+    /// # Errors
+    /// [`FlashStateError`]: the flash file cannot be used (see [`FlashState::open`],
+    /// [`FlashState::exists`], [`FlashState::load`]), or it exists and `seed` was given without
+    /// `reset`.
+    pub fn begin(
+        flash_file: Option<&Path>,
+        reset: bool,
+        seed: Option<Vec<u8>>,
+        size: u32,
+    ) -> Result<(RunFlash, Option<Vec<u8>>), FlashStateError> {
+        let state = flash_file
+            .map(|path| FlashState::open(path, size))
+            .transpose()?;
+        // An existing file is judged even when it is about to be replaced: a file of another
+        // size is not a flash of this device, and `--reset-flash` must not destroy it.
+        let from_file = match &state {
+            Some(state) if state.exists()? => {
+                if !reset && seed.is_some() {
+                    return Err(FlashStateError::BothGiven {
+                        path: state.shown.clone(),
+                    });
+                }
+                !reset
+            }
+            _ => false,
+        };
+        let content = match &state {
+            Some(state) if from_file => Some(state.load()?),
+            _ => seed,
+        };
+        let start_sha256 = content_sha256(content.as_deref().unwrap_or_default(), size);
+        Ok((
+            RunFlash {
+                state,
+                from_file,
+                start_sha256,
+                size,
+            },
+            content,
+        ))
+    }
+
+    /// The flash file of the run, when it has one.
+    #[must_use]
+    pub const fn state(&self) -> Option<&FlashState> {
+        self.state.as_ref()
+    }
+
+    /// Whether the run starts from the content of its flash file.
+    #[must_use]
+    pub const fn starts_from_the_file(&self) -> bool {
+        self.from_file
+    }
+
+    /// Ends the run for its flash: says in `log` what it started from and what became of it,
+    /// and writes the flash file when there is one and it does not already hold the content
+    /// (it did not exist, it is being replaced, or the run modified the flash).
+    ///
+    /// Returns `false` when the flash file had to be written and could not be: the error is in
+    /// `log`, and what the run wrote to the flash is lost. A failing log writer does not keep
+    /// the file from being written, nor change the answer.
+    pub fn finish(&self, machine: &Esp32C3, log: &mut dyn Write) -> bool {
+        let modified = machine.flash_modified_sectors();
+        let _ = writeln!(log, "inkemu: flash at start: sha256 {}", self.start_sha256);
+        let Some(state) = &self.state else {
+            if modified > 0 {
+                let _ = writeln!(
+                    log,
+                    "inkemu: flash at end: {modified} of its 4 KiB sectors were modified and are not kept, since the run has no flash file; pass --flash-file <path> to keep the flash of the device from one run to the next"
+                );
+            }
+            return true;
+        };
+        if self.from_file && modified == 0 {
+            let _ = writeln!(
+                log,
+                "inkemu: flash at end: not modified; {} is left as it is",
+                state.shown()
+            );
+            return true;
+        }
+        let content = machine.flash_contents();
+        match state.save(&content) {
+            Ok(()) => {
+                let _ = writeln!(
+                    log,
+                    "inkemu: flash at end: sha256 {}; {modified} of its 4 KiB sectors were modified; saved to {}",
+                    content_sha256(&content, self.size),
+                    state.shown()
+                );
+                true
+            }
+            Err(e) => {
+                let _ = writeln!(log, "error: {e}");
+                false
+            }
         }
     }
 }
@@ -637,5 +772,249 @@ mod tests {
         let err = FlashState::open(&path, SIZE).unwrap_err().to_string();
         assert!(!err.contains('\u{1b}'), "{err:?}");
         assert!(err.contains("\\u{1b}[31mred.bin"), "{err}");
+    }
+
+    /// The flash of the machines below: 1 MiB, the smallest the model takes, so that a test
+    /// writes and hashes little.
+    const MIB: u32 = 1 << 20;
+
+    /// A machine of a device with a 1 MiB flash that starts from `content` (`None`: erased) and
+    /// runs `program` to its end.
+    fn ran(content: Option<Vec<u8>>, program: &[u32]) -> Esp32C3 {
+        use soc_esp32c3::test_support::{HANG, flat_rom};
+        let config = soc_esp32c3::SocConfig {
+            flash: soc_esp32c3::FlashConfig::new(
+                MIB,
+                soc_esp32c3::JedecId::from_u24(0x9D_6014).unwrap(),
+            )
+            .unwrap(),
+            ..soc_esp32c3::SocConfig::default()
+        };
+        let mut program = program.to_vec();
+        program.push(HANG);
+        let rom = flat_rom(&program);
+        let mut machine = match content {
+            Some(content) => Esp32C3::with_flash(rom, content, &config).unwrap(),
+            None => Esp32C3::new(rom, &config),
+        };
+        machine.run_until(emu_core::Cycles(400));
+        machine
+    }
+
+    /// A program that changes one byte of the flash sector at 0x3000.
+    fn writing(byte: u8) -> Vec<u32> {
+        soc_esp32c3::test_support::flash_program(0x3000, &[byte])
+    }
+
+    fn finish(flash: &RunFlash, machine: &Esp32C3) -> (bool, String) {
+        let mut log = Vec::new();
+        let kept = flash.finish(machine, &mut log);
+        (kept, String::from_utf8(log).unwrap())
+    }
+
+    /// A seed shorter than the flash, as a firmware image is.
+    fn seed() -> Vec<u8> {
+        vec![0x5A; 0x4000]
+    }
+
+    #[test]
+    fn without_a_flash_file_the_run_starts_from_the_seed_and_says_what_it_does_not_keep() {
+        let (flash, content) = RunFlash::begin(None, false, Some(seed()), MIB).unwrap();
+        assert_eq!(content, Some(seed()));
+        assert!(flash.state().is_none() && !flash.starts_from_the_file());
+        let start = format!(
+            "inkemu: flash at start: sha256 {}\n",
+            content_sha256(&seed(), MIB)
+        );
+        // A run that writes nothing has nothing more to say.
+        let (kept, log) = finish(&flash, &ran(content.clone(), &[]));
+        assert!(kept);
+        assert_eq!(log, start);
+        let (kept, log) = finish(&flash, &ran(content, &writing(0x00)));
+        assert!(kept, "nothing was to be kept");
+        assert_eq!(
+            log,
+            format!(
+                "{start}inkemu: flash at end: 1 of its 4 KiB sectors were modified and are not kept, since the run has no flash file; pass --flash-file <path> to keep the flash of the device from one run to the next\n"
+            )
+        );
+        // No seed: an erased flash, whose hash is the one of a file of erased bytes.
+        let (flash, content) = RunFlash::begin(None, false, None, MIB).unwrap();
+        assert_eq!(content, None);
+        let (_, log) = finish(&flash, &ran(None, &[]));
+        assert_eq!(
+            log,
+            format!(
+                "inkemu: flash at start: sha256 {}\n",
+                hex(&Sha256::digest(vec![0xFFu8; MIB as usize]))
+            )
+        );
+    }
+
+    #[test]
+    fn a_first_run_creates_the_flash_file_and_the_next_one_goes_on_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x4.bin");
+        // First run: no file yet, the seed, a write.
+        let (flash, content) = RunFlash::begin(Some(&path), false, Some(seed()), MIB).unwrap();
+        assert_eq!(content, Some(seed()));
+        assert!(!flash.starts_from_the_file());
+        let machine = ran(content, &writing(0x00));
+        let (kept, log) = finish(&flash, &machine);
+        assert!(kept);
+        let first = std::fs::read(&path).unwrap();
+        assert_eq!(first.len(), MIB as usize, "the whole flash, not the seed");
+        assert_eq!(first[0x3000], 0x00, "what the run wrote");
+        assert_eq!(first[0x3001], 0x5A, "what it started from");
+        assert_eq!(first[0x4000], 0xFF, "erased past the seed");
+        let first_hash = hex(&Sha256::digest(&first));
+        assert!(
+            log.ends_with(&format!(
+                "inkemu: flash at end: sha256 {first_hash}; 1 of its 4 KiB sectors were modified; saved to {}\n",
+                sanitize(&path.display().to_string())
+            )),
+            "{log}"
+        );
+        drop(flash);
+
+        // Second run: from the file, and it writes nothing: the file is not touched.
+        let (flash, content) = RunFlash::begin(Some(&path), false, None, MIB).unwrap();
+        assert!(flash.starts_from_the_file());
+        assert_eq!(content.as_deref(), Some(&first[..]));
+        let before = identity(&path);
+        let (kept, log) = finish(&flash, &ran(content.clone(), &[]));
+        assert!(kept);
+        assert_eq!(
+            log,
+            format!(
+                "inkemu: flash at start: sha256 {first_hash}\ninkemu: flash at end: not modified; {} is left as it is\n",
+                sanitize(&path.display().to_string())
+            )
+        );
+        // A program that leaves every byte as it was (0x00 over 0x00) modified nothing either.
+        let (kept, log) = finish(&flash, &ran(content.clone(), &writing(0x00)));
+        assert!(kept && log.contains("not modified"), "{log}");
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert_eq!(identity(&path), before, "the file was not written again");
+        // A run that changes a byte: the file becomes the new content, what the first run wrote
+        // included.
+        let another_write = soc_esp32c3::test_support::flash_program(0x5000, &[0x0F]);
+        let (kept, log) = finish(&flash, &ran(content, &another_write));
+        assert!(kept && log.contains("; saved to "), "{log}");
+        let second = std::fs::read(&path).unwrap();
+        assert_eq!((second[0x3000], second[0x5000]), (0x00, 0x0F));
+        assert_ne!(identity(&path), before, "replaced, not written in place");
+    }
+
+    /// What tells a file that was replaced from one that was left alone: its inode where there
+    /// is one, its modification time elsewhere.
+    #[cfg(unix)]
+    fn identity(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).unwrap().ino()
+    }
+    #[cfg(not(unix))]
+    fn identity(path: &Path) -> std::time::SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    #[test]
+    fn a_seed_and_an_existing_flash_file_are_refused_unless_the_file_is_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x4.bin");
+        let kept_content = vec![0x11u8; MIB as usize];
+        std::fs::write(&path, &kept_content).unwrap();
+        let err = RunFlash::begin(Some(&path), false, Some(seed()), MIB).unwrap_err();
+        assert!(matches!(err, FlashStateError::BothGiven { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("both --flash and the flash file")
+                && text.contains("x4.bin")
+                && text.contains("; drop --flash")
+                && text.contains("--reset-flash"),
+            "{text}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), kept_content, "untouched");
+
+        // The refusal released the lock. A reset starts from the seed and replaces the file,
+        // even when the run modified nothing.
+        let (flash, content) = RunFlash::begin(Some(&path), true, Some(seed()), MIB).unwrap();
+        assert_eq!(content, Some(seed()));
+        assert!(!flash.starts_from_the_file());
+        let (kept, log) = finish(&flash, &ran(content, &[]));
+        assert!(
+            kept && log.contains("0 of its 4 KiB sectors were modified; saved to"),
+            "{log}"
+        );
+        let replaced = std::fs::read(&path).unwrap();
+        assert_eq!(replaced[..0x4000], seed()[..]);
+        assert!(replaced[0x4000..].iter().all(|&byte| byte == 0xFF));
+        drop(flash);
+
+        // A reset without a seed starts from an erased flash.
+        let (flash, content) = RunFlash::begin(Some(&path), true, None, MIB).unwrap();
+        assert_eq!(content, None);
+        let (kept, _) = finish(&flash, &ran(None, &[]));
+        assert!(kept);
+        assert!(
+            std::fs::read(&path)
+                .unwrap()
+                .iter()
+                .all(|&byte| byte == 0xFF)
+        );
+    }
+
+    #[test]
+    fn a_reset_does_not_replace_a_file_that_is_not_a_flash_of_the_device() {
+        // A firmware image given to --flash-file by mistake must survive --reset-flash.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firmware.bin");
+        std::fs::write(&path, seed()).unwrap();
+        for reset in [false, true] {
+            let err = RunFlash::begin(Some(&path), reset, None, MIB).unwrap_err();
+            assert!(
+                matches!(err, FlashStateError::WrongSize { .. }),
+                "{reset}: {err}"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), seed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_flash_file_that_cannot_be_written_is_said_in_the_log_and_answered_by_no() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("flash");
+        std::fs::create_dir(&inner).unwrap();
+        let (flash, content) =
+            RunFlash::begin(Some(&inner.join("x4.bin")), false, None, MIB).unwrap();
+        std::fs::remove_dir_all(&inner).unwrap();
+        let (kept, log) = finish(&flash, &ran(content, &writing(0x00)));
+        assert!(!kept);
+        assert!(
+            log.starts_with("inkemu: flash at start: sha256 ")
+                && log.contains("\nerror: cannot write the flash file ")
+                && log.contains("what this run wrote to the flash is lost"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_written_does_not_keep_the_flash_from_being_saved() {
+        struct Failing;
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x4.bin");
+        let (flash, content) = RunFlash::begin(Some(&path), false, None, MIB).unwrap();
+        let machine = ran(content, &writing(0x00));
+        assert!(flash.finish(&machine, &mut Failing));
+        assert_eq!(std::fs::read(&path).unwrap()[0x3000], 0x00);
     }
 }

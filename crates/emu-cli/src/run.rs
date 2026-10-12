@@ -170,6 +170,25 @@ impl RunEnd {
             RunEnd::Idle => EXIT_IDLE,
         }
     }
+
+    /// The process exit code of a run that ended this way and whose flash file could then not be
+    /// written: what the firmware wrote to the flash is lost, which is an error of the
+    /// environment (2) whatever ended the run, a wait nothing can end included. One end keeps
+    /// its own code, for the reason [`execute`] gives for the console: `--strict-mmio` exists
+    /// for CI, and its exit code must not depend on the state of a directory. The message of
+    /// the failed write is printed in every case.
+    #[must_use]
+    pub const fn exit_code_without_its_flash(self) -> u8 {
+        match self {
+            RunEnd::StrictMmio => EXIT_STRICT_MMIO,
+            RunEnd::Budget
+            | RunEnd::TimeLimit
+            | RunEnd::ConsoleClosed
+            | RunEnd::ConsoleError
+            | RunEnd::Idle
+            | RunEnd::Interrupted => EXIT_ERROR,
+        }
+    }
 }
 
 /// Writes `bytes` to `out` and flushes; `Ok(false)` when the reader is gone (a broken pipe).

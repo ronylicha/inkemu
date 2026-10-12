@@ -49,6 +49,18 @@ mod tests {
     }
 
     #[test]
+    fn a_run_whose_flash_file_could_not_be_written_exits_2_unless_strict_mmio_stopped_it() {
+        for end in RunEnd::ALL {
+            let expected = if end == RunEnd::StrictMmio {
+                EXIT_STRICT_MMIO
+            } else {
+                EXIT_ERROR
+            };
+            assert_eq!(end.exit_code_without_its_flash(), expected, "{end:?}");
+        }
+    }
+
+    #[test]
     fn every_end_of_a_run_is_listed_once() {
         // The `match` has no wildcard: an end added to the enum does not compile here until
         // someone gives it a place, which is the moment to add it to the list; the place of each
