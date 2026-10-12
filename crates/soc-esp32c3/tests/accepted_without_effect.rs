@@ -33,3 +33,21 @@ fn the_documented_table_is_the_one_the_code_builds() {
     std::fs::write(&path, format!("{prose}{MARKER}\n{table}"))
         .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
 }
+
+/// The plans a row may hand its register to: those that are still to come. A plan that is done
+/// cannot be an heir: what it did not do is handed on by name before it ends, and its name is
+/// removed from this list by its last task.
+const PLANS_TO_COME: [&str; 7] = ["SP1b-3d", "SP1b-3f", "SP1b-4", "SP2", "SP5a", "SP5b", "SP8"];
+
+#[test]
+fn every_row_hands_its_register_to_a_plan_that_is_still_to_come() {
+    for row in accepted_without_effect() {
+        assert!(
+            PLANS_TO_COME.contains(&row.heir),
+            "{}.{} is handed to `{}`, which is no plan to come; name the plan that will give it its effect",
+            row.peripheral,
+            row.register,
+            row.heir
+        );
+    }
+}
