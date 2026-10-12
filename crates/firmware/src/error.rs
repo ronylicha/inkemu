@@ -88,7 +88,7 @@ pub enum FirmwareError {
     )]
     FlashImageTooShort { len: usize },
     #[error(
-        "the file starts with an image but holds no partition table at offset 0x8000, so it is an application or a bootloader alone, not a full flash image; use a flash dump or the output of `esptool.py merge_bin` (bootloader, partition table and application)"
+        "the file starts with an image but holds no partition table at offset 0x8000, so it is an application or a bootloader alone, not a full flash image; use an application with --firmware, or give --flash a flash dump or the output of `esptool.py merge_bin` (bootloader, partition table and application)"
     )]
     NoPartitionTable,
 }

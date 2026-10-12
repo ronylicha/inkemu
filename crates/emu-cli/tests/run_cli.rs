@@ -458,7 +458,11 @@ fn image_declaring_more_flash_than_the_device_is_refused() {
 fn an_application_image_given_as_flash_is_refused() {
     run_with_flash(&build_image(&ImageSpec::default()))
         .code(2)
-        .stderr(contains("no partition table at offset 0x8000").and(contains("merge_bin")));
+        .stderr(
+            contains("no partition table at offset 0x8000")
+                .and(contains("; use an application with --firmware"))
+                .and(contains("merge_bin")),
+        );
 }
 
 /// `inkemu run --device x4 --flash <path>` with an empty ROM directory: a refusal of the flash file

@@ -37,7 +37,7 @@ fn the_documented_table_is_the_one_the_code_builds() {
 /// The plans a row may hand its register to: the plans still to come that own at least one row
 /// of the table. A plan that is done cannot be an heir: what it did not do is handed on by name
 /// before it ends, and its name is removed from this list by its last task. A plan to come that
-/// owns no row (SP1b-3c and SP1b-3e today) is not in the list: it is added with its first row.
+/// owns no row (SP1b-3e today) is not in the list: it is added with its first row.
 /// The list holds the table only: a comment or a document that names an heir is not read here.
 const PLANS_TO_COME: [&str; 7] = ["SP1b-3d", "SP1b-3f", "SP1b-4", "SP2", "SP5a", "SP5b", "SP8"];
 
