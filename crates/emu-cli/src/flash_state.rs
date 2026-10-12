@@ -418,6 +418,18 @@ fn read_exactly(source: impl Read, size: u32) -> std::io::Result<Result<Vec<u8>,
     })
 }
 
+/// What a read of a file of `size` bytes found instead, `found` bytes, as the message of a file
+/// that changed says it: the count when it is fewer, "more" when it is more, since no more than
+/// one byte past `size` is ever read and the count would then be `size + 1` whatever the file
+/// holds.
+fn found_instead(found: u64, size: u32) -> String {
+    if found > u64::from(size) {
+        "more".to_owned()
+    } else {
+        format!("{found}")
+    }
+}
+
 /// How many sectors of the flash a run modified, as a clause of its summary.
 fn sectors_modified(modified: u32) -> String {
     let were = if modified == 1 { "was" } else { "were" };
@@ -644,11 +656,7 @@ impl FlashState {
             .map_err(|found| FlashStateError::Changed {
                 path: self.shown.clone(),
                 size: self.size,
-                found: if found > u64::from(self.size) {
-                    "more".to_owned()
-                } else {
-                    format!("{found}")
-                },
+                found: found_instead(found, self.size),
             })
     }
 
@@ -1669,6 +1677,29 @@ mod tests {
         let text = err.to_string();
         assert!(
             text.contains(".x4.bin.tmp") && text.contains("; remove it, then run again"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_file_that_changed_while_it_was_read_is_said_to_hold_fewer_bytes_or_more() {
+        // The read stops one byte past the size: a longer file is "more", never a count.
+        assert_eq!(found_instead(u64::from(SIZE) + 1, SIZE), "more");
+        assert_eq!(
+            found_instead(u64::from(SIZE) - 1, SIZE),
+            format!("{}", SIZE - 1)
+        );
+        assert_eq!(found_instead(0, SIZE), "0");
+        let text = FlashStateError::Changed {
+            path: "x4.bin".to_owned(),
+            size: SIZE,
+            found: found_instead(12, SIZE),
+        }
+        .to_string();
+        assert!(
+            text.contains(&format!(
+                "it held {SIZE} bytes, then 12; make sure nothing else"
+            )),
             "{text}"
         );
     }
