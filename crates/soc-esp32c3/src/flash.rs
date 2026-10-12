@@ -73,6 +73,8 @@ const STATUS_WRITABLE: u8 = 0b1111_1100;
 const ADDRESS_BITS: u32 = 24;
 /// One bit per sector of the largest chip.
 const SECTOR_WORDS: usize = (MAX_FLASH_BYTES / SECTOR_BYTES / u64::BITS) as usize;
+/// A sector that holds nothing: what the sectors of an image are compared with.
+const ERASED_SECTOR: [u8; SECTOR_BYTES as usize] = [ERASED; SECTOR_BYTES as usize];
 /// Largest exponent `1 << capacity` fits a `u32`.
 const MAX_CAPACITY_EXPONENT: u8 = 31;
 
@@ -449,9 +451,65 @@ pub trait FlashDevice: fmt::Debug {
     fn modified_sectors(&self) -> u32;
 }
 
+/// A set of 4 KiB sectors of the chip: one bit per sector of the largest chip, 512 bytes
+/// whatever the firmware does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SectorSet([u64; SECTOR_WORDS]);
+
+impl SectorSet {
+    const EMPTY: SectorSet = SectorSet([0; SECTOR_WORDS]);
+
+    /// The word and the bit of `sector`; a sector no chip has is in no set.
+    fn place(sector: u32) -> (usize, u64) {
+        (index(sector / u64::BITS), 1 << (sector % u64::BITS))
+    }
+
+    fn insert(&mut self, sector: u32) {
+        let (word, bit) = SectorSet::place(sector);
+        if let Some(word) = self.0.get_mut(word) {
+            *word |= bit;
+        }
+    }
+
+    /// Takes the sectors `first..first + count` out of the set and hands each one that was in
+    /// it to `taken`, in order. It reads the 64 words of the set and calls `taken` for the
+    /// sectors found, however long the range is: emptying a range that holds nothing costs
+    /// nothing more.
+    fn remove_range(&mut self, first: u32, count: u32, mut taken: impl FnMut(u32)) {
+        let end = first.saturating_add(count);
+        for (base, word) in (0u32..).step_by(64).zip(self.0.iter_mut()) {
+            // The bits of this word that the range covers: `low..high`, empty when the word
+            // lies outside the range.
+            let low = first.saturating_sub(base).min(u64::BITS);
+            let high = end.saturating_sub(base).min(u64::BITS);
+            if low >= high {
+                continue;
+            }
+            // INVARIANT: `low < high <= 64`, so neither shift is by 64 bits or more.
+            let covered = (u64::MAX << low) & (u64::MAX >> (u64::BITS - high));
+            let mut found = *word & covered;
+            *word &= !covered;
+            while found != 0 {
+                taken(base + found.trailing_zeros());
+                found &= found - 1;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, sector: u32) -> bool {
+        let (word, bit) = SectorSet::place(sector);
+        self.0.get(word).is_some_and(|word| word & bit != 0)
+    }
+
+    fn len(&self) -> u32 {
+        self.0.iter().map(|word| word.count_ones()).sum()
+    }
+}
+
 /// A NOR flash holding the image it was given. The image is kept as supplied and grows only as
 /// far as a program reaches: what lies past it is erased, so a blank chip costs no memory
-/// (decision D19).
+/// (decision D19). It never shrinks: an erase leaves it its length, at most the size of the chip.
 #[derive(Clone)]
 pub struct NorFlash {
     image: Vec<u8>,
@@ -460,8 +518,16 @@ pub struct NorFlash {
     /// that is built starts from the factory value `0x00` (FW §C).
     status: u8,
     generation: u64,
-    /// One bit per 4 KiB sector whose content changed.
-    modified: [u64; SECTOR_WORDS],
+    /// The sectors whose content changed.
+    modified: SectorSet,
+    /// The sectors that hold a byte other than `0xFF`, and only those: what an erase has to
+    /// erase. It is computed once from the image the chip is built with, a program that stores
+    /// such a byte puts its sector in, and an erase takes it out. An erase then costs the
+    /// sectors it changes, not the size of its unit: a firmware that erases the chip in a loop
+    /// would otherwise make the host read 16 MiB at every round.
+    ///
+    /// INVARIANT: a sector that is not in the set holds only `0xFF`, in the image and past it.
+    not_blank: SectorSet,
 }
 
 impl fmt::Debug for NorFlash {
@@ -490,7 +556,8 @@ impl NorFlash {
             config,
             status: 0,
             generation: 0,
-            modified: [0; SECTOR_WORDS],
+            modified: SectorSet::EMPTY,
+            not_blank: SectorSet::EMPTY,
         }
     }
 
@@ -505,8 +572,17 @@ impl NorFlash {
                 size: config.size,
             });
         }
+        // The image is read once, here: it is no longer than the chip, so the loop has one
+        // round per sector of the chip at most (4096), whatever the caller supplies.
+        let mut not_blank = SectorSet::EMPTY;
+        for (sector, bytes) in (0u32..).zip(image.chunks(ERASED_SECTOR.len())) {
+            if *bytes != ERASED_SECTOR[..bytes.len()] {
+                not_blank.insert(sector);
+            }
+        }
         Ok(NorFlash {
             image,
+            not_blank,
             ..NorFlash::blank(config)
         })
     }
@@ -543,10 +619,7 @@ impl NorFlash {
 
     /// Records that the sector holding `offset` changed.
     fn mark_modified(&mut self, offset: u32) {
-        let sector = index(offset / SECTOR_BYTES);
-        if let Some(word) = self.modified.get_mut(sector / 64) {
-            *word |= 1 << (sector % 64);
-        }
+        self.modified.insert(offset / SECTOR_BYTES);
         self.generation += 1;
     }
 
@@ -587,6 +660,9 @@ impl NorFlash {
             }
         }
         if changed {
+            // A program only clears bits: a byte it changed is no longer `0xFF`, and the
+            // sector of the page (a page lies inside one sector) now has something to erase.
+            self.not_blank.insert(page / SECTOR_BYTES);
             self.mark_modified(page);
         }
         // "After the completion of any Write Non-Volatile Register, Program and Erase operation"
@@ -601,21 +677,26 @@ impl NorFlash {
 
     /// Sets `len` bytes from `start` to `0xFF` and records the sectors whose content changed.
     /// `start` and `len` are multiples of a sector.
+    ///
+    /// Only the sectors that hold something to erase are visited, and each of them changes: a
+    /// sector of `0xFF` is left alone and is no modification. The work is bounded by the
+    /// sectors of the largest chip (4096 of 4 KiB) and is, for a range that holds nothing, the
+    /// reading of the set.
     fn fill_erased(&mut self, start: u32, len: u32) {
-        // What lies past the image is erased already. The loop is bounded by the number of
-        // sectors of the chip, 4096 at most.
-        let end = index(start.saturating_add(len)).min(self.image.len());
-        let mut sector = start;
-        while index(sector) < end {
-            let next = index(sector + SECTOR_BYTES).min(end);
-            if let Some(bytes) = self.image.get_mut(index(sector)..next)
-                && bytes.iter().any(|&byte| byte != ERASED)
-            {
-                bytes.fill(ERASED);
-                self.mark_modified(sector);
-            }
-            sector += SECTOR_BYTES;
-        }
+        let (image, modified, generation) =
+            (&mut self.image, &mut self.modified, &mut self.generation);
+        self.not_blank
+            .remove_range(start / SECTOR_BYTES, len / SECTOR_BYTES, |sector| {
+                // A sector that holds a byte other than `0xFF` starts inside the image; the
+                // image may end inside it, and what lies past the image is erased already.
+                let from = index(sector.saturating_mul(SECTOR_BYTES));
+                let to = from.saturating_add(ERASED_SECTOR.len()).min(image.len());
+                if let Some(bytes) = image.get_mut(from..to) {
+                    bytes.fill(ERASED);
+                }
+                modified.insert(sector);
+                *generation += 1;
+            });
     }
 
     /// `20` and `D8`: erases the sector or the block that holds the address, whose low bits are
@@ -646,8 +727,9 @@ impl NorFlash {
             return Ok(None);
         }
         self.writable(opcode, 0, self.config.size)?;
+        // The image keeps its length: emptied, the next program in a high page would fill it
+        // again up to that page, 16 MiB at every round of a firmware that erases in a loop.
         self.fill_erased(0, self.config.size);
-        self.image.clear();
         self.status &= !STATUS_WEL;
         Ok(Some(FlashWrite::Erase {
             start: 0,
@@ -720,7 +802,7 @@ impl FlashDevice for NorFlash {
     }
 
     fn modified_sectors(&self) -> u32 {
-        self.modified.iter().map(|word| word.count_ones()).sum()
+        self.modified.len()
     }
 
     fn read(&self, offset: u32, out: &mut [u8]) {
@@ -1710,6 +1792,246 @@ mod tests {
         write(&mut flash, 0x20, 0x9000, &[]).unwrap();
         write(&mut flash, 0xD8, 0x0000, &[]).unwrap();
         assert_eq!((flash.generation(), flash.modified_sectors()), (erased, 1));
+    }
+
+    #[test]
+    fn a_range_taken_out_of_a_set_of_sectors_is_that_range_in_order_and_nothing_else() {
+        const SECTORS: u32 = 4096;
+        let mut n = crate::test_support::Lcg::new(0x5EC7_0125);
+        for round in 0..3000 {
+            let mut set = SectorSet::EMPTY;
+            let mut plain = vec![false; SECTORS as usize];
+            for _ in 0..n.below(300) {
+                let sector = n.below(SECTORS);
+                set.insert(sector);
+                plain[sector as usize] = true;
+            }
+            // Every shape of range: empty, one sector, inside a word, across words, the whole
+            // set, and ranges that start or end past the last sector.
+            let first = n.below(SECTORS + 100);
+            let count = match n.below(5) {
+                0 => 0,
+                1 => 1,
+                2 => n.below(70),
+                3 => n.below(SECTORS + 200),
+                _ => SECTORS - first.min(SECTORS),
+            };
+            let range = first..first.saturating_add(count);
+            let mut taken = Vec::new();
+            set.remove_range(first, count, |sector| taken.push(sector));
+            let expected: Vec<u32> = range
+                .clone()
+                .filter(|&sector| plain.get(sector as usize) == Some(&true))
+                .collect();
+            assert_eq!(taken, expected, "round {round}: {range:?}");
+            for sector in 0..SECTORS {
+                assert_eq!(
+                    set.contains(sector),
+                    plain[sector as usize] && !range.contains(&sector),
+                    "round {round}: sector {sector} after {range:?}"
+                );
+            }
+            let left = plain.iter().filter(|&&sector| sector).count() - expected.len();
+            assert_eq!(set.len() as usize, left, "round {round}");
+        }
+        // A sector no chip has is in no set, and numbers no erase produces do not overflow.
+        let mut set = SectorSet::EMPTY;
+        set.insert(SECTORS);
+        set.insert(u32::MAX);
+        assert_eq!(set, SectorSet::EMPTY);
+        set.insert(SECTORS - 1);
+        set.remove_range(u32::MAX, u32::MAX, |_| panic!("nothing is there"));
+        set.remove_range(SECTORS, u32::MAX, |_| panic!("nothing is there"));
+        assert!(set.contains(SECTORS - 1) && !set.contains(SECTORS));
+        let mut taken = Vec::new();
+        set.remove_range(0, u32::MAX, |sector| taken.push(sector));
+        assert_eq!((taken, set), (vec![SECTORS - 1], SectorSet::EMPTY));
+    }
+
+    /// A sector of erased bytes, to compare a sector with.
+    const BLANK_SECTOR: [u8; 4096] = [0xFF; 4096];
+
+    /// The chip written the plain way, from the rules of report FW §C alone: every byte of the
+    /// chip is held, and an erase looks at every byte of its unit. What [`NorFlash`] must hold
+    /// and count after any sequence of writes.
+    struct PlainChip {
+        content: Vec<u8>,
+        modified: Vec<bool>,
+        generation: u64,
+    }
+
+    impl PlainChip {
+        fn new(image: &[u8], size: usize) -> PlainChip {
+            let mut content = vec![0xFF; size];
+            content[..image.len()].copy_from_slice(image);
+            PlainChip {
+                content,
+                modified: vec![false; size / 4096],
+                generation: 0,
+            }
+        }
+
+        fn program(&mut self, address: usize, data: &[u8]) -> FlashWrite {
+            let page = address / 256 * 256;
+            let dropped = data.len().saturating_sub(256);
+            let first = (address - page + dropped) % 256;
+            let mut changed = false;
+            for (position, &byte) in (first..).zip(&data[dropped..]) {
+                let cell = &mut self.content[page + position % 256];
+                changed |= *cell & byte != *cell;
+                *cell &= byte;
+            }
+            if changed {
+                self.modified[page / 4096] = true;
+                self.generation += 1;
+            }
+            FlashWrite::Program {
+                address: u32::try_from(page + first).unwrap(),
+                data: data[dropped..].to_vec(),
+            }
+        }
+
+        fn erase(&mut self, address: usize, unit: usize) -> FlashWrite {
+            let start = address / unit * unit;
+            for sector in (start..start + unit).step_by(4096) {
+                let bytes = &mut self.content[sector..sector + 4096];
+                if bytes != BLANK_SECTOR {
+                    bytes.fill(0xFF);
+                    self.modified[sector / 4096] = true;
+                    self.generation += 1;
+                }
+            }
+            FlashWrite::Erase {
+                start: u32::try_from(start).unwrap(),
+                len: u32::try_from(unit).unwrap(),
+            }
+        }
+    }
+
+    /// Asserts that `flash` holds, counts and knows of its sectors what `plain` does.
+    fn assert_same_chip(flash: &NorFlash, plain: &PlainChip, held: &mut Vec<u8>, step: &str) {
+        held.resize(plain.content.len(), 0);
+        flash.read(0, held);
+        if *held != plain.content {
+            let at = held.iter().zip(&plain.content).position(|(a, b)| a != b);
+            panic!("{step}: the content differs at {at:x?}");
+        }
+        assert_eq!(flash.generation(), plain.generation, "{step}");
+        let modified = plain.modified.iter().filter(|&&sector| sector).count();
+        assert_eq!(
+            usize::try_from(flash.modified_sectors()).unwrap(),
+            modified,
+            "{step}"
+        );
+        // The set of sectors an erase visits: exactly the ones that hold a byte to erase.
+        for (sector, bytes) in (0u32..).zip(plain.content.chunks(4096)) {
+            assert_eq!(
+                flash.not_blank.contains(sector),
+                bytes != BLANK_SECTOR,
+                "{step}: sector {sector:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_random_sequence_of_writes_leaves_what_the_plain_chip_holds_and_counts() {
+        const SIZE: usize = MIB;
+        let small = FlashConfig::new(MIN_FLASH_BYTES, id_with(0x14)).unwrap();
+        let mut n = crate::test_support::Lcg::new(0xF1A5_0001);
+        // An image that ends inside a sector: blank sectors, sectors of zeroes, sectors with a
+        // single byte to erase, sectors of anything.
+        let mut image = vec![0xFF; 150 * 4096 + 1234];
+        for sector in image.chunks_mut(4096) {
+            match n.below(4) {
+                0 => {}
+                1 => sector.fill(0x00),
+                2 => {
+                    let at = n.below(u32::try_from(sector.len()).unwrap()) as usize;
+                    sector[at] = 0x7F;
+                }
+                _ => sector.fill_with(|| n.next_u8()),
+            }
+        }
+        let mut plain = PlainChip::new(&image, SIZE);
+        let mut flash = NorFlash::with_image(image, small).unwrap();
+        let mut held = Vec::new();
+        assert_same_chip(&flash, &plain, &mut held, "the image");
+        for step in 0..4000 {
+            // Three addresses out of four fall in eight places of the chip, so that programs
+            // and erases meet; the fourth is anywhere, the end of the chip included.
+            let address = if n.below(4) == 0 {
+                n.below(MIN_FLASH_BYTES)
+            } else {
+                (n.below(8) * 0x1_F000 + n.below(0x2400)) % MIN_FLASH_BYTES
+            };
+            let at = address as usize;
+            let (opcode, data) = match n.below(20) {
+                0 => (0xC7u8, Vec::new()),
+                1..=2 => (0xD8, Vec::new()),
+                3..=7 => (0x20, Vec::new()),
+                // One program in four is of `FF` only: it changes nothing.
+                kind => {
+                    let len = 1 + n.below(300) as usize;
+                    let mut data = vec![0xFF; len];
+                    if kind % 4 != 0 {
+                        data.fill_with(|| n.next_u8() | n.next_u8());
+                    }
+                    (0x02, data)
+                }
+            };
+            // One command in sixteen comes without its write enable, and is ignored.
+            let enabled = n.below(16) != 0;
+            if enabled {
+                run(&mut flash, 0x06, &mut []).unwrap();
+            }
+            let done = match opcode {
+                0xC7 => run(&mut flash, 0xC7, &mut []),
+                opcode => send(&mut flash, opcode, address, &data),
+            };
+            let expected = enabled.then(|| match opcode {
+                0xC7 => plain.erase(0, SIZE),
+                0xD8 => plain.erase(at, 0x1_0000),
+                0x20 => plain.erase(at, 0x1000),
+                _ => plain.program(at, &data),
+            });
+            let what = format!("step {step}: {opcode:#04x} at {address:#x}");
+            assert_eq!(done, Ok(expected), "{what}");
+            assert_same_chip(&flash, &plain, &mut held, &what);
+        }
+        assert!(plain.generation > 1000, "the sequence changed the content");
+    }
+
+    #[test]
+    fn an_erase_costs_what_it_erases_and_not_the_size_of_the_chip() {
+        // A firmware loop of two commands: one byte programmed in the last page of a 16 MiB
+        // chip, then the chip erased. Each round changes one byte and changes it back; it must
+        // not read or fill 16 MiB to do so. With that cost, a thousand rounds take minutes in
+        // this build; they are given thirty seconds.
+        let (generation, modified) = crate::test_support::within(
+            std::time::Duration::from_secs(30),
+            "1,000 rounds of a one-byte program and a chip erase did not end in 30 s: an erase costs the size of the chip",
+            || {
+                let mut flash = NorFlash::blank(FlashConfig::default());
+                for _ in 0..1000 {
+                    write(&mut flash, 0x02, 0xFF_FFFF, &[0x00]).unwrap();
+                    run(&mut flash, 0x06, &mut []).unwrap();
+                    run(&mut flash, 0xC7, &mut []).unwrap();
+                }
+                assert_eq!(content(&flash, 0xFF_FF00, 256), vec![0xFF; 256]);
+                // The image keeps the length the first program gave it: emptied by the erase,
+                // it would be filled again, 16 MiB of it, by the program of every round.
+                assert!(
+                    format!("{flash:?}").contains("image_bytes: 16777216"),
+                    "{flash:?}"
+                );
+                (flash.generation(), flash.modified_sectors())
+            },
+        );
+        assert_eq!(
+            (generation, modified),
+            (2000, 1),
+            "each program and each erase changed one byte of the last sector"
+        );
     }
 
     #[test]
