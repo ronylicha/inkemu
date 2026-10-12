@@ -1296,11 +1296,8 @@ fn mode_of(path: &std::path::Path) -> u32 {
 /// Makes a named pipe at `path`: opening one for writing waits for a reader that never comes.
 #[cfg(unix)]
 fn make_fifo(path: &std::path::Path) {
-    let made = std::process::Command::new("mkfifo")
-        .arg(path)
-        .status()
-        .unwrap();
-    assert!(made.success(), "mkfifo {}: {made}", path.display());
+    nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU)
+        .unwrap_or_else(|e| panic!("mkfifo {}: {e}", path.display()));
 }
 
 #[test]
