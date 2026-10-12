@@ -494,12 +494,51 @@ fn a_device_node_given_as_flash_is_refused_at_once() {
 
 #[test]
 fn run_help_documents_the_flash_option_and_what_strict_stops_on() {
-    inkemu().args(["run", "--help"]).assert().code(0).stdout(
-        contains("--flash")
-            .and(contains("erased"))
-            .and(contains("flash that is not mapped"))
-            .and(contains("window that may differ from the device")),
-    );
+    let output = inkemu()
+        .args(["run", "--help"])
+        .assert()
+        .code(0)
+        .stdout(contains("--flash").and(contains("erased")))
+        .get_output()
+        .clone();
+    let help = String::from_utf8(output.stdout).unwrap();
+    // What a strict run stops on is said twice: by the option and by the list of exit codes.
+    // Each text must say it on its own, whatever the width the help was wrapped at.
+    let (options, exit_codes) = help
+        .split_once("Exit codes:")
+        .unwrap_or_else(|| panic!("no list of exit codes in:\n{help}"));
+    // The help of the option: from the line that starts with its name (other options mention
+    // it in their text) to the line that starts the next option.
+    let strict_option: Vec<&str> = options
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with("--strict-mmio"))
+        .enumerate()
+        .take_while(|(index, line)| *index == 0 || !line.trim_start().starts_with('-'))
+        .map(|(_, line)| line)
+        .collect();
+    // The text of exit code 3: from its number to the number of the next code.
+    let exit_code_3 = exit_codes
+        .split_once("\n  3  ")
+        .and_then(|(_, from_3)| from_3.split_once("\n  4  "))
+        .map_or_else(
+            || panic!("no exit code 3 in:\n{exit_codes}"),
+            |(text, _)| text,
+        );
+    for (text, section) in [
+        (strict_option.join(" "), "the help of --strict-mmio"),
+        (exit_code_3.to_owned(), "the help of exit code 3"),
+    ] {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for phrase in [
+            "flash that is not mapped",
+            "read through a flash window that may differ from the device",
+        ] {
+            assert!(
+                text.contains(phrase),
+                "`{phrase}` is not in {section}: `{text}`"
+            );
+        }
+    }
 }
 
 /// The real ROM on a full flash image, through the real command.
