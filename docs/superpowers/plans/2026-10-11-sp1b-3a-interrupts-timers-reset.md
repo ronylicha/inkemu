@@ -7,7 +7,9 @@
 > - **No `--max-time`** (E11, E21) → the option exists: `inkemu run --max-time <SECONDS>` bounds a run by device time, to the cycle of the time base (`Esp32C3::run_within`).
 > - **Nothing cancels a wake-up** (E19) → the devices whose wake-ups would pile up withdraw theirs, and the scheduler removes cancelled entries when a cancel finds too many of them.
 > - **The stage walk of the watchdogs** (Tasks 10 and 13, written twice) → one bounded walk shared by the RTC watchdog and the main watchdogs (`periph/stages.rs`), at most eight iterations.
-> - **The first reset request wins** (Task 11) → the deepest level wins, the first between equal levels.
+> - **The first reset request wins** (written in Task 3, repeated in Task 11) → the deepest level wins, the first between equal levels.
+> - **An edge latch is cleared when its `CPU_INT_CLEAR` bit goes from 1 to 0** (Task 5) → it is cleared by the write that has the bit set, whatever the bit held before.
+> - **A UART on source clock 0 or 2 is timed with the crystal, silently** (Task 9) → a byte sent on either is refused by name (a warning, a stop under `--strict-mmio`), and still timed with the crystal so that a lenient run goes on.
 > - **The delivery loop** (Task 8) → one bounded pass per `service`: only the wake-ups scheduled before the pass began, and due, are delivered by it.
 > - **The text of ADR 0003** (Task 1) → the ADR as committed says more: the sampling contract of interrupt sources, the reset arbitration, the bounds, the two limits of a run.
 > - **Nothing is logged at a reset** → every reset leaves an entry in the journal, with its cause, PC and stack pointer.
