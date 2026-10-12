@@ -491,15 +491,16 @@ pub trait FlashDevice: fmt::Debug {
     fn holds_data(&self, _start: u32, _len: u32) -> bool {
         true
     }
-    /// Whether an erase of the whole chip sent now would run: its write-enable latch is set and
-    /// no block-protect bit refuses it. The caller asks [`FlashDevice::holds_data`] of every
-    /// page before such an erase only when it would run: a chip erase the chip ignores or
-    /// refuses changes nothing, and a firmware that sends it in a loop must not pay 256
-    /// questions a round for it.
+    /// Whether `command`, an erase of the whole chip, would run if it were executed now: the
+    /// chip has the command, it comes in its frame, the write-enable latch is set and no
+    /// block-protect bit refuses it. The caller asks [`FlashDevice::holds_data`] of every page
+    /// before such an erase only when it would run: a chip erase the chip ignores or refuses,
+    /// for whatever cause, changes nothing, and a firmware that sends it in a loop must not pay
+    /// 256 questions a round for it.
     ///
     /// A chip that keeps no account of it answers `true`: the caller then asks, as before every
     /// chip erase.
-    fn would_erase_the_chip(&self) -> bool {
+    fn would_erase_the_chip(&self, _command: &FlashCommand<'_>) -> bool {
         true
     }
 }
@@ -897,11 +898,14 @@ impl FlashDevice for NorFlash {
             .intersects(first, last / SECTOR_BYTES - first + 1)
     }
 
-    /// The two conditions [`NorFlash::erase_chip`] checks before it erases: the latch (a chip
-    /// ignores the write without it) and the block protection (refused). Its range is the
-    /// whole chip and always inside it.
-    fn would_erase_the_chip(&self) -> bool {
-        self.status & STATUS_WEL != 0 && self.status & STATUS_BP == 0
+    /// What [`FlashDevice::execute`] judges before it erases the whole chip, in its order: the
+    /// opcode and its frame (refused), the latch (ignored without it), the block protection
+    /// (refused). The range of a chip erase is the whole chip and always inside it.
+    fn would_erase_the_chip(&self, command: &FlashCommand<'_>) -> bool {
+        matches!(command.opcode, OP_CE | OP_CE_ALT)
+            && FlashFrame::of(command.opcode).is_some_and(|frame| frame.admits(command))
+            && self.status & STATUS_WEL != 0
+            && self.status & STATUS_BP == 0
     }
 
     fn read(&self, offset: u32, out: &mut [u8]) {
@@ -2164,14 +2168,25 @@ mod tests {
     fn an_erase_costs_what_it_erases_and_not_the_size_of_the_chip() {
         // A firmware loop of two commands: one byte programmed in the last page of a 16 MiB
         // chip, then the chip erased. Each round changes one byte and changes it back; it must
-        // not read or fill 16 MiB to do so. With that cost, a thousand rounds take minutes in
-        // this build; they are given thirty seconds.
+        // not read or fill 16 MiB to do so.
+        //
+        // What an erase costs is counted first: the generation moves once for each sector an
+        // erase fills, so 1,000 erases that each filled one sector leave it at 2,000 with the
+        // 1,000 programs. The time limit is the backstop for a cost no count sees (reading the
+        // whole unit, as the erase did before the chip kept its set of sectors that are not
+        // blank): with that cost a thousand rounds take minutes in this build. The 16 MiB the
+        // first program allocates and fills are paid before the clock starts; what is timed
+        // took 0.04 s at most instrumented by `cargo llvm-cov` beside a release build and up to
+        // 32 spinning processes on 16 cores (load average 20 to 40): the limit is 750 times that.
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        write(&mut flash, 0x02, 0xFF_FFFF, &[0x00]).unwrap();
+        run(&mut flash, 0x06, &mut []).unwrap();
+        run(&mut flash, 0xC7, &mut []).unwrap();
         let (generation, modified) = crate::test_support::within(
             std::time::Duration::from_secs(30),
             "1,000 rounds of a one-byte program and a chip erase did not end in 30 s: an erase costs the size of the chip",
-            || {
-                let mut flash = NorFlash::blank(FlashConfig::default());
-                for _ in 0..1000 {
+            move || {
+                for _ in 1..1000 {
                     write(&mut flash, 0x02, 0xFF_FFFF, &[0x00]).unwrap();
                     run(&mut flash, 0x06, &mut []).unwrap();
                     run(&mut flash, 0xC7, &mut []).unwrap();
@@ -2238,22 +2253,51 @@ mod tests {
 
     #[test]
     fn the_chip_says_a_chip_erase_would_run_exactly_when_it_runs() {
-        // Every status byte, both opcodes: what the chip answers before the command is what the
-        // command then does.
+        // Every status byte, both opcodes, the frame of a chip erase and three others (an
+        // address, dummy clocks, a data byte): what the chip answers before the command is what
+        // the command then does.
+        let address = Some(FlashAddress { value: 0, bits: 24 });
         for status in 0..=u8::MAX {
             for opcode in [0xC7, 0x60] {
-                let mut flash =
-                    NorFlash::with_image(vec![0x0F; 16], FlashConfig::default()).unwrap();
-                flash.status = status;
-                let said = flash.would_erase_the_chip();
-                let ran = matches!(run(&mut flash, opcode, &mut []), Ok(Some(_)));
-                assert_eq!(said, ran, "status {status:#04x}, opcode {opcode:#04x}");
-                assert_eq!(
-                    said,
-                    status & STATUS_WEL != 0 && status & STATUS_BP == 0,
-                    "status {status:#04x}"
-                );
+                let frames = [
+                    (None, 0, &[][..], true),
+                    (address, 0, &[][..], false),
+                    (None, 8, &[][..], false),
+                    (None, 0, &[0x00][..], false),
+                ];
+                for (address, dummy_cycles, data_out, in_its_frame) in frames {
+                    let command = FlashCommand {
+                        opcode,
+                        address,
+                        dummy_cycles,
+                        data_out,
+                    };
+                    let mut flash =
+                        NorFlash::with_image(vec![0x0F; 16], FlashConfig::default()).unwrap();
+                    flash.status = status;
+                    let said = flash.would_erase_the_chip(&command);
+                    let ran = matches!(flash.execute(&command, &mut []), Ok(Some(_)));
+                    let what = format!("status {status:#04x}, {command:?}");
+                    assert_eq!(said, ran, "{what}");
+                    assert_eq!(
+                        said,
+                        in_its_frame && status & STATUS_WEL != 0 && status & STATUS_BP == 0,
+                        "{what}"
+                    );
+                }
             }
+        }
+        // Another command is no chip erase, whatever the chip would do with it.
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        run(&mut flash, 0x06, &mut []).unwrap();
+        for opcode in [0x06, 0x04, 0x05, 0x20] {
+            let command = FlashCommand {
+                opcode,
+                address: None,
+                dummy_cycles: 0,
+                data_out: &[],
+            };
+            assert!(!flash.would_erase_the_chip(&command), "{opcode:#04x}");
         }
     }
 

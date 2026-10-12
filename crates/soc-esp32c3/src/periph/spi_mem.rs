@@ -429,9 +429,9 @@ impl Spi1 {
         // something before it runs that command, and before no other. The 256 questions would
         // cost many times a write enable or a status read, which accompany every program and
         // every erase and change no content. They are not asked either before a chip erase
-        // the chip would ignore (no write enable) or refuse (a block-protect bit): it changes
-        // nothing, and a firmware can send it in a loop.
-        let held = (erases_whole_chip(command.opcode) && self.flash.would_erase_the_chip())
+        // the chip would ignore (no write enable) or refuse (another frame than its own, a
+        // block-protect bit): it changes nothing, and a firmware can send it in a loop.
+        let held = (erases_whole_chip(command.opcode) && self.flash.would_erase_the_chip(command))
             .then(|| pages_holding_data(self.flash.as_ref()));
         match self.flash.execute(command, &mut data_in) {
             Ok(written) => {
@@ -1069,9 +1069,79 @@ mod tests {
             self.asked.set(self.asked.get() + 1);
             self.holds.is_none_or(|holds| holds(start / MMU_PAGE_BYTES))
         }
-        fn would_erase_the_chip(&self) -> bool {
+        fn would_erase_the_chip(&self, _command: &FlashCommand<'_>) -> bool {
             self.would_erase.get()
         }
+    }
+
+    /// The chip model itself, with the questions the controller asks of it counted.
+    #[derive(Debug)]
+    struct CountsQuestions {
+        chip: NorFlash,
+        asked: Rc<Cell<u32>>,
+    }
+
+    impl FlashDevice for CountsQuestions {
+        fn size(&self) -> u32 {
+            self.chip.size()
+        }
+        fn read(&self, offset: u32, out: &mut [u8]) {
+            self.chip.read(offset, out);
+        }
+        fn execute(
+            &mut self,
+            command: &FlashCommand<'_>,
+            data_in: &mut [u8],
+        ) -> Result<Option<FlashWrite>, FlashRefusal> {
+            self.chip.execute(command, data_in)
+        }
+        fn generation(&self) -> u64 {
+            self.chip.generation()
+        }
+        fn modified_sectors(&self) -> u32 {
+            self.chip.modified_sectors()
+        }
+        fn holds_data(&self, start: u32, len: u32) -> bool {
+            self.asked.set(self.asked.get() + 1);
+            self.chip.holds_data(start, len)
+        }
+        fn would_erase_the_chip(&self, command: &FlashCommand<'_>) -> bool {
+            self.chip.would_erase_the_chip(command)
+        }
+    }
+
+    #[test]
+    fn a_chip_erase_the_chip_refuses_for_its_frame_asks_it_nothing() {
+        let ctx = &mut Ctx::default();
+        let asked = Rc::new(Cell::new(0));
+        let mut spi = Spi1::new(Box::new(CountsQuestions {
+            chip: NorFlash::with_image(vec![0x00; 16], FlashConfig::default()).unwrap(),
+            asked: Rc::clone(&asked),
+        }));
+        // `60` through `USR` with a 24-bit address, after a write enable: the latch is set, and
+        // the chip refuses the command for its frame.
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, USER, USR_COMMAND | USR_ADDR);
+        spi.write(ctx, USER1, 23 << ADDR_BITLEN_SHIFT);
+        spi.write(ctx, USER2, 0x7000_0060);
+        spi.write(ctx, CMD, CMD_USR);
+        assert!(
+            matches!(
+                ctx.take_unsupported(),
+                Some(Unsupported::FlashCommandForm {
+                    opcode: 0x60,
+                    address_bits: 24,
+                    ..
+                })
+            ),
+            "refused for its frame"
+        );
+        assert_eq!(asked.get(), 0, "and nothing was asked");
+        // The same command in its frame, the latch still set: it runs, and the chip is asked.
+        spi.write(ctx, USER, USR_COMMAND);
+        spi.write(ctx, CMD, CMD_USR);
+        assert_eq!(ctx.take_unsupported(), None);
+        assert_eq!(asked.get(), 256);
     }
 
     #[test]
@@ -1112,7 +1182,12 @@ mod tests {
             "what a chip answers when it does not say otherwise"
         );
         assert!(
-            Recorder(Rc::default()).would_erase_the_chip(),
+            Recorder(Rc::default()).would_erase_the_chip(&FlashCommand {
+                opcode: 0xC7,
+                address: None,
+                dummy_cycles: 0,
+                data_out: &[],
+            }),
             "a chip that does not say is asked before every chip erase"
         );
         // No other command is expected to reach past one page, whether it names an address (a
