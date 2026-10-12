@@ -3,8 +3,9 @@ use boards::{DeviceProfile, MachineOptions};
 use clap::{Parser, Subcommand};
 use cpu_rv32::{HartConfig, MisalignedPolicy};
 use emu_cli::exit::{EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
+use emu_cli::firmware_file;
 use emu_cli::flash_file;
-use emu_cli::flash_state::{self, RunFlash};
+use emu_cli::flash_state::{self, Input, RunFlash, Seed};
 use emu_cli::rom_store::{
     self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
 };
@@ -62,6 +63,19 @@ enum Command {
         /// writes to the flash is kept by --flash-file, or lost when the run ends.
         #[arg(long)]
         flash: Option<PathBuf>,
+        /// Application image to boot (the .bin of an ESP-IDF build or of a release, its first
+        /// byte 0xE9): the flash is composed from it, as a device freshly flashed holds it. The
+        /// bootloader inkemu ships for the device goes at offset 0, the partition table of the
+        /// device profile at 0x8000, the application in the slot the bootloader starts (the
+        /// factory application, else the first OTA slot), and every other byte is erased, the
+        /// OTA data partition included.
+        /// The file is only read. A whole flash image goes to --flash instead.
+        #[arg(long, value_name = "FILE", conflicts_with = "flash")]
+        firmware: Option<PathBuf>,
+        /// Bootloader to compose the flash with instead of the one inkemu ships for the device:
+        /// the bootloader.bin of a build. It is checked against the device and written as it is.
+        #[arg(long, value_name = "FILE", requires = "firmware")]
+        bootloader: Option<PathBuf>,
         /// Keep the flash of the device in this file from one run to the next: a raw image of
         /// exactly the size of the flash. A run starts from the file when it exists (--flash is
         /// then refused unless --reset-flash is given) and writes it when it ends: at a limit,
@@ -78,7 +92,8 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         flash_file: Option<PathBuf>,
         /// Start from the --flash image, or from an erased flash, although the flash file
-        /// exists, and replace the file when the run ends.
+        /// exists, and replace the file when the run ends. With --firmware, start from the flash
+        /// composed from it.
         #[arg(long, requires = "flash_file")]
         reset_flash: bool,
         /// Stop when the CPU has executed this many cycles of its clock. The limit counts executed
@@ -179,6 +194,8 @@ fn main() -> ExitCode {
         Command::Run {
             device,
             flash,
+            firmware,
+            bootloader,
             flash_file,
             reset_flash,
             max_cycles,
@@ -191,6 +208,8 @@ fn main() -> ExitCode {
             &device,
             &FlashOptions {
                 image: flash.as_deref(),
+                firmware: firmware.as_deref(),
+                bootloader: bootloader.as_deref(),
                 file: flash_file.as_deref(),
                 reset: reset_flash,
             },
@@ -265,6 +284,10 @@ fn profile_for(id: &str) -> Result<DeviceProfile, boards::ProfileError> {
 struct FlashOptions<'a> {
     /// `--flash`: the image a run starts from, never written.
     image: Option<&'a Path>,
+    /// `--firmware`: the application a flash is composed around, never written.
+    firmware: Option<&'a Path>,
+    /// `--bootloader`: the bootloader of that flash, never written.
+    bootloader: Option<&'a Path>,
     /// `--flash-file`: where the flash is kept from one run to the next.
     file: Option<&'a Path>,
     /// `--reset-flash`: start again from the image and replace the file.
@@ -292,32 +315,27 @@ fn run_device(
         Err(e) => return fail(&e),
     };
     let flash_size = profile.flash.size();
-    // The flash image and the flash file are checked first: refusing them needs no ROM, and no
-    // download should start for a run that cannot happen.
-    if let (Some(image), Some(file)) = (flash.image, flash.file)
-        && let Err(e) = flash_state::refuse_the_image_as_flash_file(image, file)
-    {
-        return fail(&e);
+    // The files a run only reads and the flash file are checked first: refusing them needs no
+    // ROM, and no download should start for a run that cannot happen.
+    if let Some(file) = flash.file {
+        for (input, path) in [
+            (Input::Flash, flash.image),
+            (Input::Firmware, flash.firmware),
+            (Input::Bootloader, flash.bootloader),
+        ] {
+            if let Some(path) = path
+                && let Err(e) = flash_state::refuse_the_image_as_flash_file(input, path, file)
+            {
+                return fail(&e);
+            }
+        }
     }
-    let image = match flash.image {
-        Some(path) => match flash_file::load(path, profile.soc.chip_id(), flash_size) {
-            Ok(bytes) => Some(bytes),
-            Err(e) => return fail(&e),
-        },
-        None => None,
-    };
-    // What the flash holds when nothing is kept from an earlier run.
-    let fresh_note = match (flash.image, &image) {
-        (Some(path), Some(bytes)) => format!(
-            "{} ({} bytes in {} MiB)",
-            file_name(path),
-            bytes.len(),
-            flash_size >> 20
-        ),
-        _ => format!("erased ({} MiB)", flash_size >> 20),
+    let (seed, fresh_note) = match starting_flash(&profile, flash) {
+        Ok(started) => started,
+        Err(code) => return code,
     };
     // From here on the flash file is locked, until the process ends.
-    let (run_flash, content) = match RunFlash::begin(flash.file, flash.reset, image, flash_size) {
+    let (run_flash, content) = match RunFlash::begin(flash.file, flash.reset, seed, flash_size) {
         Ok(begun) => begun,
         Err(e) => return fail(&e),
     };
@@ -396,6 +414,59 @@ fn run_device(
         end.exit_code_without_its_flash()
     };
     ExitCode::from(code)
+}
+
+/// What the flash holds when nothing is kept from an earlier run (`None`: erased), and how the
+/// header line of the run names it. A refusal is printed, and its exit code given back.
+fn starting_flash(
+    profile: &DeviceProfile,
+    flash: &FlashOptions<'_>,
+) -> Result<(Option<Seed>, String), ExitCode> {
+    let flash_size = profile.flash.size();
+    Ok(match (flash.image, flash.firmware) {
+        (Some(path), _) => match flash_file::load(path, profile.soc.chip_id(), flash_size) {
+            Ok(bytes) => {
+                let note = format!(
+                    "{} ({} bytes in {} MiB)",
+                    file_name(path),
+                    bytes.len(),
+                    flash_size >> 20
+                );
+                let seed = Seed {
+                    input: Input::Flash,
+                    content: bytes,
+                };
+                (Some(seed), note)
+            }
+            Err(e) => return Err(fail(&e)),
+        },
+        (None, Some(path)) => match firmware_file::compose(profile, path, flash.bootloader) {
+            Ok(composed) => {
+                for warning in &composed.warnings {
+                    write_line(io::stderr(), &format_args!("warning: {warning}"));
+                }
+                let app = &composed.application;
+                let note = format!(
+                    "{} ({} {}, ESP-IDF {}) in {} at {:#x}, behind {}, under the partition table of the profile ({} MiB)",
+                    file_name(path),
+                    sanitize(&app.project_name),
+                    sanitize(&app.version),
+                    sanitize(&app.idf_ver),
+                    composed.slot.name,
+                    composed.slot.offset,
+                    sanitize(&composed.bootloader.to_string()),
+                    flash_size >> 20
+                );
+                let seed = Seed {
+                    input: Input::Firmware,
+                    content: composed.bytes,
+                };
+                (Some(seed), note)
+            }
+            Err(e) => return Err(fail(&e)),
+        },
+        (None, None) => (None, format!("erased ({} MiB)", flash_size >> 20)),
+    })
 }
 
 /// Whether whoever was reading standard output went away (`inkemu run | head`, once `head` has

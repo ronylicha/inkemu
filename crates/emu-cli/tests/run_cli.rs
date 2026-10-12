@@ -2696,3 +2696,218 @@ fn the_nvs_reference_firmware_goes_on_counting_in_a_second_run_on_the_same_flash
     assert_eq!(third.sha256(FLASH_AT_END), sha256_of(&file));
     assert_eq!(sha256_of(&image), NVS_IMAGE_SHA256, "--flash is only read");
 }
+
+/// `inkemu run --device x4 --firmware <application> [--bootloader <bootloader>] <more>` with a ROM
+/// directory that holds nothing: a refusal of what was given must come before any attempt to load
+/// a ROM.
+fn run_with_firmware(
+    application: &[u8],
+    bootloader: Option<&[u8]>,
+    more: &[&str],
+) -> assert_cmd::assert::Assert {
+    let dir = tempfile::tempdir().unwrap();
+    let firmware = dir.path().join("app.bin");
+    std::fs::write(&firmware, application).unwrap();
+    let mut command = inkemu();
+    command
+        .args(["run", "--device", "x4", "--max-cycles", "1000", "--rom-dir"])
+        .arg(dir.path().join("rom"))
+        .arg("--firmware")
+        .arg(&firmware);
+    if let Some(bytes) = bootloader {
+        let path = dir.path().join("bootloader.bin");
+        std::fs::write(&path, bytes).unwrap();
+        command.arg("--bootloader").arg(path);
+    }
+    command.args(more).timeout(HANG_LIMIT).assert()
+}
+
+/// What `run_with_firmware` must refuse before boot, each with its cause and its remedy.
+#[test]
+fn every_input_that_cannot_be_booted_from_an_application_is_refused_before_boot() {
+    use firmware::builder::{bootloader_spec, refresh_digest};
+    let app = build_image(&ImageSpec::default());
+    let bootloader = build_image(&bootloader_spec());
+    let mut xota = b"XOTA".to_vec();
+    xota.resize(512, 0);
+    let s3 = build_image(&ImageSpec {
+        chip: 9,
+        ..ImageSpec::default()
+    });
+    let mut corrupt = app.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 1;
+    // A data segment the size of the X4's slot, after the descriptor: the image is larger.
+    let mut too_large = ImageSpec::default();
+    too_large.segments.push((0x3C10_0000, vec![0; 0x64_0000]));
+    let too_large = build_image(&too_large);
+    let mut later_chip = bootloader.clone();
+    later_chip[15..17].copy_from_slice(&4u16.to_le_bytes());
+    refresh_digest(&mut later_chip);
+    for (case, application, given, cause, remedy) in [
+        (
+            "not an image",
+            vec![0u8; 64],
+            None,
+            "its first byte is 0x00, expected 0xe9",
+            "; use the plain application .bin",
+        ),
+        (
+            "an encrypted update",
+            xota,
+            None,
+            "is an encrypted OTA update (.xota)",
+            "; use the plain application .bin of a release",
+        ),
+        (
+            "an S3 image",
+            s3,
+            None,
+            "is built for ESP32-S3 and the device uses ESP32-C3",
+            "; choose a device with that chip",
+        ),
+        (
+            "larger than its slot",
+            too_large,
+            None,
+            "and its slot, app0, holds 6553600",
+            "; use an application that fits",
+        ),
+        (
+            "a corrupt digest",
+            corrupt,
+            None,
+            "the firmware is damaged: SHA-256 mismatch",
+            "; re-download the file or rebuild the firmware",
+        ),
+        (
+            "a whole flash image",
+            build_flash_image(&ImageSpec::default()),
+            None,
+            "is a whole flash image",
+            "; use it as the flash (`--flash`)",
+        ),
+        (
+            "a bootloader as the firmware",
+            bootloader.clone(),
+            None,
+            "the firmware is a 2nd-stage bootloader",
+            "; give it as the bootloader (`--bootloader`)",
+        ),
+        (
+            "an application as the bootloader",
+            app.clone(),
+            Some(app.clone()),
+            "the bootloader is an application image",
+            "; use it as the firmware (`--firmware`)",
+        ),
+        (
+            "a bootloader for a later chip",
+            app.clone(),
+            Some(later_chip),
+            "requires chip revision v0.4 or later and the device is v0.3: it would reset the chip for ever",
+            "; give a bootloader built for v0.3",
+        ),
+    ] {
+        let assert = run_with_firmware(&application, given.as_deref(), &[])
+            .code(2)
+            .stdout(predicate::str::is_empty());
+        let log = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+        assert!(
+            log.starts_with("error: ") && log.contains(cause) && log.contains(remedy),
+            "{case}: {log}"
+        );
+        assert!(
+            !log.contains(MISSING_ROM),
+            "{case}: refused before the ROM: {log}"
+        );
+    }
+}
+
+#[test]
+fn a_firmware_and_a_bootloader_that_pass_are_taken_to_the_rom() {
+    use firmware::builder::bootloader_spec;
+    // The ROM directory is empty: getting as far as the ROM is getting past every check.
+    let app = build_image(&ImageSpec::default());
+    for given in [None, Some(build_image(&bootloader_spec()))] {
+        run_with_firmware(&app, given.as_deref(), &[])
+            .code(2)
+            .stderr(contains(MISSING_ROM));
+    }
+}
+
+#[test]
+fn a_firmware_is_a_seed_like_an_image_and_the_flash_file_rules_apply() {
+    let app = build_image(&ImageSpec::default());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("x4.bin");
+    sparse_file(&file, X4_FLASH_BYTES);
+    let firmware = dir.path().join("app.bin");
+    std::fs::write(&firmware, &app).unwrap();
+    let firmware_arg = firmware.to_str().unwrap();
+    run_with_flash_file(&file, &["--firmware", firmware_arg])
+        .code(2)
+        .stderr(
+            contains("both --firmware and the flash file")
+                .and(contains("; drop --firmware to go on from the flash file"))
+                .and(contains(
+                    "start again from the flash composed from the firmware",
+                ))
+                .and(contains(MISSING_ROM).not()),
+        );
+    // With --reset-flash the run goes as far as the ROM.
+    run_with_flash_file(&file, &["--firmware", firmware_arg, "--reset-flash"])
+        .code(2)
+        .stderr(contains(MISSING_ROM));
+    // The firmware cannot be the flash file, nor --bootloader.
+    run_with_flash_file(&firmware, &["--firmware", firmware_arg])
+        .code(2)
+        .stderr(contains("--firmware and --flash-file name the same file"));
+    let other = dir.path().join("other.bin");
+    run_with_flash_file(
+        &firmware,
+        &[
+            "--firmware",
+            other.to_str().unwrap(),
+            "--bootloader",
+            firmware_arg,
+        ],
+    )
+    .code(2)
+    .stderr(contains("--bootloader and --flash-file name the same file"));
+    assert_eq!(std::fs::read(&firmware).unwrap(), app, "never written");
+}
+
+#[test]
+fn a_firmware_with_an_image_or_a_bootloader_without_a_firmware_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("x.bin");
+    std::fs::write(&path, b"x").unwrap();
+    let path = path.to_str().unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--flash", path, "--firmware", path])
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "'--flash <FLASH>' cannot be used with '--firmware <FILE>'",
+        ));
+    inkemu()
+        .args(["run", "--device", "x4", "--bootloader", path])
+        .assert()
+        .code(2)
+        .stderr(contains("--firmware <FILE>"));
+}
+
+#[test]
+fn run_help_documents_the_firmware_and_the_bootloader() {
+    let help = inkemu().args(["run", "--help"]).assert().success();
+    let out = String::from_utf8_lossy(&help.get_output().stdout).into_owned();
+    for expected in [
+        "--firmware <FILE>",
+        "the partition table of the device profile at 0x8000",
+        "--bootloader <FILE>",
+        "instead of the one inkemu ships",
+    ] {
+        assert!(out.contains(expected), "`{expected}` is missing:\n{out}");
+    }
+}

@@ -119,17 +119,25 @@ pub enum FlashStateError {
         found: String,
     },
     #[error(
-        "both --flash and the flash file {path}, which exists, were given: the run cannot start from two flashes; drop --flash to go on from the flash file, or add --reset-flash to start again from the image and replace the file"
+        "both {input} and the flash file {path}, which exists, were given: the run cannot start from two flashes; drop {input} to go on from the flash file, or add --reset-flash to start again from {} and replace the file",
+        input.what_it_gives()
     )]
-    BothGiven { path: String },
+    BothGiven { path: String, input: Input },
     #[error(
-        "--flash and --flash-file name the same file, {image} and {path}: the image of --flash is only read, and the flash file is replaced when the run ends; drop --flash to go on from the file, or give --flash-file another path to keep the image as it is"
+        "{input} and --flash-file name the same file, {image} and {path}: {} of {input} is only read, and the flash file is replaced when the run ends; {}",
+        input.noun(), input.same_file_remedy()
     )]
-    SameFile { image: String, path: String },
+    SameFile {
+        input: Input,
+        image: String,
+        path: String,
+    },
     #[error(
-        "--flash names {image}, which is the {role} of the flash file {path}: {why}, and the image of --flash is only read; copy the image to another name, then give that copy to --flash"
+        "{input} names {image}, which is the {role} of the flash file {path}: {why}, and {noun} of {input} is only read; copy {noun} to another name, then give that copy to {input}",
+        noun = input.noun()
     )]
     ImageIsTheRunsOwn {
+        input: Input,
         image: String,
         role: &'static str,
         path: String,
@@ -149,6 +157,64 @@ pub enum FlashStateError {
 
 fn shown(path: &Path) -> String {
     sanitize(&path.display().to_string())
+}
+
+/// A file of `inkemu run` that the run only reads, named by its option in the refusals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Input {
+    /// `--flash`: a whole flash image.
+    Flash,
+    /// `--firmware`: an application, which a flash is composed around.
+    Firmware,
+    /// `--bootloader`: the bootloader of that flash.
+    Bootloader,
+}
+
+impl Input {
+    /// What the refusals call the file of this input.
+    const fn noun(self) -> &'static str {
+        match self {
+            Input::Flash => "the image",
+            Input::Firmware | Input::Bootloader => "the file",
+        }
+    }
+
+    /// What a run starts from when this input is the seed and the flash file is reset.
+    const fn what_it_gives(self) -> &'static str {
+        match self {
+            Input::Flash => "the image",
+            Input::Firmware | Input::Bootloader => "the flash composed from the firmware",
+        }
+    }
+
+    const fn same_file_remedy(self) -> &'static str {
+        match self {
+            Input::Flash => {
+                "drop --flash to go on from the file, or give --flash-file another path to keep the image as it is"
+            }
+            Input::Firmware | Input::Bootloader => {
+                "give --flash-file another path to keep the file as it is"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Input::Flash => "--flash",
+            Input::Firmware => "--firmware",
+            Input::Bootloader => "--bootloader",
+        })
+    }
+}
+
+/// The content a run starts from when it does not go on from its flash file, and the option
+/// that gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seed {
+    pub input: Input,
+    pub content: Vec<u8>,
 }
 
 /// What to do about a file that cannot be created beside the flash file. The lock file and the
@@ -194,11 +260,13 @@ fn temporary_path(path: &Path) -> Option<PathBuf> {
 /// [`FlashStateError::ImageIsTheRunsOwn`] when it is the temporary file or the lock file of the
 /// flash file, by whatever route the two paths lead to one file.
 pub fn refuse_the_image_as_flash_file(
+    input: Input,
     image: &Path,
     flash_file: &Path,
 ) -> Result<(), FlashStateError> {
     if same_file(image, flash_file) {
         return Err(FlashStateError::SameFile {
+            input,
             image: shown(image),
             path: shown(flash_file),
         });
@@ -220,6 +288,7 @@ pub fn refuse_the_image_as_flash_file(
             && same_file(image, &path)
         {
             return Err(FlashStateError::ImageIsTheRunsOwn {
+                input,
                 image: shown(image),
                 role,
                 path: shown(flash_file),
@@ -755,7 +824,7 @@ impl RunFlash {
     pub fn begin(
         flash_file: Option<&Path>,
         reset: bool,
-        seed: Option<Vec<u8>>,
+        seed: Option<Seed>,
         size: u32,
     ) -> Result<(RunFlash, Option<Vec<u8>>), FlashStateError> {
         let state = flash_file
@@ -765,9 +834,12 @@ impl RunFlash {
         // size is not a flash of this device, and `--reset-flash` must not destroy it.
         let from_file = match &state {
             Some(state) if state.exists()? => {
-                if !reset && seed.is_some() {
+                if let Some(seed) = &seed
+                    && !reset
+                {
                     return Err(FlashStateError::BothGiven {
                         path: state.shown.clone(),
+                        input: seed.input,
                     });
                 }
                 !reset
@@ -776,7 +848,7 @@ impl RunFlash {
         };
         let content = match &state {
             Some(state) if from_file => Some(state.load()?),
-            _ => seed,
+            _ => seed.map(|seed| seed.content),
         };
         let start_sha256 = content_sha256(content.as_deref().unwrap_or_default(), size);
         Ok((
@@ -1549,7 +1621,7 @@ mod tests {
 
         // A run that is refused, here for an image given next to a flash file that exists,
         // leaves the directory as it found it but for its lock file.
-        let err = RunFlash::begin(Some(&path), false, Some(seed()), MIB).unwrap_err();
+        let err = RunFlash::begin(Some(&path), false, Some(flash_seed()), MIB).unwrap_err();
         assert!(matches!(err, FlashStateError::BothGiven { .. }), "{err}");
         assert_eq!(std::fs::read(&temporary).unwrap(), LEFT, "not removed");
 
@@ -1883,9 +1955,17 @@ mod tests {
         vec![0x5A; 0x4000]
     }
 
+    /// [`seed`], given by `--flash`.
+    fn flash_seed() -> Seed {
+        Seed {
+            input: Input::Flash,
+            content: seed(),
+        }
+    }
+
     #[test]
     fn without_a_flash_file_the_run_starts_from_the_seed_and_says_what_it_does_not_keep() {
-        let (flash, content) = RunFlash::begin(None, false, Some(seed()), MIB).unwrap();
+        let (flash, content) = RunFlash::begin(None, false, Some(flash_seed()), MIB).unwrap();
         assert_eq!(content, Some(seed()));
         assert!(flash.state.is_none() && !flash.starts_from_the_file());
         let start = format!(
@@ -1922,7 +2002,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x4.bin");
         // First run: no file yet, the seed, a write.
-        let (flash, content) = RunFlash::begin(Some(&path), false, Some(seed()), MIB).unwrap();
+        let (flash, content) =
+            RunFlash::begin(Some(&path), false, Some(flash_seed()), MIB).unwrap();
         assert_eq!(content, Some(seed()));
         assert!(!flash.starts_from_the_file());
         let machine = ran(content, &writing(0x00));
@@ -1990,7 +2071,7 @@ mod tests {
         let path = dir.path().join("x4.bin");
         let kept_content = vec![0x11u8; MIB as usize];
         std::fs::write(&path, &kept_content).unwrap();
-        let err = RunFlash::begin(Some(&path), false, Some(seed()), MIB).unwrap_err();
+        let err = RunFlash::begin(Some(&path), false, Some(flash_seed()), MIB).unwrap_err();
         assert!(matches!(err, FlashStateError::BothGiven { .. }), "{err}");
         let text = err.to_string();
         assert!(
@@ -2004,7 +2085,7 @@ mod tests {
 
         // The refusal released the lock. A reset starts from the seed and replaces the file,
         // even when the run modified nothing.
-        let (flash, content) = RunFlash::begin(Some(&path), true, Some(seed()), MIB).unwrap();
+        let (flash, content) = RunFlash::begin(Some(&path), true, Some(flash_seed()), MIB).unwrap();
         assert_eq!(content, Some(seed()));
         assert!(!flash.starts_from_the_file());
         let (kept, log) = finish(&flash, &ran(content, &[]));
@@ -2036,7 +2117,7 @@ mod tests {
         let image = dir.path().join("x4.bin");
         std::fs::write(&image, seed()).unwrap();
         let refused = |route: &str, image: &Path, flash_file: &Path| {
-            let err = refuse_the_image_as_flash_file(image, flash_file).unwrap_err();
+            let err = refuse_the_image_as_flash_file(Input::Flash, image, flash_file).unwrap_err();
             assert!(
                 matches!(err, FlashStateError::SameFile { .. }),
                 "{route}: {err}"
@@ -2069,10 +2150,11 @@ mod tests {
         // Another file with the same bytes, a file that is not there yet, and none at all.
         let copy = dir.path().join("copy.bin");
         std::fs::write(&copy, seed()).unwrap();
-        refuse_the_image_as_flash_file(&image, &copy).unwrap();
-        refuse_the_image_as_flash_file(&image, &dir.path().join("new.bin")).unwrap();
-        refuse_the_image_as_flash_file(&dir.path().join("gone.bin"), &image).unwrap();
-        refuse_the_image_as_flash_file(&dir.path().join("a"), &dir.path().join("a")).unwrap();
+        refuse_the_image_as_flash_file(Input::Flash, &image, &copy).unwrap();
+        refuse_the_image_as_flash_file(Input::Flash, &image, &dir.path().join("new.bin")).unwrap();
+        refuse_the_image_as_flash_file(Input::Flash, &dir.path().join("gone.bin"), &image).unwrap();
+        refuse_the_image_as_flash_file(Input::Flash, &dir.path().join("a"), &dir.path().join("a"))
+            .unwrap();
     }
 
     #[test]

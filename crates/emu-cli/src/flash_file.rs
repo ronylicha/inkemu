@@ -43,6 +43,41 @@ pub enum FlashFileError {
     },
 }
 
+/// Why a file could not be read whole within a limit.
+#[derive(Debug)]
+pub(crate) enum ReadFailure {
+    Io(std::io::Error),
+    /// A directory, a pipe, a device: refused without being read.
+    NotAFile,
+    /// The file is this many bytes, more than the limit, and was not read.
+    TooLong(u64),
+    /// The file held at least this many bytes when it was read, more than the limit: it grew
+    /// after its size was looked at.
+    Grew(u64),
+}
+
+/// The content of the regular file `path`, which must hold at most `limit` bytes. A path that is
+/// not a regular file is refused without being opened (a pipe would block), and no more than
+/// `limit + 1` bytes are ever read.
+pub(crate) fn read_regular_file(path: &Path, limit: u32) -> Result<Vec<u8>, ReadFailure> {
+    let metadata = std::fs::metadata(path).map_err(ReadFailure::Io)?;
+    if !metadata.is_file() {
+        return Err(ReadFailure::NotAFile);
+    }
+    if metadata.len() > u64::from(limit) {
+        return Err(ReadFailure::TooLong(metadata.len()));
+    }
+    let file = std::fs::File::open(path).map_err(ReadFailure::Io)?;
+    // The path may have been replaced between the two calls: judge what was actually opened.
+    if !file.metadata().map_err(ReadFailure::Io)?.is_file() {
+        return Err(ReadFailure::NotAFile);
+    }
+    // One byte past the limit: a file that grew since the metadata was read is still caught.
+    read_bounded(file, limit)
+        .map_err(ReadFailure::Io)?
+        .map_err(ReadFailure::Grew)
+}
+
 /// Reads `source` to its end, but never more than one byte past `limit`: `Err(n)` when it holds at
 /// least `n` bytes, more than `limit`.
 fn read_bounded(source: impl Read, limit: u32) -> std::io::Result<Result<Vec<u8>, u64>> {
@@ -64,37 +99,25 @@ fn read_bounded(source: impl Read, limit: u32) -> std::io::Result<Result<Vec<u8>
 /// [`FlashFileError`], whose message names the file, the cause and the remedy.
 pub fn load(path: &Path, chip: ChipId, flash_size: u32) -> Result<Vec<u8>, FlashFileError> {
     let shown = sanitize(&path.display().to_string());
-    let read_error = |e: &std::io::Error| FlashFileError::Read {
-        path: shown.clone(),
-        detail: sanitize(&e.to_string()),
-    };
-    let metadata = std::fs::metadata(path).map_err(|e| read_error(&e))?;
-    if !metadata.is_file() {
-        return Err(FlashFileError::NotAFile { path: shown });
-    }
-    if metadata.len() > u64::from(flash_size) {
-        return Err(FlashFileError::TooLong {
-            path: shown,
-            len: metadata.len(),
+    let bytes = read_regular_file(path, flash_size).map_err(|failure| match failure {
+        ReadFailure::Io(e) => FlashFileError::Read {
+            path: shown.clone(),
+            detail: sanitize(&e.to_string()),
+        },
+        ReadFailure::NotAFile => FlashFileError::NotAFile {
+            path: shown.clone(),
+        },
+        ReadFailure::TooLong(len) => FlashFileError::TooLong {
+            path: shown.clone(),
+            len,
             size: flash_size,
-        });
-    }
-    let file = std::fs::File::open(path).map_err(|e| read_error(&e))?;
-    // The path may have been replaced between the two calls: judge what was actually opened.
-    if !file.metadata().map_err(|e| read_error(&e))?.is_file() {
-        return Err(FlashFileError::NotAFile { path: shown });
-    }
-    // One byte past the flash: a file that grew since the metadata was read is still caught.
-    let bytes = match read_bounded(file, flash_size).map_err(|e| read_error(&e))? {
-        Ok(bytes) => bytes,
-        Err(at_least) => {
-            return Err(FlashFileError::Grew {
-                path: shown,
-                at_least,
-                size: flash_size,
-            });
-        }
-    };
+        },
+        ReadFailure::Grew(at_least) => FlashFileError::Grew {
+            path: shown.clone(),
+            at_least,
+            size: flash_size,
+        },
+    })?;
     if bytes.is_empty() {
         return Err(FlashFileError::Empty { path: shown });
     }
