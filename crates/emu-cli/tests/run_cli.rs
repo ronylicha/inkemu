@@ -1583,6 +1583,12 @@ fn wait_for_uart0_to_drain() -> [u32; 5] {
 /// and programs the next value. The byte is read through the data window (MMU entry 0), once,
 /// before it is written.
 fn counting_its_boots() -> Vec<u32> {
+    counting_its_boots_then(&[HANG])
+}
+
+/// [`counting_its_boots`] that goes on with `then` once the count is in the flash, instead of
+/// spinning: a run that has modified its flash and ends the way `then` makes it end.
+fn counting_its_boots_then(then: &[u32]) -> Vec<u32> {
     use cpu_rv32::asm::{addi, lbu, lui, sb, sw};
     use soc_esp32c3::test_support::{T0, flash_erase_sector, print_program};
     const A0: u8 = 10;
@@ -1627,7 +1633,7 @@ fn counting_its_boots() -> Vec<u32> {
     ]);
     program.extend(store_register(spi1("ADDR"), (1 << 24) | COUNT_AT));
     program.extend(store_register(spi1("CMD"), 1 << 25));
-    program.push(HANG);
+    program.extend_from_slice(then);
     program
 }
 
@@ -2027,6 +2033,280 @@ fn a_flash_file_whose_directory_became_read_only_exits_2_and_leaves_no_file() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(left, ["x4.bin.lock"], "no flash file, no temporary file");
+}
+
+/// `inkemu run --device x4` with the real ROM and `more`, to its end.
+fn run_x4(more: &[&std::ffi::OsStr]) -> Counted {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let output = inkemu()
+        .args(["run", "--device", "x4", "--rom-dir", &rom_dir])
+        .args(more)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    Counted {
+        code: output.status.code(),
+        console: String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+        log: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// What holds after the first run of [`counting_its_boots_then`] on a flash file, however that
+/// run ended: the summary says the file was saved, the file is the flash the run left, and a
+/// second run on it counts on.
+fn assert_the_first_boot_was_kept(log: &str, file: &std::path::Path) {
+    assert!(
+        log.contains("; 1 of its 4 KiB sectors was modified; saved to "),
+        "{log}"
+    );
+    let saved = std::fs::read(file).unwrap_or_else(|e| panic!("no flash file: {e}\n{log}"));
+    assert_eq!(saved.len() as u64, X4_FLASH_BYTES);
+    assert_eq!(saved[0x2_0000], 0, "the count of one boot, from 0");
+    let said = log
+        .lines()
+        .find_map(|line| line.strip_prefix(FLASH_AT_END))
+        .unwrap_or_else(|| panic!("no line `{FLASH_AT_END}` in:\n{log}"));
+    assert!(said.starts_with(&sha256_of(file)), "{log}");
+    let next = count_a_boot(&[std::ffi::OsStr::new("--flash-file"), file.as_os_str()]);
+    assert!(next.console.contains("\nboot 2\n"), "{}", next.console);
+}
+
+/// A `--strict-mmio` stop is an end of the run like the others for its flash: what the firmware
+/// wrote before the stop is saved, and the exit code is the one of the stop.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_strict_stop_saves_the_flash_file_and_exits_3() {
+    let mut then = load_register(unmodeled_register().addr).to_vec();
+    then.push(HANG);
+    let (dir, image) = flash_image_of(&counting_its_boots_then(&then));
+    let file = dir.path().join("x4.bin");
+    let run = run_x4(&[
+        "--strict-mmio".as_ref(),
+        "--flash".as_ref(),
+        image.as_os_str(),
+        "--flash-file".as_ref(),
+        file.as_os_str(),
+    ]);
+    assert_eq!(run.code, Some(3), "{}", run.log);
+    assert!(
+        run.log.contains("inkemu: stopped by --strict-mmio: "),
+        "{}",
+        run.log
+    );
+    assert!(run.console.ends_with("boot 1\n"), "{}", run.console);
+    assert_the_first_boot_was_kept(&run.log, &file);
+}
+
+/// A CPU that waits for an interrupt nothing can raise ends the run by itself, with no limit
+/// given: the flash is saved then too, and the exit code is the one of that end.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_cpu_that_waits_for_ever_saves_the_flash_file_and_exits_4() {
+    let (dir, image) = flash_image_of(&counting_its_boots_then(&[wfi(), HANG]));
+    let file = dir.path().join("x4.bin");
+    let run = run_x4(&[
+        "--flash".as_ref(),
+        image.as_os_str(),
+        "--flash-file".as_ref(),
+        file.as_os_str(),
+    ]);
+    assert_eq!(run.code, Some(4), "{}", run.log);
+    assert!(
+        run.log
+            .contains("inkemu: the CPU waits for an interrupt and none can come"),
+        "{}",
+        run.log
+    );
+    assert!(run.console.ends_with("boot 1\n"), "{}", run.console);
+    assert_the_first_boot_was_kept(&run.log, &file);
+}
+
+/// `inkemu run --flash-file x4.bin | head`: the reader that goes away ends the run, and the
+/// flash is saved. The firmware says `kept` once the count is in the flash, and the reader
+/// leaves on that line.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_reader_that_goes_away_ends_the_run_with_its_flash_file_saved() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let mut then = wait_for_uart0_to_drain().to_vec();
+    then.extend(soc_esp32c3::test_support::print_program(
+        svd_regs::esp32c3::addr("UART0", "FIFO"),
+        b"kept\n",
+    ));
+    then.push(HANG);
+    let (dir, image) = flash_image_of(&counting_its_boots_then(&then));
+    let file = dir.path().join("x4.bin");
+    let run = live::start(run_with_file(&rom_dir, &image, &file), |line| {
+        line.contains("kept")
+    });
+    let limit = std::time::Duration::from_secs(60);
+    run.wait_for_line("kept", limit);
+    let (code, log) = run.finish(limit);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        log.contains("inkemu: the reader of standard output went away\n"),
+        "{log}"
+    );
+    assert_the_first_boot_was_kept(&log, &file);
+}
+
+/// A console that cannot be written (`> /dev/full`) ends the run with exit code 2, and the
+/// flash is saved all the same. The console of this run is UART1, on which the ROM prints
+/// nothing: the first byte for standard output is the one the firmware sends once the count is
+/// in the flash.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_console_that_cannot_be_written_ends_the_run_with_its_flash_file_saved() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let mut then =
+        soc_esp32c3::test_support::print_program(svd_regs::esp32c3::addr("UART1", "FIFO"), b"x\n");
+    then.push(HANG);
+    let (dir, image) = flash_image_of(&counting_its_boots_then(&then));
+    let file = dir.path().join("x4.bin");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    // A limit: were the write to succeed, the firmware would spin for ever.
+    let output = run_with_file(&rom_dir, &image, &file)
+        .args(["--console", "uart1", "--max-cycles", "20000000"])
+        .stdin(std::process::Stdio::null())
+        .stdout(full)
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(2), "{log}");
+    assert!(
+        log.contains("error: cannot write the console output: ")
+            && !log.contains("cycle limit reached"),
+        "{log}"
+    );
+    assert_the_first_boot_was_kept(&log, &file);
+}
+
+/// A second stage that prints `ready` on the USB serial port, then some 128 000 bytes more,
+/// then reads a register the emulator does not model. The bytes are twice what a pipe holds:
+/// the run cannot reach the register, nor end, before its reader has read past `ready`.
+#[cfg(unix)]
+fn ready_then_much_output_then_an_unmodelled_register() -> Vec<u32> {
+    use cpu_rv32::asm::{addi, bne};
+    use soc_esp32c3::test_support::print_program;
+    const S0: u8 = 8;
+    /// A full-speed packet: the port sends it as soon as it is full.
+    const PACKET: usize = 64;
+    const PACKETS: i32 = 2000;
+    let port = svd_regs::esp32c3::addr("USB_DEVICE", "EP1");
+    let mut first = b"ready\n".to_vec();
+    first.resize(PACKET - 1, b'.');
+    first.push(b'\n');
+    let mut filler = vec![b'.'; PACKET - 1];
+    filler.push(b'\n');
+    let mut program = stop_watchdogs();
+    program.extend(print_program(port, &first));
+    program.push(addi(S0, 0, PACKETS));
+    let packet = print_program(port, &filler);
+    // Back over the packet and the decrement, to the first instruction of the packet.
+    let back = -4 * (i32::try_from(packet.len()).unwrap() + 1);
+    program.extend(packet);
+    program.extend([addi(S0, S0, -1), bne(S0, 0, back)]);
+    program.extend(load_register(unmodeled_register().addr));
+    program.push(HANG);
+    program
+}
+
+/// A `--strict-mmio` stop keeps exit code 3 when the flash file cannot be written: that code is
+/// for CI, and must not depend on the state of a directory. The error is printed all the same.
+///
+/// The directory of the flash file is removed by the reader of the run, when it reads `ready`
+/// and before it reads anything else: the firmware then has more to print than a pipe holds,
+/// so the run can neither stop nor save before the directory is gone.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_strict_stop_whose_flash_file_cannot_be_written_keeps_exit_code_3_and_says_what_is_lost() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (dir, image) = flash_image_of(&ready_then_much_output_then_an_unmodelled_register());
+    let kept_in = dir.path().join("flash");
+    std::fs::create_dir(&kept_in).unwrap();
+    let mut command = run_with_file(&rom_dir, &image, &kept_in.join("x4.bin"));
+    command.args(["--strict-mmio", "--console", "usb-serial-jtag"]);
+    let run = live::start(command, move |line| {
+        if line.contains("ready") {
+            std::fs::remove_dir_all(&kept_in).unwrap();
+        }
+        false
+    });
+    let (code, log) = run.finish(std::time::Duration::from_secs(60));
+    assert_eq!(code, Some(3), "{log}");
+    assert!(
+        log.contains("inkemu: stopped by --strict-mmio: ")
+            && log.contains("\nerror: cannot write the flash file ")
+            && log.contains(
+                "what this run wrote to the flash is lost; check that the directory still exists"
+            ),
+        "the stop, then the error: {log}"
+    );
+}
+
+/// A file-size limit of the host kills the process while it writes the flash file (`SIGXFSZ`):
+/// no message can be printed. The flash file is then the one of before, the part that was
+/// written stays under the temporary name, and the next run on the file removes it and goes on.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_save_killed_by_a_file_size_limit_leaves_the_flash_file_of_before_and_the_next_run_cleans_up() {
+    use std::os::unix::process::ExitStatusExt as _;
+    const SIGXFSZ: i32 = 25;
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (dir, image) = flash_image_of(&counting_its_boots());
+    let file = dir.path().join("x4.bin");
+    let flash_file = std::ffi::OsStr::new("--flash-file");
+    let first = count_a_boot(&[
+        "--flash".as_ref(),
+        image.as_os_str(),
+        flash_file,
+        file.as_os_str(),
+    ]);
+    assert_eq!(first.code, Some(0), "{}", first.log);
+    let before = sha256_of(&file);
+
+    // 2048 blocks of at most 1024 bytes: far less than the 16 MiB of the flash, and more than
+    // anything else the command writes. No core file either, whose size the limit would bound.
+    let killed = std::process::Command::new("sh")
+        .args(["-c", r#"ulimit -c 0; ulimit -f 2048; exec "$0" "$@""#])
+        .arg(env!("CARGO_BIN_EXE_inkemu"))
+        .args(["run", "--device", "x4", "--strict-mmio"])
+        .args(["--max-cycles", "5000000", "--rom-dir", &rom_dir])
+        .arg(flash_file)
+        .arg(&file)
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&killed.stderr).into_owned();
+    assert_eq!(killed.status.signal(), Some(SIGXFSZ), "{log}");
+    assert!(
+        log.contains(FLASH_AT_START) && !log.contains("flash at end"),
+        "the run was over, its flash was being saved: {log}"
+    );
+    assert_eq!(sha256_of(&file), before, "the flash file of before");
+    assert_eq!(
+        names_in(dir.path()),
+        [".x4.bin.tmp", "flash.bin", "x4.bin", "x4.bin.lock"],
+        "the part that was written stays"
+    );
+
+    // What the killed run had written to its flash is lost: this one is the second boot again.
+    let next = count_a_boot(&[flash_file, file.as_os_str()]);
+    assert_eq!(next.code, Some(0), "{}", next.log);
+    assert!(next.console.ends_with("boot 2\n"), "{}", next.console);
+    assert_eq!(next.sha256(FLASH_AT_START), before);
+    assert_eq!(next.sha256(FLASH_AT_END), sha256_of(&file));
+    assert_eq!(
+        names_in(dir.path()),
+        ["flash.bin", "x4.bin", "x4.bin.lock"],
+        "the part left by the killed save is gone"
+    );
 }
 
 /// `flash_nvs.bin` of `tools/reference-firmware/build.sh` and the whole flash after the first and
