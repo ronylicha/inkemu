@@ -1,5 +1,5 @@
 //! inkemu command-line interface.
-use boards::{DeviceProfile, MachineOptions, SocFamily};
+use boards::{DeviceProfile, MachineOptions};
 use clap::{Parser, Subcommand};
 use cpu_rv32::{HartConfig, MisalignedPolicy};
 use emu_cli::exit::{EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
@@ -11,7 +11,6 @@ use emu_cli::rom_store::{
 use emu_cli::run::{Interrupt, RunOptions, execute, parse_device_seconds, relay};
 use emu_cli::rvtest::{RunResult, TestMachine};
 use emu_cli::term::sanitize;
-use firmware::ChipId;
 use soc_esp32c3::ConsoleChannel;
 use std::fmt::Write as _;
 use std::io;
@@ -249,16 +248,10 @@ fn profile_for(id: &str) -> Result<DeviceProfile, boards::ProfileError> {
         },
         other @ (boards::ProfileError::Parse { .. }
         | boards::ProfileError::MissingFlash { .. }
-        | boards::ProfileError::IdMismatch { .. }) => other,
+        | boards::ProfileError::IdMismatch { .. }
+        | boards::ProfileError::Partitions { .. }
+        | boards::ProfileError::NoBootloader { .. }) => other,
     })
-}
-
-/// The chip id a firmware image must declare to run on the device of `profile`. The `match` is
-/// exhaustive on purpose: a new chip family does not compile until it has its chip id here.
-const fn image_chip(profile: &DeviceProfile) -> ChipId {
-    match profile.soc {
-        SocFamily::Esp32C3 => ChipId::Esp32C3,
-    }
 }
 
 /// What `inkemu run` was told about the flash of the device.
@@ -300,7 +293,7 @@ fn run_device(
         return fail(&e);
     }
     let image = match flash.image {
-        Some(path) => match flash_file::load(path, image_chip(&profile), flash_size) {
+        Some(path) => match flash_file::load(path, profile.soc.chip_id(), flash_size) {
             Ok(bytes) => Some(bytes),
             Err(e) => return fail(&e),
         },

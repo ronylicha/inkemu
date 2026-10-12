@@ -122,6 +122,7 @@ dependencies = [
 name = "boards"
 version = "0.1.0"
 dependencies = [
+ "firmware",
  "serde",
  "soc-esp32c3",
  "thiserror",

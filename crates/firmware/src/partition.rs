@@ -52,7 +52,7 @@ pub struct PartitionTable {
     pub entries: Vec<Partition>,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum PartitionError {
     #[error("the partition table is empty; add at least one partition")]
     Empty,

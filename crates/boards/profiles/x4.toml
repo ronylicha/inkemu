@@ -18,3 +18,50 @@ size_mib = 16
 # (docs/research/esp32c3-bootloader-accesses.md, section 2.1 item 5). `esptool.py flash_id` on a
 # unit settles it.
 jedec_id = 0x9D6018
+
+# The partition table the device boots with: `inkemu run --firmware` writes it at 0x8000 and puts
+# the application in the slot the bootloader starts on a blank otadata (the factory application,
+# else ota_0). The stock table of the X4, compiled byte for byte as
+# tests/fixtures/partitions/x4-stock.bin; CrossPoint's partitions.csv is the same table
+# (docs/research/flash-writes-and-crosspoint-boot.md, section J).
+[[partition]]
+name = "nvs"
+type = "data"
+subtype = "nvs"
+offset = 0x9000
+size = 0x5000
+
+[[partition]]
+name = "otadata"
+type = "data"
+subtype = "ota"
+offset = 0xE000
+size = 0x2000
+
+[[partition]]
+name = "app0"
+type = "app"
+subtype = "ota_0"
+offset = 0x10000
+size = 0x640000
+
+[[partition]]
+name = "app1"
+type = "app"
+subtype = "ota_1"
+offset = 0x650000
+size = 0x640000
+
+[[partition]]
+name = "spiffs"
+type = "data"
+subtype = "spiffs"
+offset = 0xC90000
+size = 0x360000
+
+[[partition]]
+name = "coredump"
+type = "data"
+subtype = "coredump"
+offset = 0xFF0000
+size = 0x10000
