@@ -463,6 +463,15 @@ pub trait FlashDevice: fmt::Debug {
     /// with the bytes it held): the count says which sectors were written with other bytes at
     /// some point, not which ones differ from the content the chip started from.
     fn modified_sectors(&self) -> u32;
+    /// Whether an erase that reaches the `len` bytes from `start` would change a byte: whether
+    /// a 4 KiB sector the range reaches holds a byte other than `0xFF`. A range of no byte
+    /// reaches nothing. The answer costs no reading of the content.
+    ///
+    /// A chip that keeps no account of it answers `true`: the caller then takes every erase
+    /// to change all it covers, which is never less than what it changed.
+    fn holds_data(&self, _start: u32, _len: u32) -> bool {
+        true
+    }
 }
 
 /// A set of 4 KiB sectors of the chip: one bit per sector of the largest chip, 512 bytes
@@ -485,6 +494,35 @@ impl SectorSet {
         }
     }
 
+    /// The bits of the word whose first sector is `base` that the sectors `first..end` cover:
+    /// none when the word lies outside the range.
+    fn covered(base: u32, first: u32, end: u32) -> u64 {
+        let low = first.saturating_sub(base).min(u64::BITS);
+        let high = end.saturating_sub(base).min(u64::BITS);
+        if low >= high {
+            return 0;
+        }
+        // INVARIANT: `low < high <= 64`, so neither shift is by 64 bits or more.
+        (u64::MAX << low) & (u64::MAX >> (u64::BITS - high))
+    }
+
+    /// Whether one of the sectors `first..first + count` is in the set. It reads the words the
+    /// range reaches and no other: one word for a range of 64 sectors or fewer that starts at
+    /// a multiple of 64, whatever the two numbers are.
+    fn intersects(&self, first: u32, count: u32) -> bool {
+        let end = first.saturating_add(count);
+        // The words of the set, as `SECTOR_WORDS` counts them: an index below 64, which times
+        // 64 cannot overflow.
+        (first / u64::BITS..MAX_FLASH_BYTES / SECTOR_BYTES / u64::BITS)
+            .take_while(|word| word * u64::BITS < end)
+            .any(|word| {
+                let covered = SectorSet::covered(word * u64::BITS, first, end);
+                self.0
+                    .get(index(word))
+                    .is_some_and(|bits| bits & covered != 0)
+            })
+    }
+
     /// Takes the sectors `first..first + count` out of the set and hands each one that was in
     /// it to `taken`, in order. It reads the 64 words of the set and calls `taken` for the
     /// sectors found, however long the range is: emptying a range that holds nothing costs
@@ -492,15 +530,7 @@ impl SectorSet {
     fn remove_range(&mut self, first: u32, count: u32, mut taken: impl FnMut(u32)) {
         let end = first.saturating_add(count);
         for (base, word) in (0u32..).step_by(64).zip(self.0.iter_mut()) {
-            // The bits of this word that the range covers: `low..high`, empty when the word
-            // lies outside the range.
-            let low = first.saturating_sub(base).min(u64::BITS);
-            let high = end.saturating_sub(base).min(u64::BITS);
-            if low >= high {
-                continue;
-            }
-            // INVARIANT: `low < high <= 64`, so neither shift is by 64 bits or more.
-            let covered = (u64::MAX << low) & (u64::MAX >> (u64::BITS - high));
+            let covered = SectorSet::covered(base, first, end);
             let mut found = *word & covered;
             *word &= !covered;
             while found != 0 {
@@ -817,6 +847,16 @@ impl FlashDevice for NorFlash {
 
     fn modified_sectors(&self) -> u32 {
         self.modified.len()
+    }
+
+    fn holds_data(&self, start: u32, len: u32) -> bool {
+        // The sectors from the one that holds the first byte to the one that holds the last.
+        let Some(last) = len.checked_sub(1).map(|span| start.saturating_add(span)) else {
+            return false;
+        };
+        let first = start / SECTOR_BYTES;
+        self.not_blank
+            .intersects(first, last / SECTOR_BYTES - first + 1)
     }
 
     fn read(&self, offset: u32, out: &mut [u8]) {
@@ -1806,6 +1846,66 @@ mod tests {
         write(&mut flash, 0x20, 0x9000, &[]).unwrap();
         write(&mut flash, 0xD8, 0x0000, &[]).unwrap();
         assert_eq!((flash.generation(), flash.modified_sectors()), (erased, 1));
+    }
+
+    #[test]
+    fn the_chip_says_which_ranges_hold_something_an_erase_would_change() {
+        let size = FlashConfig::default().size();
+        let mut flash = NorFlash::blank(FlashConfig::default());
+        assert!(!flash.holds_data(0, size), "a blank chip");
+        // One bit cleared at 0x12345, in sector 0x12: the answer is by sector.
+        write(&mut flash, 0x02, 0x1_2345, &[0xFE]).unwrap();
+        for (start, len, holds) in [
+            (0x1_2345, 1, true),
+            (0x1_2000, 1, true),          // the first byte of the sector
+            (0x1_2FFF, 1, true),          // its last byte
+            (0x1_1FFF, 1, false),         // the sector before
+            (0x1_3000, 0x1000, false),    // the sector after
+            (0x1_1FFF, 2, true),          // reaches the sector by its last byte
+            (0x1_0000, 0x1_0000, true),   // its 64 KiB block
+            (0, 0x1_0000, false),         // the block before
+            (0x2_0000, 0xFE_0000, false), // everything after its block
+            (0, size, true),
+            (0, u32::MAX, true),
+            (0x1_2345, 0, false), // no byte
+            // Numbers no chip has reach no sector.
+            (size, 1, false),
+            (u32::MAX, u32::MAX, false),
+            (u32::MAX, 0, false),
+        ] {
+            assert_eq!(flash.holds_data(start, len), holds, "{start:#x} {len:#x}");
+        }
+        // Erased, the sector holds nothing again.
+        write(&mut flash, 0x20, 0x1_2000, &[]).unwrap();
+        assert!(!flash.holds_data(0, size));
+        // The last byte of the chip, and a program that changes nothing.
+        write(&mut flash, 0x02, 0xFF_FFFF, &[0x7F]).unwrap();
+        write(&mut flash, 0x02, 0x80_0000, &[0xFF]).unwrap();
+        assert!(flash.holds_data(0xFF_F000, 0x1000));
+        assert!(flash.holds_data(0xFF_0000, 0x1_0000));
+        assert!(
+            !flash.holds_data(0, 0xFF_F000),
+            "everything below the last sector"
+        );
+        // A chip built from an image knows what the image holds: sectors 63 and 64 are in two
+        // words of the set.
+        let mut image = vec![0xFF; 0x4_1000];
+        image[0x3_F800] = 0;
+        image[0x4_0800] = 0;
+        let flash = NorFlash::with_image(image, FlashConfig::default()).unwrap();
+        for (start, len, holds) in [
+            (0x3_F000, 0x1000, true),
+            (0x4_0000, 0x1000, true),
+            (0x3_E000, 0x1000, false),
+            (0x4_1000, 0x1000, false),
+            (0x3_E000, 0x2000, true),   // ends in sector 63
+            (0x4_0000, 0x2000, true),   // starts in sector 64
+            (0x3_0000, 0x1_0000, true), // block 3
+            (0, 0x3_F000, false),
+            (0x4_1000, size - 0x4_1000, false),
+        ] {
+            assert_eq!(flash.holds_data(start, len), holds, "{start:#x} {len:#x}");
+        }
     }
 
     #[test]

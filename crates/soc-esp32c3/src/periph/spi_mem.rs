@@ -246,6 +246,57 @@ fn cache_pages(write: &FlashWrite) -> Option<(u32, u32)> {
     }
 }
 
+/// The 64 KiB pages of the largest chip: those an MMU entry can name, its page number has 8 bits.
+const FLASH_PAGES: usize = 256;
+
+/// For each 64 KiB page of the chip, whether it holds something an erase would change, as the
+/// chip tells it. 256 questions, whatever the chip and the firmware.
+fn pages_holding_data(flash: &dyn FlashDevice) -> [bool; FLASH_PAGES] {
+    let mut held = [false; FLASH_PAGES];
+    for (page, held) in (0u32..).zip(held.iter_mut()) {
+        // Page 255 starts at 0xFF0000: the product cannot overflow.
+        *held = flash.holds_data(page * MMU_PAGE_BYTES, MMU_PAGE_BYTES);
+    }
+    held
+}
+
+/// Tells the cache which 64 KiB pages `write` changed bytes of; `write` changed the content of
+/// the chip.
+///
+/// A write inside one page changed that page. An erase of several pages changed those of them
+/// that held something to erase and no other: with `held`, what the chip said of each page
+/// before the erase, the cache is told of each run of such pages, 128 events at most. Without
+/// it the cache is told of the whole range: more than changed, never less.
+fn tell_cache(ctx: &mut Ctx, write: &FlashWrite, held: Option<&[bool; FLASH_PAGES]>) {
+    let Some((first, last)) = cache_pages(write) else {
+        return;
+    };
+    let (Some(held), true) = (held, first != last) else {
+        ctx.signal(Event::FlashWritten {
+            first_page: first,
+            last_page: last,
+        });
+        return;
+    };
+    let mut run: Option<(u32, u32)> = None;
+    for (page, &held) in (0u32..).zip(held) {
+        if held && (first..=last).contains(&page) {
+            run = Some((run.map_or(page, |(first_page, _)| first_page), page));
+        } else if let Some((first_page, last_page)) = run.take() {
+            ctx.signal(Event::FlashWritten {
+                first_page,
+                last_page,
+            });
+        }
+    }
+    if let Some((first_page, last_page)) = run {
+        ctx.signal(Event::FlashWritten {
+            first_page,
+            last_page,
+        });
+    }
+}
+
 /// SPI1, the controller that runs the flash commands software asks for.
 ///
 /// It keeps the journal of what the run wrote to the chip and the count of the commands it
@@ -343,18 +394,22 @@ impl Spi1 {
             *count += 1;
         }
         let before = self.flash.generation();
+        // A command that names an address changes bytes of the 64 KiB page of that address and
+        // of no other: a program stays in its 256-byte page, a sector or a block erase in its
+        // unit of 4 or 64 KiB (FW §C, §G). One that names none may be the erase of the whole
+        // chip, which changes the pages that hold something and leaves the others as they
+        // were: the chip is asked which ones hold something before it runs such a command.
+        let held = command
+            .address
+            .is_none()
+            .then(|| pages_holding_data(self.flash.as_ref()));
         match self.flash.execute(command, &mut data_in) {
             Ok(written) => {
                 if let Some(write) = written {
                     // The cache is told of the bytes that changed, not of a command that left
                     // the content as it was: only the former can make a cached line stale.
-                    if self.flash.generation() != before
-                        && let Some((first_page, last_page)) = cache_pages(&write)
-                    {
-                        ctx.signal(Event::FlashWritten {
-                            first_page,
-                            last_page,
-                        });
+                    if self.flash.generation() != before {
+                        tell_cache(ctx, &write, held.as_ref());
                     }
                     self.journal.record(write);
                 }
@@ -888,12 +943,134 @@ mod tests {
         spi.write(ctx, CMD, CMD_RDSR);
         spi.write(ctx, CMD, CMD_RDID);
         assert_eq!(ctx.take_signal(), None);
-        // A chip erase: every page of the chip.
+        // A chip erase: the pages that still hold something (0, 1 and 2: the block erase left
+        // page 3 blank), not the pages past the image, which it leaves as they were.
         spi.write(ctx, CMD, CMD_WREN);
         spi.write(ctx, CMD, CMD_CE);
-        let last_page = FlashConfig::default().size() / MMU_PAGE_BYTES - 1;
-        assert_eq!(ctx.take_signal(), written(0, last_page));
+        assert_eq!(ctx.take_signal(), written(0, 2));
+        assert_eq!(ctx.take_signal(), None, "one run of pages, one event");
         assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
+    fn a_chip_erase_tells_the_cache_of_each_run_of_pages_it_changed_and_of_no_blank_page() {
+        const CMD_CE: u32 = 1 << 22;
+        let ctx = &mut Ctx::default();
+        let mut spi = spi1();
+        // One byte programmed in each of the 64 KiB pages 0, 2, 3 and 255, the last of the chip.
+        for address in [0x00_FFFF, 0x02_0000, 0x03_8000, 0xFF_FFFF] {
+            spi.write(ctx, CMD, CMD_WREN);
+            spi.write(ctx, W0, 0);
+            spi.write(ctx, ADDR, (1 << 24) | address);
+            spi.write(ctx, CMD, CMD_PP);
+            let page = address / MMU_PAGE_BYTES;
+            assert_eq!(
+                ctx.take_signal(),
+                Some(Event::FlashWritten {
+                    first_page: page,
+                    last_page: page
+                })
+            );
+        }
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, CMD, CMD_CE);
+        let told: Vec<_> = std::iter::from_fn(|| ctx.take_signal()).collect();
+        assert_eq!(
+            told,
+            [(0, 0), (2, 3), (255, 255)].map(|(first_page, last_page)| Event::FlashWritten {
+                first_page,
+                last_page
+            })
+        );
+        assert_eq!(flash_bytes(&spi, 0xFF_FFFF, 1), [0xFF], "it was erased");
+        // The chip is blank: a second erase changes nothing and tells nothing.
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, CMD, CMD_CE);
+        assert_eq!(ctx.take_signal(), None);
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    /// A chip that answers every command with an erase of the 64 KiB pages 1 to 3 that changed
+    /// its content, and says of each page what `holds` says: what the controller tells the
+    /// cache when an erase covers several pages.
+    #[derive(Debug)]
+    struct ErasesThreePages {
+        generation: u64,
+        holds: Option<fn(u32) -> bool>,
+    }
+
+    impl FlashDevice for ErasesThreePages {
+        fn size(&self) -> u32 {
+            FlashConfig::default().size()
+        }
+        fn read(&self, _offset: u32, out: &mut [u8]) {
+            out.fill(0xFF);
+        }
+        fn execute(
+            &mut self,
+            _command: &FlashCommand<'_>,
+            _data_in: &mut [u8],
+        ) -> Result<Option<FlashWrite>, FlashRefusal> {
+            self.generation += 1;
+            Ok(Some(FlashWrite::Erase {
+                start: MMU_PAGE_BYTES,
+                len: 3 * MMU_PAGE_BYTES,
+            }))
+        }
+        fn generation(&self) -> u64 {
+            self.generation
+        }
+        fn modified_sectors(&self) -> u32 {
+            0
+        }
+        fn holds_data(&self, start: u32, len: u32) -> bool {
+            assert_eq!(
+                (start % MMU_PAGE_BYTES, len),
+                (0, MMU_PAGE_BYTES),
+                "asked page by page"
+            );
+            self.holds.is_none_or(|holds| holds(start / MMU_PAGE_BYTES))
+        }
+    }
+
+    #[test]
+    fn an_erase_of_several_pages_is_told_page_by_page_only_when_the_chip_was_asked_before_it() {
+        const CMD_CE: u32 = 1 << 22;
+        let told = |holds, command| {
+            let ctx = &mut Ctx::default();
+            let mut spi = Spi1::new(Box::new(ErasesThreePages {
+                generation: 0,
+                holds,
+            }));
+            spi.write(ctx, ADDR, 0x1_0000);
+            spi.write(ctx, CMD, command);
+            std::iter::from_fn(|| ctx.take_signal())
+                .map(|event| match event {
+                    Event::FlashWritten {
+                        first_page,
+                        last_page,
+                    } => (first_page, last_page),
+                    other => panic!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let only_page_2: Option<fn(u32) -> bool> = Some(|page| page == 2);
+        let pages_0_to_2_and_4: Option<fn(u32) -> bool> = Some(|page| page <= 2 || page == 4);
+        // A command without an address: the chip was asked, and the pages it said held
+        // something are the ones told, inside the range of the erase only.
+        assert_eq!(told(only_page_2, CMD_CE), [(2, 2)]);
+        assert_eq!(told(pages_0_to_2_and_4, CMD_CE), [(1, 2)]);
+        assert_eq!(told(Some(|page| page != 2), CMD_CE), [(1, 1), (3, 3)]);
+        assert_eq!(told(Some(|_| false), CMD_CE), []);
+        // A chip that keeps no account of it says every page may hold something: the range.
+        assert_eq!(told(None, CMD_CE), [(1, 3)]);
+        assert!(
+            Recorder(Rc::default()).holds_data(0, 1),
+            "what a chip answers when it does not say otherwise"
+        );
+        // A command that names an address is not expected to reach past its page, so the chip
+        // was not asked: the whole range is told, which is never less than what changed.
+        assert_eq!(told(only_page_2, CMD_SE), [(1, 3)]);
     }
 
     #[test]

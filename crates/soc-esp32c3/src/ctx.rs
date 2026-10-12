@@ -91,8 +91,11 @@ pub enum Event {
     MmuFault { vaddr: u32, content: u32 },
     /// To `EXTMEM`: a store reached a flash window.
     FlashWindowStore { instruction_bus: bool },
-    /// To `EXTMEM`, from SPI1: a program or an erase changed bytes of the 64 KiB flash pages
-    /// `first_page` to `last_page`.
+    /// To `EXTMEM`, from SPI1: a program or an erase changed bytes of each of the 64 KiB flash
+    /// pages `first_page` to `last_page`. An erase that leaves pages as they were between pages
+    /// it changes (the erase of a chip that is blank in places) is one event per run of
+    /// changed pages. Only an erase of several pages by a chip that does not say which of them
+    /// held something names pages it may have left unchanged (`Spi1::transfer`).
     FlashWritten { first_page: u32, last_page: u32 },
     /// To `EXTMEM`, from its own `ICACHE_SYNC_CTRL`: software invalidated the cache range its
     /// `ICACHE_SYNC_ADDR` and `ICACHE_SYNC_SIZE` name. It comes back as an event because what

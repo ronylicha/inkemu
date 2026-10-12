@@ -328,7 +328,8 @@ impl SocBus {
 /// which a register access reaches and a delivery does not. A delivery resets a module, or marks
 /// or clears flash pages in the cache state: none writes one of those registers or posts a
 /// signal. So the signals there are to deliver are those one register access posted (at most one
-/// per module, or one in all for the two others), and delivering them posts none.
+/// per module; for a flash command one per run of pages it changed, 128 at most among the 256
+/// pages; one for an invalidation), and delivering them posts none.
 fn settle_signals(periph: &mut Peripherals, ctx: &mut Ctx) {
     while let Some(event) = ctx.take_signal() {
         periph.deliver(ctx, event);
@@ -1271,6 +1272,29 @@ mod tests {
         }
         assert_eq!(load(&mut b, vaddr), 0x4F02_06E8);
         assert_eq!(b.ctx.diag.drain(), Vec::new());
+    }
+
+    #[test]
+    fn a_chip_erase_makes_stale_the_pages_it_changed_and_no_page_that_held_nothing() {
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 3, 1);
+        map(&mut b, 5, 0x80); // past the image: erased already
+        let held = FLASH_DBUS_BASE + 0x3_0000;
+        let blank = FLASH_DBUS_BASE + 0x5_0000;
+        assert_eq!(load(&mut b, held), 0x4F02_06E9);
+        assert_eq!(load(&mut b, blank), 0xFFFF_FFFF);
+        // Write enable, then `FLASH_CE`: the erase of the whole chip.
+        spi1(&mut b, "CMD", 1 << 30);
+        spi1(&mut b, "CMD", 1 << 22);
+        assert_eq!(load(&mut b, blank), 0xFFFF_FFFF);
+        assert_eq!(
+            b.ctx.diag.drain(),
+            Vec::new(),
+            "the erase changed no byte of that page: a line a device kept holds what the flash does"
+        );
+        assert_eq!(load(&mut b, held), 0xFFFF_FFFF);
+        assert_eq!(b.ctx.diag.drain(), vec![stale(held, 1)]);
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 0x80)), 0);
     }
 
     #[test]
