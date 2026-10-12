@@ -2,13 +2,30 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **As executed.** This plan is the record of what was intended; it is not rewritten. The code of the fourteen tasks is the plan's own: it was imported, one commit per task, from the clone in which the code blocks below were compiled, tested and mutated, then reviewed by six independent reviewers, one per domain, and corrected. The following changed after the tasks:
+>
+> - **A data phase SPI1 cannot carry is cut and rounded** (Tasks 2 and 4) → a `USR` transfer whose data phase is longer than 512 bits, or is not whole bytes, is refused by name before anything is sent; the hard-wired read is judged the same way.
+> - **Seven commands run in any frame** (Task 3) → every command the chip runs has one frame (`FlashFrame::of`) and is refused in any other; a write is judged on its frame, then its latch, then its range and protection.
+> - **A flash refusal is listed once per value written** → the keys are bounded, 1,300 entries at most; several command bits in one write of `CMD` are one line for the run.
+> - **An erase reads and fills its whole unit** (Task 3) → the chip keeps the exact set of its sectors that are not blank: an erase costs what it erases, and the image is examined once when the chip is built. Memory is as before: a chip erase does not give the image back, and never did (it was emptied, its allocation kept); the bound is the size of the chip.
+> - **A chip erase makes every page read stale, and decoded code run again is no read** (Tasks 5 and 6) → a chip erase makes stale the pages it changed only (the controller asks the chip what its pages hold before that command and no other); an invalidation that takes a page out of the cache moves the generation, so flash code run again counts as read again; an access across two stale pages reports both; what each reset does to the stale state is stated and pinned.
+> - **ROM, bootloader and ESP-IDF "never" raise the stale-read diagnostic** (Task 6, ADR 0002) → no path that was read or measured raises it, and ESP-IDF's ranged invalidation is held by unit tests only; the ADR lists five cases where the diagnostic is silent and ten where it speaks.
+> - **The flash file takes the default mode and is judged when the run ends** (Tasks 8 to 10) → created `0600`, a replaced file keeps its mode, a file the user cannot write is refused at start; `--flash` and `--flash-file` that name the same file are refused; what would keep the file from being saved is refused before the ROM is loaded; the lock file is never followed nor waited on, and the flash file is read through the same open; the temporary file has one fixed name, `.<name>.tmp`, and what sits there is removed, and said on standard error, by the next run that is accepted, never by a run that is refused; a file removed during the run is written again.
+> - **`1 of its 4 KiB sectors were modified`** → `was modified`; the refusals of the flash say the frame a command takes, what `W0..W15` keep and a remedy for each cause; the help of `--flash-file` says who can read the file.
+> - **The trace hash of the `hello_world` life is a number the documents quote** → a test pins it, with its device time.
+> - **Ignored tests: 18, 16, 12 and 3** (Tasks 12 and 13) → 18, 24, 13 and 4; four mutations that survive Espressif's code → three, the erase being proven on the unmodified bootloader.
+> - **`--flash` is refused when it names the flash file** (Task 10) → also when it names the temporary file or the lock file of the flash file, by any route; **a second Ctrl-C always exits 130** → once the summary has begun, Ctrl-C ends nothing and the summary and the save complete; every removal at the temporary name is said, without presuming what was there; **the chip is asked what its pages hold before every chip erase** → only before one it would run. ADR 0004 is renamed `0004-entrees-d-une-execution-et-fichier-de-flash.md`.
+> - **`ASSUMPTION:` lines**: 77 at the base, 86 at the end of the branch; eleven added, two removed. The last two added mark the chip's latch and status across every reset of the ESP32-C3, and the opcode `FLASH_CE` sends. `cargo test --workspace`: 1,005 passed, 60 ignored.
+>
+> The code blocks of the tasks are not the code as it stands on the branch, and the test counts, messages and document texts they state are not those of the tree. See the hand-over note, `docs/superpowers/notes/2026-10-12-sp1b-3b-carryover.md`, section « Décisions prises pendant l'exécution ».
+
 **Goal:** the flash chip of the emulated device is written as on the device, and what is written can outlive a run. (1) ESP-IDF's unmodified `examples/storage/nvs/nvs_rw_value_cxx`, built from source, keeps a restart counter in NVS that increases across `esp_restart` inside one run: `The value is not initialized yet!`, then `Restart counter = 1`, then `= 2`. (2) A second `inkemu run` on the same `--flash-file` goes on counting where the first stopped. (3) The partition layout of the Xteink X4 (OTA slots, blank `otadata`) boots in `--strict-mmio`: the bootloader erases and programs `otadata` on the first boot only, with the measured 32 bytes, and both operations are counted. (4) In strict mode nothing unmodelled is touched and no CPU exception is taken over those lives. (5) Two runs from the same starting flash have the same trace hash and leave the same flash; the `hello_world` reference life keeps its trace hash `10174cc2726c3d77`. (6) The image given to `--flash` is never written; a run without `--flash-file` keeps nothing and says how many sectors were modified and not kept.
 
 **Architecture:** The flash chip stays one component behind the SPI1 controller (`FlashDevice`, ADR 0002). The controller learns to send what its hard-wired commands carry (an address, a byte count, data) and runs exactly one command per write of `SPI1.CMD`; the chip model (`NorFlash`) learns to program (bitwise AND, wrap inside the 256-byte page), to erase a sector, a block or everything, and to take its status register, under the write-enable latch, which clears when an operation completes. Every operation completes at once. Whatever the model does not do is refused by name, never guessed. The chip counts a *generation* that moves only when a byte changes: it is the third term of `Bus::page_version`, so decoded code follows the content, and it tells the cache state of `EXTMEM` which 64 KiB flash pages a program or an erase changed. The cache windows stay a live view of the flash; two sets of 256 bits follow the one sequence in which a device would answer differently (a page read through a window, written, read again with no invalidation between) and the bus reports such a read. The machine performs no host I/O: it hands over the whole content as bytes and the number of 4 KiB sectors a run modified. The CLI turns that into a file: a raw image of exactly the flash size, read whole when a run starts, replaced through a temporary file and a rename when it ends, under a lock on a sibling file held for the whole run. The content a run starts from is an input of the run; its SHA-256 is printed. A second reference firmware, built by the same container run as the first, proves all of it on bytes Espressif's code writes.
 
 **Tech Stack:** Rust 1.99.0 (edition 2024); no new dependency (`std::fs::File::try_lock` for the lock, `sha2` already in `emu-cli`); `clap`, `thiserror`, `assert_cmd`/`predicates`/`tempfile` (tests); the reference firmware tooling of plan SP1b-2 (`tools/reference-firmware`, Docker `espressif/idf:v5.5.2`), extended by Task 11.
 
-**Spec:** `docs/superpowers/specs/2026-10-11-inkemu-design.md` (§3.1, §4.1, §5.1, §5.2, §7, §10.2, §10.3). Hardware facts: `docs/research/esp-idf-storage-flash-traffic.md` (**SF**), `docs/research/flash-writes-and-crosspoint-boot.md` (**FW**), `docs/research/esp32c3-cache-mmu.md` (**CM**), and the reports of the earlier plans as their code cites them. ADR `docs/adr/0002-flash-model-and-cache-windows.md` (revised by Task 6), ADR `docs/adr/0004-entrees-d-un-run-et-fichier-de-flash.md` (written by Task 10). Carried-over points: `docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` (**N3a**) and `docs/superpowers/notes/2026-10-11-sp1b-2-carryover.md` (**N2**). A value in this plan is followed by the report tag and section it comes from; `ROM3:name@addr` is a symbol of the rev3 mask ROM, `IDF:` a file of ESP-IDF v5.5.2.
+**Spec:** `docs/superpowers/specs/2026-10-11-inkemu-design.md` (§3.1, §4.1, §5.1, §5.2, §7, §10.2, §10.3). Hardware facts: `docs/research/esp-idf-storage-flash-traffic.md` (**SF**), `docs/research/flash-writes-and-crosspoint-boot.md` (**FW**), `docs/research/esp32c3-cache-mmu.md` (**CM**), and the reports of the earlier plans as their code cites them. ADR `docs/adr/0002-flash-model-and-cache-windows.md` (revised by Task 6), ADR `docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md` (written by Task 10). Carried-over points: `docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` (**N3a**) and `docs/superpowers/notes/2026-10-11-sp1b-2-carryover.md` (**N2**). A value in this plan is followed by the report tag and section it comes from; `ROM3:name@addr` is a symbol of the rev3 mask ROM, `IDF:` a file of ESP-IDF v5.5.2.
 
 Every code block of this plan was compiled and its tests run in a scratch clone of the repository, one commit per task, in the order of the tasks: after each task the workspace built, `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` were clean and `cargo test --workspace` passed. The ignored tests were run against the real ROM and the reference images after the tasks that say so. The numbers the steps state (test counts, hashes, console lines) are the ones that clone produced. Each behaviour a task claims names the mutation that must make its test fail; each mutation in the tables was applied to the clone and the test named beside it failed. A mutation that survived is listed as such, with the test that kills it elsewhere. Applied in order to the commit before, the blocks of each task rebuild the commit of that task exactly: this was checked mechanically for the 14 tasks.
 
@@ -127,7 +144,7 @@ G1–G18 were given to this plan and bind it. G19 onward were taken while writin
 .github/workflows/ci.yml                     counts and filters of the ignored tests; the NVS images (Tasks 10 to 13)
 README.md                                    heirs (Task 1); the flash is written, the flash file (Task 14)
 docs/adr/0002-flash-model-and-cache-windows.md  revised (Task 6)
-docs/adr/0004-entrees-d-un-run-et-fichier-de-flash.md  new, in French (Task 10)
+docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md  new, in French (Task 10)
 docs/registers-accepted-without-effect.md    regenerated (Tasks 1, 2, 6)
 docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md  the re-assignment table (Task 1)
 docs/superpowers/notes/2026-10-12-sp1b-3b-carryover.md  the hand-over note, in French (Task 14)
@@ -7463,7 +7480,7 @@ The two options, wired to `RunFlash`, with the tests through the binary and the 
 - Modify: `crates/emu-cli/src/main.rs` (`--flash-file`, `--reset-flash`, the header line, the summary lines, the exit code)
 - Modify: `crates/emu-cli/src/exit.rs` (the help of exit code 2)
 - Modify: `crates/emu-cli/tests/run_cli.rs` (6 tests that need no ROM, 6 ignored tests on the real ROM)
-- Create: `docs/adr/0004-entrees-d-un-run-et-fichier-de-flash.md` (French)
+- Create: `docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md` (French)
 - Modify: `.github/workflows/ci.yml` (the count of the ignored CLI tests: 10 → 16)
 
 **Interfaces:**
@@ -8381,10 +8398,10 @@ Every test that starts `inkemu` gives it `--rom-dir` and a limit (`--max-cycles`
 - [ ] **Step 7: Format, lint, commit**
 
 ```bash
-/usr/bin/git add docs/adr/0004-entrees-d-un-run-et-fichier-de-flash.md
+/usr/bin/git add docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md
 /usr/bin/git commit -m "feat(cli): inkemu run --flash-file keeps the flash of a device between runs
 
-Claude-Session: https://claude.ai/code/session_01AwFxZY77NkrWpZTUtrDjAQ" -- crates/emu-cli docs/adr/0004-entrees-d-un-run-et-fichier-de-flash.md .github/workflows/ci.yml
+Claude-Session: https://claude.ai/code/session_01AwFxZY77NkrWpZTUtrDjAQ" -- crates/emu-cli docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md .github/workflows/ci.yml
 ```
 
 ---
@@ -9680,7 +9697,7 @@ Expected: `0`; `0`; then `SP1b-3d 8`, `SP1b-3f 10`, `SP1b-4 28`, `SP2 26`, `SP5a
  - [Registers accepted without effect](docs/registers-accepted-without-effect.md): what is stored but not modelled, and the plan that makes each real
  - [ADR 0002](docs/adr/0002-flash-model-and-cache-windows.md): the flash model and the cache windows (French)
  - [ADR 0003](docs/adr/0003-contexte-des-peripheriques.md): the context every peripheral access receives, device time, and the three levels of reset (French)
-+- [ADR 0004](docs/adr/0004-entrees-d-un-run-et-fichier-de-flash.md): what an input of a run is, and the life of the flash file (French)
++- [ADR 0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md): what an input of a run is, and the life of the flash file (French)
  
  ## Français
  
@@ -9739,7 +9756,7 @@ Expected: `0`; `0`; then `SP1b-3d 8`, `SP1b-3f 10`, `SP1b-4 28`, `SP2 26`, `SP5a
  ### Documentation
  
 -La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) et [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
-+La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) et [0004](docs/adr/0004-entrees-d-un-run-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
++La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) et [0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
  
  ### Matériel tiers et licence
  

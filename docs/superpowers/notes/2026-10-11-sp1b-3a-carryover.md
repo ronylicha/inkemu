@@ -2,6 +2,25 @@
 
 Note de passage du plan `docs/superpowers/plans/2026-10-11-sp1b-3a-interrupts-timers-reset.md` (base de temps, interruptions, timers, watchdogs, reset) aux plans suivants. Elle garde ce que l'historique git ne dit pas : les décisions prises en cours de route, et ce qui est volontairement reporté, avec le plan qui en hérite.
 
+## Réattribution du 12 octobre 2026 : « SP1b-3b » est devenu cinq plans
+
+Cette note, la table des registres acceptés et plusieurs commentaires du code attribuaient à un seul plan, « SP1b-3b », ce que cinq plans se partagent désormais. Le texte ci-dessous n'est pas réécrit : il reste le relevé de ce qui était décidé à la fin de SP1b-3a. Partout où il dit « SP1b-3b », lire le plan de ce tableau.
+
+| Ce que la note attribue à « SP1b-3b » | Plan qui le prend |
+|---|---|
+| Écritures en flash (programmation, effacements, registre d'état), lectures de données par SPI1, adresse et données des commandes câblées, mise à jour d'`otadata` et comptage des écritures dans le test OTA | **SP1b-3b** (écritures en flash et fichier de flash de l'appareil) |
+| Fichier de flash qui survit aux exécutions, contenu rendu par la machine, état « modifié », troisième terme de `Bus::page_version`, vue en direct ou lignes de cache périmées (ADR 0002), règle de taille d'une `FlashDevice` externe | **SP1b-3b** |
+| Lignes `SPI1.FLASH_WAITI_CTRL`, `FLASH_SUS_CTRL` et `SUS_STATUS` de la table | **SP8** : l'attente automatique et la suspension n'ont de sens que lorsqu'une opération de flash dure |
+| `--firmware`, l'ADR sur le bootloader qui doit le précéder, les tables de partitions dans les profils, les retouches de forme de `boards` (`# Errors` de `from_named_toml`, `ProfileError::Parse`) | **SP1b-3c** |
+| Réception UART, interruptions UART, format de trame (les 8 lignes `INT_ENA`, `INT_CLR`, `CONF0`, `CONF1` des deux UART), côté hôte de l'USB-Serial-JTAG, pilote de console commun aux tests d'intégration et leur accès à `test_support` | **SP1b-3d** (les consoles série dans les deux sens) |
+| Le jalon « un firmware communautaire démarre » (CrossPoint) et son pilote de test | **SP1b-3e** |
+| Sommeil profond et réveil par le timer RTC, les 10 lignes d'alimentation (`RTC_CNTL.OPTIONS0`, `TIMER1`, `TIMER3` à `TIMER6`, `PWC`, `DIG_PWC`, `DIG_ISO`, `SYSTEM.MEM_PD_MASK`), les bits 29:27 de `RTC_CNTL.TIME_UPDATE`, le découpage de `periph/timg.rs` et de `periph/rtc_cntl.rs` | **SP1b-3f** |
+| Sommeil léger | **SP1b-3f**, qui le refuse en le nommant : la spec ne demande que le sommeil profond et le réveil par timer (§10.2, point 7) |
+| Registres de programmation des eFuse (`EFUSE.CMD`, `PGM_*`) | Aucun plan : ils restent des accès non modélisés, signalés par leur nom ; aucun démarrage mesuré ne les touche |
+| Identifiant de `DeviceProfile` comme type validé | **SP2** : aucun fichier ne porte plus le nom d'un profil, le fichier de flash est désigné par son chemin |
+| Durées réelles des opérations de flash, suspension d'un effacement ou d'une programmation | **SP8** |
+| Cache fidèle à la ligne (une ligne lue avant une écriture reste périmée jusqu'à son invalidation) | **SP1b-4**, avec le coût d'un défaut de cache (`Bus::fetch_stall`) |
+
 ## Résultat
 
 L'image de référence (bootloader ESP-IDF v5.5.2 et `hello_world`, mêmes empreintes que pour SP1b-2) vit toute sa vie sur la vraie ROM : `Hello world!`, onze lignes de compte à rebours espacées d'une seconde d'appareil, `Restarting now.`, puis un second démarrage que la ROM annonce par `rst:0xc (RTC_SW_CPU_RST)` et `Saved PC:0x40048b92`. Une vie, de la mise sous tension au reset du CPU par `esp_restart`, représente 28 347 166 cycles de CPU pour 11,246 s d'appareil (mesuré avec la CLI, non figé par un test : les tests figent le jalon, onze lignes de compte à rebours espacées d'une seconde d'appareil au tick près et un second démarrage derrière `rst:0xc`, et, par la commande réelle, la même console et la même empreinte de trace pour deux exécutions menées à travers le redémarrage) ; le reste est dormi. En `--strict-mmio`, aucun registre non modélisé et aucune exception sur tout le cycle. Sans image, la puce est réinitialisée par ses watchdogs à 1,3 s, 2,6 s (`rst:0x7`) puis 2,941 s (`rst:0x10`), et le cycle recommence. Un firmware qui se bloque, interruptions masquées, est réinitialisé par son propre watchdog, et le démarrage suivant donne l'adresse où il était bloqué.

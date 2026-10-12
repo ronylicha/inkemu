@@ -4,7 +4,7 @@ use crate::clock;
 use crate::config::SocConfig;
 use crate::ctx::Event;
 use crate::diag::{Diagnostic, Unsupported};
-use crate::flash::{FlashDevice, FlashImageError, NorFlash};
+use crate::flash::{FlashDevice, FlashImageError, FlashWrite, NorFlash};
 use crate::memmap::RESET_PC;
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
@@ -487,6 +487,85 @@ impl Esp32C3 {
         }
     }
 
+    /// The programs, erases and status writes the flash chip performed since the last call,
+    /// oldest first: the journal of what the run wrote.
+    ///
+    /// Its callers are a front end that shows or checks what a firmware writes, and the tests
+    /// that compare the writes of a reference firmware with the ones measured on a chip
+    /// (`tests/reference_boot.rs`). The command line does not take it: it keeps the content of
+    /// the flash ([`Esp32C3::flash_contents`]), not the operations.
+    ///
+    /// The journal holds at most [`JOURNAL_CAPACITY`](crate::flash::JOURNAL_CAPACITY) entries
+    /// between two calls, the first ones; the operations performed while it was full are not
+    /// in it and are counted by [`Esp32C3::flash_writes_dropped`]. A caller that needs every
+    /// one takes them as often as it takes the console, and reads that count when the run
+    /// ends: 0 says that the entries it took are all of them. A caller that never takes the
+    /// journal costs the machine those entries at most (64 bytes of data each through the
+    /// controller) and loses nothing else.
+    pub fn take_flash_writes(&mut self) -> Vec<FlashWrite> {
+        self.bus.periph.spi1.take_flash_writes()
+    }
+
+    /// How many flash operations the journal did not keep since power-on, because nobody had
+    /// taken the ones before them: what a caller of [`Esp32C3::take_flash_writes`] reads to
+    /// know whether what it took is the whole of what the run wrote.
+    #[must_use]
+    pub const fn flash_writes_dropped(&self) -> u64 {
+        self.bus.periph.spi1.flash_writes_dropped()
+    }
+
+    /// How many flash commands of `opcode` the SPI1 controller sent to the chip since power-on
+    /// (`0x02` page program, `0x06` write enable, `0x04` write disable, `0x05` read status, and
+    /// so on), those the chip model refused included.
+    ///
+    /// Its callers are the tests that compare the commands a firmware sends here with the
+    /// ones it sends to a real chip (`tests/reference_boot.rs`: one write enable per write, no
+    /// write disable), and a front end that wants the same numbers. The counters are 256 `u64`
+    /// whatever the firmware sends.
+    #[must_use]
+    pub fn flash_commands_sent(&self, opcode: u8) -> u64 {
+        self.bus.periph.spi1.commands_sent(opcode)
+    }
+
+    /// The whole content of the flash chip as it is now, erased bytes included: exactly
+    /// [`FlashConfig::size`](crate::flash::FlashConfig::size) bytes, at most 16 MiB whatever the
+    /// firmware did. It is what a caller keeps to let a later run go on from this one: given
+    /// back to [`Esp32C3::with_flash`] with the same configuration, it builds a machine whose
+    /// flash holds the same bytes. The machine performs no host I/O; storing the bytes is the
+    /// caller's business.
+    ///
+    /// ```
+    /// use soc_esp32c3::{Esp32C3, FlashImageError, RomImage, SocConfig};
+    /// /// The machine of the next run: it starts again from the ROM, on the flash `last` left.
+    /// fn next_run(
+    ///     rom: RomImage,
+    ///     last: &Esp32C3,
+    ///     config: &SocConfig,
+    /// ) -> Result<Esp32C3, FlashImageError> {
+    ///     Esp32C3::with_flash(rom, last.flash_contents(), config)
+    /// }
+    /// ```
+    #[must_use]
+    pub fn flash_contents(&self) -> Vec<u8> {
+        let flash = self.bus.periph.spi1.flash();
+        // INVARIANT: a `u32` fits in `usize` on every target the workspace builds for (32 bits
+        // and more); the fallback, an empty content, is never taken.
+        let mut content = vec![0u8; usize::try_from(flash.size()).unwrap_or(0)];
+        flash.read(0, &mut content);
+        content
+    }
+
+    /// How many 4 KiB sectors of the flash had a byte changed by the run since the machine was
+    /// built: 0 says the content is the one the machine was given. A program or an erase that
+    /// left every byte as it was counts for nothing, and a reset does not start the count again:
+    /// the chip is not reset with the rest. A sector that was changed and changed back counts
+    /// (erased, then programmed with the bytes it held): a count above 0 says that the run wrote
+    /// other bytes at some point, not that the content differs now.
+    #[must_use]
+    pub fn flash_modified_sectors(&self) -> u32 {
+        self.bus.periph.spi1.flash().modified_sectors()
+    }
+
     /// Diagnostics seen for the first time since the last call.
     pub fn drain_diagnostics(&mut self) -> Vec<Diagnostic> {
         self.bus.ctx.diag.drain()
@@ -525,8 +604,8 @@ mod tests {
     use crate::memmap::ROM_BASE;
     use crate::memmap::SRAM_DBUS_BASE;
     use crate::test_support::{
-        HANG, T0, T1, flat_rom, load_register, print_program as print, stop_watchdogs,
-        store_register, unmodeled_register, within,
+        HANG, T0, T1, flash_erase_sector, flash_program, flat_rom, load_register,
+        print_program as print, stop_watchdogs, store_register, unmodeled_register, within,
     };
     use cpu_rv32::asm::{addi, csrrs, csrrwi, jal, lui, lw, sw, wfi};
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
@@ -566,6 +645,114 @@ mod tests {
             matches!(err, crate::flash::FlashImageError::TooLong { .. }),
             "{err}"
         );
+    }
+
+    #[test]
+    fn what_a_program_writes_to_the_flash_is_in_the_journal_of_the_run_once() {
+        // An erase, then the bitmap word NVS programs twice in place (SF §B.2).
+        let mut program = flash_erase_sector(0x9000);
+        program.extend(flash_program(0x9020, &[0xFE, 0xFF, 0xFF, 0xFF]));
+        program.extend(flash_program(0x9020, &[0xFA]));
+        program.push(HANG);
+        let strict = SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        };
+        let mut m = Esp32C3::with_flash(flat_rom(&program), vec![0u8; 0xA000], &strict).unwrap();
+        assert_eq!(
+            m.run_until(Cycles(400)),
+            StopReason::CycleBudget,
+            "a flash write is nothing a strict run stops on"
+        );
+        assert_eq!(
+            m.take_flash_writes(),
+            [
+                FlashWrite::Erase {
+                    start: 0x9000,
+                    len: 0x1000
+                },
+                FlashWrite::Program {
+                    address: 0x9020,
+                    data: vec![0xFE, 0xFF, 0xFF, 0xFF]
+                },
+                FlashWrite::Program {
+                    address: 0x9020,
+                    data: vec![0xFA]
+                },
+            ]
+        );
+        assert_eq!(m.take_flash_writes(), [], "taken once");
+        assert_eq!(m.flash_writes_dropped(), 0);
+        assert_eq!(m.drain_diagnostics(), []);
+    }
+
+    /// Where two flash contents first differ, their common length when one is longer: a failed
+    /// comparison says an offset, not 16 MiB of bytes.
+    fn first_difference(left: &[u8], right: &[u8]) -> Option<usize> {
+        left.iter()
+            .zip(right)
+            .position(|(l, r)| l != r)
+            .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+    }
+
+    #[test]
+    fn the_content_of_the_flash_leaves_the_machine_whole_and_builds_the_same_flash_again() {
+        // A sector erased, four bytes programmed in it, and a program in another sector that
+        // changes no byte (0x00 AND 0x0F is 0x00): one sector was modified, not two.
+        let mut program = flash_erase_sector(0x9000);
+        program.extend(flash_program(0x9020, &[0xFE, 0xCA, 0xFF, 0x00]));
+        program.extend(flash_program(0x2000, &[0x0F]));
+        program.push(HANG);
+        let config = SocConfig::default();
+        let size = config.flash.size() as usize;
+        let image = vec![0u8; 0xA000];
+        let mut m = Esp32C3::with_flash(flat_rom(&program), image.clone(), &config).unwrap();
+        let before = m.flash_contents();
+        assert_eq!(before.len(), size, "the whole chip, not the image");
+        assert_eq!(before[..image.len()], image[..]);
+        assert!(before[image.len()..].iter().all(|&byte| byte == 0xFF));
+        assert_eq!(m.flash_modified_sectors(), 0);
+
+        m.run_until(Cycles(400));
+        let after = m.flash_contents();
+        let mut expected = before.clone();
+        expected[0x9000..0xA000].fill(0xFF);
+        expected[0x9020..0x9024].copy_from_slice(&[0xFE, 0xCA, 0xFF, 0x00]);
+        assert_eq!(
+            first_difference(&after, &expected),
+            None,
+            "the erase and the program, nothing else"
+        );
+        assert_eq!(m.flash_modified_sectors(), 1);
+        m.reset(ResetCause::Mwdt0Core);
+        assert_eq!(m.flash_modified_sectors(), 1, "the chip is not reset");
+        assert_eq!(first_difference(&m.flash_contents(), &expected), None);
+
+        // What left the machine is a content `with_flash` takes: the next machine starts from it.
+        let next = Esp32C3::with_flash(flat_rom(&[HANG]), after, &config).unwrap();
+        assert_eq!(first_difference(&next.flash_contents(), &expected), None);
+        assert_eq!(
+            next.flash_modified_sectors(),
+            0,
+            "a new run, nothing modified"
+        );
+    }
+
+    #[test]
+    fn a_machine_with_an_erased_flash_hands_over_a_chip_of_erased_bytes() {
+        let small = SocConfig {
+            flash: crate::flash::FlashConfig::new(
+                1 << 20,
+                crate::flash::JedecId::from_u24(0x9D_6014).unwrap(),
+            )
+            .unwrap(),
+            ..SocConfig::default()
+        };
+        let m = Esp32C3::new(flat_rom(&[HANG]), &small);
+        let content = m.flash_contents();
+        assert_eq!(content.len(), 1 << 20, "the size of the configuration");
+        assert!(content.iter().all(|&byte| byte == 0xFF));
+        assert_eq!(m.flash_modified_sectors(), 0);
     }
 
     #[test]
@@ -917,8 +1104,9 @@ mod tests {
         assert_eq!(m.cpu_frequency().hz(), 20_000_000);
     }
 
-    /// A flash chip whose content the test can change behind the machine's back, which the real
-    /// read-only chip never does: the only way to see decoded code being dropped.
+    /// A flash chip whose content the test can change behind the machine's back, without its
+    /// generation moving, which the real chip never does: the way to see that a write to a cache
+    /// control register drops the decoded code by itself.
     #[derive(Debug)]
     struct SharedFlash(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
 
@@ -936,10 +1124,16 @@ mod tests {
             &mut self,
             command: &crate::flash::FlashCommand<'_>,
             _data_in: &mut [u8],
-        ) -> Result<(), crate::flash::UnmodeledCommand> {
-            Err(crate::flash::UnmodeledCommand {
+        ) -> Result<Option<crate::flash::FlashWrite>, crate::flash::FlashRefusal> {
+            Err(crate::flash::FlashRefusal::Unmodeled {
                 opcode: command.opcode,
             })
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+        fn modified_sectors(&self) -> u32 {
+            0
         }
     }
 
@@ -1033,6 +1227,147 @@ mod tests {
             ),
             (1, 2)
         );
+    }
+
+    /// A machine whose flash holds `li a0, 3; ret` at offset 0 and whose ROM maps flash page 0
+    /// at the start of the instruction window, calls that function, stores what it returned at
+    /// the start of the SRAM, runs `between`, then calls the function again and stores the result
+    /// in the next word.
+    fn calls_flash_code_around(between: &[u32]) -> Esp32C3 {
+        use cpu_rv32::asm::jalr;
+        const A0: u8 = 10;
+        const RA: u8 = 1;
+        const T2: u8 = 7;
+        const S0: u8 = 8;
+        let image: Vec<u8> = [addi(A0, 0, 3), jalr(0, RA, 0)]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut program = vec![
+            lui(T0, crate::periph::mmu::MMU_TABLE_BASE),
+            lui(T2, crate::memmap::FLASH_IBUS_BASE),
+            lui(S0, SRAM_DBUS_BASE),
+            sw(0, T0, 0),    // entry 0 = flash page 0
+            jalr(RA, T2, 0), // decodes the function: a0 = 3
+            sw(A0, S0, 0),
+        ];
+        program.extend_from_slice(between);
+        program.extend([jalr(RA, T2, 0), sw(A0, S0, 4), HANG]);
+        Esp32C3::with_flash(flat_rom(&program), image, &SocConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn code_decoded_from_the_flash_is_decoded_again_once_the_flash_is_programmed() {
+        // A program only clears bits: `li a0, 3` becomes `li a0, 1` (immediate 0b11 to 0b01).
+        const A0: u8 = 10;
+        let mut m = calls_flash_code_around(&flash_program(0, &addi(A0, 0, 1).to_le_bytes()));
+        m.run_until(Cycles(600));
+        // The program changed code the CPU had fetched, and nothing invalidated the cache: a
+        // device may run the function of before once more. The fetch is reported, at its address.
+        let window = crate::memmap::FLASH_IBUS_BASE;
+        assert_eq!(
+            m.drain_diagnostics(),
+            vec![Diagnostic::StaleFlashWindow {
+                vaddr: window,
+                page: 0,
+                pc: window,
+            }]
+        );
+        assert_eq!(
+            (
+                bus_word(&mut m, SRAM_DBUS_BASE),
+                bus_word(&mut m, SRAM_DBUS_BASE + 4)
+            ),
+            (3, 1),
+            "the second call runs what the flash holds now"
+        );
+    }
+
+    #[test]
+    fn code_decoded_from_the_flash_is_decoded_again_once_the_flash_is_erased() {
+        // After the erase the function is `FF FF FF FF`, which is no instruction: the second
+        // call must fault there. Code kept decoded would return 3 a second time.
+        let mut m = calls_flash_code_around(&flash_erase_sector(0));
+        m.run_until(Cycles(600));
+        let exceptions: Vec<(Exception, u32)> = m
+            .drain_diagnostics()
+            .into_iter()
+            .filter_map(|diagnostic| match diagnostic {
+                Diagnostic::Exception { cause, pc, .. } => Some((cause, pc)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exceptions.first(),
+            Some(&(Exception::IllegalInstr, crate::memmap::FLASH_IBUS_BASE)),
+            "{exceptions:?}"
+        );
+        assert_eq!(
+            (
+                bus_word(&mut m, SRAM_DBUS_BASE),
+                bus_word(&mut m, SRAM_DBUS_BASE + 4)
+            ),
+            (3, 0),
+            "the first call returned 3; the second never returned"
+        );
+    }
+
+    #[test]
+    fn flash_code_run_again_after_an_invalidation_counts_as_read_again_for_a_later_program() {
+        use cpu_rv32::asm::jalr;
+        const A0: u8 = 10;
+        const RA: u8 = 1;
+        const T2: u8 = 7;
+        const S0: u8 = 8;
+        let window = crate::memmap::FLASH_IBUS_BASE;
+        let extmem = |register| svd_regs::esp32c3::addr("EXTMEM", register);
+        // `Cache_Invalidate_ICache_All`: `ICACHE_SYNC_ADDR` and `ICACHE_SYNC_SIZE` hold 0 from
+        // reset, so the request is for every line (CM §4.1).
+        let everything = store_register(extmem("ICACHE_SYNC_CTRL"), 1).to_vec();
+        // `Cache_Invalidate_Addr(0x42000000, 0x10000)`: the `0x800` lines of the one entry that
+        // maps the function (CM §4.1).
+        let the_entry: Vec<u32> = [
+            store_register(extmem("ICACHE_SYNC_ADDR"), window),
+            store_register(extmem("ICACHE_SYNC_SIZE"), 0x800),
+            store_register(extmem("ICACHE_SYNC_CTRL"), 1),
+        ]
+        .concat();
+        // A program only clears bits: `li a0, 3` becomes `li a0, 1`.
+        let patch = flash_program(0, &addi(A0, 0, 1).to_le_bytes());
+        let results =
+            |m: &mut Esp32C3| [0, 8, 4].map(|offset| bus_word(m, SRAM_DBUS_BASE + offset));
+
+        for (request, invalidate) in [("everything", everything), ("the entry", the_entry)] {
+            // The function is called, the cache is invalidated, the function is called again,
+            // then programmed, then called. On a device the second call fills the line again
+            // and nothing drops it before the third: the third may run the function of before.
+            // The emulator must not have run the second call from the code it kept decoded,
+            // without the cache state seeing it.
+            let mut between = invalidate.clone();
+            between.extend([jalr(RA, T2, 0), sw(A0, S0, 8)]);
+            between.extend_from_slice(&patch);
+            let mut m = calls_flash_code_around(&between);
+            m.run_until(Cycles(800));
+            assert_eq!(
+                m.drain_diagnostics(),
+                vec![Diagnostic::StaleFlashWindow {
+                    vaddr: window,
+                    page: 0,
+                    pc: window,
+                }],
+                "{request}"
+            );
+            assert_eq!(results(&mut m), [3, 3, 1], "{request}");
+
+            // The control: without the call in between, no line holds the function when it
+            // is programmed, and the call after it reads the flash on a device too.
+            let mut between = invalidate;
+            between.extend_from_slice(&patch);
+            let mut m = calls_flash_code_around(&between);
+            m.run_until(Cycles(800));
+            assert_eq!(m.drain_diagnostics(), Vec::new(), "{request}");
+            assert_eq!(results(&mut m), [3, 0, 1], "{request}");
+        }
     }
 
     /// Where the tests that take traps put their vector table: a page boundary, which `lui` can
@@ -2621,9 +2956,12 @@ mod tests {
         body.extend(store_register(reg("TIMG1", "WDTCONFIG0"), 0x8020_0000));
         body.push(HANG);
         // On a thread with a limit: if the delivery pass were not bounded the loop would never
-        // leave one instruction, and nothing in the run could stop it.
+        // leave one instruction, and nothing in the run could stop it. The limit only turns a
+        // hang into a failure, so it is wide: the test takes about 1.3 s instrumented by
+        // `cargo llvm-cov` beside a release build and 16 spinning processes on 16 cores, and the
+        // limit is ten minutes, under the timeout of the CI job that runs it.
         let (calls, resets, now) = within(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_mins(10),
             "the run did not return: a delivery pass is not bounded",
             move || {
                 let mut m = machine(&body);

@@ -1,5 +1,7 @@
 //! What the emulator has to tell the user about the run: accesses it does not model, CPU
 //! exceptions, resets.
+use crate::flash::{FlashFrame, FlashRefusal};
+use crate::periph::mmu::MMU_PAGE_BYTES;
 use crate::reset::ResetCause;
 use cpu_rv32::Exception;
 use std::collections::BTreeMap;
@@ -18,9 +20,20 @@ pub enum Direction {
 /// An operation the emulator cannot perform faithfully: it is reported, and `--strict-mmio` stops on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unsupported {
-    /// An SPI flash command the flash model does not implement: a program, an erase, a data read,
-    /// or an opcode it does not know (D3).
+    /// An SPI flash command whose opcode the flash model does not implement.
     FlashCommand { opcode: u8 },
+    /// A flash command the model knows, in a frame it does not: see
+    /// [`FlashRefusal::Form`](crate::flash::FlashRefusal::Form).
+    FlashCommandForm {
+        opcode: u8,
+        address_bits: u32,
+        dummy_cycles: u32,
+        data_bytes: u32,
+    },
+    /// A flash command that addresses a byte past the end of the chip.
+    FlashRange { opcode: u8, address: u32, len: u32 },
+    /// A program or an erase while a block-protect bit of the flash status register is set.
+    FlashProtected { opcode: u8, status: u8 },
     /// An SPI1 user transfer whose command phase is not the 8-bit one the controller model
     /// implements: no command phase at all (`None`), or a command of `command_bits` bits.
     FlashTransfer {
@@ -28,6 +41,20 @@ pub enum Unsupported {
         user: u32,
         user2: u32,
     },
+    /// An SPI1 transfer whose data phase the controller model cannot carry: more than the 512 bits
+    /// `W0..W15` hold, or a number of bits that is not a whole number of bytes. `mosi_bits` and
+    /// `miso_bits` are the lengths asked for, 0 for a phase the transfer does not have (a phase
+    /// has 1 to 1024 bits).
+    FlashTransferLength { mosi_bits: u32, miso_bits: u32 },
+    /// A hard-wired page program (`SPI1.CMD` bit `FLASH_PP`) whose byte count, `ADDR[31:24]`, is 0
+    /// or more than the 64 bytes `W0..W15` hold; `addr` is the whole register.
+    FlashProgramLength { addr: u32 },
+    /// One write of `SPI1.CMD` with more than one command bit set; `cmd` is the value written.
+    /// Listed once for the run, with the first value: see the deduplication key.
+    FlashCommandBits { cmd: u32 },
+    /// A write of `SPI1.FLASH_SUS_CTRL` that sends a suspend or a resume, or enables the automatic
+    /// ones; `sus_ctrl` is the value written.
+    FlashSuspend { sus_ctrl: u32 },
     /// A write to `SHA.DMA_BLOCK_NUM`, `DMA_START` or `DMA_CONTINUE` (D7).
     ShaDma,
     /// A `SHA.MODE` the ESP32-C3 accelerator does not have.
@@ -47,6 +74,37 @@ pub enum Unsupported {
     UartClock { uart: u8, sclk_sel: u32 },
 }
 
+impl From<FlashRefusal> for Unsupported {
+    fn from(refusal: FlashRefusal) -> Unsupported {
+        match refusal {
+            FlashRefusal::Unmodeled { opcode } => Unsupported::FlashCommand { opcode },
+            FlashRefusal::Form {
+                opcode,
+                address_bits,
+                dummy_cycles,
+                data_bytes,
+            } => Unsupported::FlashCommandForm {
+                opcode,
+                address_bits,
+                dummy_cycles,
+                data_bytes,
+            },
+            FlashRefusal::OutOfRange {
+                opcode,
+                address,
+                len,
+            } => Unsupported::FlashRange {
+                opcode,
+                address,
+                len,
+            },
+            FlashRefusal::Protected { opcode, status } => {
+                Unsupported::FlashProtected { opcode, status }
+            }
+        }
+    }
+}
+
 impl Unsupported {
     /// The message of the diagnostic: what the instruction at `pc` asked for and why it was not
     /// done, then what the user can do.
@@ -54,7 +112,39 @@ impl Unsupported {
         match self {
             Unsupported::FlashCommand { opcode } => write!(
                 f,
-                "flash command {opcode:#04x} is not modeled (pc {pc:#010x}): only the identification and status commands of the virtual flash are modeled, so nothing was read or changed; use firmware that sends no other flash command until SPI1 data reads and flash writes are emulated"
+                "flash command {opcode:#04x} is not modeled (pc {pc:#010x}): the virtual flash knows write enable and disable (0x06, 0x04), the status read and write (0x05, 0x01), the identification (0x9f), the SFDP read (0x5a), release from power-down (0xab), resume (0x7a), the data reads (0x03, 0x0b, 0x3b, 0xbb, 0x6b, 0xeb), the page program (0x02) and the erases (0x20, 0xd8, 0x60, 0xc7), so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; use firmware that sends only these flash commands"
+            ),
+            Unsupported::FlashCommandForm {
+                opcode,
+                address_bits,
+                dummy_cycles,
+                data_bytes,
+            } => {
+                write!(
+                    f,
+                    "flash command {opcode:#04x} was sent in a form the virtual flash does not know ({address_bits} address bits, {dummy_cycles} dummy clocks, {data_bytes} bytes of data out, pc {pc:#010x}) and what a chip makes of it is not modeled, so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; "
+                )?;
+                // The chip refuses the form of a command it knows, so the command has a frame;
+                // a value built by hand for another opcode gets the general remedy.
+                match FlashFrame::of(opcode) {
+                    Some(frame) => write!(f, "send {opcode:#04x} with {frame}"),
+                    None => write!(
+                        f,
+                        "send the command with the address, the dummy clocks and the data its datasheet gives it"
+                    ),
+                }
+            }
+            Unsupported::FlashRange {
+                opcode,
+                address,
+                len,
+            } => write!(
+                f,
+                "flash command {opcode:#04x} addresses {len} bytes at {address:#08x}, past the end of the flash of the device (pc {pc:#010x}): a chip wraps there or ignores the address bits it lacks, and inkemu does not guess which, so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; keep flash accesses inside the flash size of the device profile"
+            ),
+            Unsupported::FlashProtected { opcode, status } => write!(
+                f,
+                "flash command {opcode:#04x} would program or erase while block-protect bits of the flash status register are set (status {status:#04x}, pc {pc:#010x}): which blocks they protect depends on the flash part and is not modeled, so nothing was changed; clear the block-protect bits (bits 5:2 of the status register) with a status write that keeps its other bits, before the program or the erase"
             ),
             Unsupported::FlashTransfer {
                 command_bits,
@@ -71,6 +161,26 @@ impl Unsupported {
                     " (USER {user:#010x}, USER2 {user2:#010x}, pc {pc:#010x}) but only transfers with an 8-bit command are modeled, so nothing was sent to the flash; use firmware whose flash commands are 8 bits long until other transfers are emulated"
                 )
             }
+            Unsupported::FlashTransferLength {
+                mosi_bits,
+                miso_bits,
+            } => write!(
+                f,
+                "SPI1 was asked for a flash transfer with a data phase of {mosi_bits} bits out and {miso_bits} bits in (pc {pc:#010x}) but only whole bytes are modeled, 64 at most, what W0..W15 hold, so nothing was sent to the flash and SPI1.W0..W15 keep the bytes they held; give MOSI_DLEN and MISO_DLEN the value 8 × bytes − 1 for 1 to 64 bytes"
+            ),
+            Unsupported::FlashProgramLength { addr } => write!(
+                f,
+                "SPI1 was asked to program {len} bytes with one FLASH_PP command (ADDR {addr:#010x}, pc {pc:#010x}) but one command carries 1 to 64 bytes, what W0..W15 hold, so nothing was sent to the flash; put the byte count, 1 to 64, in ADDR[31:24]",
+                len = addr >> 24
+            ),
+            Unsupported::FlashCommandBits { cmd } => write!(
+                f,
+                "SPI1.CMD was written with several command bits at once (value {cmd:#010x}, pc {pc:#010x}) and the order in which the controller would run them is not documented, so none was run; start one flash command per write of SPI1.CMD"
+            ),
+            Unsupported::FlashSuspend { sus_ctrl } => write!(
+                f,
+                "SPI1.FLASH_SUS_CTRL asks for a program/erase suspend or resume (value {sus_ctrl:#010x}, pc {pc:#010x}) but a flash operation completes at once here and is never suspended, so nothing was sent to the flash; build the firmware without flash suspend: no auto-suspend (CONFIG_SPI_FLASH_AUTO_SUSPEND=n, the ESP-IDF default) and no suspend or resume sent by software (FLASH_PES and FLASH_PER, which ESP-IDF writes only with CONFIG_SPI_FLASH_SOFTWARE_RESUME)"
+            ),
             Unsupported::ShaDma => write!(
                 f,
                 "SHA.DMA_BLOCK_NUM, DMA_START or DMA_CONTINUE was written (pc {pc:#010x}) but only the typical SHA mode is modeled, so DMA-SHA produces no digest; use firmware that hashes through SHA.START/CONTINUE until DMA-SHA is emulated"
@@ -134,6 +244,11 @@ pub enum Diagnostic {
         fault: MappingFault,
         pc: u32,
     },
+    /// A read through a flash window that a device may answer with other bytes. The emulator
+    /// reads the flash at every access; a device reads its cache, which keeps the bytes a 64 KiB
+    /// flash `page` held before SPI1 programmed or erased it, until software invalidates it
+    /// (report CM §3). The read returned the bytes the flash holds now.
+    StaleFlashWindow { vaddr: u32, page: u32, pc: u32 },
     /// A synchronous exception the CPU took. It is no error of the emulator: the firmware's trap
     /// handler runs, as on the device.
     Exception {
@@ -197,8 +312,25 @@ impl Diagnostic {
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
                 }
+                // One line for every length: each of the two can take 1024 values.
+                Unsupported::FlashTransferLength { .. } => (22, 0, 0),
+                // One line per opcode for each kind of refusal of the chip.
+                Unsupported::FlashCommandForm { opcode, .. } => (18, u32::from(opcode), 0),
+                Unsupported::FlashRange { opcode, .. } => (19, u32::from(opcode), 0),
+                Unsupported::FlashProtected { opcode, .. } => (20, u32::from(opcode), 0),
+                // One line per byte count, and one line each for suspend requests and for writes
+                // of several command bits: the 14 command bits alone make four times more sets
+                // than the table has entries, and the bits below them are no command at all. A
+                // key holds nothing the firmware can vary further than a byte: a firmware that
+                // is refused in a loop with other values each time must not fill the table and
+                // so hide every later diagnostic of the run.
+                Unsupported::FlashProgramLength { addr } => (15, addr >> 24, 0),
+                Unsupported::FlashCommandBits { .. } => (16, 0, 0),
+                Unsupported::FlashSuspend { .. } => (17, 0, 0),
             },
             Diagnostic::FlashMapping { entry, fault, .. } => (10, entry, fault as u32),
+            // One line per flash page: the firmware reads the page again at many addresses.
+            Diagnostic::StaleFlashWindow { page, .. } => (21, page, 0),
             Diagnostic::Reset { cause, pc, .. } => (14, pc, cause.code()),
         }
     }
@@ -212,6 +344,7 @@ impl Diagnostic {
                 | Diagnostic::SubWordWrite { .. }
                 | Diagnostic::Unsupported { .. }
                 | Diagnostic::FlashMapping { .. }
+                | Diagnostic::StaleFlashWindow { .. }
         )
     }
 }
@@ -272,6 +405,15 @@ impl fmt::Display for Diagnostic {
                     "access to the flash window at {vaddr:#010x} through MMU entry {entry} (content {content:#05x}, pc {pc:#010x}), which names a page beyond the end of the flash: 0 was returned; check the flash size of the device profile"
                 ),
             },
+            Diagnostic::StaleFlashWindow { vaddr, page, pc } => {
+                // 64 bits: `page` is a number the firmware chose through an MMU entry.
+                let start = u64::from(page) * u64::from(MMU_PAGE_BYTES);
+                let end = start + u64::from(MMU_PAGE_BYTES) - 1;
+                write!(
+                    f,
+                    "read of the flash window at {vaddr:#010x} (pc {pc:#010x}) may differ from the device: flash {start:#08x} to {end:#08x} was read through a window, then programmed or erased, and the cache was not invalidated for it since; the bytes the flash holds now were returned, where a device may still return those of before; invalidate the cache at the window addresses that map that flash after the write, as ESP-IDF's esp_flash and esp_partition functions do for mapped flash"
+                )
+            }
             Diagnostic::Exception {
                 cause,
                 tval,
@@ -348,7 +490,8 @@ impl Diagnostics {
     }
 
     /// In strict mode, the first violation; `None` otherwise or once taken. A violation is the first
-    /// unmodeled access, sub-word register write, unsupported operation or invalid flash mapping.
+    /// unmodeled access, sub-word register write, unsupported operation, invalid flash mapping or
+    /// window read that may differ from the device.
     pub fn take_violation(&mut self) -> Option<Diagnostic> {
         self.violation.take()
     }
@@ -548,6 +691,56 @@ mod tests {
         }
     }
 
+    /// The three refusals of the flash chip that are not an unknown opcode.
+    const FORM: Unsupported = Unsupported::FlashCommandForm {
+        opcode: 0x02,
+        address_bits: 32,
+        dummy_cycles: 0,
+        data_bytes: 4,
+    };
+    const RANGE: Unsupported = Unsupported::FlashRange {
+        opcode: 0x20,
+        address: 0x10_0000,
+        len: 0x1000,
+    };
+    const PROTECTED: Unsupported = Unsupported::FlashProtected {
+        opcode: 0xD8,
+        status: 0x3E,
+    };
+
+    #[test]
+    fn a_refusal_of_the_flash_chip_becomes_the_unsupported_operation_of_the_same_kind() {
+        use crate::flash::FlashRefusal;
+        assert_eq!(
+            Unsupported::from(FlashRefusal::Unmodeled { opcode: 0x35 }),
+            Unsupported::FlashCommand { opcode: 0x35 }
+        );
+        assert_eq!(
+            Unsupported::from(FlashRefusal::Form {
+                opcode: 0x02,
+                address_bits: 32,
+                dummy_cycles: 0,
+                data_bytes: 4
+            }),
+            FORM
+        );
+        assert_eq!(
+            Unsupported::from(FlashRefusal::OutOfRange {
+                opcode: 0x20,
+                address: 0x10_0000,
+                len: 0x1000
+            }),
+            RANGE
+        );
+        assert_eq!(
+            Unsupported::from(FlashRefusal::Protected {
+                opcode: 0xD8,
+                status: 0x3E
+            }),
+            PROTECTED
+        );
+    }
+
     #[test]
     fn strict_mode_stops_on_the_events_that_cannot_be_right_silently() {
         for diagnostic in [
@@ -566,8 +759,23 @@ mod tests {
                 uart: 1,
                 sclk_sel: 2,
             }),
+            unsupported(Unsupported::FlashProgramLength { addr: 0x4100_9000 }),
+            unsupported(Unsupported::FlashCommandBits { cmd: 0x0300_0000 }),
+            unsupported(Unsupported::FlashSuspend { sus_ctrl: 0x20 }),
+            unsupported(Unsupported::FlashTransferLength {
+                mosi_bits: 9,
+                miso_bits: 0,
+            }),
+            unsupported(FORM),
+            unsupported(RANGE),
+            unsupported(PROTECTED),
             mapping(3, MappingFault::InvalidEntry),
             mapping(3, MappingFault::BeyondFlash),
+            Diagnostic::StaleFlashWindow {
+                vaddr: 0x3C00_E000,
+                page: 0,
+                pc: 0x4038_0000,
+            },
         ] {
             let mut strict = Diagnostics::new(true);
             strict.record(diagnostic.clone());
@@ -704,6 +912,153 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_of_the_flash_is_listed_once_per_what_it_is_about_whatever_its_numbers() {
+        // Each row: a refusal, the same one with every other number changed (one entry with the
+        // first), and one that is about something else (another entry), or `None` when the kind
+        // has a single line.
+        let form = |opcode, address_bits, dummy_cycles, data_bytes| Unsupported::FlashCommandForm {
+            opcode,
+            address_bits,
+            dummy_cycles,
+            data_bytes,
+        };
+        let range = |opcode, address, len| Unsupported::FlashRange {
+            opcode,
+            address,
+            len,
+        };
+        let protected = |opcode, status| Unsupported::FlashProtected { opcode, status };
+        let length = |mosi_bits, miso_bits| Unsupported::FlashTransferLength {
+            mosi_bits,
+            miso_bits,
+        };
+        let rows: [(Unsupported, Unsupported, Option<Unsupported>); 7] = [
+            // A firmware that retries a read at another address, with another length.
+            (
+                range(0xBB, 0x10_0000, 64),
+                range(0xBB, 0xFF_FFC0, 4),
+                Some(range(0x20, 0x10_0000, 64)),
+            ),
+            (
+                form(0xBB, 24, 8, 0),
+                form(0xBB, 32, 6, 3),
+                Some(form(0x02, 24, 8, 0)),
+            ),
+            (
+                protected(0x02, 0x3E),
+                protected(0x02, 0x06),
+                Some(protected(0xD8, 0x3E)),
+            ),
+            // 65 bytes at two addresses, then 66 bytes.
+            (
+                Unsupported::FlashProgramLength { addr: 0x4100_9000 },
+                Unsupported::FlashProgramLength { addr: 0x41FF_F000 },
+                Some(Unsupported::FlashProgramLength { addr: 0x4200_9000 }),
+            ),
+            (
+                Unsupported::FlashSuspend { sus_ctrl: 0x20 },
+                Unsupported::FlashSuspend {
+                    sus_ctrl: 0x0A00_0013,
+                },
+                None,
+            ),
+            // Two other command bits, and other bits below them.
+            (
+                Unsupported::FlashCommandBits { cmd: 0x0300_0000 },
+                Unsupported::FlashCommandBits { cmd: 0xC004_1234 },
+                None,
+            ),
+            (length(9, 0), length(0, 1024), None),
+        ];
+        for (first, same, other) in rows {
+            let mut d = Diagnostics::new(false);
+            d.record(unsupported(first));
+            d.record(Diagnostic::Unsupported {
+                what: same,
+                pc: 0x4200_0000,
+            });
+            assert_eq!(
+                d.drain(),
+                vec![unsupported(first)],
+                "{first:?} and {same:?}"
+            );
+            assert_eq!(d.occurrences(&unsupported(same)), 2, "{same:?}");
+            if let Some(other) = other {
+                d.record(unsupported(other));
+                assert_eq!(d.drain(), vec![unsupported(other)], "{other:?}");
+                assert_eq!(d.occurrences(&unsupported(first)), 2, "{first:?}");
+            }
+        }
+    }
+
+    /// The most entries the refusals of the flash can make, all kinds together: an opcode for
+    /// each of the four refusals of the chip, a byte count for a program length, a command
+    /// length (none, or 1 to 16 bits) for a transfer, and one line each for a data length, a
+    /// suspend request and several command bits.
+    const FLASH_REFUSAL_ENTRIES: usize = 4 * 256 + 256 + 17 + 3;
+
+    #[test]
+    fn no_refusal_of_the_flash_can_fill_the_table_whatever_values_the_firmware_writes() {
+        const {
+            assert!(FLASH_REFUSAL_ENTRIES < MAX_DISTINCT_DIAGNOSTICS / 2);
+        }
+        let mut d = Diagnostics::new(false);
+        let mut numbers = crate::test_support::Lcg::new(0x5EED);
+        for _ in 0..40_000 {
+            let n = &mut numbers;
+            let refusals = [
+                Unsupported::FlashCommand {
+                    opcode: n.next_u8(),
+                },
+                Unsupported::FlashCommandForm {
+                    opcode: n.next_u8(),
+                    address_bits: n.next_u32(),
+                    dummy_cycles: n.next_u32(),
+                    data_bytes: n.next_u32(),
+                },
+                Unsupported::FlashRange {
+                    opcode: n.next_u8(),
+                    address: n.next_u32(),
+                    len: n.next_u32(),
+                },
+                Unsupported::FlashProtected {
+                    opcode: n.next_u8(),
+                    status: n.next_u8(),
+                },
+                // `USER2[31:28]` plus one: a command phase has 1 to 16 bits, or does not exist.
+                Unsupported::FlashTransfer {
+                    command_bits: Some(n.below(17)).filter(|&bits| bits != 0),
+                    user: n.next_u32(),
+                    user2: n.next_u32(),
+                },
+                Unsupported::FlashTransferLength {
+                    mosi_bits: n.below(1025),
+                    miso_bits: n.below(1025),
+                },
+                Unsupported::FlashProgramLength { addr: n.next_u32() },
+                Unsupported::FlashCommandBits { cmd: n.next_u32() },
+                Unsupported::FlashSuspend {
+                    sus_ctrl: n.next_u32(),
+                },
+            ];
+            for what in refusals {
+                let pc = n.next_u32();
+                d.record(Diagnostic::Unsupported { what, pc });
+            }
+        }
+        assert_eq!(
+            d.distinct(),
+            FLASH_REFUSAL_ENTRIES,
+            "360,000 refusals with distinct numbers: every entry there can be, and no more"
+        );
+        assert_eq!(d.suppressed(), 0);
+        assert!(!d.drain().contains(&Diagnostic::Suppressed));
+        // Whatever comes next is still listed.
+        d.record(read_at(0x6001_9000, 0));
+        assert_eq!(d.drain(), vec![read_at(0x6001_9000, 0)]);
+    }
+
+    #[test]
     fn new_messages_state_the_cause_then_the_remedy() {
         let texts = [
             (
@@ -732,6 +1087,37 @@ mod tests {
                 }),
                 "UART1 sent a byte with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = 2",
             ),
+            (
+                unsupported(Unsupported::FlashProgramLength { addr: 0x4100_9000 }),
+                "program 65 bytes with one FLASH_PP command (ADDR 0x41009000",
+            ),
+            (
+                unsupported(Unsupported::FlashCommandBits { cmd: 0x0300_0000 }),
+                "several command bits at once (value 0x03000000",
+            ),
+            (
+                unsupported(Unsupported::FlashSuspend { sus_ctrl: 0x20 }),
+                "program/erase suspend or resume (value 0x00000020",
+            ),
+            (
+                unsupported(Unsupported::FlashTransferLength {
+                    mosi_bits: 9,
+                    miso_bits: 1024,
+                }),
+                "a data phase of 9 bits out and 1024 bits in (pc 0x40381000) but only whole bytes are modeled, 64 at most, what W0..W15 hold, so nothing was sent to the flash and SPI1.W0..W15 keep the bytes they held; give MOSI_DLEN and MISO_DLEN the value 8 × bytes − 1",
+            ),
+            (
+                unsupported(FORM),
+                "flash command 0x02 was sent in a form the virtual flash does not know (32 address bits, 0 dummy clocks, 4 bytes of data out",
+            ),
+            (
+                unsupported(RANGE),
+                "flash command 0x20 addresses 4096 bytes at 0x100000, past the end of the flash",
+            ),
+            (
+                unsupported(PROTECTED),
+                "flash command 0xd8 would program or erase while block-protect bits of the flash status register are set (status 0x3e",
+            ),
             (mapping(3, MappingFault::InvalidEntry), "MMU entry 3"),
             (
                 mapping(3, MappingFault::BeyondFlash),
@@ -751,9 +1137,9 @@ mod tests {
 
     #[test]
     fn a_refused_flash_command_is_described_truthfully_whatever_the_command_does() {
-        // The same text serves a program (0x02), an erase (0x20), a data read (0x03, 0x0B, 0xBB: how
-        // `esp_flash` reads NVS), deep power-down (0xB9) and an opcode no chip has (0x00).
-        for opcode in [0x02, 0x20, 0x03, 0x0B, 0xBB, 0xB9, 0x00] {
+        // The same text serves a 4-byte-address read (0x0C) or program (0x12), deep power-down
+        // (0xB9) and an opcode no chip has (0x00).
+        for opcode in [0x0C, 0x12, 0xB9, 0x00] {
             let text = unsupported(Unsupported::FlashCommand { opcode }).to_string();
             assert!(
                 text.contains(&format!("flash command {opcode:#04x} is not modeled")),
@@ -761,13 +1147,121 @@ mod tests {
             );
             assert!(
                 text.contains(
-                    "only the identification and status commands of the virtual flash are modeled, so nothing was read or changed"
+                    "the virtual flash knows write enable and disable (0x06, 0x04), the status read and write (0x05, 0x01), the identification (0x9f), the SFDP read (0x5a), release from power-down (0xab), resume (0x7a), the data reads (0x03, 0x0b, 0x3b, 0xbb, 0x6b, 0xeb), the page program (0x02) and the erases (0x20, 0xd8, 0x60, 0xc7), so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; use firmware that sends only these flash commands"
                 ),
                 "{text}"
             );
             assert!(
-                !text.contains("read-only") && !text.contains("program or erase"),
-                "a refused read is not a write: {text}"
+                !text.contains("read-only"),
+                "the flash is no longer read-only: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_commands_a_refusal_lists_are_the_ones_the_chip_runs_all_of_them_and_no_other() {
+        // The opcode refused is one the list cannot hold: `0xb9` is in neither.
+        let text = unsupported(Unsupported::FlashCommand { opcode: 0xB9 }).to_string();
+        let (_, list) = text.split_once("the virtual flash knows").unwrap();
+        let (list, _) = list.split_once(", so nothing").unwrap();
+        let mut listed: Vec<u8> = list
+            .split("0x")
+            .skip(1)
+            .map(|rest| u8::from_str_radix(&rest[..2], 16).unwrap())
+            .collect();
+        listed.sort_unstable();
+        let run: Vec<u8> = (0..=u8::MAX)
+            .filter(|&opcode| FlashFrame::of(opcode).is_some())
+            .collect();
+        assert_eq!(listed, run, "{list}");
+    }
+
+    #[test]
+    fn the_remedies_of_the_flash_refusals_cover_every_cause_they_are_raised_for() {
+        // A suspend request is raised for the automatic suspend and for a suspend or a resume
+        // the firmware sends itself (`FLASH_PES`, `FLASH_PER`).
+        let suspend = unsupported(Unsupported::FlashSuspend { sus_ctrl: 0b10 }).to_string();
+        assert!(
+            suspend.ends_with(
+                "so nothing was sent to the flash; build the firmware without flash suspend: no auto-suspend (CONFIG_SPI_FLASH_AUTO_SUSPEND=n, the ESP-IDF default) and no suspend or resume sent by software (FLASH_PES and FLASH_PER, which ESP-IDF writes only with CONFIG_SPI_FLASH_SOFTWARE_RESUME)"
+            ),
+            "{suspend}"
+        );
+        // The remedy of a protected write clears the bits that protect and no other: a status
+        // write of 0x00 would clear quad enable too.
+        let protected = unsupported(PROTECTED).to_string();
+        assert!(
+            protected.ends_with(
+                "so nothing was changed; clear the block-protect bits (bits 5:2 of the status register) with a status write that keeps its other bits, before the program or the erase"
+            ),
+            "{protected}"
+        );
+        assert!(!protected.contains("0x00"), "{protected}");
+        // A refused read left the data registers as they were: the firmware goes on with the
+        // bytes of an earlier transfer.
+        let range = unsupported(Unsupported::FlashRange {
+            opcode: 0xBB,
+            address: 0x10_0000,
+            len: 64,
+        })
+        .to_string();
+        assert!(
+            range.contains(
+                "so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; keep flash accesses inside the flash size of the device profile"
+            ),
+            "{range}"
+        );
+    }
+
+    #[test]
+    fn a_command_in_a_form_the_flash_does_not_know_is_told_the_frame_it_takes() {
+        let form = |opcode, address_bits, dummy_cycles, data_bytes| {
+            unsupported(Unsupported::FlashCommandForm {
+                opcode,
+                address_bits,
+                dummy_cycles,
+                data_bytes,
+            })
+            .to_string()
+        };
+        // (the refusal, what was sent, the frame to send instead)
+        let cases = [
+            (
+                form(0xBB, 24, 8, 0),
+                "(24 address bits, 8 dummy clocks, 0 bytes of data out, pc 0x40381000)",
+                "; send 0xbb with a 24-bit address, 4 dummy clocks and no data out",
+            ),
+            (
+                form(0x06, 24, 0, 3),
+                "(24 address bits, 0 dummy clocks, 3 bytes of data out, pc 0x40381000)",
+                "; send 0x06 with no address, no dummy clock and no data out",
+            ),
+            (
+                form(0x01, 0, 0, 2),
+                "(0 address bits, 0 dummy clocks, 2 bytes of data out, pc 0x40381000)",
+                "; send 0x01 with no address, no dummy clock and 1 byte of data out",
+            ),
+            (
+                form(0x02, 32, 0, 4),
+                "(32 address bits, 0 dummy clocks, 4 bytes of data out, pc 0x40381000)",
+                "; send 0x02 with a 24-bit address, no dummy clock and 1 byte of data out or more",
+            ),
+            // The chip never refuses the form of an opcode it does not know; a value built by
+            // hand still gets a message with a remedy.
+            (
+                form(0x35, 0, 0, 1),
+                "flash command 0x35 was sent in a form",
+                "; send the command with the address, the dummy clocks and the data its datasheet gives it",
+            ),
+        ];
+        for (text, sent, remedy) in cases {
+            assert!(text.contains(sent), "{text}");
+            assert!(text.ends_with(remedy), "{text}");
+            assert!(
+                text.contains(
+                    "so nothing was read or changed and SPI1.W0..W15 keep the bytes they held; "
+                ),
+                "{text}"
             );
         }
     }
@@ -910,5 +1404,38 @@ mod tests {
             listed[0]
         );
         assert_eq!(d.occurrences(&listed[0]), 2, "the second one is counted");
+    }
+
+    #[test]
+    fn a_window_read_that_may_differ_is_listed_once_per_flash_page_and_says_what_to_do() {
+        let stale = |vaddr, page| Diagnostic::StaleFlashWindow {
+            vaddr,
+            page,
+            pc: 0x4038_0000,
+        };
+        let mut d = Diagnostics::new(false);
+        d.record(stale(0x3C00_E000, 0));
+        d.record(stale(0x3C00_E004, 0));
+        d.record(stale(0x3C01_0000, 1));
+        assert_eq!(
+            d.drain(),
+            vec![stale(0x3C00_E000, 0), stale(0x3C01_0000, 1)],
+            "one line per flash page, with the first address read"
+        );
+        assert_eq!(d.occurrences(&stale(0, 0)), 2);
+        let message = stale(0x3C01_E000, 1).to_string();
+        for part in [
+            "0x3c01e000",
+            "pc 0x40380000",
+            "may differ from the device",
+            "flash 0x010000 to 0x01ffff",
+            // An invalidation takes addresses of a window, not a flash range: the remedy says
+            // which addresses.
+            "; invalidate the cache at the window addresses that map that flash",
+        ] {
+            assert!(message.contains(part), "{part:?} in {message:?}");
+        }
+        // The page is a number the firmware chose: the message of any of them can be formed.
+        assert!(stale(0, u32::MAX).to_string().contains("0xffffffffffff"));
     }
 }

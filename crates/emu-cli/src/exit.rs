@@ -11,8 +11,9 @@ pub const EXIT_STRICT_MMIO: u8 = 3;
 /// `inkemu run`: the CPU waits for an interrupt and none can come.
 pub const EXIT_IDLE: u8 = 4;
 
-/// `inkemu run`: a second Ctrl-C ended the process before the first one had ended the run. The
-/// value shells give a process ended by `SIGINT` (128 + 2).
+/// `inkemu run`: a second Ctrl-C ended the process before the run began its summary; once the
+/// summary has begun, Ctrl-C ends nothing. The value shells give a process ended by `SIGINT`
+/// (128 + 2).
 pub const EXIT_SECOND_INTERRUPT: u8 = 130;
 
 /// The exit codes of `inkemu run`, for its `--help`.
@@ -20,12 +21,17 @@ pub const RUN_EXIT_CODES_HELP: &str = "\
 Exit codes:
   0  the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was
      pressed, or the reader of standard output went away
-  2  error: unknown device, missing or invalid ROM, refused flash image, or standard output cannot be written
+  2  error: unknown device, missing or invalid ROM, refused flash image or flash file, standard
+     output cannot be written, or the flash file could not be written when the run ended (what
+     the firmware wrote to the flash is then lost)
   3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
-     emulator cannot perform faithfully, or flash that is not mapped)
+     emulator cannot perform faithfully, flash that is not mapped, or a read through a flash
+     window that may differ from the device)
   4  the CPU waits for an interrupt and none can come: no interrupt line is pending and no device
      has anything scheduled
-130  Ctrl-C was pressed a second time before the run had stopped: no summary was printed";
+130  Ctrl-C was pressed a second time before the run began its summary: no summary was printed,
+     and the flash file is the one of before. Once the summary has begun, Ctrl-C ends nothing:
+     the summary and the save of the flash file complete, with the exit code of the end of the run";
 
 #[cfg(test)]
 mod tests {
@@ -44,6 +50,18 @@ mod tests {
                 format!("\n{RUN_EXIT_CODES_HELP}").contains(&format!("\n{code:>3}  ")),
                 "{code}, the exit code of {end}, is missing from the help"
             );
+        }
+    }
+
+    #[test]
+    fn a_run_whose_flash_file_could_not_be_written_exits_2_unless_strict_mmio_stopped_it() {
+        for end in RunEnd::ALL {
+            let expected = if end == RunEnd::StrictMmio {
+                EXIT_STRICT_MMIO
+            } else {
+                EXIT_ERROR
+            };
+            assert_eq!(end.exit_code_without_its_flash(), expected, "{end:?}");
         }
     }
 

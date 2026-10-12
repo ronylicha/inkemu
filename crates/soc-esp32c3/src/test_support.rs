@@ -369,6 +369,77 @@ pub fn stop_watchdogs() -> Vec<u32> {
     program
 }
 
+/// `SPI1.CMD` bits of the hard-wired commands the two helpers below use (report FW §A.1).
+const SPI1_CMD_WREN: u32 = 1 << 30;
+const SPI1_CMD_PP: u32 = 1 << 25;
+const SPI1_CMD_SE: u32 = 1 << 24;
+
+/// Code that programs `data` (1 to 64 bytes) into the flash at `address`, the way the ROM and
+/// ESP-IDF do: write enable, the bytes in `W0..`, `ADDR = len << 24 | address`, `CMD = FLASH_PP`
+/// (reports FW §A.2, §A.3).
+#[must_use]
+pub fn flash_program(address: u32, data: &[u8]) -> Vec<u32> {
+    assert!((1..=64).contains(&data.len()), "1 to 64 bytes");
+    assert!(address < 1 << 24, "a 24-bit address");
+    let spi1 = |register| svd_regs::esp32c3::addr("SPI1", register);
+    let mut program = store_register(spi1("CMD"), SPI1_CMD_WREN).to_vec();
+    for (word, chunk) in (0u32..).zip(data.chunks(4)) {
+        let mut le = [0u8; 4];
+        le[..chunk.len()].copy_from_slice(chunk);
+        program.extend(store_register(
+            spi1("W0") + 4 * word,
+            u32::from_le_bytes(le),
+        ));
+    }
+    let len = u32::try_from(data.len()).unwrap();
+    program.extend(store_register(spi1("ADDR"), (len << 24) | address));
+    program.extend(store_register(spi1("CMD"), SPI1_CMD_PP));
+    program
+}
+
+/// Code that erases the 4 KiB flash sector holding `address`: write enable, `ADDR`,
+/// `CMD = FLASH_SE`, as ESP-IDF does (report FW §A.2).
+#[must_use]
+pub fn flash_erase_sector(address: u32) -> Vec<u32> {
+    assert!(address < 1 << 24, "a 24-bit address");
+    let spi1 = |register| svd_regs::esp32c3::addr("SPI1", register);
+    let mut program = store_register(spi1("CMD"), SPI1_CMD_WREN).to_vec();
+    program.extend(store_register(spi1("ADDR"), address));
+    program.extend(store_register(spi1("CMD"), SPI1_CMD_SE));
+    program
+}
+
+/// A fixed linear congruential generator (the constants of Knuth's MMIX): numbers for a test that
+/// wants many different inputs and the same ones at every run. No host randomness is involved.
+#[derive(Clone, Debug)]
+pub struct Lcg(u64);
+
+impl Lcg {
+    #[must_use]
+    pub const fn new(seed: u64) -> Lcg {
+        Lcg(seed)
+    }
+
+    /// The next number: the high half of the state, whose low bits have short periods.
+    pub fn next_u32(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let [.., a, b, c, d] = self.0.to_le_bytes();
+        u32::from_le_bytes([a, b, c, d])
+    }
+
+    pub fn next_u8(&mut self) -> u8 {
+        self.next_u32().to_le_bytes()[3]
+    }
+
+    /// A number below `bound`, which is not 0.
+    pub fn below(&mut self, bound: u32) -> u32 {
+        self.next_u32() % bound
+    }
+}
+
 /// Runs `work` on its own thread and waits at most `limit` for its result: a test of a loop that
 /// must end, which would otherwise hang the whole suite if the loop did not. On a timeout the
 /// test fails with `unbounded`; the thread is left to spin until the test process ends. A panic of

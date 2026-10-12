@@ -1,17 +1,26 @@
-//! The milestones of plans SP1b-2 and SP1b-3a on the reference firmware (ESP-IDF v5.5.2 bootloader +
-//! `hello_world`): the boot, then the whole life of the application, its restart and a second boot.
-//! `INKEMU_ROM_ELF_DIR=<dir> INKEMU_REF_FLASH=<flash_hello.bin> cargo test -p soc-esp32c3 --test reference_boot -- --ignored`
-//! Build the image with `tools/reference-firmware/build.sh`.
+//! The milestones of plans SP1b-2, SP1b-3a and SP1b-3b on the reference firmware, three images
+//! behind the same ESP-IDF v5.5.2 bootloader:
+//! - `hello_world`: the boot, then the whole life of the application, its restart and a second
+//!   boot;
+//! - `nvs_rw_value_cxx`, which keeps a restart counter in NVS: three lives and the flash writes
+//!   of each, behind its own partition table and behind the stock table of the X4, where the
+//!   bootloader writes `otadata` first.
+//!
+//! Each image is named by its own variable, and a test whose variable is missing fails by naming
+//! it. The whole suite:
+//! `INKEMU_ROM_ELF_DIR=<dir> INKEMU_REF_FLASH=<flash_hello.bin> INKEMU_NVS_FLASH=<flash_nvs.bin> INKEMU_NVS_OTA_FLASH=<flash_nvs_ota.bin> cargo test --release -p soc-esp32c3 --test reference_boot -- --ignored`
+//! Build the three images with `tools/reference-firmware/build.sh`, which prints their paths.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
 
 mod common;
 
 use emu_core::Cycles;
 use sha2::{Digest, Sha256};
-use soc_esp32c3::diag::Unsupported;
-use soc_esp32c3::memmap::{ROM_BASE, ROM_SIZE, SRAM_DBUS_BASE, SRAM_SIZE};
+use soc_esp32c3::memmap::{SRAM_DBUS_BASE, SRAM_SIZE};
 use soc_esp32c3::reset::ResetCause;
-use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason};
+use soc_esp32c3::{
+    ConsoleChannel, Diagnostic, Esp32C3, FlashWrite, RomImage, SocConfig, StopReason,
+};
 
 /// SHA-256 of the merged reference image (`docs/research/sp1b-test-oracle.md`, §2).
 const REFERENCE_SHA256: &str = "fc05ef5dbe85372e1da52abdec3bfcbbb110738a60163734666095fcd8c39bf2";
@@ -128,8 +137,8 @@ const SECOND_NS: u64 = 1_000_000_000;
 const X4_STOCK_TABLE: &[u8] = include_bytes!("../../../tests/fixtures/partitions/x4-stock.bin");
 /// Flash offset of the partition table (ESP-IDF default, `CONFIG_PARTITION_TABLE_OFFSET`).
 const PARTITION_TABLE_OFFSET: usize = 0x8000;
-/// The instruction-bus addresses of the mask ROM (report BC §A.1).
-const MASK_ROM: std::ops::Range<u32> = ROM_BASE..ROM_BASE + ROM_SIZE;
+/// Flash offset of the `otadata` partition in the stock X4 table, and of its first entry.
+const OTADATA_OFFSET: u32 = 0xE000;
 
 /// The ESP32-C3 (rev 3) mask ROM named by `INKEMU_ROM_ELF_DIR`; every failure says why and what to do.
 fn rom() -> RomImage {
@@ -157,9 +166,15 @@ fn rom() -> RomImage {
 /// every test boots it, so a wrong image fails here with its real cause instead of as a
 /// golden-log difference.
 fn reference_flash() -> Vec<u8> {
-    let path = std::env::var("INKEMU_REF_FLASH").unwrap_or_else(|e| {
+    pinned_image("INKEMU_REF_FLASH", "flash_hello.bin", REFERENCE_SHA256)
+}
+
+/// The image `file` of `tools/reference-firmware/build.sh`, named by the environment variable
+/// `variable` and accepted only if its SHA-256 is `sha256`.
+fn pinned_image(variable: &str, file: &str, sha256: &str) -> Vec<u8> {
+    let path = std::env::var(variable).unwrap_or_else(|e| {
         panic!(
-            "INKEMU_REF_FLASH is not usable ({e}); build the image with `tools/reference-firmware/build.sh` and set the variable to the flash_hello.bin it prints"
+            "{variable} is not usable ({e}); build the image with `tools/reference-firmware/build.sh` and set the variable to the {file} it prints"
         )
     });
     let image = std::fs::read(&path).unwrap_or_else(|e| {
@@ -169,8 +184,8 @@ fn reference_flash() -> Vec<u8> {
     });
     let digest = common::hex(&Sha256::digest(&image));
     assert_eq!(
-        digest, REFERENCE_SHA256,
-        "{path} is not the pinned reference image; rebuild it with `tools/reference-firmware/build.sh`, which verifies the pins"
+        digest, sha256,
+        "{path} is not the pinned {file}; rebuild it with `tools/reference-firmware/build.sh`, which verifies the pins"
     );
     image
 }
@@ -188,6 +203,13 @@ fn mask_timestamp(line: &str) -> String {
 struct Run {
     console: String,
     diagnostics: Vec<Diagnostic>,
+    /// Every program, erase and status write the flash chip performed, in order.
+    flash_writes: Vec<FlashWrite>,
+    /// The whole content of the flash when the run ended.
+    flash: Vec<u8>,
+    flash_modified_sectors: u32,
+    /// How many flash commands of each opcode were sent to the chip, indexed by opcode.
+    flash_commands: Vec<u64>,
     stop: StopReason,
     trace_hash: Option<u64>,
     resets: u64,
@@ -234,6 +256,7 @@ fn run(config: SocConfig, done: impl Fn(&str) -> bool) -> Run {
 fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic]) -> bool) -> Run {
     let mut machine = Esp32C3::with_flash(rom(), image, &config).unwrap();
     let (mut uart0, mut diagnostics) = (Vec::new(), Vec::new());
+    let mut flash_writes = Vec::new();
     let mut stop = StopReason::CycleBudget;
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
     // `Asleep` is the CPU waiting for its next interrupt: device time goes on, the run too.
@@ -246,7 +269,13 @@ fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic
         uart0.extend(machine.take_console(ConsoleChannel::Uart0));
         let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
         diagnostics.extend(machine.drain_diagnostics());
+        flash_writes.extend(machine.take_flash_writes());
     }
+    assert_eq!(
+        machine.flash_writes_dropped(),
+        0,
+        "the journal was taken at every slice: it never filled"
+    );
     assert!(
         machine.device_time_nanos() < DEVICE_TIME_BUDGET_NS || done(&text(&uart0), &diagnostics),
         "device time ran out ({} ns) after {} CPU cycles before the run was done: the CPU sleeps and nothing wakes it?\nconsole:\n{}",
@@ -259,6 +288,12 @@ fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic
     Run {
         console: text(&uart0),
         diagnostics,
+        flash_writes,
+        flash: machine.flash_contents(),
+        flash_modified_sectors: machine.flash_modified_sectors(),
+        flash_commands: (0..=u8::MAX)
+            .map(|opcode| machine.flash_commands_sent(opcode))
+            .collect(),
         stop,
         trace_hash: machine.trace_hash(),
         resets: machine.resets(),
@@ -458,69 +493,132 @@ fn reference_image_behind_the_stock_x4_table() -> Vec<u8> {
     image
 }
 
-/// Spec §5.1: "Reset → ROM → bootloader → table de partitions → `otadata` → application". The
-/// reference image has a factory application; the target device has none. Behind the stock X4
-/// table the unmodified bootloader finds a blank `otadata`, falls back to OTA slot 0 and records
-/// that choice: the mask ROM's sector-erase and page-program functions run. The flash is still
-/// read-only (plan SP1b-3b makes it writable), so both are refused, each once and by its own
-/// opcode, and nothing else is reported before the application says hello.
-#[test]
-#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
-fn the_stock_x4_ota_layout_boots_and_only_the_otadata_update_is_refused() {
-    let boot = run_image(
-        reference_image_behind_the_stock_x4_table(),
-        SocConfig::default(),
-        |console, _| console.contains("Hello world!\n"),
+/// The `otadata` entry the bootloader writes on the first boot of an OTA layout (report FW §E,
+/// first row): sequence 1, a blank label, state valid (2), CRC.
+fn the_otadata_entry() -> Vec<u8> {
+    let mut entry = vec![0xFF; 32];
+    entry[..4].copy_from_slice(&[1, 0, 0, 0]);
+    entry[24..28].copy_from_slice(&[2, 0, 0, 0]);
+    entry[28..].copy_from_slice(&[0x9A, 0x98, 0x43, 0x47]);
+    entry
+}
+
+/// What the first boot of an OTA layout with a blank `otadata` writes (report FW §E, first row;
+/// SF §B.1): one sector erase, then one program of the entry.
+fn the_otadata_update() -> [FlashWrite; 2] {
+    [
+        FlashWrite::Erase {
+            start: OTADATA_OFFSET,
+            len: 0x1000,
+        },
+        FlashWrite::Program {
+            address: OTADATA_OFFSET,
+            data: the_otadata_entry(),
+        },
+    ]
+}
+
+/// Asserts that the first `otadata` sector of `flash`, the content of the chip when a run ended,
+/// holds the entry of [`the_otadata_entry`] and erased bytes after it: what the chip holds, not
+/// what it was asked to do.
+fn assert_otadata_holds_the_entry_and_nothing_else(flash: &[u8]) {
+    let entry = the_otadata_entry();
+    let sector = OTADATA_OFFSET as usize;
+    assert_eq!(
+        flash[sector..sector + entry.len()],
+        entry[..],
+        "the entry, as measured (FW §E)"
     );
-    assert!(
-        boot.console.starts_with(ROM_LINES),
-        "ROM part:\n{}",
-        boot.console
+    let rest = &flash[sector + entry.len()..sector + 0x1000];
+    assert_eq!(
+        rest.iter().position(|&byte| byte != 0xFF),
+        None,
+        "the rest of the sector is erased"
     );
-    let lines: Vec<String> = boot.console.lines().map(mask_timestamp).collect();
+}
+
+/// Asserts that `expected` are lines of `console`, in that order.
+fn assert_lines_in_order(console: &str, expected: &[&str]) {
+    let lines: Vec<String> = console.lines().map(mask_timestamp).collect();
     let mut from = 0;
-    for expected in [
-        "I (#) boot: No factory image, trying OTA 0",
-        "I (#) boot: Loaded app from partition at offset 0x10000",
-        "I (#) boot: Set actual ota_seq=1 in otadata[0]",
-        FIRST_APPLICATION_LINE,
-        "Hello world!",
-    ] {
+    for expected in expected {
         let at = lines[from..]
             .iter()
             .position(|line| line == expected)
             .unwrap_or_else(|| panic!("`{expected}` is missing, or out of order:\n{lines:#?}"));
         from += at + 1;
     }
-    let reported: Vec<(Unsupported, bool)> = boot
-        .diagnostics
-        .iter()
-        .map(|diagnostic| match diagnostic {
-            Diagnostic::Unsupported { what, pc } => (*what, MASK_ROM.contains(pc)),
-            other => panic!("unexpected diagnostic: {other}"),
-        })
-        .collect();
-    assert_eq!(
-        reported,
-        [
-            (Unsupported::FlashCommand { opcode: 0x20 }, true),
-            (Unsupported::FlashCommand { opcode: 0x02 }, true),
-        ],
-        "exactly the sector erase and the page program of the otadata update, each run by the mask ROM"
+}
+
+/// How many lines of `console` are `line`, timestamps masked.
+fn count_lines(console: &str, line: &str) -> usize {
+    console
+        .lines()
+        .map(mask_timestamp)
+        .filter(|found| found == line)
+        .count()
+}
+
+const NO_FACTORY_IMAGE: &str = "I (#) boot: No factory image, trying OTA 0";
+const OTADATA_SET: &str = "I (#) boot: Set actual ota_seq=1 in otadata[0]";
+
+/// Spec §5.1: "Reset → ROM → bootloader → table de partitions → `otadata` → application". The
+/// reference image has a factory application; the target device has none. Behind the stock X4
+/// table the unmodified bootloader finds a blank `otadata`, falls back to OTA slot 0 and records
+/// that choice with the mask ROM's sector erase and page program. The chip takes both: the
+/// operations are counted, the bytes are the measured ones, and the second boot, which reads
+/// `otadata` through the cache window, finds the entry valid and writes nothing.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn the_stock_x4_ota_layout_boots_and_writes_otadata_on_its_first_boot_only() {
+    let life = run_image(
+        reference_image_behind_the_stock_x4_table(),
+        SocConfig::default(),
+        |console, _| application_starts(console) == 2,
     );
     assert!(
-        matches!(boot.stop, StopReason::CycleBudget | StopReason::Asleep),
+        life.console.starts_with(ROM_LINES),
+        "ROM part:\n{}",
+        life.console
+    );
+    assert_lines_in_order(
+        &life.console,
+        &[
+            NO_FACTORY_IMAGE,
+            "I (#) boot: Loaded app from partition at offset 0x10000",
+            OTADATA_SET,
+            FIRST_APPLICATION_LINE,
+            "Hello world!",
+            "Restarting now.",
+            "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)",
+            "I (#) boot: Loaded app from partition at offset 0x10000",
+            FIRST_APPLICATION_LINE,
+        ],
+    );
+    // SF §B.3: both lines are printed on the first boot only. A second boot that printed them
+    // again would not have read back what the first one wrote.
+    assert_eq!(count_lines(&life.console, NO_FACTORY_IMAGE), 1);
+    assert_eq!(count_lines(&life.console, OTADATA_SET), 1);
+    assert_eq!(
+        life.flash_writes,
+        the_otadata_update(),
+        "two boots, one erase and one program: the update of the first boot"
+    );
+    assert_otadata_holds_the_entry_and_nothing_else(&life.flash);
+    assert_eq!(life.flash_modified_sectors, 1, "the otadata sector");
+    assert_only_the_restart_is_reported(&life.diagnostics);
+    assert!(
+        matches!(life.stop, StopReason::CycleBudget | StopReason::Asleep),
         "nothing stops a lenient run: {:?}",
-        boot.stop
+        life.stop
     );
 }
 
-/// The same layout in strict mode: the run stops on the first thing the model refuses, the sector
-/// erase with which the bootloader starts its `otadata` update, and the stop names the operation
-/// and the instruction. Nothing was reported before it, and the application did not start.
+/// The same layout in strict mode: the `otadata` update is nothing the model refuses any more.
+/// The run crosses it without a stop and without a single report, and the application starts.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
-fn a_strict_run_of_the_stock_x4_ota_layout_stops_at_the_first_flash_command_it_refuses() {
+fn a_strict_run_of_the_stock_x4_ota_layout_writes_otadata_and_reaches_the_application() {
     let strict = SocConfig {
         strict_mmio: true,
         ..SocConfig::default()
@@ -530,48 +628,52 @@ fn a_strict_run_of_the_stock_x4_ota_layout_stops_at_the_first_flash_command_it_r
         strict,
         |console, _| console.contains("Hello world!\n"),
     );
-    let StopReason::StrictMmio(violation) = &boot.stop else {
-        panic!(
-            "a strict run of this layout must stop, got {:?}\nconsole:\n{}",
-            boot.stop, boot.console
-        );
-    };
-    let Diagnostic::Unsupported {
-        what: Unsupported::FlashCommand { opcode: 0x20 },
-        pc,
-    } = violation
-    else {
-        panic!("the stop is not the sector erase: {violation}");
-    };
     assert!(
-        MASK_ROM.contains(pc),
-        "the erase is run by the mask ROM: pc {pc:#010x}"
-    );
-    let text = violation.to_string();
-    assert!(
-        text.contains("flash command 0x20 is not modeled") && text.contains(&format!("{pc:#010x}")),
-        "the stop names the operation and the instruction: {text}"
-    );
-    assert_eq!(
-        boot.diagnostics,
-        std::slice::from_ref(violation),
-        "nothing was reported before the stop, and the stop is in the journal once"
-    );
-    assert!(
-        boot.console
-            .lines()
-            .map(mask_timestamp)
-            .any(|line| line == "I (#) boot: No factory image, trying OTA 0"),
-        "the bootloader had chosen the OTA slot:\n{}",
+        matches!(boot.stop, StopReason::CycleBudget | StopReason::Asleep),
+        "a strict run of this layout does not stop: {:?}\nconsole:\n{}",
+        boot.stop,
         boot.console
     );
-    assert_eq!(
-        application_starts(&boot.console),
-        0,
-        "the run stopped in the bootloader:\n{}",
-        boot.console
+    assert_eq!(boot.diagnostics, [], "nothing unmodelled, no exception");
+    assert_lines_in_order(
+        &boot.console,
+        &[
+            NO_FACTORY_IMAGE,
+            OTADATA_SET,
+            FIRST_APPLICATION_LINE,
+            "Hello world!",
+        ],
     );
+    assert_eq!(boot.flash_writes, the_otadata_update());
+    assert_otadata_holds_the_entry_and_nothing_else(&boot.flash);
     assert_eq!(boot.resets, 0);
+}
+
+/// The same layout with an `otadata` sector that is not blank. Its first entry still reads
+/// "never written" (a sequence number of `FFFFFFFF`), so the bootloader takes the same path; the
+/// rest of the sector holds zeroes, which only an erase removes. Behind a blank sector the erase
+/// of the bootloader changes nothing and nothing here could tell whether it took place; behind
+/// this one, an erase that erased nothing would leave the entry AND-ed into the zeroes.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn the_bootloader_erases_an_otadata_sector_that_is_not_blank_before_it_programs_the_entry() {
+    let mut image = reference_image_behind_the_stock_x4_table();
+    let sector = OTADATA_OFFSET as usize;
+    image[sector + 4..sector + 0x1000].fill(0x00);
+    let life = run_image(image, SocConfig::default(), |console, _| {
+        application_starts(console) == 2
+    });
+    assert_eq!(
+        count_lines(&life.console, NO_FACTORY_IMAGE),
+        1,
+        "the first boot finds no valid entry, the second finds the one the first wrote:\n{}",
+        life.console
+    );
+    assert_eq!(count_lines(&life.console, OTADATA_SET), 1);
+    assert_eq!(life.flash_writes, the_otadata_update());
+    assert_otadata_holds_the_entry_and_nothing_else(&life.flash);
+    assert_eq!(life.flash_modified_sectors, 1, "the otadata sector");
+    assert_only_the_restart_is_reported(&life.diagnostics);
 }
 
 /// Milestone point 6: two runs of a whole life cycle, the reset included, are the same run.
@@ -601,4 +703,355 @@ fn two_life_cycles_are_identical_down_to_the_trace_hash_across_the_reset() {
         "spec §8: same session, same trace hash"
     );
     assert_eq!(first.console, second.console);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The second reference firmware: ESP-IDF's `examples/storage/nvs/nvs_rw_value_cxx`, unmodified.
+// Each of its lives reads a restart counter from NVS, writes it back incremented, counts down
+// for eleven seconds and restarts (report SF §A.1). Only the second life proves that a write was
+// kept: the first prints the same lines whether the flash took the bytes or not.
+// ---------------------------------------------------------------------------------------------
+
+/// `flash_nvs.bin`: the example behind its own single-app partition table (SF §A.3).
+const NVS_SHA256: &str = "c3f0eed129d85de6c0f959d481bb99101d14d18ec6fab8bfd11c541128ec757f";
+/// `flash_nvs_ota.bin`: the same application behind the stock partition table of the X4.
+const NVS_OTA_SHA256: &str = "87832c6d5d15672fb3892bfad281688fc7486b360a25b495bdb6a27d04f28fec";
+/// The whole flash after each life of `flash_nvs.bin`, measured under QEMU and replayed (SF §B.2).
+const NVS_AFTER_LIFE_1: &str = "cfab4ffe5187eeea8ec2ee6e9794886289282f0242ce56aad2842144a6ffb17b";
+const NVS_AFTER_LIFE_2: &str = "7ad0acf62e5a4e20aa6d47be0f1d922a7b89cb204941feac1ab2fea71363b709";
+const NVS_AFTER_LIFE_3: &str = "fc23c7ecb700e966c0ef9db3becc6b73e37324b5a21e5380519fe597542143f5";
+/// The whole flash after three lives of `flash_nvs_ota.bin` (SF §B.2).
+const NVS_OTA_AFTER_LIFE_3: &str =
+    "6c668205970fc21e7330b840b44e47ca1a2a245f22d93ef1cb0f239a3b89de5b";
+
+fn nvs_flash() -> Vec<u8> {
+    pinned_image("INKEMU_NVS_FLASH", "flash_nvs.bin", NVS_SHA256)
+}
+
+fn nvs_ota_flash() -> Vec<u8> {
+    pinned_image("INKEMU_NVS_OTA_FLASH", "flash_nvs_ota.bin", NVS_OTA_SHA256)
+}
+
+/// The configuration of every run of the example: nothing unmodelled is let through.
+fn strict() -> SocConfig {
+    SocConfig {
+        strict_mmio: true,
+        ..SocConfig::default()
+    }
+}
+
+/// The last line of a life of the example: the restart follows.
+const RESTARTING_NOW: &str = "Restarting now.\n";
+
+/// Ends a run when the example has printed the last line of its `lives`-th life. Its writes are
+/// done by then: the last one is eleven seconds before the restart (SF §B.2).
+fn lives(lives: usize) -> impl Fn(&str, &[Diagnostic]) -> bool {
+    move |console, _| console.matches(RESTARTING_NOW).count() >= lives
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    common::hex(&Sha256::digest(bytes))
+}
+
+fn program(address: u32, data: &[u8]) -> FlashWrite {
+    FlashWrite::Program {
+        address,
+        data: data.to_vec(),
+    }
+}
+
+/// The NVS entry that holds `restart_counter = value` (SF §B.2; `IDF:nvs_flash/src/nvs_page.cpp`:
+/// namespace 1, type i32, span 1, chunk index `FF`, CRC, the key in 16 bytes, the value in 8).
+fn counter_entry(crc: [u8; 4], value: u8) -> Vec<u8> {
+    let mut entry = vec![0x01, 0x14, 0x01, 0xFF];
+    entry.extend(crc);
+    entry.extend(b"restart_counter\0");
+    entry.extend([value, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+    entry
+}
+
+/// Where NVS keeps the state of the 126 entries of its first page, two bits each: the word the
+/// example programs six times in three lives, with no erase in between (SF §B.2).
+///
+/// What the tests here tell of it: that it was programmed with the measured values in the
+/// measured order, that nothing erased it, and that it ends as measured. What they cannot tell:
+/// that a program stores the AND of the byte it is sent with the byte the cell holds. The six
+/// values, `FE FA EA E2 A2 82`, each only clear bits of the one before, and every cell starts
+/// at `FF`: a chip that stored the bytes as sent would leave the same word, the same journal
+/// and the same hashes, and every test of this file would pass on it. The rule is held by unit
+/// tests, which program bytes that would set bits again:
+/// `flash::tests::a_program_only_clears_bits`,
+/// `flash::tests::a_long_random_sequence_of_writes_leaves_what_the_plain_chip_holds_and_counts`
+/// and
+/// `machine::tests::the_content_of_the_flash_leaves_the_machine_whole_and_builds_the_same_flash_again`.
+const ENTRY_STATES: u32 = 0x9020;
+
+/// Every program of the three lives of the example on an erased NVS partition, in order: the
+/// eleven rows of SF §B.2, measured under QEMU. Five on the first life (the page header, the
+/// namespace entry, the counter), three on each life after (the new counter, then the old one
+/// marked erased).
+fn the_programs_of_the_three_lives() -> [Vec<FlashWrite>; 3] {
+    let mut page_header = vec![0xFE, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0xFE];
+    page_header.extend([0xFF; 19]);
+    page_header.extend([0x84, 0x2D, 0xBA, 0xB9]);
+    let mut namespace = vec![0x00, 0x01, 0x01, 0xFF, 0x09, 0xA9, 0x50, 0x07];
+    namespace.extend(b"storage");
+    namespace.extend([0; 9]);
+    namespace.push(0x01);
+    namespace.extend([0xFF; 7]);
+    let states = |low: u8| program(ENTRY_STATES, &[low, 0xFF, 0xFF, 0xFF]);
+    [
+        vec![
+            program(0x9000, &page_header),
+            program(0x9040, &namespace),
+            states(0xFE),
+            program(0x9060, &counter_entry([0x81, 0xA8, 0xFF, 0x42], 1)),
+            states(0xFA),
+        ],
+        vec![
+            program(0x9080, &counter_entry([0x62, 0xAF, 0x70, 0xCC], 2)),
+            states(0xEA),
+            states(0xE2),
+        ],
+        vec![
+            program(0x90A0, &counter_entry([0xFC, 0xAF, 0xDA, 0x00], 3)),
+            states(0xA2),
+            states(0x82),
+        ],
+    ]
+}
+
+/// What the first life of the example says of the counter: there is none yet.
+const COUNTER_NOT_INITIALIZED: &str =
+    "Reading restart counter from NVS ... The value is not initialized yet!";
+
+/// The lines the application prints in one life, in order (SF §B.3): it opens NVS, says what it
+/// read of the counter (`reading`), writes the counter back, counts down eleven lines from 10 to
+/// 0 and restarts.
+fn the_lines_of_a_life(reading: &[&str]) -> Vec<String> {
+    let mut lines = vec!["Opening Non-Volatile Storage (NVS) handle... Done".to_owned()];
+    lines.extend(reading.iter().map(|&line| line.to_owned()));
+    lines.push("Updating restart counter in NVS ... Done".to_owned());
+    lines.push("Committing updates in NVS ... Done".to_owned());
+    lines.extend(
+        (0..=10)
+            .rev()
+            .map(|seconds| format!("Restarting in {seconds} seconds...")),
+    );
+    lines.push(RESTARTING_NOW.trim_end().to_owned());
+    lines
+}
+
+/// Asserts that `console` holds, in order, the lines of three lives of the example (SF §B.3,
+/// §G): a power-on whose life finds no counter, then two restarts whose lives read the counter
+/// the life before wrote, each life with every line of the first. `first_boot` are lines of the
+/// bootloader of the first boot, between the ROM banner and the application.
+fn assert_the_console_of_three_lives(console: &str, first_boot: &[&str]) {
+    let mut lines = vec!["rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)".to_owned()];
+    lines.extend(first_boot.iter().map(|&line| line.to_owned()));
+    lines.extend(the_lines_of_a_life(&[COUNTER_NOT_INITIALIZED]));
+    for counter in 1..=2 {
+        lines.push("rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)".to_owned());
+        lines.extend(the_lines_of_a_life(&[
+            "Reading restart counter from NVS ... Done",
+            &format!("Restart counter = {counter}"),
+        ]));
+    }
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    assert_lines_in_order(console, &lines);
+}
+
+/// What the journal of a strict run of the example may hold: the restart it asks for, and
+/// nothing else. No unmodelled register, no refused flash command, no window read that may
+/// differ from the device, and no CPU exception.
+///
+/// The restart is one entry however many lives the run crossed: the journal lists a reset once
+/// per cause and PC. A run that ends on the last line of a life may or may not have reached the
+/// restart that follows it, a few milliseconds later: no entry at all is accepted too.
+fn assert_nothing_but_the_restart_is_reported(diagnostics: &[Diagnostic]) {
+    assert!(diagnostics.len() <= 1, "{diagnostics:#?}");
+    for diagnostic in diagnostics {
+        assert!(
+            matches!(
+                diagnostic,
+                Diagnostic::Reset {
+                    cause: ResetCause::SoftwareCpu,
+                    pc: RESTART_PC,
+                    ..
+                }
+            ),
+            "{diagnostic}"
+        );
+    }
+}
+
+/// The milestone of the flash writes: three lives of the example in strict mode. The counter the
+/// second and the third life print is the one the life before wrote; the programs are the
+/// measured ones, byte for byte and in order; the flash ends as the measured image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_NVS_FLASH"]
+fn the_nvs_example_counts_its_restarts_over_three_lives_and_programs_the_measured_bytes() {
+    let run = run_image(nvs_flash(), strict(), lives(3));
+    assert!(
+        matches!(run.stop, StopReason::CycleBudget | StopReason::Asleep),
+        "a strict run of the example does not stop: {:?}\nconsole:\n{}",
+        run.stop,
+        run.console
+    );
+    assert_the_console_of_three_lives(&run.console, &[]);
+    assert_eq!(
+        count_lines(&run.console, COUNTER_NOT_INITIALIZED),
+        1,
+        "only the first life finds no counter"
+    );
+    assert_eq!(run.flash_writes, the_programs_of_the_three_lives().concat());
+    assert_eq!(sha256(&run.flash), NVS_AFTER_LIFE_3);
+    assert_eq!(run.flash_modified_sectors, 1, "the first page of NVS");
+    assert_eq!(
+        run.flash[ENTRY_STATES as usize], 0x82,
+        "the last of the six values programmed there; the journal above holds no erase"
+    );
+    assert!(run.resets >= 2, "two restarts were crossed: {}", run.resets);
+    assert_nothing_but_the_restart_is_reported(&run.diagnostics);
+}
+
+/// The same three lives behind the stock partition table of the X4: the bootloader writes
+/// `otadata` on the first boot, and on that boot only; the application then writes the same NVS
+/// bytes at the same addresses.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_NVS_OTA_FLASH"]
+fn the_nvs_example_behind_the_stock_x4_table_writes_otadata_once_and_counts_its_restarts() {
+    let run = run_image(nvs_ota_flash(), strict(), lives(3));
+    assert!(
+        matches!(run.stop, StopReason::CycleBudget | StopReason::Asleep),
+        "a strict run of the example does not stop: {:?}\nconsole:\n{}",
+        run.stop,
+        run.console
+    );
+    assert_the_console_of_three_lives(&run.console, &[NO_FACTORY_IMAGE, OTADATA_SET]);
+    assert_eq!(count_lines(&run.console, COUNTER_NOT_INITIALIZED), 1);
+    assert_eq!(count_lines(&run.console, NO_FACTORY_IMAGE), 1);
+    assert_eq!(count_lines(&run.console, OTADATA_SET), 1);
+    let mut expected = the_otadata_update().to_vec();
+    expected.extend(the_programs_of_the_three_lives().concat());
+    assert_eq!(run.flash_writes, expected);
+    assert_eq!(sha256(&run.flash), NVS_OTA_AFTER_LIFE_3);
+    assert_eq!(run.flash_modified_sectors, 2, "NVS and otadata");
+    assert_nothing_but_the_restart_is_reported(&run.diagnostics);
+}
+
+/// The flash a first life leaves is the measured one, and a machine built from it goes on
+/// counting: a power-on, not a restart, and the counter of the life before. This is what a
+/// flash file kept between two runs relies on.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_NVS_FLASH"]
+fn a_cold_start_from_the_flash_the_first_life_left_goes_on_counting() {
+    let [first_life, second_life, _] = the_programs_of_the_three_lives();
+    let first = run_image(nvs_flash(), strict(), lives(1));
+    assert_eq!(first.flash_writes, first_life);
+    assert_eq!(sha256(&first.flash), NVS_AFTER_LIFE_1);
+    assert_nothing_but_the_restart_is_reported(&first.diagnostics);
+
+    let second = run_image(first.flash, strict(), lives(1));
+    // The ROM lines of the reference image: the bootloader is the same binary.
+    assert!(
+        second.console.starts_with(ROM_LINES),
+        "a power-on:\n{}",
+        second.console
+    );
+    assert_lines_in_order(
+        &second.console,
+        &[
+            "Reading restart counter from NVS ... Done",
+            "Restart counter = 1",
+            "Restarting now.",
+        ],
+    );
+    assert_eq!(count_lines(&second.console, COUNTER_NOT_INITIALIZED), 0);
+    assert_eq!(second.flash_writes, second_life);
+    assert_eq!(sha256(&second.flash), NVS_AFTER_LIFE_2);
+    assert_nothing_but_the_restart_is_reported(&second.diagnostics);
+}
+
+/// Determinism with a flash that is written: two runs from the same content are the same run,
+/// down to the trace hash, and leave the same flash.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_NVS_OTA_FLASH"]
+fn three_lives_of_the_nvs_example_are_the_same_run_twice_and_leave_the_same_flash() {
+    let config = SocConfig {
+        trace_hash: true,
+        ..strict()
+    };
+    let run = || run_image(nvs_ota_flash(), config, lives(3));
+    let (first, second) = (run(), run());
+    assert_eq!(first.console.matches(RESTARTING_NOW).count(), 3);
+    assert!(first.trace_hash.is_some());
+    assert_eq!(
+        (first.trace_hash, first.cycles, first.device_time_nanos),
+        (second.trace_hash, second.cycles, second.device_time_nanos)
+    );
+    assert_eq!(first.console, second.console);
+    assert_eq!(first.flash_writes, second.flash_writes);
+    assert_eq!(sha256(&first.flash), sha256(&second.flash));
+    assert_eq!(sha256(&first.flash), NVS_OTA_AFTER_LIFE_3);
+}
+
+/// The flash commands of a first boot, by phase, against the list measured under QEMU (report FW
+/// §A.4, SF §B.1): the bootloader's `otadata` update is two write enables, one sector erase and
+/// one program; the application's five programs are five write enables and five programs.
+///
+/// QEMU's chip keeps its write-enable latch set after a program, so ESP-IDF sends it a write
+/// disable (`04`) after each one: 142 of them in FW §A.4. A chip clears the latch when the
+/// operation completes, and so does the model: the application sends none here. Status reads
+/// (`05`) are not counted: how many there are depends on how fast the chip answers.
+///
+/// Why a count of `04` is asserted here, when the numbers of `05` and `04` measured under QEMU
+/// are properties of QEMU's chip (SF §G assertion 1, §O question 1) and must not be pinned. The
+/// number asserted is not one QEMU gave. It is zero, in the application phase alone: a
+/// difference of two counts, which leaves out the write disable the bootloader sends whatever
+/// the chip does (BA §2.2). And it follows from the code of ESP-IDF, not from a capture: its
+/// driver sends a write disable after a program only when the chip, idle again, still shows the
+/// latch set (`IDF:spi_flash/spi_flash_chip_generic.c:462-468`; FW key result 5). A chip whose
+/// latch clears when the operation completes is sent none, however long its operations last and
+/// however many status reads they take. That the latch clears is what the datasheet states (FW
+/// §C, row "WEL cleared") and what ESP-IDF requires of a chip; it is read, not measured on a
+/// device. This test is the only one on a real firmware that fails when the latch stays set:
+/// the bytes written, the journal and the console are the same on both chips.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_NVS_OTA_FLASH"]
+fn a_first_boot_sends_one_write_enable_per_write_and_the_application_no_write_disable() {
+    const WRITE_ENABLE: usize = 0x06;
+    const WRITE_DISABLE: usize = 0x04;
+    const PROGRAM: usize = 0x02;
+    const SECTOR_ERASE: usize = 0x20;
+    const DUAL_IO_READ: usize = 0xBB;
+    /// Erases of a block or of the chip, and the status write: none is sent by this firmware.
+    const NEVER_SENT: [usize; 5] = [0xD8, 0x52, 0xC7, 0x60, 0x01];
+    // The machine is deterministic: the first run is the beginning of the second.
+    let bootloader = run_image(nvs_ota_flash(), strict(), |console, _| {
+        console.contains(FIRST_APPLICATION_LINE.trim_start_matches("I (#) "))
+    });
+    let life = run_image(nvs_ota_flash(), strict(), lives(1));
+    let (before, after) = (&bootloader.flash_commands, &life.flash_commands);
+    assert_eq!(bootloader.flash_writes, the_otadata_update());
+    assert_eq!(
+        [before[WRITE_ENABLE], before[SECTOR_ERASE], before[PROGRAM]],
+        [2, 1, 1],
+        "ROM and bootloader: the otadata update"
+    );
+    let application = |opcode: usize| after[opcode] - before[opcode];
+    assert_eq!(
+        [
+            application(WRITE_ENABLE),
+            application(PROGRAM),
+            application(SECTOR_ERASE),
+            application(WRITE_DISABLE),
+        ],
+        [5, 5, 0, 0],
+        "application: five times a write enable and a program, and no write disable"
+    );
+    assert!(application(DUAL_IO_READ) > 0, "it reads NVS through SPI1");
+    for opcode in NEVER_SENT {
+        assert_eq!(after[opcode], 0, "{opcode:#04x}");
+    }
 }

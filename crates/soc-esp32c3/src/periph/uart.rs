@@ -3,7 +3,7 @@
 //! A byte written to the FIFO leaves at the baud rate: the transmit FIFO fills, `STATUS` and
 //! `FSM_STATUS` say so, and the byte reaches the console when its last bit has gone. Software waits
 //! on both: the ROM before each character, ESP-IDF before it changes a clock or restarts (report IR
-//! §4.1). Reception and the UART interrupts arrive in SP1b-3b.
+//! §4.1). Reception and the UART interrupts arrive in SP1b-3d.
 use crate::clock::XTAL_PERIOD;
 use crate::ctx::{Ctx, Deadline, Event};
 use crate::diag::Unsupported;
@@ -24,7 +24,7 @@ pub(crate) fn accepted() -> Vec<Accepted> {
             ),
             ("CONF1", "FIFO thresholds"),
         ] {
-            rows.push(Accepted::svd(peripheral, register, not_modeled, "SP1b-3b"));
+            rows.push(Accepted::svd(peripheral, register, not_modeled, "SP1b-3d"));
         }
     }
     rows
@@ -79,7 +79,7 @@ const SCLK_SEL_XTAL: u32 = 3;
 const TXFIFO_RST: u32 = 1 << 18;
 /// ASSUMPTION: a byte is 10 bit times on the wire (a start bit, 8 data bits, a stop bit), whatever
 /// `CONF0` says. The ROM and ESP-IDF consoles use this format; another one would only change how
-/// long a byte takes. SP1b-3b gives the frame format its effect, with the receive side; a byte
+/// long a byte takes. SP1b-3d gives the frame format its effect, with the receive side; a byte
 /// timed on a chip configured for another format (two stop bits, a parity bit) settles what each
 /// field adds.
 const BITS_PER_BYTE: u64 = 10;
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(
             uart.read(ctx, reg("INT_RAW")),
             None,
-            "interrupts are SP1b-3b"
+            "interrupts are SP1b-3d"
         );
         assert_eq!(uart.read(ctx, reg("INT_ST")), None);
         assert_eq!(

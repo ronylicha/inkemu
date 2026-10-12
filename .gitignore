@@ -1,6 +1,8 @@
 # Rust
 /target/
 **/*.rs.bk
+# Coverage profiles an instrumented binary writes where it runs (`cargo llvm-cov`)
+*.profraw
 
 # Node / UI
 node_modules/

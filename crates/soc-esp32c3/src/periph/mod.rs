@@ -428,8 +428,24 @@ impl Peripherals {
     /// The peripherals after a power-on, at the device time of `ctx`: a device that has a first
     /// deadline schedules it there. The reset values arm the flash-boot protection of main
     /// watchdog 0 and of the RTC watchdog when the chip is strapped to boot from flash.
+    ///
+    /// Only this crate can call it, for the reason [`SocBus::new`](crate::bus::SocBus) gives: the
+    /// chip is the one [`SocConfig::flash`] describes. Every type below is public; the only
+    /// thing that does not compile is the call:
+    ///
+    /// ```compile_fail
+    /// use soc_esp32c3::{FlashDevice, SocConfig, ctx::Ctx};
+    /// fn peripherals_around_my_own_chip(config: &SocConfig, flash: Box<dyn FlashDevice>) {
+    ///     let mut ctx = Ctx::new(false);
+    ///     let _ = soc_esp32c3::periph::Peripherals::new(config, flash, &mut ctx);
+    /// }
+    /// ```
     #[must_use]
-    pub fn new(config: &SocConfig, flash: Box<dyn FlashDevice>, ctx: &mut Ctx) -> Peripherals {
+    pub(crate) fn new(
+        config: &SocConfig,
+        flash: Box<dyn FlashDevice>,
+        ctx: &mut Ctx,
+    ) -> Peripherals {
         let flash_boot = config.strapping & STRAP_SPI_FAST_FLASH_BOOT != 0;
         let efuse = Efuse::new(config.chip_revision);
         let mut periph = Peripherals {
@@ -473,6 +489,11 @@ impl Peripherals {
             Event::FlashWindowStore { instruction_bus } => {
                 self.extmem.latch_store(ctx, instruction_bus);
             }
+            Event::FlashWritten {
+                first_page,
+                last_page,
+            } => self.extmem.flash_written(first_page, last_page),
+            Event::CacheInvalidated => self.extmem.invalidate(&self.mmu),
             Event::Systimer => self.systimer.wake(ctx),
             Event::Timg(Group::Timg0) => self.timg0.wake(ctx),
             Event::Timg(Group::Timg1) => self.timg1.wake(ctx),
@@ -518,6 +539,10 @@ impl Peripherals {
     ///   analog registers behind regi2c and the console bytes that already left are no digital
     ///   register: they stay.
     /// - A system reset also returns `RTC_CNTL` to its reset values and clears the recorded PC.
+    ///
+    /// What the cache model keeps of the flash pages read through a window and written since
+    /// follows `EXTMEM`: a CPU reset keeps it, a core reset empties it. The sources and the one
+    /// assumption are on the fields of [`Extmem`].
     ///
     /// ASSUMPTION: a CPU reset leaves the interrupt controller as it is. The TRM lists only the PMS
     /// registers as reset with the CPU (§6.1.3); the ROM clears `CPU_INT_ENABLE` itself at every
@@ -1196,6 +1221,17 @@ mod tests {
             assert_eq!(ctx.take_signal(), None, "{module:?}");
         }
         p.deliver(ctx, Event::ClockChanged);
+        assert_eq!(ctx.take_signal(), None);
+        // The two events of the cache state: marking and clearing flash pages posts nothing.
+        p.deliver(
+            ctx,
+            Event::FlashWritten {
+                first_page: 0,
+                last_page: u32::MAX,
+            },
+        );
+        assert_eq!(ctx.take_signal(), None);
+        p.deliver(ctx, Event::CacheInvalidated);
         assert_eq!(ctx.take_signal(), None);
     }
 

@@ -1,1 +1,3 @@
 fc05ef5dbe85372e1da52abdec3bfcbbb110738a60163734666095fcd8c39bf2  flash_hello.bin
+c3f0eed129d85de6c0f959d481bb99101d14d18ec6fab8bfd11c541128ec757f  flash_nvs.bin
+87832c6d5d15672fb3892bfad281688fc7486b360a25b495bdb6a27d04f28fec  flash_nvs_ota.bin

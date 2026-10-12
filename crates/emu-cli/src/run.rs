@@ -6,6 +6,108 @@ use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, StopReason};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Ctrl-C, as the run and the handler of the signal share it: whether the user asked the run to
+/// stop, and whether the run has begun its summary.
+///
+/// The first request is left to the run, which reads it between two calls of the machine and
+/// ends with its summary. A second one, while the run has not begun its summary, means that the
+/// run does not come back, and the handler ends the process. From the first line of the summary
+/// on, no request ends anything: what is left is the summary and the save of the flash file,
+/// which a request would cut in two.
+#[derive(Debug, Default)]
+pub struct Interrupt {
+    requested: AtomicBool,
+    summarising: AtomicBool,
+}
+
+impl Interrupt {
+    #[must_use]
+    pub const fn new() -> Interrupt {
+        Interrupt {
+            requested: AtomicBool::new(false),
+            summarising: AtomicBool::new(false),
+        }
+    }
+
+    /// Records that the user asked the run to stop, and says whether the process must end at
+    /// once: the request is not the first, and the run has not begun its summary.
+    #[must_use]
+    pub fn request(&self) -> bool {
+        self.requested.swap(true, Ordering::SeqCst) && !self.summarising.load(Ordering::SeqCst)
+    }
+
+    /// Whether the user asked the run to stop.
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    /// Whether the run has begun its summary: from then on a request ends nothing.
+    #[must_use]
+    pub fn summary_has_begun(&self) -> bool {
+        self.summarising.load(Ordering::SeqCst)
+    }
+
+    /// The run is about to write the first line of its summary.
+    fn summary_begins(&self) {
+        self.summarising.store(true, Ordering::SeqCst);
+    }
+}
+
+/// How a pass of the run loop ends the run, if it does: what the console relay found and what
+/// the machine stopped on. `cycle_limit_reached` tells a slice that ended on `--max-cycles` from
+/// one that ended on its own length.
+fn pass_end(
+    console: &io::Result<bool>,
+    stop: &StopReason,
+    cycle_limit_reached: bool,
+) -> Option<RunEnd> {
+    match (console, stop) {
+        // `--strict-mmio` exists for CI: its exit code must not depend on the state of the console.
+        (_, StopReason::StrictMmio(_)) => Some(RunEnd::StrictMmio),
+        (Ok(false), _) => Some(RunEnd::ConsoleClosed),
+        (Err(_), _) => Some(RunEnd::ConsoleError),
+        (Ok(true), StopReason::Idle) => Some(RunEnd::Idle),
+        (Ok(true), StopReason::CycleBudget) if cycle_limit_reached => Some(RunEnd::Budget),
+        (Ok(true), StopReason::TimeBudget) => Some(RunEnd::TimeLimit),
+        // The end of a slice, or a CPU that sleeps while device time goes on: the next pass
+        // continues. A sleep that ended on the very instant of the device-time limit comes
+        // back as `Asleep` too; the next call then runs nothing and says `TimeBudget`.
+        (Ok(true), StopReason::CycleBudget | StopReason::Asleep) => None,
+    }
+}
+
+/// The first line of the summary: why the run ended. A console that failed has said so in the
+/// line before; `stop` carries the violation of a strict stop.
+fn say_why(log: &mut dyn Write, end: RunEnd, stop: Option<&StopReason>) {
+    let _ = match end {
+        RunEnd::Interrupted => writeln!(log, "inkemu: interrupted by the user"),
+        RunEnd::StrictMmio => match stop {
+            Some(StopReason::StrictMmio(diagnostic)) => {
+                writeln!(log, "inkemu: stopped by --strict-mmio: {diagnostic}")
+            }
+            _ => Ok(()),
+        },
+        RunEnd::ConsoleClosed => {
+            log_reader_gone(log);
+            Ok(())
+        }
+        RunEnd::ConsoleError => Ok(()),
+        RunEnd::Idle => writeln!(
+            log,
+            "inkemu: the CPU waits for an interrupt and none can come: no interrupt line is pending and no device has anything scheduled; check that the firmware enables the interrupt it waits for"
+        ),
+        RunEnd::Budget => writeln!(
+            log,
+            "inkemu: cycle limit reached; raise --max-cycles to run longer"
+        ),
+        RunEnd::TimeLimit => writeln!(
+            log,
+            "inkemu: device-time limit reached; raise --max-time to run longer"
+        ),
+    };
+}
+
 /// Cycles executed between two flushes of the console and the diagnostics: a fraction of a second
 /// of host time, so output appears as the firmware prints it.
 const SLICE_CYCLES: u64 = 1_000_000;
@@ -170,6 +272,25 @@ impl RunEnd {
             RunEnd::Idle => EXIT_IDLE,
         }
     }
+
+    /// The process exit code of a run that ended this way and whose flash file could then not be
+    /// written: what the firmware wrote to the flash is lost, which is an error of the
+    /// environment (2) whatever ended the run, a wait nothing can end included. One end keeps
+    /// its own code, for the reason [`execute`] gives for the console: `--strict-mmio` exists
+    /// for CI, and its exit code must not depend on the state of a directory. The message of
+    /// the failed write is printed in every case.
+    #[must_use]
+    pub const fn exit_code_without_its_flash(self) -> u8 {
+        match self {
+            RunEnd::StrictMmio => EXIT_STRICT_MMIO,
+            RunEnd::Budget
+            | RunEnd::TimeLimit
+            | RunEnd::ConsoleClosed
+            | RunEnd::ConsoleError
+            | RunEnd::Idle
+            | RunEnd::Interrupted => EXIT_ERROR,
+        }
+    }
 }
 
 /// Writes `bytes` to `out` and flushes; `Ok(false)` when the reader is gone (a broken pipe).
@@ -246,6 +367,7 @@ const fn journal_prefix(diagnostic: &Diagnostic) -> &'static str {
         | Diagnostic::SubWordWrite { .. }
         | Diagnostic::Unsupported { .. }
         | Diagnostic::FlashMapping { .. }
+        | Diagnostic::StaleFlashWindow { .. }
         | Diagnostic::Exception { .. }
         | Diagnostic::Suppressed => "warning",
     }
@@ -267,7 +389,8 @@ fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
 }
 
 /// Runs `machine` until it stops, sending the firmware console to `console` and everything else
-/// (warnings, the reason the run ended, the summary) to `log`.
+/// (warnings, then the summary, whose first line says why the run ended — or, when the console
+/// failed, that it did) to `log`.
 ///
 /// Output is relayed every [`SLICE_CYCLES`] cycles so a long run shows progress. Both limits of
 /// `options` are given to every call of the machine: the cycle limit ends a run whose CPU
@@ -279,7 +402,8 @@ fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
 /// - The request to stop. `interrupt` is read at the start of every pass of the loop, whatever
 ///   the previous pass ended on (a sleeping CPU included, which can go on for ever without the
 ///   cycle count advancing): once it is set (Ctrl-C), the run ends with the same summary as a run
-///   that reached a limit.
+///   that reached a limit. `interrupt` is told when the summary begins, before its first line,
+///   whatever ends the run: from then on a request no longer ends the process ([`Interrupt`]).
 /// - The state of its reader. A write to a console whose reader went away says so by failing;
 ///   the passes that had nothing to write ask `reader_gone` instead, the first of them and then
 ///   one in [`SILENT_PASSES_PER_QUESTION`] or one per slice of executed cycles ([`ReaderWatch`]),
@@ -291,7 +415,7 @@ fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
 pub fn execute(
     machine: &mut Esp32C3,
     options: &RunOptions,
-    interrupt: &AtomicBool,
+    interrupt: &Interrupt,
     reader_gone: &dyn Fn() -> bool,
     console: &mut dyn Write,
     log: &mut dyn Write,
@@ -302,8 +426,9 @@ pub fn execute(
     let mut console_usable = true;
     let mut reader = ReaderWatch::default();
     let mut end = loop {
-        if interrupt.load(Ordering::Relaxed) {
-            let _ = writeln!(log, "inkemu: interrupted by the user");
+        if interrupt.is_requested() {
+            interrupt.summary_begins();
+            say_why(log, RunEnd::Interrupted, None);
             break RunEnd::Interrupted;
         }
         let now = machine.cycles().get();
@@ -326,49 +451,19 @@ pub fn execute(
                 let _ = writeln!(log, "{}: {diagnostic}", journal_prefix(&diagnostic));
             }
         }
+        let cycle_limit_reached = options
+            .max_cycles
+            .is_some_and(|max| machine.cycles().get() >= max);
+        let Some(end) = pass_end(&console_open, &stop, cycle_limit_reached) else {
+            continue;
+        };
+        // The summary begins here: the warnings of the last slice are above, and from the next
+        // line on a request to stop no longer ends the process.
+        interrupt.summary_begins();
         // A failure to write the console is logged whatever else ended the run in the same slice.
         log_console_error(log, &console_open);
-        match (console_open, stop) {
-            // `--strict-mmio` exists for CI: its exit code must not depend on the state of the console.
-            (_, StopReason::StrictMmio(diagnostic)) => {
-                let _ = writeln!(log, "inkemu: stopped by --strict-mmio: {diagnostic}");
-                break RunEnd::StrictMmio;
-            }
-            (Ok(false), _) => {
-                log_reader_gone(log);
-                break RunEnd::ConsoleClosed;
-            }
-            (Err(_), _) => break RunEnd::ConsoleError,
-            (Ok(true), StopReason::Idle) => {
-                let _ = writeln!(
-                    log,
-                    "inkemu: the CPU waits for an interrupt and none can come: no interrupt line is pending and no device has anything scheduled; check that the firmware enables the interrupt it waits for"
-                );
-                break RunEnd::Idle;
-            }
-            (Ok(true), StopReason::CycleBudget)
-                if options
-                    .max_cycles
-                    .is_some_and(|max| machine.cycles().get() >= max) =>
-            {
-                let _ = writeln!(
-                    log,
-                    "inkemu: cycle limit reached; raise --max-cycles to run longer"
-                );
-                break RunEnd::Budget;
-            }
-            (Ok(true), StopReason::TimeBudget) => {
-                let _ = writeln!(
-                    log,
-                    "inkemu: device-time limit reached; raise --max-time to run longer"
-                );
-                break RunEnd::TimeLimit;
-            }
-            // The end of a slice, or a CPU that sleeps while device time goes on: the next pass
-            // continues. A sleep that ended on the very instant of the device-time limit comes
-            // back as `Asleep` too; the next call then runs nothing and says `TimeBudget`.
-            (Ok(true), StopReason::CycleBudget | StopReason::Asleep) => {}
-        }
+        say_why(log, end, Some(&stop));
+        break end;
     };
     // What the firmware had written and the device had not sent yet: without it the console
     // would end before the place the run stopped at.
@@ -464,7 +559,13 @@ mod tests {
         strict_mmio: true,
         trace_hash: false,
     };
-    static NOT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+    static NOT_INTERRUPTED: Interrupt = Interrupt::new();
+    /// Ctrl-C pressed once before the run starts.
+    fn requested() -> Interrupt {
+        let interrupt = Interrupt::new();
+        assert!(!interrupt.request(), "a first request ends nothing");
+        interrupt
+    }
     /// The reader of the console is there for the whole run.
     fn reader_stays() -> bool {
         false
@@ -490,6 +591,141 @@ mod tests {
     }
     fn text(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// A log that notes, for each of its lines, whether the run had begun its summary when the
+    /// line began.
+    struct Noting<'a> {
+        interrupt: &'a Interrupt,
+        lines: Vec<(bool, String)>,
+        in_a_line: bool,
+    }
+    impl io::Write for Noting<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            for &byte in bytes {
+                if !self.in_a_line {
+                    let begun = self.interrupt.summary_has_begun();
+                    self.lines.push((begun, String::new()));
+                    self.in_a_line = true;
+                }
+                if let Some((_, line)) = self.lines.last_mut() {
+                    line.push(char::from(byte));
+                }
+                self.in_a_line = byte != b'\n';
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The lines `program` logs in a run ended by `options`, each with whether the summary had
+    /// begun when it began.
+    fn noted(program: &[u32], options: &RunOptions, interrupt: &Interrupt) -> Vec<(bool, String)> {
+        let mut m = machine(program, MachineOptions::default());
+        let mut log = Noting {
+            interrupt,
+            lines: Vec::new(),
+            in_a_line: false,
+        };
+        let _ = execute(
+            &mut m,
+            options,
+            interrupt,
+            &reader_stays,
+            &mut Vec::new(),
+            &mut log,
+        );
+        log.lines
+    }
+
+    #[test]
+    fn a_second_request_ends_the_process_only_before_the_summary_begins() {
+        let interrupt = Interrupt::new();
+        assert!(!interrupt.request(), "the first is left to the run");
+        assert!(interrupt.is_requested(), "which reads it at its next pass");
+        assert!(interrupt.request(), "a second one ends the process");
+        assert!(interrupt.request(), "and so does every one after it");
+        interrupt.summary_begins();
+        for _ in 0..3 {
+            assert!(!interrupt.request(), "the summary has begun: nothing ends");
+        }
+        // A run that ended for another cause (a limit) has begun its summary: a first request
+        // after it is read by nobody, and ends nothing either.
+        let interrupt = Interrupt::new();
+        interrupt.summary_begins();
+        assert!(!interrupt.request());
+        assert!(!interrupt.request());
+    }
+
+    #[test]
+    fn the_summary_begins_before_its_first_line_and_after_the_warnings_of_the_run() {
+        // A warning in the last slice, then the cycle limit: the warning is no part of the
+        // summary, the line that says why the run ended is its first.
+        let interrupt = Interrupt::new();
+        let lines = noted(&reading_unmodeled_register(), &options(10_000), &interrupt);
+        let first = lines
+            .iter()
+            .position(|(_, line)| line.starts_with("inkemu: cycle limit reached"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(first > 0, "a warning comes before it: {lines:?}");
+        assert!(
+            lines[..first].iter().all(|(begun, _)| !begun),
+            "the warnings are written before the summary begins: {lines:?}"
+        );
+        assert!(
+            lines[first..].iter().all(|(begun, _)| *begun),
+            "every line of the summary is written once it has begun: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(_, line)| line.starts_with("inkemu: stopped at pc "))
+        );
+        // Ctrl-C before the run: the summary is the whole log, from its first line.
+        let interrupt = requested();
+        let lines = noted(&[HANG], &options(10_000), &interrupt);
+        assert_eq!(
+            lines.first().map(|(_, line)| line.as_str()),
+            Some("inkemu: interrupted by the user\n")
+        );
+        assert!(lines.iter().all(|(begun, _)| *begun), "{lines:?}");
+    }
+
+    #[test]
+    fn the_console_error_line_is_the_first_of_the_summary() {
+        // A console that fails ends the run, and the line that says so comes before the reason:
+        // the summary has begun when it is written.
+        let interrupt = Interrupt::new();
+        let mut m = machine(
+            &printing(UART0, b"hello\n", &[HANG]),
+            MachineOptions::default(),
+        );
+        let mut log = Noting {
+            interrupt: &interrupt,
+            lines: Vec::new(),
+            in_a_line: false,
+        };
+        let end = execute(
+            &mut m,
+            &options(BACKSTOP),
+            &interrupt,
+            &reader_stays,
+            &mut Failing,
+            &mut log,
+        );
+        assert_eq!(end, RunEnd::ConsoleError);
+        let first = log
+            .lines
+            .iter()
+            .position(|(_, line)| line.contains("disk full"))
+            .unwrap_or_else(|| panic!("{:?}", log.lines));
+        assert!(
+            log.lines[first..].iter().all(|(begun, _)| *begun),
+            "{:?}",
+            log.lines
+        );
     }
 
     #[test]
@@ -743,7 +979,7 @@ mod tests {
         // its first slice only if the bytes of UART1 are relayed by the loop, and not kept for
         // the flush at the end of the run.
         let mut m = machine(&printing_on_both_uarts(), MachineOptions::default());
-        let interrupt = AtomicBool::new(false);
+        let interrupt = Interrupt::new();
         let mut console = RaisesInterrupt {
             interrupt: &interrupt,
             received: Vec::new(),
@@ -1166,7 +1402,7 @@ mod tests {
         // Ctrl-C sets the flag; the run ends at the next slice like a cycle limit.
         let mut m = machine(&[HANG], MachineOptions::default());
         let (mut console, mut log) = (Vec::new(), Vec::new());
-        let interrupt = AtomicBool::new(true);
+        let interrupt = requested();
         let end = execute(
             &mut m,
             &options(BACKSTOP),
@@ -1188,12 +1424,13 @@ mod tests {
     /// A console that raises the interrupt flag when the run first writes to it, as a user
     /// pressing Ctrl-C once output has appeared.
     struct RaisesInterrupt<'a> {
-        interrupt: &'a AtomicBool,
+        interrupt: &'a Interrupt,
         received: Vec<u8>,
     }
     impl io::Write for RaisesInterrupt<'_> {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.interrupt.store(true, Ordering::Relaxed);
+            // A second request may come here: the run does not end the process, its handler does.
+            let _ = self.interrupt.request();
             self.received.extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -1235,13 +1472,21 @@ mod tests {
         device_nanos: u64,
     }
 
-    /// Runs `program` to the end of its run on a thread of its own, and fails after 30 s of host
-    /// time. For the runs whose CPU sleeps: a sleep advances no cycle, so a run that lost its
-    /// bound would otherwise hang the suite instead of failing.
+    /// How long a run of these tests may take on the host before the test fails instead of
+    /// hanging. It turns a hang into a failure and says nothing of speed, so it is wide: the
+    /// longest run bounded by it, `a_device_time_limit_ends_a_run_whose_cpu_sleeps_for_ever`,
+    /// took 12.4 s instrumented by `cargo llvm-cov` beside a release build and 16 spinning
+    /// processes on 16 cores, and the limit is fifteen minutes, under the timeout of the CI
+    /// jobs that run them.
+    const HANG_LIMIT: Duration = Duration::from_mins(15);
+
+    /// Runs `program` to the end of its run on a thread of its own, and fails after
+    /// [`HANG_LIMIT`]. For the runs whose CPU sleeps: a sleep advances no cycle, so a run that
+    /// lost its bound would otherwise hang the suite instead of failing.
     fn run_bounded(program: Vec<u32>, options: RunOptions) -> Outcome {
         within(
-            Duration::from_secs(30),
-            "the run did not end within 30 s of host time: nothing bounds it any more",
+            HANG_LIMIT,
+            "the run did not end within 15 minutes of host time: nothing bounds it any more",
             move || {
                 let mut m = machine(&program, MachineOptions::default());
                 let (mut console, mut log) = (Vec::new(), Vec::new());
@@ -1507,7 +1752,7 @@ mod tests {
         // thousand alarms), and read at the start of the second: the limit is forty passes away,
         // and near enough for a run that lost its end to fail in seconds, not minutes.
         let mut m = machine(&sleeping_for_ever(1), MachineOptions::default());
-        let interrupt = AtomicBool::new(false);
+        let interrupt = Interrupt::new();
         let mut console = RaisesInterrupt {
             interrupt: &interrupt,
             received: Vec::new(),
@@ -1543,7 +1788,7 @@ mod tests {
         let mut m = bytes_still_in_the_uart(&[HANG], MachineOptions::default());
         assert_eq!(m.run_until(Cycles(3_000)), StopReason::CycleBudget);
         let (mut console, mut log) = (Vec::new(), Vec::new());
-        let interrupt = AtomicBool::new(true);
+        let interrupt = requested();
         let end = execute(
             &mut m,
             &options(10_000),
@@ -1561,7 +1806,7 @@ mod tests {
         let mut m = bytes_still_in_the_uart(&[HANG], MachineOptions::default());
         assert_eq!(m.run_until(Cycles(3_000)), StopReason::CycleBudget);
         let mut log = Vec::new();
-        let interrupt = AtomicBool::new(true);
+        let interrupt = requested();
         let end = execute(
             &mut m,
             &options(10_000),
@@ -1614,8 +1859,8 @@ mod tests {
     #[test]
     fn a_run_whose_cpu_sleeps_ends_when_its_reader_goes_away() {
         let run = within(
-            Duration::from_secs(30),
-            "the run did not end within 30 s of host time: it no longer asks for its reader",
+            HANG_LIMIT,
+            "the run did not end within 15 minutes of host time: it no longer asks for its reader",
             || {
                 // Half a million wake-ups a call of the machine cannot end the run; ten seconds of
                 // device time would, were the question not asked.
@@ -1805,7 +2050,7 @@ mod tests {
         };
 
         let mut interrupted = machine(&program, TRACED);
-        let interrupt = AtomicBool::new(false);
+        let interrupt = Interrupt::new();
         let mut console = RaisesInterrupt {
             interrupt: &interrupt,
             received: Vec::new(),
