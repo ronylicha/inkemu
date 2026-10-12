@@ -428,9 +428,11 @@ impl Spi1 {
         // hold something and leaves the others as they were: the chip is asked which ones hold
         // something before it runs that command, and before no other. The 256 questions would
         // cost many times a write enable or a status read, which accompany every program and
-        // every erase and change no content.
-        let held =
-            erases_whole_chip(command.opcode).then(|| pages_holding_data(self.flash.as_ref()));
+        // every erase and change no content. They are not asked either before a chip erase
+        // the chip would ignore (no write enable) or refuse (a block-protect bit): it changes
+        // nothing, and a firmware can send it in a loop.
+        let held = (erases_whole_chip(command.opcode) && self.flash.would_erase_the_chip())
+            .then(|| pages_holding_data(self.flash.as_ref()));
         match self.flash.execute(command, &mut data_in) {
             Ok(written) => {
                 if let Some(write) = written {
@@ -1030,6 +1032,8 @@ mod tests {
         holds: Option<fn(u32) -> bool>,
         /// How many times the controller asked what a page holds.
         asked: Rc<Cell<u32>>,
+        /// What the chip says when asked whether a chip erase would run now.
+        would_erase: Rc<Cell<bool>>,
     }
 
     impl FlashDevice for ErasesThreePages {
@@ -1065,6 +1069,9 @@ mod tests {
             self.asked.set(self.asked.get() + 1);
             self.holds.is_none_or(|holds| holds(start / MMU_PAGE_BYTES))
         }
+        fn would_erase_the_chip(&self) -> bool {
+            self.would_erase.get()
+        }
     }
 
     #[test]
@@ -1076,6 +1083,7 @@ mod tests {
                 generation: 0,
                 holds,
                 asked: Rc::default(),
+                would_erase: Rc::new(Cell::new(true)),
             }));
             spi.write(ctx, ADDR, 0x1_0000);
             spi.write(ctx, CMD, command);
@@ -1103,6 +1111,10 @@ mod tests {
             Recorder(Rc::default()).holds_data(0, 1),
             "what a chip answers when it does not say otherwise"
         );
+        assert!(
+            Recorder(Rc::default()).would_erase_the_chip(),
+            "a chip that does not say is asked before every chip erase"
+        );
         // No other command is expected to reach past one page, whether it names an address (a
         // sector erase) or none (a write enable, a status read), so the chip was not asked: the
         // whole range is told, which is never less than what changed.
@@ -1116,10 +1128,12 @@ mod tests {
         const CMD_CE: u32 = 1 << 22;
         let ctx = &mut Ctx::default();
         let asked = Rc::new(Cell::new(0));
+        let would_erase = Rc::new(Cell::new(true));
         let mut spi = Spi1::new(Box::new(ErasesThreePages {
             generation: 0,
             holds: None,
             asked: Rc::clone(&asked),
+            would_erase: Rc::clone(&would_erase),
         }));
         // The commands that accompany every program and every erase, hard-wired and through
         // `USR`: write enable, write disable, the status read and write, the id read, the
@@ -1155,6 +1169,13 @@ mod tests {
         spi.write(ctx, USER2, 0x7000_0060);
         spi.write(ctx, CMD, CMD_USR);
         assert_eq!(asked.get(), 512);
+        // A chip erase the chip would ignore or refuse: nothing to ask, by either opcode.
+        would_erase.set(false);
+        spi.write(ctx, CMD, CMD_CE);
+        spi.write(ctx, CMD, CMD_USR);
+        assert_eq!(spi.commands_sent(0xC7), 2, "it was sent");
+        assert_eq!(spi.commands_sent(0x60), 2, "it was sent");
+        assert_eq!(asked.get(), 512, "and nothing was asked");
         assert_eq!(ctx.take_unsupported(), None);
     }
 

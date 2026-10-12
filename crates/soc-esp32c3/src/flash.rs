@@ -480,6 +480,17 @@ pub trait FlashDevice: fmt::Debug {
     fn holds_data(&self, _start: u32, _len: u32) -> bool {
         true
     }
+    /// Whether an erase of the whole chip sent now would run: its write-enable latch is set and
+    /// no block-protect bit refuses it. The caller asks [`FlashDevice::holds_data`] of every
+    /// page before such an erase only when it would run: a chip erase the chip ignores or
+    /// refuses changes nothing, and a firmware that sends it in a loop must not pay 256
+    /// questions a round for it.
+    ///
+    /// A chip that keeps no account of it answers `true`: the caller then asks, as before every
+    /// chip erase.
+    fn would_erase_the_chip(&self) -> bool {
+        true
+    }
 }
 
 /// A set of 4 KiB sectors of the chip: one bit per sector of the largest chip, 512 bytes
@@ -865,6 +876,13 @@ impl FlashDevice for NorFlash {
         let first = start / SECTOR_BYTES;
         self.not_blank
             .intersects(first, last / SECTOR_BYTES - first + 1)
+    }
+
+    /// The two conditions [`NorFlash::erase_chip`] checks before it erases: the latch (a chip
+    /// ignores the write without it) and the block protection (refused). Its range is the
+    /// whole chip and always inside it.
+    fn would_erase_the_chip(&self) -> bool {
+        self.status & STATUS_WEL != 0 && self.status & STATUS_BP == 0
     }
 
     fn read(&self, offset: u32, out: &mut [u8]) {
@@ -2197,6 +2215,27 @@ mod tests {
         assert_eq!(status(&mut flash), 0);
         // The status register is not content: the four status writes changed no byte of it.
         assert_eq!((flash.generation(), flash.modified_sectors()), (0, 0));
+    }
+
+    #[test]
+    fn the_chip_says_a_chip_erase_would_run_exactly_when_it_runs() {
+        // Every status byte, both opcodes: what the chip answers before the command is what the
+        // command then does.
+        for status in 0..=u8::MAX {
+            for opcode in [0xC7, 0x60] {
+                let mut flash =
+                    NorFlash::with_image(vec![0x0F; 16], FlashConfig::default()).unwrap();
+                flash.status = status;
+                let said = flash.would_erase_the_chip();
+                let ran = matches!(run(&mut flash, opcode, &mut []), Ok(Some(_)));
+                assert_eq!(said, ran, "status {status:#04x}, opcode {opcode:#04x}");
+                assert_eq!(
+                    said,
+                    status & STATUS_WEL != 0 && status & STATUS_BP == 0,
+                    "status {status:#04x}"
+                );
+            }
+        }
     }
 
     #[test]
