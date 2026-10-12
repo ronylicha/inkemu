@@ -1107,12 +1107,54 @@ fn run_with_flash_file(file: &std::path::Path, more: &[&str]) -> assert_cmd::ass
         .arg("--flash-file")
         .arg(file)
         .args(more)
+        // A refusal takes milliseconds: a command that waits on what it was given ends the test.
+        .timeout(std::time::Duration::from_secs(60))
         .assert()
 }
+
+/// What tells that a command was refused before it looked for a ROM: the name of the ROM file
+/// the empty directory of [`run_with_flash_file`] does not hold.
+const MISSING_ROM: &str = "esp32c3_rev3_rom.elf";
 
 /// A file of `len` zero bytes, sparse: nothing that large is written to the disk.
 fn sparse_file(path: &std::path::Path, len: u64) {
     std::fs::File::create(path).unwrap().set_len(len).unwrap();
+}
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Whether a file can be created in `dir`: the administrator creates one where the mode of the
+/// directory says nobody can, and a test of a refusal on permissions cannot be made as that user.
+#[cfg(unix)]
+fn takes_a_new_file(dir: &std::path::Path) -> bool {
+    let probe = dir.join("probe");
+    let created = std::fs::File::create(&probe).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    created
+}
+
+#[cfg(unix)]
+fn set_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Makes a named pipe at `path`: opening one for writing waits for a reader that never comes.
+#[cfg(unix)]
+fn make_fifo(path: &std::path::Path) {
+    let made = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo {}: {made}", path.display());
 }
 
 #[test]
@@ -1200,7 +1242,19 @@ fn a_flash_file_that_another_run_holds_is_refused_before_boot() {
     );
     drop(held);
     // The lock is free again: the same command now gets as far as the ROM it does not have.
-    run_with_flash_file(&file, &[])
+    // A lock lives as long as a copy of its descriptor does, and a test beside this one that
+    // starts a process holds one for an instant, between its fork and its exec: the command is
+    // tried again until that instant has passed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let freed = loop {
+        let run = run_with_flash_file(&file, &[]);
+        let still_held = String::from_utf8_lossy(&run.get_output().stderr).contains("in use");
+        if !still_held || std::time::Instant::now() >= deadline {
+            break run;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    freed
         .code(2)
         .stderr(contains("esp32c3_rev3_rom.elf").and(contains("in use").not()));
     assert!(!file.exists(), "a run that never started writes nothing");
@@ -1217,6 +1271,124 @@ fn a_flash_file_in_a_directory_that_does_not_exist_is_refused_before_boot() {
             ))
             .and(contains("esp32c3_rev3_rom.elf").not()),
     );
+}
+
+/// A name leaves room for the lock file and the temporary file, which are named after it with
+/// five bytes more, or the run is refused: no run starts whose flash could not be saved.
+#[cfg(unix)]
+#[test]
+fn a_flash_file_name_too_long_for_its_lock_file_is_refused_before_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    // 255 bytes is the longest name of a file on the filesystems a test runs on.
+    let longest = format!("{}.bin", "n".repeat(246));
+    run_with_flash_file(&dir.path().join(&longest), &[])
+        .code(2)
+        .stderr(contains(MISSING_ROM));
+    assert_eq!(
+        names_in(dir.path()),
+        [format!("{longest}.lock")],
+        "taken: the lock file, and nothing left of the trial of the temporary file"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let too_long = format!("{}.bin", "n".repeat(247));
+    run_with_flash_file(&dir.path().join(too_long), &[])
+        .code(2)
+        .stderr(
+            contains("cannot create the lock file")
+                .and(contains("; give the flash file a shorter name"))
+                .and(contains(MISSING_ROM).not()),
+        );
+    assert_eq!(names_in(dir.path()), [""; 0]);
+}
+
+/// `new.bin/` and `new.bin/.` name a directory: the content could not take that name when the
+/// run ends, and a run that starts must be able to keep its flash.
+#[test]
+fn a_flash_file_path_that_ends_as_the_path_of_a_directory_is_refused_before_boot() {
+    for ending in ["new.bin/", "new.bin/."] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = format!("{}/{ending}", dir.path().display());
+        run_with_flash_file(std::path::Path::new(&path), &[])
+            .code(2)
+            .stderr(
+                contains("ends as the path of a directory does")
+                    .and(contains("; give the path of the file itself"))
+                    .and(contains(MISSING_ROM).not()),
+            );
+        assert_eq!(names_in(dir.path()), [""; 0], "{ending}: nothing created");
+    }
+}
+
+/// A directory that takes no new file, and holds the lock file of an earlier run: the lock can
+/// be taken, the flash could not be saved. Known when the run starts, said when the run starts.
+#[cfg(unix)]
+#[test]
+fn a_flash_file_in_a_directory_that_takes_no_new_file_is_refused_before_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept_in = dir.path().join("flash");
+    std::fs::create_dir(&kept_in).unwrap();
+    std::fs::write(kept_in.join("x4.bin.lock"), b"").unwrap();
+    set_mode(&kept_in, 0o555);
+    let writable = takes_a_new_file(&kept_in);
+    let refused = run_with_flash_file(&kept_in.join("x4.bin"), &[]);
+    let left = names_in(&kept_in);
+    set_mode(&kept_in, 0o755);
+    assert!(
+        !writable,
+        "this test needs a user whom a read-only directory stops; run it as one"
+    );
+    refused.code(2).stderr(
+        contains("could not be written when this run ends")
+            .and(contains("cannot create "))
+            .and(contains(".x4.bin.tmp"))
+            .and(contains(
+                "; check that the directory exists and is writable",
+            ))
+            .and(contains(MISSING_ROM).not()),
+    );
+    assert_eq!(left, ["x4.bin.lock"]);
+}
+
+/// What a save that was killed left behind is removed by the next run on the same flash file,
+/// which holds the lock: no run is writing it.
+#[test]
+fn a_temporary_file_left_by_a_killed_save_is_removed_when_the_next_run_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".x4.bin.tmp"), b"a part of a flash").unwrap();
+    run_with_flash_file(&dir.path().join("x4.bin"), &[])
+        .code(2)
+        .stderr(contains(MISSING_ROM));
+    assert_eq!(names_in(dir.path()), ["x4.bin.lock"]);
+}
+
+/// A run refused for what sits at the path of its flash file creates nothing beside it.
+#[test]
+fn a_run_refused_for_what_is_at_the_flash_file_path_leaves_no_lock_file_beside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("x4.bin");
+    let refused_as = |cause: &str, more: &[&str]| {
+        let before = names_in(dir.path());
+        run_with_flash_file(&file, more)
+            .code(2)
+            .stderr(contains(cause).and(contains(MISSING_ROM).not()));
+        assert_eq!(names_in(dir.path()), before, "{cause}");
+    };
+    std::fs::create_dir(&file).unwrap();
+    refused_as("is not a regular file", &[]);
+    std::fs::remove_dir(&file).unwrap();
+    // A firmware image given to the wrong option.
+    std::fs::write(&file, build_flash_image(&ImageSpec::default())).unwrap();
+    refused_as("never padded or cut", &[]);
+    refused_as("never padded or cut", &["--reset-flash"]);
+    std::fs::remove_file(&file).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.path().join("elsewhere.bin"), &file).unwrap();
+        refused_as("a link is not followed", &[]);
+        std::fs::remove_file(&file).unwrap();
+        make_fifo(&file);
+        refused_as("is not a regular file", &[]);
+    }
 }
 
 /// Code that waits until the transmit FIFO of UART0 is empty. A second stage that prints must

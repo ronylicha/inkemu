@@ -25,12 +25,27 @@ pub enum FlashStateError {
     #[error("the flash file path {path} names no file; give the path of a file, like flash-x4.bin")]
     NoFileName { path: String },
     #[error(
-        "cannot create the lock file {lock} beside the flash file {path}: {detail}; check that the directory exists and is writable, or give a path in one that is"
+        "the flash file path {path} ends as the path of a directory does, with a separator or with `.`; give the path of the file itself, like flash-x4.bin"
     )]
+    NamesADirectory { path: String },
+    #[error("cannot create the lock file {lock} beside the flash file {path}: {detail}; {remedy}")]
     LockCreate {
         path: String,
         lock: String,
         detail: String,
+        remedy: &'static str,
+    },
+    /// Found when the run starts, before anything runs: the file the content goes through when
+    /// the run ends cannot be made now.
+    #[error(
+        "the flash file {path} could not be written when this run ends: cannot {action} {target}: {detail}; {remedy}"
+    )]
+    Unwritable {
+        path: String,
+        action: &'static str,
+        target: String,
+        detail: String,
+        remedy: &'static str,
     },
     #[error(
         "the flash file {path} is in use by another inkemu run, which holds the lock {lock}; wait for that run to end, or give this run another --flash-file"
@@ -80,6 +95,51 @@ pub enum FlashStateError {
 
 fn shown(path: &Path) -> String {
     sanitize(&path.display().to_string())
+}
+
+/// What to do about a file that cannot be created beside the flash file. The lock file and the
+/// temporary file are both named after the flash file with five bytes more: a name too long
+/// for one is too long for the other.
+fn creation_remedy(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::InvalidFilename {
+        "give the flash file a shorter name: its lock file and its temporary file are named after it, with 5 bytes more"
+    } else {
+        "check that the directory exists and is writable, or give a path in one that is"
+    }
+}
+
+/// Whether what is at `path` can be the flash file of a device whose flash is `size` bytes:
+/// `Ok(false)` when nothing is there, `Ok(true)` for a regular file of exactly that size.
+/// Nothing is opened: a link is not followed, and a pipe is not waited on.
+fn judge(path: &Path, shown: &str, size: u32) -> Result<bool, FlashStateError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => check(shown, size, &metadata).map(|()| true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(read_error(shown, &e)),
+    }
+}
+
+fn check(shown: &str, size: u32, metadata: &std::fs::Metadata) -> Result<(), FlashStateError> {
+    if !metadata.is_file() {
+        return Err(FlashStateError::NotAFile {
+            path: shown.to_owned(),
+        });
+    }
+    if metadata.len() != u64::from(size) {
+        return Err(FlashStateError::WrongSize {
+            path: shown.to_owned(),
+            len: metadata.len(),
+            size,
+        });
+    }
+    Ok(())
+}
+
+fn read_error(shown: &str, error: &std::io::Error) -> FlashStateError {
+    FlashStateError::Read {
+        path: shown.to_owned(),
+        detail: sanitize(&error.to_string()),
+    }
 }
 
 /// The SHA-256, in hexadecimal, of a flash of `size` bytes that holds `image` from offset 0 and is
@@ -138,24 +198,43 @@ impl FlashState {
     /// the lock file beside it if there is none, and locks it. Nothing of the flash file itself
     /// is read, created or changed.
     ///
+    /// Whatever would keep the content from being written when the run ends, and can be known
+    /// now, is refused now: a run must not go to its end to learn that what it wrote to the
+    /// flash is lost for a cause that was there before it started. What sits at the path is
+    /// judged first, so that a run refused for it creates nothing beside it; then, under the
+    /// lock, what a save that was killed left behind is removed, and the temporary file of this
+    /// run is created and removed, to know that it can be.
+    ///
     /// # Errors
-    /// [`FlashStateError`] when the path names no file, the lock file cannot be created, or
-    /// another run holds the lock.
+    /// [`FlashStateError`] when the path names no file, what is at the path cannot be the flash
+    /// file of the device, the lock file or the temporary file cannot be created, or another
+    /// run holds the lock.
     pub fn open(path: &Path, size: u32) -> Result<FlashState, FlashStateError> {
         let shown_path = shown(path);
         let Some(name) = path.file_name() else {
             return Err(FlashStateError::NoFileName { path: shown_path });
         };
+        // `new.bin/` and `new.bin/.` have a last name too, and name a directory: the content
+        // could not take that name. A path that names a file ends with the name of the file.
+        if !path
+            .as_os_str()
+            .as_encoded_bytes()
+            .ends_with(name.as_encoded_bytes())
+        {
+            return Err(FlashStateError::NamesADirectory { path: shown_path });
+        }
         let sibling = |prefix: &str, suffix: &str| {
             let mut sibling = OsString::from(prefix);
             sibling.push(name);
             sibling.push(suffix);
             path.with_file_name(sibling)
         };
+        // Before the lock file exists. The judgement that counts is made again under the lock,
+        // by whoever asks whether the file exists.
+        judge(path, &shown_path, size)?;
         let lock_path = sibling("", LOCK_SUFFIX);
         let shown_lock = shown(&lock_path);
-        // Opened for writing so that the directory is known to be writable now, not at the end
-        // of the run; nothing is ever written to it, and an existing one is not truncated.
+        // Nothing is ever written to it, and an existing one is not truncated.
         let lock = OpenOptions::new()
             .write(true)
             .create(true)
@@ -165,6 +244,7 @@ impl FlashState {
                 path: shown_path.clone(),
                 lock: shown_lock.clone(),
                 detail: sanitize(&e.to_string()),
+                remedy: creation_remedy(&e),
             })?;
         match lock.try_lock() {
             Ok(()) => {}
@@ -182,13 +262,50 @@ impl FlashState {
                 });
             }
         }
-        Ok(FlashState {
-            temporary: sibling(".", &format!(".{}.tmp", std::process::id())),
+        let state = FlashState {
+            // One name per flash file: the lock leaves this run alone with it.
+            temporary: sibling(".", ".tmp"),
             path: path.to_path_buf(),
             shown: shown_path,
             size,
             _lock: lock,
-        })
+        };
+        state.try_the_temporary_file()?;
+        Ok(state)
+    }
+
+    fn create_temporary(&self) -> std::io::Result<File> {
+        // `create_new` never follows a link and never reuses a file planted at the name.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.temporary)
+    }
+
+    /// Removes the temporary file a save that was killed left behind (no run is writing it:
+    /// this one holds the lock), then creates and removes the one of this run: the directory
+    /// takes a new file and the name fits, now.
+    fn try_the_temporary_file(&self) -> Result<(), FlashStateError> {
+        const REMOVE_IT: &str = "remove it, then run again";
+        let failed = |action: &'static str, remedy: &'static str, e: &std::io::Error| {
+            FlashStateError::Unwritable {
+                path: self.shown.clone(),
+                action,
+                target: shown(&self.temporary),
+                detail: sanitize(&e.to_string()),
+                remedy,
+            }
+        };
+        match std::fs::remove_file(&self.temporary) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(failed("remove", REMOVE_IT, &e)),
+        }
+        drop(
+            self.create_temporary()
+                .map_err(|e| failed("create", creation_remedy(&e), &e))?,
+        );
+        std::fs::remove_file(&self.temporary).map_err(|e| failed("remove", REMOVE_IT, &e))
     }
 
     /// The path of the flash file, with its control characters escaped: for messages.
@@ -204,11 +321,7 @@ impl FlashState {
     /// [`FlashStateError`] when what is at the path is not a regular file (a link is not
     /// followed), has another size, or cannot be looked at.
     pub fn exists(&self) -> Result<bool, FlashStateError> {
-        match std::fs::symlink_metadata(&self.path) {
-            Ok(metadata) => self.check(&metadata).map(|()| true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(self.read_error(&e)),
-        }
+        judge(&self.path, &self.shown, self.size)
     }
 
     /// The content of the flash file: exactly the bytes of the flash of the device. The size is
@@ -218,11 +331,16 @@ impl FlashState {
     /// [`FlashStateError`] when the file cannot be read, is not a regular file of the size of
     /// the flash, or changes while it is read.
     pub fn load(&self) -> Result<Vec<u8>, FlashStateError> {
-        let file = File::open(&self.path).map_err(|e| self.read_error(&e))?;
+        let read_error = |e: std::io::Error| read_error(&self.shown, &e);
+        let file = File::open(&self.path).map_err(read_error)?;
         // What was opened is judged, not what the path named a moment ago.
-        self.check(&file.metadata().map_err(|e| self.read_error(&e))?)?;
+        check(
+            &self.shown,
+            self.size,
+            &file.metadata().map_err(read_error)?,
+        )?;
         read_exactly(file, self.size)
-            .map_err(|e| self.read_error(&e))?
+            .map_err(read_error)?
             .map_err(|found| FlashStateError::Changed {
                 path: self.shown.clone(),
                 size: self.size,
@@ -254,19 +372,13 @@ impl FlashState {
                 size: self.size,
             }
         };
-        // `create_new` never follows a link and never reuses a file planted at the name. A
-        // leftover of a killed run is removed (a link itself, never its target), once.
-        let create = || {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&self.temporary)
-        };
-        let mut file = match create() {
+        // The name was free when the run started. Whatever was put there since is not this
+        // run's: it is removed (a link itself, never what it points to), once.
+        let mut file = match self.create_temporary() {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 std::fs::remove_file(&self.temporary)
                     .map_err(|e| failed("remove", &self.temporary, &e))?;
-                create()
+                self.create_temporary()
             }
             other => other,
         }
@@ -277,29 +389,6 @@ impl FlashState {
         drop(file);
         std::fs::rename(&self.temporary, &self.path)
             .map_err(|e| failed("move into place", &self.path, &e))
-    }
-
-    fn check(&self, metadata: &std::fs::Metadata) -> Result<(), FlashStateError> {
-        if !metadata.is_file() {
-            return Err(FlashStateError::NotAFile {
-                path: self.shown.clone(),
-            });
-        }
-        if metadata.len() != u64::from(self.size) {
-            return Err(FlashStateError::WrongSize {
-                path: self.shown.clone(),
-                len: metadata.len(),
-                size: self.size,
-            });
-        }
-        Ok(())
-    }
-
-    fn read_error(&self, error: &std::io::Error) -> FlashStateError {
-        FlashStateError::Read {
-            path: self.shown.clone(),
-            detail: sanitize(&error.to_string()),
-        }
     }
 }
 
@@ -547,10 +636,16 @@ mod tests {
         // A sparse file far larger than any flash: judged from its metadata.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x4.bin");
-        File::create(&path).unwrap().set_len(1 << 40).unwrap();
         let state = FlashState::open(&path, SIZE).unwrap();
+        File::create(&path).unwrap().set_len(1 << 40).unwrap();
         assert!(matches!(
             state.load(),
+            Err(FlashStateError::WrongSize { len, .. }) if len == 1 << 40
+        ));
+        drop(state);
+        // And when a run starts, before anything else is done.
+        assert!(matches!(
+            FlashState::open(&path, SIZE),
             Err(FlashStateError::WrongSize { len, .. }) if len == 1 << 40
         ));
     }
@@ -579,11 +674,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x4.bin");
         std::fs::create_dir(&path).unwrap();
+        let err = FlashState::open(&path, SIZE).unwrap_err();
+        assert!(matches!(err, FlashStateError::NotAFile { .. }), "{err}");
+        assert!(err.to_string().contains("; give the path"), "{err}");
+        assert_eq!(
+            names(dir.path()),
+            ["x4.bin"],
+            "no lock file beside what was refused"
+        );
+        // A directory that took the place of the flash file while a run went on.
+        std::fs::remove_dir(&path).unwrap();
         let state = FlashState::open(&path, SIZE).unwrap();
+        std::fs::create_dir(&path).unwrap();
         for err in [state.exists().unwrap_err(), state.load().unwrap_err()] {
             assert!(matches!(err, FlashStateError::NotAFile { .. }), "{err}");
-            assert!(err.to_string().contains("; give the path"), "{err}");
         }
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_flash_of_the_device_is_refused_before_a_lock_file_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firmware.bin");
+        std::fs::write(&path, [0xE9; 100]).unwrap();
+        let err = FlashState::open(&path, SIZE).unwrap_err();
+        assert!(
+            matches!(err, FlashStateError::WrongSize { len: 100, .. }),
+            "{err}"
+        );
+        assert_eq!(names(dir.path()), ["firmware.bin"]);
     }
 
     #[cfg(unix)]
@@ -594,11 +712,107 @@ mod tests {
         std::fs::write(&target, content(9)).unwrap();
         let path = dir.path().join("x4.bin");
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        let state = FlashState::open(&path, SIZE).unwrap();
-        let err = state.exists().unwrap_err();
+        let err = FlashState::open(&path, SIZE).unwrap_err();
         assert!(matches!(err, FlashStateError::NotAFile { .. }), "{err}");
         assert!(err.to_string().contains("a link is not followed"), "{err}");
         assert_eq!(std::fs::read(&target).unwrap(), content(9));
+        assert_eq!(names(dir.path()), ["precious.bin", "x4.bin"]);
+        // A link that took the place of the flash file while a run went on.
+        std::fs::remove_file(&path).unwrap();
+        let state = FlashState::open(&path, SIZE).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let err = state.exists().unwrap_err();
+        assert!(matches!(err, FlashStateError::NotAFile { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_path_that_ends_as_the_path_of_a_directory_is_refused_and_nothing_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        for ending in ["x4.bin/", "x4.bin/.", "x4.bin//", "x4.bin/./."] {
+            let path = format!("{}/{ending}", dir.path().display());
+            let err = FlashState::open(Path::new(&path), SIZE).unwrap_err();
+            assert!(
+                matches!(err, FlashStateError::NamesADirectory { .. }),
+                "{ending}: {err}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains(ending) && text.contains("; give the path of the file itself"),
+                "{text}"
+            );
+        }
+        assert_eq!(names(dir.path()), [""; 0]);
+        // Separators inside the path are no end of it: this one names a file.
+        let doubled = format!("{}//x4.bin", dir.path().display());
+        FlashState::open(Path::new(&doubled), SIZE).unwrap();
+        assert_eq!(names(dir.path()), ["x4.bin.lock"]);
+    }
+
+    // 255 bytes: the longest name of a file on the filesystems a test runs on.
+    #[cfg(unix)]
+    #[test]
+    fn the_longest_name_that_leaves_room_for_its_lock_file_is_saved_and_a_longer_one_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let longest = format!("{}.bin", "n".repeat(246));
+        let path = dir.path().join(&longest);
+        let state = FlashState::open(&path, SIZE).unwrap();
+        state.save(&content(1)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), content(1));
+        assert_eq!(
+            names(dir.path()),
+            [longest.clone(), format!("{longest}.lock")]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let too_long = dir.path().join(format!("{}.bin", "n".repeat(247)));
+        let err = FlashState::open(&too_long, SIZE).unwrap_err();
+        assert!(matches!(err, FlashStateError::LockCreate { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("; give the flash file a shorter name"),
+            "{err}"
+        );
+        assert_eq!(names(dir.path()), [""; 0], "nothing was created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_takes_no_new_file_is_refused_at_once_though_it_holds_the_lock_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("flash");
+        std::fs::create_dir(&inner).unwrap();
+        let path = inner.join("x4.bin");
+        // An earlier run left its lock file: taking the lock needs no new file.
+        drop(FlashState::open(&path, SIZE).unwrap());
+        let mode = |mode| std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(mode));
+        mode(0o555).unwrap();
+        let administrator = File::create(inner.join("probe")).is_ok();
+        let refused = FlashState::open(&path, SIZE);
+        mode(0o755).unwrap();
+        assert!(
+            !administrator,
+            "this test needs a user whom a read-only directory stops; run it as one"
+        );
+        let err = refused.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FlashStateError::Unwritable {
+                    action: "create",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("could not be written when this run ends")
+                && text.contains(".x4.bin.tmp")
+                && text.contains("; check that the directory exists and is writable"),
+            "{text}"
+        );
+        assert_eq!(names(&inner), ["x4.bin.lock"]);
     }
 
     #[test]
@@ -682,15 +896,24 @@ mod tests {
     }
 
     #[test]
-    fn a_leftover_at_the_temporary_name_is_replaced_and_a_link_planted_there_is_not_followed() {
+    fn what_a_killed_save_left_is_removed_at_the_start_and_a_link_planted_later_is_not_followed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x4.bin");
+        let temporary = dir.path().join(".x4.bin.tmp");
+        std::fs::write(
+            &temporary,
+            b"a part of a flash, left by a save that was killed",
+        )
+        .unwrap();
         let state = FlashState::open(&path, SIZE).unwrap();
-        let temporary = dir
-            .path()
-            .join(format!(".x4.bin.{}.tmp", std::process::id()));
-        assert_eq!(state.temporary, temporary);
-        std::fs::write(&temporary, b"left by a killed run").unwrap();
+        assert_eq!(state.temporary, temporary, "one name per flash file");
+        assert_eq!(
+            names(dir.path()),
+            ["x4.bin.lock"],
+            "removed by the run that holds the lock"
+        );
+        // What takes the name while the run goes on is not this run's: it is replaced.
+        std::fs::write(&temporary, b"planted").unwrap();
         state.save(&content(1)).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), content(1));
         #[cfg(unix)]
@@ -703,6 +926,28 @@ mod tests {
             assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
         }
         assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn what_sits_at_the_temporary_name_and_cannot_be_removed_is_refused_when_the_run_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".x4.bin.tmp")).unwrap();
+        let err = FlashState::open(&dir.path().join("x4.bin"), SIZE).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FlashStateError::Unwritable {
+                    action: "remove",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(".x4.bin.tmp") && text.contains("; remove it, then run again"),
+            "{text}"
+        );
     }
 
     #[test]
