@@ -172,7 +172,7 @@ SP1b-3d : 8. SP1b-3f : 10. SP1b-4 : 28. SP2 : 26. SP5a : 8. SP5b : 2. SP8 : 22. 
 
 ## Tests et coût en CI
 
-`cargo test --workspace` : 1 004 tests passent, 60 sont ignorés (18 de `real_rom`, 13 de `reference_boot`, 28 de `run_cli`, 1 de `inspect_cli` qui demande un firmware tiers). Il se lance sous un utilisateur ordinaire, pas sous `root` (voir plus haut). La CI exécute les tests ignorés avec leur compte exact :
+`cargo test --workspace` : 1 005 tests passent, 60 sont ignorés (18 de `real_rom`, 13 de `reference_boot`, 28 de `run_cli`, 1 de `inspect_cli` qui demande un firmware tiers). Il se lance sous un utilisateur ordinaire, pas sous `root` (voir plus haut). La CI exécute les tests ignorés avec leur compte exact :
 
 - job `rom-boot` : `real_rom` 18, et les tests de la commande sans firmware de référence, passés de 10 à 24 ;
 - job `reference-boot` : `reference_boot` passe de 7 à 13 tests, les tests de la commande sur le firmware de référence de 2 à 4.
