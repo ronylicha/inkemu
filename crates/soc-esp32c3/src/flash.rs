@@ -626,14 +626,16 @@ impl FlashDevice for NorFlash {
     }
 
     fn read(&self, offset: u32, out: &mut [u8]) {
-        let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        for (i, byte) in out.iter_mut().enumerate() {
-            *byte = start
-                .checked_add(i)
-                .and_then(|index| self.image.get(index))
-                .copied()
-                .unwrap_or(ERASED);
-        }
+        // The part of `out` the image holds is copied in one piece (the whole chip is read this
+        // way when its content leaves the machine); the rest reads erased.
+        let held = usize::try_from(offset)
+            .ok()
+            .and_then(|start| self.image.get(start..))
+            .unwrap_or_default();
+        let (copied, erased) = out.split_at_mut(held.len().min(out.len()));
+        // INVARIANT: `copied` is no longer than `held`, by the `min` above.
+        copied.copy_from_slice(&held[..copied.len()]);
+        erased.fill(ERASED);
     }
 
     fn execute(
@@ -770,6 +772,35 @@ mod tests {
         let mut bytes = [0u8; 6];
         flash.read(2, &mut bytes);
         assert_eq!(bytes, [2, 0x4F, 0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn a_read_of_any_range_is_the_image_where_it_has_bytes_and_erased_elsewhere() {
+        let image: Vec<u8> = (0..=9).collect();
+        let flash = NorFlash::with_image(image.clone(), FlashConfig::default()).unwrap();
+        // (offset, length): inside the image, straddling its end, at its end, far past it, and
+        // the offsets no chip has.
+        for (offset, len) in [
+            (0u32, 10usize),
+            (0, 3),
+            (7, 3),
+            (7, 8),
+            (10, 4),
+            (11, 4),
+            (0, 0),
+            (10, 0),
+            (1 << 24, 4),
+            (u32::MAX, 4),
+        ] {
+            let mut bytes = vec![0x55u8; len];
+            flash.read(offset, &mut bytes);
+            let expected: Vec<u8> = (u64::from(offset)..)
+                .take(len)
+                .map(|at| usize::try_from(at).ok().and_then(|at| image.get(at)))
+                .map(|byte| byte.copied().unwrap_or(ERASED))
+                .collect();
+            assert_eq!(bytes, expected, "{offset:#x} + {len}");
+        }
     }
 
     #[test]

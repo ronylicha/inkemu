@@ -428,8 +428,15 @@ impl Peripherals {
     /// The peripherals after a power-on, at the device time of `ctx`: a device that has a first
     /// deadline schedules it there. The reset values arm the flash-boot protection of main
     /// watchdog 0 and of the RTC watchdog when the chip is strapped to boot from flash.
+    ///
+    /// Only this crate can call it, for the reason [`SocBus::new`](crate::bus::SocBus) gives: the
+    /// chip is the one [`SocConfig::flash`] describes.
     #[must_use]
-    pub fn new(config: &SocConfig, flash: Box<dyn FlashDevice>, ctx: &mut Ctx) -> Peripherals {
+    pub(crate) fn new(
+        config: &SocConfig,
+        flash: Box<dyn FlashDevice>,
+        ctx: &mut Ctx,
+    ) -> Peripherals {
         let flash_boot = config.strapping & STRAP_SPI_FAST_FLASH_BOOT != 0;
         let efuse = Efuse::new(config.chip_revision);
         let mut periph = Peripherals {

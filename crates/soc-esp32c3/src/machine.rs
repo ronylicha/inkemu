@@ -505,6 +505,43 @@ impl Esp32C3 {
         self.bus.periph.spi1.flash_writes_dropped()
     }
 
+    /// The whole content of the flash chip as it is now, erased bytes included: exactly
+    /// [`FlashConfig::size`](crate::flash::FlashConfig::size) bytes, at most 16 MiB whatever the
+    /// firmware did. It is what a caller keeps to let a later run go on from this one: given
+    /// back to [`Esp32C3::with_flash`] with the same configuration, it builds a machine whose
+    /// flash holds the same bytes. The machine performs no host I/O; storing the bytes is the
+    /// caller's business.
+    ///
+    /// ```
+    /// use soc_esp32c3::{Esp32C3, FlashImageError, RomImage, SocConfig};
+    /// /// The machine of the next run: it starts again from the ROM, on the flash `last` left.
+    /// fn next_run(
+    ///     rom: RomImage,
+    ///     last: &Esp32C3,
+    ///     config: &SocConfig,
+    /// ) -> Result<Esp32C3, FlashImageError> {
+    ///     Esp32C3::with_flash(rom, last.flash_contents(), config)
+    /// }
+    /// ```
+    #[must_use]
+    pub fn flash_contents(&self) -> Vec<u8> {
+        let flash = self.bus.periph.spi1.flash();
+        // INVARIANT: a `u32` fits in `usize` on every target the workspace builds for (32 bits
+        // and more); the fallback, an empty content, is never taken.
+        let mut content = vec![0u8; usize::try_from(flash.size()).unwrap_or(0)];
+        flash.read(0, &mut content);
+        content
+    }
+
+    /// How many 4 KiB sectors of the flash hold a byte the run changed since the machine was
+    /// built: 0 says the content is the one the machine was given. A program or an erase that
+    /// left every byte as it was counts for nothing, and a reset does not start the count again:
+    /// the chip is not reset with the rest.
+    #[must_use]
+    pub fn flash_modified_sectors(&self) -> u32 {
+        self.bus.periph.spi1.flash().modified_sectors()
+    }
+
     /// Diagnostics seen for the first time since the last call.
     pub fn drain_diagnostics(&mut self) -> Vec<Diagnostic> {
         self.bus.ctx.diag.drain()
@@ -623,6 +660,75 @@ mod tests {
         assert_eq!(m.take_flash_writes(), [], "taken once");
         assert_eq!(m.flash_writes_dropped(), 0);
         assert_eq!(m.drain_diagnostics(), []);
+    }
+
+    /// Where two flash contents first differ, their common length when one is longer: a failed
+    /// comparison says an offset, not 16 MiB of bytes.
+    fn first_difference(left: &[u8], right: &[u8]) -> Option<usize> {
+        left.iter()
+            .zip(right)
+            .position(|(l, r)| l != r)
+            .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+    }
+
+    #[test]
+    fn the_content_of_the_flash_leaves_the_machine_whole_and_builds_the_same_flash_again() {
+        // A sector erased, four bytes programmed in it, and a program in another sector that
+        // changes no byte (0x00 AND 0x0F is 0x00): one sector was modified, not two.
+        let mut program = flash_erase_sector(0x9000);
+        program.extend(flash_program(0x9020, &[0xFE, 0xCA, 0xFF, 0x00]));
+        program.extend(flash_program(0x2000, &[0x0F]));
+        program.push(HANG);
+        let config = SocConfig::default();
+        let size = config.flash.size() as usize;
+        let image = vec![0u8; 0xA000];
+        let mut m = Esp32C3::with_flash(flat_rom(&program), image.clone(), &config).unwrap();
+        let before = m.flash_contents();
+        assert_eq!(before.len(), size, "the whole chip, not the image");
+        assert_eq!(before[..image.len()], image[..]);
+        assert!(before[image.len()..].iter().all(|&byte| byte == 0xFF));
+        assert_eq!(m.flash_modified_sectors(), 0);
+
+        m.run_until(Cycles(400));
+        let after = m.flash_contents();
+        let mut expected = before.clone();
+        expected[0x9000..0xA000].fill(0xFF);
+        expected[0x9020..0x9024].copy_from_slice(&[0xFE, 0xCA, 0xFF, 0x00]);
+        assert_eq!(
+            first_difference(&after, &expected),
+            None,
+            "the erase and the program, nothing else"
+        );
+        assert_eq!(m.flash_modified_sectors(), 1);
+        m.reset(ResetCause::Mwdt0Core);
+        assert_eq!(m.flash_modified_sectors(), 1, "the chip is not reset");
+        assert_eq!(first_difference(&m.flash_contents(), &expected), None);
+
+        // What left the machine is a content `with_flash` takes: the next machine starts from it.
+        let next = Esp32C3::with_flash(flat_rom(&[HANG]), after, &config).unwrap();
+        assert_eq!(first_difference(&next.flash_contents(), &expected), None);
+        assert_eq!(
+            next.flash_modified_sectors(),
+            0,
+            "a new run, nothing modified"
+        );
+    }
+
+    #[test]
+    fn a_machine_with_an_erased_flash_hands_over_a_chip_of_erased_bytes() {
+        let small = SocConfig {
+            flash: crate::flash::FlashConfig::new(
+                1 << 20,
+                crate::flash::JedecId::from_u24(0x9D_6014).unwrap(),
+            )
+            .unwrap(),
+            ..SocConfig::default()
+        };
+        let m = Esp32C3::new(flat_rom(&[HANG]), &small);
+        let content = m.flash_contents();
+        assert_eq!(content.len(), 1 << 20, "the size of the configuration");
+        assert!(content.iter().all(|&byte| byte == 0xFF));
+        assert_eq!(m.flash_modified_sectors(), 0);
     }
 
     #[test]

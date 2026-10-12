@@ -100,8 +100,22 @@ const fn size_mask(size: AccessSize) -> u32 {
 }
 
 impl SocBus {
+    /// The bus of a chip whose flash is `flash`.
+    ///
+    /// Only this crate can call it: [`Esp32C3::new`](crate::Esp32C3::new) and
+    /// [`Esp32C3::with_flash`](crate::Esp32C3::with_flash) build the chip from
+    /// [`SocConfig::flash`], so a machine never holds a flash whose size or id is another than
+    /// the one its configuration states. A caller outside the crate hands over bytes, not a chip;
+    /// the only thing that does not compile below is the call:
+    ///
+    /// ```compile_fail
+    /// use soc_esp32c3::{FlashDevice, RomImage, SocConfig};
+    /// fn a_bus_around_my_own_chip(rom: RomImage, flash: Box<dyn FlashDevice>, config: &SocConfig) {
+    ///     let _ = soc_esp32c3::bus::SocBus::new(rom, flash, config);
+    /// }
+    /// ```
     #[must_use]
-    pub fn new(rom: RomImage, flash: Box<dyn FlashDevice>, config: &SocConfig) -> SocBus {
+    pub(crate) fn new(rom: RomImage, flash: Box<dyn FlashDevice>, config: &SocConfig) -> SocBus {
         let mut ctx = Ctx::new(config.strict_mmio);
         let periph = Peripherals::new(config, flash, &mut ctx);
         SocBus {
