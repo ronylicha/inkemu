@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use cpu_rv32::{HartConfig, MisalignedPolicy};
 use emu_cli::exit::{EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
 use emu_cli::flash_file;
-use emu_cli::flash_state::RunFlash;
+use emu_cli::flash_state::{self, RunFlash};
 use emu_cli::rom_store::{
     self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
 };
@@ -292,6 +292,11 @@ fn run_device(
     let flash_size = profile.flash.size();
     // The flash image and the flash file are checked first: refusing them needs no ROM, and no
     // download should start for a run that cannot happen.
+    if let (Some(image), Some(file)) = (flash.image, flash.file)
+        && let Err(e) = flash_state::refuse_the_image_as_flash_file(image, file)
+    {
+        return fail(&e);
+    }
     let image = match flash.image {
         Some(path) => match flash_file::load(path, image_chip(&profile), flash_size) {
             Ok(bytes) => Some(bytes),

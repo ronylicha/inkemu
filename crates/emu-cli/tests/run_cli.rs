@@ -1239,6 +1239,71 @@ fn an_image_together_with_a_flash_file_that_exists_is_refused_before_boot() {
     assert_eq!(std::fs::metadata(&file).unwrap().len(), X4_FLASH_BYTES);
 }
 
+/// `--flash` is only read and the flash file is replaced: a file cannot be both. Whatever the
+/// route by which the two options reach the same file, with or without a reset, the run is
+/// refused before boot and the image is, byte for byte, the one it was.
+#[test]
+fn an_image_that_is_also_the_flash_file_is_refused_before_boot_by_every_route_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("x4.bin");
+    // A dump of the whole flash: an image for `--flash` and, by its size, a flash file too.
+    let mut bytes = build_flash_image(&ImageSpec::default());
+    bytes.resize(usize::try_from(X4_FLASH_BYTES).unwrap(), 0xFF);
+    std::fs::write(&image, &bytes).unwrap();
+    let digest = sha256_of(&image);
+    let mut routes = vec![
+        ("the same path", image.clone(), image.clone()),
+        (
+            "another spelling",
+            image.clone(),
+            dir.path().join(".").join("x4.bin"),
+        ),
+    ];
+    #[cfg(unix)]
+    {
+        let hard_link = dir.path().join("hard-link.bin");
+        std::fs::hard_link(&image, &hard_link).unwrap();
+        routes.push(("a hard link", hard_link, image.clone()));
+        let link = dir.path().join("link.bin");
+        std::os::unix::fs::symlink(&image, &link).unwrap();
+        routes.push(("a symbolic link", link, image.clone()));
+    }
+    let before = names_in(dir.path());
+    for (route, flash, flash_file) in routes {
+        for more in [&[][..], &["--reset-flash"][..]] {
+            let mut arguments = vec!["--flash", flash.to_str().unwrap()];
+            arguments.extend(more);
+            run_with_flash_file(&flash_file, &arguments).code(2).stderr(
+                contains("--flash and --flash-file name the same file")
+                    .and(contains("; drop --flash to go on from the file"))
+                    .and(contains("give --flash-file another path"))
+                    // No remedy that would have the image replaced.
+                    .and(contains("--reset-flash").not())
+                    .and(contains(MISSING_ROM).not()),
+            );
+            assert_eq!(sha256_of(&image), digest, "{route} {more:?}");
+            assert_eq!(
+                names_in(dir.path()),
+                before,
+                "{route} {more:?}: no lock file"
+            );
+        }
+    }
+    // Two files that only hold the same bytes are two files: the refusal is the one of an
+    // image beside a flash file that exists, whose remedies are sound here.
+    let copy = dir.path().join("copy.bin");
+    std::fs::copy(&image, &copy).unwrap();
+    run_with_flash_file(&image, &["--flash", copy.to_str().unwrap()])
+        .code(2)
+        .stderr(contains("both --flash and the flash file").and(contains("--reset-flash")));
+    run_with_flash_file(
+        &image,
+        &["--flash", copy.to_str().unwrap(), "--reset-flash"],
+    )
+    .code(2)
+    .stderr(contains(MISSING_ROM));
+}
+
 #[test]
 fn a_flash_file_that_another_run_holds_is_refused_before_boot() {
     let dir = tempfile::tempdir().unwrap();

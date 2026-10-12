@@ -103,6 +103,10 @@ pub enum FlashStateError {
     )]
     BothGiven { path: String },
     #[error(
+        "--flash and --flash-file name the same file, {image} and {path}: the image of --flash is only read, and the flash file is replaced when the run ends; drop --flash to go on from the file, or give --flash-file another path to keep the image as it is"
+    )]
+    SameFile { image: String, path: String },
+    #[error(
         "cannot write the flash file {path}: cannot {action} {target}: {detail}; what this run wrote to the flash is lost; check that the directory still exists, is writable and has {size} bytes free, then run again"
     )]
     Write {
@@ -127,6 +131,49 @@ fn creation_remedy(error: &std::io::Error) -> &'static str {
     } else {
         "check that the directory exists and is writable, or give a path in one that is"
     }
+}
+
+/// Refuses `image`, the file given to `--flash`, as the flash file of the same run: the image is
+/// only read, the flash file is replaced when the run ends, and one file cannot be both. Asked
+/// before anything is created: a refused run leaves no lock file beside the image.
+///
+/// # Errors
+/// [`FlashStateError::SameFile`] when the two paths lead to one file.
+pub fn refuse_the_image_as_flash_file(
+    image: &Path,
+    flash_file: &Path,
+) -> Result<(), FlashStateError> {
+    if same_file(image, flash_file) {
+        return Err(FlashStateError::SameFile {
+            image: shown(image),
+            path: shown(flash_file),
+        });
+    }
+    Ok(())
+}
+
+/// Whether the two paths lead to one file, by whatever route: another spelling of the path, a
+/// symbolic link (followed on both sides: a link to the image is the image) or a hard link. A
+/// path that leads to nothing is one file with no other: what is wrong with it is said by
+/// whoever opens it.
+#[cfg(unix)]
+fn same_file(one: &Path, other: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(one), std::fs::metadata(other)) {
+        (Ok(one), Ok(other)) => one.dev() == other.dev() && one.ino() == other.ino(),
+        _ => false,
+    }
+}
+
+/// Where the standard library gives a file no identity, the two paths are compared once every
+/// link in them is resolved. A hard link is then not seen; replacing the flash file leaves the
+/// other name of the image with its content.
+#[cfg(not(unix))]
+fn same_file(one: &Path, other: &Path) -> bool {
+    matches!(
+        (std::fs::canonicalize(one), std::fs::canonicalize(other)),
+        (Ok(one), Ok(other)) if one == other
+    )
 }
 
 /// Opens the file at `path` as `options` say, and never anything else that would be there in its
@@ -1504,6 +1551,51 @@ mod tests {
                 .iter()
                 .all(|&byte| byte == 0xFF)
         );
+    }
+
+    #[test]
+    fn the_image_is_refused_as_the_flash_file_by_every_route_to_it_and_by_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("x4.bin");
+        std::fs::write(&image, seed()).unwrap();
+        let refused = |route: &str, image: &Path, flash_file: &Path| {
+            let err = refuse_the_image_as_flash_file(image, flash_file).unwrap_err();
+            assert!(
+                matches!(err, FlashStateError::SameFile { .. }),
+                "{route}: {err}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains("name the same file")
+                    && text.contains("; drop --flash to go on from the file")
+                    && text.contains("give --flash-file another path")
+                    && !text.contains("--reset-flash"),
+                "{route}: {text}"
+            );
+        };
+        refused("the same path", &image, &image);
+        refused(
+            "another spelling",
+            &image,
+            &dir.path().join(".").join("x4.bin"),
+        );
+        #[cfg(unix)]
+        {
+            let hard_link = dir.path().join("hard-link.bin");
+            std::fs::hard_link(&image, &hard_link).unwrap();
+            refused("a hard link", &hard_link, &image);
+            let link = dir.path().join("link.bin");
+            std::os::unix::fs::symlink(&image, &link).unwrap();
+            refused("a link as the image", &link, &image);
+            refused("a link as the flash file", &image, &link);
+        }
+        // Another file with the same bytes, a file that is not there yet, and none at all.
+        let copy = dir.path().join("copy.bin");
+        std::fs::write(&copy, seed()).unwrap();
+        refuse_the_image_as_flash_file(&image, &copy).unwrap();
+        refuse_the_image_as_flash_file(&image, &dir.path().join("new.bin")).unwrap();
+        refuse_the_image_as_flash_file(&dir.path().join("gone.bin"), &image).unwrap();
+        refuse_the_image_as_flash_file(&dir.path().join("a"), &dir.path().join("a")).unwrap();
     }
 
     #[test]
