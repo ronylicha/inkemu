@@ -193,6 +193,20 @@ impl PartitionTable {
         Ok(out)
     }
 
+    /// The application the 2nd-stage bootloader starts when `otadata` is blank or absent: the
+    /// factory application, else the OTA slot `ota_0` (ESP-IDF v5.5.2,
+    /// `bootloader_utility.c`, `bootloader_utility_get_selected_boot_partition`: "Defaulting to
+    /// factory image", else "No factory image, trying OTA 0").
+    #[must_use]
+    pub fn application_slot(&self) -> Option<&Partition> {
+        let app = |subtype| {
+            self.entries
+                .iter()
+                .find(|p| p.ptype == TYPE_APP && p.subtype == subtype)
+        };
+        app(SUBTYPE_FACTORY).or_else(|| app(SUBTYPE_OTA_0))
+    }
+
     /// Reads a table back, verifying its MD5 entry when one is present.
     ///
     /// # Errors
@@ -287,6 +301,25 @@ mod tests {
             (t.entries[2].ptype, t.entries[2].subtype),
             (TYPE_APP, SUBTYPE_OTA_0)
         );
+    }
+
+    #[test]
+    fn the_application_slot_is_the_factory_one_else_ota_0() {
+        assert_eq!(
+            xteink_x4_stock()
+                .application_slot()
+                .map(|p| p.name.as_str()),
+            Some("app0")
+        );
+        let mut with_factory = xteink_x4_stock();
+        with_factory.entries[3].subtype = SUBTYPE_FACTORY;
+        assert_eq!(
+            with_factory.application_slot().map(|p| p.name.as_str()),
+            Some("app1")
+        );
+        let mut ota_1_only = xteink_x4_stock();
+        ota_1_only.entries.remove(2);
+        assert_eq!(ota_1_only.application_slot(), None);
     }
 
     #[test]
