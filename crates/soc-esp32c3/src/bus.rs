@@ -211,16 +211,24 @@ impl SocBus {
         // at most 4 bytes, so it touches at most two entries, one after the other: remembering the
         // last fault is enough to report each (entry, fault) once.
         let mut reported: Option<UnbackedByte> = None;
+        // The flash page of a byte a device may answer otherwise (`Extmem::window_read`). One
+        // access is one event, as above: the first such page is the one reported.
+        let mut stale: Option<u32> = None;
         // Byte by byte: a misaligned access may straddle two 64 KiB pages, each with its own entry.
         for (index, byte) in (0u32..len).zip(bytes.iter_mut()) {
             // INVARIANT: `locate` checked that the whole access lies inside the window, so
             // `window_offset + index` stays below `FLASH_WINDOW_SIZE` and cannot overflow.
             match self.flash_offset(window_offset + index) {
-                Ok(offset) => self
-                    .periph
-                    .spi1
-                    .flash()
-                    .read(offset, std::slice::from_mut(byte)),
+                Ok(offset) => {
+                    self.periph
+                        .spi1
+                        .flash()
+                        .read(offset, std::slice::from_mut(byte));
+                    let page = offset / MMU_PAGE_BYTES;
+                    if self.periph.extmem.window_read(page) {
+                        stale.get_or_insert(page);
+                    }
+                }
                 Err(unbacked) if reported == Some(unbacked) => {}
                 Err(unbacked) => {
                     // The fault registers and the diagnostic name the address of the access.
@@ -238,6 +246,13 @@ impl SocBus {
                     reported = Some(unbacked);
                 }
             }
+        }
+        if let Some(page) = stale {
+            self.ctx.diag.record(Diagnostic::StaleFlashWindow {
+                vaddr,
+                page,
+                pc: self.ctx.pc(),
+            });
         }
         ReadOutcome {
             value: u32::from_le_bytes(bytes) & size_mask(size),
@@ -294,10 +309,12 @@ impl SocBus {
 /// Delivers the events devices posted with [`Ctx::signal`], oldest first.
 ///
 /// The loop ends: the only code that posts a signal is a write to `SYSTEM.PERIP_RST_EN0/1`
-/// (`System::write`), which a register access reaches and a delivery does not. A delivery resets a
-/// module, and no module reset writes a register of `SYSTEM` or posts a signal. So the signals
-/// there are to deliver are those one register access posted (at most one per module), and
-/// delivering them posts none.
+/// (`System::write`: module resets), to `SPI1.CMD` (`Spi1::transfer`: a program or an erase
+/// changed the flash) or to `EXTMEM.ICACHE_SYNC_CTRL` (`Extmem::write`: a cache invalidation),
+/// which a register access reaches and a delivery does not. A delivery resets a module, or marks
+/// or clears flash pages in the cache state: none writes one of those registers or posts a
+/// signal. So the signals there are to deliver are those one register access posted (at most one
+/// per module, or one in all for the two others), and delivering them posts none.
 fn settle_signals(periph: &mut Peripherals, ctx: &mut Ctx) {
     while let Some(event) = ctx.take_signal() {
         periph.deliver(ctx, event);
@@ -1129,6 +1146,147 @@ mod tests {
             "RAM versions are untouched"
         );
         assert_eq!(b.ctx.diag.drain(), Vec::new());
+    }
+
+    fn spi1(b: &mut SocBus, register: &str, value: u32) {
+        b.write(svd_regs::esp32c3::addr("SPI1", register), Word, value)
+            .unwrap();
+    }
+    /// Programs one byte through SPI1 as the ROM and ESP-IDF do: write enable, then page program.
+    fn program_byte(b: &mut SocBus, flash_address: u32, byte: u8) {
+        spi1(b, "CMD", 1 << 30);
+        spi1(b, "W0", u32::from(byte));
+        spi1(b, "ADDR", (1 << 24) | flash_address);
+        spi1(b, "CMD", 1 << 25);
+    }
+    fn erase_sector(b: &mut SocBus, flash_address: u32) {
+        spi1(b, "CMD", 1 << 30);
+        spi1(b, "ADDR", flash_address);
+        spi1(b, "CMD", 1 << 24);
+    }
+    /// `Cache_Invalidate_ICache_Items(addr, lines)` (CM §4.1).
+    fn invalidate(b: &mut SocBus, addr: u32, lines: u32) {
+        for (register, value) in [
+            ("ICACHE_SYNC_ADDR", addr),
+            ("ICACHE_SYNC_SIZE", lines),
+            ("ICACHE_SYNC_CTRL", 1),
+        ] {
+            b.write(svd_regs::esp32c3::addr("EXTMEM", register), Word, value)
+                .unwrap();
+        }
+    }
+    fn stale(vaddr: u32, page: u32) -> Diagnostic {
+        Diagnostic::StaleFlashWindow { vaddr, page, pc: 0 }
+    }
+
+    #[test]
+    fn a_window_read_of_flash_programmed_since_it_was_read_is_reported_and_returns_the_flash() {
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 3, 1);
+        map(&mut b, 0, 0);
+        let vaddr = FLASH_DBUS_BASE + 0x3_0000;
+        assert_eq!(load(&mut b, vaddr), 0x4F02_06E9);
+        assert_eq!(load(&mut b, FLASH_DBUS_BASE), 0x4433_2211);
+        program_byte(&mut b, 0x1_0000, 0x00);
+        assert_eq!(
+            b.ctx.diag.drain(),
+            Vec::new(),
+            "the write itself is faithful"
+        );
+        assert_eq!(
+            load(&mut b, vaddr),
+            0x4F02_0600,
+            "the window stays a view of the flash: the new byte is returned"
+        );
+        assert_eq!(b.ctx.diag.drain(), vec![stale(vaddr, 1)]);
+        // The same page through the other window and at another address: the same line, counted.
+        assert_eq!(load(&mut b, FLASH_IBUS_BASE + 0x3_FFFC), 0xA3A2_A1A0);
+        assert_eq!(b.ctx.diag.drain(), Vec::new());
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 1)), 2);
+        // Page 0 was read too, and not written: its reads are those of a device.
+        assert_eq!(load(&mut b, FLASH_DBUS_BASE), 0x4433_2211);
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 0)), 0);
+    }
+
+    #[test]
+    fn an_invalidation_of_the_page_ends_the_report_until_it_is_written_again() {
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 3, 1);
+        let vaddr = FLASH_DBUS_BASE + 0x3_0000;
+        load(&mut b, vaddr);
+        program_byte(&mut b, 0x1_0000, 0x00);
+        // What `spi_flash_check_and_flush_cache` does after a write to mapped flash.
+        invalidate(&mut b, vaddr, 0x800);
+        assert_eq!(load(&mut b, vaddr), 0x4F02_0600);
+        assert_eq!(
+            b.ctx.diag.drain(),
+            Vec::new(),
+            "a device reads the flash again too"
+        );
+        // That read filled the cache again; an erase makes it stale again.
+        erase_sector(&mut b, 0x1_0000);
+        assert_eq!(load(&mut b, vaddr), 0xFFFF_FFFF);
+        assert_eq!(b.ctx.diag.drain(), vec![stale(vaddr, 1)]);
+        // `Cache_Invalidate_ICache_All`, as `Cache_Disable_ICache` issues it.
+        invalidate(&mut b, 0, 0);
+        load(&mut b, vaddr);
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 1)), 1, "no new occurrence");
+    }
+
+    #[test]
+    fn flash_written_before_a_window_read_it_or_left_as_it_was_is_not_reported() {
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 3, 1);
+        let vaddr = FLASH_DBUS_BASE + 0x3_0000;
+        // Written first, read after: no cache line held the bytes of before.
+        program_byte(&mut b, 0x1_0000, 0xE8);
+        assert_eq!(load(&mut b, vaddr), 0x4F02_06E8);
+        // Read, then a program that changes no byte (0xE8 AND 0xE8).
+        program_byte(&mut b, 0x1_0000, 0xE8);
+        assert_eq!(load(&mut b, vaddr), 0x4F02_06E8);
+        // Read, then a write to a page no window read.
+        program_byte(&mut b, 0x2_0000, 0x00);
+        assert_eq!(load(&mut b, vaddr), 0x4F02_06E8);
+        // Switching the cache off and on is no invalidation and no write.
+        for (register, value) in [("ICACHE_CTRL", 0), ("ICACHE_CTRL", 1)] {
+            b.write(svd_regs::esp32c3::addr("EXTMEM", register), Word, value)
+                .unwrap();
+        }
+        assert_eq!(load(&mut b, vaddr), 0x4F02_06E8);
+        assert_eq!(b.ctx.diag.drain(), Vec::new());
+    }
+
+    #[test]
+    fn one_load_that_straddles_a_stale_page_is_one_occurrence_at_its_address() {
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 3, 1);
+        map(&mut b, 4, 2);
+        let vaddr = FLASH_DBUS_BASE + 0x3_FFFE; // two bytes of flash page 1, two of page 2
+        assert_eq!(load(&mut b, vaddr), 0xB1B0_A3A2);
+        program_byte(&mut b, 0x2_0000, 0x00);
+        assert_eq!(load(&mut b, vaddr), 0xB100_A3A2);
+        assert_eq!(b.ctx.diag.drain(), vec![stale(vaddr, 2)]);
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 2)), 1);
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 1)), 0);
+    }
+
+    #[test]
+    fn strict_mode_turns_a_window_read_that_may_differ_into_a_violation() {
+        let mut b = bus_with_flash(SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        });
+        map(&mut b, 3, 1);
+        let vaddr = FLASH_DBUS_BASE + 0x3_0000;
+        load(&mut b, vaddr);
+        program_byte(&mut b, 0x1_0000, 0x00);
+        assert_eq!(
+            b.ctx.diag.take_violation(),
+            None,
+            "the write is no violation"
+        );
+        load(&mut b, vaddr);
+        assert_eq!(b.ctx.diag.take_violation(), Some(stale(vaddr, 1)));
     }
 
     #[test]

@@ -79,8 +79,9 @@ enum Command {
         )]
         max_time: Option<u64>,
         /// Stop at the first access to a register the emulator does not model, 8/16-bit write to a
-        /// peripheral register, operation the emulator cannot perform faithfully, or access to flash
-        /// that is not mapped (exit code 3).
+        /// peripheral register, operation the emulator cannot perform faithfully, access to flash
+        /// that is not mapped, or read through a flash window that may differ from the device
+        /// (exit code 3).
         #[arg(long)]
         strict_mmio: bool,
         /// Which console of the device goes to standard output.

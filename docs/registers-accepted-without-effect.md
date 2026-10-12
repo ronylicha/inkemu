@@ -130,9 +130,9 @@ its first section says which plan takes what.
 | `0x600c4000` | `EXTMEM.ICACHE_CTRL` | 1 | cache enable: the flash windows are always readable (D5) | SP1b-4 |
 | `0x600c4004` | `EXTMEM.ICACHE_CTRL1` | 1 | bus gating of the flash windows (SHUT_IBUS, SHUT_DBUS; D5) | SP1b-4 |
 | `0x600c4008` | `EXTMEM.ICACHE_TAG_POWER_CTRL` | 1 | tag memory power | SP8 |
-| `0x600c4028` | `EXTMEM.ICACHE_SYNC_CTRL` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
-| `0x600c402c` | `EXTMEM.ICACHE_SYNC_ADDR` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
-| `0x600c4030` | `EXTMEM.ICACHE_SYNC_SIZE` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
+| `0x600c4028` | `EXTMEM.ICACHE_SYNC_CTRL` | 1 | cache invalidation: completes at once, there are no cache lines; it only ends the stale-read warning of the flash pages it covers | SP1b-4 |
+| `0x600c402c` | `EXTMEM.ICACHE_SYNC_ADDR` | 1 | cache invalidation: completes at once, there are no cache lines; it only ends the stale-read warning of the flash pages it covers | SP1b-4 |
+| `0x600c4030` | `EXTMEM.ICACHE_SYNC_SIZE` | 1 | cache invalidation: completes at once, there are no cache lines; it only ends the stale-read warning of the flash pages it covers | SP1b-4 |
 | `0x600c4034` | `EXTMEM.ICACHE_PRELOAD_CTRL` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
 | `0x600c4040` | `EXTMEM.ICACHE_AUTOLOAD_CTRL` | 1 | cache operation: completes at once, there are no cache lines | SP1b-4 |
 | `0x600c40a8` | `EXTMEM.CACHE_WRAP_AROUND_CTRL` | 1 | wrap-around read mode | SP1b-4 |

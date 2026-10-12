@@ -1,8 +1,9 @@
 //! SPI0 and SPI1, the two controllers that share the flash chip (`spi_mem_reg.h`; reports BC §D.1,
 //! FB §B and §D). SPI1 runs the commands software asks for; SPI0 refills the cache, which this
 //! emulator does not model (the bus reads the flash directly), so SPI0 is configuration storage.
+use super::mmu::MMU_PAGE_BYTES;
 use super::{Accepted, SPI0_BASE, SPI1_BASE, Storage};
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, Event};
 use crate::diag::Unsupported;
 use crate::flash::{FlashAddress, FlashCommand, FlashDevice, FlashJournal, FlashWrite};
 use emu_core::Peripheral;
@@ -216,6 +217,23 @@ impl Peripheral<Ctx> for Spi0 {
     }
 }
 
+/// The first and the last 64 KiB flash page `write` holds bytes of, the unit of the MMU and of
+/// what the cache is told; `None` for a status write, which changes no content.
+fn cache_pages(write: &FlashWrite) -> Option<(u32, u32)> {
+    match *write {
+        // A program stays inside its 256-byte page, so inside one 64 KiB page.
+        FlashWrite::Program { address, .. } => {
+            let page = address / MMU_PAGE_BYTES;
+            Some((page, page))
+        }
+        FlashWrite::Erase { start, len } => {
+            let last = start.saturating_add(len.saturating_sub(1));
+            Some((start / MMU_PAGE_BYTES, last / MMU_PAGE_BYTES))
+        }
+        FlashWrite::Status { .. } => None,
+    }
+}
+
 #[derive(Debug)]
 pub struct Spi1 {
     registers: Storage,
@@ -280,9 +298,20 @@ impl Spi1 {
         data_in_len: usize,
     ) -> Option<Vec<u8>> {
         let mut data_in = vec![0u8; data_in_len.min(DATA_BYTES)];
+        let before = self.flash.generation();
         match self.flash.execute(command, &mut data_in) {
             Ok(written) => {
                 if let Some(write) = written {
+                    // The cache is told of the bytes that changed, not of a command that left
+                    // the content as it was: only the former can make a cached line stale.
+                    if self.flash.generation() != before
+                        && let Some((first_page, last_page)) = cache_pages(&write)
+                    {
+                        ctx.signal(Event::FlashWritten {
+                            first_page,
+                            last_page,
+                        });
+                    }
                     self.journal.record(write);
                 }
                 Some(data_in)
@@ -737,6 +766,84 @@ mod tests {
         assert_eq!(flash_bytes(&spi, 0, 0x2_0000), image);
         assert_eq!(spi.take_flash_writes(), []);
         assert_eq!(ctx.take_unsupported(), None);
+        assert_eq!(ctx.take_signal(), None, "the cache is told of nothing");
+    }
+
+    #[test]
+    fn a_command_that_changes_the_flash_tells_the_cache_which_pages_and_no_other_does() {
+        const CMD_CE: u32 = 1 << 22;
+        let ctx = &mut Ctx::default();
+        let mut spi = Spi1::new(Box::new(
+            NorFlash::with_image(vec![0x5A; 0x4_0000], FlashConfig::default()).unwrap(),
+        ));
+        let written = |first_page, last_page| {
+            Some(Event::FlashWritten {
+                first_page,
+                last_page,
+            })
+        };
+        fill_data_registers(ctx, &mut spi);
+        // Four bytes from 0x2FFFE: they wrap in their 256-byte page, so stay in 64 KiB page 2.
+        spi.write(ctx, ADDR, 0x0402_FFFE);
+        spi.write(ctx, CMD, CMD_WREN);
+        assert_eq!(ctx.take_signal(), None, "the latch is no content");
+        spi.write(ctx, CMD, CMD_PP);
+        assert_eq!(ctx.take_signal(), written(2, 2));
+        assert_eq!(ctx.take_signal(), None, "one command, one event");
+        // The same program again changes no byte: no line of a cache can be stale of it.
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, CMD, CMD_PP);
+        assert_eq!(ctx.take_signal(), None);
+        assert_eq!(spi.take_flash_writes().len(), 2, "both are in the journal");
+        // The last sector of page 1, then the 64 KiB block that is page 3.
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, ADDR, 0x1_F000);
+        spi.write(ctx, CMD, CMD_SE);
+        assert_eq!(ctx.take_signal(), written(1, 1));
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, ADDR, 0x3_0000);
+        spi.write(ctx, CMD, CMD_BE);
+        assert_eq!(ctx.take_signal(), written(3, 3));
+        // A status write changes no content; neither does a read.
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, RD_STATUS, 0);
+        spi.write(ctx, CMD, CMD_WRSR);
+        spi.write(ctx, CMD, CMD_RDSR);
+        spi.write(ctx, CMD, CMD_RDID);
+        assert_eq!(ctx.take_signal(), None);
+        // A chip erase: every page of the chip.
+        spi.write(ctx, CMD, CMD_WREN);
+        spi.write(ctx, CMD, CMD_CE);
+        let last_page = FlashConfig::default().size() / MMU_PAGE_BYTES - 1;
+        assert_eq!(ctx.take_signal(), written(0, last_page));
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
+    fn the_pages_of_a_write_are_those_of_its_bytes_whatever_its_numbers() {
+        let program = |address| FlashWrite::Program {
+            address,
+            data: vec![0; 64],
+        };
+        let erase = |start, len| FlashWrite::Erase { start, len };
+        assert_eq!(cache_pages(&program(0)), Some((0, 0)));
+        assert_eq!(
+            cache_pages(&program(0xFFFF)),
+            Some((0, 0)),
+            "wraps in its page"
+        );
+        assert_eq!(cache_pages(&program(0xFF_FFC0)), Some((255, 255)));
+        assert_eq!(cache_pages(&erase(0xE000, 0x1000)), Some((0, 0)));
+        assert_eq!(cache_pages(&erase(0x1_0000, 0x1_0000)), Some((1, 1)));
+        assert_eq!(cache_pages(&erase(0xF000, 0x2000)), Some((0, 1)));
+        assert_eq!(cache_pages(&erase(0, 0x100_0000)), Some((0, 255)));
+        assert_eq!(cache_pages(&FlashWrite::Status { value: 0x40 }), None);
+        // Numbers no chip produces must not overflow.
+        assert_eq!(
+            cache_pages(&erase(u32::MAX, u32::MAX)),
+            Some((0xFFFF, 0xFFFF))
+        );
+        assert_eq!(cache_pages(&erase(5, 0)), Some((0, 0)));
     }
 
     #[test]

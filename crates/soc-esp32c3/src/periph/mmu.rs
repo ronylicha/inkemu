@@ -49,6 +49,15 @@ impl MmuTable {
         self.entries.get(index).copied()
     }
 
+    /// The 64 KiB flash page entry `index` maps; `None` when the entry is invalid or `index` lies
+    /// past the table.
+    #[must_use]
+    pub fn flash_page(&self, index: usize) -> Option<u32> {
+        self.entry(index)
+            .filter(|content| content & MMU_ENTRY_INVALID == 0)
+            .map(|content| content & PAGE_NUMBER_MASK)
+    }
+
     /// The flash offset `window_offset` (an address minus the base of its window) maps to.
     ///
     /// # Errors
@@ -139,6 +148,21 @@ mod tests {
         );
         assert_eq!(mmu.entry(85), Some(0x1FF));
         assert_eq!(mmu.entry(128), None);
+    }
+
+    #[test]
+    fn the_flash_page_of_an_entry_is_its_low_byte_and_an_invalid_entry_has_none() {
+        let ctx = &mut Ctx::default();
+        let mut mmu = MmuTable::new();
+        assert_eq!(mmu.flash_page(3), None, "invalid from power-on");
+        mmu.write(ctx, 4 * 3, 0x35);
+        assert_eq!(mmu.flash_page(3), Some(0x35));
+        mmu.write(ctx, 4 * 3, 0x135);
+        assert_eq!(mmu.flash_page(3), None, "bit 8 set: the entry maps nothing");
+        mmu.write(ctx, 4 * 127, 0xFF);
+        assert_eq!(mmu.flash_page(127), Some(0xFF));
+        assert_eq!(mmu.flash_page(128), None);
+        assert_eq!(mmu.flash_page(usize::MAX), None);
     }
 
     #[test]

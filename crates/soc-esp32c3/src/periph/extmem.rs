@@ -4,8 +4,17 @@
 //! No cache line is modelled: the bus reads the flash through the MMU table at every access
 //! (decision D4). The operations software waits for (invalidate, preload, autoload, freeze)
 //! therefore complete at once, and the registers below only keep what software reads back.
+//!
+//! One thing a cache does is still followed, because it is where reading the flash live can differ
+//! from a device: a line filled from the flash keeps its bytes when SPI1 programs or erases them,
+//! until software invalidates it (CM §3, "Stale data"). [`Extmem::window_read`],
+//! [`Extmem::flash_written`] and [`Extmem::invalidate`] keep, per 64 KiB flash page, whether a
+//! window read may now return other bytes than a device would. The bus reports such a read; it
+//! still returns the bytes of the flash.
+use super::mmu::{MMU_ENTRIES, MMU_PAGE_BYTES, MmuTable};
 use super::{Accepted, EXTMEM_BASE, Storage};
-use crate::ctx::{Ctx, Source};
+use crate::ctx::{Ctx, Event, Source};
+use crate::memmap::{FLASH_DBUS_BASE, FLASH_IBUS_BASE, FLASH_WINDOW_SIZE};
 use emu_core::Peripheral;
 use svd_regs::esp32c3::addr;
 
@@ -16,6 +25,8 @@ const fn reg(name: &str) -> u32 {
 const ICACHE_CTRL: u32 = reg("ICACHE_CTRL");
 const ICACHE_CTRL1: u32 = reg("ICACHE_CTRL1");
 const ICACHE_SYNC_CTRL: u32 = reg("ICACHE_SYNC_CTRL");
+const ICACHE_SYNC_ADDR: u32 = reg("ICACHE_SYNC_ADDR");
+const ICACHE_SYNC_SIZE: u32 = reg("ICACHE_SYNC_SIZE");
 const ICACHE_PRELOAD_CTRL: u32 = reg("ICACHE_PRELOAD_CTRL");
 const ICACHE_AUTOLOAD_CTRL: u32 = reg("ICACHE_AUTOLOAD_CTRL");
 const ICACHE_FREEZE: u32 = reg("ICACHE_FREEZE");
@@ -33,6 +44,52 @@ const CACHE_MMU_FAULT_VADDR: u32 = reg("CACHE_MMU_FAULT_VADDR");
 /// SVD gives reset 1 (`INVALIDATE_ENA` set, `DONE` clear), which reads as a tag initialisation that
 /// ends before the ROM runs; the ROM sets bit 0 and waits for bit 1 either way (CM §9 item 5).
 const SYNC_DONE: u32 = 1 << 1;
+/// `ICACHE_SYNC_CTRL` bit 0, `INVALIDATE_ENA`: starts the invalidation of the range in
+/// `ICACHE_SYNC_ADDR` and `ICACHE_SYNC_SIZE` (`ROM3:Cache_Invalidate_ICache_Items@0x40050f28`:
+/// `SYNC_ADDR = addr`, `SYNC_SIZE[22:0] = n`, `SYNC_CTRL |= 1`; CM §4.1).
+const SYNC_INVALIDATE: u32 = 1 << 0;
+/// `ICACHE_SYNC_SIZE` [22:0]: the number of cache lines, not of bytes. `Cache_Invalidate_Addr`
+/// called for `0x10000` bytes writes `0x800` (CM §4.1, measured).
+const SYNC_LINES_MASK: u32 = 0x7F_FFFF;
+/// A cache line (`ROM3:Cache_Get_ICache_Line_Size@0x40050e4c` returns 32; CM §3).
+const LINE_BYTES: u64 = 32;
+/// The 64 KiB pages of the largest flash an MMU entry can name: its page number has 8 bits.
+const FLASH_PAGES: u32 = 256;
+const PAGE_SET_WORDS: usize = 4;
+const WORD_BITS: u32 = u64::BITS;
+
+/// A set of 64 KiB flash pages, one bit each: constant size whatever the firmware does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PageSet([u64; PAGE_SET_WORDS]);
+
+impl PageSet {
+    /// The word that holds `page` and the bit of the page in it; `None` past the 256 pages an
+    /// MMU entry can name, so that a page number out of range is in no set and changes none.
+    fn slot(&mut self, page: u32) -> Option<(&mut u64, u64)> {
+        let word = self.0.get_mut(usize::try_from(page / WORD_BITS).ok()?)?;
+        Some((word, 1 << (page % WORD_BITS)))
+    }
+
+    fn contains(&self, page: u32) -> bool {
+        usize::try_from(page / WORD_BITS)
+            .ok()
+            .and_then(|word| self.0.get(word))
+            .is_some_and(|word| word & (1 << (page % WORD_BITS)) != 0)
+    }
+
+    fn insert(&mut self, page: u32) {
+        if let Some((word, bit)) = self.slot(page) {
+            *word |= bit;
+        }
+    }
+
+    fn remove(&mut self, page: u32) {
+        if let Some((word, bit)) = self.slot(page) {
+            *word &= !bit;
+        }
+    }
+}
+
 /// `ICACHE_PRELOAD_CTRL`: bit 1 `DONE` (always set: nothing is ever preloading), bit 2 `ORDER` (stored).
 const PRELOAD_DONE: u32 = 1 << 1;
 const PRELOAD_ORDER: u32 = 1 << 2;
@@ -83,6 +140,7 @@ const ILLEGAL_GATES: [(u32, u32); 5] = [
 ];
 
 const WHY_OPERATION: &str = "cache operation: completes at once, there are no cache lines";
+const WHY_INVALIDATE: &str = "cache invalidation: completes at once, there are no cache lines; it only ends the stale-read warning of the flash pages it covers";
 const ACCEPTED: [Accepted; 12] = [
     Accepted::svd(
         "EXTMEM",
@@ -97,9 +155,9 @@ const ACCEPTED: [Accepted; 12] = [
         "SP1b-4",
     ),
     Accepted::svd("EXTMEM", "ICACHE_TAG_POWER_CTRL", "tag memory power", "SP8"),
-    Accepted::svd("EXTMEM", "ICACHE_SYNC_CTRL", WHY_OPERATION, "SP1b-4"),
-    Accepted::svd("EXTMEM", "ICACHE_SYNC_ADDR", WHY_OPERATION, "SP1b-4"),
-    Accepted::svd("EXTMEM", "ICACHE_SYNC_SIZE", WHY_OPERATION, "SP1b-4"),
+    Accepted::svd("EXTMEM", "ICACHE_SYNC_CTRL", WHY_INVALIDATE, "SP1b-4"),
+    Accepted::svd("EXTMEM", "ICACHE_SYNC_ADDR", WHY_INVALIDATE, "SP1b-4"),
+    Accepted::svd("EXTMEM", "ICACHE_SYNC_SIZE", WHY_INVALIDATE, "SP1b-4"),
     Accepted::svd("EXTMEM", "ICACHE_PRELOAD_CTRL", WHY_OPERATION, "SP1b-4"),
     Accepted::svd("EXTMEM", "ICACHE_AUTOLOAD_CTRL", WHY_OPERATION, "SP1b-4"),
     Accepted::svd(
@@ -130,12 +188,20 @@ pub struct Extmem {
     fault_content: u32,
     fault_vaddr: u32,
     generation: u64,
+    /// The flash pages read through a window since the cache was last invalidated for them: the
+    /// pages a device may hold lines of.
+    cached: PageSet,
+    /// Those of `cached` a program or an erase has changed since: a device may still answer a
+    /// window read of them with the bytes of before.
+    stale: PageSet,
 }
 
 impl Extmem {
     #[must_use]
     pub fn new() -> Extmem {
         Extmem {
+            cached: PageSet::default(),
+            stale: PageSet::default(),
             registers: Storage::accepted(EXTMEM_BASE, &ACCEPTED),
             preload_order: 0,
             autoload: 0,
@@ -154,6 +220,82 @@ impl Extmem {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// A read through a flash window reached the 64 KiB flash page `page`. Returns whether a
+    /// device may answer with other bytes than the flash now holds: the page was read through a
+    /// window, then programmed or erased, and the cache was not invalidated for it since.
+    ///
+    /// Constant cost: one bit set and one bit tested. A page number past the 256 an MMU entry can
+    /// name is in no set.
+    pub(crate) fn window_read(&mut self, page: u32) -> bool {
+        self.cached.insert(page);
+        self.stale.contains(page)
+    }
+
+    /// SPI1 changed bytes of the flash pages `first_page` to `last_page`. The pages a window read
+    /// since their last invalidation become stale; a page no window read is in no cache line.
+    ///
+    /// The two numbers come from an address the firmware wrote: the loop is bounded by
+    /// [`FLASH_PAGES`], whatever they are.
+    pub(crate) fn flash_written(&mut self, first_page: u32, last_page: u32) {
+        for page in first_page..=last_page.min(FLASH_PAGES - 1) {
+            if self.cached.contains(page) {
+                self.stale.insert(page);
+            }
+        }
+    }
+
+    /// Software invalidated the cache lines of the range in `ICACHE_SYNC_ADDR` and
+    /// `ICACHE_SYNC_SIZE`: the flash pages the range covers are in no line any more.
+    ///
+    /// - Address 0 with size 0 is every line (`ROM3:Cache_Invalidate_ICache_All@0x40051126` is
+    ///   `Cache_Invalidate_ICache_Items(0, 0)`; `Cache_Disable_ICache` and
+    ///   `Cache_Set_Default_Mode` call it; CM §4.1).
+    /// - Otherwise the range is `size` lines of 32 bytes from an address of one of the two
+    ///   windows. Both windows go through the one MMU table and the one cache (CM §1, §3), so the
+    ///   range names MMU entries whichever window it is given in. A page is dropped when a whole
+    ///   entry that maps it lies in the range, as `spi_flash_check_and_flush_cache` asks
+    ///   (`IDF:components/spi_flash/flash_mmap.c:306-321`: `cache_hal_invalidate_addr(vaddr,
+    ///   SPI_FLASH_MMU_PAGE_SIZE)`). A range that covers part of an entry drops nothing: the model
+    ///   keeps one bit per page, and the lines left in the cache would still be stale.
+    ///
+    /// ASSUMPTION: a size of 0 at another address than 0, and an address outside the two windows,
+    /// invalidate nothing. No ROM or ESP-IDF function issues either (`Cache_Invalidate_Addr`
+    /// returns 1 before it writes a register when the range is not inside one window, CM §4.1).
+    /// Reading a window, programming it, issuing such a request and reading again on a device
+    /// settles both.
+    ///
+    /// The loop is bounded by the 128 entries of the table, whatever the two registers hold.
+    pub(crate) fn invalidate(&mut self, mmu: &MmuTable) {
+        let addr = self.registers.read(ICACHE_SYNC_ADDR).unwrap_or(0);
+        let lines = self.registers.read(ICACHE_SYNC_SIZE).unwrap_or(0) & SYNC_LINES_MASK;
+        if lines == 0 {
+            if addr == 0 {
+                self.cached = PageSet::default();
+                self.stale = PageSet::default();
+            }
+            return;
+        }
+        let Some(start) = [FLASH_DBUS_BASE, FLASH_IBUS_BASE]
+            .into_iter()
+            .filter_map(|base| addr.checked_sub(base))
+            .find(|offset| *offset < FLASH_WINDOW_SIZE)
+        else {
+            return;
+        };
+        let page_bytes = u64::from(MMU_PAGE_BYTES);
+        let end = u64::from(start) + u64::from(lines) * LINE_BYTES;
+        let first = u64::from(start).div_ceil(page_bytes);
+        for entry in (first..end / page_bytes).take(MMU_ENTRIES) {
+            let page = usize::try_from(entry)
+                .ok()
+                .and_then(|index| mmu.flash_page(index));
+            if let Some(page) = page {
+                self.cached.remove(page);
+                self.stale.remove(page);
+            }
+        }
     }
 
     /// Records an access through an invalid MMU entry (`CACHE_ILG_INT_ST`, `CACHE_MMU_FAULT_*`; CM §6.1).
@@ -226,8 +368,15 @@ impl Peripheral<Ctx> for Extmem {
 
     fn write(&mut self, ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         match offset {
-            // The invalidation has nothing to invalidate; `SYNC_DONE` already reads set.
-            ICACHE_SYNC_CTRL => {}
+            // There is no line to invalidate and `SYNC_DONE` already reads set. What the request
+            // ends is the stale state of the pages it covers; which pages those are is told by
+            // the MMU table, another device, so the request comes back as an event
+            // (`Extmem::invalidate`).
+            ICACHE_SYNC_CTRL => {
+                if value & SYNC_INVALIDATE != 0 {
+                    ctx.signal(Event::CacheInvalidated);
+                }
+            }
             ICACHE_PRELOAD_CTRL => self.preload_order = value & PRELOAD_ORDER,
             ICACHE_AUTOLOAD_CTRL => self.autoload = value & AUTOLOAD_CONFIG,
             ICACHE_FREEZE => self.freeze = value & (FREEZE_ENA | FREEZE_MODE),
@@ -561,6 +710,211 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An MMU table whose entries map flash pages: `(entry, page)` pairs.
+    fn mapping(pairs: &[(u32, u32)]) -> MmuTable {
+        let ctx = &mut Ctx::default();
+        let mut mmu = MmuTable::new();
+        for &(entry, page) in pairs {
+            assert!(mmu.write(ctx, 4 * entry, page));
+        }
+        mmu
+    }
+
+    /// Software's request, as `Cache_Invalidate_ICache_Items(addr, lines)` issues it, and the
+    /// event it posts delivered as `Peripherals::deliver` does.
+    fn invalidate(x: &mut Extmem, mmu: &MmuTable, addr: u32, lines: u32) {
+        let ctx = &mut Ctx::default();
+        assert!(x.write(ctx, reg("ICACHE_SYNC_ADDR"), addr));
+        assert!(x.write(ctx, reg("ICACHE_SYNC_SIZE"), lines));
+        assert!(x.write(ctx, reg("ICACHE_SYNC_CTRL"), 1));
+        assert_eq!(ctx.take_signal(), Some(Event::CacheInvalidated));
+        assert_eq!(ctx.take_signal(), None, "one request, one event");
+        x.invalidate(mmu);
+    }
+
+    /// The lines of one 64 KiB MMU page: `Cache_Invalidate_Addr(vaddr, 0x10000)` writes `0x800`.
+    const PAGE_LINES: u32 = 0x800;
+    const PAGE: u32 = MMU_PAGE_BYTES;
+
+    #[test]
+    fn a_page_read_through_a_window_then_written_is_stale_until_the_cache_is_invalidated() {
+        let mmu = mapping(&[(3, 5)]);
+        let mut x = Extmem::new();
+        assert!(!x.window_read(5), "a first read is what the flash holds");
+        x.flash_written(5, 5);
+        assert!(
+            x.window_read(5),
+            "read, then written: a device has the line"
+        );
+        assert!(x.window_read(5), "and keeps it: the next read is stale too");
+        assert!(!x.window_read(4), "another page is untouched");
+        invalidate(&mut x, &mmu, FLASH_DBUS_BASE + 3 * PAGE, PAGE_LINES);
+        assert!(!x.window_read(5), "the line was dropped: the read is fresh");
+        // The read above filled the line again: a new write makes it stale again.
+        x.flash_written(5, 5);
+        assert!(x.window_read(5));
+    }
+
+    #[test]
+    fn a_page_written_before_any_window_read_it_is_not_stale() {
+        let mmu = mapping(&[(3, 5)]);
+        let mut x = Extmem::new();
+        x.flash_written(5, 5);
+        assert!(!x.window_read(5), "no line held the bytes of before");
+        // An invalidation forgets the read too: a write after it makes nothing stale.
+        invalidate(&mut x, &mmu, FLASH_IBUS_BASE + 3 * PAGE, PAGE_LINES);
+        x.flash_written(5, 5);
+        assert!(!x.window_read(5));
+    }
+
+    #[test]
+    fn a_write_marks_the_pages_of_its_range_that_were_read_and_no_other() {
+        let mut x = Extmem::new();
+        assert!(!x.window_read(2));
+        assert!(!x.window_read(4));
+        assert!(!x.window_read(5));
+        x.flash_written(1, 4); // a 64 KiB block erase and more: pages 1 to 4
+        assert!(x.window_read(2));
+        assert!(x.window_read(4));
+        assert!(!x.window_read(1), "in the range, never read");
+        assert!(!x.window_read(3), "in the range, never read");
+        assert!(!x.window_read(5), "read, past the range");
+        assert!(!x.window_read(0), "before the range");
+    }
+
+    #[test]
+    fn an_invalidation_drops_the_pages_of_the_whole_entries_it_covers_in_either_window() {
+        let mmu = mapping(&[(3, 5), (4, 6), (5, 7)]);
+        let stale = |x: &mut Extmem| [5, 6, 7].map(|page| x.window_read(page));
+        let mut x = Extmem::new();
+        let fill = |x: &mut Extmem| {
+            for page in [5, 6, 7] {
+                x.window_read(page);
+            }
+            x.flash_written(5, 7);
+        };
+        fill(&mut x);
+        assert_eq!(stale(&mut x), [true, true, true]);
+        // One entry, named through the data window, then another through the instruction window.
+        invalidate(&mut x, &mmu, FLASH_DBUS_BASE + 4 * PAGE, PAGE_LINES);
+        assert_eq!(stale(&mut x), [true, false, true]);
+        invalidate(&mut x, &mmu, FLASH_IBUS_BASE + 3 * PAGE, PAGE_LINES);
+        assert_eq!(stale(&mut x), [false, false, true]);
+        // Two entries at once.
+        fill(&mut x);
+        invalidate(&mut x, &mmu, FLASH_DBUS_BASE + 3 * PAGE, 2 * PAGE_LINES);
+        assert_eq!(stale(&mut x), [false, false, true]);
+        // A range that covers no whole entry leaves the lines it does not name: nothing is dropped.
+        fill(&mut x);
+        invalidate(&mut x, &mmu, FLASH_DBUS_BASE + 3 * PAGE, PAGE_LINES - 1);
+        assert_eq!(stale(&mut x), [true, true, true], "one line short");
+        invalidate(&mut x, &mmu, FLASH_DBUS_BASE + 3 * PAGE + 32, PAGE_LINES);
+        assert_eq!(stale(&mut x), [true, true, true], "one line late");
+        // One line late and long enough to cover the next entry: that one is dropped.
+        invalidate(
+            &mut x,
+            &mmu,
+            FLASH_DBUS_BASE + 3 * PAGE + 32,
+            2 * PAGE_LINES,
+        );
+        assert_eq!(stale(&mut x), [true, false, true]);
+    }
+
+    #[test]
+    fn an_invalidation_of_everything_drops_every_page() {
+        // `Cache_Invalidate_ICache_All` is `Cache_Invalidate_ICache_Items(0, 0)` (CM §4.1).
+        let mmu = MmuTable::new(); // nothing mapped: "everything" does not go through the table
+        let mut x = Extmem::new();
+        for page in [0, 63, 64, 255] {
+            x.window_read(page);
+        }
+        x.flash_written(0, 255);
+        assert!(x.window_read(0) && x.window_read(63) && x.window_read(64) && x.window_read(255));
+        invalidate(&mut x, &mmu, 0, 0);
+        for page in [0, 63, 64, 255] {
+            assert!(!x.window_read(page), "{page}");
+        }
+    }
+
+    #[test]
+    fn a_request_that_names_no_line_of_a_window_drops_nothing() {
+        let mmu = mapping(&[(0, 5), (127, 5)]);
+        let mut x = Extmem::new();
+        x.window_read(5);
+        x.flash_written(5, 5);
+        for (addr, lines) in [
+            (FLASH_DBUS_BASE, 0),                              // no line, at an address
+            (0, PAGE_LINES),                                   // lines, outside the windows
+            (FLASH_DBUS_BASE - PAGE, 2 * PAGE_LINES),          // starts before the window
+            (FLASH_IBUS_BASE + FLASH_WINDOW_SIZE, PAGE_LINES), // starts past its end
+            (FLASH_DBUS_BASE + PAGE, PAGE_LINES),              // an entry that maps nothing
+            (u32::MAX, u32::MAX),
+        ] {
+            invalidate(&mut x, &mmu, addr, lines);
+            assert!(x.window_read(5), "{addr:#x} {lines:#x}");
+        }
+        // The size field has 23 bits: the largest request from the last entry ends past the
+        // window and is still followed to the end of the table, no further.
+        invalidate(&mut x, &mmu, FLASH_IBUS_BASE + 127 * PAGE, u32::MAX);
+        assert!(!x.window_read(5));
+    }
+
+    #[test]
+    fn only_the_invalidate_bit_of_the_sync_register_asks_for_an_invalidation() {
+        let ctx = &mut Ctx::default();
+        let mut x = Extmem::new();
+        for value in [0, SYNC_DONE, !SYNC_INVALIDATE] {
+            assert!(x.write(ctx, reg("ICACHE_SYNC_CTRL"), value));
+            assert_eq!(ctx.take_signal(), None, "{value:#x}");
+        }
+        for value in [SYNC_INVALIDATE, 3, u32::MAX] {
+            assert!(x.write(ctx, reg("ICACHE_SYNC_CTRL"), value));
+            assert_eq!(
+                ctx.take_signal(),
+                Some(Event::CacheInvalidated),
+                "{value:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_the_cache_off_and_on_keeps_its_lines() {
+        // `Cache_Suspend_ICache` and `Cache_Resume_ICache` around a flash operation write
+        // `ICACHE_CTRL` and `ICACHE_CTRL1` and invalidate nothing (CM §4.1): the lines are still
+        // there when the cache is back, stale if the operation changed their bytes.
+        let ctx = &mut Ctx::default();
+        let mut x = Extmem::new();
+        x.window_read(5);
+        x.write(ctx, reg("ICACHE_CTRL1"), 3);
+        x.write(ctx, reg("ICACHE_CTRL"), 0);
+        x.flash_written(5, 5);
+        x.write(ctx, reg("ICACHE_CTRL"), 1);
+        x.write(ctx, reg("ICACHE_CTRL1"), 0);
+        assert_eq!(ctx.take_signal(), None);
+        assert!(x.window_read(5));
+    }
+
+    #[test]
+    fn page_numbers_no_entry_can_name_are_in_no_set() {
+        let mut x = Extmem::new();
+        for page in [256, 257, 1 << 16, u32::MAX] {
+            assert!(!x.window_read(page), "{page}");
+        }
+        // A range the firmware's address made absurd is followed to page 255 and no further.
+        x.window_read(255);
+        x.flash_written(0, u32::MAX);
+        assert!(x.window_read(255));
+        for page in [256, u32::MAX] {
+            assert!(!x.window_read(page), "{page}");
+        }
+        // An empty range (first past last) marks nothing.
+        let mut x = Extmem::new();
+        x.window_read(2);
+        x.flash_written(3, 2);
+        x.flash_written(300, 400);
+        assert!(!x.window_read(2));
     }
 
     #[test]

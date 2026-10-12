@@ -1,6 +1,7 @@
 //! What the emulator has to tell the user about the run: accesses it does not model, CPU
 //! exceptions, resets.
 use crate::flash::FlashRefusal;
+use crate::periph::mmu::MMU_PAGE_BYTES;
 use crate::reset::ResetCause;
 use cpu_rv32::Exception;
 use std::collections::BTreeMap;
@@ -219,6 +220,11 @@ pub enum Diagnostic {
         fault: MappingFault,
         pc: u32,
     },
+    /// A read through a flash window that a device may answer with other bytes. The emulator
+    /// reads the flash at every access; a device reads its cache, which keeps the bytes a 64 KiB
+    /// flash `page` held before SPI1 programmed or erased it, until software invalidates it
+    /// (report CM §3). The read returned the bytes the flash holds now.
+    StaleFlashWindow { vaddr: u32, page: u32, pc: u32 },
     /// A synchronous exception the CPU took. It is no error of the emulator: the firmware's trap
     /// handler runs, as on the device.
     Exception {
@@ -292,6 +298,8 @@ impl Diagnostic {
                 Unsupported::FlashSuspend { .. } => (17, 0, 0),
             },
             Diagnostic::FlashMapping { entry, fault, .. } => (10, entry, fault as u32),
+            // One line per flash page: the firmware reads the page again at many addresses.
+            Diagnostic::StaleFlashWindow { page, .. } => (21, page, 0),
             Diagnostic::Reset { cause, pc, .. } => (14, pc, cause.code()),
         }
     }
@@ -305,6 +313,7 @@ impl Diagnostic {
                 | Diagnostic::SubWordWrite { .. }
                 | Diagnostic::Unsupported { .. }
                 | Diagnostic::FlashMapping { .. }
+                | Diagnostic::StaleFlashWindow { .. }
         )
     }
 }
@@ -365,6 +374,15 @@ impl fmt::Display for Diagnostic {
                     "access to the flash window at {vaddr:#010x} through MMU entry {entry} (content {content:#05x}, pc {pc:#010x}), which names a page beyond the end of the flash: 0 was returned; check the flash size of the device profile"
                 ),
             },
+            Diagnostic::StaleFlashWindow { vaddr, page, pc } => {
+                // 64 bits: `page` is a number the firmware chose through an MMU entry.
+                let start = u64::from(page) * u64::from(MMU_PAGE_BYTES);
+                let end = start + u64::from(MMU_PAGE_BYTES) - 1;
+                write!(
+                    f,
+                    "read of the flash window at {vaddr:#010x} (pc {pc:#010x}) may differ from the device: flash {start:#08x} to {end:#08x} was read through a window, then programmed or erased, and the cache was not invalidated for it since; the bytes the flash holds now were returned, where a device may still return those of before; invalidate the cache for that range after the write, as ESP-IDF's esp_flash and esp_partition functions do for mapped flash"
+                )
+            }
             Diagnostic::Exception {
                 cause,
                 tval,
@@ -441,7 +459,8 @@ impl Diagnostics {
     }
 
     /// In strict mode, the first violation; `None` otherwise or once taken. A violation is the first
-    /// unmodeled access, sub-word register write, unsupported operation or invalid flash mapping.
+    /// unmodeled access, sub-word register write, unsupported operation, invalid flash mapping or
+    /// window read that may differ from the device.
     pub fn take_violation(&mut self) -> Option<Diagnostic> {
         self.violation.take()
     }
@@ -717,6 +736,11 @@ mod tests {
             unsupported(PROTECTED),
             mapping(3, MappingFault::InvalidEntry),
             mapping(3, MappingFault::BeyondFlash),
+            Diagnostic::StaleFlashWindow {
+                vaddr: 0x3C00_E000,
+                page: 0,
+                pc: 0x4038_0000,
+            },
         ] {
             let mut strict = Diagnostics::new(true);
             strict.record(diagnostic.clone());
@@ -1083,5 +1107,36 @@ mod tests {
             listed[0]
         );
         assert_eq!(d.occurrences(&listed[0]), 2, "the second one is counted");
+    }
+
+    #[test]
+    fn a_window_read_that_may_differ_is_listed_once_per_flash_page_and_says_what_to_do() {
+        let stale = |vaddr, page| Diagnostic::StaleFlashWindow {
+            vaddr,
+            page,
+            pc: 0x4038_0000,
+        };
+        let mut d = Diagnostics::new(false);
+        d.record(stale(0x3C00_E000, 0));
+        d.record(stale(0x3C00_E004, 0));
+        d.record(stale(0x3C01_0000, 1));
+        assert_eq!(
+            d.drain(),
+            vec![stale(0x3C00_E000, 0), stale(0x3C01_0000, 1)],
+            "one line per flash page, with the first address read"
+        );
+        assert_eq!(d.occurrences(&stale(0, 0)), 2);
+        let message = stale(0x3C01_E000, 1).to_string();
+        for part in [
+            "0x3c01e000",
+            "pc 0x40380000",
+            "may differ from the device",
+            "flash 0x010000 to 0x01ffff",
+            "invalidate the cache",
+        ] {
+            assert!(message.contains(part), "{part:?} in {message:?}");
+        }
+        // The page is a number the firmware chose: the message of any of them can be formed.
+        assert!(stale(0, u32::MAX).to_string().contains("0xffffffffffff"));
     }
 }

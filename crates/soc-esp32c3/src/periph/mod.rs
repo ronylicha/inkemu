@@ -473,6 +473,11 @@ impl Peripherals {
             Event::FlashWindowStore { instruction_bus } => {
                 self.extmem.latch_store(ctx, instruction_bus);
             }
+            Event::FlashWritten {
+                first_page,
+                last_page,
+            } => self.extmem.flash_written(first_page, last_page),
+            Event::CacheInvalidated => self.extmem.invalidate(&self.mmu),
             Event::Systimer => self.systimer.wake(ctx),
             Event::Timg(Group::Timg0) => self.timg0.wake(ctx),
             Event::Timg(Group::Timg1) => self.timg1.wake(ctx),
@@ -1196,6 +1201,17 @@ mod tests {
             assert_eq!(ctx.take_signal(), None, "{module:?}");
         }
         p.deliver(ctx, Event::ClockChanged);
+        assert_eq!(ctx.take_signal(), None);
+        // The two events of the cache state: marking and clearing flash pages posts nothing.
+        p.deliver(
+            ctx,
+            Event::FlashWritten {
+                first_page: 0,
+                last_page: u32::MAX,
+            },
+        );
+        assert_eq!(ctx.take_signal(), None);
+        p.deliver(ctx, Event::CacheInvalidated);
         assert_eq!(ctx.take_signal(), None);
     }
 

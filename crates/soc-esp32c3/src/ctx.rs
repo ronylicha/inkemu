@@ -91,6 +91,13 @@ pub enum Event {
     MmuFault { vaddr: u32, content: u32 },
     /// To `EXTMEM`: a store reached a flash window.
     FlashWindowStore { instruction_bus: bool },
+    /// To `EXTMEM`, from SPI1: a program or an erase changed bytes of the 64 KiB flash pages
+    /// `first_page` to `last_page`.
+    FlashWritten { first_page: u32, last_page: u32 },
+    /// To `EXTMEM`, from its own `ICACHE_SYNC_CTRL`: software invalidated the cache range its
+    /// `ICACHE_SYNC_ADDR` and `ICACHE_SYNC_SIZE` name. It comes back as an event because what
+    /// the range holds is told by the MMU table, another device.
+    CacheInvalidated,
     /// Wake-up of the SYSTIMER: one of its comparators may have an alarm due.
     Systimer,
     /// Wake-up of UART 0 or 1: its transmitter may have gone idle.
@@ -348,9 +355,11 @@ impl Ctx {
     ///
     /// The rule for a device author: a signal is delivered before the instruction that posted it
     /// ends, and the delivery of signals is not bounded by a pass. So a device must not post a
-    /// signal from the delivery of a signal or of a wake-up (today only a write to `SYSTEM`
-    /// posts one, and no delivery writes `SYSTEM`): a chain of signals each posting the next
-    /// would never let the instruction end.
+    /// signal from the delivery of a signal or of a wake-up: a chain of signals each posting the
+    /// next would never let the instruction end. Today three register writes post one, and no
+    /// delivery writes any of the three registers: `SYSTEM.PERIP_RST_EN0/1` (module resets),
+    /// `SPI1.CMD` (a program or an erase changed the flash) and `EXTMEM.ICACHE_SYNC_CTRL` (a
+    /// cache invalidation).
     pub fn signal(&mut self, event: Event) {
         self.signals.push_back(event);
     }

@@ -22,7 +22,8 @@ Exit codes:
      pressed, or the reader of standard output went away
   2  error: unknown device, missing or invalid ROM, refused flash image, or standard output cannot be written
   3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
-     emulator cannot perform faithfully, or flash that is not mapped)
+     emulator cannot perform faithfully, flash that is not mapped, or a read through a flash
+     window that may differ from the device)
   4  the CPU waits for an interrupt and none can come: no interrupt line is pending and no device
      has anything scheduled
 130  Ctrl-C was pressed a second time before the run had stopped: no summary was printed";

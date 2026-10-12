@@ -497,7 +497,8 @@ fn run_help_documents_the_flash_option_and_what_strict_stops_on() {
     inkemu().args(["run", "--help"]).assert().code(0).stdout(
         contains("--flash")
             .and(contains("erased"))
-            .and(contains("flash that is not mapped")),
+            .and(contains("flash that is not mapped"))
+            .and(contains("window that may differ from the device")),
     );
 }
 

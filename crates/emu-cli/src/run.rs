@@ -246,6 +246,7 @@ const fn journal_prefix(diagnostic: &Diagnostic) -> &'static str {
         | Diagnostic::SubWordWrite { .. }
         | Diagnostic::Unsupported { .. }
         | Diagnostic::FlashMapping { .. }
+        | Diagnostic::StaleFlashWindow { .. }
         | Diagnostic::Exception { .. }
         | Diagnostic::Suppressed => "warning",
     }

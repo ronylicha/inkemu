@@ -1132,7 +1132,17 @@ mod tests {
         const A0: u8 = 10;
         let mut m = calls_flash_code_around(&flash_program(0, &addi(A0, 0, 1).to_le_bytes()));
         m.run_until(Cycles(600));
-        assert_eq!(m.drain_diagnostics(), Vec::new());
+        // The program changed code the CPU had fetched, and nothing invalidated the cache: a
+        // device may run the function of before once more. The fetch is reported, at its address.
+        let window = crate::memmap::FLASH_IBUS_BASE;
+        assert_eq!(
+            m.drain_diagnostics(),
+            vec![Diagnostic::StaleFlashWindow {
+                vaddr: window,
+                page: 0,
+                pc: window,
+            }]
+        );
         assert_eq!(
             (
                 bus_word(&mut m, SRAM_DBUS_BASE),
