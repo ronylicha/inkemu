@@ -73,6 +73,17 @@ pub fn build_image(spec: &ImageSpec) -> Vec<u8> {
     out
 }
 
+/// Recomputes the SHA-256 appended to `image`, over every byte before it: a test that changes a
+/// header byte (the digest covers the header) keeps the image valid with this.
+///
+/// # Panics
+/// When `image` is shorter than a digest.
+pub fn refresh_digest(image: &mut [u8]) {
+    let hashed = image.len() - 32;
+    let digest = Sha256::digest(&image[..hashed]);
+    image[hashed..].copy_from_slice(&digest);
+}
+
 /// An erased flash byte, which fills the gap between the image and the partition table.
 const ERASED: u8 = 0xFF;
 
@@ -138,6 +149,19 @@ mod tests {
             PartitionTable::parse(&flash[0x8000..]),
             Ok(xteink_x4_stock())
         );
+    }
+
+    #[test]
+    fn a_header_byte_changed_and_the_digest_refreshed_is_a_valid_image() {
+        use crate::image::FirmwareImage;
+        let mut image = build_image(&ImageSpec::default());
+        image[15..17].copy_from_slice(&4u16.to_le_bytes());
+        assert!(
+            FirmwareImage::parse(&image).is_err(),
+            "the digest covers the header"
+        );
+        refresh_digest(&mut image);
+        assert_eq!(FirmwareImage::parse(&image).unwrap().min_chip_rev_full, 4);
     }
 
     #[test]

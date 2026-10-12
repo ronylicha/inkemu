@@ -44,6 +44,9 @@ pub struct FirmwareImage {
     pub segments: Vec<Segment>,
     pub hash_appended: bool,
     pub app_desc: Option<AppDesc>,
+    /// Bytes of the image, from its header to the end of its trailer (the checksum, and the
+    /// digest when one is appended). What follows in a file is not part of the image.
+    pub len: usize,
 }
 
 pub(crate) fn le_u16(b: &[u8], at: usize) -> u16 {
@@ -60,6 +63,26 @@ impl FirmwareImage {
     /// # Errors
     /// Any [`FirmwareError`] describing why the file is not a usable application image.
     pub fn parse(bytes: &[u8]) -> Result<FirmwareImage, FirmwareError> {
+        Self::parse_checked(bytes, true).map(|(image, _)| image)
+    }
+
+    /// Like [`FirmwareImage::parse`], but an appended SHA-256 that does not match is reported
+    /// (`false`) instead of refused: the mask ROM boots a bootloader whose digest is wrong when
+    /// secure boot is off (`docs/research/esp32c3-rom-flash-boot.md`, §F step 7). The checksum is
+    /// still required: the ROM refuses an image without it.
+    ///
+    /// # Errors
+    /// Any [`FirmwareError`] of [`FirmwareImage::parse`] but [`FirmwareError::HashMismatch`].
+    pub fn parse_reporting_digest(bytes: &[u8]) -> Result<(FirmwareImage, bool), FirmwareError> {
+        Self::parse_checked(bytes, false)
+    }
+
+    /// Parses an image; the answer says whether its appended digest matches (`true` when none
+    /// is appended). A digest that does not match is an error when `require_digest` is set.
+    fn parse_checked(
+        bytes: &[u8],
+        require_digest: bool,
+    ) -> Result<(FirmwareImage, bool), FirmwareError> {
         if bytes.starts_with(XOTA_MAGIC) {
             return Err(FirmwareError::EncryptedOta);
         }
@@ -89,9 +112,12 @@ impl FirmwareImage {
             .ok_or(FirmwareError::BadFlashSize { raw: size_code })?;
         let (segments, checksum, end) = Self::read_segments(bytes, usize::from(count))?;
         let hash_appended = bytes[HASH_APPENDED_OFFSET] != 0;
-        Self::verify_trailer(bytes, end, checksum, hash_appended)?;
+        let (len, digest_matches) = Self::verify_trailer(bytes, end, checksum, hash_appended)?;
+        if require_digest && !digest_matches {
+            return Err(FirmwareError::HashMismatch);
+        }
         let app_desc = segments.first().and_then(|s| AppDesc::parse(&s.data));
-        Ok(FirmwareImage {
+        let image = FirmwareImage {
             chip: ChipId::from_raw(le_u16(bytes, 12)),
             entry: le_u32(bytes, 4),
             spi_mode,
@@ -102,7 +128,9 @@ impl FirmwareImage {
             segments,
             hash_appended,
             app_desc,
-        })
+            len,
+        };
+        Ok((image, digest_matches))
     }
 
     /// Reads `count` segments; returns them, the XOR checksum of their data, and the
@@ -146,14 +174,15 @@ impl FirmwareImage {
         Ok((segments, checksum, pos))
     }
 
-    /// Checks the checksum byte (at the next `position % 16 == 15`) and, when announced,
-    /// the SHA-256 digest that follows it.
+    /// Checks the checksum byte (at the next `position % 16 == 15`) and, when announced, compares
+    /// the SHA-256 digest that follows it. Returns the length of the image and whether its digest
+    /// matches (`true` when none is appended).
     fn verify_trailer(
         bytes: &[u8],
         end: usize,
         checksum: u8,
         hash_appended: bool,
-    ) -> Result<(), FirmwareError> {
+    ) -> Result<(usize, bool), FirmwareError> {
         let checksum_pos = end + (TRAILER_ALIGN - 1 - end % TRAILER_ALIGN);
         let stored = *bytes
             .get(checksum_pos)
@@ -164,16 +193,15 @@ impl FirmwareImage {
                 computed: checksum,
             });
         }
-        if hash_appended {
-            let hashed_len = checksum_pos + 1;
-            let stored_hash = bytes
-                .get(hashed_len..hashed_len + SHA256_LEN)
-                .ok_or(FirmwareError::TruncatedTrailer)?;
-            if Sha256::digest(&bytes[..hashed_len]).as_slice() != stored_hash {
-                return Err(FirmwareError::HashMismatch);
-            }
+        let hashed_len = checksum_pos + 1;
+        if !hash_appended {
+            return Ok((hashed_len, true));
         }
-        Ok(())
+        let stored_hash = bytes
+            .get(hashed_len..hashed_len + SHA256_LEN)
+            .ok_or(FirmwareError::TruncatedTrailer)?;
+        let matches = Sha256::digest(&bytes[..hashed_len]).as_slice() == stored_hash;
+        Ok((hashed_len + SHA256_LEN, matches))
     }
 
     /// # Errors
@@ -234,6 +262,51 @@ mod tests {
             ),
             ("1.0.0", "demo", "v5.5.2")
         );
+    }
+
+    #[test]
+    fn the_length_of_an_image_ends_with_its_trailer_whatever_follows_it() {
+        for hash_appended in [true, false] {
+            let spec = ImageSpec {
+                hash_appended,
+                ..ImageSpec::default()
+            };
+            let bytes = build_image(&spec);
+            let mut longer = bytes.clone();
+            longer.extend([0xFF; 100]);
+            assert_eq!(FirmwareImage::parse(&bytes).unwrap().len, bytes.len());
+            assert_eq!(FirmwareImage::parse(&longer).unwrap().len, bytes.len());
+        }
+    }
+
+    #[test]
+    fn a_digest_that_does_not_match_can_be_reported_instead_of_refused() {
+        let mut bytes = build_image(&ImageSpec::default());
+        assert_eq!(
+            FirmwareImage::parse_reporting_digest(&bytes).map(|(_, matches)| matches),
+            Ok(true)
+        );
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        assert_eq!(
+            FirmwareImage::parse(&bytes),
+            Err(FirmwareError::HashMismatch)
+        );
+        let (image, matches) = FirmwareImage::parse_reporting_digest(&bytes).unwrap();
+        assert!(!matches);
+        assert_eq!(image.len, bytes.len());
+        // The checksum is never only reported.
+        let spec = ImageSpec {
+            hash_appended: false,
+            ..ImageSpec::default()
+        };
+        let mut bytes = build_image(&spec);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        assert!(matches!(
+            FirmwareImage::parse_reporting_digest(&bytes),
+            Err(FirmwareError::ChecksumMismatch { .. })
+        ));
     }
 
     #[test]
