@@ -1,5 +1,7 @@
 //! Device profiles: what a board is made of, as data.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
+pub mod notices;
+
 use firmware::bootloader::{ShippedBootloader, shipped};
 use firmware::partition::{Partition, PartitionError, PartitionTable, TYPE_APP, TYPE_DATA};
 use firmware::{Bootloader, ChipId, ComposeError, ComposedFlash, Device, FlashSize, SpiMode};

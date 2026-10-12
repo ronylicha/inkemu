@@ -113,6 +113,9 @@ enum Command {
         #[arg(long)]
         trace_hash: bool,
     },
+    /// Print the notices and the licences of the third-party parts built into inkemu: the
+    /// register descriptions of the chip and the 2nd-stage bootloader it ships.
+    Licenses,
     /// Manage the mask-ROM files the emulator needs.
     Rom {
         #[command(subcommand)]
@@ -169,6 +172,10 @@ fn main() -> ExitCode {
             allow_misaligned,
         ),
         Command::Inspect { file } => run_inspect(&file),
+        Command::Licenses => match print_stdout(&boards::notices::notices_text()) {
+            ControlFlow::Continue(()) => ExitCode::SUCCESS,
+            ControlFlow::Break(code) => code,
+        },
         Command::Run {
             device,
             flash,
