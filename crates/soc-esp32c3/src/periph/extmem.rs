@@ -272,9 +272,9 @@ impl Extmem {
     /// since their last invalidation become stale; a page no window read is in no cache line.
     ///
     /// The two numbers come from an address the firmware wrote: the loop is bounded by
-    /// [`FLASH_PAGES`], whatever they are.
+    /// [`FLASH_PAGES`], whatever they are ([`written_pages`]).
     pub(crate) fn flash_written(&mut self, first_page: u32, last_page: u32) {
-        for page in first_page..=last_page.min(FLASH_PAGES - 1) {
+        for page in written_pages(first_page, last_page) {
             if self.cached.contains(page) {
                 self.stale.insert(page);
             }
@@ -329,7 +329,8 @@ impl Extmem {
     /// read, while a device fills the line again at the next fetch. The cost is one decode of
     /// the flash code that runs next; a request that drops nothing costs nothing.
     ///
-    /// The loop is bounded by the 128 entries of the table, whatever the two registers hold.
+    /// The loop is bounded by the 128 entries of the table, whatever the two registers hold
+    /// ([`whole_entries`]).
     pub(crate) fn invalidate(&mut self, mmu: &MmuTable) {
         let addr = self.registers.read(ICACHE_SYNC_ADDR).unwrap_or(0);
         let lines = self.registers.read(ICACHE_SYNC_SIZE).unwrap_or(0) & SYNC_LINES_MASK;
@@ -350,15 +351,9 @@ impl Extmem {
         else {
             return;
         };
-        let page_bytes = u64::from(MMU_PAGE_BYTES);
-        let end = u64::from(start) + u64::from(lines) * LINE_BYTES;
-        let first = u64::from(start).div_ceil(page_bytes);
         let mut dropped = false;
-        for entry in (first..end / page_bytes).take(MMU_ENTRIES) {
-            let page = usize::try_from(entry)
-                .ok()
-                .and_then(|index| mmu.flash_page(index));
-            if let Some(page) = page {
+        for entry in whole_entries(start, lines) {
+            if let Some(page) = mmu.flash_page(entry) {
                 dropped |= self.cached.remove(page);
                 self.stale.remove(page);
             }
@@ -401,6 +396,23 @@ impl Extmem {
             self.access_status & self.access_enable & ACCESS_BITS != 0,
         );
     }
+}
+
+/// The flash pages a write of pages `first_page` to `last_page` reaches: those an MMU entry can
+/// name, so at most the [`FLASH_PAGES`] of the largest flash, whatever the two numbers are.
+fn written_pages(first_page: u32, last_page: u32) -> std::ops::RangeInclusive<u32> {
+    first_page..=last_page.min(FLASH_PAGES - 1)
+}
+
+/// The MMU entries that lie whole in `lines` cache lines from `start` bytes into a window, at
+/// most the [`MMU_ENTRIES`] of the table: the largest request, `0x7FFFFF` lines, covers 4,095
+/// entries from its start, and only those of the table exist.
+fn whole_entries(start: u32, lines: u32) -> std::ops::Range<usize> {
+    let page_bytes = u64::from(MMU_PAGE_BYTES);
+    let end = u64::from(start) + u64::from(lines) * LINE_BYTES;
+    let entry =
+        |bytes: u64| usize::try_from(bytes).map_or(MMU_ENTRIES, |entry| entry.min(MMU_ENTRIES));
+    entry(u64::from(start).div_ceil(page_bytes))..entry(end / page_bytes)
 }
 
 impl Default for Extmem {
@@ -1038,6 +1050,101 @@ mod tests {
         x.flash_written(3, 2);
         x.flash_written(300, 400);
         assert!(!x.window_read(2));
+    }
+
+    #[test]
+    fn the_pages_of_a_write_stop_at_the_last_page_an_entry_can_name() {
+        assert_eq!(written_pages(0, u32::MAX), 0..=255);
+        assert_eq!(written_pages(255, u32::MAX), 255..=255);
+        assert_eq!(written_pages(5, 7), 5..=7);
+        assert!(written_pages(300, u32::MAX).is_empty());
+        assert!(written_pages(3, 2).is_empty());
+    }
+
+    #[test]
+    fn the_entries_of_an_invalidation_stop_at_the_end_of_the_table() {
+        let last = FLASH_WINDOW_SIZE - 1;
+        // The largest request the 23-bit size field can make, from the start, the middle and
+        // the last byte of a window: 4,095 entries' worth, of which the table has 128.
+        assert_eq!(whole_entries(0, SYNC_LINES_MASK), 0..128);
+        assert_eq!(whole_entries(64 * PAGE, SYNC_LINES_MASK), 64..128);
+        assert_eq!(whole_entries(last, SYNC_LINES_MASK), 128..128);
+        assert_eq!(whole_entries(127 * PAGE, SYNC_LINES_MASK), 127..128);
+        assert_eq!(whole_entries(127 * PAGE + 1, SYNC_LINES_MASK), 128..128);
+        // What the value of the register can no longer hold, the function still bounds.
+        assert_eq!(whole_entries(last, u32::MAX), 128..128);
+        assert_eq!(whole_entries(0, u32::MAX), 0..128);
+        // Ordinary requests: one page, two, one line short, one line late.
+        assert_eq!(whole_entries(3 * PAGE, PAGE_LINES), 3..4);
+        assert_eq!(whole_entries(3 * PAGE, 2 * PAGE_LINES), 3..5);
+        assert!(whole_entries(3 * PAGE, PAGE_LINES - 1).is_empty());
+        assert!(whole_entries(3 * PAGE + 32, PAGE_LINES).is_empty());
+    }
+
+    #[test]
+    fn the_size_register_gives_its_low_23_bits_as_the_number_of_lines() {
+        // `ICACHE_SYNC_SIZE` [22:0] is the line count; bits 31:23 are not part of it.
+        let mmu = mapping(&[(3, 5)]);
+        // Bits 31:23 set and a line count of 0, at address 0: the request for everything.
+        for size in [0x0080_0000, 0xFF80_0000] {
+            let mut x = Extmem::new();
+            x.window_read(5);
+            x.window_read(200);
+            x.flash_written(0, 255);
+            invalidate(&mut x, &mmu, 0, size);
+            assert!(!x.window_read(5), "{size:#x}: everything was dropped");
+            assert!(!x.window_read(200), "{size:#x}: everything was dropped");
+        }
+        // The same high bits at an address in a window: a count of 0 there drops nothing.
+        for addr in [FLASH_DBUS_BASE + 3 * PAGE, FLASH_IBUS_BASE] {
+            let mut x = Extmem::new();
+            x.window_read(5);
+            x.flash_written(5, 5);
+            invalidate(&mut x, &mmu, addr, 0xFF80_0000);
+            assert!(x.window_read(5), "{addr:#x}: no line was named");
+        }
+        // High bits above a real count: the count alone decides.
+        let mut x = Extmem::new();
+        x.window_read(5);
+        x.flash_written(5, 5);
+        invalidate(
+            &mut x,
+            &mmu,
+            FLASH_DBUS_BASE + 3 * PAGE,
+            0xFF80_0000 | PAGE_LINES,
+        );
+        assert!(!x.window_read(5), "the entry's page was dropped");
+    }
+
+    #[test]
+    fn the_largest_requests_cost_the_table_and_the_256_pages_at_most() {
+        // Each call below is the worst a firmware can ask of the two loops: a write of every
+        // page number there is, an invalidation of every line the register can name from the
+        // first entry. Within their bounds they walk 256 pages and 128 entries; followed past
+        // them, the first walks 2^32 pages and the second 4,095 entries, or 2^21 with the size
+        // register unmasked.
+        let (stale, kept) = crate::test_support::within(
+            std::time::Duration::from_secs(10),
+            "the largest writes and invalidations did not end in 10 s: a loop follows a number the firmware wrote past its bound",
+            || {
+                let mmu = mapping(&[(0, 5), (127, 6)]);
+                let mut x = Extmem::new();
+                let mut stale = true;
+                let mut kept = false;
+                for _ in 0..10_000 {
+                    x.window_read(5);
+                    x.window_read(6);
+                    x.flash_written(0, u32::MAX);
+                    stale &= x.window_read(5) && x.window_read(6);
+                    invalidate(&mut x, &mmu, FLASH_DBUS_BASE, u32::MAX);
+                    kept |= x.window_read(5) || x.window_read(6);
+                    invalidate(&mut x, &mmu, FLASH_IBUS_BASE, SYNC_LINES_MASK);
+                }
+                (stale, kept)
+            },
+        );
+        assert!(stale, "every write reached pages 5 and 6");
+        assert!(!kept, "every invalidation dropped both entries' pages");
     }
 
     #[test]
