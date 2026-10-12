@@ -75,6 +75,7 @@ Deux comportements plus anciens sont maintenant marqués comme hypothèses et li
 - **Un module maintenu en reset tant que son bit reste à 1** : le modèle réinitialise sur le front montant seulement ; sur puce, un module dont le bit de reset est encore à 1 ne répondrait pas. Un firmware qui oublie de relâcher un reset marche ici et pas sur la puce : à nommer au moins par un diagnostic.
 - `mstatus.MPP` reste câblé à 3 ; `mie` et `mip` sont modélisés comme de simples registres (hypothèse ci-dessous).
 - **Fronts d'interruption** : voir « À prévoir plus tard » avant d'ajouter un périphérique qui émet des impulsions.
+- **La documentation générée n'est pas une porte de la CI** : `cargo doc --workspace --no-deps --document-private-items` réussit avec 68 avertissements (des plages de bits écrites `[31:30]` que rustdoc prend pour des liens, des chevrons non échappés), dont la plupart précèdent ce plan. À corriger puis à garder par `RUSTDOCFLAGS="-D warnings"` avec le reste de l'hygiène de la CI.
 - **Le cache de décodage et les instantanés** (point ouvert depuis SP1a, que la note de SP1b-1 rappelait) : `DecodeCache` n'a pas de `clear()`. Un reset n'en a pas besoin, `Hart::reset` reconstruit le cache à chaque niveau ; la restauration d'un instantané, qui arrive avec l'enregistrement et le rejeu, devra l'abandonner de la même façon.
 - Les lignes de la table qui nomment SP1b-4 : voir plus bas « Lignes de la table des registres acceptés, par héritier ».
 
