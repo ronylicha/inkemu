@@ -411,7 +411,7 @@ impl fmt::Display for Diagnostic {
                 let end = start + u64::from(MMU_PAGE_BYTES) - 1;
                 write!(
                     f,
-                    "read of the flash window at {vaddr:#010x} (pc {pc:#010x}) may differ from the device: flash {start:#08x} to {end:#08x} was read through a window, then programmed or erased, and the cache was not invalidated for it since; the bytes the flash holds now were returned, where a device may still return those of before; invalidate the cache for that range after the write, as ESP-IDF's esp_flash and esp_partition functions do for mapped flash"
+                    "read of the flash window at {vaddr:#010x} (pc {pc:#010x}) may differ from the device: flash {start:#08x} to {end:#08x} was read through a window, then programmed or erased, and the cache was not invalidated for it since; the bytes the flash holds now were returned, where a device may still return those of before; invalidate the cache at the window addresses that map that flash after the write, as ESP-IDF's esp_flash and esp_partition functions do for mapped flash"
                 )
             }
             Diagnostic::Exception {
@@ -1429,7 +1429,9 @@ mod tests {
             "pc 0x40380000",
             "may differ from the device",
             "flash 0x010000 to 0x01ffff",
-            "invalidate the cache",
+            // An invalidation takes addresses of a window, not a flash range: the remedy says
+            // which addresses.
+            "; invalidate the cache at the window addresses that map that flash",
         ] {
             assert!(message.contains(part), "{part:?} in {message:?}");
         }

@@ -225,9 +225,12 @@ impl SocBus {
         // at most 4 bytes, so it touches at most two entries, one after the other: remembering the
         // last fault is enough to report each (entry, fault) once.
         let mut reported: Option<UnbackedByte> = None;
-        // The flash page of a byte a device may answer otherwise (`Extmem::window_read`). One
-        // access is one event, as above: the first such page is the one reported.
-        let mut stale: Option<u32> = None;
+        // The flash page of the previous byte. The cache state is told of a read once per
+        // flash page of the access, not once per byte, and a page a device may answer otherwise
+        // (`Extmem::window_read`) is one event per access, as above. The bytes of an access go
+        // through two entries at most, one after the other, so two pages at most: remembering
+        // the last page is enough to see each once, and both are reported when both are stale.
+        let mut read_page: Option<u32> = None;
         // Byte by byte: a misaligned access may straddle two 64 KiB pages, each with its own entry.
         for (index, byte) in (0u32..len).zip(bytes.iter_mut()) {
             // INVARIANT: `locate` checked that the whole access lies inside the window, so
@@ -239,8 +242,13 @@ impl SocBus {
                         .flash()
                         .read(offset, std::slice::from_mut(byte));
                     let page = offset / MMU_PAGE_BYTES;
-                    if self.periph.extmem.window_read(page) {
-                        stale.get_or_insert(page);
+                    if read_page.replace(page) != Some(page) && self.periph.extmem.window_read(page)
+                    {
+                        self.ctx.diag.record(Diagnostic::StaleFlashWindow {
+                            vaddr,
+                            page,
+                            pc: self.ctx.pc(),
+                        });
                     }
                 }
                 Err(unbacked) if reported == Some(unbacked) => {}
@@ -260,13 +268,6 @@ impl SocBus {
                     reported = Some(unbacked);
                 }
             }
-        }
-        if let Some(page) = stale {
-            self.ctx.diag.record(Diagnostic::StaleFlashWindow {
-                vaddr,
-                page,
-                pc: self.ctx.pc(),
-            });
         }
         ReadOutcome {
             value: u32::from_le_bytes(bytes) & size_mask(size),
@@ -1356,6 +1357,29 @@ mod tests {
         assert_eq!(b.ctx.diag.drain(), vec![stale(vaddr, 2)]);
         assert_eq!(b.ctx.diag.occurrences(&stale(0, 2)), 1);
         assert_eq!(b.ctx.diag.occurrences(&stale(0, 1)), 0);
+    }
+
+    #[test]
+    fn one_load_that_straddles_two_stale_pages_reports_each_of_them_once() {
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 3, 1);
+        map(&mut b, 4, 2);
+        let vaddr = FLASH_DBUS_BASE + 0x3_FFFE; // two bytes of flash page 1, two of page 2
+        assert_eq!(load(&mut b, vaddr), 0xB1B0_A3A2);
+        program_byte(&mut b, 0x1_FFFF, 0x00);
+        program_byte(&mut b, 0x2_0000, 0x00);
+        assert_eq!(load(&mut b, vaddr), 0xB100_00A2);
+        // A device may answer either half with the bytes of before: both pages are named, in
+        // the order of the bytes, each for one access.
+        assert_eq!(b.ctx.diag.drain(), vec![stale(vaddr, 1), stale(vaddr, 2)]);
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 1)), 1);
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 2)), 1);
+        // The two halves in one flash page, through two entries (its last two bytes, then its
+        // first two): one page, one occurrence.
+        map(&mut b, 4, 1);
+        assert_eq!(load(&mut b, vaddr), 0x06E9_00A2);
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 1)), 2);
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 2)), 1);
     }
 
     #[test]

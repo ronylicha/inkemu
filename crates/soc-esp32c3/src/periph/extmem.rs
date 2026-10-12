@@ -260,8 +260,9 @@ impl Extmem {
     /// device may answer with other bytes than the flash now holds: the page was read through a
     /// window, then programmed or erased, and the cache was not invalidated for it since.
     ///
-    /// Constant cost: one bit set and one bit tested. A page number past the 256 an MMU entry can
-    /// name is in no set.
+    /// Constant cost: one bit set and one bit tested. The bus calls it once per flash page of an
+    /// access, so twice at most for an access that straddles two pages. A page number past the
+    /// 256 an MMU entry can name is in no set.
     pub(crate) fn window_read(&mut self, page: u32) -> bool {
         self.cached.insert(page);
         self.stale.contains(page)
