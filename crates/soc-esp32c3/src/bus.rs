@@ -1252,6 +1252,53 @@ mod tests {
     }
 
     #[test]
+    fn an_invalidation_at_one_address_of_a_page_ends_the_report_of_its_reads_at_another() {
+        // Pins the ASSUMPTION on `Extmem::invalidate`: the cache state is kept per flash page,
+        // so a request drops the page whichever address it was read at.
+        let other_window = FLASH_IBUS_BASE + 0x3_0000;
+        let other_entry = FLASH_DBUS_BASE + 0x4_0000;
+        for (read_at, invalidated_at) in [
+            (FLASH_DBUS_BASE + 0x3_0000, other_window),
+            (other_entry, FLASH_DBUS_BASE + 0x3_0000),
+        ] {
+            let mut b = bus_with_flash(SocConfig::default());
+            map(&mut b, 3, 1);
+            map(&mut b, 4, 1); // a second entry for the same flash page
+            load(&mut b, read_at);
+            program_byte(&mut b, 0x1_0000, 0x00);
+            invalidate(&mut b, invalidated_at, 0x800);
+            assert_eq!(load(&mut b, read_at), 0x4F02_0600);
+            assert_eq!(
+                b.ctx.diag.drain(),
+                Vec::new(),
+                "read at {read_at:#010x}, invalidated at {invalidated_at:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_one_byte_into_an_entry_or_at_an_entry_that_maps_nothing_keeps_the_report() {
+        // The other ASSUMPTION on `Extmem::invalidate`: the range starts at the address as
+        // written, so the entry it starts inside is not whole in it.
+        let mut b = bus_with_flash(SocConfig::default());
+        map(&mut b, 3, 1);
+        let vaddr = FLASH_DBUS_BASE + 0x3_0000;
+        load(&mut b, vaddr);
+        program_byte(&mut b, 0x1_0000, 0x00);
+        invalidate(&mut b, vaddr + 1, 0x800);
+        load(&mut b, vaddr);
+        assert_eq!(b.ctx.diag.drain(), vec![stale(vaddr, 1)]);
+        // A request issued while the entry maps nothing names no flash page, whatever page
+        // number the invalid entry holds: the lines of the page it mapped are still there when
+        // it maps it again.
+        map(&mut b, 3, crate::periph::mmu::MMU_ENTRY_INVALID | 1);
+        invalidate(&mut b, vaddr, 0x800);
+        map(&mut b, 3, 1);
+        load(&mut b, vaddr);
+        assert_eq!(b.ctx.diag.occurrences(&stale(0, 1)), 2);
+    }
+
+    #[test]
     fn flash_written_before_a_window_read_it_or_left_as_it_was_is_not_reported() {
         let mut b = bus_with_flash(SocConfig::default());
         map(&mut b, 3, 1);
@@ -1328,6 +1375,47 @@ mod tests {
         );
         load(&mut b, vaddr);
         assert_eq!(b.ctx.diag.take_violation(), Some(stale(vaddr, 1)));
+    }
+
+    #[test]
+    fn a_cpu_reset_keeps_what_the_cache_holds_of_the_flash_and_a_core_reset_forgets_it() {
+        // The lines of the cache are in internal memory and `EXTMEM` is no part of the CPU: a
+        // CPU reset leaves both (TRM §6.1.1, §6.1.3). A core or a system reset rebuilds
+        // `EXTMEM`: the ASSUMPTION on the fields of `Extmem`.
+        let vaddr = FLASH_DBUS_BASE + 0x3_0000;
+        for (cause, kept) in [
+            (ResetCause::SoftwareCpu, true),
+            (ResetCause::Mwdt0Core, false),
+            (ResetCause::RtcWatchdogSystem, false),
+        ] {
+            let reported = |b: &mut SocBus| {
+                // A core reset rebuilt the MMU table; after a CPU reset this writes the entry
+                // the value it holds.
+                map(b, 3, 1);
+                load(b, vaddr);
+                b.ctx.diag.drain()
+            };
+            let expected = if kept {
+                vec![stale(vaddr, 1)]
+            } else {
+                Vec::new()
+            };
+            // Read and written before the reset: stale across a CPU reset.
+            let mut b = bus_with_flash(SocConfig::default());
+            map(&mut b, 3, 1);
+            load(&mut b, vaddr);
+            program_byte(&mut b, 0x1_0000, 0x00);
+            b.reset(cause, 0x4000_0000, 0);
+            assert_eq!(reported(&mut b), expected, "written before {cause:?}");
+            // Read before the reset, written after it: the line a device filled before a CPU
+            // reset is still there for the write to make stale.
+            let mut b = bus_with_flash(SocConfig::default());
+            map(&mut b, 3, 1);
+            load(&mut b, vaddr);
+            b.reset(cause, 0x4000_0000, 0);
+            program_byte(&mut b, 0x1_0000, 0x00);
+            assert_eq!(reported(&mut b), expected, "written after {cause:?}");
+        }
     }
 
     #[test]

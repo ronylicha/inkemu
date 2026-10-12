@@ -202,6 +202,24 @@ pub struct Extmem {
     /// code without a bus access, so the bus sees a page read once however often its code runs;
     /// that is enough only while the page stays in the set. [`Extmem::invalidate`] therefore
     /// moves the generation, which drops the decoded code, whenever it takes a page out.
+    ///
+    /// What a reset does to this set and to `stale`: they stand for the lines of the cache, so
+    /// they follow the cache.
+    /// - A CPU reset keeps both. It resets the CPU core and the permission registers only: the
+    ///   registers of `EXTMEM` keep their values, and the internal memory, where the lines are
+    ///   (CM §3: the cache occupies SRAM0), keeps its content (TRM §6.1.1, §6.1.3; report IR
+    ///   §4.2). A page read and programmed before a CPU reset is still stale after it, until
+    ///   the cache is invalidated for it.
+    /// - A core or a system reset empties both, with the other registers of `EXTMEM`
+    ///   (`Peripherals::reset`). ASSUMPTION: no line is valid after a reset of the digital
+    ///   system. The memory of the lines keeps its content at such a reset too (TRM §6.1.1);
+    ///   that their tags are cleared is read from the reset value the SVD gives
+    ///   `ICACHE_SYNC_CTRL`, `INVALIDATE_ENA` set (the assumption on `SYNC_DONE`). No
+    ///   firmware the ROM starts can tell: at every boot the ROM invalidates every line before
+    ///   it reads a window (`ROM_Boot_Cache_Init` calls `Cache_Set_Default_Mode`, which calls
+    ///   `Cache_Invalidate_ICache_All`; CM §4.1, §5.1). A debugger settles it: read a window,
+    ///   program what it showed, reset the core, halt at the reset vector, enable the cache
+    ///   without the ROM and read the window again.
     cached: PageSet,
     /// Those of `cached` a program or an erase has changed since: a device may still answer a
     /// window read of them with the bytes of before.
@@ -269,8 +287,7 @@ impl Extmem {
     ///   `Cache_Invalidate_ICache_Items(0, 0)`; `Cache_Disable_ICache` and
     ///   `Cache_Set_Default_Mode` call it; CM §4.1).
     /// - Otherwise the range is `size` lines of 32 bytes from an address of one of the two
-    ///   windows. Both windows go through the one MMU table and the one cache (CM §1, §3), so the
-    ///   range names MMU entries whichever window it is given in. A page is dropped when a whole
+    ///   windows, and names the MMU entries that lie whole in it. A page is dropped when a whole
     ///   entry that maps it lies in the range, as `spi_flash_check_and_flush_cache` asks
     ///   (`IDF:components/spi_flash/flash_mmap.c:306-321`: `cache_hal_invalidate_addr(vaddr,
     ///   SPI_FLASH_MMU_PAGE_SIZE)`). A range that covers part of an entry drops nothing: the model
@@ -281,6 +298,30 @@ impl Extmem {
     /// returns 1 before it writes a register when the range is not inside one window, CM §4.1).
     /// Reading a window, programming it, issuing such a request and reading again on a device
     /// settles both.
+    ///
+    /// ASSUMPTION: a request drops the lines of a flash page whichever address they were filled
+    /// through: an entry named at its address in one window drops what was read at its address
+    /// in the other, and what was read through another entry that maps the same page. The model
+    /// keeps one bit per flash page; a cache keeps lines, and what a line is tagged with is not
+    /// established. CM §1 and §3 establish one MMU table and one cache memory for both buses,
+    /// no more. ESP-IDF names one address per page, in the window the mapping is used through
+    /// (`is_page_mapped_in_cache`, `IDF:components/spi_flash/flash_mmap.c:276-293`: the
+    /// instruction window for a mapping that can execute, the data window otherwise), which
+    /// shows nothing of the lines filled through the other address. If a line belongs to its
+    /// address, a device keeps the lines of the address the request did not name, and a read
+    /// there is stale on the device while nothing is reported here. Settled on a device: read
+    /// a page at its `0x3C…` address, program it, invalidate its entry at its `0x42…` address
+    /// only, read at `0x3C…` again; the same with two entries that map one page.
+    ///
+    /// ASSUMPTION: the lines a request names start at the address as `ICACHE_SYNC_ADDR` holds
+    /// it, so a request that starts past the first byte of an entry leaves that entry out, even
+    /// by one byte. What the cache does with the low 5 bits of the address, those inside a
+    /// line, is not established: `Cache_Op_Addr` aligns the address to a line before it writes
+    /// the register (CM §4.1), so no ROM or ESP-IDF path shows it. If silicon rounds the address
+    /// down to its line, a request one byte into an entry for the `0x800` lines of a page drops
+    /// that page on a device and nothing here: a read after it is then reported though the
+    /// device reads the flash. Settled on a device: read a page, program it, invalidate `0x800`
+    /// lines from one byte past the start of its entry, read again.
     ///
     /// A request that takes a page out of the cache moves [`Extmem::generation`]: the CPU may
     /// hold decoded code of that page, which it would go on running without the bus seeing a

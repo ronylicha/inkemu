@@ -531,6 +531,10 @@ impl Peripherals {
     ///   register: they stay.
     /// - A system reset also returns `RTC_CNTL` to its reset values and clears the recorded PC.
     ///
+    /// What the cache model keeps of the flash pages read through a window and written since
+    /// follows `EXTMEM`: a CPU reset keeps it, a core reset empties it. The sources and the one
+    /// assumption are on the fields of [`Extmem`].
+    ///
     /// ASSUMPTION: a CPU reset leaves the interrupt controller as it is. The TRM lists only the PMS
     /// registers as reset with the CPU (§6.1.3); the ROM clears `CPU_INT_ENABLE` itself at every
     /// boot (`ROM3:boot_prepare`, trace F1), which hides the difference (TW §D.2). A read of
