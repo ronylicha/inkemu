@@ -20,11 +20,19 @@ step() {
 # configuration as its only one, checks its three binaries against the pinned hashes of "$2", and
 # leaves the shell in its build directory. It says how long the build took: the cost of each
 # example in a CI job is read in the job log.
+#
+# The reference configuration is added to the example, it replaces nothing: an example that ships
+# a sdkconfig.defaults of its own stops the script before anything is copied. Its file would be
+# overwritten, and what is built would no longer be the example as ESP-IDF configures it.
 build_example() {
   local example="$1" sums="$2"
   local name project started="$SECONDS"
   name="$(basename "$example")"
   project="/tmp/$name"
+  if [ -e "$IDF_PATH/examples/$example/sdkconfig.defaults" ]; then
+    echo "error: the example $example ships its own sdkconfig.defaults, which the reference configuration would replace: the build would not be the unmodified example; choose an example without one, or decide how the two configurations combine and pin the result of that build" >&2
+    exit 1
+  fi
   rm -rf "$project"
   cp -r "$IDF_PATH/examples/$example" "$project"
   cp /ref/sdkconfig.defaults "$project/sdkconfig.defaults"

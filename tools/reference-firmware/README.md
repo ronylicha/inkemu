@@ -17,15 +17,24 @@ Nothing built here is committed and nothing is executed on the host: the images 
 program counter printed by inkemu into a function name: the last symbol whose address is not above
 the PC.
 
-Run the tests that need the images:
+The examples are built as ESP-IDF ships them, with `sdkconfig.defaults` of this directory as their
+only configuration. An example that ships a `sdkconfig.defaults` of its own stops the script before
+anything is built: its file would be replaced, and the build would not be the unmodified example.
+
+Run the tests that need the images, those of the machine and those of the `inkemu` command:
 
     tools/reference-firmware/build.sh
     cargo run --release -p emu-cli -- rom fetch --all --rom-dir /tmp/inkemu-rom
-    INKEMU_ROM_ELF_DIR=/tmp/inkemu-rom \
-      INKEMU_REF_FLASH=target/reference-firmware/flash_hello.bin \
-      INKEMU_NVS_FLASH=target/reference-firmware/flash_nvs.bin \
-      INKEMU_NVS_OTA_FLASH=target/reference-firmware/flash_nvs_ota.bin \
-      cargo test --release -p soc-esp32c3 --test reference_boot -- --ignored
+    export INKEMU_ROM_ELF_DIR=/tmp/inkemu-rom \
+      INKEMU_REF_FLASH="$PWD/target/reference-firmware/flash_hello.bin" \
+      INKEMU_NVS_FLASH="$PWD/target/reference-firmware/flash_nvs.bin" \
+      INKEMU_NVS_OTA_FLASH="$PWD/target/reference-firmware/flash_nvs_ota.bin"
+    cargo test --release -p soc-esp32c3 --test reference_boot -- --ignored
+    cargo test --release -p emu-cli --test run_cli reference_firmware -- --ignored
+
+The paths are absolute because each test binary runs in the directory of its own crate. Every test
+checks the SHA-256 of the image it is given before it runs it, and fails by naming the variable or
+the file when the image is missing or is not the pinned one.
 
 The builds are reproducible (same hashes from clean builds, from another path and with the compiler
 cache off): see `docs/research/sp1b-test-oracle.md`, section 2, and
