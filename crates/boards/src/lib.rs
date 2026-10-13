@@ -46,9 +46,13 @@ impl SocFamily {
     }
 }
 
-/// The flash-mode family of every profile: the flash of each Xteink file seen is driven in DIO
-/// (`docs/research/shipped-bootloader-and-firmware-composition.md`, section B). A device whose
-/// flash needs QIO, or octal, adds a key to `[flash]` and a bootloader built for it.
+/// The flash-mode family of every profile, which picks the bootloader inkemu ships for it. A
+/// device whose flash needs QIO, or octal, adds a key to `[flash]` and a bootloader built for it.
+// ASSUMPTION: the SPI mode the flash of retail Xteink units is driven in is not established. The
+// header of every Xteink file seen says DIO, but the header of a QIO build says DIO too
+// (`docs/research/shipped-bootloader-and-firmware-composition.md`, section B, row `qio`), and the
+// report lists the mode as assumed (section H, open question 5). What would settle it: the
+// `SPI Mode` line of the boot log of a retail unit, or the bootloader of a dump of one.
 const FLASH_MODE: SpiMode = SpiMode::Dio;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
