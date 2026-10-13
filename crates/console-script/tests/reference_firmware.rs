@@ -264,14 +264,21 @@ fn without_first(stream: &[u8], echo: &[u8]) -> Option<Vec<u8>> {
 /// The 90 bytes are sent once the dump of the first line has reached UART0: the example's task
 /// is then back in `usb_serial_jtag_read_bytes`, so the handler of the first packet wakes it, and
 /// it takes those 64 bytes before the host sends the next packet, `HOST_LATENCY` after the handler
-/// emptied the FIFO. Sent while the task still prints that dump, both packets would reach the
-/// driver's ring before the task reads it, and it would read the 90 bytes in one call: what
-/// Espressif's README shows (64 + 24) is a task waiting in its read when the line comes.
+/// emptied the FIFO. Sent while the task still prints that dump, both packets may reach the
+/// driver's ring before the task reads it, which then reads the 90 bytes in one call: the
+/// emulator did so, and whether a chip does is report USJ §O.13. What Espressif's README shows
+/// (64 + 24) is a task waiting in its read when the line comes.
 ///
-/// USB-Serial-JTAG carries more than the echo: the application keeps the ROM console of the
-/// bootloader inkemu ships, which mirrors every byte printed on UART0 to USB-Serial-JTAG
-/// (report USJ §B.1, §B.2). So its stream is the stream of UART0 with the echoed bytes in it,
-/// and the two packets of the echo of the 90 bytes may be apart: each is waited for on its own.
+/// USB-Serial-JTAG carries more than the echo, and ESP-IDF's secondary console plays no part in
+/// it: the example sets `CONFIG_ESP_CONSOLE_SECONDARY_NONE`. The copy is the ROM's. The image is
+/// a `MINIMAL_BUILD` that links no VFS (report USJ §F.1, §O.9), so `printf` and `ESP_LOG` go
+/// through `esp_system_console_put_char` to the ROM's `uart_tx_one_char`, which sends each
+/// character to USB-Serial-JTAG too while `g_usb_print` is set; the bootloader inkemu ships sets
+/// it and the application does not set the ROM console again (USJ §B.1, §B.2). Every byte the
+/// ROM's output routines print, which is all this image prints on UART0, is thus on
+/// USB-Serial-JTAG: its stream is the stream of UART0 with the echoed bytes in it, and the two
+/// packets of the echo of the 90 bytes may be apart, so each is waited for on its own. The
+/// equality below observes that the image writes by the ROM only.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_USJ_ECHO_APP"]
 fn usb_serial_jtag_echo_reference_firmware_echoes_on_usb_and_dumps_on_uart0() {
@@ -317,11 +324,32 @@ fn usb_serial_jtag_echo_reference_firmware_echoes_on_usb_and_dumps_on_uart0() {
         "26 bytes read on their own:\n{}",
         run.report()
     );
+    // The 26 bytes are one read: their second row is the next 16 bytes of the buffer, and not a
+    // third read of 10 starting at the buffer again.
+    let address = |line: &str| u32::from_str_radix(dump_address(line), 16).unwrap();
+    assert_eq!(
+        address(dumps[6]),
+        address(dumps[0]) + 16,
+        "the last 10 bytes in the same read as the 16 before them:\n{}",
+        run.report()
+    );
+    assert!(dumps[6].ends_with("|0123456789|"), "{}", run.report());
     // What was written and not yet sent belongs to each console.
     let mut uart0 = run.consoles.bytes(ConsoleChannel::Uart0).to_vec();
     uart0.extend(machine.flush_console(ConsoleChannel::Uart0));
     let mut usb = run.consoles.bytes(ConsoleChannel::UsbSerialJtag).to_vec();
     usb.extend(machine.flush_console(ConsoleChannel::UsbSerialJtag));
+    // The echo is on USB-Serial-JTAG only: were it on UART0 too, the ROM's copy would put it on
+    // USB-Serial-JTAG twice and the equality below would hold all the same.
+    for echo in [first, packet, rest] {
+        assert!(
+            !uart0
+                .windows(echo.len())
+                .any(|window| window == echo.as_bytes()),
+            "{echo:?} on UART0:\n{}",
+            run.report()
+        );
+    }
     let mirrored = [first, packet, rest]
         .into_iter()
         .try_fold(usb, |stream, echo| without_first(&stream, echo.as_bytes()));
