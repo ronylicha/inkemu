@@ -55,9 +55,10 @@ impl ConsoleChannel {
     }
 }
 
-/// The most bytes of the host a channel holds that the firmware has not read yet: what a front
-/// end may hand over ahead of the firmware ([`Esp32C3::send_console`]). A megabyte, a thousand
-/// times the 1 KiB receive buffer of the ESP-IDF drivers.
+/// The most bytes of the host a channel holds that have not reached the device yet
+/// ([`Esp32C3::input_pending`]): what a front end may hand over ahead of the firmware
+/// ([`Esp32C3::send_console`]). A megabyte, a thousand times the 1 KiB receive buffer of the
+/// ESP-IDF drivers; what has reached the device is in its receive FIFO, 128 bytes at most.
 pub const MAX_PENDING_HOST_BYTES: usize = 1 << 20;
 /// The most changes of the USB host still to come ([`Esp32C3::set_usb_host`]).
 pub const MAX_PENDING_HOST_CHANGES: usize = 16_384;
@@ -74,7 +75,7 @@ pub enum InputError {
     InThePast { at_nanos: u64, now_nanos: u64 },
     /// The channel already holds as many bytes of the host as it may.
     #[error(
-        "{channel} would hold {pending} bytes of the host that the firmware has not read, more than {MAX_PENDING_HOST_BYTES}; send the rest once the firmware has read some",
+        "{channel} would hold {pending} bytes of the host that have not reached the device, more than {MAX_PENDING_HOST_BYTES}; send the rest once the firmware has read some",
         channel = channel.name()
     )]
     TooMuchPending {
@@ -127,7 +128,8 @@ pub enum StopReason {
     /// A channel [`Esp32C3::watch_console`] watches handed bytes to the host: the call returns
     /// at the instruction boundary at which they went (at their very instant while the CPU
     /// sleeps), so that [`Esp32C3::device_time`] is the device time they reached the host. The
-    /// caller takes them with [`Esp32C3::take_console`] and calls again.
+    /// caller takes them with [`Esp32C3::take_console`] and calls again; bytes of a watched
+    /// channel it leaves untaken end the next calls too ([`Esp32C3::watch_console`]).
     ConsoleOutput,
 }
 
@@ -156,23 +158,16 @@ pub const MAX_FRUITLESS_WAKES: u32 = 100_000;
 /// configurable.
 pub const INTERRUPT_LATENCY_CYCLES: u64 = 4;
 
-const NANOS_PER_SECOND: u128 = 1_000_000_000;
-
 /// The instant, in cycles of the time base since power-on, at which a device-time limit of
 /// `nanos` nanoseconds is reached: the first cycle boundary at or after that time, 4 cycles for
-/// every 25 ns at 160 MHz. A whole number of microseconds is exact.
+/// every 25 ns at 160 MHz. A whole number of microseconds is exact. A console script rounds its
+/// waits with the same conversion.
 ///
 /// It is never the `u64::MAX` at which device time saturates: the longest limit, 584 years, is
 /// under a sixth of the time the base can count.
 fn limit_instant(nanos: u64) -> Cycles {
-    // In 128 bits: the product is under 2^92.
-    let cycles = (u128::from(nanos) * u128::from(clock::TIME_BASE.hz())).div_ceil(NANOS_PER_SECOND);
-    // INVARIANT: a second has more nanoseconds than cycles of the time base (asserted below), so
-    // the quotient is at most `nanos` and fits: the fallback, that same bound, is never taken.
-    Cycles(u64::try_from(cycles).unwrap_or(nanos))
+    clock::TIME_BASE.nanos_to_cycles(u128::from(nanos))
 }
-// A widening cast: `u128::from` is not callable in a constant.
-const _: () = assert!(clock::TIME_BASE.hz() as u128 <= NANOS_PER_SECOND);
 
 /// What one sleep of the CPU came to.
 enum Sleep {
@@ -606,8 +601,9 @@ impl Esp32C3 {
     /// [`InputError::BeyondTheLine`] when a UART is given a date after
     /// [`crate::periph::uart::LAST_INPUT_DATE`], about 114 years of device time;
     /// [`InputError::TooMuchPending`] when the channel would hold more than
-    /// [`MAX_PENDING_HOST_BYTES`] bytes of the host the firmware has not read. Nothing is sent
-    /// then.
+    /// [`MAX_PENDING_HOST_BYTES`] bytes of the host that have not reached the device
+    /// ([`Esp32C3::input_pending`]), a zero-length packet of USB-Serial-JTAG counting as one.
+    /// Nothing is sent then.
     pub fn send_console(
         &mut self,
         channel: ConsoleChannel,
@@ -622,9 +618,12 @@ impl Esp32C3 {
                 last_nanos: clock::TIME_BASE.cycles_to_nanos(crate::periph::uart::LAST_INPUT_DATE),
             });
         }
-        let pending = self
-            .input_pending(channel)
-            .saturating_add(bytes.len().max(1));
+        // No byte at all is a packet on USB-Serial-JTAG, and nothing on a UART.
+        let added = match channel {
+            ConsoleChannel::UsbSerialJtag => bytes.len().max(1),
+            ConsoleChannel::Uart0 | ConsoleChannel::Uart1 => bytes.len(),
+        };
+        let pending = self.input_pending(channel).saturating_add(added);
         if pending > MAX_PENDING_HOST_BYTES {
             return Err(InputError::TooMuchPending { channel, pending });
         }
@@ -637,8 +636,11 @@ impl Esp32C3 {
         Ok(())
     }
 
-    /// The bytes of the host on `channel` the firmware has not read yet, a zero-length packet of
-    /// USB-Serial-JTAG counting as one: a front end that ends a run says when some are left.
+    /// The bytes of the host on `channel` that have not reached the device yet, the same count on
+    /// every channel: on a UART those still to start and the one on the line, on
+    /// USB-Serial-JTAG the packets not yet in the OUT FIFO, a zero-length one counting as one
+    /// byte. What reached the receive FIFO is the firmware's to read, and is not counted. A
+    /// front end that ends a run says when some are left.
     #[must_use]
     pub fn input_pending(&self, channel: ConsoleChannel) -> usize {
         let periph = &self.bus.periph;
@@ -682,7 +684,12 @@ impl Esp32C3 {
     /// the host ends the call of [`Esp32C3::run_within`] with [`StopReason::ConsoleOutput`], at
     /// the instruction boundary it went at, or at its very instant while the CPU sleeps. A front
     /// end that waits for a text then knows the device time it came at, whatever its slices.
-    /// Watching changes nothing the firmware can see.
+    /// Watching changes nothing the firmware can see, nor the diagnostics of the run.
+    ///
+    /// The caller takes a watched channel ([`Esp32C3::take_console`]) after every call, and once
+    /// before it starts watching: the stop says that bytes left that no call has taken, not that
+    /// bytes left in this call, so bytes left untaken end every following call that brings a
+    /// device to now, at that later instant.
     pub fn watch_console(&mut self, channel: ConsoleChannel, watched: bool) {
         self.watched[channel.index()] = watched;
         let (periph, ctx) = (&mut self.bus.periph, &mut self.bus.ctx);
@@ -1306,6 +1313,15 @@ mod tests {
             })
         );
         assert_eq!(
+            m.send_console(ConsoleChannel::Uart1, Cycles::ZERO, b""),
+            Ok(()),
+            "no byte is nothing on a UART: it adds nothing to hold"
+        );
+        assert_eq!(
+            m.input_pending(ConsoleChannel::Uart1),
+            MAX_PENDING_HOST_BYTES
+        );
+        assert_eq!(
             m.send_console(ConsoleChannel::UsbSerialJtag, Cycles::ZERO, &megabyte),
             Ok(())
         );
@@ -1332,6 +1348,36 @@ mod tests {
     }
 
     #[test]
+    fn the_input_pending_on_every_channel_is_what_has_not_reached_the_device() {
+        // The firmware reads nothing: what reached a receive FIFO stays there, and is not
+        // counted, on a UART as on USB-Serial-JTAG.
+        let mut m = machine(&[HANG]);
+        for channel in ConsoleChannel::ALL {
+            m.send_console(channel, Cycles::ZERO, b"abc").unwrap();
+            assert_eq!(m.input_pending(channel), 3, "{channel:?}");
+        }
+        // 100 us: the packet reached the OUT FIFO 50 us after it was sent, and `a` is on the
+        // line of each UART.
+        m.run_within(Cycles(u64::MAX), Some(100_000));
+        assert_eq!(m.input_pending(ConsoleChannel::UsbSerialJtag), 0);
+        let after_bytes =
+            |bytes: u64| clock::TIME_BASE.cycles_to_nanos(Cycles(bytes * RESET_BYTE)) + 1_000;
+        for (bytes, pending) in [(0, 3), (2, 1), (4, 0)] {
+            if bytes > 0 {
+                m.run_within(Cycles(u64::MAX), Some(after_bytes(bytes)));
+            }
+            for channel in [ConsoleChannel::Uart0, ConsoleChannel::Uart1] {
+                assert_eq!(
+                    m.input_pending(channel),
+                    pending,
+                    "{channel:?} after {bytes} byte times"
+                );
+            }
+        }
+        assert_eq!(m.input_pending(ConsoleChannel::UsbSerialJtag), 0);
+    }
+
+    #[test]
     fn a_firmware_receives_the_bytes_of_the_host_at_their_dates() {
         let mut m = machine(&echo_uart0());
         let sent_at = Cycles(1_000_000);
@@ -1353,25 +1399,35 @@ mod tests {
 
     #[test]
     fn a_watched_channel_ends_the_call_at_the_instant_each_byte_reaches_the_host() {
-        // The CPU sleeps after the writes: each byte is seen at its very instant.
-        let mut program = print(UART0, b"abc");
-        program.extend([wfi(), HANG]);
-        let mut m = machine(&program);
-        m.watch_console(ConsoleChannel::Uart0, true);
-        assert_eq!(m.run_until(Cycles(1_000_000)), StopReason::ConsoleOutput);
-        assert_eq!(m.take_console(ConsoleChannel::Uart0), b"a");
-        let first = m.device_time();
-        for (byte, after) in [(b"b", 1), (b"c", 2)] {
+        // The CPU sleeps after the writes: each byte is seen at its very instant. A byte that is
+        // not the last written when the one before it leaves (`b`) is seen at its instant only
+        // because the channel is watched; UART1 as UART0.
+        for (fifo, channel) in [
+            (UART0, ConsoleChannel::Uart0),
+            (
+                svd_regs::esp32c3::addr("UART1", "FIFO"),
+                ConsoleChannel::Uart1,
+            ),
+        ] {
+            let mut program = print(fifo, b"abc");
+            program.extend([wfi(), HANG]);
+            let mut m = machine(&program);
+            m.watch_console(channel, true);
             assert_eq!(m.run_until(Cycles(1_000_000)), StopReason::ConsoleOutput);
-            assert_eq!(m.take_console(ConsoleChannel::Uart0), byte);
-            assert_eq!(
-                m.device_time(),
-                first + after * RESET_BYTE,
-                "back to back, to the cycle"
-            );
+            assert_eq!(m.take_console(channel), b"a", "{channel:?}");
+            let first = m.device_time();
+            for (byte, after) in [(b"b", 1), (b"c", 2)] {
+                assert_eq!(m.run_until(Cycles(1_000_000)), StopReason::ConsoleOutput);
+                assert_eq!(m.take_console(channel), byte, "{channel:?}");
+                assert_eq!(
+                    m.device_time(),
+                    first + after * RESET_BYTE,
+                    "{channel:?}: back to back, to the cycle"
+                );
+            }
+            m.watch_console(channel, false);
+            assert_ne!(m.run_until(Cycles(1_000_000)), StopReason::ConsoleOutput);
         }
-        m.watch_console(ConsoleChannel::Uart0, false);
-        assert_ne!(m.run_until(Cycles(1_000_000)), StopReason::ConsoleOutput);
     }
 
     #[test]
@@ -1395,6 +1451,76 @@ mod tests {
         );
         assert_eq!(watched.take_console(ConsoleChannel::Uart0), b"a");
         assert_eq!(watched.device_time(), seen_at);
+    }
+
+    /// Runs `program` one CPU cycle a call, taking `channel` after each, and returns the device
+    /// time `text` is first found at: the boundary a watching machine must stop at.
+    fn first_seen_stepping(program: &[u32], channel: ConsoleChannel, text: &[u8]) -> Cycles {
+        let mut stepped = machine(program);
+        let mut seen = Vec::new();
+        while stepped.cycles() < Cycles(1_000_000) {
+            stepped.run_until(stepped.cycles() + 1);
+            seen.extend(stepped.take_console(channel));
+            if seen == text {
+                return stepped.device_time();
+            }
+            assert!(text.starts_with(&seen), "{seen:?}");
+        }
+        panic!("{text:?} never left");
+    }
+
+    /// `program`, with `channel` watched and no other, stops with
+    /// [`StopReason::ConsoleOutput`] at the instant a stepped run first sees `text`, which is all
+    /// it takes, on that channel only.
+    fn assert_watched_stop(program: &[u32], channel: ConsoleChannel, text: &[u8]) {
+        let seen_at = first_seen_stepping(program, channel, text);
+        let mut watched = machine(program);
+        watched.watch_console(channel, true);
+        assert_eq!(
+            watched.run_until(Cycles(1_000_000)),
+            StopReason::ConsoleOutput,
+            "{channel:?}"
+        );
+        assert_eq!(watched.device_time(), seen_at, "{channel:?}");
+        assert_eq!(watched.take_console(channel), text, "{channel:?}");
+        for other in ConsoleChannel::ALL.into_iter().filter(|&c| c != channel) {
+            assert_eq!(watched.take_console(other), b"", "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_watched_usb_packet_ends_the_call_at_the_instant_the_host_takes_it() {
+        // `WR_DONE` commits `ok`; the host takes it 50 us later, both bytes at one instant.
+        let mut program = print(USB, b"ok");
+        program.extend([addi(T1, 0, 1), sw(T1, T0, 4), HANG]);
+        assert_watched_stop(&program, ConsoleChannel::UsbSerialJtag, b"ok");
+    }
+
+    #[test]
+    fn watching_a_uart_timed_on_a_clock_the_model_lacks_changes_none_of_its_diagnostics() {
+        // `SCLK_SEL` = 0 names no documented clock: each byte sent and each byte read is refused
+        // once, at the write or the read, however often the watched UART is brought to now.
+        let clk_conf = svd_regs::esp32c3::addr("UART0", "CLK_CONF");
+        let mut program = store_register(clk_conf, 0x0340_0000).to_vec();
+        program.extend(print(UART0, b"ab"));
+        program.extend(echo_uart0());
+        let diagnostics = |watched: bool| {
+            let mut m = machine(&program);
+            m.watch_console(ConsoleChannel::Uart0, watched);
+            m.send_console(ConsoleChannel::Uart0, Cycles(200_000), b"xy")
+                .unwrap();
+            let mut console = Vec::new();
+            while m.run_within(m.cycles() + 997, Some(10_000_000)) != StopReason::TimeBudget {
+                console.extend(m.take_console(ConsoleChannel::Uart0));
+            }
+            console.extend(m.take_console(ConsoleChannel::Uart0));
+            let repeated = m.most_repeated_diagnostics(16);
+            (console, repeated, m.drain_diagnostics())
+        };
+        let unwatched = diagnostics(false);
+        assert_eq!(unwatched.0, b"abxy");
+        assert!(!unwatched.1.is_empty(), "{unwatched:?}");
+        assert_eq!(diagnostics(true), unwatched);
     }
 
     /// Everything a run shows of itself: its consoles, its trace hash, its device time, its

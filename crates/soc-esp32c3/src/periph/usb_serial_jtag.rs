@@ -286,11 +286,12 @@ impl UsbSerialJtag {
         self.host
     }
 
-    /// How many bytes the host has sent that the firmware has not read, its packets counted as
-    /// one byte each at least, so that zero-length ones count too.
+    /// How many bytes the host has sent that have not reached the OUT FIFO, its packets counted
+    /// as one byte each at least, so that zero-length ones count too. The FIFO holds 64 bytes at
+    /// most, the firmware's to read: a UART counts the same way (`Uart::host_pending`).
     #[must_use]
     pub fn host_pending(&self) -> usize {
-        self.out_fifo.len() + self.sent_bytes
+        self.sent_bytes
     }
 
     /// Whether the host took bytes that no call has taken. The host takes a packet at an instant
