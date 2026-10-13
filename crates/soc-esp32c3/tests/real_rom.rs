@@ -84,6 +84,10 @@ fn eco_versions_identify_the_three_revisions() {
 
 /// Far more than the ROM needs to reach its banner; a bound, not an expectation.
 const BANNER_BUDGET: u64 = 20_000_000;
+/// The device time of a boot to the banner: ten times what [`BANNER_BUDGET`] lasts at the 20 MHz
+/// the ROM runs at. A bound for a CPU that would sleep, whose cycle counter stands still, so that
+/// the first bound never comes; a bound, not an expectation.
+const BANNER_TIME_BUDGET_NS: u64 = 10 * SECOND_NS;
 const SLICE: u64 = 100_000;
 const BOOT_LINE: &str = "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n";
 
@@ -106,7 +110,7 @@ fn boot(revision: u16, config: SocConfig) -> Boot {
     let bounds = Bounds {
         slice: SLICE,
         max_cycles: BANNER_BUDGET,
-        max_nanos: u64::MAX,
+        max_nanos: BANNER_TIME_BUDGET_NS,
     };
     let driven = drive(&mut machine, bounds, &mut consoles, |_, _, seen| {
         seen.text(ConsoleChannel::Uart0).contains(BOOT_LINE)
@@ -263,6 +267,9 @@ const STUB_CODE: [u8; 4] = [0x6f, 0, 0, 0];
 const ROM_HANG_PC: u32 = 0x4004_7ed2;
 /// The ROM path from the banner to the bootloader entry is about 121,000 instructions (FB §1 item 1).
 const FLASH_BOOT_BUDGET: u64 = 40_000_000;
+/// The device time of a flash boot: ten times what [`FLASH_BOOT_BUDGET`] lasts at 20 MHz, for the
+/// same reason as [`BANNER_TIME_BUDGET_NS`].
+const FLASH_BOOT_TIME_BUDGET_NS: u64 = 20 * SECOND_NS;
 const INVALID_HEADER_BLANK: &str = "invalid header: 0xffffffff\n";
 
 fn stub_spec() -> ImageSpec {
@@ -305,7 +312,7 @@ fn flash_boot(flash: Option<Vec<u8>>, config: SocConfig, done: impl Fn(&str) -> 
     let bounds = Bounds {
         slice: SLICE,
         max_cycles: FLASH_BOOT_BUDGET,
-        max_nanos: u64::MAX,
+        max_nanos: FLASH_BOOT_TIME_BUDGET_NS,
     };
     let mut extra_slices = 1;
     let driven = drive(&mut machine, bounds, &mut consoles, |_, _, seen| {
@@ -512,8 +519,13 @@ fn two_flash_boots_are_identical_down_to_the_trace_hash() {
 const SECOND_NS: u64 = 1_000_000_000;
 /// Where the watchdogs catch the ROM of a blank chip: in its UART routine
 /// (`ROM3:uart_tx_one_char_uart.part.0@0x4004c0be`), in the loop that waits for room in the FIFO
-/// while it prints `invalid header`.
-const ROM_UART_WAIT_PC: u32 = 0x4004_c0d4;
+/// while it prints `invalid header`. Its four instructions, as the rev3 ROM ELF disassembles:
+/// `lw a4,0(a3)` reads `UART_STATUS`, `srli a4,a4,0x10` and `andi a4,a4,896` keep the top bits of
+/// `TXFIFO_CNT`, `bnez a4,0x4004c0d4` loops while the FIFO holds 128 bytes or more. Which of the
+/// four a watchdog expiry finds depends on the phase of the loop against the expiry, which
+/// anything that changes the time the ROM spends elsewhere (its USB-Serial-JTAG output, for one)
+/// moves: these tests pin the loop, and the trace hashes pin the run.
+const ROM_UART_WAIT_LOOP: [u32; 4] = [0x4004_c0d4, 0x4004_c0d6, 0x4004_c0d8, 0x4004_c0dc];
 /// Cycles between two looks at the machine in the watchdog tests: 50 us at the 20 MHz the ROM
 /// runs at, the resolution the instant of a reset is observed with.
 const WATCHDOG_SLICE: u64 = 1_000;
@@ -615,22 +627,39 @@ fn a_blank_flash_is_reset_by_the_main_watchdog_then_by_the_rtc_watchdog() {
             .nth(1)
             .is_some_and(|rest| rest.contains(INVALID_HEADER_BLANK))
     });
-    // Strict mode: nothing unmodelled. The journal holds the resets and nothing else: the two of
-    // main watchdog 0 found the ROM at the same instruction, so they are one entry counted
-    // twice, and the RTC watchdog found it there too.
+    // Strict mode: nothing unmodelled. The journal holds the resets and nothing else, each cause
+    // and PC once, at its first occurrence; a reset that found the ROM at the same instruction
+    // as an earlier one of its cause is counted with it. Taken back in the order they came, the
+    // three resets are those of main watchdog 0 twice, then of the RTC watchdog, each in the
+    // loop where the ROM waits for room in the UART FIFO.
+    let repeated: Vec<((ResetCause, u32), u64)> = run
+        .repeated
+        .iter()
+        .map(|(diagnostic, count)| (reset_entries(std::slice::from_ref(diagnostic))[0], *count))
+        .collect();
+    let resets: Vec<(ResetCause, u32)> = reset_entries(&run.diagnostics)
+        .into_iter()
+        .flat_map(|entry| {
+            let count = repeated
+                .iter()
+                .find(|(other, _)| *other == entry)
+                .map_or(1, |&(_, count)| count);
+            std::iter::repeat_n(entry, usize::try_from(count).unwrap())
+        })
+        .collect();
     assert_eq!(
-        reset_entries(&run.diagnostics),
+        resets.iter().map(|&(cause, _)| cause).collect::<Vec<_>>(),
         [
-            (ResetCause::Mwdt0Core, ROM_UART_WAIT_PC),
-            (ResetCause::RtcWatchdogSystem, ROM_UART_WAIT_PC),
-        ]
+            ResetCause::Mwdt0Core,
+            ResetCause::Mwdt0Core,
+            ResetCause::RtcWatchdogSystem
+        ],
+        "journal {:?}, repeated {repeated:?}",
+        run.diagnostics
     );
-    assert_eq!(
-        run.repeated
-            .iter()
-            .map(|(diagnostic, count)| (reset_entries(std::slice::from_ref(diagnostic))[0], *count))
-            .collect::<Vec<_>>(),
-        [((ResetCause::Mwdt0Core, ROM_UART_WAIT_PC), 2)]
+    assert!(
+        resets.iter().all(|(_, pc)| ROM_UART_WAIT_LOOP.contains(pc)),
+        "every reset finds the ROM in its wait for room in the UART FIFO: {resets:?}"
     );
     // A reset is seen at the first look after it: the loop looks every `WATCHDOG_SLICE` cycles, 50 us
     // at 20 MHz, so a reset is seen up to 50 us after its instant. The window of 100 us is that
@@ -682,11 +711,11 @@ fn a_blank_flash_is_reset_by_the_main_watchdog_then_by_the_rtc_watchdog() {
             lines[*boot..*next].join("\n")
         );
     }
-    // The ROM was printing `invalid header` when it was reset: the line the next boot prints
-    // names the instruction the journal names.
-    let saved_pc = format!("Saved PC:{ROM_UART_WAIT_PC:#010x}");
-    assert_eq!(lines[boots[1] + 1], saved_pc);
-    assert_eq!(lines[boots[2] + 1], saved_pc);
+    // The ROM was printing `invalid header` when it was reset: the line each boot after a reset
+    // by main watchdog 0 prints names the instruction the journal names for that reset.
+    for (boot, (_, pc)) in boots[1..3].iter().zip(&resets[..2]) {
+        assert_eq!(lines[boot + 1], format!("Saved PC:{pc:#010x}"));
+    }
     assert_eq!(
         lines[boots[3] + 1],
         INVALID_HEADER_BLANK.trim_end(),
