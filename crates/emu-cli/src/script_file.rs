@@ -70,6 +70,41 @@ mod tests {
     }
 
     #[test]
+    fn every_variant_names_the_file_and_states_its_cause_then_its_remedy() {
+        let path = || "steps.txt".to_owned();
+        let refused = Script::parse(b"inkemu-console-script 9\n").unwrap_err();
+        for error in [
+            ScriptFileError::Read {
+                path: path(),
+                detail: "permission denied".to_owned(),
+            },
+            ScriptFileError::NotAFile { path: path() },
+            ScriptFileError::TooLong {
+                path: path(),
+                len: 2_000_000,
+            },
+            // A file that grew while it was read cannot be made in a test without a second
+            // writer racing the reader: the variant is built.
+            ScriptFileError::Grew { path: path() },
+            ScriptFileError::Refused {
+                path: path(),
+                source: refused,
+            },
+        ] {
+            let message = error.to_string();
+            let (cause, remedy) = message
+                .rsplit_once("; ")
+                .unwrap_or_else(|| panic!("no remedy after a semicolon: {message}"));
+            assert!(cause.contains("steps.txt"), "{message}");
+            assert!(remedy.len() > 10, "{message}");
+        }
+        assert_eq!(
+            ScriptFileError::Grew { path: path() }.to_string(),
+            "the console script steps.txt held more than 1048576 bytes when it was read (it grew while it was being read); give a file that nothing else writes"
+        );
+    }
+
+    #[test]
     fn each_refusal_names_the_file_and_states_its_remedy() {
         let dir = tempfile::tempdir().unwrap();
         let bad = dir.path().join("bad.txt");

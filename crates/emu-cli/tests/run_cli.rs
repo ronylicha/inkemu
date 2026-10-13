@@ -219,7 +219,7 @@ fn a_refused_console_script_exits_2_at_its_line_and_column_before_any_rom_is_rea
         .code(2)
         .stderr(
             contains("steps.txt, line 2, column 6: `3` is no duration; write a whole number")
-                .and(contains("rom").not()),
+                .and(contains("esp32c3_rev3_rom.elf").not()),
         );
     inkemu()
         .args(["run", "--device", "x4", "--rom-dir"])
@@ -420,6 +420,45 @@ fn x4_boots_the_real_rom_to_its_banner() {
     };
     assert!(hash(&first).is_some());
     assert_eq!(hash(&first), hash(&run()));
+}
+
+/// `--usb-host` reaches the machine: nothing in a run of a blank chip changes the host, so the
+/// summary says at the end the state the option gave at power-on, and `open` without it.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn the_usb_host_given_is_the_one_the_summary_says() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    for (option, state) in [
+        (Some("absent"), "absent"),
+        (Some("attached"), "attached"),
+        (Some("open"), "open"),
+        (None, "open"),
+    ] {
+        let mut command = inkemu();
+        command.args([
+            "run",
+            "--device",
+            "x4",
+            "--max-cycles",
+            "1000000",
+            "--rom-dir",
+            &rom_dir,
+        ]);
+        if let Some(option) = option {
+            command.args(["--usb-host", option]);
+        }
+        let output = command
+            .timeout(HANG_LIMIT)
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            log.contains(&format!("\ninkemu: USB host {state}\n")),
+            "--usb-host {option:?}:\n{log}"
+        );
+    }
 }
 
 /// The command the `rom-boot` CI job and the README recommend, on ROM files that are already there:
@@ -885,13 +924,22 @@ fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_res
     let micros = device_micros(&log);
     assert!((1_500_000..=1_500_010).contains(&micros), "{log}");
     assert!(!log.contains("the CPU is asleep"), "{log}");
-    // The journal says what the ROM's `rst:0x7` line does, with the stack pointer besides.
+    // The journal says what the ROM's `rst:0x7` line does, with the stack pointer besides. The
+    // watchdog finds the ROM in the loop of `uart_tx_one_char_uart.part.0` that waits for room in
+    // the UART FIFO, at whichever of its four instructions the phase of the loop puts it on
+    // (rev3 ROM ELF: `lw` 0x4004c0d4, `srli` 0x4004c0d6, `andi` 0x4004c0d8, `bnez` 0x4004c0dc);
+    // the trace hash pins the run.
+    let Some((reset_pc, _)) = log
+        .split_once("\ninkemu: reset by main watchdog 0, a core reset (rst:0x7) at pc ")
+        .and_then(|(_, rest)| rest.split_once(", sp 0x"))
+    else {
+        panic!("no reset by main watchdog 0 in the journal:\n{log}")
+    };
     assert!(
-        log.contains(
-            "\ninkemu: reset by main watchdog 0, a core reset (rst:0x7) at pc 0x4004c0d4, sp 0x"
-        ) && !log.contains("warning:"),
+        ["0x4004c0d4", "0x4004c0d6", "0x4004c0d8", "0x4004c0dc"].contains(&reset_pc),
         "{log}"
     );
+    assert!(!log.contains("warning:"), "{log}");
     let second = run();
     assert_eq!(
         first.stdout, second.stdout,
@@ -967,6 +1015,10 @@ fn a_console_script_still_waiting_when_the_run_ends_exits_5() {
     let output = scripted_run(&rom_dir, "wait-for uart0 \"login:\"\n");
     let log = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(5), "{log}");
+    // The firmware ran and printed its prompt: the script waited for a text that never came,
+    // not for a firmware that never started.
+    let console = String::from_utf8_lossy(&output.stdout);
+    assert!(console.ends_with("ready"), "{console:?}");
     assert!(
         log.contains("inkemu: console script not through: line 2 (wait-for uart0 \"login:\") was still waiting; "),
         "{log}"

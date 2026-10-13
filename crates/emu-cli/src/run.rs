@@ -824,6 +824,12 @@ mod tests {
             "{}",
             text(&log)
         );
+        assert_eq!(
+            text(&log).matches("error: ").count(),
+            1,
+            "the refusal is said once: {}",
+            text(&log)
+        );
         m.send_console(ConsoleChannel::Uart0, m.device_time(), b"z")
             .unwrap();
         assert_ne!(
