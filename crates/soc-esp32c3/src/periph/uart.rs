@@ -187,6 +187,9 @@ pub struct Uart {
     /// until they have left, not for ever), a byte of the host lands, the receive timeout comes,
     /// or the transmit FIFO falls below its threshold.
     wake: Deadline,
+    /// The machine watches what this UART sends: each byte asks for a call at the instant it has
+    /// left, so that the machine sees it go at that instant ([`Uart::watch`]).
+    watched: bool,
 }
 
 impl Uart {
@@ -211,7 +214,23 @@ impl Uart {
             int_raw: TXFIFO_EMPTY,
             idle_since: None,
             wake: Deadline::default(),
+            watched: false,
         }
+    }
+
+    /// While `watched`, each byte asks for a call at the instant its last bit has gone, not only
+    /// the last one: the machine then sees each byte leave at its own instant, and a front end
+    /// that waits for a text knows when it came (ADR 0006). A call changes nothing the firmware
+    /// can see.
+    pub(crate) fn watch(&mut self, ctx: &mut Ctx, watched: bool) {
+        self.watched = watched;
+        self.arm(ctx);
+    }
+
+    /// Whether bytes have left that no call has taken.
+    #[must_use]
+    pub(crate) fn has_left(&self) -> bool {
+        !self.tx.is_empty()
     }
 
     /// The module is reset (`SYSTEM.PERIP_RST_EN0`, or a core reset): its registers return to their
@@ -292,9 +311,20 @@ impl Uart {
         let timeout_enabled = self.config.read(CONF1).unwrap_or(0) & RX_TOUT_EN != 0;
         let timeout = self.timeout_at(ctx).filter(|_| timeout_enabled);
         let below_threshold = self.tx_below_threshold_at();
-        for instant in [last_gone, next_landing, timeout, below_threshold]
-            .into_iter()
-            .flatten()
+        let first_gone = self
+            .in_flight
+            .front()
+            .map(|&(gone_at, _)| gone_at)
+            .filter(|_| self.watched);
+        for instant in [
+            last_gone,
+            next_landing,
+            timeout,
+            below_threshold,
+            first_gone,
+        ]
+        .into_iter()
+        .flatten()
         {
             self.wake.arm(
                 ctx,

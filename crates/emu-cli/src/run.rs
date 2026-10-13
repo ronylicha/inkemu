@@ -73,7 +73,10 @@ fn pass_end(
         // The end of a slice, or a CPU that sleeps while device time goes on: the next pass
         // continues. A sleep that ended on the very instant of the device-time limit comes
         // back as `Asleep` too; the next call then runs nothing and says `TimeBudget`.
-        (Ok(true), StopReason::CycleBudget | StopReason::Asleep) => None,
+        // A watched console spoke: the console script, if any, reads it, and the run goes on.
+        (Ok(true), StopReason::CycleBudget | StopReason::Asleep | StopReason::ConsoleOutput) => {
+            None
+        }
     }
 }
 

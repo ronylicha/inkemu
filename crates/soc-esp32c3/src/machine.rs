@@ -6,6 +6,7 @@ use crate::ctx::Event;
 use crate::diag::{Diagnostic, Unsupported};
 use crate::flash::{FlashDevice, FlashImageError, FlashWrite, NorFlash};
 use crate::memmap::RESET_PC;
+use crate::periph::UsbHost;
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
 use cpu_rv32::{
@@ -33,6 +34,58 @@ impl ConsoleChannel {
         ConsoleChannel::UsbSerialJtag,
         ConsoleChannel::Uart1,
     ];
+
+    /// The channel as the command line and a front end name it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            ConsoleChannel::Uart0 => "uart0",
+            ConsoleChannel::UsbSerialJtag => "usb-serial-jtag",
+            ConsoleChannel::Uart1 => "uart1",
+        }
+    }
+
+    /// The place of the channel in [`ConsoleChannel::ALL`].
+    const fn index(self) -> usize {
+        match self {
+            ConsoleChannel::Uart0 => 0,
+            ConsoleChannel::UsbSerialJtag => 1,
+            ConsoleChannel::Uart1 => 2,
+        }
+    }
+}
+
+/// The most bytes of the host a channel holds that the firmware has not read yet: what a front
+/// end may hand over ahead of the firmware ([`Esp32C3::send_console`]). A megabyte, a thousand
+/// times the 1 KiB receive buffer of the ESP-IDF drivers.
+pub const MAX_PENDING_HOST_BYTES: usize = 1 << 20;
+/// The most changes of the USB host still to come ([`Esp32C3::set_usb_host`]).
+pub const MAX_PENDING_HOST_CHANGES: usize = 16_384;
+
+/// Why the machine refused an input of the run ([`Esp32C3::send_console`],
+/// [`Esp32C3::set_usb_host`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InputError {
+    /// The input is dated before the device time the machine has reached: what the firmware
+    /// did since cannot have seen it.
+    #[error(
+        "the input is dated {at_nanos} ns of device time, but the run is at {now_nanos} ns already; date it at {now_nanos} ns or later"
+    )]
+    InThePast { at_nanos: u64, now_nanos: u64 },
+    /// The channel already holds as many bytes of the host as it may.
+    #[error(
+        "{channel} would hold {pending} bytes of the host that the firmware has not read, more than {MAX_PENDING_HOST_BYTES}; send the rest once the firmware has read some",
+        channel = channel.name()
+    )]
+    TooMuchPending {
+        channel: ConsoleChannel,
+        pending: usize,
+    },
+    /// The changes of the USB host still to come are as many as they may be.
+    #[error(
+        "{MAX_PENDING_HOST_CHANGES} changes of the USB host are still to come; give the next ones once the run has reached some"
+    )]
+    TooManyHostChanges,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +114,11 @@ pub enum StopReason {
     /// sleeping CPU returns `Asleep` although the CPU is then awake, about to execute the first
     /// instruction of the ROM. [`Esp32C3::is_asleep`] gives the state.
     Asleep,
+    /// A channel [`Esp32C3::watch_console`] watches handed bytes to the host: the call returns
+    /// at the instruction boundary at which they went (at their very instant while the CPU
+    /// sleeps), so that [`Esp32C3::device_time`] is the device time they reached the host. The
+    /// caller takes them with [`Esp32C3::take_console`] and calls again.
+    ConsoleOutput,
 }
 
 /// Device time one call to [`Esp32C3::run_within`] sleeps through, all its sleeps added, before
@@ -130,6 +188,8 @@ pub struct Esp32C3 {
     selected: Option<(u32, Cycles)>,
     /// Resets since power-on.
     resets: u64,
+    /// The channels [`Esp32C3::watch_console`] watches, by their place in [`ConsoleChannel::ALL`].
+    watched: [bool; 3],
 }
 
 impl Esp32C3 {
@@ -185,6 +245,7 @@ impl Esp32C3 {
             trace: config.trace_hash.then(TraceHash::new),
             selected: None,
             resets: 0,
+            watched: [false; 3],
         }
     }
 
@@ -247,6 +308,9 @@ impl Esp32C3 {
                     if let Some(violation) = self.bus.ctx.diag.take_violation() {
                         return StopReason::StrictMmio(violation);
                     }
+                    if self.watched_output() {
+                        return StopReason::ConsoleOutput;
+                    }
                     if slept >= SLEEP_SLICE || sleeps >= MAX_FRUITLESS_WAKES {
                         return StopReason::Asleep;
                     }
@@ -277,12 +341,34 @@ impl Esp32C3 {
             }
             if self.needs_service() {
                 self.service(pc);
+                // A watched byte leaves at an instant its device asked to be called at: the
+                // service of that call is the boundary it is seen at.
+                if self.watched_output() {
+                    if let Some(violation) = self.bus.ctx.diag.take_violation() {
+                        return StopReason::StrictMmio(violation);
+                    }
+                    return StopReason::ConsoleOutput;
+                }
             }
             if let Some(violation) = self.bus.ctx.diag.take_violation() {
                 return StopReason::StrictMmio(violation);
             }
         }
         StopReason::CycleBudget
+    }
+
+    /// Whether a watched channel has handed bytes to the host that no call has taken.
+    fn watched_output(&self) -> bool {
+        let periph = &self.bus.periph;
+        let left = [
+            periph.uart0.has_left(),
+            periph.usb_serial_jtag.has_left(),
+            periph.uart1.has_left(),
+        ];
+        self.watched
+            .iter()
+            .zip(left)
+            .any(|(&watched, left)| watched && left)
     }
 
     /// Whether anything happened that the loop has to act on before the next instruction.
@@ -489,6 +575,113 @@ impl Esp32C3 {
         }
     }
 
+    /// Device time since power-on, in cycles of the time base ([`clock::TIME_BASE`]): the unit
+    /// the inputs of a run are dated in.
+    #[must_use]
+    pub const fn device_time(&self) -> Cycles {
+        self.bus.ctx.now()
+    }
+
+    /// The host sends `bytes` on `channel`, the first from device time `at`, the others after
+    /// it and after what it sent before (ADR 0006): a UART receives them back to back at its
+    /// line rate (report UR §5.4), USB-Serial-JTAG in packets of at most 64 bytes, no byte at all
+    /// being one zero-length packet (report USJ §R.5). An input is part of the run: two runs
+    /// given the same inputs at the same dates are the same run, however they are cut into
+    /// calls.
+    ///
+    /// # Errors
+    /// [`InputError::InThePast`] when `at` is before [`Esp32C3::device_time`];
+    /// [`InputError::TooMuchPending`] when the channel would hold more than
+    /// [`MAX_PENDING_HOST_BYTES`] bytes of the host the firmware has not read. Nothing is sent
+    /// then.
+    pub fn send_console(
+        &mut self,
+        channel: ConsoleChannel,
+        at: Cycles,
+        bytes: &[u8],
+    ) -> Result<(), InputError> {
+        self.check_date(at)?;
+        let pending = self
+            .input_pending(channel)
+            .saturating_add(bytes.len().max(1));
+        if pending > MAX_PENDING_HOST_BYTES {
+            return Err(InputError::TooMuchPending { channel, pending });
+        }
+        let (periph, ctx) = (&mut self.bus.periph, &mut self.bus.ctx);
+        match channel {
+            ConsoleChannel::Uart0 => periph.uart0.receive(ctx, at, bytes),
+            ConsoleChannel::UsbSerialJtag => periph.usb_serial_jtag.receive(ctx, at, bytes),
+            ConsoleChannel::Uart1 => periph.uart1.receive(ctx, at, bytes),
+        }
+        Ok(())
+    }
+
+    /// The bytes of the host on `channel` the firmware has not read yet, a zero-length packet of
+    /// USB-Serial-JTAG counting as one: a front end that ends a run says when some are left.
+    #[must_use]
+    pub fn input_pending(&self, channel: ConsoleChannel) -> usize {
+        let periph = &self.bus.periph;
+        match channel {
+            ConsoleChannel::Uart0 => periph.uart0.host_pending(),
+            ConsoleChannel::UsbSerialJtag => periph.usb_serial_jtag.host_pending(),
+            ConsoleChannel::Uart1 => periph.uart1.host_pending(),
+        }
+    }
+
+    /// From device time `at` the USB host is `state` (ADR 0006; report USJ §R.2).
+    ///
+    /// # Errors
+    /// [`InputError::InThePast`] when `at` is before [`Esp32C3::device_time`];
+    /// [`InputError::TooManyHostChanges`] when [`MAX_PENDING_HOST_CHANGES`] changes are still to
+    /// come. Nothing changes then.
+    pub fn set_usb_host(&mut self, at: Cycles, state: UsbHost) -> Result<(), InputError> {
+        self.check_date(at)?;
+        let usb = &mut self.bus.periph.usb_serial_jtag;
+        if usb.host_changes_pending() >= MAX_PENDING_HOST_CHANGES {
+            return Err(InputError::TooManyHostChanges);
+        }
+        usb.set_host(&mut self.bus.ctx, at, state);
+        Ok(())
+    }
+
+    /// The USB host now, the changes due by now applied.
+    pub fn usb_host(&mut self) -> UsbHost {
+        self.bus.periph.usb_serial_jtag.host(&mut self.bus.ctx)
+    }
+
+    /// The changes of the USB host still to come.
+    #[must_use]
+    pub fn usb_host_changes_pending(&self) -> usize {
+        self.bus.periph.usb_serial_jtag.host_changes_pending()
+    }
+
+    /// Watches `channel` or stops watching it. While a channel is watched, each byte it hands to
+    /// the host ends the call of [`Esp32C3::run_within`] with [`StopReason::ConsoleOutput`], at
+    /// the instruction boundary it went at, or at its very instant while the CPU sleeps. A front
+    /// end that waits for a text then knows the device time it came at, whatever its slices.
+    /// Watching changes nothing the firmware can see.
+    pub fn watch_console(&mut self, channel: ConsoleChannel, watched: bool) {
+        self.watched[channel.index()] = watched;
+        let (periph, ctx) = (&mut self.bus.periph, &mut self.bus.ctx);
+        match channel {
+            ConsoleChannel::Uart0 => periph.uart0.watch(ctx, watched),
+            // The host takes each packet at an instant the block asked to be called at.
+            ConsoleChannel::UsbSerialJtag => {}
+            ConsoleChannel::Uart1 => periph.uart1.watch(ctx, watched),
+        }
+    }
+
+    fn check_date(&self, at: Cycles) -> Result<(), InputError> {
+        let now = self.device_time();
+        if at < now {
+            return Err(InputError::InThePast {
+                at_nanos: clock::TIME_BASE.cycles_to_nanos(at),
+                now_nanos: clock::TIME_BASE.cycles_to_nanos(now),
+            });
+        }
+        Ok(())
+    }
+
     /// The programs, erases and status writes the flash chip performed since the last call,
     /// oldest first: the journal of what the run wrote.
     ///
@@ -609,7 +802,7 @@ mod tests {
         HANG, T0, T1, flash_erase_sector, flash_program, flat_rom, load_register,
         print_program as print, stop_watchdogs, store_register, unmodeled_register, within,
     };
-    use cpu_rv32::asm::{addi, csrrs, csrrwi, jal, lui, lw, sw, wfi};
+    use cpu_rv32::asm::{addi, beq, csrrs, csrrwi, jal, lbu, lui, lw, sw, wfi};
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
     use emu_core::{AccessKind, AccessSize, Bus};
 
@@ -982,6 +1175,247 @@ mod tests {
         };
         assert!(diagnostic.to_string().contains("LEDC"), "{diagnostic}");
         assert!(m.cycles().get() < 100, "stopped right after the access");
+    }
+
+    /// A program that echoes on UART0 every byte it receives: it polls `STATUS.RXFIFO_CNT` (its
+    /// low byte), reads `FIFO`, writes the byte back.
+    fn echo_uart0() -> Vec<u32> {
+        vec![
+            lui(T0, UART0),
+            lbu(T1, T0, 0x1C),
+            beq(T1, 0, -4),
+            lw(T1, T0, 0),
+            sw(T1, T0, 0),
+            jal(0, -16),
+        ]
+    }
+
+    /// A byte at the reset settings of UART0: `CLKDIV` 694 on the crystal divided by 2, 10 bit
+    /// times: 55 520 cycles of the time base, 347 us.
+    const RESET_BYTE: u64 = 55_520;
+
+    #[test]
+    fn an_input_dated_before_the_device_time_is_refused_and_changes_nothing() {
+        let mut m = machine(&echo_uart0());
+        m.run_until(Cycles(100));
+        let now = m.device_time();
+        assert_eq!(
+            m.send_console(ConsoleChannel::Uart0, Cycles(now.get() - 1), b"x"),
+            Err(InputError::InThePast {
+                at_nanos: clock::TIME_BASE.cycles_to_nanos(Cycles(now.get() - 1)),
+                now_nanos: m.device_time_nanos(),
+            })
+        );
+        assert_eq!(m.input_pending(ConsoleChannel::Uart0), 0);
+        assert_eq!(
+            m.set_usb_host(Cycles::ZERO, UsbHost::Absent),
+            Err(InputError::InThePast {
+                at_nanos: 0,
+                now_nanos: m.device_time_nanos(),
+            })
+        );
+        assert_eq!(m.usb_host(), UsbHost::Open);
+        assert_eq!(m.send_console(ConsoleChannel::Uart0, now, b"x"), Ok(()));
+        assert_eq!(m.input_pending(ConsoleChannel::Uart0), 1);
+        let message = InputError::InThePast {
+            at_nanos: 5,
+            now_nanos: 10,
+        }
+        .to_string();
+        assert!(
+            message.ends_with("; date it at 10 ns or later"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_channel_holds_a_megabyte_of_the_host_at_most() {
+        let mut m = machine(&[HANG]);
+        let megabyte = vec![b'.'; MAX_PENDING_HOST_BYTES];
+        assert_eq!(
+            m.send_console(ConsoleChannel::Uart1, Cycles::ZERO, &megabyte),
+            Ok(())
+        );
+        assert_eq!(
+            m.send_console(ConsoleChannel::Uart1, Cycles::ZERO, b"!"),
+            Err(InputError::TooMuchPending {
+                channel: ConsoleChannel::Uart1,
+                pending: MAX_PENDING_HOST_BYTES + 1,
+            })
+        );
+        assert_eq!(
+            m.send_console(ConsoleChannel::UsbSerialJtag, Cycles::ZERO, &megabyte),
+            Ok(())
+        );
+        assert_eq!(
+            m.send_console(ConsoleChannel::UsbSerialJtag, Cycles::ZERO, b""),
+            Err(InputError::TooMuchPending {
+                channel: ConsoleChannel::UsbSerialJtag,
+                pending: MAX_PENDING_HOST_BYTES + 1,
+            }),
+            "a zero-length packet counts"
+        );
+        for _ in 0..MAX_PENDING_HOST_CHANGES {
+            assert_eq!(m.set_usb_host(Cycles(1_000), UsbHost::Open), Ok(()));
+        }
+        assert_eq!(
+            m.set_usb_host(Cycles(1_000), UsbHost::Open),
+            Err(InputError::TooManyHostChanges)
+        );
+        assert!(
+            InputError::TooManyHostChanges
+                .to_string()
+                .contains("; give the next ones")
+        );
+    }
+
+    #[test]
+    fn a_firmware_receives_the_bytes_of_the_host_at_their_dates() {
+        let mut m = machine(&echo_uart0());
+        let sent_at = Cycles(1_000_000);
+        m.send_console(ConsoleChannel::Uart0, sent_at, b"hi")
+            .unwrap();
+        let landed_ns = clock::TIME_BASE.cycles_to_nanos(sent_at + RESET_BYTE);
+        m.run_within(Cycles(u64::MAX), Some(landed_ns - 1_000));
+        assert_eq!(
+            m.input_pending(ConsoleChannel::Uart0),
+            2,
+            "h is on the line"
+        );
+        assert_eq!(m.take_console(ConsoleChannel::Uart0), b"");
+        m.run_within(Cycles(u64::MAX), Some(landed_ns + 3 * 347_000));
+        assert_eq!(m.take_console(ConsoleChannel::Uart0), b"hi");
+        assert_eq!(m.input_pending(ConsoleChannel::Uart0), 0);
+        assert_eq!(m.drain_diagnostics(), Vec::new());
+    }
+
+    #[test]
+    fn a_watched_channel_ends_the_call_at_the_instant_each_byte_reaches_the_host() {
+        // The CPU sleeps after the writes: each byte is seen at its very instant.
+        let mut program = print(UART0, b"abc");
+        program.extend([wfi(), HANG]);
+        let mut m = machine(&program);
+        m.watch_console(ConsoleChannel::Uart0, true);
+        assert_eq!(m.run_until(Cycles(1_000_000)), StopReason::ConsoleOutput);
+        assert_eq!(m.take_console(ConsoleChannel::Uart0), b"a");
+        let first = m.device_time();
+        for (byte, after) in [(b"b", 1), (b"c", 2)] {
+            assert_eq!(m.run_until(Cycles(1_000_000)), StopReason::ConsoleOutput);
+            assert_eq!(m.take_console(ConsoleChannel::Uart0), byte);
+            assert_eq!(
+                m.device_time(),
+                first + after * RESET_BYTE,
+                "back to back, to the cycle"
+            );
+        }
+        m.watch_console(ConsoleChannel::Uart0, false);
+        assert_ne!(m.run_until(Cycles(1_000_000)), StopReason::ConsoleOutput);
+    }
+
+    #[test]
+    fn a_watched_byte_ends_the_call_at_the_first_instruction_boundary_after_it_leaves() {
+        // While the CPU executes: the boundary is the one a caller taking the console after
+        // every instruction first finds the byte at.
+        let mut program = print(UART0, b"a");
+        program.push(HANG);
+        let mut stepped = machine(&program);
+        let seen_at = loop {
+            stepped.run_until(stepped.cycles() + 1);
+            if stepped.take_console(ConsoleChannel::Uart0) == b"a" {
+                break stepped.device_time();
+            }
+        };
+        let mut watched = machine(&program);
+        watched.watch_console(ConsoleChannel::Uart0, true);
+        assert_eq!(
+            watched.run_until(Cycles(1_000_000)),
+            StopReason::ConsoleOutput
+        );
+        assert_eq!(watched.take_console(ConsoleChannel::Uart0), b"a");
+        assert_eq!(watched.device_time(), seen_at);
+    }
+
+    /// Everything a run shows of itself: its consoles, its trace hash, its device time, its
+    /// cycles and instructions.
+    type EchoRun = (Vec<u8>, Vec<u8>, Option<u64>, Cycles, Cycles, u64);
+
+    /// The echo firmware with three inputs and a change of the USB host, run to 40 ms of device
+    /// time in calls of `slice` cycles, watching UART0 or not.
+    fn echo_run(slice: u64, watched: bool) -> EchoRun {
+        let mut m = machine_with(
+            &echo_uart0(),
+            SocConfig {
+                trace_hash: true,
+                ..SocConfig::default()
+            },
+        );
+        m.watch_console(ConsoleChannel::Uart0, watched);
+        m.send_console(ConsoleChannel::Uart0, Cycles(800_000), b"ab")
+            .unwrap();
+        m.send_console(ConsoleChannel::Uart0, Cycles(800_001), b"c")
+            .unwrap();
+        m.send_console(ConsoleChannel::Uart0, Cycles(3_000_000), b"\r\n")
+            .unwrap();
+        m.set_usb_host(Cycles(2_000_000), UsbHost::Absent).unwrap();
+        let (mut uart0, mut usb) = (Vec::new(), Vec::new());
+        let limit_ns = 40_000_000;
+        loop {
+            let stop = m.run_within(m.cycles() + slice, Some(limit_ns));
+            uart0.extend(m.take_console(ConsoleChannel::Uart0));
+            usb.extend(m.take_console(ConsoleChannel::UsbSerialJtag));
+            match stop {
+                StopReason::TimeBudget => break,
+                StopReason::CycleBudget | StopReason::Asleep | StopReason::ConsoleOutput => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        let trace = m.trace_hash();
+        (
+            uart0,
+            usb,
+            trace,
+            m.device_time(),
+            m.cycles(),
+            m.instructions(),
+        )
+    }
+
+    #[test]
+    fn a_run_with_inputs_is_the_same_whatever_its_calls_and_whether_it_is_watched() {
+        // ADR 0006: the device time of an input is fixed by the inputs alone.
+        let whole = echo_run(u64::MAX, false);
+        assert_eq!(whole.0, b"abc\r\n");
+        assert!(whole.2.is_some());
+        for (slice, watched) in [(1, false), (997, false), (1, true), (1_000_000, true)] {
+            assert_eq!(
+                echo_run(slice, watched),
+                whole,
+                "slice {slice}, watched {watched}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_usb_host_changes_at_its_date() {
+        let mut m = machine(&[HANG]);
+        m.set_usb_host(Cycles(1_000), UsbHost::Attached).unwrap();
+        assert_eq!(m.usb_host(), UsbHost::Open);
+        assert_eq!(m.usb_host_changes_pending(), 1);
+        m.run_within(
+            Cycles(u64::MAX),
+            Some(clock::TIME_BASE.cycles_to_nanos(Cycles(1_000))),
+        );
+        assert_eq!(m.usb_host(), UsbHost::Attached);
+        assert_eq!(m.usb_host_changes_pending(), 0);
+    }
+
+    #[test]
+    fn the_channels_are_named_as_the_command_line_names_them() {
+        let names: Vec<&str> = ConsoleChannel::ALL.iter().map(|c| c.name()).collect();
+        assert_eq!(names, ["uart0", "usb-serial-jtag", "uart1"]);
+        for (place, channel) in ConsoleChannel::ALL.into_iter().enumerate() {
+            assert_eq!(channel.index(), place);
+        }
     }
 
     #[test]

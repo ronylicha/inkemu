@@ -288,6 +288,13 @@ impl UsbSerialJtag {
                 .sum::<usize>()
     }
 
+    /// Whether the host took bytes that no call has taken. The host takes a packet at an instant
+    /// the block asked to be called at: a front end that watches this channel sees it then.
+    #[must_use]
+    pub(crate) fn has_left(&self) -> bool {
+        !self.tx.is_empty()
+    }
+
     /// How many changes of the host are still to come.
     #[must_use]
     pub fn host_changes_pending(&self) -> usize {
