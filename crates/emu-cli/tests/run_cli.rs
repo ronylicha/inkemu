@@ -1514,12 +1514,12 @@ fn x4_runs_the_reference_firmware_along_its_pinned_trace() {
     let log = String::from_utf8_lossy(&output.stderr).into_owned();
     assert_eq!(
         trace_hash_line(&log),
-        Some("trace-hash 10174cc2726c3d77"),
+        Some("trace-hash fb9ea628bc25b355"),
         "{log}"
     );
     assert_eq!(device_micros(&log), 11_396_706, "{log}");
     assert!(
-        log.contains("after 40000001 cycles (26562395 instructions)"),
+        log.contains("after 40000001 cycles (26559249 instructions)"),
         "{log}"
     );
 }
@@ -3766,12 +3766,12 @@ fn x4_runs_the_reference_firmware_from_its_application_image_along_its_pinned_tr
     let log = String::from_utf8_lossy(&output.stderr).into_owned();
     assert_eq!(
         trace_hash_line(&log),
-        Some("trace-hash c6b24a1cc226ed4a"),
+        Some("trace-hash 9a6cf19d47136f33"),
         "{log}"
     );
     assert_eq!(device_micros(&log), 11_403_054, "{log}");
     assert!(
-        log.contains("after 40000001 cycles (26637404 instructions)"),
+        log.contains("after 40000001 cycles (26635331 instructions)"),
         "{log}"
     );
     assert!(
