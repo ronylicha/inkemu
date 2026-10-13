@@ -141,6 +141,9 @@ pub struct UsbSerialJtag {
     /// The packets the host sends and that have not reached the FIFO, each with the device
     /// time, in cycles, before which it is not sent; a zero-length packet is empty.
     sent: VecDeque<(u64, Vec<u8>)>,
+    /// The bytes of `sent`, a zero-length packet counted as one: kept as the packets come and
+    /// go, so that a count costs nothing however many packets wait.
+    sent_bytes: usize,
     /// The packet of the host in the OUT FIFO, what the firmware has not read of it.
     out_fifo: VecDeque<u8>,
     /// When the OUT FIFO was last left empty: the host sends its next packet from then on.
@@ -186,6 +189,7 @@ impl UsbSerialJtag {
             committed: None,
             tx: Vec::new(),
             sent: VecDeque::new(),
+            sent_bytes: 0,
             out_fifo: VecDeque::new(),
             out_free_since: 0,
             host,
@@ -257,6 +261,7 @@ impl UsbSerialJtag {
         for packet in bytes.chunks(PACKET_BYTES) {
             self.sent.push_back((date, packet.to_vec()));
         }
+        self.sent_bytes = self.sent_bytes.saturating_add(bytes.len().max(1));
         self.arm(ctx);
     }
 
@@ -283,12 +288,7 @@ impl UsbSerialJtag {
     /// one byte each at least, so that zero-length ones count too.
     #[must_use]
     pub fn host_pending(&self) -> usize {
-        self.out_fifo.len()
-            + self
-                .sent
-                .iter()
-                .map(|(_, packet)| packet.len().max(1))
-                .sum::<usize>()
+        self.out_fifo.len() + self.sent_bytes
     }
 
     /// Whether the host took bytes that no call has taken. The host takes a packet at an instant
@@ -437,6 +437,7 @@ impl UsbSerialJtag {
         let Some((_, packet)) = self.sent.pop_front() else {
             return;
         };
+        self.sent_bytes = self.sent_bytes.saturating_sub(packet.len().max(1));
         if packet.is_empty() {
             // A zero-length packet leaves the FIFO empty: the next one can follow.
             self.int_raw |= OUT_EP1_ZERO_PAYLOAD;
@@ -774,6 +775,7 @@ mod tests {
         assert_eq!(usb.host_pending(), 90);
         run_to(ctx, &mut usb, Cycles(HOST_LATENCY));
         assert_eq!(read_packet(ctx, &mut usb), &input[..64]);
+        assert_eq!(usb.host_pending(), 26, "the second packet is still to come");
         let read_at = ctx.now();
         run_to(ctx, &mut usb, read_at + (HOST_LATENCY - 1));
         assert_eq!(
@@ -783,6 +785,7 @@ mod tests {
         );
         run_to(ctx, &mut usb, read_at + HOST_LATENCY);
         assert_eq!(read_packet(ctx, &mut usb), &input[64..]);
+        assert_eq!(usb.host_pending(), 0);
     }
 
     #[test]
@@ -798,8 +801,10 @@ mod tests {
             OUT_EP1_ZERO_PAYLOAD
         );
         assert_eq!(usb.read(ctx, INT_RAW).unwrap() & SERIAL_OUT_RECV_PKT, 0);
+        assert_eq!(usb.host_pending(), 1, "the zero-length packet is gone");
         run_to(ctx, &mut usb, Cycles(2 * HOST_LATENCY));
         assert_eq!(read_packet(ctx, &mut usb), b"z");
+        assert_eq!(usb.host_pending(), 0);
     }
 
     #[test]
