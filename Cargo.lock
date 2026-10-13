@@ -875,6 +875,7 @@ dependencies = [
  "goblin",
  "sha1",
  "sha2",
+ "soc-esp32c3",
  "svd-regs",
  "thiserror",
 ]

@@ -8,6 +8,7 @@ use emu_core::Cycles;
 use firmware::builder::{ImageSpec, build_image};
 use sha2::{Digest, Sha256};
 use soc_esp32c3::reset::ResetCause;
+use soc_esp32c3::test_support::{Bounds, Consoles, Driven, drive};
 use soc_esp32c3::{
     ChipRevision, ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason,
 };
@@ -90,7 +91,7 @@ struct Boot {
     uart0: String,
     usb: String,
     diagnostics: Vec<Diagnostic>,
-    stop: StopReason,
+    driven: Driven,
     trace_hash: Option<u64>,
     cycles: u64,
 }
@@ -99,23 +100,20 @@ struct Boot {
 /// Carriage returns are dropped: the ROM expands `\n` to `\r\n` on the UART.
 fn boot(revision: u16, config: SocConfig) -> Boot {
     let mut machine = Esp32C3::new(RomImage::from_elf(&elf(revision)).unwrap(), &config);
-    let (mut uart0, mut usb, mut diagnostics) = (Vec::new(), Vec::new(), Vec::new());
-    let mut stop = StopReason::CycleBudget;
-    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
-    while stop == StopReason::CycleBudget
-        && machine.cycles().get() < BANNER_BUDGET
-        && !text(&uart0).contains(BOOT_LINE)
-    {
-        stop = machine.run_until(Cycles(machine.cycles().get() + SLICE));
-        uart0.extend(machine.take_console(ConsoleChannel::Uart0));
-        usb.extend(machine.take_console(ConsoleChannel::UsbSerialJtag));
-        diagnostics.extend(machine.drain_diagnostics());
-    }
+    let mut consoles = Consoles::default();
+    let bounds = Bounds {
+        slice: SLICE,
+        max_cycles: BANNER_BUDGET,
+        max_nanos: u64::MAX,
+    };
+    let driven = drive(&mut machine, bounds, &mut consoles, |_, _, seen| {
+        seen.text(ConsoleChannel::Uart0).contains(BOOT_LINE)
+    });
     Boot {
-        uart0: text(&uart0),
-        usb: text(&usb),
-        diagnostics,
-        stop,
+        uart0: consoles.text(ConsoleChannel::Uart0),
+        usb: consoles.text(ConsoleChannel::UsbSerialJtag),
+        diagnostics: consoles.diagnostics,
+        driven,
         trace_hash: machine.trace_hash(),
         cycles: machine.cycles().get(),
     }
@@ -179,7 +177,7 @@ fn assert_strict_boot_reaches_the_banner(rom_revision: u16, banner_text: &str) {
     assert!(
         boot.uart0.starts_with(banner_text),
         "rev{rom_revision} stopped early: {:?}\nUART0: {:?}",
-        boot.stop,
+        boot.driven,
         boot.uart0
     );
     assert!(
@@ -250,7 +248,7 @@ struct FlashBoot {
     /// UART0 output after the three banner lines, carriage returns dropped.
     after_banner: String,
     diagnostics: Vec<Diagnostic>,
-    stop: StopReason,
+    driven: Driven,
     pc: u32,
     trace_hash: Option<u64>,
 }
@@ -264,31 +262,34 @@ fn flash_boot(flash: Option<Vec<u8>>, config: SocConfig, done: impl Fn(&str) -> 
         None => Esp32C3::new(rom, &config),
     };
     let banner_text = banner("esp32c3-api1-20210207", "Feb  7 2021");
-    let (mut uart0, mut diagnostics) = (Vec::new(), Vec::new());
-    let mut stop = StopReason::CycleBudget;
-    let mut extra_slices = 1;
-    let after = |bytes: &[u8]| {
-        let text = String::from_utf8_lossy(bytes).replace('\r', "");
-        text.strip_prefix(&banner_text)
+    let after = |consoles: &Consoles| {
+        consoles
+            .text(ConsoleChannel::Uart0)
+            .strip_prefix(&banner_text)
             .map(str::to_owned)
             .unwrap_or_default()
     };
-    while stop == StopReason::CycleBudget && machine.cycles().get() < FLASH_BOOT_BUDGET {
-        if done(&after(&uart0)) {
-            if extra_slices == 0 {
-                break;
-            }
-            extra_slices -= 1;
+    let mut consoles = Consoles::default();
+    let bounds = Bounds {
+        slice: SLICE,
+        max_cycles: FLASH_BOOT_BUDGET,
+        max_nanos: u64::MAX,
+    };
+    let mut extra_slices = 1;
+    let driven = drive(&mut machine, bounds, &mut consoles, |_, _, seen| {
+        if !done(&after(seen)) {
+            return false;
         }
-        stop = machine.run_until(Cycles(machine.cycles().get() + SLICE));
-        uart0.extend(machine.take_console(ConsoleChannel::Uart0));
-        let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
-        diagnostics.extend(machine.drain_diagnostics());
-    }
+        if extra_slices == 0 {
+            return true;
+        }
+        extra_slices -= 1;
+        false
+    });
     FlashBoot {
-        after_banner: after(&uart0),
-        diagnostics,
-        stop,
+        after_banner: after(&consoles),
+        diagnostics: consoles.diagnostics,
+        driven,
         pc: machine.pc(),
         trace_hash: machine.trace_hash(),
     }
@@ -327,7 +328,7 @@ fn rom_loads_a_synthetic_bootloader_and_jumps_to_its_entry() {
         Vec::new(),
         "nothing unmodelled, no exception, on the whole flash path"
     );
-    assert_eq!(boot.stop, StopReason::CycleBudget);
+    assert_eq!(boot.driven, Driven::Done);
     assert_eq!(boot.pc, STUB_ENTRY, "the ROM jumped into the image");
 }
 
@@ -352,7 +353,7 @@ fn blank_flash_prints_invalid_header_forever() {
         boot.after_banner
     );
     assert_eq!(boot.diagnostics, Vec::new());
-    assert_eq!(boot.stop, StopReason::CycleBudget, "a loop, not a stop");
+    assert_eq!(boot.driven, Driven::Done, "a loop, not a stop");
 }
 
 #[test]
@@ -530,35 +531,33 @@ fn run_to_resets(
     limit_ns: u64,
     done: impl Fn(&str) -> bool,
 ) -> WatchdogRun {
-    let (mut uart0, mut reset_seen_at, mut diagnostics) = (Vec::new(), Vec::new(), Vec::new());
-    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
-    while !(machine.resets() >= resets && done(&text(&uart0))) {
-        assert!(
-            machine.cycles().get() < FLASH_BOOT_BUDGET * 4
-                && machine.device_time_nanos() < limit_ns,
-            "budget exhausted after {} resets, at {} ns of device time and {} cycles (limits: {limit_ns} ns, {} cycles); console:\n{}",
-            machine.resets(),
-            machine.device_time_nanos(),
-            machine.cycles().get(),
-            FLASH_BOOT_BUDGET * 4,
-            text(&uart0)
-        );
-        let stop = machine.run_until(Cycles(machine.cycles().get() + WATCHDOG_SLICE));
-        assert!(
-            matches!(stop, StopReason::CycleBudget | StopReason::Asleep),
-            "{stop:?}"
-        );
+    let mut reset_seen_at = Vec::new();
+    let mut consoles = Consoles::default();
+    let bounds = Bounds {
+        slice: WATCHDOG_SLICE,
+        max_cycles: FLASH_BOOT_BUDGET * 4,
+        max_nanos: limit_ns,
+    };
+    let driven = drive(&mut machine, bounds, &mut consoles, |machine, _, seen| {
         if machine.resets() > u64::try_from(reset_seen_at.len()).unwrap() {
             reset_seen_at.push(machine.device_time_nanos());
         }
-        uart0.extend(machine.take_console(ConsoleChannel::Uart0));
-        let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
-        diagnostics.extend(machine.drain_diagnostics());
-    }
+        machine.resets() >= resets && done(&seen.text(ConsoleChannel::Uart0))
+    });
+    assert_eq!(
+        driven,
+        Driven::Done,
+        "after {} resets, at {} ns of device time and {} cycles (limits: {limit_ns} ns, {} cycles); console:\n{}",
+        machine.resets(),
+        machine.device_time_nanos(),
+        machine.cycles().get(),
+        FLASH_BOOT_BUDGET * 4,
+        consoles.text(ConsoleChannel::Uart0)
+    );
     WatchdogRun {
-        console: text(&uart0),
+        console: consoles.text(ConsoleChannel::Uart0),
         reset_seen_at,
-        diagnostics,
+        diagnostics: consoles.diagnostics,
         repeated: machine.most_repeated_diagnostics(8),
     }
 }

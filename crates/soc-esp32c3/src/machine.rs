@@ -46,7 +46,7 @@ impl ConsoleChannel {
     }
 
     /// The place of the channel in [`ConsoleChannel::ALL`].
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         match self {
             ConsoleChannel::Uart0 => 0,
             ConsoleChannel::UsbSerialJtag => 1,
