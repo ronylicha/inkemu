@@ -94,7 +94,7 @@ jobs:
         # Each command must run exactly the expected number of tests, all passing: a renamed or
         # un-ignored test would otherwise leave this job green with nothing proven.
         run: |
-          tools/ci/run-ignored-tests.sh 18 --release -p soc-esp32c3 --test real_rom -- --ignored
+          tools/ci/run-ignored-tests.sh 19 --release -p soc-esp32c3 --test real_rom -- --ignored
           tools/ci/run-ignored-tests.sh 27 --release -p emu-cli --test run_cli -- --ignored --skip reference_firmware
   reference-boot:
     # Boots the reference firmware (stock ESP-IDF bootloader + hello_world) from the real mask ROM

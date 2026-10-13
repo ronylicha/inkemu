@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use soc_esp32c3::reset::ResetCause;
 use soc_esp32c3::test_support::{Bounds, Consoles, Driven, drive};
 use soc_esp32c3::{
-    ChipRevision, ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason,
+    ChipRevision, ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason, UsbHost,
 };
 
 /// The ROM ELF of `revision` in the directory `INKEMU_ROM_ELF_DIR` names; a failure says why and
@@ -90,6 +90,8 @@ const BOOT_LINE: &str = "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n";
 struct Boot {
     uart0: String,
     usb: String,
+    /// What the firmware wrote on USB-Serial-JTAG and the host did not take.
+    usb_left: Vec<u8>,
     diagnostics: Vec<Diagnostic>,
     driven: Driven,
     trace_hash: Option<u64>,
@@ -116,6 +118,7 @@ fn boot(revision: u16, config: SocConfig) -> Boot {
         driven,
         trace_hash: machine.trace_hash(),
         cycles: machine.cycles().get(),
+        usb_left: machine.flush_console(ConsoleChannel::UsbSerialJtag),
     }
 }
 
@@ -146,6 +149,35 @@ fn rev3_rom_prints_the_same_banner_on_usb_serial_jtag() {
         "USB printed: {:?}",
         boot.usb
     );
+}
+
+/// With no host, or a host whose port is closed, nobody takes the ROM's first USB packet: the ROM
+/// waits for room 5,000 times, gives up and drops the rest of its USB output, and its banner on
+/// UART0 goes on (report USJ §B.1, §F.3).
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rev3_rom_keeps_its_first_usb_packet_without_a_host_that_takes_it_and_goes_on() {
+    for usb_host in [UsbHost::Absent, UsbHost::Attached] {
+        let boot = boot(
+            3,
+            SocConfig {
+                usb_host,
+                ..SocConfig::default()
+            },
+        );
+        assert!(
+            boot.uart0
+                .starts_with(&banner("esp32c3-api1-20210207", "Feb  7 2021")),
+            "{usb_host:?}: UART0 printed {:?}",
+            boot.uart0
+        );
+        assert_eq!(boot.usb, "", "{usb_host:?}: the host took nothing");
+        assert_eq!(
+            String::from_utf8_lossy(&boot.usb_left),
+            "ESP-ROM:esp32c3-api1-20210207\r\n",
+            "{usb_host:?}: the first packet only"
+        );
+    }
 }
 
 #[test]
