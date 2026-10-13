@@ -93,10 +93,36 @@ pub enum FirmwareError {
     NoPartitionTable,
 }
 
+impl FirmwareError {
+    /// The cause the message states, without its remedy: for a message about another role, whose
+    /// remedy differs (the remedies of these messages speak of an application).
+    #[must_use]
+    pub fn cause(&self) -> String {
+        let message = self.to_string();
+        match message.split_once("; ") {
+            Some((cause, _)) => cause.to_owned(),
+            None => message,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chip::ChipId;
+
+    #[test]
+    fn the_cause_of_every_message_is_what_comes_before_its_one_remedy() {
+        for err in one_of_each() {
+            let message = err.to_string();
+            assert_eq!(message.matches("; ").count(), 1, "{message}");
+            let cause = err.cause();
+            assert!(
+                message.starts_with(&format!("{cause}; ")) && !cause.is_empty(),
+                "{message}"
+            );
+        }
+    }
 
     /// One instance of every variant. The exhaustive `match` in `variant_index` makes
     /// adding a variant without adding it here a compile error.

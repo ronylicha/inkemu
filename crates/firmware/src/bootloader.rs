@@ -354,7 +354,10 @@ pub enum BootloaderError {
         /// The codes the ROM of the chip accepts ([`MemoryMap::rom_speeds`]).
         accepted: &'static [u8],
     },
-    #[error("the bootloader is damaged: {0}")]
+    #[error(
+        "the bootloader is damaged: {}; re-download the file, rebuild the bootloader, or give no bootloader to use the one inkemu ships",
+        .0.cause()
+    )]
     Damaged(FirmwareError),
     #[error(
         "segment {index} of the bootloader is loaded at {addr:#010x}, in a window of the flash, as an application's code is; use the file as the firmware (`--firmware`), with the bootloader of its build"
@@ -1039,11 +1042,54 @@ mod tests {
         };
         let mut bytes = build_image(&spec);
         let last = bytes.len() - 1;
+        let stored = bytes[last];
         bytes[last] ^= 1;
-        assert!(matches!(
-            refusal(&bytes),
-            BootloaderError::Damaged(FirmwareError::ChecksumMismatch { .. })
-        ));
+        let err = refusal(&bytes);
+        assert_eq!(
+            err,
+            BootloaderError::Damaged(FirmwareError::ChecksumMismatch {
+                stored: stored ^ 1,
+                computed: stored
+            })
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the bootloader is damaged: checksum mismatch (stored {:#04x}, computed {stored:#04x}); re-download the file, rebuild the bootloader, or give no bootloader to use the one inkemu ships",
+                stored ^ 1
+            )
+        );
+    }
+
+    #[test]
+    fn a_damaged_bootloader_is_told_to_be_rebuilt_not_the_firmware() {
+        // Every damage the parse of a bootloader can report past the checks before it.
+        for damage in [
+            FirmwareError::TooManySegments { count: 17, max: 16 },
+            FirmwareError::TruncatedSegmentHeader {
+                index: 1,
+                offset: 288,
+            },
+            FirmwareError::TruncatedSegment {
+                index: 0,
+                offset: 24,
+                declared: 256,
+                available: 8,
+            },
+            FirmwareError::MisalignedSegment { index: 0, len: 3 },
+            FirmwareError::BadSpiMode { raw: 9 },
+            FirmwareError::BadFlashSize { raw: 8 },
+            FirmwareError::TruncatedTrailer,
+            FirmwareError::ChecksumMismatch {
+                stored: 1,
+                computed: 2,
+            },
+        ] {
+            let text = BootloaderError::Damaged(damage).to_string();
+            assert_eq!(text.matches("; ").count(), 1, "{text}");
+            assert!(!text.contains("firmware"), "{text}");
+            assert!(text.ends_with("; re-download the file, rebuild the bootloader, or give no bootloader to use the one inkemu ships"), "{text}");
+        }
     }
 
     #[test]
