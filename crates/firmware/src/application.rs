@@ -8,7 +8,7 @@ use crate::chip::ChipId;
 use crate::device::{Device, revision};
 use crate::error::FirmwareError;
 use crate::image::FirmwareImage;
-use crate::partition::{PARTITION_TABLE_OFFSET, Partition};
+use crate::partition::{PARTITION_TABLE_LEN, PARTITION_TABLE_OFFSET, Partition};
 
 /// The bootloader ignores a revision bound of 0 or 65535 (`IS_FIELD_SET`,
 /// `bootloader_common_loader.c` of ESP-IDF v5.5.2).
@@ -62,6 +62,10 @@ pub enum ApplicationError {
         "the firmware is {len} bytes and starts with a 2nd-stage bootloader, so it is a whole flash image, but its partition table at 0x8000 does not parse; use an intact dump as the flash (`--flash`), or the application .bin of its build as the firmware"
     )]
     FlashImageWithoutTable { len: usize },
+    #[error(
+        "the firmware is {len} bytes and starts with a 2nd-stage bootloader, which ends below the partition table at 0x8000 (32768 bytes), so it is neither a bootloader nor a whole flash image; give the bootloader.bin of a build as the bootloader (`--bootloader`), and the application .bin as the firmware"
+    )]
+    BootloaderTooLong { len: usize },
     #[error(
         "the firmware has no application descriptor at 0x20 (esp_app_desc_t), which every ESP-IDF application carries and the bootloader reads; use the application .bin of an ESP-IDF build"
     )]
@@ -134,10 +138,15 @@ pub fn check_application(
     let Some(desc) = image.app_desc.clone() else {
         return Err(if !is_bootloader(&image) {
             ApplicationError::NoDescriptor
-        } else if bytes.len() > PARTITION_TABLE_OFFSET as usize {
-            // A bootloader ends below the table: more is a dump or a merged image, whose table
+        } else if bytes.len() >= PARTITION_TABLE_OFFSET as usize + PARTITION_TABLE_LEN {
+            // A bootloader ends below the table: a file long enough to hold the whole table
+            // (`PARTITION_TABLE_LEN` bytes from 0x8000) is a dump or a merged image, whose table
             // `has_partition_table` did not find.
             ApplicationError::FlashImageWithoutTable { len: bytes.len() }
+        } else if bytes.len() > PARTITION_TABLE_OFFSET as usize {
+            // Past the end of a bootloader and too short for a table: the bootloader and
+            // a few erased bytes, not a dump.
+            ApplicationError::BootloaderTooLong { len: bytes.len() }
         } else {
             ApplicationError::Bootloader
         });
@@ -324,6 +333,31 @@ mod tests {
     }
 
     #[test]
+    fn a_bootloader_descriptor_names_a_bootloader_whatever_its_segments() {
+        // A bootloader of a chip inkemu has no memory map for: only its descriptor names it.
+        let for_another_chip = build_image(&ImageSpec {
+            chip: 9,
+            entry: 0x403C_B700,
+            segments: vec![
+                (
+                    0x3FCE_2700,
+                    crate::builder::bootloader_desc_bytes("v5.5.2", ""),
+                ),
+                (0x403C_B700, vec![0x6F, 0, 0, 0]),
+            ],
+            ..ImageSpec::default()
+        });
+        assert_eq!(refusal(&for_another_chip), ApplicationError::Bootloader);
+        // A segment in a window of the flash: its addresses alone would make it an application.
+        let mut spec = bootloader_spec();
+        spec.segments.push((0x3C00_0020, vec![0; 8]));
+        assert_eq!(refusal(&build_image(&spec)), ApplicationError::Bootloader);
+        // The same segments without the descriptor are an application without its descriptor.
+        spec.segments[0].1[0] = 0;
+        assert_eq!(refusal(&build_image(&spec)), ApplicationError::NoDescriptor);
+    }
+
+    #[test]
     fn a_dump_whose_partition_table_does_not_parse_is_named_a_flash_image() {
         let mut no_descriptor = bootloader_spec();
         no_descriptor.segments[0].1[0] = 0;
@@ -345,6 +379,36 @@ mod tests {
         let mut bootloader = build_image(&bootloader_spec());
         bootloader.resize(0x8000, 0xFF);
         assert_eq!(refusal(&bootloader), ApplicationError::Bootloader);
+    }
+
+    #[test]
+    fn a_file_is_a_whole_flash_image_only_when_it_is_long_enough_to_hold_a_table() {
+        let table_end = 0x8000 + crate::partition::PARTITION_TABLE_LEN;
+        let mut no_descriptor = bootloader_spec();
+        no_descriptor.segments[0].1[0] = 0;
+        for spec in [bootloader_spec(), no_descriptor] {
+            let mut file = build_image(&spec);
+            // A bootloader followed by a few erased bytes is neither a bootloader nor a dump.
+            file.resize(0x8001, 0xFF);
+            let err = refusal(&file);
+            assert_eq!(err, ApplicationError::BootloaderTooLong { len: 0x8001 });
+            assert_eq!(
+                err.to_string(),
+                "the firmware is 32769 bytes and starts with a 2nd-stage bootloader, which ends below the partition table at 0x8000 (32768 bytes), so it is neither a bootloader nor a whole flash image; give the bootloader.bin of a build as the bootloader (`--bootloader`), and the application .bin as the firmware"
+            );
+            file.resize(table_end - 1, 0xFF);
+            assert_eq!(
+                refusal(&file),
+                ApplicationError::BootloaderTooLong { len: table_end - 1 }
+            );
+            // From the end of the table sector's content on, a table that does not parse is a
+            // damaged dump.
+            file.resize(table_end, 0xFF);
+            assert_eq!(
+                refusal(&file),
+                ApplicationError::FlashImageWithoutTable { len: table_end }
+            );
+        }
     }
 
     #[test]
@@ -518,6 +582,7 @@ mod tests {
             ApplicationError::Damaged(FirmwareError::HashMismatch),
             ApplicationError::Bootloader,
             ApplicationError::FlashImageWithoutTable { len: 0x100_0000 },
+            ApplicationError::BootloaderTooLong { len: 0x8001 },
             ApplicationError::NoDescriptor,
             ApplicationError::ChipMismatch {
                 expected: ChipId::Esp32C3,
