@@ -1458,7 +1458,9 @@ fn a_flash_file_of_another_size_is_refused_before_boot_with_both_sizes_and_left_
                 .and(contains(format!("is {} bytes", image.len())))
                 .and(contains("16777216 bytes"))
                 .and(contains("never padded or cut"))
-                .and(contains("; use it with the device it was written for"))
+                .and(contains(
+                    "; use it with the device it was written for, pass a firmware image with --flash instead, or give a new path\n",
+                ))
                 .and(contains("esp32c3_rev3_rom.elf").not()),
         );
         assert_eq!(std::fs::read(&file).unwrap(), image);
@@ -3144,20 +3146,44 @@ fn a_firmware_is_a_seed_like_an_image_and_the_flash_file_rules_apply() {
     let firmware = dir.path().join("app.bin");
     std::fs::write(&firmware, &app).unwrap();
     let firmware_arg = firmware.to_str().unwrap();
-    run_with_flash_file(&file, &["--firmware", firmware_arg])
-        .code(2)
-        .stderr(
+    let bootloader = dir.path().join("bootloader.bin");
+    std::fs::write(
+        &bootloader,
+        build_image(&firmware::builder::bootloader_spec()),
+    )
+    .unwrap();
+    for more in [&[][..], &["--bootloader", bootloader.to_str().unwrap()][..]] {
+        let args = [&["--firmware", firmware_arg][..], more].concat();
+        run_with_flash_file(&file, &args).code(2).stderr(
             contains("both --firmware and the flash file")
-                .and(contains("; drop --firmware to go on from the flash file"))
+                .and(contains(
+                    "; drop --firmware, and --bootloader if it was given, to go on from the flash file",
+                ))
                 .and(contains(
                     "start again from the flash composed from the firmware",
                 ))
                 .and(contains(MISSING_ROM).not()),
         );
-    // With --reset-flash the run goes as far as the ROM.
+    }
+    // Dropping both goes on from the flash file, as far as the ROM; with --reset-flash the run
+    // starts from the firmware, as far as the ROM.
+    run_with_flash_file(&file, &[])
+        .code(2)
+        .stderr(contains(MISSING_ROM));
     run_with_flash_file(&file, &["--firmware", firmware_arg, "--reset-flash"])
         .code(2)
         .stderr(contains(MISSING_ROM));
+    // A flash file of another size is kept, and the remedy does not send a firmware to --flash.
+    let small = dir.path().join("small.bin");
+    sparse_file(&small, 1 << 20);
+    run_with_flash_file(&small, &["--firmware", firmware_arg, "--reset-flash"])
+        .code(2)
+        .stderr(
+            contains(
+                "is 1048576 bytes and the flash of the device is 16777216 bytes: the file is not the flash of this device, and it is never padded or cut; use it with the device it was written for, or give --flash-file a new path\n",
+            )
+            .and(contains(MISSING_ROM).not()),
+        );
     // The firmware cannot be the flash file, nor --bootloader. The remedy keeps the file: a reset
     // of the flash file would replace the firmware with the flash.
     let keeps_the_file = || {

@@ -24,7 +24,8 @@ pub enum FirmwareFileError {
     #[error("{path}, given to {input}, is not a regular file; give the path of the file itself")]
     NotAFile { input: Input, path: String },
     #[error(
-        "{path}, given to {input}, is {len} bytes, more than the {size} byte flash of the device, so it is no application nor bootloader of this device; give the .bin of a build, or a flash image of this device to --flash"
+        "{path}, given to {input}, is {len} bytes, more than the {size} byte flash of the device, so it is no application nor bootloader of this device; {}",
+        too_long_remedy(*input)
     )]
     TooLong {
         input: Input,
@@ -48,6 +49,19 @@ pub enum FirmwareFileError {
         #[source]
         source: ComposeError,
     },
+}
+
+/// What to give in place of a file longer than the flash, by the option it was given to: a
+/// bootloader is replaced by a bootloader, never by a flash image.
+const fn too_long_remedy(input: Input) -> &'static str {
+    match input {
+        Input::Bootloader => {
+            "give the bootloader.bin of a build, or no --bootloader to use the one inkemu ships"
+        }
+        Input::Firmware | Input::Flash => {
+            "give the application .bin of a build, or give a flash image of this device to --flash instead of --firmware"
+        }
+    }
 }
 
 fn shown(path: &Path) -> String {
@@ -217,6 +231,30 @@ mod tests {
                     size: 16_777_216,
                     ..
                 }
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().ends_with(
+                "; give the application .bin of a build, or give a flash image of this device to --flash instead of --firmware"
+            ),
+            "{err}"
+        );
+        // The remedy of a bootloader is a bootloader, never a flash image.
+        let err = compose(&x4(), &app, Some(&big)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FirmwareFileError::TooLong {
+                    input: Input::Bootloader,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().ends_with(
+                "; give the bootloader.bin of a build, or no --bootloader to use the one inkemu ships"
             ),
             "{err}"
         );

@@ -106,10 +106,17 @@ pub enum FlashStateError {
         "the flash file {path} cannot be opened for writing: {detail}; make it writable for you, since a run replaces its flash file when it ends, or keep it as it is and give it to --flash, which is only read, with another path for --flash-file"
     )]
     NotWritable { path: String, detail: String },
+    /// `seed` is the option the run would have started from, if any: it chooses the remedy.
     #[error(
-        "the flash file {path} is {len} bytes and the flash of the device is {size} bytes: the file is not the flash of this device, and it is never padded or cut; use it with the device it was written for, pass a firmware image with --flash instead, or give a new path"
+        "the flash file {path} is {len} bytes and the flash of the device is {size} bytes: the file is not the flash of this device, and it is never padded or cut; {}",
+        wrong_size_remedy(*seed)
     )]
-    WrongSize { path: String, len: u64, size: u32 },
+    WrongSize {
+        path: String,
+        len: u64,
+        size: u32,
+        seed: Option<Input>,
+    },
     #[error(
         "the flash file {path} changed while it was being read: it held {size} bytes, then {found}; make sure nothing else writes it, then run again"
     )]
@@ -119,8 +126,8 @@ pub enum FlashStateError {
         found: String,
     },
     #[error(
-        "both {input} and the flash file {path}, which exists, were given: the run cannot start from two flashes; drop {input} to go on from the flash file, or add --reset-flash to start again from {} and replace the file",
-        input.what_it_gives()
+        "both {input} and the flash file {path}, which exists, were given: the run cannot start from two flashes; drop {} to go on from the flash file, or add --reset-flash to start again from {} and replace the file",
+        input.to_drop(), input.what_it_gives()
     )]
     BothGiven { path: String, input: Input },
     #[error(
@@ -179,6 +186,15 @@ impl Input {
         }
     }
 
+    /// What to drop from the command line for the run to go on from its flash file: a
+    /// `--bootloader` cannot stay without its `--firmware`.
+    const fn to_drop(self) -> &'static str {
+        match self {
+            Input::Flash => "--flash",
+            Input::Firmware | Input::Bootloader => "--firmware, and --bootloader if it was given,",
+        }
+    }
+
     /// What a run starts from when this input is the seed and the flash file is reset.
     const fn what_it_gives(self) -> &'static str {
         match self {
@@ -206,6 +222,20 @@ impl std::fmt::Display for Input {
             Input::Firmware => "--firmware",
             Input::Bootloader => "--bootloader",
         })
+    }
+}
+
+/// What to do about a flash file of another size than the flash, by the option the run would
+/// have started from: with `--firmware` on the command line, `--flash` is no remedy, since the
+/// two cannot be given together.
+const fn wrong_size_remedy(seed: Option<Input>) -> &'static str {
+    match seed {
+        None | Some(Input::Flash) => {
+            "use it with the device it was written for, pass a firmware image with --flash instead, or give a new path"
+        }
+        Some(Input::Firmware | Input::Bootloader) => {
+            "use it with the device it was written for, or give --flash-file a new path"
+        }
     }
 }
 
@@ -426,6 +456,7 @@ fn check(shown: &str, size: u32, metadata: &std::fs::Metadata) -> Result<(), Fla
             path: shown.to_owned(),
             len: metadata.len(),
             size,
+            seed: None,
         });
     }
     Ok(())
@@ -822,6 +853,27 @@ impl RunFlash {
     /// [`FlashState::exists`], [`FlashState::load`]), or it exists and `seed` was given without
     /// `reset`.
     pub fn begin(
+        flash_file: Option<&Path>,
+        reset: bool,
+        seed: Option<Seed>,
+        size: u32,
+    ) -> Result<(RunFlash, Option<Vec<u8>>), FlashStateError> {
+        let input = seed.as_ref().map(|seed| seed.input);
+        Self::take(flash_file, reset, seed, size).map_err(|error| match error {
+            // The file is judged before the seed is looked at: the remedy names what was given.
+            FlashStateError::WrongSize {
+                path, len, size, ..
+            } => FlashStateError::WrongSize {
+                path,
+                len,
+                size,
+                seed: input,
+            },
+            other => other,
+        })
+    }
+
+    fn take(
         flash_file: Option<&Path>,
         reset: bool,
         seed: Option<Seed>,
