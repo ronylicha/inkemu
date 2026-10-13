@@ -2983,6 +2983,116 @@ fn the_nvs_reference_firmware_goes_on_counting_in_a_second_run_on_the_same_flash
     assert_eq!(sha256_of(&image), NVS_IMAGE_SHA256, "--flash is only read");
 }
 
+/// What the README says standard error reads for the runs of the reference images: the
+/// `inkemu:` lines of its `text` blocks against the ones the binary prints. Each example is the
+/// sentence that introduces a block and the command or commands that produce it, written as
+/// the README writes them. An example that begins with `$ ` takes its commands from the block
+/// itself, one run per paragraph. The images are copied under the names the README shows, and
+/// the runs start in the directory that holds them, so that the file names the lines print are
+/// the README's own. Numbers (program counter, cycles, instructions, device time, flash digests)
+/// move with any change that touches what the firmware sees; this is the test that says so.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the images.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR, INKEMU_REF_FLASH and INKEMU_NVS_FLASH"]
+fn the_readme_shows_what_the_binary_prints_for_the_reference_firmware() {
+    const BINARY: &str = "target/release/inkemu ";
+    /// The introduction of a block of the README, and what runs to produce it (empty: the
+    /// commands are in the block).
+    const EXAMPLES: [(&str, &[&str]); 3] = [
+        (
+            "With `--max-cycles 50000000`, standard error reads:\n\n",
+            &["run --device x4 --flash flash_hello.bin --max-cycles 50000000"],
+        ),
+        (
+            "`Restarting in 6 seconds...` and standard error reads:\n\n",
+            &["run --device x4 --flash flash_hello.bin --max-time 5"],
+        ),
+        ("keeps a restart counter in NVS:\n\n", &[]),
+    ];
+
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let images = [
+        ("flash_hello.bin", reference_image()),
+        (
+            "flash_nvs.bin",
+            pinned_image("INKEMU_NVS_FLASH", "flash_nvs.bin", NVS_IMAGE_SHA256),
+        ),
+    ];
+    let readme = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+    )
+    .unwrap();
+    let inkemu_lines = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.starts_with("inkemu:"))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let mut disagreements = Vec::new();
+    for (introduction, commands) in EXAMPLES {
+        let after = readme
+            .split_once(introduction)
+            .unwrap_or_else(|| panic!("the README has no block after {introduction:?}"))
+            .1;
+        let block = after
+            .strip_prefix("```text\n")
+            .unwrap_or_else(|| panic!("no `text` block after {introduction:?}"))
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        // One run, one paragraph of the block, when the block holds its commands.
+        let runs: Vec<(String, String)> = if commands.is_empty() {
+            block
+                .split("\n\n")
+                .map(|paragraph| {
+                    let command = paragraph
+                        .lines()
+                        .next()
+                        .and_then(|line| line.strip_prefix("$ "))
+                        .and_then(|line| line.strip_prefix(BINARY))
+                        .unwrap_or_else(|| panic!("no command opens:\n{paragraph}"));
+                    (command.to_owned(), paragraph.to_owned())
+                })
+                .collect()
+        } else {
+            vec![(commands[0].to_owned(), block.to_owned())]
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        for (name, source) in &images {
+            std::fs::copy(source, dir.path().join(name)).unwrap();
+        }
+        for (command, shown) in runs {
+            let output = inkemu()
+                .current_dir(dir.path())
+                .args(command.split_whitespace())
+                .args(["--rom-dir", &rom_dir])
+                .timeout(HANG_LIMIT)
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert_eq!(output.status.code(), Some(0), "{command}\n{log}");
+            let printed = inkemu_lines(&log);
+            let shown = inkemu_lines(&shown);
+            if printed != shown {
+                disagreements.push(format!(
+                    "`{BINARY}{command}` prints:\n{}\nthe README shows:\n{}",
+                    printed.join("\n"),
+                    shown.join("\n")
+                ));
+            }
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "{}\n\nthe README shows other `inkemu:` lines than the binary prints; copy the lines \
+         above that follow \"prints:\" into README.md, in place of the lines it shows",
+        disagreements.join("\n\n")
+    );
+}
+
 /// `inkemu run --device x4 --firmware <application> [--bootloader <bootloader>] <more>` with a ROM
 /// directory that holds nothing: a refusal of what was given must come before any attempt to load
 /// a ROM.
