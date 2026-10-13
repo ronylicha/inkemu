@@ -182,9 +182,14 @@ pub struct Uart {
     in_flight: VecDeque<(u64, u8)>,
     /// The bytes that have left, for the console.
     tx: Vec<u8>,
-    /// The bytes the host sends and that have not started: each with the device time, in
-    /// thirty-seconds, before which it does not start, the date of the input it came in.
-    host: VecDeque<(u64, u8)>,
+    /// The bytes the host sends and that have not started, in order. The caller bounds them
+    /// (`MAX_PENDING_HOST_BYTES`, [`Uart::host_pending`]).
+    host: VecDeque<u8>,
+    /// The dates of `host`, in runs: the device time, in thirty-seconds, before which the next
+    /// byte of the run does not start, and how many bytes of `host` the run still holds. An input
+    /// dated no later than the run before it joins that run: its bytes follow the run's anyway.
+    /// So an input costs a run only when it is dated later, at most one per byte of `host`.
+    host_runs: VecDeque<(u64, usize)>,
     /// The byte on the line: the instant its frame ends, when it lands, and the byte.
     receiving: Option<(u64, u8)>,
     /// When the line is free for the next byte: the end of the last frame that started.
@@ -224,6 +229,7 @@ impl Uart {
             in_flight: VecDeque::new(),
             tx: Vec::new(),
             host: VecDeque::new(),
+            host_runs: VecDeque::new(),
             receiving: None,
             line_free_at: 0,
             rx: VecDeque::new(),
@@ -284,8 +290,34 @@ impl Uart {
     pub fn receive(&mut self, ctx: &mut Ctx, at: Cycles, bytes: &[u8]) {
         self.settle(ctx);
         let date = at.max(ctx.now()).get().saturating_mul(SUBCYCLES);
-        self.host.extend(bytes.iter().map(|&byte| (date, byte)));
+        if bytes.is_empty() {
+            return;
+        }
+        match self.host_runs.back_mut() {
+            // The bytes start after those of the run, which start at its date or later.
+            Some((run_date, count)) if *run_date >= date => *count += bytes.len(),
+            _ => self.host_runs.push_back((date, bytes.len())),
+        }
+        self.host.extend(bytes);
         self.arm(ctx);
+    }
+
+    /// The next byte of the host to start, and the device time, in thirty-seconds, before which
+    /// it does not start.
+    fn next_host_byte(&self) -> Option<(u64, u8)> {
+        let &(date, _) = self.host_runs.front()?;
+        self.host.front().map(|&byte| (date, byte))
+    }
+
+    /// The next byte of the host has started.
+    fn pop_host_byte(&mut self) {
+        self.host.pop_front();
+        if let Some((_, count)) = self.host_runs.front_mut() {
+            *count -= 1;
+            if *count == 0 {
+                self.host_runs.pop_front();
+            }
+        }
     }
 
     /// How many bytes the host has sent that have not landed yet.
@@ -378,7 +410,7 @@ impl Uart {
         if let Some((lands_at, _)) = self.receiving {
             return Some(lands_at);
         }
-        let &(date, _) = self.host.front()?;
+        let (date, _) = self.next_host_byte()?;
         Some(
             date.max(self.line_free_at)
                 .saturating_add(self.byte_time(self.source_period(ctx))),
@@ -439,7 +471,7 @@ impl Uart {
         loop {
             let timeout = self.timeout_at(ctx).filter(|&at| at <= now);
             if self.receiving.is_none() {
-                let Some(&(date, byte)) = self.host.front() else {
+                let Some((date, byte)) = self.next_host_byte() else {
                     if timeout.is_some() {
                         self.time_out();
                         continue;
@@ -468,7 +500,7 @@ impl Uart {
                 if let Some(sclk_sel) = self.unmodelled_source() {
                     self.rx_mistimed = Some(sclk_sel);
                 }
-                self.host.pop_front();
+                self.pop_host_byte();
                 self.receiving = Some((lands_at, byte));
                 self.line_free_at = lands_at;
                 self.idle_since = None;
@@ -1422,6 +1454,32 @@ mod tests {
         assert_eq!(rx_count(ctx, &mut uart), 4);
         let read: Vec<u32> = (0..4).map(|_| uart.read(ctx, FIFO).unwrap()).collect();
         assert_eq!(read, [97, 98, 99, 100]);
+    }
+
+    #[test]
+    fn an_input_dated_no_later_than_the_one_before_joins_its_run() {
+        // A text sent at once costs a byte of memory per byte; a run is kept per later date.
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        uart.receive(ctx, Cycles(1_000), b"ab");
+        uart.receive(ctx, Cycles(1_000), b"cd");
+        uart.receive(ctx, Cycles(500), b"e");
+        uart.receive(ctx, Cycles::ZERO, b"");
+        assert_eq!(uart.host_runs.len(), 1);
+        uart.receive(ctx, Cycles(1_001), b"f");
+        assert_eq!(uart.host_runs.len(), 2);
+        assert_eq!(uart.host_pending(), 6);
+        // `e`, dated 500, follows `d`; `f`, dated 1 001, waits for the line: back to back from
+        // 1 000.
+        run_to(ctx, &mut uart, Cycles(1_000 + landed(5).get()));
+        assert_eq!(rx_count(ctx, &mut uart), 5);
+        run_to(ctx, &mut uart, Cycles(1_000 + landed(6).get() - 1));
+        assert_eq!(rx_count(ctx, &mut uart), 5);
+        run_to(ctx, &mut uart, Cycles(1_000 + landed(6).get()));
+        assert_eq!(rx_count(ctx, &mut uart), 6);
+        assert_eq!(uart.host_runs.len(), 0);
+        let read: Vec<u32> = (0..6).map(|_| uart.read(ctx, FIFO).unwrap()).collect();
+        assert_eq!(read, b"abcdef".map(u32::from));
     }
 
     #[test]
