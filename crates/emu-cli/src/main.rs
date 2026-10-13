@@ -128,8 +128,9 @@ enum Command {
         #[arg(long)]
         trace_hash: bool,
     },
-    /// Print the notices and the licences of the third-party parts built into inkemu: the
-    /// register descriptions of the chip and the 2nd-stage bootloader it ships.
+    /// Print the notices and the licences of the third-party material inkemu embeds as data: the
+    /// register descriptions of the chip and the 2nd-stage bootloader it ships (the notices of the
+    /// Rust libraries it links are not listed yet).
     Licenses,
     /// Manage the mask-ROM files the emulator needs.
     Rom {

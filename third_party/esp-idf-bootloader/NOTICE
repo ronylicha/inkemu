@@ -4,6 +4,12 @@ Licensed under the Apache License, Version 2.0 (see LICENSE in this directory).
 Source: https://github.com/espressif/esp-idf, tag v5.5.2 (commit 30aaf64524299d3bde422ca9a2848090d1bc5d0f),
 built from unmodified sources; only the build configuration is inkemu's (see PROVENANCE.md).
 
+Changes made by inkemu (Apache License 2.0, section 4(b)): for a device whose flash is not
+16 MiB, inkemu writes this bootloader into the flash it composes with two changes, made in memory:
+the flash-size field of its image header (byte 3, high nibble) is set to the size of that flash,
+and the SHA-256 appended to the image is computed again, as esptool.py does to any image written
+at offset 0. For a flash of 16 MiB the bytes are written unchanged.
+
 The binary contains code expanded from two headers of ESP-IDF, distributed under the following
 terms.
 

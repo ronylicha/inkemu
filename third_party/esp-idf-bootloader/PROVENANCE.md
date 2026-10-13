@@ -41,5 +41,6 @@ section D).
 16 MiB, inkemu writes the image with the flash-size nibble of its header (byte 3, high nibble) set
 to the size of that flash and its appended SHA-256 computed again, as `esptool.py` does to any image
 written at offset 0 (`esptool/cmds.py` of esptool v4.11). That is a modification of the object
-form (Apache License 2.0, section 4 b). This file is never changed: the rewrite happens in memory,
-in `firmware::bootloader::ShippedBootloader::for_flash`.
+form (Apache License 2.0, section 4(b)), and `NOTICE` states it, so that the binary carries the
+statement: `inkemu licenses` prints that file. This file is never changed: the rewrite happens in
+memory, in `firmware::bootloader::ShippedBootloader::for_flash`.

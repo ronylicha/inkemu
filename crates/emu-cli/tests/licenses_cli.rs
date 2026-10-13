@@ -21,7 +21,12 @@ fn licenses_prints_the_notice_then_every_part_with_its_licence() {
         "This product includes the ESP-IDF 2nd-stage bootloader",
         "== ESP-IDF 2nd-stage bootloader (third_party/esp-idf-bootloader) ==",
         "== ESP32-C3 register descriptions (Espressif CMSIS-SVD) (third_party/espressif-svd) ==",
+        "built from unmodified sources",
+        "Changes made by inkemu (Apache License 2.0, section 4(b))",
+        "components/riscv/include/riscv/csr.h:",
         "Copyright (c) 2018-2019, The libfemto authors",
+        "components/riscv/include/riscv/encoding.h:",
+        "Copyright (c) 2010-2017, The Regents of the University of California",
         "TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION",
     ] {
         assert!(text.contains(expected), "`{expected}` is missing");
@@ -39,7 +44,9 @@ fn the_help_lists_the_licenses_command() {
         .clone();
     let help = String::from_utf8(output).unwrap();
     assert!(
-        help.contains("licenses") && help.contains("third-party parts built into inkemu"),
+        help.contains("licenses")
+            && help.contains("third-party material inkemu embeds as data")
+            && help.contains("Rust libraries it links are not listed yet"),
         "{help}"
     );
 }

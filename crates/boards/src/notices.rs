@@ -1,13 +1,15 @@
-//! What the inkemu binary carries from third parties, and the notices their licences ask a
-//! distribution to carry with it (Apache License 2.0, section 4; BSD-3-Clause, clause 2). The
-//! texts are those of the repository, built into the binary: `inkemu licenses` prints them, and a
-//! front end shows them on its "About" page.
+//! The third-party material inkemu embeds as data (the register descriptions of the chip and the
+//! 2nd-stage bootloader it ships), and the notices their licences ask a distribution to carry
+//! with it (Apache License 2.0, section 4; BSD-3-Clause, clause 2). The texts are those of the
+//! repository, built into the binary: `inkemu licenses` prints them, and a front end shows them on
+//! its "About" page. The notices of the Rust crates the binary links are not gathered here yet:
+//! they come with the packaging of releases (SP9).
 use std::fmt::Write as _;
 
 /// The `NOTICE` of inkemu: one paragraph per third-party part.
 pub const NOTICE: &str = include_str!("../../../NOTICE");
 
-/// A third-party part of the binary.
+/// A piece of third-party material the binary embeds as data.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ThirdParty {
     /// What it is, in a few words.
@@ -18,9 +20,9 @@ pub struct ThirdParty {
     pub license: &'static str,
 }
 
-/// Every third-party part the binary carries. The register descriptions are compiled into the
-/// model (`svd-regs`, generated from the SVD); the bootloader is embedded byte for byte
-/// (`firmware::SHIPPED`).
+/// Every piece of third-party material the binary embeds as data. The register descriptions are
+/// compiled into the model (`svd-regs`, generated from the SVD); the bootloader is embedded byte
+/// for byte (`firmware::SHIPPED`).
 pub static THIRD_PARTIES: [ThirdParty; 2] = [
     ThirdParty {
         name: "ESP32-C3 register descriptions (Espressif CMSIS-SVD)",
@@ -85,9 +87,100 @@ mod tests {
             assert!(text.contains(part.notice.trim_end()), "{}", part.directory);
             assert!(text.contains(part.license.trim_end()), "{}", part.directory);
         }
-        assert!(
-            text.contains("The Regents of the University of California"),
-            "the BSD-3-Clause notice of the bootloader"
+    }
+
+    /// The text with every run of white space made one space, so that a phrase is found whatever
+    /// the line breaks and the indentation of the file.
+    fn words(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The notice of the part kept in `directory`; a part missing from [`THIRD_PARTIES`] fails.
+    fn notice_of(directory: &str) -> String {
+        let part = THIRD_PARTIES
+            .iter()
+            .find(|part| part.directory == directory)
+            .unwrap_or_else(|| panic!("no third-party part is kept in {directory}"));
+        words(part.notice)
+    }
+
+    /// What clause 2 of BSD-3-Clause asks a binary copy to reproduce: the copyright notice, the
+    /// list of conditions and the disclaimer, here as the headers of ESP-IDF v5.5.2 state them.
+    fn assert_bsd_notice(section: &str, header: &str, copyright: &str) {
+        for expected in [
+            copyright,
+            "Redistributions of source code must retain the above copyright notice, this list of \
+             conditions and the following disclaimer.",
+            "Redistributions in binary form must reproduce the above copyright notice, this list \
+             of conditions and the following disclaimer in the documentation and/or other \
+             materials provided with the distribution.",
+            "Neither the name of the Regents nor the names of its contributors may be used to \
+             endorse or promote products derived from this software without specific prior \
+             written permission.",
+            "IN NO EVENT SHALL REGENTS BE LIABLE TO ANY PARTY FOR DIRECT, INDIRECT, SPECIAL, \
+             INCIDENTAL, OR CONSEQUENTIAL DAMAGES",
+            "REGENTS SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE \
+             IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.",
+        ] {
+            assert!(
+                section.contains(expected),
+                "the notice of {header} has no `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn the_register_descriptions_part_carries_its_attribution() {
+        let notice = notice_of("third_party/espressif-svd");
+        for expected in [
+            "Copyright Espressif Systems (Shanghai) Co., Ltd.",
+            "Licensed under the Apache License, Version 2.0",
+        ] {
+            assert!(
+                notice.contains(expected),
+                "the notice of the register descriptions has no `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bootloader_part_carries_both_bsd_notices_and_says_what_was_built_and_changed() {
+        let notice = notice_of("third_party/esp-idf-bootloader");
+        let csr = "components/riscv/include/riscv/csr.h:";
+        let encoding = "components/riscv/include/riscv/encoding.h:";
+        let (_, from_csr) = notice
+            .split_once(csr)
+            .unwrap_or_else(|| panic!("no section for {csr}"));
+        let (csr_section, encoding_section) = from_csr
+            .split_once(encoding)
+            .unwrap_or_else(|| panic!("no section for {encoding}, after that of {csr}"));
+        assert_bsd_notice(
+            csr_section,
+            csr,
+            "Copyright (c) 2013, The Regents of the University of California (Regents). \
+             Copyright (c) 2018-2019, The libfemto authors Copyright (c) 2020 Espressif Systems \
+             (Shanghai) PTE LTD All Rights Reserved.",
         );
+        assert_bsd_notice(
+            encoding_section,
+            encoding,
+            "Copyright (c) 2010-2017, The Regents of the University of California (Regents). All \
+             Rights Reserved.",
+        );
+        for expected in [
+            "Copyright Espressif Systems (Shanghai) Co., Ltd.",
+            "tag v5.5.2 (commit 30aaf64524299d3bde422ca9a2848090d1bc5d0f)",
+            "built from unmodified sources",
+            // The change inkemu makes to the object form, which Apache-2.0 section 4(b) asks a
+            // distribution to state (`firmware::ShippedBootloader::for_flash`).
+            "Apache License 2.0, section 4(b)",
+            "the flash-size field of its image header",
+            "the SHA-256 appended to the image is computed again",
+        ] {
+            assert!(
+                notice.contains(expected),
+                "the notice of the bootloader has no `{expected}`"
+            );
+        }
     }
 }
