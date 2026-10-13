@@ -7,8 +7,10 @@ allow-expect-in-tests = true
 
 # firmware, boards and soc-esp32c3 do no host I/O: a graphical front end and the WebAssembly build
 # use them, and std on wasm32-unknown-unknown compiles these calls only to fail at run time. Files,
-# the environment, the clock, processes and the network belong to the front end (emu-cli). Test code
-# that reads a fixture allows it on the item that does (`#[allow(clippy::disallowed_methods)]`).
+# the environment, the clock, processes, threads, the console and the network belong to the front end
+# (emu-cli). Test code that reads a fixture allows it on the item that does
+# (`#[allow(clippy::disallowed_methods)]`). `crates/boards/tests/host_io_ban.rs` holds the three
+# copies of this file equal and the list below complete: change them together.
 disallowed-methods = [
     { path = "std::fs::read", reason = "no host I/O in this crate: take bytes, let the front end read files" },
     { path = "std::fs::read_to_string", reason = "no host I/O in this crate: take text, let the front end read files" },
@@ -48,6 +50,30 @@ disallowed-methods = [
     { path = "std::process::id", reason = "no process in this crate" },
     { path = "std::process::Command::new", reason = "no process in this crate" },
     { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "no network in this crate" },
+    { path = "std::path::Path::exists", reason = "no host I/O in this crate: a path is text here, the front end looks at the file system" },
+    { path = "std::path::Path::try_exists", reason = "no host I/O in this crate" },
+    { path = "std::path::Path::is_file", reason = "no host I/O in this crate" },
+    { path = "std::path::Path::is_dir", reason = "no host I/O in this crate" },
+    { path = "std::path::Path::is_symlink", reason = "no host I/O in this crate" },
+    { path = "std::path::Path::metadata", reason = "no host I/O in this crate" },
+    { path = "std::path::Path::symlink_metadata", reason = "no host I/O in this crate" },
+    { path = "std::path::Path::canonicalize", reason = "no host I/O in this crate" },
+    { path = "std::path::Path::read_dir", reason = "no host I/O in this crate" },
+    { path = "std::path::Path::read_link", reason = "no host I/O in this crate" },
+    { path = "std::io::stdin", reason = "no console in this crate: the front end reads the user's input" },
+    { path = "std::io::stdout", reason = "no console in this crate: return the text, the front end prints it" },
+    { path = "std::io::stderr", reason = "no console in this crate: return the text, the front end prints it" },
+    { path = "std::thread::spawn", reason = "no host threads in this crate: std on wasm32-unknown-unknown cannot start one" },
+    { path = "std::thread::sleep", reason = "no host clock in this crate: time is the device's, counted in cycles" },
+    { path = "std::thread::scope", reason = "no host threads in this crate: std on wasm32-unknown-unknown cannot start one" },
+    { path = "std::thread::Builder::spawn", reason = "no host threads in this crate: std on wasm32-unknown-unknown cannot start one" },
+]
+disallowed-macros = [
+    { path = "std::print", reason = "no console in this crate: return the text, the front end prints it" },
+    { path = "std::println", reason = "no console in this crate: return the text, the front end prints it" },
+    { path = "std::eprint", reason = "no console in this crate: return the text, the front end prints it" },
+    { path = "std::eprintln", reason = "no console in this crate: return the text, the front end prints it" },
+    { path = "std::dbg", reason = "no console in this crate: remove the debugging output" },
 ]
 disallowed-types = [
     { path = "std::fs::File", reason = "no host I/O in this crate: take bytes, let the front end read files" },
