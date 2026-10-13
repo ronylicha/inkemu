@@ -335,6 +335,25 @@ mod tests {
     }
 
     #[test]
+    fn the_whole_file_must_fit_its_slot_not_only_the_image_it_starts_with() {
+        // A partition dump: the image, then the rest of its slot. The whole file is written.
+        let image = build_image(&ImageSpec::default());
+        let mut padded = image.clone();
+        padded.resize(image.len() + 0x100, 0xFF);
+        let image_len = u32::try_from(image.len()).unwrap();
+        assert_eq!(
+            check_application(&padded, &X4, &slot(image_len)).unwrap_err(),
+            ApplicationError::TooLarge {
+                len: padded.len(),
+                slot: "app0".into(),
+                size: image_len
+            }
+        );
+        let report = check_application(&padded, &X4, &slot(0x64_0000)).unwrap();
+        assert_eq!(report.image_len, image.len(), "the image, not the file");
+    }
+
+    #[test]
     fn an_application_declaring_more_flash_than_the_device_is_refused() {
         let mut bytes = build_image(&ImageSpec::default());
         bytes[3] = 0x5F;
