@@ -462,8 +462,10 @@ impl Uart {
             match self.receiving {
                 Some((lands_at, byte)) if lands_at <= now => {
                     self.receiving = None;
-                    self.land(ctx, byte);
-                    self.idle_since = Some(lands_at);
+                    // A receiver whose clock is off counts no idle line (`land`).
+                    if self.land(ctx, byte) {
+                        self.idle_since = Some(lands_at);
+                    }
                 }
                 _ => break,
             }
@@ -480,11 +482,12 @@ impl Uart {
     /// it comes once per idle period (report UR A3). QEMU raises it with an empty FIFO; ESP-IDF
     /// leaves a byte in the FIFO "in order to trigger `uart_intr_rxfifo_tout`" (`uart.c:1275-1277`).
     /// A logic analyser on the receive line of a chip, with a GPIO toggled by the handler,
-    /// settles it.
+    /// settles it. A timeout that comes while the receiver's clock is off is not raised (`land`).
     fn time_out(&mut self) {
         self.idle_since = None;
         let conf1 = self.config.read(CONF1).unwrap_or(0);
-        if conf1 & RX_TOUT_EN == 0 {
+        let clk_conf = self.config.read(CLK_CONF).unwrap_or(0);
+        if conf1 & RX_TOUT_EN == 0 || clk_conf & RX_SCLK_EN == 0 {
             return;
         }
         // An enabled timeout was timed with the bit time: on a clock the model does not have,
@@ -545,26 +548,39 @@ impl Uart {
         self.int_raw & self.config.read(INT_ENA).unwrap_or(0)
     }
 
-    /// A byte of the host has been received whole: it enters the FIFO.
+    /// A byte of the host has been received whole: it enters the FIFO. Returns whether the
+    /// receiver heard it, its clock on: the idle line that follows is counted from it then.
     ///
     /// ASSUMPTION: a byte that lands while the receiver's clock is off (`CLK_CONF.RX_SCLK_EN`
     /// clear) or while `CONF0.RXFIFO_RST` is set is lost (report UR A8), and a byte that finds
     /// 128 bytes in the FIFO is dropped while the 128 stay (report UR A2). Input sent to a chip
     /// during its boot, and 200 bytes sent to a FIFO nobody reads, settle them.
-    fn land(&mut self, ctx: &mut Ctx, byte: u8) {
+    ///
+    /// ASSUMPTION: the receive timeout is counted with the receiver's clock: a byte lost because
+    /// that clock is off starts no idle period, and a timeout that comes while it is off is not
+    /// raised (`time_out`); a byte the FIFO reset or a full FIFO drops was heard, and starts one.
+    /// No source says; ESP-IDF v5.5.2 clears `RX_SCLK_EN` only when it deletes a driver
+    /// (`uart_ll_sclk_disable`, `IDF:components/esp_driver_uart/src/uart.c:295`). Bytes sent to
+    /// a chip whose receiver clock is gated with data in its FIFO and the timeout enabled settle
+    /// it.
+    fn land(&mut self, ctx: &mut Ctx, byte: u8) -> bool {
         let clk_conf = self.config.read(CLK_CONF).unwrap_or(0);
         let conf0 = self.config.read(CONF0).unwrap_or(0);
-        if clk_conf & RX_SCLK_EN == 0 || conf0 & RXFIFO_RST != 0 {
-            return;
+        if clk_conf & RX_SCLK_EN == 0 {
+            return false;
+        }
+        if conf0 & RXFIFO_RST != 0 {
+            return true;
         }
         if self.rx.len() >= FIFO_BYTES {
             ctx.unsupported(Unsupported::UartRxOverflow { uart: self.index });
             if self.config.read(CONF1).unwrap_or(0) & DIS_RX_DAT_OVF == 0 {
                 self.int_raw |= RXFIFO_OVF;
             }
-            return;
+            return true;
         }
         self.rx.push_back(byte);
+        true
     }
 
     /// A read of `FIFO`: the oldest byte received.
@@ -1439,6 +1455,35 @@ mod tests {
             assert_eq!(rx_count(ctx, &mut uart), 0, "{register:#x}");
             assert_eq!(uart.host_pending(), 0, "the byte arrived, and was lost");
         }
+    }
+
+    #[test]
+    fn a_receiver_whose_clock_is_off_counts_no_timeout() {
+        let receiver_off = CLK_CONF_XTAL & !RX_SCLK_EN;
+        // Three bytes wait in the FIFO; the clock goes off before their timeout comes.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        uart.receive(ctx, Cycles::ZERO, b"123");
+        run_to(ctx, &mut uart, landed(3));
+        uart.write(ctx, CLK_CONF, receiver_off);
+        run_to(ctx, &mut uart, timed_out_after(3));
+        assert_eq!(ctx.sources(), 0, "a timeout that comes with the clock off");
+        // The clock is off when a fourth byte lands, and on again right after: the lost byte
+        // starts no idle period, so no timeout comes 100 bit times after it.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        uart.receive(ctx, Cycles::ZERO, b"123");
+        run_to(ctx, &mut uart, timed_out_after(3));
+        assert_eq!(ctx.sources(), 1 << 21, "the timeout of the three bytes");
+        uart.write(ctx, INT_CLR, RXFIFO_TOUT);
+        uart.write(ctx, CLK_CONF, receiver_off);
+        let fourth = ctx.now();
+        uart.receive(ctx, fourth, b"4");
+        run_to(ctx, &mut uart, fourth + landed(1).get());
+        uart.write(ctx, CLK_CONF, CLK_CONF_XTAL);
+        run_to(ctx, &mut uart, fourth + timed_out_after(1).get());
+        assert_eq!(ctx.sources(), 0, "no idle period after a byte nobody heard");
+        assert_eq!(rx_count(ctx, &mut uart), 3);
     }
 
     #[test]
