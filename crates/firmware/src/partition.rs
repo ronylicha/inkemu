@@ -338,17 +338,71 @@ impl PartitionTable {
     }
 }
 
-/// How `gen_esp32part.py` writes an application subtype: `factory`, `test`, `ota_0`…`ota_15`, or
-/// its value when it has no name.
-fn app_subtype_name(subtype: u8) -> String {
-    match subtype {
-        SUBTYPE_FACTORY => "factory".to_owned(),
-        SUBTYPE_TEST => "test".to_owned(),
-        _ if subtype.wrapping_sub(SUBTYPE_OTA_0) < OTA_SLOTS => {
-            format!("ota_{}", subtype - SUBTYPE_OTA_0)
-        }
-        _ => format!("{subtype:#04x}"),
+/// The application subtypes `gen_esp32part.py` (ESP-IDF v5.5.2, `SUBTYPES`) knows by name, with
+/// their values, besides the 16 OTA slots `ota_0` to `ota_15` ([`subtype_value`]).
+pub const APP_SUBTYPES: [(&str, u8); 2] = [("factory", SUBTYPE_FACTORY), ("test", SUBTYPE_TEST)];
+/// The data subtypes `gen_esp32part.py` (ESP-IDF v5.5.2, `SUBTYPES`) knows by name, with their
+/// values, in its order.
+pub const DATA_SUBTYPES: [(&str, u8); 11] = [
+    ("ota", SUBTYPE_DATA_OTA),
+    ("phy", 0x01),
+    ("nvs", SUBTYPE_NVS),
+    ("coredump", SUBTYPE_COREDUMP),
+    ("nvs_keys", 0x04),
+    ("efuse", 0x05),
+    ("undefined", 0x06),
+    ("esphttpd", 0x80),
+    ("fat", 0x81),
+    ("spiffs", SUBTYPE_SPIFFS),
+    ("littlefs", 0x83),
+];
+
+/// The value of the subtype `name` writes in a partition of type `ptype` ([`TYPE_APP`] or
+/// [`TYPE_DATA`]), as `gen_esp32part.py` reads a table row; `None` when the type has no subtype of
+/// that name. An OTA slot is written `ota_<n>`, `n` from 0 to 15 in decimal without a leading zero.
+#[must_use]
+pub fn subtype_value(ptype: u8, name: &str) -> Option<u8> {
+    let named = |table: &[(&str, u8)]| {
+        table
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|&(_, value)| value)
+    };
+    match ptype {
+        TYPE_APP => named(&APP_SUBTYPES).or_else(|| {
+            name.strip_prefix("ota_")
+                .and_then(|slot| slot.parse::<u8>().ok())
+                .filter(|&slot| slot < OTA_SLOTS && name == format!("ota_{slot}"))
+                .map(|slot| SUBTYPE_OTA_0 + slot)
+        }),
+        TYPE_DATA => named(&DATA_SUBTYPES),
+        _ => None,
     }
+}
+
+/// The name `gen_esp32part.py` writes for `subtype` in a partition of type `ptype`, for a front end
+/// that shows the rows of a table; `None` when the value has no name.
+#[must_use]
+pub fn subtype_name(ptype: u8, subtype: u8) -> Option<String> {
+    let named = |table: &[(&str, u8)]| {
+        table
+            .iter()
+            .find(|&&(_, value)| value == subtype)
+            .map(|&(name, _)| name.to_owned())
+    };
+    match ptype {
+        TYPE_APP => named(&APP_SUBTYPES).or_else(|| {
+            (subtype.wrapping_sub(SUBTYPE_OTA_0) < OTA_SLOTS)
+                .then(|| format!("ota_{}", subtype - SUBTYPE_OTA_0))
+        }),
+        TYPE_DATA => named(&DATA_SUBTYPES),
+        _ => None,
+    }
+}
+
+/// How `gen_esp32part.py` writes an application subtype: its name, or its value when it has none.
+fn app_subtype_name(subtype: u8) -> String {
+    subtype_name(TYPE_APP, subtype).unwrap_or_else(|| format!("{subtype:#04x}"))
 }
 
 fn parse_entry(e: &[u8]) -> Partition {
@@ -719,6 +773,57 @@ mod tests {
         data_too.entries[2].subtype = SUBTYPE_FACTORY;
         assert_eq!(data_too.entries[1].subtype, SUBTYPE_FACTORY);
         assert!(data_too.to_bytes(FlashSize::Mb16).is_ok());
+    }
+
+    #[test]
+    fn every_subtype_name_of_gen_esp32part_maps_to_its_value_and_back() {
+        // gen_esp32part.py v5.5.2, `SUBTYPES`: the names a table row may write, with their values.
+        let named: [(u8, &str, u8); 15] = [
+            (TYPE_APP, "factory", 0x00),
+            (TYPE_APP, "test", 0x20),
+            (TYPE_APP, "ota_0", 0x10),
+            (TYPE_APP, "ota_15", 0x1F),
+            (TYPE_DATA, "ota", 0x00),
+            (TYPE_DATA, "phy", 0x01),
+            (TYPE_DATA, "nvs", 0x02),
+            (TYPE_DATA, "coredump", 0x03),
+            (TYPE_DATA, "nvs_keys", 0x04),
+            (TYPE_DATA, "efuse", 0x05),
+            (TYPE_DATA, "undefined", 0x06),
+            (TYPE_DATA, "esphttpd", 0x80),
+            (TYPE_DATA, "fat", 0x81),
+            (TYPE_DATA, "spiffs", 0x82),
+            (TYPE_DATA, "littlefs", 0x83),
+        ];
+        for (ptype, name, value) in named {
+            assert_eq!(subtype_value(ptype, name), Some(value), "{name}");
+            assert_eq!(subtype_name(ptype, value).as_deref(), Some(name), "{name}");
+        }
+        for slot in 0..16u8 {
+            let name = format!("ota_{slot}");
+            assert_eq!(subtype_value(TYPE_APP, &name), Some(0x10 + slot));
+            assert_eq!(subtype_name(TYPE_APP, 0x10 + slot), Some(name));
+        }
+        // A name of the other type, a slot past the 16th, a slot written another way, a value
+        // without a name, a type without names.
+        for (ptype, name) in [
+            (TYPE_APP, "nvs"),
+            (TYPE_DATA, "factory"),
+            (TYPE_APP, "ota_16"),
+            (TYPE_APP, "ota_01"),
+            (TYPE_APP, "ota_"),
+            (TYPE_APP, "ota_+1"),
+            (0x40, "nvs"),
+        ] {
+            assert_eq!(subtype_value(ptype, name), None, "{name}");
+        }
+        for (ptype, value) in [(TYPE_APP, 0x30), (TYPE_DATA, 0x07), (0x40, 0x00)] {
+            assert_eq!(subtype_name(ptype, value), None, "{value:#04x}");
+        }
+        assert_eq!(
+            DATA_SUBTYPES.map(|(name, _)| name).join(", "),
+            "ota, phy, nvs, coredump, nvs_keys, efuse, undefined, esphttpd, fat, spiffs, littlefs"
+        );
     }
 
     #[test]

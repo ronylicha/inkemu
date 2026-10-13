@@ -4,7 +4,9 @@ pub mod notices;
 
 use firmware::bootloader::{ShippedBootloader, shipped};
 use firmware::device::revision;
-use firmware::partition::{Partition, PartitionError, PartitionTable, TYPE_APP, TYPE_DATA};
+use firmware::partition::{
+    DATA_SUBTYPES, Partition, PartitionError, PartitionTable, TYPE_APP, TYPE_DATA, subtype_value,
+};
 use firmware::{Bootloader, ChipId, ComposeError, ComposedFlash, Device, FlashSize, SpiMode};
 use serde::Deserialize;
 use soc_esp32c3::flash::{
@@ -160,46 +162,9 @@ enum PartitionKind {
     Data,
 }
 
-/// The subtypes `gen_esp32part.py` (ESP-IDF v5.5.2) knows by name, with their values. The 16 OTA
-/// slots of an application are `ota_0` to `ota_15`.
-const APP_SUBTYPES: [(&str, u8); 2] = [("factory", 0x00), ("test", 0x20)];
-const APP_OTA_FIRST: u8 = 0x10;
-const APP_OTA_SLOTS: u8 = 16;
-const DATA_SUBTYPES: [(&str, u8); 11] = [
-    ("ota", 0x00),
-    ("phy", 0x01),
-    ("nvs", 0x02),
-    ("coredump", 0x03),
-    ("nvs_keys", 0x04),
-    ("efuse", 0x05),
-    ("undefined", 0x06),
-    ("esphttpd", 0x80),
-    ("fat", 0x81),
-    ("spiffs", 0x82),
-    ("littlefs", 0x83),
-];
 /// Flag bits of a partition entry (`gen_esp32part.py`).
 const FLAG_ENCRYPTED: u32 = 1 << 0;
 const FLAG_READONLY: u32 = 1 << 1;
-
-fn subtype_value(kind: PartitionKind, name: &str) -> Option<u8> {
-    match kind {
-        PartitionKind::App => APP_SUBTYPES
-            .iter()
-            .find(|(known, _)| *known == name)
-            .map(|&(_, value)| value)
-            .or_else(|| {
-                name.strip_prefix("ota_")
-                    .and_then(|slot| slot.parse::<u8>().ok())
-                    .filter(|&slot| slot < APP_OTA_SLOTS && name == format!("ota_{slot}"))
-                    .map(|slot| APP_OTA_FIRST + slot)
-            }),
-        PartitionKind::Data => DATA_SUBTYPES
-            .iter()
-            .find(|(known, _)| *known == name)
-            .map(|&(_, value)| value),
-    }
-}
 
 /// A `[[partition]]` row whose subtype is one its type has.
 #[derive(Deserialize)]
@@ -210,7 +175,11 @@ impl TryFrom<UncheckedPartition> for RawPartition {
     type Error = String;
 
     fn try_from(raw: UncheckedPartition) -> Result<RawPartition, String> {
-        let subtype = subtype_value(raw.kind, &raw.subtype).ok_or_else(|| {
+        let ptype = match raw.kind {
+            PartitionKind::App => TYPE_APP,
+            PartitionKind::Data => TYPE_DATA,
+        };
+        let subtype = subtype_value(ptype, &raw.subtype).ok_or_else(|| {
             let (kind, known) = match raw.kind {
                 PartitionKind::App => ("app", "factory, test, or ota_0 to ota_15".to_owned()),
                 PartitionKind::Data => (
@@ -227,10 +196,6 @@ impl TryFrom<UncheckedPartition> for RawPartition {
                 raw.subtype.escape_debug()
             )
         })?;
-        let ptype = match raw.kind {
-            PartitionKind::App => TYPE_APP,
-            PartitionKind::Data => TYPE_DATA,
-        };
         let flags = (if raw.encrypted { FLAG_ENCRYPTED } else { 0 })
             | (if raw.readonly { FLAG_READONLY } else { 0 });
         Ok(RawPartition(Partition {
@@ -758,26 +723,6 @@ mod tests {
             (entry.ptype, entry.subtype, entry.flags),
             (TYPE_APP, 0x1F, 0b11)
         );
-        for (kind, subtype, value) in [
-            ("app", "factory", 0x00),
-            ("app", "test", 0x20),
-            ("app", "ota_0", 0x10),
-            ("data", "nvs", 0x02),
-            ("data", "littlefs", 0x83),
-        ] {
-            assert_eq!(
-                subtype_value(
-                    if kind == "app" {
-                        PartitionKind::App
-                    } else {
-                        PartitionKind::Data
-                    },
-                    subtype
-                ),
-                Some(value),
-                "{subtype}"
-            );
-        }
     }
 
     #[test]
