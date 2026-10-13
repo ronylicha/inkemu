@@ -57,6 +57,19 @@ pub(crate) fn le_u32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
+/// The data of the first segment of the image `bytes` starts with, read in place and cut at the
+/// end of the file, without parsing the rest: enough to read the descriptor at 0x20 of a file of
+/// any length. `None` when `bytes` does not start with an image that has a segment.
+pub(crate) fn first_segment_data(bytes: &[u8]) -> Option<&[u8]> {
+    let header = bytes.get(..HEADER_LEN + SEGMENT_HEADER_LEN)?;
+    if header[0] != IMAGE_MAGIC || header[1] == 0 {
+        return None;
+    }
+    let declared = usize::try_from(le_u32(header, HEADER_LEN + 4)).unwrap_or(usize::MAX);
+    let data = &bytes[HEADER_LEN + SEGMENT_HEADER_LEN..];
+    Some(&data[..declared.min(data.len())])
+}
+
 impl FirmwareImage {
     /// Parses and fully verifies an image: header, every segment, checksum and hash.
     ///
@@ -316,6 +329,22 @@ mod tests {
             ..ImageSpec::default()
         };
         assert!(FirmwareImage::parse(&build_image(&spec)).is_ok());
+    }
+
+    #[test]
+    fn the_first_segment_is_read_in_place_and_cut_at_the_end_of_the_file() {
+        let bytes = build_image(&ImageSpec::default());
+        let first = first_segment_data(&bytes).unwrap();
+        assert_eq!(first.len(), 256, "the descriptor segment");
+        assert!(AppDesc::parse(first).is_some());
+        // Declared longer than the file: cut at its end.
+        let mut lying = bytes.clone();
+        lying[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(first_segment_data(&lying).unwrap().len(), bytes.len() - 32);
+        assert_eq!(first_segment_data(&bytes[..32]), Some(&[][..]));
+        assert_eq!(first_segment_data(&bytes[..31]), None, "no segment header");
+        assert_eq!(first_segment_data(&with(|b| b[0] = 0)), None, "no image");
+        assert_eq!(first_segment_data(&with(|b| b[1] = 0)), None, "no segment");
     }
 
     #[test]

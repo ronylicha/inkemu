@@ -5,10 +5,13 @@
 //! what it states, its chip family; the size of its flash is written into the header when the
 //! flash is composed (`docs/research/shipped-bootloader-and-firmware-composition.md`, **SB** in
 //! the comments of this crate, §B).
+use crate::app_desc::AppDesc;
 use crate::chip::{ChipId, FlashSize, SpiMode};
 use crate::device::{Device, revision};
 use crate::error::FirmwareError;
-use crate::image::{FirmwareImage, HEADER_LEN, IMAGE_MAGIC, Segment, XOTA_MAGIC};
+use crate::image::{
+    FirmwareImage, HEADER_LEN, IMAGE_MAGIC, Segment, XOTA_MAGIC, first_segment_data,
+};
 use crate::partition::PARTITION_TABLE_OFFSET;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -462,6 +465,11 @@ pub fn check_bootloader(
         return Err(BootloaderError::FlashImage);
     }
     if bytes.len() > PARTITION_TABLE_OFFSET as usize {
+        // An application is far longer than a bootloader can be: its descriptor, read in place,
+        // names it before its length is refused.
+        if first_segment_data(bytes).and_then(AppDesc::parse).is_some() {
+            return Err(BootloaderError::Application);
+        }
         return Err(BootloaderError::TooLong { len: bytes.len() });
     }
     if bytes.len() < HEADER_LEN {
@@ -720,6 +728,43 @@ mod tests {
             refusal(&[0x7F; 64]),
             BootloaderError::NotAnImage { found: 0x7F }
         );
+    }
+
+    #[test]
+    fn an_application_longer_than_a_bootloader_can_be_is_named_as_one() {
+        // A real application is far longer than the 0x8000 bytes below the partition table.
+        let mut spec = ImageSpec::default();
+        spec.segments.push((0x3C01_0000, vec![0; 0x9000]));
+        let application = build_image(&spec);
+        assert!(application.len() > 0x8000);
+        let err = refusal(&application);
+        assert_eq!(err, BootloaderError::Application);
+        assert!(
+            err.to_string()
+                .contains("; use it as the firmware (`--firmware`)"),
+            "{err}"
+        );
+        // Without its descriptor, or cut inside it, its length is all that is known.
+        let mut cut = application.clone();
+        cut[0x20] ^= 1;
+        assert_eq!(
+            refusal(&cut),
+            BootloaderError::TooLong {
+                len: application.len()
+            }
+        );
+        let mut short_segment = application;
+        short_segment[28..32].copy_from_slice(&255u32.to_le_bytes());
+        assert_eq!(
+            refusal(&short_segment),
+            BootloaderError::TooLong {
+                len: short_segment.len()
+            }
+        );
+        // A dump whose table does not parse starts with a bootloader, not an application.
+        let mut dump = build_flash_image(&bootloader_spec());
+        dump[0x8010] ^= 1;
+        assert_eq!(refusal(&dump), BootloaderError::TooLong { len: dump.len() });
     }
 
     #[test]
