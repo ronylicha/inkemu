@@ -311,6 +311,35 @@ mod tests {
     }
 
     #[test]
+    fn a_sleeping_firmware_dates_the_steps_the_same_whatever_the_calls_the_run_is_cut_into() {
+        // The CPU sleeps while `ready` leaves: each byte ends a call at its very instant, and
+        // the step after the wait-for is dated when `y` reached the host, four byte times after
+        // `r`, however the run is cut.
+        let mut program = print_program(UART0, b"ready");
+        program.extend([wfi(), HANG]);
+        let steps = script("wait-for uart0 \"dy\"\nsend uart1 \"z\"\n");
+        let dated = |slice: u64| {
+            let mut m = machine(&program);
+            let (console, run) = run(&mut m, &steps, slice, 10_000_000);
+            assert_eq!(console, b"ready", "slice {slice}");
+            assert_eq!(run.status(m.device_time()), ScriptStatus::Complete);
+            run.last_dated
+        };
+        let whole = dated(u64::MAX);
+        let mut first_byte = machine(&program);
+        first_byte.watch_console(ConsoleChannel::Uart0, true);
+        assert_eq!(
+            first_byte.run_until(Cycles(1_000_000)),
+            StopReason::ConsoleOutput
+        );
+        let r_at = first_byte.device_time();
+        assert_eq!(whole, Some((1, r_at + 4 * RESET_BYTE)));
+        for slice in [1, 7, 1_000] {
+            assert_eq!(dated(slice), whole, "slice {slice}");
+        }
+    }
+
+    #[test]
     fn the_steps_are_dated_the_same_whatever_the_calls_the_run_is_cut_into() {
         // ADR 0006: the device time of every input is fixed by the inputs alone.
         let steps = script(
