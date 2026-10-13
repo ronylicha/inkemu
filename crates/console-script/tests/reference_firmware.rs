@@ -85,14 +85,35 @@ fn script(body: &str) -> Script {
     Script::parse(format!("{VERSION_LINE}\n{body}").as_bytes()).unwrap()
 }
 
+/// How a scripted run ended, and what its consoles sent.
+struct Scripted {
+    consoles: Consoles,
+    status: ScriptStatus,
+    driven: Driven,
+}
+
+impl Scripted {
+    /// Whether the script went through before the machine stopped or the bounds ran out.
+    fn through(&self) -> bool {
+        (&self.status, &self.driven) == (&ScriptStatus::Complete, &Driven::Done)
+    }
+
+    /// What a failed assertion prints: how the run ended, and both consoles of the script, so
+    /// that a log of the CI says which one went wrong without a second run.
+    fn report(&self) -> String {
+        format!(
+            "status: {:?}\ndriven: {:?}\n--- UART0 ---\n{}\n--- USB-Serial-JTAG ---\n{}",
+            self.status,
+            self.driven,
+            self.consoles.text(ConsoleChannel::Uart0),
+            self.consoles.text(ConsoleChannel::UsbSerialJtag)
+        )
+    }
+}
+
 /// Runs `machine` with `script` in calls of `slice` cycles until the script is through, the
 /// machine stops, or `max_nanos` of device time have passed.
-fn scripted(
-    machine: &mut Esp32C3,
-    script: &Script,
-    slice: u64,
-    max_nanos: u64,
-) -> (Consoles, ScriptStatus, Driven) {
+fn scripted(machine: &mut Esp32C3, script: &Script, slice: u64, max_nanos: u64) -> Scripted {
     let mut run = ScriptRun::start(script, machine).unwrap();
     let mut consoles = Consoles::default();
     let bounds = Bounds {
@@ -104,7 +125,11 @@ fn scripted(
         run.observe(machine, taken).unwrap();
         run.status(machine.device_time()) == ScriptStatus::Complete
     });
-    (consoles, run.status(machine.device_time()), driven)
+    Scripted {
+        consoles,
+        status: run.status(machine.device_time()),
+        driven,
+    }
 }
 
 /// The milliseconds an ESP-IDF log line begins with: `I (5321) tag: ...`.
@@ -148,20 +173,19 @@ fn uart_select(trace_hash: bool) -> Esp32C3 {
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_UART_SELECT_APP"]
 fn uart_select_reference_firmware_times_out_then_reads_each_byte_typed() {
     let mut machine = uart_select(false);
-    let (consoles, status, driven) = scripted(
+    let run = scripted(
         &mut machine,
         &script(UART_SELECT_SCRIPT),
         1_000_000,
         30 * SECOND_NS,
     );
-    let console = consoles.text(ConsoleChannel::Uart0);
-    assert_eq!(driven, Driven::Done, "{console}");
-    assert_eq!(status, ScriptStatus::Complete);
+    assert!(run.through(), "{}", run.report());
+    let console = run.consoles.text(ConsoleChannel::Uart0);
     let lines: Vec<&str> = console.lines().collect();
     let returned = lines
         .iter()
         .position(|line| line.contains("main_task: Returned from app_main()"))
-        .unwrap_or_else(|| panic!("{console}"));
+        .unwrap_or_else(|| panic!("{}", run.report()));
     let after: Vec<&str> = lines[returned + 1..]
         .iter()
         .map(|line| line.split_once(") ").map_or(*line, |(_, text)| text))
@@ -179,12 +203,14 @@ fn uart_select_reference_firmware_times_out_then_reads_each_byte_typed() {
             "",
             TIMEOUT_LINE,
         ],
-        "{console}"
+        "{}",
+        run.report()
     );
     let waited = log_millis(lines[returned + 1]) - log_millis(lines[returned]);
     assert!(
         (4_990..=5_020).contains(&waited),
-        "the first timeout came {waited} ms after app_main returned:\n{console}"
+        "the first timeout came {waited} ms after app_main returned:\n{}",
+        run.report()
     );
 }
 
@@ -195,16 +221,16 @@ fn uart_select_reference_firmware_times_out_then_reads_each_byte_typed() {
 fn uart_select_reference_firmware_typed_into_is_the_same_run_whatever_the_slices() {
     let outcome = |slice: u64| {
         let mut machine = uart_select(true);
-        let (consoles, status, driven) = scripted(
+        let run = scripted(
             &mut machine,
             &script(UART_SELECT_SCRIPT),
             slice,
             30 * SECOND_NS,
         );
-        assert_eq!((status, driven), (ScriptStatus::Complete, Driven::Done));
+        assert!(run.through(), "calls of {slice} cycles: {}", run.report());
         (
-            consoles.bytes(ConsoleChannel::Uart0).to_vec(),
-            consoles.bytes(ConsoleChannel::UsbSerialJtag).to_vec(),
+            run.consoles.bytes(ConsoleChannel::Uart0).to_vec(),
+            run.consoles.bytes(ConsoleChannel::UsbSerialJtag).to_vec(),
             machine.trace_hash(),
             machine.device_time(),
             machine.instructions(),
@@ -223,9 +249,29 @@ fn dump_address(line: &str) -> &str {
         .unwrap()
 }
 
+/// `stream` without the first occurrence of `echo`, or `None` when `echo` is not in it.
+fn without_first(stream: &[u8], echo: &[u8]) -> Option<Vec<u8>> {
+    let at = stream
+        .windows(echo.len())
+        .position(|window| window == echo)?;
+    Some([&stream[..at], &stream[at + echo.len()..]].concat())
+}
+
 /// Milestone 2 (USJ §F.1): with the host open, a line sent after the init line is echoed on
-/// USB-Serial-JTAG and dumped on UART0; 90 bytes arrive as two packets, 64 and 26, which the
+/// USB-Serial-JTAG and dumped on UART0. Then 90 bytes arrive as two packets, 64 and 26, which the
 /// example reads in two calls: the second dump starts again at the first address of the buffer.
+///
+/// The 90 bytes are sent once the dump of the first line has reached UART0: the example's task
+/// is then back in `usb_serial_jtag_read_bytes`, so the handler of the first packet wakes it, and
+/// it takes those 64 bytes before the host sends the next packet, `HOST_LATENCY` after the handler
+/// emptied the FIFO. Sent while the task still prints that dump, both packets would reach the
+/// driver's ring before the task reads it, and it would read the 90 bytes in one call: what
+/// Espressif's README shows (64 + 24) is a task waiting in its read when the line comes.
+///
+/// USB-Serial-JTAG carries more than the echo: the application keeps the ROM console of the
+/// bootloader inkemu ships, which mirrors every byte printed on UART0 to USB-Serial-JTAG
+/// (report USJ §B.1, §B.2). So its stream is the stream of UART0 with the echoed bytes in it,
+/// and the two packets of the echo of the 90 bytes may be apart: each is waited for on its own.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_USJ_ECHO_APP"]
 fn usb_serial_jtag_echo_reference_firmware_echoes_on_usb_and_dumps_on_uart0() {
@@ -235,24 +281,15 @@ fn usb_serial_jtag_echo_reference_firmware_echoes_on_usb_and_dumps_on_uart0() {
         "usb_serial_jtag_echo.bin",
     );
     let mut machine = x4_with(&application, MachineOptions::default());
+    let first = "hi, espressif\n";
     let ninety = "0123456789".repeat(9);
+    let (packet, rest) = ninety.split_at(64);
     let body = format!(
-        "wait-for uart0 \"USB_SERIAL_JTAG init done\"\nsend usb-serial-jtag \"hi, espressif\\n\"\nwait-for usb-serial-jtag \"hi, espressif\\n\"\nsend usb-serial-jtag \"{ninety}\"\nwait-for usb-serial-jtag \"{ninety}\"\nwait 100ms\n"
+        "wait-for uart0 \"USB_SERIAL_JTAG init done\"\nsend usb-serial-jtag \"hi, espressif\\n\"\nwait-for usb-serial-jtag \"hi, espressif\\n\"\nwait-for uart0 \"|hi, espressif.|\"\nsend usb-serial-jtag \"{ninety}\"\nwait-for usb-serial-jtag \"{packet}\"\nwait-for usb-serial-jtag \"{rest}\"\nwait 100ms\n"
     );
-    let (consoles, status, driven) =
-        scripted(&mut machine, &script(&body), 1_000_000, 20 * SECOND_NS);
-    let uart0 = consoles.text(ConsoleChannel::Uart0);
-    assert_eq!(
-        (status, driven),
-        (ScriptStatus::Complete, Driven::Done),
-        "{uart0}"
-    );
-    let usb = consoles.bytes(ConsoleChannel::UsbSerialJtag);
-    assert!(
-        usb.ends_with(format!("hi, espressif\n{ninety}").as_bytes()),
-        "{}",
-        String::from_utf8_lossy(usb)
-    );
+    let run = scripted(&mut machine, &script(&body), 1_000_000, 20 * SECOND_NS);
+    assert!(run.through(), "{}", run.report());
+    let uart0 = run.consoles.text(ConsoleChannel::Uart0);
     let dumps: Vec<&str> = uart0
         .lines()
         .filter(|line| line.contains("Recv str: "))
@@ -260,17 +297,39 @@ fn usb_serial_jtag_echo_reference_firmware_echoes_on_usb_and_dumps_on_uart0() {
     assert_eq!(
         dumps.len(),
         7,
-        "one row for the first line, 4 + 2 for the 90 bytes:\n{uart0}"
+        "one row for the first line, 4 + 2 for the 90 bytes:\n{}",
+        run.report()
     );
     assert!(
         dumps[0].ends_with("68 69 2c 20 65 73 70 72  65 73 73 69 66 0a        |hi, espressif.|"),
-        "{uart0}"
+        "{}",
+        run.report()
     );
-    assert_eq!(dump_address(dumps[1]), dump_address(dumps[0]));
+    assert_eq!(
+        dump_address(dumps[1]),
+        dump_address(dumps[0]),
+        "{}",
+        run.report()
+    );
     assert_eq!(
         dump_address(dumps[5]),
         dump_address(dumps[0]),
-        "26 bytes read on their own:\n{uart0}"
+        "26 bytes read on their own:\n{}",
+        run.report()
+    );
+    // What was written and not yet sent belongs to each console.
+    let mut uart0 = run.consoles.bytes(ConsoleChannel::Uart0).to_vec();
+    uart0.extend(machine.flush_console(ConsoleChannel::Uart0));
+    let mut usb = run.consoles.bytes(ConsoleChannel::UsbSerialJtag).to_vec();
+    usb.extend(machine.flush_console(ConsoleChannel::UsbSerialJtag));
+    let mirrored = [first, packet, rest]
+        .into_iter()
+        .try_fold(usb, |stream, echo| without_first(&stream, echo.as_bytes()));
+    assert_eq!(
+        mirrored.as_deref().map(String::from_utf8_lossy),
+        Some(String::from_utf8_lossy(&uart0)),
+        "USB-Serial-JTAG is UART0 with the echo in it:\n{}",
+        run.report()
     );
 }
 
@@ -298,33 +357,27 @@ fn usb_serial_jtag_console(host: UsbHost) -> Esp32C3 {
 fn usb_serial_jtag_console_reference_firmware_needs_an_open_host() {
     let mut open = usb_serial_jtag_console(UsbHost::Open);
     let body = "wait-for usb-serial-jtag \"ready\\r\\n\"\nsend usb-serial-jtag \"hello\\r\"\nwait-for usb-serial-jtag \"echo: hello\\r\\n\"\n";
-    let (consoles, status, driven) = scripted(&mut open, &script(body), 1_000_000, 10 * SECOND_NS);
-    let usb = consoles.text(ConsoleChannel::UsbSerialJtag);
-    assert_eq!(
-        (status, driven),
-        (ScriptStatus::Complete, Driven::Done),
-        "{usb}"
+    let run = scripted(&mut open, &script(body), 1_000_000, 10 * SECOND_NS);
+    assert!(run.through(), "{}", run.report());
+    let usb = run.consoles.text(ConsoleChannel::UsbSerialJtag);
+    assert!(
+        usb.ends_with("ready\necho: hello\n"),
+        "{usb:?}\n{}",
+        run.report()
     );
-    assert!(usb.ends_with("ready\necho: hello\n"), "{usb:?}");
 
     let mut absent = usb_serial_jtag_console(UsbHost::Absent);
     // The last line the bootloader prints on UART0 before it jumps to the application, as the
     // reference boot pins it (`soc-esp32c3/tests/reference_boot.rs`): a firmware that never
     // started would leave USB-Serial-JTAG empty too.
     let body = "wait-for uart0 \"boot: Disabling RNG early entropy source...\"\nwait 2s\n";
-    let (consoles, status, driven) =
-        scripted(&mut absent, &script(body), 1_000_000, 10 * SECOND_NS);
+    let run = scripted(&mut absent, &script(body), 1_000_000, 10 * SECOND_NS);
+    assert!(run.through(), "{}", run.report());
     assert_eq!(
-        (status, driven),
-        (ScriptStatus::Complete, Driven::Done),
-        "{}",
-        consoles.text(ConsoleChannel::Uart0)
-    );
-    assert_eq!(
-        consoles.text(ConsoleChannel::UsbSerialJtag),
+        run.consoles.text(ConsoleChannel::UsbSerialJtag),
         "",
-        "UART0:\n{}",
-        consoles.text(ConsoleChannel::Uart0)
+        "{}",
+        run.report()
     );
 }
 
@@ -339,16 +392,17 @@ fn hello_world_reference_firmware_prints_the_same_bytes_on_usb_serial_jtag_as_on
         .instantiate_with_flash(rom(), flash, MachineOptions::default())
         .unwrap();
     let body = "wait-for uart0 \"Restarting in 5 seconds...\"\n";
-    let (consoles, status, driven) =
-        scripted(&mut machine, &script(body), 1_000_000, 20 * SECOND_NS);
-    assert_eq!((status, driven), (ScriptStatus::Complete, Driven::Done));
+    let run = scripted(&mut machine, &script(body), 1_000_000, 20 * SECOND_NS);
+    assert!(run.through(), "{}", run.report());
     // What was written and not yet sent belongs to each console.
-    let mut uart0 = consoles.bytes(ConsoleChannel::Uart0).to_vec();
+    let mut uart0 = run.consoles.bytes(ConsoleChannel::Uart0).to_vec();
     uart0.extend(machine.flush_console(ConsoleChannel::Uart0));
-    let mut usb = consoles.bytes(ConsoleChannel::UsbSerialJtag).to_vec();
+    let mut usb = run.consoles.bytes(ConsoleChannel::UsbSerialJtag).to_vec();
     usb.extend(machine.flush_console(ConsoleChannel::UsbSerialJtag));
     assert_eq!(
         String::from_utf8_lossy(&usb),
-        String::from_utf8_lossy(&uart0)
+        String::from_utf8_lossy(&uart0),
+        "{}",
+        run.report()
     );
 }
