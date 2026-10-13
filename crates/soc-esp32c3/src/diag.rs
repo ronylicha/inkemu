@@ -72,6 +72,11 @@ pub enum Unsupported {
     /// frequency for: the RC fast clock (2), or no documented source (0). The byte is timed with
     /// the crystal.
     UartClock { uart: u8, sclk_sel: u32 },
+    /// A read of the receiver of a UART (`FIFO`, `STATUS`, `INT_RAW`, `INT_ST`) after a byte of
+    /// the host started, or a receive timeout came, while `CLK_CONF.SCLK_SEL` selected a source
+    /// clock the model has no frequency for: they were timed with the crystal. Refused at the read,
+    /// an instant the firmware fixes, rather than at the start bit, which any call may reach.
+    UartReceiveClock { uart: u8, sclk_sel: u32 },
     /// A UART field set to a mode the model does not have (report UR §10): the register keeps
     /// the value, and the UART goes on as if the field were clear.
     UartFeature { uart: u8, feature: UartFeature },
@@ -272,6 +277,7 @@ impl Unsupported {
             ),
             Unsupported::UartOverflow { .. }
             | Unsupported::UartClock { .. }
+            | Unsupported::UartReceiveClock { .. }
             | Unsupported::UartFeature { .. }
             | Unsupported::UartRxOverflow { .. }
             | Unsupported::UartEmptyRead { .. }
@@ -290,6 +296,10 @@ impl Unsupported {
             Unsupported::UartClock { uart, sclk_sel } => write!(
                 f,
                 "UART{uart} sent a byte with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = {sclk_sel}, pc {pc:#010x}), so the byte was timed with the 40 MHz crystal and its duration differs from the device; select the crystal (SCLK_SEL = 3) or APB_CLK (SCLK_SEL = 1)"
+            ),
+            Unsupported::UartReceiveClock { uart, sclk_sel } => write!(
+                f,
+                "UART{uart} received from the host, or counted its receive timeout, with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = {sclk_sel}, read at pc {pc:#010x}), so the bit times were those of the 40 MHz crystal and what the read shows differs from the device; select the crystal (SCLK_SEL = 3) or APB_CLK (SCLK_SEL = 1)"
             ),
             Unsupported::UartFeature { uart, feature } => {
                 let (field, asked, instead) = feature.describe();
@@ -416,6 +426,7 @@ impl Diagnostic {
                 Unsupported::SlowClock { .. } => (9, 0, 0),
                 Unsupported::UartOverflow { uart } => (12, u32::from(uart), 0),
                 Unsupported::UartClock { uart, sclk_sel } => (13, u32::from(uart), sclk_sel),
+                Unsupported::UartReceiveClock { uart, sclk_sel } => (28, u32::from(uart), sclk_sel),
                 Unsupported::UartFeature { uart, feature } => (23, u32::from(uart), feature as u32),
                 Unsupported::UartRxOverflow { uart } => (24, u32::from(uart), 0),
                 Unsupported::UartEmptyRead { uart } => (25, u32::from(uart), 0),
@@ -872,6 +883,10 @@ mod tests {
                 uart: 1,
                 sclk_sel: 2,
             }),
+            unsupported(Unsupported::UartReceiveClock {
+                uart: 0,
+                sclk_sel: 0,
+            }),
             unsupported(Unsupported::UartFeature {
                 uart: 0,
                 feature: UartFeature::Loopback,
@@ -1026,6 +1041,19 @@ mod tests {
                 "UART{uart}, SCLK_SEL {sclk_sel}"
             );
         }
+        // What the receiver showed on such a clock is another line, once per UART and selection.
+        let received = |uart: u8, sclk_sel: u32, pc: u32| Diagnostic::Unsupported {
+            what: Unsupported::UartReceiveClock { uart, sclk_sel },
+            pc,
+        };
+        d.record(received(0, 2, 0x4038_1000));
+        d.record(received(0, 2, 0x4200_0000));
+        assert_eq!(d.distinct(), 8, "not a byte sent");
+        assert_eq!(d.occurrences(&received(0, 2, 0x4038_2000)), 2);
+        assert_eq!(d.occurrences(&uart_clock(0, 2, 0x4038_1000)), 2);
+        d.record(received(1, 2, 0x4038_1000));
+        d.record(received(0, 0, 0x4038_1000));
+        assert_eq!(d.distinct(), 10);
     }
 
     #[test]
@@ -1318,6 +1346,13 @@ mod tests {
                     feature: UartFeature::Rs485,
                 },
                 "UART0 was set to RS485 mode (RS485_CONF other than 0, pc 0x40381000)",
+            ),
+            (
+                Unsupported::UartReceiveClock {
+                    uart: 1,
+                    sclk_sel: 2,
+                },
+                "UART1 received from the host, or counted its receive timeout, with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = 2, read at pc 0x40381000)",
             ),
             (
                 Unsupported::UartRxOverflow { uart: 1 },

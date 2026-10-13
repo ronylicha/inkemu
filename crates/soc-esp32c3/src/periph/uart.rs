@@ -190,6 +190,10 @@ pub struct Uart {
     /// The machine watches what this UART sends: each byte asks for a call at the instant it has
     /// left, so that the machine sees it go at that instant ([`Uart::watch`]).
     watched: bool,
+    /// The `SCLK_SEL` without a frequency in the model that timed a byte of the host or a
+    /// receive timeout since the firmware last looked at the receiver: refused at that look
+    /// ([`Uart::report_mistimed_reception`]).
+    rx_mistimed: Option<u32>,
 }
 
 impl Uart {
@@ -215,6 +219,7 @@ impl Uart {
             idle_since: None,
             wake: Deadline::default(),
             watched: false,
+            rx_mistimed: None,
         }
     }
 
@@ -355,7 +360,7 @@ impl Uart {
     /// whose frame is timed with the settings of now. They hold until a register write or a
     /// change of the clocks, and each brings the UART to now first (`write`,
     /// [`Uart::clock_changing`]).
-    fn next_landing(&self, ctx: &mut Ctx) -> Option<u64> {
+    fn next_landing(&self, ctx: &Ctx) -> Option<u64> {
         if let Some((lands_at, _)) = self.receiving {
             return Some(lands_at);
         }
@@ -393,7 +398,7 @@ impl Uart {
     /// chip's counter follows such a change is not documented, and no measured path changes the
     /// rate while a driver waits for input. A logic analyser on the receive line of a chip whose
     /// clock is switched during an idle period, with a GPIO toggled by the handler, settles it.
-    fn timeout_at(&self, ctx: &mut Ctx) -> Option<u64> {
+    fn timeout_at(&self, ctx: &Ctx) -> Option<u64> {
         let since = self.idle_since?;
         let threshold = (self.config.read(MEM_CONF).unwrap_or(0) >> RX_TOUT_THRHD_SHIFT) & TEN_BITS;
         Some(since.saturating_add(u64::from(threshold) * self.bit_time(self.source_period(ctx))))
@@ -446,6 +451,9 @@ impl Uart {
                 // the timeout it put off is not asked for again (`arm`), and the landing starts
                 // the count again.
                 let lands_at = starts_at.saturating_add(self.byte_time(self.source_period(ctx)));
+                if let Some(sclk_sel) = self.unmodelled_source() {
+                    self.rx_mistimed = Some(sclk_sel);
+                }
                 self.host.pop_front();
                 self.receiving = Some((lands_at, byte));
                 self.line_free_at = lands_at;
@@ -476,8 +484,30 @@ impl Uart {
     fn time_out(&mut self) {
         self.idle_since = None;
         let conf1 = self.config.read(CONF1).unwrap_or(0);
-        if conf1 & RX_TOUT_EN != 0 && !self.rx.is_empty() {
+        if conf1 & RX_TOUT_EN == 0 {
+            return;
+        }
+        // An enabled timeout was timed with the bit time: on a clock the model does not have,
+        // its instant is wrong whether or not it raises the bit.
+        if let Some(sclk_sel) = self.unmodelled_source() {
+            self.rx_mistimed = Some(sclk_sel);
+        }
+        if !self.rx.is_empty() {
             self.int_raw |= RXFIFO_TOUT;
+        }
+    }
+
+    /// The firmware looks at the receiver (`FIFO`, `STATUS`, `INT_RAW`, `INT_ST`): what it sees
+    /// of a byte of the host, or of a receive timeout, timed with a source clock the model does
+    /// not have is refused by name there, at the access. The access is an instant the firmware
+    /// fixes, whatever the calls the run is cut into; the instant a byte starts is not one, since
+    /// any call may bring the UART to it.
+    fn report_mistimed_reception(&mut self, ctx: &mut Ctx) {
+        if let Some(sclk_sel) = self.rx_mistimed.take() {
+            ctx.unsupported(Unsupported::UartReceiveClock {
+                uart: self.index,
+                sclk_sel,
+            });
         }
     }
 
@@ -550,29 +580,36 @@ impl Uart {
         0
     }
 
-    /// The period of the source clock a byte sent now is timed with, in time-base cycles.
+    /// The period of the source clock the UART times its bits with now, in time-base cycles.
     ///
     /// `SCLK_SEL` 1 is `APB_CLK` and 3 the crystal. 2 selects the RC fast clock
     /// (`case UART_SCLK_RTC: hw->clk_conf.sclk_sel = 2;`,
     /// `components/hal/esp32c3/include/hal/uart_ll.h:178-179`, ESP-IDF v5.5.2), 17.5 MHz nominal,
     /// and 0 has no documented source (`uart_reg.h:1189` documents only the reset value, 3). The
-    /// model has a clock for neither: a byte sent with one of them is refused by name
-    /// ([`Unsupported::UartClock`], a stop under `--strict-mmio`) and timed with the crystal so
-    /// that a lenient run goes on, instead of being given a duration that is silently wrong (the
-    /// calibration of the timer groups measures the same oscillator at its 17.5 MHz). Nothing on
-    /// the measured paths selects either.
-    fn source_period(&self, ctx: &mut Ctx) -> u64 {
-        let clk_conf = self.config.read(CLK_CONF).unwrap_or(0);
-        match (clk_conf >> SCLK_SEL_SHIFT) & SCLK_SEL_MASK {
-            SCLK_SEL_APB => ctx.clock().apb_period(),
-            SCLK_SEL_XTAL => XTAL_PERIOD,
-            sclk_sel => {
-                ctx.unsupported(Unsupported::UartClock {
-                    uart: self.index,
-                    sclk_sel,
-                });
-                XTAL_PERIOD
-            }
+    /// model has a clock for neither ([`Uart::unmodelled_source`]): it times with the crystal so
+    /// that a lenient run goes on, and refuses by name what that timing gives, instead of a
+    /// duration that is silently wrong (the calibration of the timer groups measures the same
+    /// oscillator at its 17.5 MHz): a byte sent ([`Unsupported::UartClock`]), a byte received or
+    /// a receive timeout ([`Unsupported::UartReceiveClock`]), each a stop under `--strict-mmio`.
+    /// Nothing on the measured paths selects either.
+    fn source_period(&self, ctx: &Ctx) -> u64 {
+        if self.source_selection() == SCLK_SEL_APB {
+            ctx.clock().apb_period()
+        } else {
+            XTAL_PERIOD
+        }
+    }
+
+    /// `CLK_CONF.SCLK_SEL`.
+    fn source_selection(&self) -> u32 {
+        (self.config.read(CLK_CONF).unwrap_or(0) >> SCLK_SEL_SHIFT) & SCLK_SEL_MASK
+    }
+
+    /// The `SCLK_SEL` of now when the model has no frequency for the clock it selects.
+    fn unmodelled_source(&self) -> Option<u32> {
+        match self.source_selection() {
+            SCLK_SEL_APB | SCLK_SEL_XTAL => None,
+            sclk_sel => Some(sclk_sel),
         }
     }
 
@@ -632,6 +669,12 @@ impl Uart {
             ctx.unsupported(Unsupported::UartOverflow { uart: self.index });
             return;
         }
+        if let Some(sclk_sel) = self.unmodelled_source() {
+            ctx.unsupported(Unsupported::UartClock {
+                uart: self.index,
+                sclk_sel,
+            });
+        }
         let byte_time = self.byte_time(self.source_period(ctx));
         // ASSUMPTION: a byte keeps the duration it was given when it was written: a later change
         // of `CLKDIV`, `CLK_CONF` or the APB clock applies to the bytes written after it. What
@@ -655,6 +698,9 @@ impl Uart {
 impl Peripheral<Ctx> for Uart {
     fn read(&mut self, ctx: &mut Ctx, offset: u32) -> Option<u32> {
         self.settle(ctx);
+        if matches!(offset, FIFO | STATUS | INT_RAW | INT_ST) {
+            self.report_mistimed_reception(ctx);
+        }
         match offset {
             FIFO => Some(self.pop(ctx)),
             STATUS => {
@@ -1651,6 +1697,49 @@ mod tests {
             assert_eq!(uart.take_tx(ctx), b"r", "SCLK_SEL {selection}");
             uart.write(ctx, FIFO, u32::from(b's'));
             assert!(ctx.take_unsupported().is_some(), "every byte is reported");
+        }
+    }
+
+    #[test]
+    fn what_the_receiver_shows_on_a_source_clock_the_model_does_not_have_is_refused_when_the_firmware_reads_it()
+     {
+        // The byte and the timeout are timed with the crystal. The refusal comes at the read that
+        // shows them, an instant the firmware fixes, not when a call reaches the start bit.
+        for (selection, byte_read, timeout_read) in [(0, STATUS, INT_ST), (2, FIFO, INT_RAW)] {
+            let ctx = &mut Ctx::default();
+            let mut uart = driver(ctx);
+            select_source(ctx, &mut uart, selection);
+            uart.receive(ctx, Cycles::ZERO, b"a");
+            run_to(ctx, &mut uart, Cycles(landed(1).get() - 1));
+            uart.take_tx(ctx);
+            assert_eq!(
+                ctx.take_unsupported(),
+                None,
+                "SCLK_SEL {selection}: not read yet"
+            );
+            assert_eq!(uart.read(ctx, CONF0), Some(0x1000_001C));
+            assert_eq!(ctx.take_unsupported(), None, "not a read of the receiver");
+            run_to(ctx, &mut uart, landed(1));
+            assert_ne!(
+                uart.read(ctx, byte_read),
+                Some(0),
+                "landed one crystal frame later"
+            );
+            let refused = Some(Unsupported::UartReceiveClock {
+                uart: 0,
+                sclk_sel: selection,
+            });
+            assert_eq!(ctx.take_unsupported(), refused);
+            uart.read(ctx, timeout_read);
+            assert_eq!(ctx.take_unsupported(), None, "seen already");
+            run_to(ctx, &mut uart, timed_out_after(1));
+            assert_eq!(
+                ctx.take_unsupported(),
+                None,
+                "the timeout came, not read yet"
+            );
+            uart.read(ctx, timeout_read);
+            assert_eq!(ctx.take_unsupported(), refused, "the timeout read");
         }
     }
 
