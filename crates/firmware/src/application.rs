@@ -3,7 +3,7 @@
 //! `docs/research/flash-writes-and-crosspoint-boot.md`, **FW** below, §M;
 //! `docs/research/shipped-bootloader-and-firmware-composition.md`, **SB** below, §C).
 use crate::app_desc::AppDesc;
-use crate::bootloader::BootloaderDesc;
+use crate::bootloader::{BootloaderDesc, memory_map};
 use crate::chip::ChipId;
 use crate::device::{Device, revision};
 use crate::error::FirmwareError;
@@ -14,6 +14,11 @@ use crate::partition::Partition;
 /// `bootloader_common_loader.c` of ESP-IDF v5.5.2).
 const fn is_set(bound: u16) -> bool {
     bound != 0 && bound != u16::MAX
+}
+
+/// ` (CONFIG_…)`: the Kconfig option a remedy names, when it is known.
+fn named(option: Option<&str>) -> String {
+    option.map_or_else(String::new, |option| format!(" ({option})"))
 }
 
 /// What the check of an application found.
@@ -70,10 +75,16 @@ pub enum ApplicationError {
     )]
     LargerFlash { header: u32, device: u32 },
     #[error(
-        "the firmware requires chip revision {} or later and the device is {}: the bootloader would refuse to start it; use a build for {} (CONFIG_ESP32C3_REV_MIN), or choose a device of revision {} or later",
-        revision(*required), revision(*device), revision(*device), revision(*required)
+        "the firmware requires chip revision {} or later and the device is {}: the bootloader would refuse to start it; use a build for {}{}, or choose a device of revision {} or later",
+        revision(*required), revision(*device), revision(*device), named(*option), revision(*required)
     )]
-    ChipTooOld { required: u16, device: u16 },
+    ChipTooOld {
+        required: u16,
+        device: u16,
+        /// The Kconfig option that sets the revision, when inkemu models the chip
+        /// ([`crate::bootloader::MemoryMap::revision_option`]).
+        option: Option<&'static str>,
+    },
     #[error(
         "the firmware accepts chip revisions up to {} and the device is {}: the bootloader would refuse to start it; use a build that accepts {}, or choose a device of revision {} or earlier",
         revision(*accepted), revision(*device), revision(*device), revision(*accepted)
@@ -162,6 +173,7 @@ fn check_revisions(
         return Err(ApplicationError::ChipTooOld {
             required: image.min_chip_rev_full,
             device: chip,
+            option: memory_map(device.chip).map(|map| map.revision_option),
         });
     }
     if is_set(image.max_chip_rev_full) && chip > image.max_chip_rev_full {
@@ -343,7 +355,8 @@ mod tests {
             refusal(&with_header(15, 4)),
             ApplicationError::ChipTooOld {
                 required: 4,
-                device: 3
+                device: 3,
+                option: Some("CONFIG_ESP32C3_REV_MIN")
             }
         );
         assert!(check_application(&with_header(15, 3), &X4, &slot(0x64_0000)).is_ok());
@@ -412,6 +425,12 @@ mod tests {
             ApplicationError::ChipTooOld {
                 required: 4,
                 device: 3,
+                option: Some("CONFIG_ESP32C3_REV_MIN"),
+            },
+            ApplicationError::ChipTooOld {
+                required: 4,
+                device: 3,
+                option: None,
             },
             ApplicationError::ChipTooNew {
                 accepted: 2,
