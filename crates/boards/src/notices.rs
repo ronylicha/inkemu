@@ -79,6 +79,49 @@ mod tests {
         }
     }
 
+    /// The SHA-256 of the licence text kept in each third-party directory: the whole Apache
+    /// License 2.0, which section 4(a) asks a distribution to give. A shortened file changes it.
+    const LICENSE_SHA256: [(&str, &str); 2] = [
+        (
+            "third_party/espressif-svd",
+            "258d0cdc26654510786f1bf1313d95e4039d220cd8ac6cdbdd973f8cb6ce831b",
+        ),
+        (
+            "third_party/esp-idf-bootloader",
+            "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        ),
+    ];
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // reads the licence files of the repository
+    fn the_licence_the_binary_prints_is_the_whole_text_of_the_repository() {
+        for part in &THIRD_PARTIES {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(part.directory)
+                .join("LICENSE");
+            let on_disk = std::fs::read(&path).unwrap();
+            let embedded = firmware::bootloader::sha256_hex(part.license.as_bytes());
+            assert_eq!(
+                embedded,
+                firmware::bootloader::sha256_hex(&on_disk),
+                "the licence built into the binary is not {}; rebuild",
+                path.display()
+            );
+            let (_, pinned) = LICENSE_SHA256
+                .iter()
+                .find(|(directory, _)| *directory == part.directory)
+                .unwrap_or_else(|| panic!("no pinned licence hash for {}", part.directory));
+            assert_eq!(
+                &embedded, pinned,
+                "the licence text of {} is not the Apache License 2.0 as it was added; restore \
+                 the file (a deliberate change updates the pinned hash)",
+                part.directory
+            );
+        }
+        assert_eq!(LICENSE_SHA256.len(), THIRD_PARTIES.len());
+    }
+
     #[test]
     fn the_text_holds_every_notice_and_licence() {
         let text = notices_text();
