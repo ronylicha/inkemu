@@ -16,10 +16,8 @@ use std::fmt;
 /// How to write the `jedec_id` key, for the messages that refuse one.
 const JEDEC_ID_FORM: &str = "write jedec_id as 0xMMTTCC (manufacturer, type, capacity)";
 
-const BUILTIN: [(&str, &str); 2] = [
-    ("x3", include_str!("../profiles/x3.toml")),
-    ("x4", include_str!("../profiles/x4.toml")),
-];
+// `BUILTIN`: every `profiles/<id>.toml` as `(id, text)`, sorted by id (`build.rs`).
+include!(concat!(env!("OUT_DIR"), "/builtin_profiles.rs"));
 /// The ids of [`BUILTIN`], in the same order: derived, so there is one list to keep.
 const BUILTIN_IDS: [&str; BUILTIN.len()] = {
     let mut ids = [""; BUILTIN.len()];
@@ -571,17 +569,37 @@ mod tests {
 
     const VALID: &str = "id = \"demo\"\nname = \"Demo board\"\n\n[soc]\nfamily = \"esp32c3\"\nrevision = \"v1.1\"\n\n[flash]\nsize_mib = 4\njedec_id = 0xEF4016\n\n[[partition]]\nname = \"app\"\ntype = \"app\"\nsubtype = \"factory\"\noffset = 0x10000\nsize = 0x10000\n";
 
+    /// A device is one file of `profiles/`: the built-in list is every `*.toml` there, by name.
     #[test]
-    fn builtin_profiles_load_and_carry_their_own_id() {
-        assert_eq!(builtin_ids(), ["x3", "x4"]);
+    fn the_built_in_profiles_are_the_files_of_the_profiles_directory_in_order() {
+        // The test reads the directory the build script reads: test code only.
+        #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+        let mut files: Vec<String> =
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/profiles"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+                .map(|path| path.file_stem().unwrap().to_str().unwrap().to_owned())
+                .collect();
+        files.sort();
+        assert_eq!(builtin_ids(), files);
         assert_eq!(
             builtin_ids(),
             BUILTIN.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             "one list of devices"
         );
+    }
+
+    #[test]
+    fn builtin_profiles_load_and_carry_their_own_id() {
         for id in builtin_ids() {
             let profile = builtin(id).unwrap();
             assert_eq!(profile.id, *id);
+            assert!(!profile.name.is_empty(), "{id}");
+        }
+        // The two Xteink devices of spec §2.
+        for id in ["x3", "x4"] {
+            let profile = builtin(id).unwrap();
             assert_eq!(profile.soc, SocFamily::Esp32C3);
             assert_eq!(profile.chip_revision, ChipRevision::V0_3);
             assert!(profile.name.starts_with("Xteink"));
@@ -608,7 +626,20 @@ mod tests {
             firmware::bootloader::sha256_hex(&x3.partitions.to_bytes(FlashSize::Mb16).unwrap()),
             "334c9553e2799107ed33eb9057f8661c6dd757c662a661edac6c73bb99ae7d5e"
         );
+        // Every bundled profile, whatever file added it: a table that compiles for its flash, the
+        // slot an application is written to, and a bootloader inkemu ships for its chip.
         for id in builtin_ids() {
+            let profile = builtin(id).unwrap();
+            let flash_size = profile.firmware_device().flash_size;
+            assert!(profile.partitions.to_bytes(flash_size).is_ok(), "{id}");
+            assert!(profile.partitions.application_slot().is_some(), "{id}");
+            assert_eq!(
+                profile.bootloader.chip,
+                profile.soc.chip_id(),
+                "{id}: a bootloader for its chip"
+            );
+        }
+        for id in ["x3", "x4"] {
             let profile = builtin(id).unwrap();
             assert_eq!(profile.bootloader, &firmware::SHIPPED[0], "{id}");
             let slot = profile.partitions.application_slot().unwrap();
