@@ -19,7 +19,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Also fails when a path a clippy.toml bans names nothing: see tools/ci/clippy.sh.
+      - run: tools/ci/clippy.sh --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       - run: cargo run -p svd-gen -- --check
       # The model crates, and the crates a front end composes a flash with, must go on building for

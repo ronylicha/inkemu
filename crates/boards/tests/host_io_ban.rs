@@ -158,8 +158,10 @@ fn each_copy_carries_the_workspace_settings() {
     }
 }
 
+/// Each copy names every banned path. That clippy resolves each of them, so that the ban bites, is
+/// what `tools/ci/clippy.sh` checks: a path that names nothing is only a warning of clippy.
 #[test]
-fn each_copy_refuses_every_call_to_the_host() {
+fn each_copy_lists_every_call_to_the_host() {
     for name in CRATES {
         let origin = format!("crates/{name}/clippy.toml");
         let copy = parse(&read(&workspace_root().join(&origin)), &origin);
