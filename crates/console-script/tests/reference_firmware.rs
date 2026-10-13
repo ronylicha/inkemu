@@ -291,7 +291,8 @@ fn usb_serial_jtag_console(host: UsbHost) -> Esp32C3 {
 
 /// Milestone 3 (USJ §F.2): the console of this firmware works only with a host that reads the
 /// port. Open: `ready`, then the line typed, echoed. Absent: no start-of-frame ever comes, the
-/// console discards what is printed, and USB-Serial-JTAG carries nothing.
+/// console discards what is printed, and USB-Serial-JTAG carries nothing, two seconds after the
+/// bootloader, which prints on UART0, has started the application.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_USJ_CONSOLE_APP"]
 fn usb_serial_jtag_console_reference_firmware_needs_an_open_host() {
@@ -307,9 +308,18 @@ fn usb_serial_jtag_console_reference_firmware_needs_an_open_host() {
     assert!(usb.ends_with("ready\necho: hello\n"), "{usb:?}");
 
     let mut absent = usb_serial_jtag_console(UsbHost::Absent);
-    let (consoles, _, driven) =
-        scripted(&mut absent, &script("wait 2s\n"), 1_000_000, 3 * SECOND_NS);
-    assert_eq!(driven, Driven::Done);
+    // The last line the bootloader prints on UART0 before it jumps to the application, as the
+    // reference boot pins it (`soc-esp32c3/tests/reference_boot.rs`): a firmware that never
+    // started would leave USB-Serial-JTAG empty too.
+    let body = "wait-for uart0 \"boot: Disabling RNG early entropy source...\"\nwait 2s\n";
+    let (consoles, status, driven) =
+        scripted(&mut absent, &script(body), 1_000_000, 10 * SECOND_NS);
+    assert_eq!(
+        (status, driven),
+        (ScriptStatus::Complete, Driven::Done),
+        "{}",
+        consoles.text(ConsoleChannel::Uart0)
+    );
     assert_eq!(
         consoles.text(ConsoleChannel::UsbSerialJtag),
         "",
