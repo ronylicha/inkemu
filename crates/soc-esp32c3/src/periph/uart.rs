@@ -299,6 +299,23 @@ impl Uart {
         self.arm(ctx);
     }
 
+    /// The clocks are about to change (a write of the `SYSTEM` clock registers): with `SCLK_SEL`
+    /// = 1 the UART counts `APB_CLK`, which a register of the UART does not change. It comes to
+    /// now first, so that a byte of the host whose start bit came before the change is timed with
+    /// the clock of then, and a timeout due by then comes, whether or not something called the
+    /// UART since: the device time of an input is fixed by the inputs alone (ADR 0006).
+    pub(crate) fn clock_changing(&mut self, ctx: &mut Ctx) {
+        self.settle(ctx);
+    }
+
+    /// The clocks changed: the instants worked out with the old `APB_CLK` (the landing of the
+    /// next byte, the timeout) are worked out again, and a timeout the new rate puts before now
+    /// comes now.
+    pub(crate) fn clock_changed(&mut self, ctx: &mut Ctx) {
+        self.settle(ctx);
+        self.arm(ctx);
+    }
+
     /// Asks to be called at the next instant an interrupt condition can begin: the last byte of
     /// the transmitter leaves (`TX_DONE`), the transmit FIFO falls below its threshold
     /// (`TXFIFO_EMPTY`), the next byte of the host lands (`RXFIFO_FULL`, `RXFIFO_OVF`), the
@@ -335,8 +352,9 @@ impl Uart {
     }
 
     /// The instant the next byte of the host lands: the one on the line, or the next to start,
-    /// whose frame is timed with the settings of now (they hold until a register write, which
-    /// settles first).
+    /// whose frame is timed with the settings of now. They hold until a register write or a
+    /// change of the clocks, and each brings the UART to now first (`write`,
+    /// [`Uart::clock_changing`]).
     fn next_landing(&self, ctx: &mut Ctx) -> Option<u64> {
         if let Some((lands_at, _)) = self.receiving {
             return Some(lands_at);
@@ -368,6 +386,13 @@ impl Uart {
 
     /// The instant the receive timeout of the current idle period comes: `RX_TOUT_THRHD` bit
     /// times after the last byte landed (report UR §5.2), timed with the settings of now.
+    ///
+    /// ASSUMPTION: a change of the bit time during an idle period (`CLKDIV`, `CLK_CONF`, or
+    /// `APB_CLK` with `SCLK_SEL` = 1) times the whole period again, from the landing, with the
+    /// new bit time; a timeout that this puts before the change comes at the change. How the
+    /// chip's counter follows such a change is not documented, and no measured path changes the
+    /// rate while a driver waits for input. A logic analyser on the receive line of a chip whose
+    /// clock is switched during an idle period, with a GPIO toggled by the handler, settles it.
     fn timeout_at(&self, ctx: &mut Ctx) -> Option<u64> {
         let since = self.idle_since?;
         let threshold = (self.config.read(MEM_CONF).unwrap_or(0) >> RX_TOUT_THRHD_SHIFT) & TEN_BITS;
@@ -413,7 +438,11 @@ impl Uart {
                     break;
                 }
                 // The frame of a byte is the one the UART is set to when it starts: a register
-                // write settles before it changes the setting. A start bit ends the idle line:
+                // write and a change of the clocks bring the UART to now before they change it.
+                // ASSUMPTION: as a byte sent keeps the duration it was given (`send`), a byte
+                // received keeps the bit time of its start bit; a later change of the rate
+                // applies to the bytes that start after it. A logic-analyser capture of a byte
+                // received while `CLKDIV` is rewritten settles it. A start bit ends the idle line:
                 // the timeout it put off is not asked for again (`arm`), and the landing starts
                 // the count again.
                 let lands_at = starts_at.saturating_add(self.byte_time(self.source_period(ctx)));
@@ -1190,6 +1219,83 @@ mod tests {
 
     fn rx_count(ctx: &mut Ctx, uart: &mut Uart) -> u32 {
         uart.read(ctx, STATUS).unwrap() & 0x3FF
+    }
+
+    /// What a run shows at each cycle up to `end`: the bytes in the receive FIFO and the level
+    /// of the sources, looked at without calling the UART.
+    type Timeline = Vec<(usize, u64)>;
+
+    /// A UART on `APB_CLK` (power-on: 20 MHz) receives `a` at 0, with a receive timeout of 10 bit
+    /// times. The clocks change at each of `changes`, the way the machine changes them
+    /// (`Esp32C3::retune`). Device time moves a cycle at a time and each call the UART asked for
+    /// is delivered at its instant; with `taken_every` the console is also taken every so many
+    /// cycles, as a front end that cuts the run into calls, or watches the UART, does.
+    fn apb_timeline(
+        changes: &[(u64, crate::clock::CpuClock)],
+        end: u64,
+        taken_every: Option<u64>,
+    ) -> Timeline {
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        uart.write(ctx, MEM_CONF, 0x000A_0012);
+        select_source(ctx, &mut uart, SCLK_SEL_APB);
+        uart.receive(ctx, Cycles::ZERO, b"a");
+        let mut timeline = Vec::new();
+        for cycle in 1..=end {
+            ctx.sleep_until(Cycles(cycle));
+            if let Some(&(_, clock)) = changes.iter().find(|&&(at, _)| at == cycle) {
+                uart.clock_changing(ctx);
+                ctx.set_clock(clock);
+                uart.clock_changed(ctx);
+            }
+            while ctx.take_due().is_some() {
+                uart.wake(ctx);
+            }
+            if taken_every.is_some_and(|every| cycle % every == 0) {
+                uart.take_tx(ctx);
+            }
+            timeline.push((uart.rx.len(), ctx.sources()));
+        }
+        timeline
+    }
+
+    #[test]
+    fn a_byte_and_a_timeout_on_the_apb_clock_come_at_the_same_instants_whenever_the_uart_is_called()
+    {
+        // The APB clock goes from 20 to 40 MHz while `a` is on the line (its start bit at 0, its
+        // frame at 20 MHz: 27 775 cycles), then to 80 MHz while the timeout counts: 10 bit times
+        // at 80 MHz after the landing (34 718.75) is after the second change, at 33 000, and
+        // before the instant worked out at 40 MHz (41 662.5).
+        let changes = [
+            (10_000, crate::clock::CpuClock::new(4, 4)),
+            (33_000, crate::clock::CpuClock::new(2, 2)),
+        ];
+        let end = 45_000;
+        let called_only_when_asked = apb_timeline(&changes, end, None);
+        let landed = called_only_when_asked
+            .iter()
+            .position(|&(received, _)| received == 1)
+            .map(|index| index + 1);
+        assert_eq!(
+            landed,
+            Some(27_775),
+            "timed with the clock of its start bit"
+        );
+        let raised = called_only_when_asked
+            .iter()
+            .position(|&(_, sources)| sources != 0)
+            .map(|index| index + 1);
+        assert_eq!(
+            raised,
+            Some(34_719),
+            "the timeout at the rate of now, at its instant"
+        );
+        for every in [1, 7, 997] {
+            assert!(
+                apb_timeline(&changes, end, Some(every)) == called_only_when_asked,
+                "the console taken every {every} cycles"
+            );
+        }
     }
 
     #[test]

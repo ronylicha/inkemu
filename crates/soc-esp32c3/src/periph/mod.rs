@@ -480,6 +480,14 @@ impl Peripherals {
         periph
     }
 
+    /// The clocks are about to change: the devices that time with `APB_CLK` from the settings of
+    /// now come to now at the old rate first. The UARTs do; the timer groups keep their counts at
+    /// the rate they were set to, and [`Event::ClockChanged`] tells them after the change.
+    pub(crate) fn clock_changing(&mut self, ctx: &mut Ctx) {
+        self.uart0.clock_changing(ctx);
+        self.uart1.clock_changing(ctx);
+    }
+
     /// Calls the device an event is for: a wake-up whose time has come, or what another part of the
     /// machine has to tell it (ADR 0003).
     pub(crate) fn deliver(&mut self, ctx: &mut Ctx, event: Event) {
@@ -500,6 +508,8 @@ impl Peripherals {
             Event::ClockChanged => {
                 self.timg0.clock_changed(ctx);
                 self.timg1.clock_changed(ctx);
+                self.uart0.clock_changed(ctx);
+                self.uart1.clock_changed(ctx);
             }
             Event::Uart(0) => self.uart0.wake(ctx),
             Event::Uart(_) => self.uart1.wake(ctx),
@@ -1201,6 +1211,64 @@ mod tests {
             Some(0),
             "and group 0 is another device"
         );
+    }
+
+    #[test]
+    fn a_uart_on_the_apb_clock_raises_its_timeout_at_the_instant_the_new_rate_gives() {
+        // A UART counts APB_CLK, 20 MHz at power-on: `a`, sent at 0, lands at 55 520 even though
+        // the clock goes to 40 MHz at 30 000, with the byte on the line. 10 bit times later is
+        // 83 280 at 40 MHz; at 60 000 the clock goes to 80 MHz, and the timeout comes 10 bit times
+        // at 80 MHz after the landing, at 69 400. Nothing calls the UART but its wake-ups and the
+        // changes of the clocks.
+        use emu_core::Cycles;
+        let svd = svd_regs::esp32c3::addr;
+        let deliver_until = |p: &mut Peripherals, ctx: &mut Ctx, instant: u64| {
+            ctx.sleep_until(Cycles(instant));
+            while let Some(event) = ctx.take_due() {
+                p.deliver(ctx, event);
+            }
+        };
+        for (uart, source) in [("UART0", 21), ("UART1", 22)] {
+            let ctx = &mut Ctx::default();
+            let mut p = peripherals(ctx);
+            write(&mut p, ctx, svd(uart, "CLK_CONF"), 0x0350_0000);
+            write(&mut p, ctx, svd(uart, "MEM_CONF"), 0x000A_0012);
+            write(&mut p, ctx, svd(uart, "CONF1"), 0x0020_C078);
+            write(&mut p, ctx, svd(uart, "INT_ENA"), 1 << 8);
+            let receiver = if source == 21 {
+                &mut p.uart0
+            } else {
+                &mut p.uart1
+            };
+            receiver.receive(ctx, Cycles::ZERO, b"a");
+            let pending = |p: &Peripherals| {
+                if source == 21 {
+                    p.uart0.host_pending()
+                } else {
+                    p.uart1.host_pending()
+                }
+            };
+            for (instant, apb_period) in [(30_000, 4), (60_000, 2)] {
+                deliver_until(&mut p, ctx, instant);
+                p.clock_changing(ctx);
+                ctx.set_clock(crate::clock::CpuClock::new(apb_period, apb_period));
+                p.deliver(ctx, Event::ClockChanged);
+                if instant == 30_000 {
+                    deliver_until(&mut p, ctx, 55_519);
+                    assert_eq!(pending(&p), 1, "{uart}: on the line");
+                    deliver_until(&mut p, ctx, 55_520);
+                    assert_eq!(pending(&p), 0, "{uart}: landed");
+                }
+            }
+            deliver_until(&mut p, ctx, 69_399);
+            assert_eq!(ctx.sources() & 1 << source, 0, "{uart}");
+            deliver_until(&mut p, ctx, 69_400);
+            assert_eq!(
+                ctx.sources() & 1 << source,
+                1 << source,
+                "{uart}: RXFIFO_TOUT"
+            );
+        }
     }
 
     #[test]

@@ -487,6 +487,8 @@ impl Esp32C3 {
         let (sysclk_conf, cpu_per_conf) = self.bus.periph.system.clock_registers();
         match clock::cpu_clock(sysclk_conf, cpu_per_conf) {
             Some(selected) => {
+                // The devices that time with APB_CLK come to now at the old rate first.
+                self.bus.periph.clock_changing(&mut self.bus.ctx);
                 self.bus.ctx.set_clock(selected);
                 // The devices that count APB cycles go on at the new rate.
                 self.bus.deliver(Event::ClockChanged);
@@ -802,7 +804,7 @@ mod tests {
         HANG, T0, T1, flash_erase_sector, flash_program, flat_rom, load_register,
         print_program as print, stop_watchdogs, store_register, unmodeled_register, within,
     };
-    use cpu_rv32::asm::{addi, beq, csrrs, csrrwi, jal, lbu, lui, lw, sw, wfi};
+    use cpu_rv32::asm::{addi, beq, bne, csrrs, csrrwi, jal, lbu, lui, lw, sw, wfi};
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
     use emu_core::{AccessKind, AccessSize, Bus};
 
@@ -1389,6 +1391,64 @@ mod tests {
         for (slice, watched) in [(1, false), (997, false), (1, true), (1_000_000, true)] {
             assert_eq!(
                 echo_run(slice, watched),
+                whole,
+                "slice {slice}, watched {watched}"
+            );
+        }
+    }
+
+    /// UART0 counts `APB_CLK` (`SCLK_SEL` = 1, the source divider at 1): at the reset `CLKDIV`
+    /// and 20 MHz a byte takes 55 520 cycles. The host sends `a` at 2 000; about 400 loops later,
+    /// with the byte on the line, the firmware moves the CPU and APB to the undivided crystal,
+    /// 40 MHz, then echoes what it receives. Run to 2 ms in calls of `slice` cycles.
+    fn apb_echo_run(slice: u64, watched: bool) -> EchoRun {
+        const T2: u8 = 7;
+        let clk_conf = svd_regs::esp32c3::addr("UART0", "CLK_CONF");
+        let mut program = store_register(clk_conf, 0x0350_0000).to_vec();
+        program.extend([addi(T2, 0, 400), addi(T2, T2, -1), bne(T2, 0, -4)]);
+        program.extend(store(SYSCLK_CONF, 0));
+        program.extend(echo_uart0());
+        let mut m = machine_with(
+            &program,
+            SocConfig {
+                trace_hash: true,
+                ..SocConfig::default()
+            },
+        );
+        m.watch_console(ConsoleChannel::Uart0, watched);
+        m.send_console(ConsoleChannel::Uart0, Cycles(2_000), b"a")
+            .unwrap();
+        let mut uart0 = Vec::new();
+        loop {
+            let stop = m.run_within(m.cycles() + slice, Some(2_000_000));
+            uart0.extend(m.take_console(ConsoleChannel::Uart0));
+            match stop {
+                StopReason::TimeBudget => break,
+                StopReason::CycleBudget | StopReason::Asleep | StopReason::ConsoleOutput => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(m.cpu_frequency().hz(), 40_000_000);
+        let trace = m.trace_hash();
+        (
+            uart0,
+            Vec::new(),
+            trace,
+            m.device_time(),
+            m.cycles(),
+            m.instructions(),
+        )
+    }
+
+    #[test]
+    fn a_byte_on_the_apb_clock_lands_the_same_whatever_the_calls_when_the_clock_changes_under_it() {
+        // The byte is timed with the clock of its start bit, whether a call took the console
+        // before the change or not (ADR 0006).
+        let whole = apb_echo_run(u64::MAX, false);
+        assert_eq!(whole.0, b"a");
+        for (slice, watched) in [(1, false), (997, false), (7_919, true)] {
+            assert_eq!(
+                apb_echo_run(slice, watched),
                 whole,
                 "slice {slice}, watched {watched}"
             );
