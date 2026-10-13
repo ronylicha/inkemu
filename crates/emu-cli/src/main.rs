@@ -78,11 +78,11 @@ enum Command {
         #[arg(long, value_name = "FILE", requires = "firmware")]
         bootloader: Option<PathBuf>,
         /// Keep the flash of the device in this file from one run to the next: a raw image of
-        /// exactly the size of the flash. A run starts from the file when it exists (--flash is
-        /// then refused unless --reset-flash is given) and writes it when it ends: at a limit,
-        /// at the first Ctrl-C, at a --strict-mmio stop, when the CPU waits for ever. The file
-        /// is replaced in one step, never written while the run goes on, so a run that is
-        /// killed leaves the file of before. The new content goes through a temporary file
+        /// exactly the size of the flash. A run starts from the file when it exists (--flash or
+        /// --firmware is then refused unless --reset-flash is given) and writes it when it ends:
+        /// at a limit, at the first Ctrl-C, at a --strict-mmio stop, when the CPU waits for ever.
+        /// The file is replaced in one step, never written while the run goes on, so a run that
+        /// is killed leaves the file of before. The new content goes through a temporary file
         /// beside it (.FILE.tmp, the name of FILE after a dot): what is found at that name (an
         /// interrupted save leaves its file there) is removed by the next run that starts, and
         /// by the save, which say so. A lock file

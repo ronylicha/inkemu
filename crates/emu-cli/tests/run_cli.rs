@@ -3355,6 +3355,36 @@ fn run_help_documents_the_firmware_and_the_bootloader() {
     }
 }
 
+/// The help says that a flash file that exists refuses `--firmware` as it refuses `--flash`, and
+/// the README shows the help as the binary prints it (white space aside: the help is wrapped to
+/// the terminal).
+#[test]
+fn the_readme_shows_run_help_as_the_binary_prints_it() {
+    fn words(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    let help = inkemu().args(["run", "--help"]).assert().success();
+    let help = words(&String::from_utf8_lossy(&help.get_output().stdout));
+    assert!(
+        help.contains(
+            "A run starts from the file when it exists (--flash or --firmware is then refused unless --reset-flash is given)"
+        ),
+        "{help}"
+    );
+    let readme = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+    )
+    .unwrap();
+    let after = readme
+        .split_once(
+            "The options and the exit codes, as `inkemu run --help` prints them:\n\n```text\n",
+        )
+        .unwrap_or_else(|| panic!("no help block in the README"))
+        .1;
+    let block = after.split_once("\n```").unwrap().0;
+    assert_eq!(words(block), help);
+}
+
 /// `hello_world.bin` and `nvs_rw_value_cxx.bin`, the application images the reference build
 /// merges at 0x10000 (`tools/reference-firmware/SHA256SUMS.inputs`, `SHA256SUMS.inputs-nvs`).
 const HELLO_APPLICATION_SHA256: &str =
