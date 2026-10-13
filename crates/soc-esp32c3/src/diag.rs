@@ -108,6 +108,16 @@ pub enum UartFeature {
     FifoSize,
     /// `RS485_CONF` other than 0.
     Rs485,
+    /// `CONF0.TX_FLOW_EN`: the transmitter waits while CTS is inactive.
+    TxFlowControl,
+    /// `CONF1.RX_FLOW_EN`: RTS holds the host while the receive FIFO is above `RX_FLOW_THRHD`.
+    RxFlowControl,
+    /// `CONF0.TXD_INV`: the transmit line is inverted.
+    InvertedTx,
+    /// `CONF0.IRDA_EN`: infrared framing.
+    Irda,
+    /// `CONF0.TXD_BRK`: a break is sent after the data.
+    TxBreak,
 }
 
 impl UartFeature {
@@ -144,6 +154,31 @@ impl UartFeature {
                 "RS485_CONF other than 0",
                 "to RS485 mode",
                 "it sends and receives as a plain UART; write RS485_CONF = 0",
+            ),
+            UartFeature::TxFlowControl => (
+                "CONF0.TX_FLOW_EN",
+                "to hold its transmitter while CTS is inactive",
+                "its bytes leave whatever CTS says; clear CONF0.TX_FLOW_EN",
+            ),
+            UartFeature::RxFlowControl => (
+                "CONF1.RX_FLOW_EN",
+                "to hold the host with RTS while its receive FIFO fills",
+                "the host sends at its own pace and a full FIFO drops what comes; clear CONF1.RX_FLOW_EN and read the FIFO in time",
+            ),
+            UartFeature::InvertedTx => (
+                "CONF0.TXD_INV",
+                "to invert its transmit line",
+                "the host receives its bytes as they were written; clear CONF0.TXD_INV",
+            ),
+            UartFeature::Irda => (
+                "CONF0.IRDA_EN",
+                "to IrDA mode",
+                "it sends and receives plain UART frames; clear CONF0.IRDA_EN",
+            ),
+            UartFeature::TxBreak => (
+                "CONF0.TXD_BRK",
+                "to send a break after its data",
+                "no break is sent and the line stays idle; clear CONF0.TXD_BRK",
             ),
         }
     }
@@ -1303,50 +1338,63 @@ mod tests {
     }
 
     #[test]
-    fn the_refusals_of_the_serial_ports_state_the_cause_then_the_remedy() {
+    fn the_refused_uart_modes_state_the_cause_then_the_remedy() {
         let texts = [
             (
-                Unsupported::UartFeature {
-                    uart: 1,
-                    feature: UartFeature::Loopback,
-                },
+                1,
+                UartFeature::Loopback,
                 "UART1 was set to loop its transmitter back to its receiver (CONF0.LOOPBACK, pc 0x40381000), which inkemu does not model",
             ),
+            (0, UartFeature::InvertedRx, "(CONF0.RXD_INV, pc 0x40381000)"),
             (
-                Unsupported::UartFeature {
-                    uart: 0,
-                    feature: UartFeature::InvertedRx,
-                },
-                "(CONF0.RXD_INV, pc 0x40381000)",
-            ),
-            (
-                Unsupported::UartFeature {
-                    uart: 0,
-                    feature: UartFeature::Autobaud,
-                },
+                0,
+                UartFeature::Autobaud,
                 "(CONF0.AUTOBAUD_EN, pc 0x40381000)",
             ),
             (
-                Unsupported::UartFeature {
-                    uart: 0,
-                    feature: UartFeature::NoStopBit,
-                },
+                0,
+                UartFeature::NoStopBit,
                 "(CONF0.STOP_BIT_NUM = 0, pc 0x40381000)",
             ),
             (
-                Unsupported::UartFeature {
-                    uart: 0,
-                    feature: UartFeature::FifoSize,
-                },
+                0,
+                UartFeature::FifoSize,
                 "(MEM_CONF.RX_SIZE or TX_SIZE other than 1, pc 0x40381000)",
             ),
             (
-                Unsupported::UartFeature {
-                    uart: 0,
-                    feature: UartFeature::Rs485,
-                },
+                0,
+                UartFeature::Rs485,
                 "UART0 was set to RS485 mode (RS485_CONF other than 0, pc 0x40381000)",
             ),
+            (
+                0,
+                UartFeature::TxFlowControl,
+                "(CONF0.TX_FLOW_EN, pc 0x40381000)",
+            ),
+            (
+                1,
+                UartFeature::RxFlowControl,
+                "UART1 was set to hold the host with RTS while its receive FIFO fills (CONF1.RX_FLOW_EN, pc 0x40381000)",
+            ),
+            (0, UartFeature::InvertedTx, "(CONF0.TXD_INV, pc 0x40381000)"),
+            (
+                0,
+                UartFeature::Irda,
+                "UART0 was set to IrDA mode (CONF0.IRDA_EN, pc 0x40381000)",
+            ),
+            (0, UartFeature::TxBreak, "(CONF0.TXD_BRK, pc 0x40381000)"),
+        ];
+        for (uart, feature, needle) in texts {
+            assert_cause_then_remedy(
+                &unsupported(Unsupported::UartFeature { uart, feature }),
+                needle,
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusals_of_the_serial_ports_state_the_cause_then_the_remedy() {
+        let texts = [
             (
                 Unsupported::UartReceiveClock {
                     uart: 1,

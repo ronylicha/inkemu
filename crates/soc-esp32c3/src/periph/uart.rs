@@ -126,12 +126,26 @@ const PARITY_EN: u32 = 1 << 1;
 const BIT_NUM_SHIFT: u32 = 2;
 const STOP_BIT_NUM_SHIFT: u32 = 4;
 const TWO_BITS: u32 = 0b11;
-/// The modes of `CONF0` the model refuses by name when they are set (report UR §10).
-const CONF0_REFUSED: [(u32, UartFeature); 3] = [
+/// The modes of `CONF0` the model refuses by name when they are set: loopback, an inverted
+/// receive line and autobaud (report UR §10); and what would change the bytes on the line or
+/// their timing: CTS flow control, an inverted transmit line, infrared framing, a break after the
+/// data. Bit
+/// positions from `UART_*_S` in `IDF:components/soc/esp32c3/register/soc/uart_reg.h` (ESP-IDF
+/// v5.5.2). ESP-IDF writes the last four as 0 unless asked for them (`uart_ll_set_hw_flow_ctrl`,
+/// `uart_ll_inverse_signal`, `uart_ll_set_mode_normal`, `uart_ll_tx_break`,
+/// `IDF:components/hal/esp32c3/include/hal/uart_ll.h`), and every console uses no flow control.
+const CONF0_REFUSED: [(u32, UartFeature); 7] = [
+    (1 << 8, UartFeature::TxBreak),
     (1 << 14, UartFeature::Loopback),
+    (1 << 15, UartFeature::TxFlowControl),
+    (1 << 16, UartFeature::Irda),
     (1 << 19, UartFeature::InvertedRx),
+    (1 << 22, UartFeature::InvertedTx),
     (1 << 27, UartFeature::Autobaud),
 ];
+/// `CONF1` bit 20 `RX_FLOW_EN`: RTS flow control of the receiver, refused by name when set (the
+/// host of the model sends at its own pace; `UART_RX_FLOW_EN_S`, `uart_reg.h`).
+const RX_FLOW_EN: u32 = 1 << 20;
 /// Device time is kept in thirty-seconds of a time-base cycle here: a bit lasts a whole number of
 /// sixteenths (the fraction of `CLKDIV`), and a frame may end on half a bit (1.5 stop bits).
 const SUBCYCLES: u64 = 32;
@@ -760,6 +774,15 @@ impl Peripheral<Ctx> for Uart {
                     self.rx.clear();
                 }
                 self.refuse_modes(ctx, value);
+                self.config.write(offset, value)
+            }
+            CONF1 => {
+                if value & RX_FLOW_EN != 0 {
+                    ctx.unsupported(Unsupported::UartFeature {
+                        uart: self.index,
+                        feature: UartFeature::RxFlowControl,
+                    });
+                }
                 self.config.write(offset, value)
             }
             MEM_CONF => {
@@ -1919,6 +1942,44 @@ mod tests {
             assert!(uart.write(ctx, CONF0, 0x0400_001C));
             assert_eq!(ctx.take_unsupported(), None, "cleared: nothing to refuse");
         }
+    }
+
+    #[test]
+    fn flow_control_an_inverted_transmit_line_irda_and_a_break_are_refused_by_name() {
+        // They would change what the host sees or when: refused when set, stored all the same.
+        for (bits, feature) in [
+            (1 << 8, UartFeature::TxBreak),
+            (1 << 15, UartFeature::TxFlowControl),
+            (1 << 16, UartFeature::Irda),
+            (1 << 22, UartFeature::InvertedTx),
+        ] {
+            let ctx = &mut Ctx::default();
+            let mut uart = Uart::new(0, UART0);
+            assert!(uart.write(ctx, CONF0, 0x0400_001C | bits));
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::UartFeature { uart: 0, feature })
+            );
+            assert_eq!(uart.read(ctx, CONF0), Some(0x0400_001C | bits));
+            assert!(uart.write(ctx, CONF0, 0x0400_001C));
+            assert_eq!(ctx.take_unsupported(), None, "cleared: nothing to refuse");
+        }
+        let ctx = &mut Ctx::default();
+        let mut uart = Uart::new(1, UART1);
+        assert!(uart.write(ctx, CONF1, 0x0020_C078 | RX_FLOW_EN));
+        assert_eq!(
+            ctx.take_unsupported(),
+            Some(Unsupported::UartFeature {
+                uart: 1,
+                feature: UartFeature::RxFlowControl
+            })
+        );
+        assert_eq!(uart.read(ctx, CONF1), Some(0x0020_C078 | RX_FLOW_EN));
+        assert!(
+            uart.write(ctx, CONF1, 0x0020_C078),
+            "what the driver writes"
+        );
+        assert_eq!(ctx.take_unsupported(), None);
     }
 
     #[test]
