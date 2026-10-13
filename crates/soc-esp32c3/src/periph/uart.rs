@@ -194,8 +194,9 @@ pub struct Uart {
     /// dated no later than the run before it joins that run: its bytes follow the run's anyway.
     /// So an input costs a run only when it is dated later, at most one per byte of `host`.
     host_runs: VecDeque<(u64, usize)>,
-    /// The byte on the line: the instant its frame ends, when it lands, and the byte.
-    receiving: Option<(u64, u8)>,
+    /// The byte on the line: the instant its frame ends, when it lands, the byte, and the
+    /// `SCLK_SEL` without a frequency in the model its frame was timed with, if it was.
+    receiving: Option<(u64, u8, Option<u32>)>,
     /// When the line is free for the next byte: the end of the last frame that started.
     line_free_at: u64,
     /// The receive FIFO.
@@ -203,7 +204,7 @@ pub struct Uart {
     /// `INT_RAW`.
     int_raw: u32,
     /// The instant the last byte landed, while the receive timeout of that idle period has not
-    /// come: `None` once it came, and from the start bit of the next byte to its landing.
+    /// come: `None` once it came, and from a start bit the receiver hears to its landing.
     idle_since: Option<u64>,
     /// The call at the next instant the device has something to do: a byte of its transmitter
     /// leaves (so that a CPU that waits for an interrupt with bytes on their way out sleeps
@@ -273,6 +274,10 @@ impl Uart {
         self.rx.clear();
         self.int_raw = 0;
         self.idle_since = None;
+        // The FIFO is empty and the idle period closed: nothing of what a clock the model lacks
+        // timed is left to show. The byte on the line, if that clock timed it, is refused when it
+        // lands (`take_next_on_the_line`).
+        self.rx_mistimed = None;
         self.assert_levels();
         self.drive(ctx);
         self.arm(ctx);
@@ -413,7 +418,7 @@ impl Uart {
     /// change of the clocks, and each brings the UART to now first (`write`,
     /// [`Uart::clock_changing`]).
     fn next_landing(&self, ctx: &Ctx) -> Option<u64> {
-        if let Some((lands_at, _)) = self.receiving {
+        if let Some((lands_at, _, _)) = self.receiving {
             return Some(lands_at);
         }
         let (date, _) = self.next_host_byte()?;
@@ -473,10 +478,10 @@ impl Uart {
             self.int_raw |= TX_DONE;
         }
         // INVARIANT: a pass that does not end the loop ends the timeout of an idle period, which
-        // only the one open now or a landing opens, or lands a byte (it may start it too): at
-        // most two passes per byte of the host, on the line or not, and two more. The bytes are
-        // those the caller handed over within its bound (`host_pending`). A pass that ran out
-        // would leave the device behind now: a test fails on it instead of hanging.
+        // only the one open now or a landing opens, or lands a byte (either may start a byte
+        // too): at most two passes per byte of the host, on the line or not, and two more. The
+        // bytes are those the caller handed over within its bound (`host_pending`). A pass that
+        // ran out would leave the device behind now: a test fails on it instead of hanging.
         let passes = 2 * self.host_pending() + 2;
         let settled = (0..passes).any(|_| !self.take_next_on_the_line(ctx, now));
         debug_assert!(settled, "UART{} not settled in {passes} passes", self.index);
@@ -487,8 +492,8 @@ impl Uart {
     /// Takes the first thing due on the receive line by `now`, in the order of their instants:
     /// the receive timeout, a start bit, a landing. Returns whether there may be another.
     fn take_next_on_the_line(&mut self, ctx: &mut Ctx, now: u64) -> bool {
-        let timeout = self.timeout_at(ctx).filter(|&at| at <= now);
         if self.receiving.is_none() {
+            let timeout = self.timeout_at(ctx).filter(|&at| at <= now);
             let Some((date, byte)) = self.next_host_byte() else {
                 if timeout.is_some() {
                     self.time_out();
@@ -511,28 +516,50 @@ impl Uart {
             // ASSUMPTION: as a byte sent keeps the duration it was given (`send`), a byte
             // received keeps the bit time of its start bit; a later change of the rate applies
             // to the bytes that start after it. A logic-analyser capture of a byte received
-            // while `CLKDIV` is rewritten settles it. A start bit ends the idle line: the timeout
-            // it put off is not asked for again (`arm`), and the landing starts the count again.
+            // while `CLKDIV` is rewritten settles it. A start bit the receiver hears ends the
+            // idle line: the timeout it put off is not asked for again (`arm`), and the landing
+            // starts the count again. One it does not hear, its clock off, ends nothing (`land`).
             let lands_at = starts_at.saturating_add(self.byte_time(self.source_period(ctx)));
-            if let Some(sclk_sel) = self.unmodelled_source() {
-                self.rx_mistimed = Some(sclk_sel);
+            let timed_on = self.unmodelled_source();
+            if self.receiver_clock_on() {
+                if let Some(sclk_sel) = timed_on {
+                    self.rx_mistimed = Some(sclk_sel);
+                }
+                self.idle_since = None;
             }
             self.pop_host_byte();
-            self.receiving = Some((lands_at, byte));
+            self.receiving = Some((lands_at, byte, timed_on));
             self.line_free_at = lands_at;
-            self.idle_since = None;
         }
-        match self.receiving {
-            Some((lands_at, byte)) if lands_at <= now => {
-                self.receiving = None;
-                // A receiver whose clock is off counts no idle line (`land`).
-                if self.land(ctx, byte) {
-                    self.idle_since = Some(lands_at);
-                }
-                true
+        let Some((lands_at, byte, timed_on)) = self.receiving else {
+            return false;
+        };
+        // The idle period is still open only when the receiver did not hear the start bit: its
+        // timeout comes at its instant, the byte on the line or not.
+        if self
+            .timeout_at(ctx)
+            .is_some_and(|at| at <= now && at <= lands_at)
+        {
+            self.time_out();
+            return true;
+        }
+        if lands_at > now {
+            return false;
+        }
+        self.receiving = None;
+        // A receiver whose clock is off counts no idle line, and shows nothing of the byte.
+        if self.land(ctx, byte) {
+            self.idle_since = Some(lands_at);
+            if let Some(sclk_sel) = timed_on {
+                self.rx_mistimed = Some(sclk_sel);
             }
-            _ => false,
         }
+        true
+    }
+
+    /// `CLK_CONF.RX_SCLK_EN`: the receiver's clock runs.
+    fn receiver_clock_on(&self) -> bool {
+        self.config.read(CLK_CONF).unwrap_or(0) & RX_SCLK_EN != 0
     }
 
     /// The receive timeout came: it is raised when it is enabled and the FIFO holds data, and
@@ -618,19 +645,19 @@ impl Uart {
     /// during its boot, and 200 bytes sent to a FIFO nobody reads, settle them.
     ///
     /// ASSUMPTION: the receive timeout is counted with the receiver's clock: a byte lost because
-    /// that clock is off starts no idle period, and a timeout that comes while it is off is not
-    /// raised (`time_out`); a byte the FIFO reset or a full FIFO drops was heard, and starts one.
+    /// that clock is off starts no idle period, a start bit that comes while it is off ends none
+    /// (its timeout comes at its instant, the byte on the line or not), and a timeout that comes
+    /// while it is off is not raised (`time_out`); a byte the FIFO reset or a full FIFO drops was
+    /// heard, and starts one.
     /// No source says; ESP-IDF v5.5.2 clears `RX_SCLK_EN` only when it deletes a driver
     /// (`uart_ll_sclk_disable`, `IDF:components/esp_driver_uart/src/uart.c:295`). Bytes sent to
     /// a chip whose receiver clock is gated with data in its FIFO and the timeout enabled settle
     /// it.
     fn land(&mut self, ctx: &mut Ctx, byte: u8) -> bool {
-        let clk_conf = self.config.read(CLK_CONF).unwrap_or(0);
-        let conf0 = self.config.read(CONF0).unwrap_or(0);
-        if clk_conf & RX_SCLK_EN == 0 {
+        if !self.receiver_clock_on() {
             return false;
         }
-        if conf0 & RXFIFO_RST != 0 {
+        if self.config.read(CONF0).unwrap_or(0) & RXFIFO_RST != 0 {
             return true;
         }
         if self.rx.len() >= FIFO_BYTES {
@@ -1663,6 +1690,65 @@ mod tests {
     }
 
     #[test]
+    fn a_byte_whose_start_bit_comes_with_the_receiver_clock_off_ends_no_idle_period() {
+        let receiver_off = CLK_CONF_XTAL & !RX_SCLK_EN;
+        // `1` lands and opens an idle period whose timeout comes 100 bit times later. The clock
+        // goes off a bit time after the landing, `2` starts a bit time after that, nobody hears
+        // it, and it is lost; the clock comes back after it: the timeout comes at its instant.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        uart.receive(ctx, Cycles::ZERO, b"1");
+        run_to(ctx, &mut uart, gone_after(22));
+        uart.write(ctx, CLK_CONF, receiver_off);
+        uart.receive(ctx, gone_after(24), b"2");
+        run_to(ctx, &mut uart, gone_after(50));
+        uart.write(ctx, CLK_CONF, CLK_CONF_XTAL);
+        run_to(ctx, &mut uart, Cycles(timed_out_after(1).get() - 1));
+        assert_eq!(ctx.sources(), 0);
+        run_to(ctx, &mut uart, timed_out_after(1));
+        assert_eq!(
+            ctx.sources(),
+            1 << 21,
+            "the timeout of the idle period of `1`"
+        );
+        assert_eq!(rx_count(ctx, &mut uart), 1, "`2` was lost");
+        // The same, `2` still on the line when the timeout comes, the clock back before it: the
+        // timeout comes at its instant, not when `2` lands, and `2` lands in the FIFO after it.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        uart.receive(ctx, Cycles::ZERO, b"1");
+        run_to(ctx, &mut uart, gone_after(205));
+        uart.write(ctx, CLK_CONF, receiver_off);
+        uart.receive(ctx, gone_after(210), b"2");
+        run_to(ctx, &mut uart, gone_after(215));
+        uart.write(ctx, CLK_CONF, CLK_CONF_XTAL);
+        run_to(ctx, &mut uart, Cycles(timed_out_after(1).get() - 1));
+        assert_eq!(ctx.sources(), 0);
+        run_to(ctx, &mut uart, timed_out_after(1));
+        assert_eq!(
+            ctx.sources(),
+            1 << 21,
+            "the timeout comes with `2` on the line"
+        );
+        assert_eq!(rx_count(ctx, &mut uart), 1);
+        run_to(ctx, &mut uart, gone_after(231));
+        assert_eq!(rx_count(ctx, &mut uart), 2, "`2` landed with the clock on");
+        // `2` lands at the very instant of the timeout, 220 half bits: the timeout comes first,
+        // as it does before a start bit at its instant; the landing then opens the next period.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        uart.receive(ctx, Cycles::ZERO, b"1");
+        run_to(ctx, &mut uart, gone_after(195));
+        uart.write(ctx, CLK_CONF, receiver_off);
+        uart.receive(ctx, gone_after(200), b"2");
+        run_to(ctx, &mut uart, gone_after(210));
+        uart.write(ctx, CLK_CONF, CLK_CONF_XTAL);
+        run_to(ctx, &mut uart, timed_out_after(1));
+        assert_eq!(ctx.sources(), 1 << 21, "the timeout, then the landing");
+        assert_eq!(rx_count(ctx, &mut uart), 2);
+    }
+
+    #[test]
     fn the_receive_fifo_reset_empties_the_fifo() {
         // `uart_param_config` pulses it (UR §3.3).
         let ctx = &mut Ctx::default();
@@ -1962,6 +2048,63 @@ mod tests {
             uart.read(ctx, timeout_read);
             assert_eq!(ctx.take_unsupported(), refused, "the timeout read");
         }
+    }
+
+    #[test]
+    fn a_reset_forgets_what_the_receiver_showed_on_a_clock_the_model_lacks_and_not_the_byte_on_the_line()
+     {
+        let refused = Some(Unsupported::UartReceiveClock {
+            uart: 0,
+            sclk_sel: 2,
+        });
+        // `a` landed, timed with the crystal for the RC fast clock, and nobody read it; a reset
+        // empties the FIFO and the next owner of the UART (the ROM, after a core reset) reads a
+        // receiver that shows nothing of it.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        select_source(ctx, &mut uart, 2);
+        uart.receive(ctx, Cycles::ZERO, b"a");
+        run_to(ctx, &mut uart, landed(1));
+        uart.reset(ctx);
+        assert_eq!(rx_count(ctx, &mut uart), 0);
+        assert_eq!(ctx.take_unsupported(), None, "nothing mistimed is shown");
+        // `b` is on the line at the reset: it lands after it with the duration its start bit
+        // gave it, and its read is refused.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        select_source(ctx, &mut uart, 2);
+        uart.receive(ctx, Cycles::ZERO, b"b");
+        run_to(ctx, &mut uart, gone_after(10));
+        uart.reset(ctx);
+        assert_eq!(ctx.take_unsupported(), None, "not looked at yet");
+        run_to(ctx, &mut uart, landed(1));
+        assert_eq!(rx_count(ctx, &mut uart), 1);
+        assert_eq!(
+            ctx.take_unsupported(),
+            refused,
+            "the byte that landed after it"
+        );
+    }
+
+    #[test]
+    fn a_byte_nobody_hears_on_a_clock_the_model_lacks_is_not_refused() {
+        // The receiver's clock is off from before the start bit to after the landing: the byte
+        // is lost (`land`), and the firmware sees nothing of its duration.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        uart.write(
+            ctx,
+            CLK_CONF,
+            (CLK_CONF_XTAL & !RX_SCLK_EN & !(SCLK_SEL_MASK << SCLK_SEL_SHIFT))
+                | (2 << SCLK_SEL_SHIFT),
+        );
+        uart.receive(ctx, Cycles::ZERO, b"c");
+        run_to(ctx, &mut uart, gone_after(10));
+        assert_eq!(rx_count(ctx, &mut uart), 0);
+        assert_eq!(ctx.take_unsupported(), None, "on the line, not heard");
+        run_to(ctx, &mut uart, landed(1));
+        assert_eq!(rx_count(ctx, &mut uart), 0);
+        assert_eq!(ctx.take_unsupported(), None, "lost");
     }
 
     #[test]
