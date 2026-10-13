@@ -149,6 +149,10 @@ const RX_FLOW_EN: u32 = 1 << 20;
 /// Device time is kept in thirty-seconds of a time-base cycle here: a bit lasts a whole number of
 /// sixteenths (the fraction of `CLKDIV`), and a frame may end on half a bit (1.5 stop bits).
 const SUBCYCLES: u64 = 32;
+/// The last device time a byte of the host can be dated at: in thirty-seconds of a cycle, in a
+/// `u64`, it is `u64::MAX / 32` cycles, about 114 years at 160 MHz. A later date would saturate
+/// and the byte start before it, so the machine refuses it ([`Uart::receive`]).
+pub const LAST_INPUT_DATE: Cycles = Cycles(u64::MAX / SUBCYCLES);
 
 /// The length of a frame in half bit times: a start bit, the data bits, the parity bit, the stop
 /// bits (report UR §5.1, §6). `RS485_CONF.DL0_EN`/`DL1_EN` would each add a bit; the model
@@ -280,9 +284,11 @@ impl Uart {
         std::mem::take(&mut self.tx)
     }
 
-    /// The host sends `bytes`, the first starting at device time `at` (now or later), the others
-    /// right after it, and after the bytes it sent before. The caller bounds how many it hands
-    /// over ([`Uart::host_pending`]).
+    /// The host sends `bytes`, the first starting at device time `at` (now or later, and no later
+    /// than [`LAST_INPUT_DATE`]), the others right after it, and after the bytes it sent before.
+    /// The caller bounds how many it hands over ([`Uart::host_pending`]) and their date. Past the
+    /// last date, the arithmetic of the line saturates there as device time does at its end
+    /// (`Ctx::schedule`): the bytes that the line would end after it land at it.
     ///
     /// ASSUMPTION: the host sends at the baud rate and in the frame the UART is set to, as a
     /// terminal set to match it does; a host at another rate would give framing errors, which the

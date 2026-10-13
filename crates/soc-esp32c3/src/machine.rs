@@ -81,6 +81,16 @@ pub enum InputError {
         channel: ConsoleChannel,
         pending: usize,
     },
+    /// The input is dated after the last instant a UART times its line at.
+    #[error(
+        "{channel} cannot take an input dated {at_nanos} ns of device time: a UART times its line up to {last_nanos} ns; date it at {last_nanos} ns or earlier",
+        channel = channel.name()
+    )]
+    BeyondTheLine {
+        channel: ConsoleChannel,
+        at_nanos: u64,
+        last_nanos: u64,
+    },
     /// The changes of the USB host still to come are as many as they may be.
     #[error(
         "{MAX_PENDING_HOST_CHANGES} changes of the USB host are still to come; give the next ones once the run has reached some"
@@ -593,6 +603,8 @@ impl Esp32C3 {
     ///
     /// # Errors
     /// [`InputError::InThePast`] when `at` is before [`Esp32C3::device_time`];
+    /// [`InputError::BeyondTheLine`] when a UART is given a date after
+    /// [`crate::periph::uart::LAST_INPUT_DATE`], about 114 years of device time;
     /// [`InputError::TooMuchPending`] when the channel would hold more than
     /// [`MAX_PENDING_HOST_BYTES`] bytes of the host the firmware has not read. Nothing is sent
     /// then.
@@ -603,6 +615,13 @@ impl Esp32C3 {
         bytes: &[u8],
     ) -> Result<(), InputError> {
         self.check_date(at)?;
+        if channel != ConsoleChannel::UsbSerialJtag && at > crate::periph::uart::LAST_INPUT_DATE {
+            return Err(InputError::BeyondTheLine {
+                channel,
+                at_nanos: clock::TIME_BASE.cycles_to_nanos(at),
+                last_nanos: clock::TIME_BASE.cycles_to_nanos(crate::periph::uart::LAST_INPUT_DATE),
+            });
+        }
         let pending = self
             .input_pending(channel)
             .saturating_add(bytes.len().max(1));
@@ -1226,6 +1245,45 @@ mod tests {
         .to_string();
         assert!(
             message.ends_with("; date it at 10 ns or later"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_input_dated_after_the_last_instant_a_uart_times_is_refused_and_changes_nothing() {
+        // A UART times its line in thirty-seconds of a cycle: a later date would saturate, and
+        // the byte would start before it.
+        use crate::periph::uart::LAST_INPUT_DATE;
+        let mut m = machine(&echo_uart0());
+        let last_nanos = clock::TIME_BASE.cycles_to_nanos(LAST_INPUT_DATE);
+        for channel in [ConsoleChannel::Uart0, ConsoleChannel::Uart1] {
+            let too_late = Cycles(LAST_INPUT_DATE.get() + 1);
+            assert_eq!(
+                m.send_console(channel, too_late, b"x"),
+                Err(InputError::BeyondTheLine {
+                    channel,
+                    at_nanos: clock::TIME_BASE.cycles_to_nanos(too_late),
+                    last_nanos,
+                })
+            );
+            assert_eq!(m.input_pending(channel), 0);
+            assert_eq!(m.send_console(channel, LAST_INPUT_DATE, b"x"), Ok(()));
+            assert_eq!(m.input_pending(channel), 1);
+        }
+        assert_eq!(
+            m.send_console(ConsoleChannel::UsbSerialJtag, Cycles(u64::MAX), b"x"),
+            Ok(()),
+            "USB-Serial-JTAG dates in whole cycles"
+        );
+        let message = InputError::BeyondTheLine {
+            channel: ConsoleChannel::Uart1,
+            at_nanos: 5,
+            last_nanos: 4,
+        }
+        .to_string();
+        assert!(
+            message.starts_with("uart1 cannot take an input dated 5 ns")
+                && message.ends_with("; date it at 4 ns or earlier"),
             "{message}"
         );
     }
