@@ -12,7 +12,9 @@ and checks the images against `SHA256SUMS.output`. The ESP-IDF version is `ESP_I
 | `flash_nvs.bin` | `examples/storage/nvs/nvs_rw_value_cxx`: it keeps a restart counter in NVS, prints it, and restarts every eleven seconds | the single-app table of the build | `SHA256SUMS.inputs-nvs` |
 | `flash_nvs_ota.bin` | the same application | `tests/fixtures/partitions/x4-stock.bin`, the stock table of the X4: `otadata` and two application slots, so the bootloader writes `otadata` on the first boot | `SHA256SUMS.inputs-nvs` |
 
-Nothing built here is committed and nothing is executed on the host: the images are data for inkemu.
+One artefact of this build is committed: its bootloader, the one inkemu ships, under
+`third_party/esp-idf-bootloader/` (the same bytes, checked by the CI). Nothing else built here is
+committed, and nothing is executed on the host: the images are data for inkemu.
 `bootloader.nm`, `hello_world.nm` and `nvs_rw_value_cxx.nm` are symbol tables (text) that turn a
 program counter printed by inkemu into a function name: the last symbol whose address is not above
 the PC.

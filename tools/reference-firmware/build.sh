@@ -5,7 +5,9 @@
 #   flash_nvs.bin      the nvs_rw_value_cxx example, which keeps a restart counter in NVS;
 #   flash_nvs_ota.bin  the same application under the stock partition table of the X4
 #                      (tests/fixtures/partitions/x4-stock.bin), whose bootloader writes otadata.
-# Everything third-party runs inside Docker, in one container run; nothing built here is committed.
+# Everything third-party runs inside Docker, in one container run. One artefact of this build is
+# committed: its bootloader, the one inkemu ships (third_party/esp-idf-bootloader/, the same bytes);
+# nothing else built here is.
 # The binaries and the merged images are checked against pinned SHA-256 values
 # (docs/research/sp1b-test-oracle.md, section 2; docs/research/esp-idf-storage-flash-traffic.md,
 # sections A and G): a mismatch stops the script.
