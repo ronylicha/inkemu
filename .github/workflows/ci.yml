@@ -22,9 +22,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       - run: cargo run -p svd-gen -- --check
-      # The model crates, and the crates a front end composes a flash with, do no host I/O and must
-      # go on building for `wasm32-unknown-unknown`, the target of the web version: nothing else
-      # would notice a host dependency slipping in.
+      # The model crates, and the crates a front end composes a flash with, must go on building for
+      # `wasm32-unknown-unknown`, the target of the web version: this step notices a crate that does
+      # not build there. It cannot notice host I/O, which std compiles there and fails at run time:
+      # the clippy step above refuses it in firmware, boards and soc-esp32c3 (their clippy.toml).
       - name: Build the model for WebAssembly
         run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3 -p firmware -p boards
       - uses: EmbarkStudios/cargo-deny-action@v2

@@ -391,6 +391,8 @@ mod tests {
     use super::*;
     use crate::chip::FlashSize;
 
+    // A test reads its fixture; the crate's code does no host I/O (`clippy.toml`).
+    #[allow(clippy::disallowed_methods)]
     fn golden() -> Vec<u8> {
         std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),

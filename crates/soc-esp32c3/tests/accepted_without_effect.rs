@@ -12,6 +12,9 @@ const MARKER: &str = "<!-- generated table -->";
 const BLESS: &str = "INKEMU_BLESS";
 
 #[test]
+// The test reads and, when blessed, rewrites a document; the crate's code does no host I/O
+// (`clippy.toml`).
+#[allow(clippy::disallowed_methods)]
 fn the_documented_table_is_the_one_the_code_builds() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DOCUMENT);
     let document = std::fs::read_to_string(&path)
