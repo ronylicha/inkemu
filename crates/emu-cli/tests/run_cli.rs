@@ -458,7 +458,11 @@ fn image_declaring_more_flash_than_the_device_is_refused() {
 fn an_application_image_given_as_flash_is_refused() {
     run_with_flash(&build_image(&ImageSpec::default()))
         .code(2)
-        .stderr(contains("no partition table at offset 0x8000").and(contains("merge_bin")));
+        .stderr(
+            contains("no partition table at offset 0x8000")
+                .and(contains("; use an application with --firmware"))
+                .and(contains("merge_bin")),
+        );
 }
 
 /// `inkemu run --device x4 --flash <path>` with an empty ROM directory: a refusal of the flash file
@@ -500,6 +504,102 @@ fn a_device_node_given_as_flash_is_refused_at_once() {
     run_with_flash_path("/dev/zero")
         .code(2)
         .stderr(contains("/dev/zero").and(contains("is not a regular file; use the path of")));
+}
+
+/// Runs `inkemu run --device x4 --max-cycles 1000 <args>` with an empty ROM directory, `pipe`
+/// being a named pipe among the files `args` gives, and tells whether the command opened the pipe.
+///
+/// Opening a pipe for reading waits for a writer that never comes: a command that opened it would
+/// wait for ever. No wall-clock limit decides the outcome. Between looks at whether the command
+/// ended, the test opens the pipe for writing without waiting (`O_NONBLOCK`), which the system
+/// refuses (`ENXIO`) while no reader holds it, and grants as soon as the command opened it to
+/// read, even while that open still waits. Each look ends in one of two outcomes the command
+/// decides: it ended, or it opened the pipe, and granting the write end lets its open return.
+/// [`HANG_LIMIT`] only turns a command that does neither into a failure.
+#[cfg(unix)]
+fn run_on_a_pipe(
+    pipe: &std::path::Path,
+    rom_dir: &std::path::Path,
+    args: &[&std::ffi::OsStr],
+) -> (bool, std::process::Output) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_inkemu"))
+        .args(["run", "--device", "x4", "--max-cycles", "1000", "--rom-dir"])
+        .arg(rom_dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + HANG_LIMIT;
+    let opened = loop {
+        if child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(pipe)
+        {
+            // A reader holds the pipe: the command opened it.
+            Ok(_writer) => break true,
+            Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ENXIO as i32) => {}
+            Err(e) => panic!("opening {} to write: {e}", pipe.display()),
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the command neither ended nor opened {}", pipe.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    if opened {
+        // Whatever it does next, its outcome is decided.
+        let _ = child.kill();
+    }
+    (opened, child.wait_with_output().unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pipe_given_as_flash_firmware_or_bootloader_is_refused_without_being_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = dir.path().join("pipe.bin");
+    make_fifo(&pipe);
+    let app = dir.path().join("app.bin");
+    std::fs::write(&app, build_image(&ImageSpec::default())).unwrap();
+    let rom_dir = dir.path().join("rom");
+    for (option, args) in [
+        (
+            "--flash",
+            vec![std::ffi::OsStr::new("--flash"), pipe.as_os_str()],
+        ),
+        (
+            "--firmware",
+            vec![std::ffi::OsStr::new("--firmware"), pipe.as_os_str()],
+        ),
+        (
+            "--bootloader",
+            vec![
+                std::ffi::OsStr::new("--firmware"),
+                app.as_os_str(),
+                std::ffi::OsStr::new("--bootloader"),
+                pipe.as_os_str(),
+            ],
+        ),
+    ] {
+        let (opened, output) = run_on_a_pipe(&pipe, &rom_dir, &args);
+        let log = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!opened, "{option}: the pipe was opened: {log}");
+        assert_eq!(output.status.code(), Some(2), "{option}: {log}");
+        assert!(
+            log.contains("pipe.bin")
+                && log.contains("is not a regular file")
+                && !log.contains(MISSING_ROM),
+            "{option}: {log}"
+        );
+    }
 }
 
 #[test]
@@ -1358,7 +1458,9 @@ fn a_flash_file_of_another_size_is_refused_before_boot_with_both_sizes_and_left_
                 .and(contains(format!("is {} bytes", image.len())))
                 .and(contains("16777216 bytes"))
                 .and(contains("never padded or cut"))
-                .and(contains("; use it with the device it was written for"))
+                .and(contains(
+                    "; use it with the device it was written for, pass a firmware image with --flash instead, or give a new path\n",
+                ))
                 .and(contains("esp32c3_rev3_rom.elf").not()),
         );
         assert_eq!(std::fs::read(&file).unwrap(), image);
@@ -2695,4 +2797,882 @@ fn the_nvs_reference_firmware_goes_on_counting_in_a_second_run_on_the_same_flash
     assert_eq!(third.sha256(FLASH_AT_START), NVS_AFTER_LIFE_2);
     assert_eq!(third.sha256(FLASH_AT_END), sha256_of(&file));
     assert_eq!(sha256_of(&image), NVS_IMAGE_SHA256, "--flash is only read");
+}
+
+/// `inkemu run --device x4 --firmware <application> [--bootloader <bootloader>] <more>` with a ROM
+/// directory that holds nothing: a refusal of what was given must come before any attempt to load
+/// a ROM.
+fn run_with_firmware(
+    application: &[u8],
+    bootloader: Option<&[u8]>,
+    more: &[&str],
+) -> assert_cmd::assert::Assert {
+    let dir = tempfile::tempdir().unwrap();
+    let firmware = dir.path().join("app.bin");
+    std::fs::write(&firmware, application).unwrap();
+    let mut command = inkemu();
+    command
+        .args(["run", "--device", "x4", "--max-cycles", "1000", "--rom-dir"])
+        .arg(dir.path().join("rom"))
+        .arg("--firmware")
+        .arg(&firmware);
+    if let Some(bytes) = bootloader {
+        let path = dir.path().join("bootloader.bin");
+        std::fs::write(&path, bytes).unwrap();
+        command.arg("--bootloader").arg(path);
+    }
+    command.args(more).timeout(HANG_LIMIT).assert()
+}
+
+/// What `run_with_firmware` must refuse before boot, each with its cause and its remedy.
+#[test]
+fn every_input_that_cannot_be_booted_from_an_application_is_refused_before_boot() {
+    use firmware::builder::{bootloader_spec, refresh_digest};
+    let app = build_image(&ImageSpec::default());
+    let bootloader = build_image(&bootloader_spec());
+    let mut xota = b"XOTA".to_vec();
+    xota.resize(512, 0);
+    let s3 = build_image(&ImageSpec {
+        chip: 9,
+        ..ImageSpec::default()
+    });
+    let mut corrupt = app.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 1;
+    // A data segment the size of the X4's slot, after the descriptor: the image is larger.
+    let mut too_large = ImageSpec::default();
+    too_large.segments.push((0x3C10_0000, vec![0; 0x64_0000]));
+    let too_large = build_image(&too_large);
+    let mut later_chip = bootloader.clone();
+    later_chip[15..17].copy_from_slice(&4u16.to_le_bytes());
+    refresh_digest(&mut later_chip);
+    for (case, application, given, cause, remedy) in [
+        (
+            "not an image",
+            vec![0u8; 64],
+            None,
+            "its first byte is 0x00, expected 0xe9",
+            "; use the plain application .bin",
+        ),
+        (
+            "an encrypted update",
+            xota,
+            None,
+            "is an encrypted OTA update (.xota)",
+            "; use the plain application .bin of a release",
+        ),
+        (
+            "an S3 image",
+            s3,
+            None,
+            "is built for ESP32-S3 and the device uses ESP32-C3",
+            "; choose a device with that chip",
+        ),
+        (
+            "larger than its slot",
+            too_large,
+            None,
+            "and its slot, app0, holds 6553600",
+            "; use an application that fits",
+        ),
+        (
+            "a corrupt digest",
+            corrupt,
+            None,
+            "the firmware is damaged: SHA-256 mismatch",
+            "; re-download the file or rebuild the firmware",
+        ),
+        (
+            "a whole flash image",
+            build_flash_image(&ImageSpec::default()),
+            None,
+            "is a whole flash image",
+            "; use it as the flash (`--flash`)",
+        ),
+        (
+            "a bootloader as the firmware",
+            bootloader.clone(),
+            None,
+            "the firmware is a 2nd-stage bootloader",
+            "; give it as the bootloader (`--bootloader`)",
+        ),
+        (
+            "an application as the bootloader",
+            app.clone(),
+            Some(app.clone()),
+            "the bootloader is an application image",
+            "; use it as the firmware (`--firmware`)",
+        ),
+        (
+            "a bootloader for a later chip",
+            app.clone(),
+            Some(later_chip),
+            "requires chip revision v0.4 or later and the device is v0.3: it would reset the chip for ever",
+            "; give a bootloader built for v0.3",
+        ),
+    ] {
+        assert_refused_before_boot(case, &application, given.as_deref(), cause, remedy);
+    }
+}
+
+/// `image` with the 16-bit header field at `at` set to `value`, its digest refreshed: only that
+/// field is wrong.
+fn with_header_field(image: &[u8], at: usize, value: u16) -> Vec<u8> {
+    let mut image = image.to_vec();
+    image[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    firmware::builder::refresh_digest(&mut image);
+    image
+}
+
+/// `image` whose header says 32 MB of flash (byte 3, high nibble 5), its digest refreshed.
+fn with_32_mb_of_flash(image: &[u8]) -> Vec<u8> {
+    let mut image = image.to_vec();
+    image[3] = 0x5F;
+    firmware::builder::refresh_digest(&mut image);
+    image
+}
+
+/// The test application whose descriptor accepts the eFuse block revisions `min..=max`
+/// (`min_efuse_blk_rev_full` and `max_efuse_blk_rev_full`, bytes 176..180); those of the X4 are
+/// v1.2.
+fn with_efuse_blocks(min: u16, max: u16) -> Vec<u8> {
+    let mut desc = firmware::builder::app_desc_bytes("1.0.0", "demo", "v5.5.2");
+    desc[176..178].copy_from_slice(&min.to_le_bytes());
+    desc[178..180].copy_from_slice(&max.to_le_bytes());
+    let mut spec = ImageSpec::default();
+    spec.segments[0].1 = desc;
+    build_image(&spec)
+}
+
+/// `image` whose checksum, the byte before the appended digest, is wrong, its digest refreshed so
+/// that only the checksum is; and the cause the refusal states.
+fn with_a_wrong_checksum(image: &[u8]) -> (Vec<u8>, String) {
+    let mut image = image.to_vec();
+    let at = image.len() - 33;
+    let computed = image[at];
+    image[at] ^= 1;
+    firmware::builder::refresh_digest(&mut image);
+    let cause = format!(
+        "the firmware is damaged: checksum mismatch (stored {:#04x}, computed {computed:#04x})",
+        computed ^ 1
+    );
+    (image, cause)
+}
+
+/// What the bootloader or the mask ROM would refuse in an application or a bootloader, refused
+/// by `run_with_firmware` before boot, each message whole: its cause, then its remedy.
+#[test]
+fn what_the_bootloader_or_the_rom_would_refuse_is_refused_before_boot_in_whole_words() {
+    use firmware::builder::bootloader_spec;
+    let app = build_image(&ImageSpec::default());
+    let bootloader = build_image(&bootloader_spec());
+    // Code in a window of the flash and no descriptor: an application without its descriptor.
+    let no_descriptor = build_image(&ImageSpec {
+        segments: vec![(0x4200_0020, vec![0; 8]), (0x4038_0000, vec![0; 8])],
+        ..ImageSpec::default()
+    });
+    let (bad_checksum, checksum_cause) = with_a_wrong_checksum(&app);
+    // An application longer than the 0x8000 bytes below the partition table, given as the
+    // bootloader.
+    let mut long_application = ImageSpec::default();
+    long_application
+        .segments
+        .push((0x3C01_0000, vec![0; 0x9000]));
+    let long_application = build_image(&long_application);
+    // A flash image, a bootloader at its start, whose partition table does not parse.
+    let mut damaged_table = build_flash_image(&bootloader_spec());
+    damaged_table[0x8010] ^= 1;
+    let damaged_table_cause = format!(
+        "the firmware is {} bytes and starts with a 2nd-stage bootloader, so it is a whole flash image, but its partition table at 0x8000 does not parse",
+        damaged_table.len()
+    );
+    // Header bytes 15..17 are min_chip_rev_full, 17..19 max_chip_rev_full.
+    for (case, application, given, cause, remedy) in [
+        (
+            "no application descriptor",
+            no_descriptor,
+            None,
+            "the firmware has no application descriptor at 0x20 (esp_app_desc_t), which every ESP-IDF application carries and the bootloader reads",
+            "; use the application .bin of an ESP-IDF build\n",
+        ),
+        (
+            "a later chip revision required",
+            with_header_field(&app, 15, 4),
+            None,
+            "the firmware requires chip revision v0.4 or later and the device is v0.3: the bootloader would refuse to start it",
+            "; use a build for v0.3 (CONFIG_ESP32C3_REV_MIN), or choose a device of revision v0.4 or later\n",
+        ),
+        (
+            "an earlier chip revision required",
+            with_header_field(&app, 17, 2),
+            None,
+            "the firmware accepts chip revisions up to v0.2 and the device is v0.3: the bootloader would refuse to start it",
+            "; use a build that accepts v0.3, or choose a device of revision v0.2 or earlier\n",
+        ),
+        (
+            "a later eFuse block revision required",
+            with_efuse_blocks(103, 199),
+            None,
+            "the firmware requires eFuse block revision v1.3 or later and the chip has v1.2: the bootloader would refuse to start it",
+            "; use a build that accepts v1.2\n",
+        ),
+        (
+            "an earlier eFuse block revision required",
+            with_efuse_blocks(0, 101),
+            None,
+            "the firmware accepts eFuse block revisions up to v1.1 and the chip has v1.2: the bootloader would refuse to start it",
+            "; use a build that accepts v1.2\n",
+        ),
+        (
+            "more flash in the header of the firmware than the device has",
+            with_32_mb_of_flash(&app),
+            None,
+            "the header of the firmware says 32 MB of flash and the device has 16 MB",
+            "; use the firmware built for 16 MB, or choose a device with at least 32 MB\n",
+        ),
+        (
+            "a wrong checksum",
+            bad_checksum,
+            None,
+            checksum_cause.as_str(),
+            "; re-download the file or rebuild the firmware\n",
+        ),
+        (
+            "a flash image whose partition table does not parse",
+            damaged_table,
+            None,
+            damaged_table_cause.as_str(),
+            "; use an intact dump as the flash (`--flash`), or the application .bin of its build as the firmware\n",
+        ),
+        (
+            "more flash in the header of the bootloader than the device has",
+            app.clone(),
+            Some(with_32_mb_of_flash(&bootloader)),
+            "the header of the bootloader says 32 MB of flash and the device has 16 MB: the application would abort when it finds the smaller chip",
+            "; give a bootloader built for 16 MB, or no bootloader to use the one inkemu ships\n",
+        ),
+        (
+            "an application longer than a bootloader can be, as the bootloader",
+            app.clone(),
+            Some(long_application),
+            "the bootloader is an application image (it carries an application descriptor at 0x20)",
+            "; use it as the firmware (`--firmware`), and give no bootloader or the bootloader.bin of its build\n",
+        ),
+    ] {
+        assert!(remedy.ends_with('\n'), "{case}: the remedy ends the line");
+        assert_refused_before_boot(case, &application, given.as_deref(), cause, remedy);
+    }
+}
+
+/// A file given as the bootloader that is no bootloader at all — not an image, an encrypted
+/// update, a whole flash image — refused by `run_with_firmware` before boot, each message whole.
+#[test]
+fn what_is_no_bootloader_at_all_is_refused_as_the_bootloader_in_whole_words() {
+    use firmware::builder::bootloader_spec;
+    let app = build_image(&ImageSpec::default());
+    let mut xota = b"XOTA".to_vec();
+    xota.resize(512, 0);
+    for (case, given, cause, remedy) in [
+        (
+            "not an image",
+            vec![0x7F; 64],
+            "the bootloader is not an ESP-IDF image: its first byte is 0x7f, expected 0xe9",
+            "; give the bootloader.bin of a build, or no bootloader to use the one inkemu ships\n",
+        ),
+        (
+            "an encrypted update",
+            xota,
+            "the bootloader is an encrypted OTA update (.xota), not a bootloader",
+            "; give the bootloader.bin of a build, or no bootloader to use the one inkemu ships\n",
+        ),
+        (
+            "a whole flash image",
+            build_flash_image(&bootloader_spec()),
+            "the bootloader is a whole flash image (a partition table follows it at 0x8000), not a bootloader alone",
+            "; use it as the flash (`--flash`), and give no firmware (`--firmware`): the image holds its own application\n",
+        ),
+    ] {
+        assert_refused_before_boot(case, &app, Some(&given), cause, remedy);
+    }
+}
+
+/// `run_with_firmware(application, given)` exits 2 before it looks for the ROM, with an error
+/// that holds `cause` and `remedy`; a `remedy` that ends the line follows `cause` at once, so
+/// that the two are the whole message.
+fn assert_refused_before_boot(
+    what: &str,
+    application: &[u8],
+    given: Option<&[u8]>,
+    cause: &str,
+    remedy: &str,
+) {
+    let assert = run_with_firmware(application, given, &[])
+        .code(2)
+        .stdout(predicate::str::is_empty());
+    let log = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        log.starts_with("error: ") && log.contains(cause) && log.contains(remedy),
+        "{what}: {log}"
+    );
+    if remedy.ends_with('\n') {
+        assert!(
+            log.contains(&format!("{cause}{remedy}")),
+            "{what}: the whole message: {log}"
+        );
+    }
+    assert!(
+        !log.contains(MISSING_ROM),
+        "{what}: refused before the ROM: {log}"
+    );
+}
+
+#[test]
+fn a_firmware_and_a_bootloader_that_pass_are_taken_to_the_rom() {
+    use firmware::builder::bootloader_spec;
+    // The ROM directory is empty: getting as far as the ROM is getting past every check.
+    let app = build_image(&ImageSpec::default());
+    for given in [None, Some(build_image(&bootloader_spec()))] {
+        run_with_firmware(&app, given.as_deref(), &[])
+            .code(2)
+            .stderr(contains(MISSING_ROM));
+    }
+}
+
+#[test]
+fn the_warnings_of_a_given_bootloader_are_printed_before_the_rom_is_looked_for() {
+    use firmware::builder::{bootloader_spec, refresh_digest};
+    // A header that says 4 MB of flash, and an appended digest that does not match: both are
+    // warnings, and the run goes on to the ROM.
+    let mut bootloader = build_image(&bootloader_spec());
+    bootloader[3] = 0x2F;
+    refresh_digest(&mut bootloader);
+    let last = bootloader.len() - 1;
+    bootloader[last] ^= 1;
+    let assert = run_with_firmware(&build_image(&ImageSpec::default()), Some(&bootloader), &[])
+        .code(2)
+        .stdout(predicate::str::is_empty());
+    let log = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        lines.get(..2),
+        Some(
+            &[
+                "warning: the header of the bootloader says 4 MB of flash and the device has 16 MB; the application is told 4 MB and uses no more; rebuild the bootloader for 16 MB to use the whole flash",
+                "warning: the SHA-256 appended to the bootloader does not match it; the mask ROM boots it anyway, as a chip without secure boot does, and prints four lines that say so; rebuild the bootloader if it was not changed on purpose",
+            ][..]
+        ),
+        "{log}"
+    );
+    assert!(
+        lines.get(2).is_some_and(|line| line.contains(MISSING_ROM)),
+        "{log}"
+    );
+}
+
+/// A run refused for its flash file prints no warning about a bootloader it will never boot: the
+/// refusal is the whole of what it says.
+#[test]
+fn a_run_refused_for_its_flash_file_prints_no_warning_of_its_bootloader() {
+    use firmware::builder::{bootloader_spec, refresh_digest};
+    let mut bootloader = build_image(&bootloader_spec());
+    bootloader[3] = 0x2F;
+    refresh_digest(&mut bootloader);
+    let dir = tempfile::tempdir().unwrap();
+    let kept = dir.path().join("x4.bin");
+    std::fs::write(&kept, vec![0xFF; 16 << 20]).unwrap();
+    let assert = run_with_firmware(
+        &build_image(&ImageSpec::default()),
+        Some(&bootloader),
+        &["--flash-file", kept.to_str().unwrap()],
+    )
+    .code(2)
+    .stdout(predicate::str::is_empty());
+    let log = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        log.starts_with("error: both --firmware and the flash file ")
+            && log.contains("x4.bin, which exists, were given")
+            && log.lines().count() == 1,
+        "{log}"
+    );
+}
+
+/// The header of a run names the bootloader it was given: by its descriptor and the SHA-256 of
+/// its image, or by that hash alone when it has no descriptor. The header is printed once the ROM
+/// is loaded.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn the_header_of_a_run_names_the_bootloader_it_was_given() {
+    use firmware::builder::bootloader_spec;
+    let rom = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let dir = tempfile::tempdir().unwrap();
+    let firmware = dir.path().join("app.bin");
+    std::fs::write(&firmware, build_image(&ImageSpec::default())).unwrap();
+    // ESP-IDF before v5.1 writes no bootloader descriptor: its magic word is cleared here.
+    let mut without_descriptor = bootloader_spec();
+    without_descriptor.segments[0].1[0] = 0;
+    for (image, named) in [
+        (
+            build_image(&bootloader_spec()),
+            "behind a bootloader of ESP-IDF v5.5.2-test built Oct 13 2026 10:00:00, sha256 ",
+        ),
+        (
+            build_image(&without_descriptor),
+            "behind a bootloader without a descriptor, sha256 ",
+        ),
+    ] {
+        let bootloader = dir.path().join("bootloader.bin");
+        std::fs::write(&bootloader, &image).unwrap();
+        let output = inkemu()
+            .args([
+                "run",
+                "--device",
+                "x4",
+                "--max-cycles",
+                "1000",
+                "--rom-dir",
+                &rom,
+            ])
+            .arg("--firmware")
+            .arg(&firmware)
+            .arg("--bootloader")
+            .arg(&bootloader)
+            .timeout(HANG_LIMIT)
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
+        let log = String::from_utf8_lossy(&output.stderr).into_owned();
+        let expected = format!(
+            "{named}{}, under the partition table of the profile",
+            sha256_of(&bootloader)
+        );
+        assert!(log.contains(&expected), "`{expected}` is missing:\n{log}");
+    }
+}
+
+#[test]
+fn a_firmware_is_a_seed_like_an_image_and_the_flash_file_rules_apply() {
+    let app = build_image(&ImageSpec::default());
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("x4.bin");
+    sparse_file(&file, X4_FLASH_BYTES);
+    let firmware = dir.path().join("app.bin");
+    std::fs::write(&firmware, &app).unwrap();
+    let firmware_arg = firmware.to_str().unwrap();
+    let bootloader = dir.path().join("bootloader.bin");
+    std::fs::write(
+        &bootloader,
+        build_image(&firmware::builder::bootloader_spec()),
+    )
+    .unwrap();
+    for more in [&[][..], &["--bootloader", bootloader.to_str().unwrap()][..]] {
+        let args = [&["--firmware", firmware_arg][..], more].concat();
+        run_with_flash_file(&file, &args).code(2).stderr(
+            contains("both --firmware and the flash file")
+                .and(contains(
+                    "; drop --firmware, and --bootloader if it was given, to go on from the flash file",
+                ))
+                .and(contains(
+                    "start again from the flash composed from the firmware",
+                ))
+                .and(contains(MISSING_ROM).not()),
+        );
+    }
+    // Dropping both goes on from the flash file, as far as the ROM; with --reset-flash the run
+    // starts from the firmware, as far as the ROM.
+    run_with_flash_file(&file, &[])
+        .code(2)
+        .stderr(contains(MISSING_ROM));
+    run_with_flash_file(&file, &["--firmware", firmware_arg, "--reset-flash"])
+        .code(2)
+        .stderr(contains(MISSING_ROM));
+    // A flash file of another size is kept, and the remedy does not send a firmware to --flash.
+    let small = dir.path().join("small.bin");
+    sparse_file(&small, 1 << 20);
+    run_with_flash_file(&small, &["--firmware", firmware_arg, "--reset-flash"])
+        .code(2)
+        .stderr(
+            contains(
+                "is 1048576 bytes and the flash of the device is 16777216 bytes: the file is not the flash of this device, and it is never padded or cut; use it with the device it was written for, or give --flash-file a new path\n",
+            )
+            .and(contains(MISSING_ROM).not()),
+        );
+    // The firmware cannot be the flash file, nor --bootloader. The remedy keeps the file: a reset
+    // of the flash file would replace the firmware with the flash.
+    let keeps_the_file = || {
+        contains("; give --flash-file another path to keep the file as it is\n")
+            .and(contains("--reset-flash").not())
+    };
+    run_with_flash_file(&firmware, &["--firmware", firmware_arg])
+        .code(2)
+        .stderr(contains("--firmware and --flash-file name the same file").and(keeps_the_file()));
+    let other = dir.path().join("other.bin");
+    run_with_flash_file(
+        &firmware,
+        &[
+            "--firmware",
+            other.to_str().unwrap(),
+            "--bootloader",
+            firmware_arg,
+        ],
+    )
+    .code(2)
+    .stderr(contains("--bootloader and --flash-file name the same file").and(keeps_the_file()));
+    assert_eq!(std::fs::read(&firmware).unwrap(), app, "never written");
+}
+
+#[test]
+fn a_firmware_with_an_image_or_a_bootloader_without_a_firmware_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("x.bin");
+    std::fs::write(&path, b"x").unwrap();
+    let path = path.to_str().unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--flash", path, "--firmware", path])
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "'--flash <FLASH>' cannot be used with '--firmware <FILE>'",
+        ));
+    inkemu()
+        .args(["run", "--device", "x4", "--bootloader", path])
+        .assert()
+        .code(2)
+        .stderr(contains("--firmware <FILE>"));
+}
+
+#[test]
+fn run_help_documents_the_firmware_and_the_bootloader() {
+    let help = inkemu().args(["run", "--help"]).assert().success();
+    let out = String::from_utf8_lossy(&help.get_output().stdout).into_owned();
+    for expected in [
+        "--firmware <FILE>",
+        "the partition table of the device profile at 0x8000",
+        "--bootloader <FILE>",
+        "instead of the one inkemu ships",
+    ] {
+        assert!(out.contains(expected), "`{expected}` is missing:\n{out}");
+    }
+}
+
+/// The help says that a flash file that exists refuses `--firmware` as it refuses `--flash`, and
+/// the README shows the help as the binary prints it (white space aside: the help is wrapped to
+/// the terminal).
+#[test]
+fn the_readme_shows_run_help_as_the_binary_prints_it() {
+    fn words(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    let help = inkemu().args(["run", "--help"]).assert().success();
+    let help = words(&String::from_utf8_lossy(&help.get_output().stdout));
+    assert!(
+        help.contains(
+            "A run starts from the file when it exists (--flash or --firmware is then refused unless --reset-flash is given)"
+        ),
+        "{help}"
+    );
+    let readme = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+    )
+    .unwrap();
+    let after = readme
+        .split_once(
+            "The options and the exit codes, as `inkemu run --help` prints them:\n\n```text\n",
+        )
+        .unwrap_or_else(|| panic!("no help block in the README"))
+        .1;
+    let block = after.split_once("\n```").unwrap().0;
+    assert_eq!(words(block), help);
+}
+
+/// `hello_world.bin` and `nvs_rw_value_cxx.bin`, the application images the reference build
+/// merges at 0x10000 (`tools/reference-firmware/SHA256SUMS.inputs`, `SHA256SUMS.inputs-nvs`).
+const HELLO_APPLICATION_SHA256: &str =
+    "4b82d73e37d10969d660eba95984cbe7f053212d39306cc54bfce6c366d0f04b";
+const NVS_APPLICATION_SHA256: &str =
+    "44523a2fd8f7dc0a3eaad17a8991c647ab663ad993dc0db2e31235806b516ff2";
+/// The flash composed for the X4 from each application: the reference images merged under the
+/// stock table of the X4, `flash_hello_ota.bin` (docs/research/sp1b-test-oracle.md, section 2) and
+/// `flash_nvs_ota.bin` (`SHA256SUMS.output`).
+const HELLO_COMPOSED_SHA256: &str =
+    "9ddacb60b8b7338731b52edee1ecae47c7f45470d8db6fa8d1fbc5a20011bc89";
+const NVS_COMPOSED_SHA256: &str =
+    "87832c6d5d15672fb3892bfad281688fc7486b360a25b495bdb6a27d04f28fec";
+
+/// The application image of the pinned merged image `variable` names, written to a file of its
+/// own: the bytes the reference build merged at 0x10000, checked against `application_sha256`.
+fn reference_application(
+    variable: &str,
+    file: &str,
+    sha256: &str,
+    application_sha256: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    use sha2::Digest as _;
+    let merged = std::fs::read(pinned_image(variable, file, sha256)).unwrap();
+    let from = &merged[0x1_0000..];
+    let len = firmware::FirmwareImage::parse(from).unwrap().len;
+    let application = &from[..len];
+    assert_eq!(
+        emu_cli::term::hex(&sha2::Sha256::digest(application)),
+        application_sha256,
+        "the application merged at 0x10000 of {file}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(file.replace("flash_", "app_"));
+    std::fs::write(&path, application).unwrap();
+    (dir, path)
+}
+
+/// A console with the timestamps of ESP-IDF's log lines masked: `I (123) boot: …` → `I (#) boot: …`.
+fn masked(console: &str) -> String {
+    console
+        .lines()
+        .map(|line| match line.split_once(") ") {
+            Some((head, rest))
+                if head.len() > 3
+                    && head[..3].ends_with(" (")
+                    && head[3..].bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                format!("{} (#) {rest}", &head[..1])
+            }
+            _ => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The first boot of the application behind the stock table of the X4: the lines of the QEMU
+/// capture of the same flash (`golden_hello_ota_boot.log`, docs/research/sp1b-test-oracle.md,
+/// section 2), with the two documented differences of inkemu's chip: eFuse block revision v1.2
+/// and SPI mode DIO.
+const OTA_FIRST_BOOT_LINES: [&str; 26] = [
+    "I (#) boot: ESP-IDF v5.5.2 2nd stage bootloader",
+    "I (#) boot: chip revision: v0.3",
+    "I (#) boot: efuse block revision: v1.2",
+    "I (#) boot.esp32c3: SPI Speed      : 80MHz",
+    "I (#) boot.esp32c3: SPI Mode       : DIO",
+    "I (#) boot.esp32c3: SPI Flash Size : 16MB",
+    "I (#) boot: Enabling RNG early entropy source...",
+    "I (#) boot: Partition Table:",
+    "I (#) boot: ## Label            Usage          Type ST Offset   Length",
+    "I (#) boot:  0 nvs              WiFi data        01 02 00009000 00005000",
+    "I (#) boot:  1 otadata          OTA data         01 00 0000e000 00002000",
+    "I (#) boot:  2 app0             OTA app          00 10 00010000 00640000",
+    "I (#) boot:  3 app1             OTA app          00 11 00650000 00640000",
+    "I (#) boot:  4 spiffs           Unknown data     01 82 00c90000 00360000",
+    "I (#) boot:  5 coredump         Unknown data     01 03 00ff0000 00010000",
+    "I (#) boot: End of partition table",
+    "I (#) boot: No factory image, trying OTA 0",
+    "I (#) esp_image: segment 0: paddr=00010020 vaddr=3c010020 size=0656ch ( 25964) map",
+    "I (#) esp_image: segment 1: paddr=00016594 vaddr=3fc8b600 size=011d8h (  4568) load",
+    "I (#) esp_image: segment 2: paddr=00017774 vaddr=40380000 size=088a4h ( 34980) load",
+    "I (#) esp_image: segment 3: paddr=00020020 vaddr=42000020 size=0e6fch ( 59132) map",
+    "I (#) esp_image: segment 4: paddr=0002e724 vaddr=403888a4 size=02c70h ( 11376) load",
+    "I (#) esp_image: segment 5: paddr=0003139c vaddr=50000000 size=00020h (    32) load",
+    "I (#) boot: Loaded app from partition at offset 0x10000",
+    "I (#) boot: Set actual ota_seq=1 in otadata[0]",
+    "I (#) boot: Disabling RNG early entropy source...",
+];
+
+/// The milestone of an application image: `--firmware hello_world.bin`, the application alone,
+/// boots behind the bootloader inkemu ships and the stock table of the X4, in strict mode,
+/// through its whole life, its restart and the second boot; the bootloader writes `otadata` on
+/// the first boot and on that one only.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn x4_boots_the_reference_firmware_from_its_application_image_through_a_second_boot() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (_dir, application) = reference_application(
+        "INKEMU_REF_FLASH",
+        "flash_hello.bin",
+        HELLO_IMAGE_SHA256,
+        HELLO_APPLICATION_SHA256,
+    );
+    // One life is 40 million cycles here; 44 million reach the application of the second boot.
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--strict-mmio",
+            "--max-cycles",
+            "44000000",
+        ])
+        .args(["--rom-dir", &rom_dir, "--firmware"])
+        .arg(&application)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = masked(&String::from_utf8_lossy(&output.stdout).replace('\r', ""));
+    let first_boot = OTA_FIRST_BOOT_LINES.join("\n");
+    assert!(console.contains(&first_boot), "{console}");
+    let mut from = 0;
+    for expected in [
+        "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        "entry 0x403cbf1a\n",
+        first_boot.as_str(),
+        "I (#) cpu_start: Unicore app\n",
+        "Hello world!\n",
+        "Restarting in 0 seconds...\n",
+        "Restarting now.\n",
+        "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        "I (#) boot: End of partition table\nI (#) esp_image: segment 0:",
+        "I (#) boot: Loaded app from partition at offset 0x10000\nI (#) boot: Disabling RNG early entropy source...\n",
+        "I (#) cpu_start: Unicore app\n",
+    ] {
+        let at = console[from..]
+            .find(expected)
+            .unwrap_or_else(|| panic!("`{expected}` is missing, or out of order:\n{console}"));
+        from += at + expected.len();
+    }
+    // The second boot finds otadata written: it neither looks for a factory image nor writes.
+    assert_eq!(
+        console
+            .matches("Set actual ota_seq=1 in otadata[0]")
+            .count(),
+        1
+    );
+    assert_eq!(console.matches("No factory image, trying OTA 0").count(), 1);
+    assert_eq!(console.matches("2nd stage bootloader").count(), 2);
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        log.contains(
+            "flash: app_hello.bin (hello_world 1, ESP-IDF v5.5.2) in app0 at 0x10000, behind the ESP-IDF v5.5.2 bootloader inkemu ships (esp-idf-v5.5.2-esp32c3-dio), under the partition table of the profile (16 MiB)\n"
+        ),
+        "{log}"
+    );
+    assert!(
+        !log.contains("warning:") && !log.contains("stopped by --strict-mmio"),
+        "nothing was reported in a whole life cycle: {log}"
+    );
+}
+
+/// The trace hash of the application image's life, pinned like the one of the merged image
+/// (`x4_runs_the_reference_firmware_along_its_pinned_trace`), with its device time and the flash
+/// it starts from. The two differ from those of the merged image: the table is the X4's, so the
+/// bootloader takes the OTA path and writes `otadata`.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_REF_FLASH"]
+fn x4_runs_the_reference_firmware_from_its_application_image_along_its_pinned_trace() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (_dir, application) = reference_application(
+        "INKEMU_REF_FLASH",
+        "flash_hello.bin",
+        HELLO_IMAGE_SHA256,
+        HELLO_APPLICATION_SHA256,
+    );
+    let output = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--strict-mmio",
+            "--max-cycles",
+            "40000001",
+        ])
+        .args(["--trace-hash", "--rom-dir", &rom_dir, "--firmware"])
+        .arg(&application)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        trace_hash_line(&log),
+        Some("trace-hash c6b24a1cc226ed4a"),
+        "{log}"
+    );
+    assert_eq!(device_micros(&log), 11_403_054, "{log}");
+    assert!(
+        log.contains("after 40000001 cycles (26637404 instructions)"),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("{FLASH_AT_START}{HELLO_COMPOSED_SHA256}\n")),
+        "the composed flash is the merged image under the X4 table: {log}"
+    );
+}
+
+/// The NVS example from its application image, kept in a flash file: the first run composes the
+/// flash (it is `flash_nvs_ota.bin`, byte for byte), the second goes on from the file and counts.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_NVS_FLASH"]
+fn the_nvs_reference_firmware_counts_on_from_its_application_image_across_two_runs() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let (dir, application) = reference_application(
+        "INKEMU_NVS_FLASH",
+        "flash_nvs.bin",
+        NVS_IMAGE_SHA256,
+        NVS_APPLICATION_SHA256,
+    );
+    let file = dir.path().join("x4.bin");
+    let run = |more: &[&std::ffi::OsStr]| {
+        let output = inkemu()
+            .args(["run", "--device", "x4", "--strict-mmio", "--max-time", "5"])
+            .args(["--rom-dir", &rom_dir])
+            .args(more)
+            .arg("--flash-file")
+            .arg(&file)
+            .timeout(HANG_LIMIT)
+            .output()
+            .unwrap();
+        Counted {
+            code: output.status.code(),
+            console: String::from_utf8_lossy(&output.stdout).replace('\r', ""),
+            log: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    };
+    let first = run(&[std::ffi::OsStr::new("--firmware"), application.as_os_str()]);
+    assert_eq!(first.code, Some(0), "{}", first.log);
+    assert_eq!(first.sha256(FLASH_AT_START), NVS_COMPOSED_SHA256);
+    assert!(
+        first
+            .console
+            .contains("boot: Set actual ota_seq=1 in otadata[0]\n")
+            && first.console.contains(
+                "Reading restart counter from NVS ... The value is not initialized yet!\n"
+            ),
+        "{}",
+        first.console
+    );
+    assert_eq!(first.sha256(FLASH_AT_END), sha256_of(&file));
+    let second = run(&[]);
+    assert_eq!(second.code, Some(0), "{}", second.log);
+    assert_eq!(second.sha256(FLASH_AT_START), first.sha256(FLASH_AT_END));
+    assert!(
+        second.console.contains("rst:0x1 (POWERON)")
+            && !second.console.contains("Set actual ota_seq")
+            && second
+                .console
+                .contains("Reading restart counter from NVS ... Done\nRestart counter = 1\n"),
+        "{}",
+        second.console
+    );
+    for log in [&first.log, &second.log] {
+        assert!(!log.contains("warning:"), "{log}");
+    }
+    assert_eq!(
+        sha256_of(&application),
+        NVS_APPLICATION_SHA256,
+        "--firmware is only read"
+    );
+}
+
+/// The bootloader inkemu ships is the one the reference build produces: the first bytes of the
+/// pinned merged image, which the build checks against the same SHA-256.
+#[test]
+#[ignore = "needs INKEMU_REF_FLASH"]
+fn the_shipped_bootloader_is_the_one_the_reference_firmware_build_produced() {
+    let merged = std::fs::read(reference_image()).unwrap();
+    let shipped = firmware::SHIPPED[0].bytes;
+    assert_eq!(&merged[..shipped.len()], shipped);
+    assert!(
+        merged[shipped.len()..0x8000]
+            .iter()
+            .all(|&byte| byte == 0xFF),
+        "nothing follows the bootloader before the table"
+    );
 }

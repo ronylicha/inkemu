@@ -10,9 +10,11 @@ workspace = true
 
 [dependencies]
 soc-esp32c3.workspace = true
+firmware.workspace = true
 serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 soc-esp32c3 = { workspace = true, features = ["test-support"] }
+firmware = { workspace = true, features = ["test-support"] }

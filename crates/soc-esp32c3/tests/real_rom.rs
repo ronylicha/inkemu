@@ -13,7 +13,9 @@ use soc_esp32c3::{
 };
 
 /// The ROM ELF of `revision` in the directory `INKEMU_ROM_ELF_DIR` names; a failure says why and
-/// what to do.
+/// what to do. The test reads a file the environment names; the crate's code does no host I/O
+/// (`clippy.toml`).
+#[allow(clippy::disallowed_methods)]
 fn elf(revision: u16) -> Vec<u8> {
     let dir = std::env::var("INKEMU_ROM_ELF_DIR").unwrap_or_else(|e| {
         panic!(

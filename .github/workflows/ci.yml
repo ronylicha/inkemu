@@ -19,13 +19,16 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Also fails when a path a clippy.toml bans names nothing: see tools/ci/clippy.sh.
+      - run: tools/ci/clippy.sh --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       - run: cargo run -p svd-gen -- --check
-      # The model crates do no host I/O and must go on building for `wasm32-unknown-unknown`,
-      # the target of the web version: nothing else would notice a host dependency slipping in.
+      # The model crates, and the crates a front end composes a flash with, must go on building for
+      # `wasm32-unknown-unknown`, the target of the web version: this step notices a crate that does
+      # not build there. It cannot notice host I/O, which std compiles there and fails at run time:
+      # the clippy step above refuses it in firmware, boards and soc-esp32c3 (their clippy.toml).
       - name: Build the model for WebAssembly
-        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3
+        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3 -p firmware -p boards
       - uses: EmbarkStudios/cargo-deny-action@v2
   coverage:
     runs-on: ubuntu-24.04
@@ -91,15 +94,18 @@ jobs:
         # un-ignored test would otherwise leave this job green with nothing proven.
         run: |
           tools/ci/run-ignored-tests.sh 18 --release -p soc-esp32c3 --test real_rom -- --ignored
-          tools/ci/run-ignored-tests.sh 24 --release -p emu-cli --test run_cli -- --ignored --skip reference_firmware
+          tools/ci/run-ignored-tests.sh 25 --release -p emu-cli --test run_cli -- --ignored --skip reference_firmware
   reference-boot:
     # Boots the reference firmware (stock ESP-IDF bootloader + hello_world) from the real mask ROM
     # and runs it through a whole life: the application, its countdown, the restart it asks for
-    # and the second boot. A second example, nvs_rw_value_cxx, keeps a restart counter in NVS:
-    # it is built next to the first, once under its own partition table and once under the stock
-    # table of the X4. The firmware is built here, inside the pinned ESP-IDF image, and checked
-    # against pinned SHA-256 values; it is never stored in this repository. The cache saves the
-    # build and replaces no check: the images are re-hashed on every run.
+    # and the second boot; then the same application alone, behind the bootloader inkemu ships,
+    # whose bytes a test compares with those of this build. A second example, nvs_rw_value_cxx,
+    # keeps a restart counter in NVS: it is built next to the first, once under its own partition
+    # table and once under the stock table of the X4. The firmware is built here, inside the
+    # pinned ESP-IDF image, and checked against pinned SHA-256 values. The bootloader is the one
+    # artefact of this build that is committed, under third_party/esp-idf-bootloader/; the
+    # applications and the merged images are never stored in this repository. The cache saves
+    # the build and replaces no check: the images are re-hashed on every run.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -145,4 +151,4 @@ jobs:
         # Exact test counts, as in rom-boot: see tools/ci/run-ignored-tests.sh.
         run: |
           tools/ci/run-ignored-tests.sh 13 --release -p soc-esp32c3 --test reference_boot -- --ignored
-          tools/ci/run-ignored-tests.sh 4 --release -p emu-cli --test run_cli reference_firmware -- --ignored
+          tools/ci/run-ignored-tests.sh 8 --release -p emu-cli --test run_cli reference_firmware -- --ignored

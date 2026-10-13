@@ -41,6 +41,15 @@ const WAFER_MINOR_HI_SHIFT: u32 = 23;
 /// The minor revision is 4 bits: its top bit lives in `RD_MAC_SPI_SYS_5`, the low three in `_3`.
 const WAFER_MINOR_LO_BITS: u32 = 3;
 const WAFER_MAJOR_SHIFT: u32 = 24;
+/// `RD_MAC_SPI_SYS_3` bits [26:24]: `BLK_VERSION_MINOR`; `RD_SYS_PART1_DATA4` bits [1:0]:
+/// `BLK_VERSION_MAJOR` (ESP-IDF v5.5.2 `hal/esp32c3/include/hal/efuse_ll.h`,
+/// `efuse_ll_get_blk_version_minor`/`_major`).
+const BLK_MINOR_SHIFT: u32 = 24;
+const BLK_MINOR_MASK: u32 = 0x7;
+const RD_SYS_PART1_DATA4: u32 = reg("RD_SYS_PART1_DATA4");
+const BLK_MAJOR_MASK: u32 = 0x3;
+/// `efuse_hal_blk_version()` is `major * 100 + minor`.
+const BLK_MAJOR_WEIGHT: u32 = 100;
 /// The wafer-version fields the profile's chip revision overrides.
 const WAFER_FIELDS_SYS_3: u32 = WAFER_MINOR_LO_MASK << WAFER_MINOR_LO_SHIFT;
 const WAFER_FIELDS_SYS_5: u32 = (0x3 << WAFER_MAJOR_SHIFT) | (1 << WAFER_MINOR_HI_SHIFT);
@@ -66,7 +75,7 @@ const PRODUCTION_V0_3: [(u32, u32); 14] = [
     (reg("RD_SYS_PART1_DATA1"), 0x6F41_FDC3),
     (reg("RD_SYS_PART1_DATA2"), 0x512C_EDBE),
     (reg("RD_SYS_PART1_DATA3"), 0x217E_E31D),
-    (reg("RD_SYS_PART1_DATA4"), 0xD864_EA41),
+    (RD_SYS_PART1_DATA4, 0xD864_EA41),
     (reg("RD_SYS_PART1_DATA5"), 0x5ABA_3A86),
     (reg("RD_SYS_PART1_DATA6"), 0x1E26_0363),
     (reg("RD_SYS_PART1_DATA7"), 0x0000_0009),
@@ -114,6 +123,23 @@ impl Efuse {
             })
             .collect();
         Efuse { read_mirror }
+    }
+
+    /// The eFuse block revision the chip reports, `major * 100 + minor`, as
+    /// `efuse_hal_blk_version()` computes it: what the 2nd-stage bootloader compares with the
+    /// bounds of an application's descriptor (`bootloader_common_check_efuse_blk_validity`).
+    #[must_use]
+    pub fn block_revision(&self) -> u16 {
+        let word = |at: u32| {
+            self.read_mirror
+                .iter()
+                .find(|&&(offset, _)| offset == at)
+                .map_or(0, |&(_, value)| value)
+        };
+        let minor = (word(RD_MAC_SPI_SYS_3) >> BLK_MINOR_SHIFT) & BLK_MINOR_MASK;
+        let major = word(RD_SYS_PART1_DATA4) & BLK_MAJOR_MASK;
+        // INVARIANT: 2 bits and 3 bits: at most 3 * 100 + 7, which a u16 holds.
+        u16::try_from(major * BLK_MAJOR_WEIGHT + minor).unwrap_or(u16::MAX)
     }
 
     /// `WDT_DELAY_SEL`, `RD_REPEAT_DATA1[17:16]`: the multiplier of the stage 0 timeout of the RTC
@@ -236,6 +262,13 @@ mod tests {
             (1, 2),
             "eFuse block revision v1.2"
         );
+        for chip in [ChipRevision::V0_3, ChipRevision::new(1, 1).unwrap()] {
+            assert_eq!(
+                Efuse::new(chip).block_revision(),
+                102,
+                "{chip}: the block revision does not follow the chip revision"
+            );
+        }
         let mac_low = word(ctx, &mut efuse, "RD_MAC_SPI_SYS_0").to_be_bytes();
         let mac_high = word(ctx, &mut efuse, "RD_MAC_SPI_SYS_1").to_be_bytes();
         assert_eq!(

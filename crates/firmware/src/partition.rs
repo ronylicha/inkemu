@@ -1,5 +1,9 @@
 //! ESP-IDF partition tables, bit-compatible with `gen_esp32part.py`.
 //!
+//! A table is written only when `gen_esp32part.py` would accept it and ESP-IDF's bootloader would
+//! find its application where inkemu writes it: two application rows of one subtype, which the
+//! script accepts, are refused too.
+//!
 //! Every error message states the cause and a correction ("<cause>; <imperative remedy>").
 use crate::chip::FlashSize;
 use md5::{Digest, Md5};
@@ -22,6 +26,9 @@ const PARTITION_TABLE_SECTOR: u32 = 0x1000;
 /// Lowest offset a partition may start at: the end of the partition-table sector
 /// (`gen_esp32part.py` `verify`: `p.offset < offset_part_table + PARTITION_TABLE_SIZE` is an error).
 pub const FIRST_PARTITION_OFFSET: u32 = PARTITION_TABLE_OFFSET + PARTITION_TABLE_SECTOR;
+/// The one size of an otadata partition: two 4 KiB sectors, one per OTA entry
+/// (`gen_esp32part.py`, ESP-IDF v5.5.5, `PartitionTable.verify`).
+const OTADATA_SIZE: u32 = 0x2000;
 const APP_ALIGN: u32 = 0x10000;
 const DATA_ALIGN: u32 = 0x1000;
 
@@ -30,6 +37,9 @@ pub const TYPE_DATA: u8 = 0x01;
 pub const SUBTYPE_FACTORY: u8 = 0x00;
 pub const SUBTYPE_OTA_0: u8 = 0x10;
 pub const SUBTYPE_OTA_1: u8 = 0x11;
+pub const SUBTYPE_TEST: u8 = 0x20;
+/// The 16 OTA slots of an application are subtypes `0x10` (`ota_0`) to `0x1F` (`ota_15`).
+const OTA_SLOTS: u8 = 16;
 pub const SUBTYPE_DATA_OTA: u8 = 0x00;
 pub const SUBTYPE_NVS: u8 = 0x02;
 pub const SUBTYPE_COREDUMP: u8 = 0x03;
@@ -52,7 +62,7 @@ pub struct PartitionTable {
     pub entries: Vec<Partition>,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum PartitionError {
     #[error("the partition table is empty; add at least one partition")]
     Empty,
@@ -64,6 +74,18 @@ pub enum PartitionError {
         "partition name `{name}` is longer than 15 bytes or not ASCII; shorten the name to 15 ASCII characters or fewer"
     )]
     NameTooLong { name: String },
+    /// `row` counts the partitions of the table from 1.
+    #[error(
+        "partition {row} of the table has an empty name; give it a name of 1 to 15 ASCII characters"
+    )]
+    EmptyName { row: usize },
+    /// The table stores a name up to its first NUL: the bootloader, and [`PartitionTable::parse`],
+    /// would read a shorter name than the one written.
+    #[error(
+        "partition name `{}` holds a NUL byte, where the name stored in the table would end; remove the NUL from the name",
+        name.escape_debug()
+    )]
+    NulInName { name: String },
     #[error(
         "partition `{name}` starts at {offset:#x}, which is not aligned to {required:#x}; move it to a multiple of {required:#x}"
     )]
@@ -94,6 +116,43 @@ pub enum PartitionError {
         "partitions `{first}` and `{second}` overlap; move one of them so their ranges no longer intersect"
     )]
     Overlap { first: String, second: String },
+    /// ESP-IDF's bootloader keeps the last row of each application subtype (`bootloader_utility.c`
+    /// of v5.5.1, `bootloader_utility_load_partition_table`, lines 178 and 195: `bs->factory` and
+    /// `bs->ota[...]` are assigned on every row), while the application is written to the first:
+    /// the chip would start an erased slot and reset for ever (measured with the bootloader inkemu
+    /// ships, v5.5.2: "No bootable app partitions in the partition table" for two `ota_0`,
+    /// "Factory app partition is not bootable" for two `factory`).
+    #[error(
+        "partitions `{first}` and `{second}` are both the {} application slot, and the bootloader keeps only the last of them; give each application partition a subtype of its own",
+        app_subtype_name(*subtype)
+    )]
+    DuplicateAppSubtype {
+        first: String,
+        second: String,
+        subtype: u8,
+    },
+    /// `gen_esp32part.py` (ESP-IDF v5.5.5, `PartitionTable.verify`, line 336) refuses a second
+    /// otadata partition; the bootloader would read the last one only (`bootloader_utility.c` of
+    /// v5.5.1, line 207).
+    #[error(
+        "partitions `{first}` and `{second}` are both otadata (type data, subtype ota), and the bootloader reads only the last of them; remove one of them"
+    )]
+    DuplicateOtadata { first: String, second: String },
+    /// `gen_esp32part.py` (ESP-IDF v5.5.5, `PartitionTable.verify`, line 343) requires 0x2000: two
+    /// 4 KiB sectors, one per OTA entry. A smaller one makes the bootloader refuse to boot
+    /// (`bootloader_utility.c` of v5.5.1, `bootloader_common_read_otadata`, lines 100-103; measured
+    /// with the bootloader inkemu ships, v5.5.2: "`ota_info` partition size 4096 is too small
+    /// (minimum 8192 bytes)", then a reset loop).
+    #[error(
+        "the otadata partition `{name}` is {size:#x} bytes, not the 0x2000 bytes of its two 4 KiB entries; set its size to 0x2000"
+    )]
+    OtadataSize { name: String, size: u32 },
+    /// The table has no slot for [`PartitionTable::application_slot`]. [`PartitionTable::to_bytes`]
+    /// does not refuse it, a table of data partitions being valid; a device profile does.
+    #[error(
+        "the table has neither a factory application nor an ota_0 slot, and inkemu writes the application to the factory slot, else to ota_0; add an app partition of subtype factory or ota_0"
+    )]
+    NoApplicationSlot,
     #[error(
         "entry {index} of the partition table is not a valid entry; use a table read from offset 0x8000 of a valid flash dump"
     )]
@@ -114,7 +173,15 @@ impl PartitionTable {
                 count: self.entries.len(),
             });
         }
-        for p in &self.entries {
+        for (index, p) in self.entries.iter().enumerate() {
+            if p.name.is_empty() {
+                return Err(PartitionError::EmptyName { row: index + 1 });
+            }
+            if p.name.contains('\0') {
+                return Err(PartitionError::NulInName {
+                    name: p.name.clone(),
+                });
+            }
             if p.name.len() >= NAME_LEN || !p.name.is_ascii() {
                 return Err(PartitionError::NameTooLong {
                     name: p.name.clone(),
@@ -165,6 +232,41 @@ impl PartitionTable {
                 });
             }
         }
+        self.validate_boot_roles()
+    }
+
+    /// The rows the bootloader looks up by subtype: one per application subtype, one otadata of
+    /// 0x2000 bytes. The table has at most [`MAX_ENTRIES`] rows, which bounds the pairs compared.
+    fn validate_boot_roles(&self) -> Result<(), PartitionError> {
+        let is_otadata = |p: &Partition| p.ptype == TYPE_DATA && p.subtype == SUBTYPE_DATA_OTA;
+        for (index, first) in self.entries.iter().enumerate() {
+            let later = &self.entries[index + 1..];
+            if first.ptype == TYPE_APP
+                && let Some(second) = later
+                    .iter()
+                    .find(|p| p.ptype == TYPE_APP && p.subtype == first.subtype)
+            {
+                return Err(PartitionError::DuplicateAppSubtype {
+                    first: first.name.clone(),
+                    second: second.name.clone(),
+                    subtype: first.subtype,
+                });
+            }
+            if is_otadata(first) {
+                if let Some(second) = later.iter().find(|p| is_otadata(p)) {
+                    return Err(PartitionError::DuplicateOtadata {
+                        first: first.name.clone(),
+                        second: second.name.clone(),
+                    });
+                }
+                if first.size != OTADATA_SIZE {
+                    return Err(PartitionError::OtadataSize {
+                        name: first.name.clone(),
+                        size: first.size,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -191,6 +293,20 @@ impl PartitionTable {
         out.extend(digest);
         out.resize(PARTITION_TABLE_LEN, ERASED);
         Ok(out)
+    }
+
+    /// The application the 2nd-stage bootloader starts when `otadata` is blank or absent: the
+    /// factory application, else the OTA slot `ota_0` (ESP-IDF v5.5.2,
+    /// `bootloader_utility.c`, `bootloader_utility_get_selected_boot_partition`: "Defaulting to
+    /// factory image", else "No factory image, trying OTA 0").
+    #[must_use]
+    pub fn application_slot(&self) -> Option<&Partition> {
+        let app = |subtype| {
+            self.entries
+                .iter()
+                .find(|p| p.ptype == TYPE_APP && p.subtype == subtype)
+        };
+        app(SUBTYPE_FACTORY).or_else(|| app(SUBTYPE_OTA_0))
     }
 
     /// Reads a table back, verifying its MD5 entry when one is present.
@@ -220,6 +336,73 @@ impl PartitionTable {
         }
         Ok(PartitionTable { entries })
     }
+}
+
+/// The application subtypes `gen_esp32part.py` (ESP-IDF v5.5.2, `SUBTYPES`) knows by name, with
+/// their values, besides the 16 OTA slots `ota_0` to `ota_15` ([`subtype_value`]).
+pub const APP_SUBTYPES: [(&str, u8); 2] = [("factory", SUBTYPE_FACTORY), ("test", SUBTYPE_TEST)];
+/// The data subtypes `gen_esp32part.py` (ESP-IDF v5.5.2, `SUBTYPES`) knows by name, with their
+/// values, in its order.
+pub const DATA_SUBTYPES: [(&str, u8); 11] = [
+    ("ota", SUBTYPE_DATA_OTA),
+    ("phy", 0x01),
+    ("nvs", SUBTYPE_NVS),
+    ("coredump", SUBTYPE_COREDUMP),
+    ("nvs_keys", 0x04),
+    ("efuse", 0x05),
+    ("undefined", 0x06),
+    ("esphttpd", 0x80),
+    ("fat", 0x81),
+    ("spiffs", SUBTYPE_SPIFFS),
+    ("littlefs", 0x83),
+];
+
+/// The value of the subtype `name` writes in a partition of type `ptype` ([`TYPE_APP`] or
+/// [`TYPE_DATA`]), as `gen_esp32part.py` reads a table row; `None` when the type has no subtype of
+/// that name. An OTA slot is written `ota_<n>`, `n` from 0 to 15 in decimal without a leading zero.
+#[must_use]
+pub fn subtype_value(ptype: u8, name: &str) -> Option<u8> {
+    let named = |table: &[(&str, u8)]| {
+        table
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|&(_, value)| value)
+    };
+    match ptype {
+        TYPE_APP => named(&APP_SUBTYPES).or_else(|| {
+            name.strip_prefix("ota_")
+                .and_then(|slot| slot.parse::<u8>().ok())
+                .filter(|&slot| slot < OTA_SLOTS && name == format!("ota_{slot}"))
+                .map(|slot| SUBTYPE_OTA_0 + slot)
+        }),
+        TYPE_DATA => named(&DATA_SUBTYPES),
+        _ => None,
+    }
+}
+
+/// The name `gen_esp32part.py` writes for `subtype` in a partition of type `ptype`, for a front end
+/// that shows the rows of a table; `None` when the value has no name.
+#[must_use]
+pub fn subtype_name(ptype: u8, subtype: u8) -> Option<String> {
+    let named = |table: &[(&str, u8)]| {
+        table
+            .iter()
+            .find(|&&(_, value)| value == subtype)
+            .map(|&(name, _)| name.to_owned())
+    };
+    match ptype {
+        TYPE_APP => named(&APP_SUBTYPES).or_else(|| {
+            (subtype.wrapping_sub(SUBTYPE_OTA_0) < OTA_SLOTS)
+                .then(|| format!("ota_{}", subtype - SUBTYPE_OTA_0))
+        }),
+        TYPE_DATA => named(&DATA_SUBTYPES),
+        _ => None,
+    }
+}
+
+/// How `gen_esp32part.py` writes an application subtype: its name, or its value when it has none.
+fn app_subtype_name(subtype: u8) -> String {
+    subtype_name(TYPE_APP, subtype).unwrap_or_else(|| format!("{subtype:#04x}"))
 }
 
 fn parse_entry(e: &[u8]) -> Partition {
@@ -262,6 +445,8 @@ mod tests {
     use super::*;
     use crate::chip::FlashSize;
 
+    // A test reads its fixture; the crate's code does no host I/O (`clippy.toml`).
+    #[allow(clippy::disallowed_methods)]
     fn golden() -> Vec<u8> {
         std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -290,12 +475,34 @@ mod tests {
     }
 
     #[test]
+    fn the_application_slot_is_the_factory_one_else_ota_0() {
+        assert_eq!(
+            xteink_x4_stock()
+                .application_slot()
+                .map(|p| p.name.as_str()),
+            Some("app0")
+        );
+        let mut with_factory = xteink_x4_stock();
+        with_factory.entries[3].subtype = SUBTYPE_FACTORY;
+        assert_eq!(
+            with_factory.application_slot().map(|p| p.name.as_str()),
+            Some("app1")
+        );
+        let mut ota_1_only = xteink_x4_stock();
+        ota_1_only.entries.remove(2);
+        assert_eq!(ota_1_only.application_slot(), None);
+    }
+
+    #[test]
     fn detects_corrupted_md5() {
         let mut b = golden();
         b[40] ^= 1; // inside entry 1
         assert_eq!(PartitionTable::parse(&b), Err(PartitionError::Md5Mismatch));
     }
 
+    /// Rows of `(name, type, offset, size)`: an application is a factory one, a data partition a
+    /// SPIFFS one, so that no row is otadata and no two rows share an application subtype unless
+    /// a test sets it.
     fn table(entries: Vec<(&str, u8, u32, u32)>) -> PartitionTable {
         PartitionTable {
             entries: entries
@@ -303,7 +510,11 @@ mod tests {
                 .map(|(n, t, o, s)| Partition {
                     name: n.into(),
                     ptype: t,
-                    subtype: 0,
+                    subtype: if t == TYPE_APP {
+                        SUBTYPE_FACTORY
+                    } else {
+                        SUBTYPE_SPIFFS
+                    },
                     offset: o,
                     size: s,
                     flags: 0,
@@ -355,8 +566,8 @@ mod tests {
     }
 
     /// Imperatives that open the remedy clause of a message (`"; <verb> ..."`).
-    const REMEDY_VERBS: [&str; 7] = [
-        "add", "remove", "shorten", "move", "shrink", "use", "rename",
+    const REMEDY_VERBS: [&str; 9] = [
+        "add", "remove", "shorten", "move", "shrink", "use", "rename", "give", "set",
     ];
 
     #[test]
@@ -365,6 +576,21 @@ mod tests {
             PartitionError::Empty,
             PartitionError::TooManyEntries { count: 99 },
             PartitionError::NameTooLong { name: "n".into() },
+            PartitionError::EmptyName { row: 2 },
+            PartitionError::NulInName { name: "n\0".into() },
+            PartitionError::DuplicateAppSubtype {
+                first: "a".into(),
+                second: "b".into(),
+                subtype: SUBTYPE_OTA_1,
+            },
+            PartitionError::DuplicateOtadata {
+                first: "a".into(),
+                second: "b".into(),
+            },
+            PartitionError::OtadataSize {
+                name: "n".into(),
+                size: 0x1000,
+            },
             PartitionError::Misaligned {
                 name: "n".into(),
                 offset: 1,
@@ -385,6 +611,7 @@ mod tests {
                 first: "a".into(),
                 second: "b".into(),
             },
+            PartitionError::NoApplicationSlot,
             PartitionError::BadEntryMagic { index: 3 },
             PartitionError::Md5Mismatch,
         ];
@@ -405,7 +632,7 @@ mod tests {
                 .map(|i| Partition {
                     name: format!("p{i}"),
                     ptype: TYPE_DATA,
-                    subtype: 0,
+                    subtype: SUBTYPE_SPIFFS,
                     offset: FIRST_PARTITION_OFFSET + 0x1000 * u32::try_from(i).unwrap(),
                     size: 0x1000,
                     flags: 0,
@@ -490,6 +717,228 @@ mod tests {
         assert_eq!(bytes.len(), PARTITION_TABLE_LEN);
         assert!(bytes[0xE0..].iter().all(|&b| b == ERASED));
         assert_eq!(PartitionTable::parse(&bytes).unwrap(), t);
+    }
+
+    #[test]
+    fn two_application_rows_of_one_subtype_are_refused_by_name() {
+        // ESP-IDF's bootloader keeps the last row of a subtype (`bootloader_utility.c`), the
+        // application slot is the first: they would disagree on what boots.
+        let mut two_ota_0 = xteink_x4_stock();
+        two_ota_0.entries[3].subtype = SUBTYPE_OTA_0;
+        assert_eq!(
+            two_ota_0.to_bytes(FlashSize::Mb16),
+            Err(PartitionError::DuplicateAppSubtype {
+                first: "app0".into(),
+                second: "app1".into(),
+                subtype: SUBTYPE_OTA_0
+            })
+        );
+        let mut two_factory = xteink_x4_stock();
+        two_factory.entries[2].subtype = SUBTYPE_FACTORY;
+        two_factory.entries[3].subtype = SUBTYPE_FACTORY;
+        let err = two_factory.to_bytes(FlashSize::Mb16).unwrap_err();
+        assert_eq!(
+            err,
+            PartitionError::DuplicateAppSubtype {
+                first: "app0".into(),
+                second: "app1".into(),
+                subtype: SUBTYPE_FACTORY
+            }
+        );
+        assert!(
+            err.to_string()
+                .starts_with("partitions `app0` and `app1` are both the factory application"),
+            "{err}"
+        );
+        let mut two_test = xteink_x4_stock();
+        two_test.entries[2].subtype = SUBTYPE_TEST;
+        two_test.entries[3].subtype = SUBTYPE_TEST;
+        assert!(matches!(
+            two_test.to_bytes(FlashSize::Mb16),
+            Err(PartitionError::DuplicateAppSubtype {
+                subtype: SUBTYPE_TEST,
+                ..
+            })
+        ));
+        for (subtype, name) in [
+            (SUBTYPE_OTA_0, "ota_0"),
+            (0x1F, "ota_15"),
+            (SUBTYPE_TEST, "test"),
+            (0x30, "0x30"),
+        ] {
+            assert_eq!(app_subtype_name(subtype), name);
+        }
+        // A data row of the same subtype value is another kind of partition.
+        let mut data_too = xteink_x4_stock();
+        data_too.entries[2].subtype = SUBTYPE_FACTORY;
+        assert_eq!(data_too.entries[1].subtype, SUBTYPE_FACTORY);
+        assert!(data_too.to_bytes(FlashSize::Mb16).is_ok());
+    }
+
+    #[test]
+    fn every_subtype_name_of_gen_esp32part_maps_to_its_value_and_back() {
+        // gen_esp32part.py v5.5.2, `SUBTYPES`: the names a table row may write, with their values.
+        let named: [(u8, &str, u8); 15] = [
+            (TYPE_APP, "factory", 0x00),
+            (TYPE_APP, "test", 0x20),
+            (TYPE_APP, "ota_0", 0x10),
+            (TYPE_APP, "ota_15", 0x1F),
+            (TYPE_DATA, "ota", 0x00),
+            (TYPE_DATA, "phy", 0x01),
+            (TYPE_DATA, "nvs", 0x02),
+            (TYPE_DATA, "coredump", 0x03),
+            (TYPE_DATA, "nvs_keys", 0x04),
+            (TYPE_DATA, "efuse", 0x05),
+            (TYPE_DATA, "undefined", 0x06),
+            (TYPE_DATA, "esphttpd", 0x80),
+            (TYPE_DATA, "fat", 0x81),
+            (TYPE_DATA, "spiffs", 0x82),
+            (TYPE_DATA, "littlefs", 0x83),
+        ];
+        for (ptype, name, value) in named {
+            assert_eq!(subtype_value(ptype, name), Some(value), "{name}");
+            assert_eq!(subtype_name(ptype, value).as_deref(), Some(name), "{name}");
+        }
+        for slot in 0..16u8 {
+            let name = format!("ota_{slot}");
+            assert_eq!(subtype_value(TYPE_APP, &name), Some(0x10 + slot));
+            assert_eq!(subtype_name(TYPE_APP, 0x10 + slot), Some(name));
+        }
+        // A name of the other type, a slot past the 16th, a slot written another way, a value
+        // without a name, a type without names.
+        for (ptype, name) in [
+            (TYPE_APP, "nvs"),
+            (TYPE_DATA, "factory"),
+            (TYPE_APP, "ota_16"),
+            (TYPE_APP, "ota_01"),
+            (TYPE_APP, "ota_"),
+            (TYPE_APP, "ota_+1"),
+            (0x40, "nvs"),
+        ] {
+            assert_eq!(subtype_value(ptype, name), None, "{name}");
+        }
+        for (ptype, value) in [(TYPE_APP, 0x30), (TYPE_DATA, 0x07), (0x40, 0x00)] {
+            assert_eq!(subtype_name(ptype, value), None, "{value:#04x}");
+        }
+        assert_eq!(
+            DATA_SUBTYPES.map(|(name, _)| name).join(", "),
+            "ota, phy, nvs, coredump, nvs_keys, efuse, undefined, esphttpd, fat, spiffs, littlefs"
+        );
+    }
+
+    #[test]
+    fn otadata_is_unique_and_two_sectors_long() {
+        let mut small = xteink_x4_stock();
+        small.entries[1].size = 0x1000;
+        let err = small.to_bytes(FlashSize::Mb16).unwrap_err();
+        assert_eq!(
+            err,
+            PartitionError::OtadataSize {
+                name: "otadata".into(),
+                size: 0x1000
+            }
+        );
+        assert!(
+            err.to_string().ends_with("; set its size to 0x2000"),
+            "{err}"
+        );
+        let mut large = xteink_x4_stock();
+        large.entries[0].size = 0x4000;
+        large.entries[1].offset = 0xD000;
+        large.entries[1].size = 0x3000;
+        assert!(matches!(
+            large.to_bytes(FlashSize::Mb16),
+            Err(PartitionError::OtadataSize { size: 0x3000, .. })
+        ));
+        let mut two = xteink_x4_stock();
+        two.entries[4].size -= 0x1_0000; // spiffs gives up its last 64 KiB
+        two.entries.push(Partition {
+            name: "otadata2".into(),
+            ptype: TYPE_DATA,
+            subtype: SUBTYPE_DATA_OTA,
+            offset: 0xFE_0000,
+            size: 0x2000,
+            flags: 0,
+        });
+        assert_eq!(
+            two.to_bytes(FlashSize::Mb16),
+            Err(PartitionError::DuplicateOtadata {
+                first: "otadata".into(),
+                second: "otadata2".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_name_is_neither_empty_nor_cut_by_a_nul() {
+        assert_eq!(
+            table(vec![("", TYPE_DATA, 0x9000, 0x1000)]).to_bytes(FlashSize::Mb4),
+            Err(PartitionError::EmptyName { row: 1 })
+        );
+        let err = table(vec![
+            ("nvs", TYPE_DATA, 0x9000, 0x1000),
+            ("a\0b", TYPE_DATA, 0xA000, 0x1000),
+        ])
+        .to_bytes(FlashSize::Mb4)
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PartitionError::NulInName {
+                name: "a\0b".into()
+            }
+        );
+        assert!(err.to_string().contains("`a\\0b`"), "{err}");
+    }
+
+    #[test]
+    fn a_name_of_sixteen_bytes_leaves_no_room_for_its_nul() {
+        let name = "a".repeat(NAME_LEN);
+        assert_eq!(
+            table(vec![(name.as_str(), TYPE_DATA, 0x9000, 0x1000)]).to_bytes(FlashSize::Mb4),
+            Err(PartitionError::NameTooLong { name })
+        );
+    }
+
+    #[test]
+    fn a_partition_ends_at_the_end_of_the_flash_or_before() {
+        let last_sector = 0x40_0000 - 0x1000;
+        assert!(
+            table(vec![("last", TYPE_DATA, last_sector, 0x1000)])
+                .to_bytes(FlashSize::Mb4)
+                .is_ok()
+        );
+        assert_eq!(
+            table(vec![("last", TYPE_DATA, last_sector, 0x2000)]).to_bytes(FlashSize::Mb4),
+            Err(PartitionError::BeyondFlash {
+                name: "last".into(),
+                end: 0x40_1000,
+                flash_bytes: 0x40_0000
+            })
+        );
+    }
+
+    #[test]
+    fn an_end_past_four_gib_is_computed_without_wrapping() {
+        assert_eq!(
+            table(vec![("top", TYPE_DATA, 0xFFFF_F000, 0x2000)]).to_bytes(FlashSize::Mb16),
+            Err(PartitionError::BeyondFlash {
+                name: "top".into(),
+                end: 0x1_0000_1000,
+                flash_bytes: 0x100_0000
+            })
+        );
+    }
+
+    #[test]
+    fn a_data_partition_starts_on_a_four_kib_boundary() {
+        assert_eq!(
+            table(vec![("half", TYPE_DATA, 0x9800, 0x800)]).to_bytes(FlashSize::Mb4),
+            Err(PartitionError::Misaligned {
+                name: "half".into(),
+                offset: 0x9800,
+                required: 0x1000
+            })
+        );
     }
 
     #[test]

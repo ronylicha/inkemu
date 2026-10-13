@@ -446,6 +446,9 @@ impl Lcg {
 /// `work` is the panic of the caller.
 ///
 /// `work` builds what it needs itself (a machine is not `Send`) and returns plain data.
+// Test support, compiled only for tests and the `test-support` feature: the crate itself starts
+// no thread (`clippy.toml`), a test of a loop that must end needs one to be able to give up.
+#[allow(clippy::disallowed_methods)]
 pub fn within<T: Send + 'static>(
     limit: std::time::Duration,
     unbounded: &str,

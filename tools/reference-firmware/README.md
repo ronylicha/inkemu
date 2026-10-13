@@ -12,7 +12,9 @@ and checks the images against `SHA256SUMS.output`. The ESP-IDF version is `ESP_I
 | `flash_nvs.bin` | `examples/storage/nvs/nvs_rw_value_cxx`: it keeps a restart counter in NVS, prints it, and restarts every eleven seconds | the single-app table of the build | `SHA256SUMS.inputs-nvs` |
 | `flash_nvs_ota.bin` | the same application | `tests/fixtures/partitions/x4-stock.bin`, the stock table of the X4: `otadata` and two application slots, so the bootloader writes `otadata` on the first boot | `SHA256SUMS.inputs-nvs` |
 
-Nothing built here is committed and nothing is executed on the host: the images are data for inkemu.
+One artefact of this build is committed: its bootloader, the one inkemu ships, under
+`third_party/esp-idf-bootloader/` (the same bytes, checked by the CI). Nothing else built here is
+committed, and nothing is executed on the host: the images are data for inkemu.
 `bootloader.nm`, `hello_world.nm` and `nvs_rw_value_cxx.nm` are symbol tables (text) that turn a
 program counter printed by inkemu into a function name: the last symbol whose address is not above
 the PC.
@@ -31,6 +33,18 @@ Run the tests that need the images, those of the machine and those of the `inkem
       INKEMU_NVS_OTA_FLASH="$PWD/target/reference-firmware/flash_nvs_ota.bin"
     cargo test --release -p soc-esp32c3 --test reference_boot -- --ignored
     cargo test --release -p emu-cli --test run_cli reference_firmware -- --ignored
+
+The tests of `inkemu run --firmware` boot the application images alone: they take them out of the
+merged images, from 0x10000, and check them against `SHA256SUMS.inputs` and `SHA256SUMS.inputs-nvs`
+before they run them. To boot one by hand, cut it out the same way (`hello_world.bin` is the 136,160
+bytes from 65,536 of `flash_hello.bin`, `nvs_rw_value_cxx.bin` the 161,312 bytes from 65,536 of
+`flash_nvs.bin`):
+
+    dd if=target/reference-firmware/flash_hello.bin of=hello_world.bin bs=4096 skip=65536 count=136160 iflag=skip_bytes,count_bytes
+    cargo run --release -p emu-cli -- run --device x4 --firmware hello_world.bin --max-time 12
+
+The bootloader of this build is the one inkemu ships (`third_party/esp-idf-bootloader/`): a test
+compares the first bytes of `flash_hello.bin` with it.
 
 The paths are absolute because each test binary runs in the directory of its own crate. Every test
 checks the SHA-256 of the image it is given before it runs it, and fails by naming the variable or

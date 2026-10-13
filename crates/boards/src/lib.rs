@@ -1,19 +1,26 @@
 //! Device profiles: what a board is made of, as data.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
+pub mod notices;
+
+use firmware::bootloader::{ShippedBootloader, shipped};
+use firmware::device::revision;
+use firmware::partition::{
+    DATA_SUBTYPES, Partition, PartitionError, PartitionTable, TYPE_APP, TYPE_DATA, subtype_value,
+};
+use firmware::{Bootloader, ChipId, ComposeError, ComposedFlash, Device, FlashSize, SpiMode};
 use serde::Deserialize;
 use soc_esp32c3::flash::{
     FlashConfig, FlashConfigError, FlashImageError, JedecId, MAX_FLASH_BYTES, MIB, MIN_FLASH_BYTES,
 };
+use soc_esp32c3::periph::Efuse;
 use soc_esp32c3::{ChipRevision, Esp32C3, RomImage, SocConfig};
 use std::fmt;
 
 /// How to write the `jedec_id` key, for the messages that refuse one.
 const JEDEC_ID_FORM: &str = "write jedec_id as 0xMMTTCC (manufacturer, type, capacity)";
 
-const BUILTIN: [(&str, &str); 2] = [
-    ("x3", include_str!("../profiles/x3.toml")),
-    ("x4", include_str!("../profiles/x4.toml")),
-];
+// `BUILTIN`: every `profiles/<id>.toml` as `(id, text)`, sorted by id (`build.rs`).
+include!(concat!(env!("OUT_DIR"), "/builtin_profiles.rs"));
 /// The ids of [`BUILTIN`], in the same order: derived, so there is one list to keep.
 const BUILTIN_IDS: [&str; BUILTIN.len()] = {
     let mut ids = [""; BUILTIN.len()];
@@ -31,6 +38,26 @@ pub enum SocFamily {
     Esp32C3,
 }
 
+impl SocFamily {
+    /// The chip id the images of this family declare in their header. The `match` is exhaustive
+    /// on purpose: a new family does not build until it has its chip id.
+    #[must_use]
+    pub const fn chip_id(self) -> ChipId {
+        match self {
+            SocFamily::Esp32C3 => ChipId::Esp32C3,
+        }
+    }
+}
+
+/// The flash-mode family of every profile, which picks the bootloader inkemu ships for it. A
+/// device whose flash needs QIO, or octal, adds a key to `[flash]` and a bootloader built for it.
+// ASSUMPTION: the SPI mode the flash of retail Xteink units is driven in is not established. The
+// header of every Xteink file seen says DIO, but the header of a QIO build says DIO too
+// (`docs/research/shipped-bootloader-and-firmware-composition.md`, section B, row `qio`), and the
+// report lists the mode as assumed (section H, open question 5). What would settle it: the
+// `SPI Mode` line of the boot log of a retail unit, or the bootloader of a dump of one.
+const FLASH_MODE: SpiMode = SpiMode::Dio;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceProfile {
     pub id: String,
@@ -38,6 +65,30 @@ pub struct DeviceProfile {
     pub soc: SocFamily,
     pub chip_revision: ChipRevision,
     pub flash: FlashConfig,
+    /// The partition table an application is booted with, checked when the profile is loaded:
+    /// against the flash, against what ESP-IDF's bootloader boots, and for the slot the
+    /// application is written to, which it always has.
+    pub partitions: PartitionTable,
+    /// The bootloader inkemu ships for this device, selected by its chip family, when it starts
+    /// the chip revision of the device; otherwise why no bootloader inkemu ships starts it. Such
+    /// a device is still described: it boots behind a bootloader its user gives (ADR 0005).
+    pub bootloader: Result<&'static ShippedBootloader, NoShippedBootloader>,
+}
+
+/// Why no bootloader inkemu ships can start a device: the one it ships for the chip family
+/// requires a later chip revision than the device's, and would reset the chip for ever (SB §B).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the bootloader inkemu ships for {} ({}) requires chip revision {} or later and the device is {}: it would reset the chip for ever, and inkemu ships no bootloader for an earlier revision; give a bootloader built for {} (`--bootloader`)",
+    bootloader.chip, bootloader.id, revision(bootloader.min_chip_revision),
+    revision(*device_revision), revision(*device_revision)
+)]
+pub struct NoShippedBootloader {
+    /// The bootloader inkemu ships for the chip family of the device, which does not start it;
+    /// its `min_chip_revision` is the lowest revision it starts.
+    pub bootloader: &'static ShippedBootloader,
+    /// The chip revision of the device, `major * 100 + minor`.
+    pub device_revision: u16,
 }
 
 /// Run-time choices that are not properties of the device.
@@ -49,7 +100,8 @@ pub struct MachineOptions {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProfileError {
-    #[error("{origin}: {detail}; correct the device profile")]
+    /// `detail` ends with a remedy: its own, or the general one ([`parse_detail`]).
+    #[error("{origin}: {detail}")]
     Parse { origin: String, detail: String },
     #[error(
         "{origin}: the profile has no [flash] table; add one with its two keys: size_mib ({sizes}) and jedec_id (0xMMTTCC, the three bytes the chip answers to a read-id command)",
@@ -66,6 +118,15 @@ pub enum ProfileError {
         expected: String,
         found: String,
     },
+    #[error("{origin}: the partition table of the profile is refused: {source}")]
+    Partitions {
+        origin: String,
+        source: PartitionError,
+    },
+    #[error(
+        "{origin}: inkemu ships no bootloader for {chip} with a flash driven in DIO; choose a chip family inkemu ships a bootloader for"
+    )]
+    NoBootloader { origin: String, chip: ChipId },
 }
 
 #[derive(Deserialize)]
@@ -77,6 +138,81 @@ struct RawProfile {
     soc: RawSoc,
     /// Optional here so that its absence gets a message that names the table and its keys.
     flash: Option<RawFlash>,
+    /// The `[[partition]]` rows, in the order of the table. None at all is refused as an empty
+    /// table, with the remedy of [`PartitionError::Empty`].
+    #[serde(default)]
+    partition: Vec<RawPartition>,
+}
+
+/// One `[[partition]]` row as written: `name`, `type`, `subtype`, `offset`, `size`, and the two
+/// flags of `gen_esp32part.py`, `encrypted` and `readonly`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedPartition {
+    name: String,
+    #[serde(rename = "type")]
+    kind: PartitionKind,
+    subtype: String,
+    offset: u32,
+    size: u32,
+    #[serde(default)]
+    encrypted: bool,
+    #[serde(default)]
+    readonly: bool,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PartitionKind {
+    App,
+    Data,
+}
+
+/// Flag bits of a partition entry (`gen_esp32part.py`).
+const FLAG_ENCRYPTED: u32 = 1 << 0;
+const FLAG_READONLY: u32 = 1 << 1;
+
+/// A `[[partition]]` row whose subtype is one its type has.
+#[derive(Deserialize)]
+#[serde(try_from = "UncheckedPartition")]
+struct RawPartition(Partition);
+
+impl TryFrom<UncheckedPartition> for RawPartition {
+    type Error = String;
+
+    fn try_from(raw: UncheckedPartition) -> Result<RawPartition, String> {
+        let ptype = match raw.kind {
+            PartitionKind::App => TYPE_APP,
+            PartitionKind::Data => TYPE_DATA,
+        };
+        let subtype = subtype_value(ptype, &raw.subtype).ok_or_else(|| {
+            let (kind, known) = match raw.kind {
+                PartitionKind::App => ("app", "factory, test, or ota_0 to ota_15".to_owned()),
+                PartitionKind::Data => (
+                    "data",
+                    DATA_SUBTYPES
+                        .iter()
+                        .map(|(name, _)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            };
+            format!(
+                "the subtype `{}` is not one of an {kind} partition; write one of {known}",
+                raw.subtype.escape_debug()
+            )
+        })?;
+        let flags = (if raw.encrypted { FLAG_ENCRYPTED } else { 0 })
+            | (if raw.readonly { FLAG_READONLY } else { 0 });
+        Ok(RawPartition(Partition {
+            name: raw.name,
+            ptype,
+            subtype,
+            offset: raw.offset,
+            size: raw.size,
+            flags,
+        }))
+    }
 }
 
 #[derive(Deserialize)]
@@ -226,6 +362,44 @@ fn chip_revision<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 
+/// The size of `flash` as an image header states it.
+fn header_flash_size(flash: FlashConfig) -> FlashSize {
+    let Some(size) = FlashSize::from_bytes(u64::from(flash.size())) else {
+        // INVARIANT: a `FlashConfig` is 1 to 16 MiB, a power of two, each of which a header can
+        // state (a test walks every valid size).
+        unreachable!("every modelled flash size has a header code")
+    };
+    size
+}
+
+/// The bootloader inkemu ships for `chip`, in the flash-mode family of every profile.
+fn select_bootloader(
+    origin: &str,
+    chip: ChipId,
+) -> Result<&'static ShippedBootloader, ProfileError> {
+    shipped(chip, FLASH_MODE).ok_or_else(|| ProfileError::NoBootloader {
+        origin: origin.to_owned(),
+        chip,
+    })
+}
+
+/// What a refusal of the TOML says, with one remedy. The deserializers of this crate end their
+/// message with a remedy of their own (`…; write size_mib as …`); the parser's messages (an unknown
+/// key, a missing one, broken TOML) have none and get the general one. The message is the last
+/// line: the lines above it show where in the file the problem is.
+fn parse_detail(error: &toml::de::Error) -> String {
+    let detail = error.to_string().trim_end().to_owned();
+    let has_remedy = detail
+        .lines()
+        .next_back()
+        .is_some_and(|message| message.contains("; "));
+    if has_remedy {
+        detail
+    } else {
+        format!("{detail}; correct the device profile")
+    }
+}
+
 #[must_use]
 pub fn builtin_ids() -> &'static [&'static str] {
     &BUILTIN_IDS
@@ -246,29 +420,67 @@ pub fn builtin(id: &str) -> Result<DeviceProfile, ProfileError> {
 
 impl DeviceProfile {
     /// # Errors
-    /// [`ProfileError::Parse`] with the line of the first problem, or
-    /// [`ProfileError::MissingFlash`] when the profile has no `[flash]` table.
+    /// [`ProfileError::Parse`] with the line of the first problem,
+    /// [`ProfileError::MissingFlash`] when the profile has no `[flash]` table,
+    /// [`ProfileError::Partitions`] when its table is refused, or [`ProfileError::NoBootloader`]
+    /// when inkemu ships no bootloader for its chip. A chip revision below the minimum of that
+    /// bootloader is no refusal: [`DeviceProfile::bootloader`] says so.
     pub fn from_toml(origin: &str, text: &str) -> Result<DeviceProfile, ProfileError> {
         let raw: RawProfile = toml::from_str(text).map_err(|e| ProfileError::Parse {
             origin: origin.to_owned(),
-            detail: e.to_string().trim_end().to_owned(),
+            detail: parse_detail(&e),
         })?;
         let RawFlash(flash) = raw.flash.ok_or_else(|| ProfileError::MissingFlash {
             origin: origin.to_owned(),
         })?;
+        let partitions = PartitionTable {
+            entries: raw.partition.into_iter().map(|RawPartition(p)| p).collect(),
+        };
+        // The table is compiled once, to be refused here with the profile it belongs to rather
+        // than when a firmware is composed.
+        partitions
+            .to_bytes(header_flash_size(flash))
+            .map_err(|source| ProfileError::Partitions {
+                origin: origin.to_owned(),
+                source,
+            })?;
+        // Refused here rather than when a firmware is composed: a device a front end lists can
+        // always be given an application.
+        if partitions.application_slot().is_none() {
+            return Err(ProfileError::Partitions {
+                origin: origin.to_owned(),
+                source: PartitionError::NoApplicationSlot,
+            });
+        }
+        let shipped = select_bootloader(origin, raw.soc.family.chip_id())?;
+        let device_revision = raw.soc.revision.full();
+        // A chip below the minimum of the shipped bootloader still loads: a board of that
+        // revision exists, and boots behind a bootloader its user gives. A front end shows the
+        // state, never a bootloader that does not start the device (ADR 0005).
+        let bootloader = if shipped.min_chip_revision > device_revision {
+            Err(NoShippedBootloader {
+                bootloader: shipped,
+                device_revision,
+            })
+        } else {
+            Ok(shipped)
+        };
         Ok(DeviceProfile {
             id: raw.id,
             name: raw.name,
             soc: raw.soc.family,
             chip_revision: raw.soc.revision,
             flash,
+            partitions,
+            bootloader,
         })
     }
 
     /// Like [`DeviceProfile::from_toml`], and checks that the profile carries the id it is loaded under.
     ///
     /// # Errors
-    /// [`ProfileError::Parse`], or [`ProfileError::IdMismatch`] when the ids differ.
+    /// [`ProfileError::Parse`] or [`ProfileError::MissingFlash`] as [`DeviceProfile::from_toml`]
+    /// says, or [`ProfileError::IdMismatch`] when the ids differ.
     pub fn from_named_toml(
         expected_id: &str,
         origin: &str,
@@ -284,6 +496,50 @@ impl DeviceProfile {
                 found: profile.id,
             })
         }
+    }
+
+    /// The device as the checks of a bootloader and an application see it: its chip, its
+    /// revision, the eFuse block revision its chip reports, its flash size.
+    #[must_use]
+    pub fn firmware_device(&self) -> Device {
+        Device {
+            chip: self.soc.chip_id(),
+            chip_revision: self.chip_revision.full(),
+            efuse_block_revision: Efuse::new(self.chip_revision).block_revision(),
+            flash_size: header_flash_size(self.flash),
+        }
+    }
+
+    /// The flash this device boots `application` from: the bootloader inkemu ships for it (or
+    /// `bootloader`, when one is given), the partition table of the profile, the application in
+    /// the slot the bootloader starts, and nothing else (`firmware::compose`).
+    ///
+    /// # Errors
+    /// [`ComposeError`] when the application or the bootloader is refused, and
+    /// [`ComposeError::ShippedNeedsLaterChip`] when no bootloader is given and none inkemu ships
+    /// starts the device ([`DeviceProfile::bootloader`]).
+    pub fn compose_flash(
+        &self,
+        application: &[u8],
+        bootloader: Option<&[u8]>,
+    ) -> Result<ComposedFlash, ComposeError> {
+        let bootloader = match (bootloader, self.bootloader) {
+            (Some(given), _) => Bootloader::Given(given),
+            (None, Ok(shipped)) => Bootloader::Shipped(shipped),
+            (None, Err(none)) => {
+                return Err(ComposeError::ShippedNeedsLaterChip {
+                    id: none.bootloader.id,
+                    required: none.bootloader.min_chip_revision,
+                    device: none.device_revision,
+                });
+            }
+        };
+        firmware::compose(
+            &self.firmware_device(),
+            &self.partitions,
+            application,
+            bootloader,
+        )
     }
 
     #[must_use]
@@ -326,19 +582,39 @@ mod tests {
     use super::*;
     use soc_esp32c3::test_support::{HANG, flat_rom};
 
-    const VALID: &str = "id = \"demo\"\nname = \"Demo board\"\n\n[soc]\nfamily = \"esp32c3\"\nrevision = \"v1.1\"\n\n[flash]\nsize_mib = 4\njedec_id = 0xEF4016\n";
+    const VALID: &str = "id = \"demo\"\nname = \"Demo board\"\n\n[soc]\nfamily = \"esp32c3\"\nrevision = \"v1.1\"\n\n[flash]\nsize_mib = 4\njedec_id = 0xEF4016\n\n[[partition]]\nname = \"app\"\ntype = \"app\"\nsubtype = \"factory\"\noffset = 0x10000\nsize = 0x10000\n";
 
+    /// A device is one file of `profiles/`: the built-in list is every `*.toml` there, by name.
     #[test]
-    fn builtin_profiles_load_and_carry_their_own_id() {
-        assert_eq!(builtin_ids(), ["x3", "x4"]);
+    fn the_built_in_profiles_are_the_files_of_the_profiles_directory_in_order() {
+        // The test reads the directory the build script reads: test code only.
+        #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+        let mut files: Vec<String> =
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/profiles"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+                .map(|path| path.file_stem().unwrap().to_str().unwrap().to_owned())
+                .collect();
+        files.sort();
+        assert_eq!(builtin_ids(), files);
         assert_eq!(
             builtin_ids(),
             BUILTIN.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             "one list of devices"
         );
+    }
+
+    #[test]
+    fn builtin_profiles_load_and_carry_their_own_id() {
         for id in builtin_ids() {
             let profile = builtin(id).unwrap();
             assert_eq!(profile.id, *id);
+            assert!(!profile.name.is_empty(), "{id}");
+        }
+        // The two Xteink devices of spec §2.
+        for id in ["x3", "x4"] {
+            let profile = builtin(id).unwrap();
             assert_eq!(profile.soc, SocFamily::Esp32C3);
             assert_eq!(profile.chip_revision, ChipRevision::V0_3);
             assert!(profile.name.starts_with("Xteink"));
@@ -349,6 +625,333 @@ mod tests {
                 "decision D2"
             );
         }
+    }
+
+    #[test]
+    fn every_builtin_profile_states_its_partition_table_and_selects_a_bootloader() {
+        let x4 = builtin("x4").unwrap();
+        assert_eq!(
+            x4.partitions.to_bytes(FlashSize::Mb16).unwrap(),
+            include_bytes!("../../../tests/fixtures/partitions/x4-stock.bin"),
+            "the stock table of the X4, byte for byte"
+        );
+        // gen_esp32part.py v5.5.2 on the X3 layout with the X4 names (SB §F, measured).
+        let x3 = builtin("x3").unwrap();
+        assert_eq!(
+            firmware::bootloader::sha256_hex(&x3.partitions.to_bytes(FlashSize::Mb16).unwrap()),
+            "334c9553e2799107ed33eb9057f8661c6dd757c662a661edac6c73bb99ae7d5e"
+        );
+        // Every bundled profile, whatever file added it: a table that compiles for its flash, the
+        // slot an application is written to, and a bootloader inkemu ships for its chip.
+        for id in builtin_ids() {
+            let profile = builtin(id).unwrap();
+            let flash_size = profile.firmware_device().flash_size;
+            assert!(profile.partitions.to_bytes(flash_size).is_ok(), "{id}");
+            assert!(profile.partitions.application_slot().is_some(), "{id}");
+            let shipped = profile
+                .bootloader
+                .unwrap_or_else(|none| panic!("{id}: a bootloader that starts it: {none}"));
+            assert_eq!(
+                shipped.chip,
+                profile.soc.chip_id(),
+                "{id}: a bootloader for its chip"
+            );
+        }
+        for id in ["x3", "x4"] {
+            let profile = builtin(id).unwrap();
+            assert_eq!(profile.bootloader, Ok(&firmware::SHIPPED[0]), "{id}");
+            let slot = profile.partitions.application_slot().unwrap();
+            assert_eq!(
+                (slot.name.as_str(), slot.offset),
+                ("app0", 0x1_0000),
+                "{id}"
+            );
+            assert_eq!(
+                profile.firmware_device(),
+                Device {
+                    chip: ChipId::Esp32C3,
+                    chip_revision: 3,
+                    efuse_block_revision: 102,
+                    flash_size: FlashSize::Mb16
+                },
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chip_family_without_a_shipped_bootloader_is_refused_by_name() {
+        let err = select_bootloader("demo.toml", ChipId::Esp32S3).unwrap_err();
+        assert_eq!(
+            err,
+            ProfileError::NoBootloader {
+                origin: "demo.toml".into(),
+                chip: ChipId::Esp32S3
+            }
+        );
+        assert!(err.to_string().contains("ESP32-S3"), "{err}");
+        assert!(select_bootloader("demo.toml", ChipId::Esp32C3).is_ok());
+    }
+
+    /// The X4 with a v0.2 chip: the bootloader inkemu ships for the ESP32-C3 requires v0.3.
+    fn x4_at_v0_2() -> DeviceProfile {
+        let text = include_str!("../profiles/x4.toml").replace(
+            "revision = \"v0.3\"",
+            "revision = \"v0.2\"\n# an earlier chip",
+        );
+        assert!(
+            text.contains("an earlier chip"),
+            "the revision line was found"
+        );
+        DeviceProfile::from_toml("x4-v0.2.toml", &text).unwrap()
+    }
+
+    #[test]
+    fn a_profile_whose_chip_is_older_than_its_shipped_bootloader_loads_and_says_none_starts_it() {
+        let old = x4_at_v0_2();
+        let none = old.bootloader.unwrap_err();
+        assert_eq!(
+            none,
+            NoShippedBootloader {
+                bootloader: &firmware::SHIPPED[0],
+                device_revision: 2,
+            }
+        );
+        assert_eq!(
+            none.to_string(),
+            "the bootloader inkemu ships for ESP32-C3 (esp-idf-v5.5.2-esp32c3-dio) requires chip revision v0.3 or later and the device is v0.2: it would reset the chip for ever, and inkemu ships no bootloader for an earlier revision; give a bootloader built for v0.2 (`--bootloader`)"
+        );
+        // The revision the bootloader requires is the first it starts.
+        let at_the_minimum =
+            DeviceProfile::from_toml("x4.toml", include_str!("../profiles/x4.toml"));
+        assert_eq!(
+            at_the_minimum.unwrap().bootloader,
+            Ok(&firmware::SHIPPED[0])
+        );
+    }
+
+    #[test]
+    fn a_partition_row_is_read_with_its_subtype_and_flags() {
+        // The factory row after it is the slot an application is written to.
+        let text = VALID
+            .replace("subtype = \"factory\"", "subtype = \"ota_15\"")
+            .replace(
+                "size = 0x10000\n",
+                "size = 0x10000\nencrypted = true\nreadonly = true\n",
+            )
+            + &partition_row("factory", "app", "factory", 0x2_0000, 0x1_0000);
+        let profile = DeviceProfile::from_toml("demo.toml", &text).unwrap();
+        let entry = &profile.partitions.entries[0];
+        assert_eq!(
+            (entry.ptype, entry.subtype, entry.flags),
+            (TYPE_APP, 0x1F, 0b11)
+        );
+    }
+
+    #[test]
+    fn an_unknown_subtype_is_refused_with_its_line_and_the_known_ones() {
+        for bad in ["ota_16", "ota_07", "nvs", "ota-1", ""] {
+            let err =
+                error_for(&VALID.replace("subtype = \"factory\"", &format!("subtype = \"{bad}\"")));
+            assert!(
+                err.contains("line 12")
+                    && err.contains("is not one of an app partition; write one of factory, test, or ota_0 to ota_15"),
+                "{bad}: {err}"
+            );
+        }
+        let err = error_for(
+            &VALID
+                .replace("type = \"app\"", "type = \"data\"")
+                .replace("subtype = \"factory\"", "subtype = \"ota_0\""),
+        );
+        assert!(
+            err.contains("write one of ota, phy, nvs, coredump"),
+            "{err}"
+        );
+        let err = error_for(&VALID.replace("type = \"app\"", "type = \"bootloader\""));
+        assert!(err.contains("line 14") && err.contains("`app`"), "{err}");
+    }
+
+    #[test]
+    fn a_partition_table_that_does_not_fit_the_flash_is_refused_at_load() {
+        let beyond = VALID.replace("size = 0x10000", "size = 0x400000");
+        assert!(matches!(
+            DeviceProfile::from_toml("demo.toml", &beyond),
+            Err(ProfileError::Partitions {
+                source: PartitionError::BeyondFlash { .. },
+                ..
+            })
+        ));
+        let misaligned = VALID.replace("offset = 0x10000", "offset = 0x11000");
+        let err = DeviceProfile::from_toml("demo.toml", &misaligned).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProfileError::Partitions {
+                    source: PartitionError::Misaligned { .. },
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().starts_with("demo.toml: the partition table of the profile is refused: partition `app` starts at 0x11000"),
+            "{err}"
+        );
+        let overlap = format!(
+            "{VALID}\n[[partition]]\nname = \"nvs\"\ntype = \"data\"\nsubtype = \"nvs\"\noffset = 0x18000\nsize = 0x1000\n"
+        );
+        assert!(matches!(
+            DeviceProfile::from_toml("demo.toml", &overlap),
+            Err(ProfileError::Partitions {
+                source: PartitionError::Overlap { .. },
+                ..
+            })
+        ));
+        let none = VALID.split("\n[[partition]]").next().unwrap();
+        assert!(matches!(
+            DeviceProfile::from_toml("demo.toml", none),
+            Err(ProfileError::Partitions {
+                source: PartitionError::Empty,
+                ..
+            })
+        ));
+    }
+
+    /// A `[[partition]]` row of `VALID`'s flash.
+    fn partition_row(name: &str, kind: &str, subtype: &str, offset: u32, size: u32) -> String {
+        format!(
+            "\n[[partition]]\nname = \"{name}\"\ntype = \"{kind}\"\nsubtype = \"{subtype}\"\noffset = {offset:#x}\nsize = {size:#x}\n"
+        )
+    }
+
+    #[test]
+    fn a_table_without_the_slot_the_application_is_written_to_is_refused_at_load() {
+        let head = VALID.split("\n[[partition]]").next().unwrap();
+        let nvs = partition_row("nvs", "data", "nvs", 0x9000, 0x5000);
+        let otadata = partition_row("otadata", "data", "ota", 0xE000, 0x2000);
+        let app = |name: &str, subtype: &str, offset: u32| {
+            partition_row(name, "app", subtype, offset, 0x10_0000)
+        };
+        for rows in [
+            vec![nvs.clone(), otadata.clone()],
+            vec![
+                otadata.clone(),
+                app("app1", "ota_1", 0x1_0000),
+                app("app2", "ota_2", 0x11_0000),
+            ],
+            vec![app("t", "test", 0x1_0000)],
+        ] {
+            let text = format!("{head}{}", rows.concat());
+            let err = DeviceProfile::from_toml("demo.toml", &text).unwrap_err();
+            assert_eq!(
+                err,
+                ProfileError::Partitions {
+                    origin: "demo.toml".into(),
+                    source: PartitionError::NoApplicationSlot
+                },
+                "{text}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "demo.toml: the partition table of the profile is refused: the table has neither a factory application nor an ota_0 slot, and inkemu writes the application to the factory slot, else to ota_0; add an app partition of subtype factory or ota_0"
+            );
+        }
+        let text = format!("{head}{nvs}{otadata}{}", app("app0", "ota_0", 0x1_0000));
+        assert!(DeviceProfile::from_toml("demo.toml", &text).is_ok());
+    }
+
+    #[test]
+    fn a_table_the_shipped_bootloader_would_not_boot_is_refused_at_load() {
+        let head = VALID
+            .split("\n[[partition]]")
+            .next()
+            .unwrap()
+            .replace("size_mib = 4", "size_mib = 16")
+            .replace("0xEF4016", "0x9D6018");
+        let nvs = partition_row("nvs", "data", "nvs", 0x9000, 0x5000);
+        let otadata = partition_row("otadata", "data", "ota", 0xE000, 0x2000);
+        let app = |name: &str, subtype: &str, offset: u32| {
+            partition_row(name, "app", subtype, offset, 0x10_0000)
+        };
+        let refusal = |rows: &[&String]| {
+            let text = format!(
+                "{head}{}",
+                rows.iter().map(|r| r.as_str()).collect::<String>()
+            );
+            match DeviceProfile::from_toml("demo.toml", &text) {
+                Err(ProfileError::Partitions { source, .. }) => source,
+                other => panic!("{other:?}"),
+            }
+        };
+        let (app0, app1) = (
+            app("app0", "ota_0", 0x1_0000),
+            app("app1", "ota_0", 0x11_0000),
+        );
+        assert_eq!(
+            refusal(&[&nvs, &otadata, &app0, &app1]),
+            PartitionError::DuplicateAppSubtype {
+                first: "app0".into(),
+                second: "app1".into(),
+                subtype: 0x10
+            }
+        );
+        let (f1, f2) = (
+            app("f1", "factory", 0x1_0000),
+            app("f2", "factory", 0x11_0000),
+        );
+        assert!(matches!(
+            refusal(&[&nvs, &otadata, &f1, &f2]),
+            PartitionError::DuplicateAppSubtype { subtype: 0, .. }
+        ));
+        let small = partition_row("otadata", "data", "ota", 0xE000, 0x1000);
+        assert_eq!(
+            refusal(&[&nvs, &small, &app0]),
+            PartitionError::OtadataSize {
+                name: "otadata".into(),
+                size: 0x1000
+            }
+        );
+    }
+
+    #[test]
+    fn every_modelled_flash_size_has_a_header_code() {
+        for mib in [1, 2, 4, 8, 16] {
+            let config = FlashConfig::new(
+                mib * MIB,
+                JedecId::from_u24(0xEF_4000 | (mib.trailing_zeros() + 0x14)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(header_flash_size(config).megabytes(), mib);
+        }
+    }
+
+    #[test]
+    fn a_profile_composes_its_flash_with_its_bootloader_or_a_given_one() {
+        use firmware::builder::{ImageSpec, bootloader_spec, build_image};
+        let x4 = builtin("x4").unwrap();
+        let app = build_image(&ImageSpec::default());
+        let flash = x4.compose_flash(&app, None).unwrap();
+        let shipped = x4.bootloader.unwrap();
+        assert_eq!(&flash.bytes[..shipped.bytes.len()], shipped.bytes);
+        assert_eq!(&flash.bytes[0x1_0000..0x1_0000 + app.len()], &app[..]);
+        let given = build_image(&bootloader_spec());
+        let flash = x4.compose_flash(&app, Some(&given)).unwrap();
+        assert_eq!(&flash.bytes[..given.len()], &given[..]);
+        // A chip below the minimum of the shipped bootloader: refused with no bootloader given,
+        // composed behind a given bootloader that accepts it (its minimum revision is v0.0).
+        let old = x4_at_v0_2();
+        assert_eq!(
+            old.compose_flash(&app, None).unwrap_err(),
+            ComposeError::ShippedNeedsLaterChip {
+                id: "esp-idf-v5.5.2-esp32c3-dio",
+                required: 3,
+                device: 2
+            }
+        );
+        let flash = old.compose_flash(&app, Some(&given)).unwrap();
+        assert_eq!(&flash.bytes[..given.len()], &given[..]);
+        assert_eq!(&flash.bytes[0x1_0000..0x1_0000 + app.len()], &app[..]);
     }
 
     #[test]
@@ -377,6 +980,28 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_profile_states_one_remedy() {
+        // A refusal of this crate carries its own remedy, and no other is added after it.
+        let size = error_for(&VALID.replace("size_mib = 4", "size_mib = 3"));
+        assert!(
+            size.ends_with("; write size_mib as 1, 2, 4, 8 or 16"),
+            "{size}"
+        );
+        assert!(!size.contains("correct the device profile"), "{size}");
+        // A refusal of the parser has none, and gets the general one, once.
+        let key = error_for(&format!("{VALID}x = 1\n"));
+        assert!(
+            key.contains("unknown field `x`") && key.ends_with("; correct the device profile"),
+            "{key}"
+        );
+        assert_eq!(
+            key.matches("; correct the device profile").count(),
+            1,
+            "{key}"
+        );
+    }
+
+    #[test]
     fn malformed_revision_points_at_its_line_and_says_how_to_write_it() {
         let err = error_for(&VALID.replace("v1.1", "1.1"));
         assert!(
@@ -398,7 +1023,7 @@ mod tests {
     fn unknown_key_is_rejected_rather_than_ignored() {
         let err = error_for(&format!("{VALID}flash_size = \"16MB\"\n"));
         assert!(
-            err.contains("flash_size") && err.contains("line 11"),
+            err.contains("flash_size") && err.contains("line 18"),
             "{err}"
         );
     }

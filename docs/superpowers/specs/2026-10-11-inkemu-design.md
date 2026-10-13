@@ -118,6 +118,8 @@ Ajouter un appareil revient à écrire un profil, plus le modèle d'une puce si 
 | Fichiers SVD | Espressif | Licence à vérifier avec la ROM ; générés en Rust au build |
 | QEMU (fork Espressif) | GPL | **Uniquement outil de test** (oracle lockstep), jamais lié ni distribué |
 
+L'[ADR 0005](../../adr/0005-bootloader-embarque.md) précise la ligne du bootloader : un binaire par famille de puce, et par famille de mode de flash quand un profil en demande une autre, choisi par le profil et remplaçable.
+
 ---
 
 ## 4. Cœur d'exécution et timing

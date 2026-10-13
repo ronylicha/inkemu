@@ -80,6 +80,20 @@ impl FlashSize {
         })
     }
 
+    /// The code of the header nibble: the inverse of [`FlashSize::from_nibble`].
+    #[must_use]
+    pub const fn nibble(self) -> u8 {
+        self as u8
+    }
+
+    /// The flash size of exactly `bytes` bytes, if it is one the header can state.
+    #[must_use]
+    pub fn from_bytes(bytes: u64) -> Option<FlashSize> {
+        (0..=7)
+            .filter_map(FlashSize::from_nibble)
+            .find(|size| size.bytes() == bytes)
+    }
+
     #[must_use]
     pub const fn megabytes(self) -> u32 {
         1 << (self as u32)
@@ -173,7 +187,11 @@ mod tests {
             let size = FlashSize::from_nibble(nibble).unwrap();
             assert_eq!(size.megabytes(), mb);
             assert_eq!(size.bytes(), u64::from(mb) * 1024 * 1024);
+            assert_eq!(size.nibble(), nibble);
+            assert_eq!(FlashSize::from_bytes(size.bytes()), Some(size));
         }
+        assert_eq!(FlashSize::from_bytes(3 << 20), None);
+        assert_eq!(FlashSize::from_bytes(0), None);
         assert_eq!(FlashSize::from_nibble(8), None);
     }
 

@@ -73,6 +73,17 @@ pub fn build_image(spec: &ImageSpec) -> Vec<u8> {
     out
 }
 
+/// Recomputes the SHA-256 appended to `image`, over every byte before it: a test that changes a
+/// header byte (the digest covers the header) keeps the image valid with this.
+///
+/// # Panics
+/// When `image` is shorter than a digest.
+pub fn refresh_digest(image: &mut [u8]) {
+    let hashed = image.len() - 32;
+    let digest = Sha256::digest(&image[..hashed]);
+    image[hashed..].copy_from_slice(&digest);
+}
+
 /// An erased flash byte, which fills the gap between the image and the partition table.
 const ERASED: u8 = 0xFF;
 
@@ -98,6 +109,39 @@ pub fn build_flash_image(spec: &ImageSpec) -> Vec<u8> {
     };
     flash.extend(table);
     flash
+}
+
+/// An 80-byte `esp_bootloader_desc_t` with the given strings (truncated to their field sizes).
+#[must_use]
+pub fn bootloader_desc_bytes(idf_ver: &str, date_time: &str) -> Vec<u8> {
+    let mut d = vec![0u8; 80];
+    d[0] = crate::bootloader::BOOTLOADER_DESC_MAGIC;
+    d[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let put = |d: &mut Vec<u8>, at: usize, len: usize, s: &str| {
+        let b = s.as_bytes();
+        let n = b.len().min(len - 1);
+        d[at..at + n].copy_from_slice(&b[..n]);
+    };
+    put(&mut d, 8, 32, idf_ver);
+    put(&mut d, 40, 24, date_time);
+    d
+}
+
+/// A small bootloader: its descriptor in DRAM, then four bytes of code in IRAM, at the addresses
+/// of ESP-IDF's (`docs/research/flash-writes-and-crosspoint-boot.md`, §I).
+#[must_use]
+pub fn bootloader_spec() -> ImageSpec {
+    ImageSpec {
+        entry: 0x403C_BF10,
+        segments: vec![
+            (
+                0x3FCD_5820,
+                bootloader_desc_bytes("v5.5.2-test", "Oct 13 2026 10:00:00"),
+            ),
+            (0x403C_BF10, vec![0x6F, 0, 0, 0]),
+        ],
+        ..ImageSpec::default()
+    }
 }
 
 /// A 256-byte `esp_app_desc_t` with the given strings (truncated to their field sizes).
@@ -138,6 +182,19 @@ mod tests {
             PartitionTable::parse(&flash[0x8000..]),
             Ok(xteink_x4_stock())
         );
+    }
+
+    #[test]
+    fn a_header_byte_changed_and_the_digest_refreshed_is_a_valid_image() {
+        use crate::image::FirmwareImage;
+        let mut image = build_image(&ImageSpec::default());
+        image[15..17].copy_from_slice(&4u16.to_le_bytes());
+        assert!(
+            FirmwareImage::parse(&image).is_err(),
+            "the digest covers the header"
+        );
+        refresh_digest(&mut image);
+        assert_eq!(FirmwareImage::parse(&image).unwrap().min_chip_rev_full, 4);
     }
 
     #[test]

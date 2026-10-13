@@ -141,6 +141,8 @@ const PARTITION_TABLE_OFFSET: usize = 0x8000;
 const OTADATA_OFFSET: u32 = 0xE000;
 
 /// The ESP32-C3 (rev 3) mask ROM named by `INKEMU_ROM_ELF_DIR`; every failure says why and what to do.
+/// The test reads a file the environment names; the crate's code does no host I/O (`clippy.toml`).
+#[allow(clippy::disallowed_methods)]
 fn rom() -> RomImage {
     let dir = std::env::var("INKEMU_ROM_ELF_DIR").unwrap_or_else(|e| {
         panic!(
@@ -170,7 +172,9 @@ fn reference_flash() -> Vec<u8> {
 }
 
 /// The image `file` of `tools/reference-firmware/build.sh`, named by the environment variable
-/// `variable` and accepted only if its SHA-256 is `sha256`.
+/// `variable` and accepted only if its SHA-256 is `sha256`. The test reads a file the environment
+/// names; the crate's code does no host I/O (`clippy.toml`).
+#[allow(clippy::disallowed_methods)]
 fn pinned_image(variable: &str, file: &str, sha256: &str) -> Vec<u8> {
     let path = std::env::var(variable).unwrap_or_else(|e| {
         panic!(

@@ -18,3 +18,53 @@ size_mib = 16
 # (docs/research/esp32c3-bootloader-accesses.md, section 2.1 item 5). `esptool.py flash_id` on a
 # unit settles it.
 jedec_id = 0x9D6018
+
+# The partition table the device boots with: `inkemu run --firmware` writes it at 0x8000 and puts
+# the application in the slot the bootloader starts on a blank otadata (the factory application,
+# else ota_0). Offsets and sizes are those of real X3 units: xteink-flasher refuses to flash an X3
+# whose table differs in type, subtype, offset or size
+# (docs/research/shipped-bootloader-and-firmware-composition.md, section F).
+# ASSUMPTION: the names, the flags and the MD5 entry of the X3 table are not established; the names
+# are those of the X4 table, no flag is set, and the table ends with its MD5 entry as
+# gen_esp32part.py writes it. A dump of the first 0x9000 bytes of a unit settles it.
+[[partition]]
+name = "nvs"
+type = "data"
+subtype = "nvs"
+offset = 0x9000
+size = 0x5000
+
+[[partition]]
+name = "otadata"
+type = "data"
+subtype = "ota"
+offset = 0xE000
+size = 0x2000
+
+[[partition]]
+name = "app0"
+type = "app"
+subtype = "ota_0"
+offset = 0x10000
+size = 0x770000
+
+[[partition]]
+name = "app1"
+type = "app"
+subtype = "ota_1"
+offset = 0x780000
+size = 0x770000
+
+[[partition]]
+name = "spiffs"
+type = "data"
+subtype = "spiffs"
+offset = 0xEF0000
+size = 0x100000
+
+[[partition]]
+name = "coredump"
+type = "data"
+subtype = "coredump"
+offset = 0xFF0000
+size = 0x10000
