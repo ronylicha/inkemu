@@ -924,6 +924,12 @@ mod tests {
         run_to(ctx, &mut usb, opened + HOST_LATENCY);
         assert_eq!(usb.take_tx(ctx), b"line\n");
         assert_eq!(read_packet(ctx, &mut usb), b"in");
+        assert_eq!(
+            usb.read(ctx, INT_RAW).unwrap() & USB_BUS_RESET,
+            0,
+            "opening the port is no attach"
+        );
+        assert_eq!(usb.read(ctx, FRAM_NUM), Some(200), "nor a new first frame");
         // The port closes: a packet committed then waits again.
         let closed = ctx.now() + 1;
         usb.set_host(ctx, closed, UsbHost::Attached);
@@ -985,6 +991,62 @@ mod tests {
         run_to(ctx, &mut usb, Cycles(2 * FRAME));
         assert_eq!(usb.host(ctx), UsbHost::Absent);
         assert_eq!(usb.host_changes_pending(), 0);
+    }
+
+    #[test]
+    fn a_host_that_closes_its_port_at_the_instant_it_would_take_a_packet_does_not_take_it() {
+        // A change of the host comes first at an instant it shares with the taking of a packet.
+        let ctx = &mut Ctx::default();
+        let mut usb = open();
+        send(ctx, &mut usb, b"x");
+        usb.write(ctx, EP1_CONF, WR_DONE);
+        usb.set_host(ctx, Cycles(HOST_LATENCY), UsbHost::Attached);
+        run_to(ctx, &mut usb, Cycles(10 * HOST_LATENCY));
+        assert_eq!(usb.take_tx(ctx), [], "the port closed first");
+        assert_eq!(usb.read(ctx, EP1_CONF), Some(0), "the packet still waits");
+        assert_eq!(usb.take_written(), b"x");
+    }
+
+    #[test]
+    fn two_changes_of_the_host_at_the_same_instant_apply_in_the_order_given() {
+        // A cable pulled out and plugged in again at one step of a script.
+        let ctx = &mut Ctx::default();
+        let mut usb = open();
+        let instant = Cycles(5 * FRAME);
+        usb.set_host(ctx, instant, UsbHost::Absent);
+        usb.set_host(ctx, instant, UsbHost::Open);
+        run_to(ctx, &mut usb, instant);
+        assert_eq!(usb.host(ctx), UsbHost::Open);
+        assert_eq!(
+            usb.read(ctx, INT_RAW).unwrap() & USB_BUS_RESET,
+            USB_BUS_RESET,
+            "attached again"
+        );
+        assert_eq!(usb.read(ctx, FRAM_NUM), Some(0), "the frames start again");
+    }
+
+    #[test]
+    fn a_host_attached_again_starts_its_frames_from_the_new_attach() {
+        // The connection monitor (report USJ §B.3) must see a SOF at the first tick after the
+        // cable is plugged in again, however many frames the first attachment had.
+        let ctx = &mut Ctx::default();
+        let mut usb = open();
+        run_to(ctx, &mut usb, Cycles(5 * FRAME));
+        usb.set_host(ctx, Cycles(5 * FRAME), UsbHost::Absent);
+        usb.set_host(ctx, Cycles(7 * FRAME), UsbHost::Open);
+        run_to(ctx, &mut usb, Cycles(6 * FRAME));
+        usb.write(ctx, INT_CLR, INTERRUPT_BITS);
+        run_to(ctx, &mut usb, Cycles(7 * FRAME));
+        assert_eq!(usb.read(ctx, INT_RAW), Some(SOF | USB_BUS_RESET));
+        assert_eq!(usb.read(ctx, FRAM_NUM), Some(0));
+        usb.write(ctx, INT_CLR, SOF);
+        ctx.sleep_until(Cycles(8 * FRAME));
+        assert_eq!(
+            usb.read(ctx, INT_RAW).unwrap() & SOF,
+            SOF,
+            "and one each ms"
+        );
+        assert_eq!(usb.read(ctx, FRAM_NUM), Some(1));
     }
 
     #[test]
