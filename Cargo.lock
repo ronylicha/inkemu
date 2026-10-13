@@ -218,8 +218,10 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 name = "console-script"
 version = "0.1.0"
 dependencies = [
+ "boards",
  "cpu-rv32",
  "emu-core",
+ "sha2",
  "soc-esp32c3",
  "svd-regs",
  "thiserror",

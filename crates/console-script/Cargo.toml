@@ -17,3 +17,7 @@ thiserror.workspace = true
 cpu-rv32 = { workspace = true, features = ["test-support"] }
 soc-esp32c3 = { workspace = true, features = ["test-support"] }
 svd-regs.workspace = true
+# The tests on the reference firmwares compose their flash as `inkemu run --firmware` does, and
+# check the images they are given against their pinned SHA-256.
+boards.workspace = true
+sha2.workspace = true

@@ -149,7 +149,11 @@ jobs:
           INKEMU_REF_FLASH: ${{ runner.temp }}/reference-firmware/flash_hello.bin
           INKEMU_NVS_FLASH: ${{ runner.temp }}/reference-firmware/flash_nvs.bin
           INKEMU_NVS_OTA_FLASH: ${{ runner.temp }}/reference-firmware/flash_nvs_ota.bin
+          INKEMU_UART_SELECT_APP: ${{ runner.temp }}/reference-firmware/uart_select.bin
+          INKEMU_USJ_ECHO_APP: ${{ runner.temp }}/reference-firmware/usb_serial_jtag_echo.bin
+          INKEMU_USJ_CONSOLE_APP: ${{ runner.temp }}/reference-firmware/usb_serial_jtag_console.bin
         # Exact test counts, as in rom-boot: see tools/ci/run-ignored-tests.sh.
         run: |
           tools/ci/run-ignored-tests.sh 13 --release -p soc-esp32c3 --test reference_boot -- --ignored
           tools/ci/run-ignored-tests.sh 8 --release -p emu-cli --test run_cli reference_firmware -- --ignored
+          tools/ci/run-ignored-tests.sh 5 --release -p console-script --test reference_firmware -- --ignored

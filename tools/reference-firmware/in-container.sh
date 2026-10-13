@@ -16,32 +16,49 @@ step() {
   fi
 }
 
-# Builds the ESP-IDF example "$1" (a path under $IDF_PATH/examples), unmodified, with the reference
-# configuration as its only one, checks its three binaries against the pinned hashes of "$2", and
-# leaves the shell in its build directory. It says how long the build took: the cost of each
-# example in a CI job is read in the job log.
+# Builds the ESP-IDF project in the directory "$1" (an example under $IDF_PATH/examples, or a
+# reference firmware of this directory), unmodified, checks its three binaries against the pinned
+# hashes of "$2", and leaves the shell in its build directory. It says how long the build took: the
+# cost of each project in a CI job is read in the job log.
 #
-# The reference configuration is added to the example, it replaces nothing: an example that ships
-# a sdkconfig.defaults of its own stops the script before anything is copied. Its file would be
-# overwritten, and what is built would no longer be the example as ESP-IDF configures it.
+# The configuration is the reference one, then the project's own sdkconfig.defaults when it ships
+# one: ESP-IDF reads the list in order, a later file overriding an earlier one, so the project
+# keeps every setting it chose and the reference settings fill in the rest. The project's file is
+# never replaced: what is built is the project as it is configured, on top of the reference. A
+# project without a file of its own gets the reference file copied in, as before this rule existed,
+# so that the builds pinned before it do not change.
+#
+# A project whose sums file "$2" does not exist yet is built, its hashes printed and its name added
+# to `unpinned`; the script goes on with the others and stops before handing anything over: that is
+# how a new reference firmware is pinned, every new one in the same run (README.md, "Adding a
+# firmware").
+unpinned=()
 build_example() {
-  local example="$1" sums="$2"
+  local source="$1" sums="$2"
   local name project started="$SECONDS"
-  name="$(basename "$example")"
+  name="$(basename "$source")"
   project="/tmp/$name"
-  if [ -e "$IDF_PATH/examples/$example/sdkconfig.defaults" ]; then
-    echo "error: the example $example ships its own sdkconfig.defaults, which the reference configuration would replace: the build would not be the unmodified example; choose an example without one, or decide how the two configurations combine and pin the result of that build" >&2
-    exit 1
-  fi
   rm -rf "$project"
-  cp -r "$IDF_PATH/examples/$example" "$project"
-  cp /ref/sdkconfig.defaults "$project/sdkconfig.defaults"
+  cp -r "$source" "$project"
   cd "$project"
-  step "idf.py set-target ($name)" "/tmp/set-target-$name.log" idf.py set-target esp32c3
-  step "idf.py build ($name)" "/tmp/build-$name.log" idf.py build
+  local defaults=()
+  if [ -e sdkconfig.defaults ]; then
+    defaults=(-D "SDKCONFIG_DEFAULTS=/ref/sdkconfig.defaults;$project/sdkconfig.defaults")
+  else
+    cp /ref/sdkconfig.defaults sdkconfig.defaults
+  fi
+  step "idf.py set-target ($name)" "/tmp/set-target-$name.log" idf.py "${defaults[@]}" set-target esp32c3
+  step "idf.py build ($name)" "/tmp/build-$name.log" idf.py "${defaults[@]}" build
   cd build
+  local binaries=(bootloader/bootloader.bin partition_table/partition-table.bin "$name.bin")
+  if [ ! -e "$sums" ]; then
+    echo "unpinned $(basename "$sums"):"
+    sha256sum "${binaries[@]}"
+    unpinned+=("$name")
+    return 0
+  fi
   if ! sha256sum -c "$sums"; then
-    sha256sum bootloader/bootloader.bin partition_table/partition-table.bin "$name.bin" >&2
+    sha256sum "${binaries[@]}" >&2
     echo "error: the build of $name is not the pinned one (hashes above); do not edit $(basename "$sums"): check the image tag, the ESP-IDF version and sdkconfig.defaults" >&2
     exit 1
   fi
@@ -72,7 +89,7 @@ symbols() {
 
 stage="$(mktemp -d)"
 
-build_example get-started/hello_world /ref/SHA256SUMS.inputs
+build_example "$IDF_PATH/examples/get-started/hello_world" /ref/SHA256SUMS.inputs
 merge flash_hello.bin partition_table/partition-table.bin hello_world.bin
 symbols bootloader/bootloader hello_world
 
@@ -80,10 +97,33 @@ symbols bootloader/bootloader hello_world
 # table (its sums pin them again), once as built and once under the stock partition table of the
 # X4, which has `otadata` and two application slots. Neither the bootloader nor the application
 # embeds the table, so the second image needs no second build.
-build_example storage/nvs/nvs_rw_value_cxx /ref/SHA256SUMS.inputs-nvs
+build_example "$IDF_PATH/examples/storage/nvs/nvs_rw_value_cxx" /ref/SHA256SUMS.inputs-nvs
 merge flash_nvs.bin partition_table/partition-table.bin nvs_rw_value_cxx.bin
 merge flash_nvs_ota.bin /partitions/x4-stock.bin nvs_rw_value_cxx.bin
 symbols nvs_rw_value_cxx
+
+# The firmwares of the serial consoles. Their tests boot the application alone, behind the
+# bootloader inkemu ships (`inkemu run --firmware`): only the application leaves the container.
+# uart_select reads UART0 through the driver and select(); usb_serial_jtag_echo, which ships a
+# sdkconfig.defaults of its own, echoes what the host sends to USB-Serial-JTAG; the third is this
+# directory's own, a console on USB-Serial-JTAG that needs a host reading the port.
+applications=()
+for project in \
+  "$IDF_PATH/examples/peripherals/uart/uart_select:SHA256SUMS.inputs-uart-select" \
+  "$IDF_PATH/examples/peripherals/usb_serial_jtag/usb_serial_jtag_echo:SHA256SUMS.inputs-usj-echo" \
+  "/ref/usb_serial_jtag_console:SHA256SUMS.inputs-usj-console"; do
+  source="${project%%:*}"
+  name="$(basename "$source")"
+  build_example "$source" "/ref/${project##*:}"
+  cp "$name.bin" "$stage/$name.bin"
+  symbols "$name"
+  applications+=("$name.bin" "$name.nm")
+done
+
+if [ "${#unpinned[@]}" -ne 0 ]; then
+  echo "error: ${unpinned[*]}: no pinned hashes yet (the lines after \"unpinned\" above give those of this build); build a second time from a clean cache, and when both builds give the same hashes write each block to the file it names, in tools/reference-firmware/; nothing was written to the output directory" >&2
+  exit 1
+fi
 
 if ! (cd "$stage" && sha256sum -c /ref/SHA256SUMS.output); then
   (cd "$stage" && sha256sum flash_hello.bin flash_nvs.bin flash_nvs_ota.bin) >&2
@@ -91,5 +131,5 @@ if ! (cd "$stage" && sha256sum -c /ref/SHA256SUMS.output); then
   echo "error: a merged image is not the pinned one (hashes above); nothing was written to the output directory" >&2
   exit 1
 fi
-results=(flash_hello.bin flash_nvs.bin flash_nvs_ota.bin bootloader.nm hello_world.nm nvs_rw_value_cxx.nm)
+results=(flash_hello.bin flash_nvs.bin flash_nvs_ota.bin bootloader.nm hello_world.nm nvs_rw_value_cxx.nm "${applications[@]}")
 (cd "$stage" && chown "$HOST_UID:$HOST_GID" "${results[@]}" && mv "${results[@]}" /out/)

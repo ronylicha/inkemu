@@ -4,7 +4,9 @@
 #   flash_hello.bin    the hello_world example;
 #   flash_nvs.bin      the nvs_rw_value_cxx example, which keeps a restart counter in NVS;
 #   flash_nvs_ota.bin  the same application under the stock partition table of the X4
-#                      (tests/fixtures/partitions/x4-stock.bin), whose bootloader writes otadata.
+#                      (tests/fixtures/partitions/x4-stock.bin), whose bootloader writes otadata;
+# and three applications alone, which the tests of the serial consoles boot behind the bootloader
+# inkemu ships: uart_select.bin, usb_serial_jtag_echo.bin and usb_serial_jtag_console.bin.
 # Everything third-party runs inside Docker, in one container run. One artefact of this build is
 # committed: its bootloader, the one inkemu ships (third_party/esp-idf-bootloader/, the same bytes);
 # nothing else built here is.
@@ -32,3 +34,6 @@ docker run --rm --network none \
 echo "$out/flash_hello.bin"
 echo "$out/flash_nvs.bin"
 echo "$out/flash_nvs_ota.bin"
+echo "$out/uart_select.bin"
+echo "$out/usb_serial_jtag_echo.bin"
+echo "$out/usb_serial_jtag_console.bin"
