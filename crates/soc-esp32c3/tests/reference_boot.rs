@@ -14,13 +14,11 @@
 
 mod common;
 
-use emu_core::Cycles;
 use sha2::{Digest, Sha256};
 use soc_esp32c3::memmap::{SRAM_DBUS_BASE, SRAM_SIZE};
 use soc_esp32c3::reset::ResetCause;
-use soc_esp32c3::{
-    ConsoleChannel, Diagnostic, Esp32C3, FlashWrite, RomImage, SocConfig, StopReason,
-};
+use soc_esp32c3::test_support::{Bounds, Consoles, Driven, drive};
+use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, FlashWrite, RomImage, SocConfig};
 
 /// SHA-256 of the merged reference image (`docs/research/sp1b-test-oracle.md`, §2).
 const REFERENCE_SHA256: &str = "fc05ef5dbe85372e1da52abdec3bfcbbb110738a60163734666095fcd8c39bf2";
@@ -214,7 +212,9 @@ struct Run {
     flash_modified_sectors: u32,
     /// How many flash commands of each opcode were sent to the chip, indexed by opcode.
     flash_commands: Vec<u64>,
-    stop: StopReason,
+    /// How the drive ended: a run that stopped (a strict stop, a CPU waiting for ever) did not
+    /// reach what it waited for.
+    driven: Driven,
     trace_hash: Option<u64>,
     resets: u64,
     cycles: u64,
@@ -259,46 +259,41 @@ fn run(config: SocConfig, done: impl Fn(&str) -> bool) -> Run {
 /// stops, or the budget ends.
 fn run_image(image: Vec<u8>, config: SocConfig, done: impl Fn(&str, &[Diagnostic]) -> bool) -> Run {
     let mut machine = Esp32C3::with_flash(rom(), image, &config).unwrap();
-    let (mut uart0, mut diagnostics) = (Vec::new(), Vec::new());
-    let mut flash_writes = Vec::new();
-    let mut stop = StopReason::CycleBudget;
-    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
-    // `Asleep` is the CPU waiting for its next interrupt: device time goes on, the run too.
-    while matches!(stop, StopReason::CycleBudget | StopReason::Asleep)
-        && machine.cycles().get() < BUDGET
-        && machine.device_time_nanos() < DEVICE_TIME_BUDGET_NS
-        && !done(&text(&uart0), &diagnostics)
-    {
-        stop = machine.run_until(Cycles(machine.cycles().get() + SLICE));
-        uart0.extend(machine.take_console(ConsoleChannel::Uart0));
-        let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
-        diagnostics.extend(machine.drain_diagnostics());
-        flash_writes.extend(machine.take_flash_writes());
-    }
+    let mut consoles = Consoles::default();
+    let bounds = Bounds {
+        slice: SLICE,
+        max_cycles: BUDGET,
+        max_nanos: DEVICE_TIME_BUDGET_NS,
+    };
+    let driven = drive(&mut machine, bounds, &mut consoles, |_, _, seen| {
+        done(&seen.text(ConsoleChannel::Uart0), &seen.diagnostics)
+    });
     assert_eq!(
         machine.flash_writes_dropped(),
         0,
         "the journal was taken at every slice: it never filled"
     );
     assert!(
-        machine.device_time_nanos() < DEVICE_TIME_BUDGET_NS || done(&text(&uart0), &diagnostics),
+        machine.device_time_nanos() < DEVICE_TIME_BUDGET_NS || driven == Driven::Done,
         "device time ran out ({} ns) after {} CPU cycles before the run was done: the CPU sleeps and nothing wakes it?\nconsole:\n{}",
         machine.device_time_nanos(),
         machine.cycles().get(),
-        text(&uart0)
+        consoles.text(ConsoleChannel::Uart0)
     );
     // The run is over: what the firmware wrote and the UART had not sent yet belongs to its console.
-    uart0.extend(machine.flush_console(ConsoleChannel::Uart0));
+    let unsent = machine.flush_console(ConsoleChannel::Uart0);
+    let mut console = consoles.bytes(ConsoleChannel::Uart0).to_vec();
+    console.extend(unsent);
     Run {
-        console: text(&uart0),
-        diagnostics,
-        flash_writes,
+        console: String::from_utf8_lossy(&console).replace('\r', ""),
+        diagnostics: consoles.diagnostics,
+        flash_writes: consoles.flash_writes,
         flash: machine.flash_contents(),
         flash_modified_sectors: machine.flash_modified_sectors(),
         flash_commands: (0..=u8::MAX)
             .map(|opcode| machine.flash_commands_sent(opcode))
             .collect(),
-        stop,
+        driven,
         trace_hash: machine.trace_hash(),
         resets: machine.resets(),
         cycles: machine.cycles().get(),
@@ -395,9 +390,9 @@ fn a_strict_run_crosses_the_restart_without_anything_unmodelled() {
     };
     let life = run(strict, |console| application_starts(console) == 2);
     assert!(
-        matches!(life.stop, StopReason::CycleBudget | StopReason::Asleep),
+        !matches!(life.driven, Driven::Stopped(_)),
         "nothing stops the run: {:?}\nconsole:\n{}",
-        life.stop,
+        life.driven,
         life.console
     );
     // The restart is an entry of the journal, not a violation: strict mode lets it pass and
@@ -430,32 +425,37 @@ fn the_countdown_lines_are_one_device_second_apart_and_the_cpu_sleeps_between_th
     /// One tick of the application's scheduler (`CONFIG_FREERTOS_HZ` is 100).
     const TICK_NS: u64 = SECOND_NS / 100;
     let mut machine = Esp32C3::with_flash(rom(), reference_flash(), &SocConfig::default()).unwrap();
-    let mut uart0 = Vec::new();
+    let mut consoles = Consoles::default();
     // Device time, read from the machine, at the first look that found each countdown line
     // printed.
     let mut seen_at: Vec<u64> = Vec::new();
-    let mut restarting = false;
-    while machine.cycles().get() < BUDGET
-        && machine.device_time_nanos() < DEVICE_TIME_BUDGET_NS
-        && !restarting
-    {
-        let stop = machine.run_until(Cycles(machine.cycles().get() + LOOK));
-        assert!(
-            matches!(stop, StopReason::CycleBudget | StopReason::Asleep),
-            "{stop:?}"
-        );
-        let fresh = machine.take_console(ConsoleChannel::Uart0);
-        if fresh.is_empty() {
-            continue;
-        }
-        uart0.extend(fresh);
-        let console = String::from_utf8_lossy(&uart0);
-        if console.matches("seconds...\r\n").count() > seen_at.len() {
-            seen_at.push(machine.device_time_nanos());
-        }
-        restarting = console.contains("Restarting now.");
-    }
-    assert_eq!(seen_at.len(), 11, "{}", String::from_utf8_lossy(&uart0));
+    let bounds = Bounds {
+        slice: LOOK,
+        max_cycles: BUDGET,
+        max_nanos: DEVICE_TIME_BUDGET_NS,
+    };
+    let driven = drive(
+        &mut machine,
+        bounds,
+        &mut consoles,
+        |machine, taken, seen| {
+            if taken[0].1.is_empty() {
+                return false;
+            }
+            let console = seen.text(ConsoleChannel::Uart0);
+            if console.matches("seconds...\n").count() > seen_at.len() {
+                seen_at.push(machine.device_time_nanos());
+            }
+            console.contains("Restarting now.")
+        },
+    );
+    assert_eq!(driven, Driven::Done);
+    assert_eq!(
+        seen_at.len(),
+        11,
+        "{}",
+        consoles.text(ConsoleChannel::Uart0)
+    );
     // `vTaskDelay(1000 / portTICK_PERIOD_MS)` waits 100 ticks counted from the next tick edge, so
     // the first delay, which starts inside a tick, lasts one second less the part of that tick
     // already spent: 0 to 10 ms shorter than a second, never longer. Which tick the first line is
@@ -612,9 +612,9 @@ fn the_stock_x4_ota_layout_boots_and_writes_otadata_on_its_first_boot_only() {
     assert_eq!(life.flash_modified_sectors, 1, "the otadata sector");
     assert_only_the_restart_is_reported(&life.diagnostics);
     assert!(
-        matches!(life.stop, StopReason::CycleBudget | StopReason::Asleep),
+        !matches!(life.driven, Driven::Stopped(_)),
         "nothing stops a lenient run: {:?}",
-        life.stop
+        life.driven
     );
 }
 
@@ -633,9 +633,9 @@ fn a_strict_run_of_the_stock_x4_ota_layout_writes_otadata_and_reaches_the_applic
         |console, _| console.contains("Hello world!\n"),
     );
     assert!(
-        matches!(boot.stop, StopReason::CycleBudget | StopReason::Asleep),
+        !matches!(boot.driven, Driven::Stopped(_)),
         "a strict run of this layout does not stop: {:?}\nconsole:\n{}",
-        boot.stop,
+        boot.driven,
         boot.console
     );
     assert_eq!(boot.diagnostics, [], "nothing unmodelled, no exception");
@@ -897,9 +897,9 @@ fn assert_nothing_but_the_restart_is_reported(diagnostics: &[Diagnostic]) {
 fn the_nvs_example_counts_its_restarts_over_three_lives_and_programs_the_measured_bytes() {
     let run = run_image(nvs_flash(), strict(), lives(3));
     assert!(
-        matches!(run.stop, StopReason::CycleBudget | StopReason::Asleep),
+        !matches!(run.driven, Driven::Stopped(_)),
         "a strict run of the example does not stop: {:?}\nconsole:\n{}",
-        run.stop,
+        run.driven,
         run.console
     );
     assert_the_console_of_three_lives(&run.console, &[]);
@@ -927,9 +927,9 @@ fn the_nvs_example_counts_its_restarts_over_three_lives_and_programs_the_measure
 fn the_nvs_example_behind_the_stock_x4_table_writes_otadata_once_and_counts_its_restarts() {
     let run = run_image(nvs_ota_flash(), strict(), lives(3));
     assert!(
-        matches!(run.stop, StopReason::CycleBudget | StopReason::Asleep),
+        !matches!(run.driven, Driven::Stopped(_)),
         "a strict run of the example does not stop: {:?}\nconsole:\n{}",
-        run.stop,
+        run.driven,
         run.console
     );
     assert_the_console_of_three_lives(&run.console, &[NO_FACTORY_IMAGE, OTADATA_SET]);

@@ -13,7 +13,7 @@ use soc_esp32c3::flash::{
     FlashConfig, FlashConfigError, FlashImageError, JedecId, MAX_FLASH_BYTES, MIB, MIN_FLASH_BYTES,
 };
 use soc_esp32c3::periph::Efuse;
-use soc_esp32c3::{ChipRevision, Esp32C3, RomImage, SocConfig};
+use soc_esp32c3::{ChipRevision, Esp32C3, RomImage, SocConfig, UsbHost};
 use std::fmt;
 
 /// How to write the `jedec_id` key, for the messages that refuse one.
@@ -96,6 +96,8 @@ pub struct NoShippedBootloader {
 pub struct MachineOptions {
     pub strict_mmio: bool,
     pub trace_hash: bool,
+    /// The USB host on the USB-Serial-JTAG port at power-on (ADR 0006).
+    pub usb_host: UsbHost,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -549,6 +551,7 @@ impl DeviceProfile {
             flash: self.flash,
             strict_mmio: options.strict_mmio,
             trace_hash: options.trace_hash,
+            usb_host: options.usb_host,
             ..SocConfig::default()
         }
     }
@@ -1049,10 +1052,12 @@ mod tests {
         let config = profile.soc_config(MachineOptions {
             strict_mmio: true,
             trace_hash: true,
+            usb_host: UsbHost::Attached,
         });
         assert_eq!(config.chip_revision.to_string(), "v1.1");
         assert_eq!(config.flash, profile.flash);
         assert!(config.strict_mmio && config.trace_hash);
+        assert_eq!(config.usb_host, UsbHost::Attached);
         assert_eq!(
             profile.soc_config(MachineOptions::default()),
             SocConfig {

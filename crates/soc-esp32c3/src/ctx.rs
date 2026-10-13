@@ -77,6 +77,7 @@ pub enum Module {
     Timg1,
     Systimer,
     Sha,
+    UsbDevice,
 }
 
 /// What a device is called for, besides register accesses: at the instant it asked for (a wake-up),
@@ -103,8 +104,11 @@ pub enum Event {
     CacheInvalidated,
     /// Wake-up of the SYSTIMER: one of its comparators may have an alarm due.
     Systimer,
-    /// Wake-up of UART 0 or 1: its transmitter may have gone idle.
+    /// Wake-up of UART 0 or 1: a byte may have left or landed, or an interrupt condition begun.
     Uart(u8),
+    /// Wake-up of USB-Serial-JTAG: the host may have changed, taken the committed IN packet or
+    /// sent a packet to the OUT FIFO, or a frame may have started while `SOF` is enabled.
+    UsbSerialJtag,
     /// Wake-up of a timer group: its timer or its watchdog may have reached a deadline.
     Timg(Group),
     /// Wake-up of `RTC_CNTL`: the RTC watchdog may have reached a stage timeout.

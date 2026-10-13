@@ -72,6 +72,116 @@ pub enum Unsupported {
     /// frequency for: the RC fast clock (2), or no documented source (0). The byte is timed with
     /// the crystal.
     UartClock { uart: u8, sclk_sel: u32 },
+    /// A read of the receiver of a UART (`FIFO`, `STATUS`, `INT_RAW`, `INT_ST`) after a byte of
+    /// the host started, or a receive timeout came, while `CLK_CONF.SCLK_SEL` selected a source
+    /// clock the model has no frequency for: they were timed with the crystal. Refused at the read,
+    /// an instant the firmware fixes, rather than at the start bit, which any call may reach.
+    UartReceiveClock { uart: u8, sclk_sel: u32 },
+    /// A UART field set to a mode the model does not have (report UR §10): the register keeps
+    /// the value, and the UART goes on as if the field were clear.
+    UartFeature { uart: u8, feature: UartFeature },
+    /// A byte of the host that found the 128-byte receive FIFO of a UART full: dropped.
+    /// ASSUMPTION: the new byte is lost and the 128 stay (report UR A2); 200 bytes sent to a FIFO
+    /// nobody reads, on a chip, settle it.
+    UartRxOverflow { uart: u8 },
+    /// A read of the receive FIFO of a UART while it was empty: 0 was returned (report UR A6).
+    UartEmptyRead { uart: u8 },
+    /// A read of `USB_DEVICE.EP1` while the OUT FIFO was empty: 0 was returned (report USJ O.6).
+    UsbEmptyRead,
+    /// A write of `USB_DEVICE.EP1` while the IN endpoint had no room: the byte was ignored
+    /// (report USJ O.6).
+    UsbInFull,
+}
+
+/// A UART mode the model refuses by name when software sets it (report UR §10, A4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UartFeature {
+    /// `CONF0.LOOPBACK`: the transmitter drives the receiver.
+    Loopback,
+    /// `CONF0.RXD_INV`: the receive line is inverted.
+    InvertedRx,
+    /// `CONF0.AUTOBAUD_EN`: the baud rate is detected from the line.
+    Autobaud,
+    /// `CONF0.STOP_BIT_NUM` = 0: a frame with no documented stop bit (report UR A4).
+    NoStopBit,
+    /// `MEM_CONF.RX_SIZE` or `TX_SIZE` other than one 128-byte block.
+    FifoSize,
+    /// `RS485_CONF` other than 0.
+    Rs485,
+    /// `CONF0.TX_FLOW_EN`: the transmitter waits while CTS is inactive.
+    TxFlowControl,
+    /// `CONF1.RX_FLOW_EN`: RTS holds the host while the receive FIFO is above `RX_FLOW_THRHD`.
+    RxFlowControl,
+    /// `CONF0.TXD_INV`: the transmit line is inverted.
+    InvertedTx,
+    /// `CONF0.IRDA_EN`: infrared framing.
+    Irda,
+    /// `CONF0.TXD_BRK`: a break is sent after the data.
+    TxBreak,
+}
+
+impl UartFeature {
+    /// The register field, then what it asks for, then what the model does instead and the
+    /// remedy, as the message says them.
+    const fn describe(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            UartFeature::Loopback => (
+                "CONF0.LOOPBACK",
+                "to loop its transmitter back to its receiver",
+                "its bytes still go to the host and its receiver hears only the host; clear CONF0.LOOPBACK",
+            ),
+            UartFeature::InvertedRx => (
+                "CONF0.RXD_INV",
+                "to invert its receive line",
+                "the host's bytes are received as they were sent; clear CONF0.RXD_INV",
+            ),
+            UartFeature::Autobaud => (
+                "CONF0.AUTOBAUD_EN",
+                "to detect its baud rate from the line",
+                "the baud rate stays the one CLKDIV sets; set the baud rate with CLKDIV",
+            ),
+            UartFeature::NoStopBit => (
+                "CONF0.STOP_BIT_NUM = 0",
+                "for a frame without a stop bit",
+                "its bytes are timed with one stop bit; write STOP_BIT_NUM 1, 2 or 3 (1, 1.5 or 2 stop bits)",
+            ),
+            UartFeature::FifoSize => (
+                "MEM_CONF.RX_SIZE or TX_SIZE other than 1",
+                "to give its FIFOs another share of the UART memory",
+                "each FIFO keeps 128 bytes; leave RX_SIZE and TX_SIZE at 1",
+            ),
+            UartFeature::Rs485 => (
+                "RS485_CONF other than 0",
+                "to RS485 mode",
+                "it sends and receives as a plain UART; write RS485_CONF = 0",
+            ),
+            UartFeature::TxFlowControl => (
+                "CONF0.TX_FLOW_EN",
+                "to hold its transmitter while CTS is inactive",
+                "its bytes leave whatever CTS says; clear CONF0.TX_FLOW_EN",
+            ),
+            UartFeature::RxFlowControl => (
+                "CONF1.RX_FLOW_EN",
+                "to hold the host with RTS while its receive FIFO fills",
+                "the host sends at its own pace and a full FIFO drops what comes; clear CONF1.RX_FLOW_EN and read the FIFO in time",
+            ),
+            UartFeature::InvertedTx => (
+                "CONF0.TXD_INV",
+                "to invert its transmit line",
+                "the host receives its bytes as they were written; clear CONF0.TXD_INV",
+            ),
+            UartFeature::Irda => (
+                "CONF0.IRDA_EN",
+                "to IrDA mode",
+                "it sends and receives plain UART frames; clear CONF0.IRDA_EN",
+            ),
+            UartFeature::TxBreak => (
+                "CONF0.TXD_BRK",
+                "to send a break after its data",
+                "no break is sent and the line stays idle; clear CONF0.TXD_BRK",
+            ),
+        }
+    }
 }
 
 impl From<FlashRefusal> for Unsupported {
@@ -200,6 +310,20 @@ impl Unsupported {
                 f,
                 "RTC_CNTL.CLK_CONF selects an RTC slow clock inkemu does not model (value {clk_conf:#010x}, pc {pc:#010x}), so the RTC timer and the RTC watchdog keep counting the 136 kHz RC oscillator; select the RC oscillator (ANA_CLK_RTC_SEL = 0) or expect their durations to differ from the device"
             ),
+            Unsupported::UartOverflow { .. }
+            | Unsupported::UartClock { .. }
+            | Unsupported::UartReceiveClock { .. }
+            | Unsupported::UartFeature { .. }
+            | Unsupported::UartRxOverflow { .. }
+            | Unsupported::UartEmptyRead { .. }
+            | Unsupported::UsbEmptyRead
+            | Unsupported::UsbInFull => self.describe_serial(pc, f),
+        }
+    }
+
+    /// The messages of the refusals of the serial ports, for [`Unsupported::describe`].
+    fn describe_serial(self, pc: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
             Unsupported::UartOverflow { uart } => write!(
                 f,
                 "a byte was written to UART{uart} while its 128-byte transmit FIFO was full (pc {pc:#010x}), so inkemu dropped the byte; wait for room in the FIFO (UART.STATUS TXFIFO_CNT) before writing"
@@ -208,6 +332,35 @@ impl Unsupported {
                 f,
                 "UART{uart} sent a byte with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = {sclk_sel}, pc {pc:#010x}), so the byte was timed with the 40 MHz crystal and its duration differs from the device; select the crystal (SCLK_SEL = 3) or APB_CLK (SCLK_SEL = 1)"
             ),
+            Unsupported::UartReceiveClock { uart, sclk_sel } => write!(
+                f,
+                "UART{uart} received from the host, or counted its receive timeout, with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = {sclk_sel}, read at pc {pc:#010x}), so the bit times were those of the 40 MHz crystal and what the read shows differs from the device; select the crystal (SCLK_SEL = 3) or APB_CLK (SCLK_SEL = 1)"
+            ),
+            Unsupported::UartFeature { uart, feature } => {
+                let (field, asked, instead) = feature.describe();
+                write!(
+                    f,
+                    "UART{uart} was set {asked} ({field}, pc {pc:#010x}), which inkemu does not model, so {instead}"
+                )
+            }
+            Unsupported::UartRxOverflow { uart } => write!(
+                f,
+                "a byte the host sent found the 128-byte receive FIFO of UART{uart} full (pc {pc:#010x}), so it was dropped and the 128 bytes stay; read the FIFO sooner, or send less at once"
+            ),
+            Unsupported::UartEmptyRead { uart } => write!(
+                f,
+                "UART{uart}.FIFO was read while the receive FIFO was empty (pc {pc:#010x}), so 0 was returned; read only the number of bytes UART.STATUS RXFIFO_CNT gives"
+            ),
+            Unsupported::UsbEmptyRead => write!(
+                f,
+                "USB_DEVICE.EP1 was read while the OUT FIFO was empty (pc {pc:#010x}), so 0 was returned; read EP1 only while EP1_CONF.SERIAL_OUT_EP_DATA_AVAIL is set"
+            ),
+            Unsupported::UsbInFull => write!(
+                f,
+                "a byte was written to USB_DEVICE.EP1 while the IN endpoint had no room (pc {pc:#010x}), so it was ignored; write EP1 only while EP1_CONF.SERIAL_IN_EP_DATA_FREE is set"
+            ),
+            // INVARIANT: `describe` hands only the refusals above to this function.
+            _ => Ok(()),
         }
     }
 }
@@ -308,6 +461,12 @@ impl Diagnostic {
                 Unsupported::SlowClock { .. } => (9, 0, 0),
                 Unsupported::UartOverflow { uart } => (12, u32::from(uart), 0),
                 Unsupported::UartClock { uart, sclk_sel } => (13, u32::from(uart), sclk_sel),
+                Unsupported::UartReceiveClock { uart, sclk_sel } => (28, u32::from(uart), sclk_sel),
+                Unsupported::UartFeature { uart, feature } => (23, u32::from(uart), feature as u32),
+                Unsupported::UartRxOverflow { uart } => (24, u32::from(uart), 0),
+                Unsupported::UartEmptyRead { uart } => (25, u32::from(uart), 0),
+                Unsupported::UsbEmptyRead => (26, 0, 0),
+                Unsupported::UsbInFull => (27, 0, 0),
                 // A command is 1 to 16 bits long, so 0 is free for "no command phase".
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
@@ -759,6 +918,14 @@ mod tests {
                 uart: 1,
                 sclk_sel: 2,
             }),
+            unsupported(Unsupported::UartReceiveClock {
+                uart: 0,
+                sclk_sel: 0,
+            }),
+            unsupported(Unsupported::UartFeature {
+                uart: 0,
+                feature: UartFeature::Loopback,
+            }),
             unsupported(Unsupported::FlashProgramLength { addr: 0x4100_9000 }),
             unsupported(Unsupported::FlashCommandBits { cmd: 0x0300_0000 }),
             unsupported(Unsupported::FlashSuspend { sus_ctrl: 0x20 }),
@@ -909,6 +1076,37 @@ mod tests {
                 "UART{uart}, SCLK_SEL {sclk_sel}"
             );
         }
+        // What the receiver showed on such a clock is another line, once per UART and selection.
+        let received = |uart: u8, sclk_sel: u32, pc: u32| Diagnostic::Unsupported {
+            what: Unsupported::UartReceiveClock { uart, sclk_sel },
+            pc,
+        };
+        d.record(received(0, 2, 0x4038_1000));
+        d.record(received(0, 2, 0x4200_0000));
+        assert_eq!(d.distinct(), 8, "not a byte sent");
+        assert_eq!(d.occurrences(&received(0, 2, 0x4038_2000)), 2);
+        assert_eq!(d.occurrences(&uart_clock(0, 2, 0x4038_1000)), 2);
+        d.record(received(1, 2, 0x4038_1000));
+        d.record(received(0, 0, 0x4038_1000));
+        assert_eq!(d.distinct(), 10);
+    }
+
+    #[test]
+    fn a_refused_uart_feature_is_listed_once_per_uart_and_feature() {
+        let feature = |uart, feature, pc| Diagnostic::Unsupported {
+            what: Unsupported::UartFeature { uart, feature },
+            pc,
+        };
+        let mut d = Diagnostics::new(false);
+        d.record(feature(0, UartFeature::Loopback, 0x4200_0000));
+        d.record(feature(0, UartFeature::Loopback, 0x4200_0010));
+        d.record(feature(1, UartFeature::Loopback, 0x4200_0000));
+        d.record(feature(0, UartFeature::Autobaud, 0x4200_0000));
+        assert_eq!(d.distinct(), 3, "per UART and feature, whatever the pc");
+        assert_eq!(
+            d.occurrences(&feature(0, UartFeature::Loopback, 0x4200_0020)),
+            2
+        );
     }
 
     #[test]
@@ -1125,13 +1323,104 @@ mod tests {
             ),
         ];
         for (diagnostic, needle) in texts {
-            let text = diagnostic.to_string();
-            assert!(text.contains(needle), "{text}");
-            assert!(text.contains("pc 0x40"), "{text}");
-            let (cause, remedy) = text
-                .split_once("; ")
-                .unwrap_or_else(|| panic!("no remedy in: {text}"));
-            assert!(!cause.is_empty() && !remedy.is_empty(), "{text}");
+            assert_cause_then_remedy(&diagnostic, needle);
+        }
+    }
+
+    fn assert_cause_then_remedy(diagnostic: &Diagnostic, needle: &str) {
+        let text = diagnostic.to_string();
+        assert!(text.contains(needle), "{text}");
+        assert!(text.contains("pc 0x40"), "{text}");
+        let (cause, remedy) = text
+            .split_once("; ")
+            .unwrap_or_else(|| panic!("no remedy in: {text}"));
+        assert!(!cause.is_empty() && !remedy.is_empty(), "{text}");
+    }
+
+    #[test]
+    fn the_refused_uart_modes_state_the_cause_then_the_remedy() {
+        let texts = [
+            (
+                1,
+                UartFeature::Loopback,
+                "UART1 was set to loop its transmitter back to its receiver (CONF0.LOOPBACK, pc 0x40381000), which inkemu does not model",
+            ),
+            (0, UartFeature::InvertedRx, "(CONF0.RXD_INV, pc 0x40381000)"),
+            (
+                0,
+                UartFeature::Autobaud,
+                "(CONF0.AUTOBAUD_EN, pc 0x40381000)",
+            ),
+            (
+                0,
+                UartFeature::NoStopBit,
+                "(CONF0.STOP_BIT_NUM = 0, pc 0x40381000)",
+            ),
+            (
+                0,
+                UartFeature::FifoSize,
+                "(MEM_CONF.RX_SIZE or TX_SIZE other than 1, pc 0x40381000)",
+            ),
+            (
+                0,
+                UartFeature::Rs485,
+                "UART0 was set to RS485 mode (RS485_CONF other than 0, pc 0x40381000)",
+            ),
+            (
+                0,
+                UartFeature::TxFlowControl,
+                "(CONF0.TX_FLOW_EN, pc 0x40381000)",
+            ),
+            (
+                1,
+                UartFeature::RxFlowControl,
+                "UART1 was set to hold the host with RTS while its receive FIFO fills (CONF1.RX_FLOW_EN, pc 0x40381000)",
+            ),
+            (0, UartFeature::InvertedTx, "(CONF0.TXD_INV, pc 0x40381000)"),
+            (
+                0,
+                UartFeature::Irda,
+                "UART0 was set to IrDA mode (CONF0.IRDA_EN, pc 0x40381000)",
+            ),
+            (0, UartFeature::TxBreak, "(CONF0.TXD_BRK, pc 0x40381000)"),
+        ];
+        for (uart, feature, needle) in texts {
+            assert_cause_then_remedy(
+                &unsupported(Unsupported::UartFeature { uart, feature }),
+                needle,
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusals_of_the_serial_ports_state_the_cause_then_the_remedy() {
+        let texts = [
+            (
+                Unsupported::UartReceiveClock {
+                    uart: 1,
+                    sclk_sel: 2,
+                },
+                "UART1 received from the host, or counted its receive timeout, with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = 2, read at pc 0x40381000)",
+            ),
+            (
+                Unsupported::UartRxOverflow { uart: 1 },
+                "a byte the host sent found the 128-byte receive FIFO of UART1 full (pc 0x40381000)",
+            ),
+            (
+                Unsupported::UartEmptyRead { uart: 0 },
+                "UART0.FIFO was read while the receive FIFO was empty (pc 0x40381000), so 0 was returned",
+            ),
+            (
+                Unsupported::UsbEmptyRead,
+                "USB_DEVICE.EP1 was read while the OUT FIFO was empty (pc 0x40381000)",
+            ),
+            (
+                Unsupported::UsbInFull,
+                "a byte was written to USB_DEVICE.EP1 while the IN endpoint had no room (pc 0x40381000)",
+            ),
+        ];
+        for (what, needle) in texts {
+            assert_cause_then_remedy(&unsupported(what), needle);
         }
     }
 

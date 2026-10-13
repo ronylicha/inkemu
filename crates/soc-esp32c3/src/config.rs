@@ -1,6 +1,7 @@
 //! Run-time configuration of the virtual `SoC`.
 use crate::chip::ChipRevision;
 use crate::flash::FlashConfig;
+use crate::periph::UsbHost;
 
 /// Seed of the hardware random number generator model (decision D8): fixed, so two runs are identical.
 /// The bytes spell "inkemu"; any non-zero value would do.
@@ -24,6 +25,9 @@ pub struct SocConfig {
     pub flash: FlashConfig,
     /// Seed of the random number generator (`APB_CTRL.RND_DATA`).
     pub rng_seed: u64,
+    /// The USB host on the USB-Serial-JTAG port when the chip starts (ADR 0006): an input of
+    /// the run, open by default.
+    pub usb_host: UsbHost,
 }
 
 impl Default for SocConfig {
@@ -35,6 +39,7 @@ impl Default for SocConfig {
             trace_hash: false,
             flash: FlashConfig::default(),
             rng_seed: DEFAULT_RNG_SEED,
+            usb_host: UsbHost::Open,
         }
     }
 }
@@ -52,5 +57,6 @@ mod tests {
         assert_eq!(config.flash, crate::flash::FlashConfig::default());
         assert_eq!(config.rng_seed, DEFAULT_RNG_SEED);
         assert_ne!(DEFAULT_RNG_SEED, 0);
+        assert_eq!(config.usb_host, UsbHost::Open, "report USJ §R.2");
     }
 }

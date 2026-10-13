@@ -31,8 +31,8 @@ then rewrites the table below, and nothing else; review the diff before committi
 
 "Count" is 1 for a single register, or the number of consecutive registers the row stands for.
 "Made real by" names the plan that gives the register its effect. Each plan inherits the rows that
-name it. The table has seven heirs: SP1b-3d (the serial consoles in both directions), SP1b-3f
-(deep sleep), SP1b-4, SP2, SP5a, SP5b and SP8. The carry-over note
+name it. The table has six heirs: SP1b-3f (deep sleep), SP1b-4, SP2, SP5a, SP5b and SP8. The
+UART rows SP1b-3d inherited left the table when it gave them their effect. The carry-over note
 `docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` names the rows one by one, as the table
 stood at the end of plan SP1b-3a, when one plan, "SP1b-3b", was to take what five plans now share;
 its first section says which plan takes what.
@@ -40,10 +40,6 @@ its first section says which plan takes what.
 <!-- generated table -->
 | Address | Register | Count | Hardware effect not modelled | Made real by |
 |---|---|---|---|---|
-| `0x6000000c` | `UART0.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3d |
-| `0x60000010` | `UART0.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3d |
-| `0x60000020` | `UART0.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3d |
-| `0x60000024` | `UART0.CONF1` | 1 | FIFO thresholds | SP1b-3d |
 | `0x60002008` | `SPI1.CTRL` | 1 | read mode, dummy output, WP level (the two-byte status write bit acts) | SP8 |
 | `0x6000200c` | `SPI1.CTRL1` | 1 | CS hold delay after a release-from-power-down | SP8 |
 | `0x60002010` | `SPI1.CTRL2` | 1 | CS setup and hold times | SP8 |
@@ -99,10 +95,6 @@ its first section says which plan takes what.
 | `0x6000e040` | `ANA_I2C.I2C_MST_ANA_CONF0` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6000e044` | `ANA_I2C.ANA_CONFIG` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
 | `0x6000e048` | `ANA_I2C.ANA_CONFIG2` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
-| `0x6001000c` | `UART1.INT_ENA` | 1 | interrupt enables: nothing is raised | SP1b-3d |
-| `0x60010010` | `UART1.INT_CLR` | 1 | interrupt clear: nothing is pending | SP1b-3d |
-| `0x60010020` | `UART1.CONF0` | 1 | frame format: a byte is 10 bit times (the transmit FIFO reset acts) | SP1b-3d |
-| `0x60010024` | `UART1.CONF1` | 1 | FIFO thresholds | SP1b-3d |
 | `0x6001ccd4` | `NRX.NRXPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x6001d054` | `BB.BBPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60026014` | `APB_CTRL.WIFI_CLK_EN` | 1 | radio clock gates: there is no radio | SP5a |

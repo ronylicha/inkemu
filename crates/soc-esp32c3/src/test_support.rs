@@ -4,7 +4,9 @@
 
 use crate::memmap::ROM_BASE;
 use crate::rom::{ROM_LEN, RomImage};
+use crate::{ConsoleChannel, Diagnostic, Esp32C3, FlashWrite, StopReason};
 use cpu_rv32::asm;
+use emu_core::Cycles;
 
 /// A minimal ELF32 little-endian writer: enough structure for `RomImage::from_elf`, nothing more.
 #[derive(Clone, Debug, Default)]
@@ -466,5 +468,299 @@ pub fn within<T: Send + 'static>(
             Err(panic) => std::panic::resume_unwind(panic),
             Ok(()) => panic!("the thread ended without a result"),
         },
+    }
+}
+
+/// What the consoles of a machine sent since it was driven, and its diagnostics, taken after
+/// every call: the one record the tests that drive a machine through its consoles keep.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Consoles {
+    sent: [Vec<u8>; 3],
+    pub diagnostics: Vec<Diagnostic>,
+    pub flash_writes: Vec<FlashWrite>,
+}
+
+impl Consoles {
+    /// Everything `channel` sent.
+    #[must_use]
+    pub fn bytes(&self, channel: ConsoleChannel) -> &[u8] {
+        &self.sent[channel.index()]
+    }
+
+    /// Everything `channel` sent, as text, carriage returns dropped: the ROM and ESP-IDF expand
+    /// `\n` to `\r\n` on their consoles.
+    #[must_use]
+    pub fn text(&self, channel: ConsoleChannel) -> String {
+        String::from_utf8_lossy(self.bytes(channel)).replace('\r', "")
+    }
+
+    /// Takes what every channel of `machine` sent, its diagnostics and its flash writes, keeps
+    /// them, and gives back what the channels sent in this take, in [`ConsoleChannel::ALL`]
+    /// order: what a console script reads.
+    pub fn take(&mut self, machine: &mut Esp32C3) -> Vec<(ConsoleChannel, Vec<u8>)> {
+        self.diagnostics.extend(machine.drain_diagnostics());
+        self.flash_writes.extend(machine.take_flash_writes());
+        ConsoleChannel::ALL
+            .into_iter()
+            .map(|channel| {
+                let taken = machine.take_console(channel);
+                self.sent[channel.index()].extend_from_slice(&taken);
+                (channel, taken)
+            })
+            .collect()
+    }
+}
+
+/// The bounds of [`drive`]: the CPU cycles of each call, and the cycles and device time of the
+/// whole run. Both totals are needed: the cycle counter stands still while the CPU sleeps, so a
+/// machine that sleeps for ever never exhausts the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bounds {
+    pub slice: u64,
+    pub max_cycles: u64,
+    pub max_nanos: u64,
+}
+
+/// How [`drive`] ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Driven {
+    /// The caller's check accepted what the machine did.
+    Done,
+    /// The machine stopped for this reason, which no further call changes: a strict stop, or a
+    /// CPU that waits for ever.
+    Stopped(StopReason),
+    /// The cycles or the device time of [`Bounds`] ran out first.
+    OutOfBounds,
+}
+
+/// Drives `machine` in calls of `bounds.slice` cycles, taking its consoles into `consoles`
+/// after each call, until `done` accepts them, the machine stops, or the bounds run out. `done`
+/// sees the machine (to feed it input dated from what it sent), what this call took
+/// ([`Consoles::take`]) and everything taken so far. A call that ends because a watched console
+/// spoke, or because the CPU slept a while, is followed by the next.
+///
+/// # Panics
+/// When `bounds.slice` is 0: no call would move the machine on, and the loop would never end.
+pub fn drive(
+    machine: &mut Esp32C3,
+    bounds: Bounds,
+    consoles: &mut Consoles,
+    mut done: impl FnMut(&mut Esp32C3, &[(ConsoleChannel, Vec<u8>)], &Consoles) -> bool,
+) -> Driven {
+    assert!(
+        bounds.slice > 0,
+        "a slice of 0 cycles moves the machine on by nothing; give drive a slice of 1 cycle or more"
+    );
+    loop {
+        let cycles = machine.cycles().get();
+        if cycles >= bounds.max_cycles || machine.device_time_nanos() >= bounds.max_nanos {
+            return Driven::OutOfBounds;
+        }
+        let limit = cycles.saturating_add(bounds.slice).min(bounds.max_cycles);
+        let stop = machine.run_within(Cycles(limit), Some(bounds.max_nanos));
+        let taken = consoles.take(machine);
+        if done(machine, &taken, consoles) {
+            return Driven::Done;
+        }
+        match stop {
+            StopReason::CycleBudget
+            | StopReason::TimeBudget
+            | StopReason::Asleep
+            | StopReason::ConsoleOutput => {}
+            StopReason::StrictMmio(_) | StopReason::Idle => return Driven::Stopped(stop),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SocConfig;
+    use asm::wfi;
+
+    const UART0: u32 = 0x6000_0000;
+
+    fn machine(program: &[u32]) -> Esp32C3 {
+        Esp32C3::new(flat_rom(program), &SocConfig::default())
+    }
+
+    const WIDE: Bounds = Bounds {
+        slice: 1_000,
+        max_cycles: 10_000_000,
+        max_nanos: 1_000_000_000,
+    };
+
+    #[test]
+    fn drive_keeps_every_channel_and_ends_when_the_check_accepts() {
+        let mut m = machine(&print_program(UART0, b"ok"));
+        let mut consoles = Consoles::default();
+        let mut calls = 0;
+        let end = drive(&mut m, WIDE, &mut consoles, |_, _, seen| {
+            calls += 1;
+            seen.text(ConsoleChannel::Uart0) == "ok"
+        });
+        assert_eq!(end, Driven::Done);
+        assert_eq!(consoles.bytes(ConsoleChannel::Uart0), b"ok");
+        assert_eq!(consoles.bytes(ConsoleChannel::UsbSerialJtag), b"");
+        assert!(calls > 1, "the check is called after every call");
+    }
+
+    #[test]
+    fn drive_ends_on_a_stop_and_when_its_bounds_run_out() {
+        // Strapped for another boot mode, no watchdog runs at reset: nothing wakes the CPU, and
+        // device time stands still, so a driver that called again would never return.
+        let end = within(
+            std::time::Duration::from_secs(60),
+            "drive called an idle machine again and again",
+            || {
+                let mut idle = Esp32C3::new(
+                    flat_rom(&[wfi(), HANG]),
+                    &SocConfig {
+                        strapping: 0,
+                        ..SocConfig::default()
+                    },
+                );
+                drive(&mut idle, WIDE, &mut Consoles::default(), |_, _, _| false)
+            },
+        );
+        assert_eq!(end, Driven::Stopped(StopReason::Idle));
+        // A driver that missed a bound would call a machine that has nothing left to do in its
+        // budget again and again: each of these calls must return.
+        let (end, cycles) = within(
+            std::time::Duration::from_secs(60),
+            "drive went on past its bound of cycles",
+            || {
+                let mut spinning = machine(&[HANG]);
+                let tight = Bounds {
+                    max_cycles: 5_500,
+                    ..WIDE
+                };
+                let end = drive(&mut spinning, tight, &mut Consoles::default(), |_, _, _| {
+                    false
+                });
+                (end, spinning.cycles().get())
+            },
+        );
+        assert_eq!(end, Driven::OutOfBounds);
+        // The last call stops at the bound, not a slice later: the instruction that crosses it
+        // completes (a jump is 2 cycles).
+        assert!((5_500..5_510).contains(&cycles), "{cycles}");
+        // A jump is 100 ns at 20 MHz, so instruction boundaries fall every 100 ns: one of these
+        // two bounds is one of them, which the run reaches exactly, and the other is not.
+        for max_nanos in [10_000, 10_050] {
+            let (end, nanos) = within(
+                std::time::Duration::from_secs(60),
+                "drive went on past its bound of device time",
+                move || {
+                    let mut spinning = machine(&[HANG]);
+                    let short = Bounds { max_nanos, ..WIDE };
+                    let end = drive(&mut spinning, short, &mut Consoles::default(), |_, _, _| {
+                        false
+                    });
+                    (end, spinning.device_time_nanos())
+                },
+            );
+            assert_eq!(end, Driven::OutOfBounds);
+            // Ends at the first instruction boundary at or past the bound.
+            assert!(
+                (max_nanos..max_nanos + 100).contains(&nanos),
+                "{nanos} for a bound of {max_nanos}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "a slice of 0 cycles moves the machine on by nothing")]
+    fn drive_refuses_a_slice_of_0_cycles() {
+        // Without the refusal, each call would end where it started and the loop never would.
+        within(
+            std::time::Duration::from_secs(60),
+            "drive called a machine again and again for 0 cycles",
+            || {
+                let mut m = machine(&[HANG]);
+                let empty = Bounds { slice: 0, ..WIDE };
+                drive(&mut m, empty, &mut Consoles::default(), |_, _, _| false)
+            },
+        );
+    }
+
+    #[test]
+    fn take_keeps_the_diagnostics_and_the_flash_writes_of_every_take() {
+        // A read and a write of an unmodelled register (two diagnostics: they differ in
+        // direction), an erase and a program of the flash, then `a\r\nb` on UART0: taken in calls
+        // of a few cycles, so that each comes in a take of its own.
+        let ledc = unmodeled_register().addr;
+        let mut program = load_register(ledc).to_vec();
+        program.extend(flash_erase_sector(0x9000));
+        program.extend(store_register(ledc, 0));
+        program.extend(flash_program(0x9020, &[0xFA]));
+        program.extend(print_program(UART0, b"a\r\nb"));
+        program.push(HANG);
+        let mut m = Esp32C3::with_flash(flat_rom(&program), vec![0; 0xA000], &SocConfig::default())
+            .unwrap();
+        let mut consoles = Consoles::default();
+        let mut takes_with_something = 0;
+        // 2 ms at 20 MHz: the four bytes take 350 us on the line at 115 200 baud.
+        while m.cycles().get() < 40_000 {
+            let next = m.cycles() + 7;
+            m.run_until(next);
+            let before = (consoles.diagnostics.len(), consoles.flash_writes.len());
+            consoles.take(&mut m);
+            if (consoles.diagnostics.len(), consoles.flash_writes.len()) != before {
+                takes_with_something += 1;
+            }
+        }
+        assert!(
+            takes_with_something > 1,
+            "they came in {takes_with_something} take: {consoles:?}"
+        );
+        assert!(
+            matches!(
+                consoles.diagnostics[..],
+                [
+                    Diagnostic::UnmodeledMmio { addr: read, .. },
+                    Diagnostic::UnmodeledMmio { addr: written, .. },
+                ] if read == ledc && written == ledc
+            ),
+            "{:?}",
+            consoles.diagnostics
+        );
+        assert_eq!(
+            consoles.flash_writes,
+            [
+                FlashWrite::Erase {
+                    start: 0x9000,
+                    len: 0x1000
+                },
+                FlashWrite::Program {
+                    address: 0x9020,
+                    data: vec![0xFA]
+                },
+            ]
+        );
+        assert_eq!(consoles.bytes(ConsoleChannel::Uart0), b"a\r\nb");
+        assert_eq!(
+            consoles.text(ConsoleChannel::Uart0),
+            "a\nb",
+            "the carriage returns are dropped from the text, not from the bytes"
+        );
+    }
+
+    #[test]
+    fn take_gives_back_what_each_channel_sent_in_this_take() {
+        let mut m = machine(&print_program(UART0, b"x"));
+        let mut consoles = Consoles::default();
+        m.run_until(Cycles(1_000_000));
+        let taken = consoles.take(&mut m);
+        assert_eq!(
+            taken,
+            [
+                (ConsoleChannel::Uart0, b"x".to_vec()),
+                (ConsoleChannel::UsbSerialJtag, Vec::new()),
+                (ConsoleChannel::Uart1, Vec::new()),
+            ]
+        );
+        assert_eq!(consoles.take(&mut m)[0].1, b"", "taken once");
+        assert_eq!(consoles.bytes(ConsoleChannel::Uart0), b"x");
     }
 }

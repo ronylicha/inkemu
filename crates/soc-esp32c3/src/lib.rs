@@ -31,5 +31,9 @@ pub use diag::Diagnostic;
 pub use flash::{
     FlashConfig, FlashConfigError, FlashDevice, FlashImageError, FlashWrite, JedecId, NorFlash,
 };
-pub use machine::{ConsoleChannel, Esp32C3, StopReason};
+pub use machine::{
+    ConsoleChannel, Esp32C3, InputError, MAX_PENDING_HOST_BYTES, MAX_PENDING_HOST_CHANGES,
+    StopReason,
+};
+pub use periph::UsbHost;
 pub use rom::{RomError, RomImage};

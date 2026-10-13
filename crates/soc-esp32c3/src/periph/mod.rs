@@ -43,7 +43,7 @@ pub use system::System;
 pub use systimer::Systimer;
 pub use timg::Timg;
 pub use uart::Uart;
-pub use usb_serial_jtag::UsbSerialJtag;
+pub use usb_serial_jtag::{UsbHost, UsbSerialJtag};
 
 /// A register whose value the emulator stores although the hardware effect is not modelled
 /// (decision D12). The lists of these are what the storage of each model is built from, and what
@@ -275,7 +275,6 @@ pub fn accepted_without_effect() -> Vec<Accepted> {
         gpio::accepted(),
         sensitive::accepted(),
         system::accepted(),
-        uart::accepted(),
         intmatrix::accepted(),
         assist_debug::accepted(),
         extmem::accepted(),
@@ -472,13 +471,21 @@ impl Peripherals {
             radio_power: AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED),
             uart0: Uart::new(0, UART0_BASE),
             uart1: Uart::new(1, UART1_BASE),
-            usb_serial_jtag: UsbSerialJtag::new(),
+            usb_serial_jtag: UsbSerialJtag::new(config.usb_host),
         };
         periph.rtc_cntl.wake(ctx);
         periph.timg0.wake(ctx);
         periph.timg1.wake(ctx);
         periph.systimer.wake(ctx);
         periph
+    }
+
+    /// The clocks are about to change: the devices that time with `APB_CLK` from the settings of
+    /// now come to now at the old rate first. The UARTs do; the timer groups keep their counts at
+    /// the rate they were set to, and [`Event::ClockChanged`] tells them after the change.
+    pub(crate) fn clock_changing(&mut self, ctx: &mut Ctx) {
+        self.uart0.clock_changing(ctx);
+        self.uart1.clock_changing(ctx);
     }
 
     /// Calls the device an event is for: a wake-up whose time has come, or what another part of the
@@ -501,9 +508,12 @@ impl Peripherals {
             Event::ClockChanged => {
                 self.timg0.clock_changed(ctx);
                 self.timg1.clock_changed(ctx);
+                self.uart0.clock_changed(ctx);
+                self.uart1.clock_changed(ctx);
             }
             Event::Uart(0) => self.uart0.wake(ctx),
             Event::Uart(_) => self.uart1.wake(ctx),
+            Event::UsbSerialJtag => self.usb_serial_jtag.wake(ctx),
             Event::ModuleReset(module) => self.reset_module(ctx, module),
         }
     }
@@ -521,12 +531,13 @@ impl Peripherals {
                 self.spi0 = Spi0::new();
                 self.spi1.reset();
             }
-            Module::Uart0 => self.uart0.reset(ctx.now()),
-            Module::Uart1 => self.uart1.reset(ctx.now()),
+            Module::Uart0 => self.uart0.reset(ctx),
+            Module::Uart1 => self.uart1.reset(ctx),
             Module::Timg0 => self.timg0.reset(ctx),
             Module::Timg1 => self.timg1.reset(ctx),
             Module::Systimer => self.systimer.reset(ctx),
             Module::Sha => self.sha = Sha::new(),
+            Module::UsbDevice => self.usb_serial_jtag.reset(ctx),
         }
     }
 
@@ -584,9 +595,9 @@ impl Peripherals {
         self.ana_i2c.reset();
         self.apb_saradc = AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED);
         self.radio_power = AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED);
-        self.uart0.reset(ctx.now());
-        self.uart1.reset(ctx.now());
-        self.usb_serial_jtag.reset();
+        self.uart0.reset(ctx);
+        self.uart1.reset(ctx);
+        self.usb_serial_jtag.reset(ctx);
         // No rebuilt device asserts an interrupt source, and `SYSTEM` selects the reset clock again.
         // The timer groups and the SYSTIMER go last: each withdraws its wake-up, so that none of
         // the replaced devices leaves a call behind, and drives its sources low.
@@ -1204,6 +1215,81 @@ mod tests {
     }
 
     #[test]
+    fn a_uart_on_the_apb_clock_raises_its_timeout_at_the_instant_the_new_rate_gives() {
+        // A UART counts APB_CLK, 20 MHz at power-on: `a`, sent at 0, lands at 55 520 even though
+        // the clock goes to 40 MHz at 30 000, with the byte on the line. 10 bit times later is
+        // 83 280 at 40 MHz; at 60 000 the clock goes to 80 MHz, and the timeout comes 10 bit times
+        // at 80 MHz after the landing, at 69 400. Nothing calls the UART but its wake-ups and the
+        // changes of the clocks.
+        use emu_core::Cycles;
+        let svd = svd_regs::esp32c3::addr;
+        let deliver_until = |p: &mut Peripherals, ctx: &mut Ctx, instant: u64| {
+            ctx.sleep_until(Cycles(instant));
+            while let Some(event) = ctx.take_due() {
+                p.deliver(ctx, event);
+            }
+        };
+        for (uart, source) in [("UART0", 21), ("UART1", 22)] {
+            let ctx = &mut Ctx::default();
+            let mut p = peripherals(ctx);
+            write(&mut p, ctx, svd(uart, "CLK_CONF"), 0x0350_0000);
+            write(&mut p, ctx, svd(uart, "MEM_CONF"), 0x000A_0012);
+            write(&mut p, ctx, svd(uart, "CONF1"), 0x0020_C078);
+            write(&mut p, ctx, svd(uart, "INT_ENA"), 1 << 8);
+            let receiver = if source == 21 {
+                &mut p.uart0
+            } else {
+                &mut p.uart1
+            };
+            receiver.receive(ctx, Cycles::ZERO, b"a");
+            let pending = |p: &Peripherals| {
+                if source == 21 {
+                    p.uart0.host_pending()
+                } else {
+                    p.uart1.host_pending()
+                }
+            };
+            for (instant, apb_period) in [(30_000, 4), (60_000, 2)] {
+                deliver_until(&mut p, ctx, instant);
+                p.clock_changing(ctx);
+                ctx.set_clock(crate::clock::CpuClock::new(apb_period, apb_period));
+                p.deliver(ctx, Event::ClockChanged);
+                if instant == 30_000 {
+                    deliver_until(&mut p, ctx, 55_519);
+                    assert_eq!(pending(&p), 1, "{uart}: on the line");
+                    deliver_until(&mut p, ctx, 55_520);
+                    assert_eq!(pending(&p), 0, "{uart}: landed");
+                }
+            }
+            deliver_until(&mut p, ctx, 69_399);
+            assert_eq!(ctx.sources() & 1 << source, 0, "{uart}");
+            deliver_until(&mut p, ctx, 69_400);
+            assert_eq!(
+                ctx.sources() & 1 << source,
+                1 << source,
+                "{uart}: RXFIFO_TOUT"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_of_the_usb_device_empties_usb_serial_jtag_and_keeps_its_host() {
+        // `PERIP_RST_EN0` bit 23 (report USJ §A, §R.1).
+        let ctx = &mut Ctx::default();
+        let mut p = peripherals(ctx);
+        let usb = |name| svd_regs::esp32c3::addr("USB_DEVICE", name);
+        let source = 1 << 26;
+        write(&mut p, ctx, usb("EP1"), u32::from(b'x'));
+        write(&mut p, ctx, usb("INT_ENA"), 1 << 3);
+        assert_eq!(ctx.sources() & source, source, "SERIAL_IN_EMPTY, enabled");
+        p.deliver(ctx, Event::ModuleReset(Module::UsbDevice));
+        assert_eq!(read(&mut p, ctx, usb("INT_ENA")), Some(0));
+        assert_eq!(ctx.sources() & source, 0);
+        assert_eq!(p.usb_serial_jtag.take_written(), [], "the byte is lost");
+        assert_eq!(p.usb_serial_jtag.host(ctx), UsbHost::Open, "the host stays");
+    }
+
+    #[test]
     fn delivering_the_reset_of_a_module_posts_no_signal() {
         // `settle_signals` ends because a delivery posts nothing: only a write to `SYSTEM` does.
         let ctx = &mut Ctx::default();
@@ -1216,6 +1302,7 @@ mod tests {
             Module::Timg1,
             Module::Systimer,
             Module::Sha,
+            Module::UsbDevice,
         ] {
             p.deliver(ctx, Event::ModuleReset(module));
             assert_eq!(ctx.take_signal(), None, "{module:?}");

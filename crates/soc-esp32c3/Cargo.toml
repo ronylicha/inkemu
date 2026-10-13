@@ -24,3 +24,10 @@ sha2.workspace = true
 [dev-dependencies]
 cpu-rv32 = { workspace = true, features = ["test-support"] }
 firmware = { workspace = true, features = ["test-support"] }
+# The integration tests of this crate drive machines with `test_support` (its console driver
+# among it), which they can only reach through the feature. A crate that depends on itself for
+# its tests turns the feature on for every test build of it, `cargo test -p soc-esp32c3` as
+# `cargo test --workspace`: the two agree, where the documentation examples of SP1b-3b differed.
+# Those examples keep taking their `RomImage` as a parameter, so that none of them leans on the
+# feature (`crates/soc-esp32c3/tests/test_support_is_test_only.rs`).
+soc-esp32c3 = { path = ".", features = ["test-support"] }

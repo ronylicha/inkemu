@@ -183,6 +183,69 @@ fn a_console_the_device_does_not_have_exits_2_and_lists_the_three_it_has() {
 }
 
 #[test]
+fn a_usb_host_state_the_port_does_not_have_exits_2_and_lists_the_three_it_has() {
+    inkemu()
+        .args(["run", "--device", "x4", "--usb-host", "closed"])
+        .assert()
+        .code(2)
+        .stderr(
+            contains("'--usb-host <USB_HOST>'")
+                .and(contains("absent"))
+                .and(contains("attached"))
+                .and(contains("open")),
+        );
+}
+
+/// A console script with `body` after its version line, in a directory that lives as long as
+/// the value.
+fn console_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("steps.txt");
+    std::fs::write(&path, format!("inkemu-console-script 1\n{body}")).unwrap();
+    (dir, path)
+}
+
+#[test]
+fn a_refused_console_script_exits_2_at_its_line_and_column_before_any_rom_is_read() {
+    let (dir, script) = console_script("wait 3\n");
+    let empty_rom_dir = dir.path().join("roms");
+    std::fs::create_dir(&empty_rom_dir).unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--rom-dir"])
+        .arg(&empty_rom_dir)
+        .arg("--console-script")
+        .arg(&script)
+        .assert()
+        .code(2)
+        .stderr(
+            contains("steps.txt, line 2, column 6: `3` is no duration; write a whole number")
+                .and(contains("esp32c3_rev3_rom.elf").not()),
+        );
+    inkemu()
+        .args(["run", "--device", "x4", "--rom-dir"])
+        .arg(&empty_rom_dir)
+        .arg("--console-script")
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "is not a regular file; give the path of the file itself",
+        ));
+}
+
+#[test]
+fn run_help_documents_the_console_script_and_the_usb_host() {
+    inkemu().args(["run", "--help"]).assert().code(0).stdout(
+        contains("--console-script <FILE>")
+            .and(contains("inkemu-console-script 1"))
+            .and(contains("wait-for CHANNEL"))
+            .and(contains("--usb-host <USB_HOST>"))
+            .and(contains("[default: open]"))
+            .and(contains("\n  5  ")),
+    );
+}
+
+#[test]
 fn rom_fetch_requires_a_device_or_all() {
     inkemu().args(["rom", "fetch"]).assert().code(2);
 }
@@ -357,6 +420,45 @@ fn x4_boots_the_real_rom_to_its_banner() {
     };
     assert!(hash(&first).is_some());
     assert_eq!(hash(&first), hash(&run()));
+}
+
+/// `--usb-host` reaches the machine: nothing in a run of a blank chip changes the host, so the
+/// summary says at the end the state the option gave at power-on, and `open` without it.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn the_usb_host_given_is_the_one_the_summary_says() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    for (option, state) in [
+        (Some("absent"), "absent"),
+        (Some("attached"), "attached"),
+        (Some("open"), "open"),
+        (None, "open"),
+    ] {
+        let mut command = inkemu();
+        command.args([
+            "run",
+            "--device",
+            "x4",
+            "--max-cycles",
+            "1000000",
+            "--rom-dir",
+            &rom_dir,
+        ]);
+        if let Some(option) = option {
+            command.args(["--usb-host", option]);
+        }
+        let output = command
+            .timeout(HANG_LIMIT)
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            log.contains(&format!("\ninkemu: USB host {state}\n")),
+            "--usb-host {option:?}:\n{log}"
+        );
+    }
 }
 
 /// The command the `rom-boot` CI job and the README recommend, on ROM files that are already there:
@@ -822,13 +924,22 @@ fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_res
     let micros = device_micros(&log);
     assert!((1_500_000..=1_500_010).contains(&micros), "{log}");
     assert!(!log.contains("the CPU is asleep"), "{log}");
-    // The journal says what the ROM's `rst:0x7` line does, with the stack pointer besides.
+    // The journal says what the ROM's `rst:0x7` line does, with the stack pointer besides. The
+    // watchdog finds the ROM in the loop of `uart_tx_one_char_uart.part.0` that waits for room in
+    // the UART FIFO, at whichever of its four instructions the phase of the loop puts it on
+    // (rev3 ROM ELF: `lw` 0x4004c0d4, `srli` 0x4004c0d6, `andi` 0x4004c0d8, `bnez` 0x4004c0dc);
+    // the trace hash pins the run.
+    let Some((reset_pc, _)) = log
+        .split_once("\ninkemu: reset by main watchdog 0, a core reset (rst:0x7) at pc ")
+        .and_then(|(_, rest)| rest.split_once(", sp 0x"))
+    else {
+        panic!("no reset by main watchdog 0 in the journal:\n{log}")
+    };
     assert!(
-        log.contains(
-            "\ninkemu: reset by main watchdog 0, a core reset (rst:0x7) at pc 0x4004c0d4, sp 0x"
-        ) && !log.contains("warning:"),
+        ["0x4004c0d4", "0x4004c0d6", "0x4004c0d8", "0x4004c0dc"].contains(&reset_pc),
         "{log}"
     );
+    assert!(!log.contains("warning:"), "{log}");
     let second = run();
     assert_eq!(
         first.stdout, second.stdout,
@@ -838,6 +949,148 @@ fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_res
     assert_eq!(
         trace_hash_line(&log),
         trace_hash_line(&String::from_utf8_lossy(&second.stderr))
+    );
+}
+
+/// A second stage that stops the watchdogs, prints `ready` on UART0, then echoes on UART0 what
+/// it receives, polling `STATUS.RXFIFO_CNT`. Before each byte it writes it waits for room in the
+/// transmit FIFO, as the ROM's `uart_tx_one_char` does (`TXFIFO_CNT` below 128, `uart.rs`): the
+/// ROM enters it with the FIFO still full of its last lines, and a byte written to a full FIFO
+/// is lost, on the device as here.
+fn ready_then_echo() -> Vec<u32> {
+    use cpu_rv32::asm::{addi, beq, blt, jal, lb, lbu, lui, lw, sw};
+    use soc_esp32c3::test_support::{T0, T1};
+    let fifo = svd_regs::esp32c3::addr("UART0", "FIFO");
+    let status = svd_regs::esp32c3::addr("UART0", "STATUS");
+    // `T0` holds the base of UART0, which is the address of its FIFO: `lui` keeps only the page.
+    assert_eq!(fifo & 0xFFF, 0, "the FIFO opens its page");
+    let status = (status - fifo).cast_signed();
+    // `STATUS` [25:16] is `TXFIFO_CNT`, at most 128: its bit 7, the sign bit of the byte at
+    // offset 2 of the register, is set exactly when the FIFO is full. `lb` sign-extends it, and
+    // `blt` against `x0` loops back to the `lb` while it is set.
+    let wait_for_room = [lb(T1, T0, status + 2), blt(T1, 0, -4)];
+    let mut program = stop_watchdogs();
+    program.push(lui(T0, fifo));
+    for &byte in b"ready" {
+        program.extend(wait_for_room);
+        program.extend([addi(T1, 0, i32::from(byte)), sw(T1, T0, 0)]);
+    }
+    // The loop of the echo: wait for a byte (`STATUS` [9:0] is `RXFIFO_CNT`, at most 128: its
+    // low byte), wait for room, read the byte, write it, and back to the first instruction, 6
+    // words up.
+    program.extend([lbu(T1, T0, status), beq(T1, 0, -4)]);
+    program.extend(wait_for_room);
+    program.extend([lw(T1, T0, 0), sw(T1, T0, 0), jal(0, -24)]);
+    program
+}
+
+/// The first bytes of a second stage that leave the transmit FIFO of UART0 full, as the ROM
+/// leaves it when it enters the image: 129 bytes, the first of which goes on the line at once
+/// and the 128 others wait (`uart.rs`, `FIFO_BYTES`).
+fn uart0_fifo_left_full() -> Vec<u32> {
+    soc_esp32c3::test_support::print_program(svd_regs::esp32c3::addr("UART0", "FIFO"), &[b'.'; 129])
+}
+
+/// The echo firmware without the ROM, entered with the transmit FIFO of UART0 full: `ready` and
+/// the echo of what the host typed come after the 129 bytes already there, and no byte is
+/// dropped. The host types at power-on, so that the echo too finds the FIFO full: the three
+/// bytes are in the receive FIFO long before `ready` is out of the firmware.
+#[test]
+fn the_echo_firmware_waits_for_room_in_the_transmit_fifo_the_rom_leaves_full() {
+    use soc_esp32c3::test_support::{Bounds, Consoles, Driven, drive, flat_rom};
+    use soc_esp32c3::{ConsoleChannel, Esp32C3, SocConfig};
+    let mut program = uart0_fifo_left_full();
+    program.extend(ready_then_echo());
+    let mut machine = Esp32C3::new(flat_rom(&program), &SocConfig::default());
+    let now = machine.device_time();
+    machine
+        .send_console(ConsoleChannel::Uart0, now, b"hi\r")
+        .unwrap();
+    // 137 bytes leave UART0 at its reset settings, 55 520 cycles of the 160 MHz time base each
+    // (347 us), under 48 ms of device time: one second and twenty million cycles are far more
+    // than the run needs, and bound it if it hangs.
+    let bounds = Bounds {
+        slice: 1_000,
+        max_cycles: 20_000_000,
+        max_nanos: 1_000_000_000,
+    };
+    let mut consoles = Consoles::default();
+    let end = drive(&mut machine, bounds, &mut consoles, |_, _, seen| {
+        seen.bytes(ConsoleChannel::Uart0).ends_with(b"readyhi\r")
+    });
+    let sent = consoles.bytes(ConsoleChannel::Uart0);
+    assert_eq!(end, Driven::Done, "{:?}", String::from_utf8_lossy(sent));
+    assert_eq!(sent, [&[b'.'; 129][..], b"readyhi\r"].concat());
+    assert!(
+        consoles.diagnostics.is_empty(),
+        "{:?}",
+        consoles.diagnostics
+    );
+}
+
+/// The device time the scripted runs below are given. In a run of the CI cut at 50 ms, the last
+/// byte of the ROM's lines (`entry 0x40380000`) had left UART0, the CPU clock at 20 MHz; some
+/// 186 bytes, 16 ms of line, come out before `ready`. From that last byte on, `ready` follows
+/// the bytes of the ROM still in the FIFO: its 5 bytes leave within 5 byte times, 0.43 ms at
+/// 115 200 baud and 10 bits a byte (86.8 us each). The script then types `hi\r`, whose echo ends
+/// about one byte time after its third byte comes in: 4 byte times, 0.35 ms. Everything is over
+/// before 51 ms; 100 ms is twice that, and costs two million cycles of the busy loop of the
+/// second stage in the run that waits for ever.
+const SCRIPTED_RUN_SECONDS: &str = "0.1";
+
+/// The run of the echo firmware with the console script `body`, to [`SCRIPTED_RUN_SECONDS`] of
+/// device time.
+fn scripted_run(rom_dir: &str, body: &str) -> std::process::Output {
+    let (_flash_dir, flash) = flash_image_of(&ready_then_echo());
+    let (_script_dir, script) = console_script(body);
+    inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--max-time",
+            SCRIPTED_RUN_SECONDS,
+            "--rom-dir",
+            rom_dir,
+        ])
+        .arg("--flash")
+        .arg(&flash)
+        .arg("--console-script")
+        .arg(&script)
+        .timeout(HANG_LIMIT)
+        .output()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_console_script_types_into_the_firmware_after_its_prompt() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let output = scripted_run(&rom_dir, "wait-for uart0 \"ready\"\nsend uart0 \"hi\\r\"\n");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{log}");
+    let console = String::from_utf8_lossy(&output.stdout);
+    assert!(console.ends_with("readyhi\r"), "{console:?}");
+    assert!(
+        log.contains("inkemu: USB host open\ninkemu: console script through (2 steps)\n"),
+        "{log}"
+    );
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_console_script_still_waiting_when_the_run_ends_exits_5() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let output = scripted_run(&rom_dir, "wait-for uart0 \"login:\"\n");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(5), "{log}");
+    // The firmware ran and printed its prompt: the script waited for a text that never came,
+    // not for a firmware that never started.
+    let console = String::from_utf8_lossy(&output.stdout);
+    assert!(console.ends_with("ready"), "{console:?}");
+    assert!(
+        log.contains("inkemu: console script not through: line 2 (wait-for uart0 \"login:\") was still waiting; "),
+        "{log}"
     );
 }
 
@@ -1330,12 +1583,12 @@ fn x4_runs_the_reference_firmware_along_its_pinned_trace() {
     let log = String::from_utf8_lossy(&output.stderr).into_owned();
     assert_eq!(
         trace_hash_line(&log),
-        Some("trace-hash 10174cc2726c3d77"),
+        Some("trace-hash fb9ea628bc25b355"),
         "{log}"
     );
     assert_eq!(device_micros(&log), 11_396_706, "{log}");
     assert!(
-        log.contains("after 40000001 cycles (26562395 instructions)"),
+        log.contains("after 40000001 cycles (26559249 instructions)"),
         "{log}"
     );
 }
@@ -2799,6 +3052,116 @@ fn the_nvs_reference_firmware_goes_on_counting_in_a_second_run_on_the_same_flash
     assert_eq!(sha256_of(&image), NVS_IMAGE_SHA256, "--flash is only read");
 }
 
+/// What the README says standard error reads for the runs of the reference images: the
+/// `inkemu:` lines of its `text` blocks against the ones the binary prints. Each example is the
+/// sentence that introduces a block and the command or commands that produce it, written as
+/// the README writes them. An example that begins with `$ ` takes its commands from the block
+/// itself, one run per paragraph. The images are copied under the names the README shows, and
+/// the runs start in the directory that holds them, so that the file names the lines print are
+/// the README's own. Numbers (program counter, cycles, instructions, device time, flash digests)
+/// move with any change that touches what the firmware sees; this is the test that says so.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the images.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR, INKEMU_REF_FLASH and INKEMU_NVS_FLASH"]
+fn the_readme_shows_what_the_binary_prints_for_the_reference_firmware() {
+    const BINARY: &str = "target/release/inkemu ";
+    /// The introduction of a block of the README, and what runs to produce it (empty: the
+    /// commands are in the block).
+    const EXAMPLES: [(&str, &[&str]); 3] = [
+        (
+            "With `--max-cycles 50000000`, standard error reads:\n\n",
+            &["run --device x4 --flash flash_hello.bin --max-cycles 50000000"],
+        ),
+        (
+            "`Restarting in 6 seconds...` and standard error reads:\n\n",
+            &["run --device x4 --flash flash_hello.bin --max-time 5"],
+        ),
+        ("keeps a restart counter in NVS:\n\n", &[]),
+    ];
+
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let images = [
+        ("flash_hello.bin", reference_image()),
+        (
+            "flash_nvs.bin",
+            pinned_image("INKEMU_NVS_FLASH", "flash_nvs.bin", NVS_IMAGE_SHA256),
+        ),
+    ];
+    let readme = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+    )
+    .unwrap();
+    let inkemu_lines = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.starts_with("inkemu:"))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let mut disagreements = Vec::new();
+    for (introduction, commands) in EXAMPLES {
+        let after = readme
+            .split_once(introduction)
+            .unwrap_or_else(|| panic!("the README has no block after {introduction:?}"))
+            .1;
+        let block = after
+            .strip_prefix("```text\n")
+            .unwrap_or_else(|| panic!("no `text` block after {introduction:?}"))
+            .split_once("\n```")
+            .unwrap()
+            .0;
+        // One run, one paragraph of the block, when the block holds its commands.
+        let runs: Vec<(String, String)> = if commands.is_empty() {
+            block
+                .split("\n\n")
+                .map(|paragraph| {
+                    let command = paragraph
+                        .lines()
+                        .next()
+                        .and_then(|line| line.strip_prefix("$ "))
+                        .and_then(|line| line.strip_prefix(BINARY))
+                        .unwrap_or_else(|| panic!("no command opens:\n{paragraph}"));
+                    (command.to_owned(), paragraph.to_owned())
+                })
+                .collect()
+        } else {
+            vec![(commands[0].to_owned(), block.to_owned())]
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        for (name, source) in &images {
+            std::fs::copy(source, dir.path().join(name)).unwrap();
+        }
+        for (command, shown) in runs {
+            let output = inkemu()
+                .current_dir(dir.path())
+                .args(command.split_whitespace())
+                .args(["--rom-dir", &rom_dir])
+                .timeout(HANG_LIMIT)
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert_eq!(output.status.code(), Some(0), "{command}\n{log}");
+            let printed = inkemu_lines(&log);
+            let shown = inkemu_lines(&shown);
+            if printed != shown {
+                disagreements.push(format!(
+                    "`{BINARY}{command}` prints:\n{}\nthe README shows:\n{}",
+                    printed.join("\n"),
+                    shown.join("\n")
+                ));
+            }
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "{}\n\nthe README shows other `inkemu:` lines than the binary prints; copy the lines \
+         above that follow \"prints:\" into README.md, in place of the lines it shows",
+        disagreements.join("\n\n")
+    );
+}
+
 /// `inkemu run --device x4 --firmware <application> [--bootloader <bootloader>] <more>` with a ROM
 /// directory that holds nothing: a refusal of what was given must come before any attempt to load
 /// a ROM.
@@ -3582,12 +3945,12 @@ fn x4_runs_the_reference_firmware_from_its_application_image_along_its_pinned_tr
     let log = String::from_utf8_lossy(&output.stderr).into_owned();
     assert_eq!(
         trace_hash_line(&log),
-        Some("trace-hash c6b24a1cc226ed4a"),
+        Some("trace-hash 9a6cf19d47136f33"),
         "{log}"
     );
     assert_eq!(device_micros(&log), 11_403_054, "{log}");
     assert!(
-        log.contains("after 40000001 cycles (26637404 instructions)"),
+        log.contains("after 40000001 cycles (26635331 instructions)"),
         "{log}"
     );
     assert!(

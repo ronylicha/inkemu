@@ -8,8 +8,9 @@ use emu_core::Cycles;
 use firmware::builder::{ImageSpec, build_image};
 use sha2::{Digest, Sha256};
 use soc_esp32c3::reset::ResetCause;
+use soc_esp32c3::test_support::{Bounds, Consoles, Driven, drive};
 use soc_esp32c3::{
-    ChipRevision, ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason,
+    ChipRevision, ConsoleChannel, Diagnostic, Esp32C3, RomImage, SocConfig, StopReason, UsbHost,
 };
 
 /// The ROM ELF of `revision` in the directory `INKEMU_ROM_ELF_DIR` names; a failure says why and
@@ -83,14 +84,20 @@ fn eco_versions_identify_the_three_revisions() {
 
 /// Far more than the ROM needs to reach its banner; a bound, not an expectation.
 const BANNER_BUDGET: u64 = 20_000_000;
+/// The device time of a boot to the banner: ten times what [`BANNER_BUDGET`] lasts at the 20 MHz
+/// the ROM runs at. A bound for a CPU that would sleep, whose cycle counter stands still, so that
+/// the first bound never comes; a bound, not an expectation.
+const BANNER_TIME_BUDGET_NS: u64 = 10 * SECOND_NS;
 const SLICE: u64 = 100_000;
 const BOOT_LINE: &str = "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n";
 
 struct Boot {
     uart0: String,
     usb: String,
+    /// What the firmware wrote on USB-Serial-JTAG and the host did not take.
+    usb_left: Vec<u8>,
     diagnostics: Vec<Diagnostic>,
-    stop: StopReason,
+    driven: Driven,
     trace_hash: Option<u64>,
     cycles: u64,
 }
@@ -99,25 +106,23 @@ struct Boot {
 /// Carriage returns are dropped: the ROM expands `\n` to `\r\n` on the UART.
 fn boot(revision: u16, config: SocConfig) -> Boot {
     let mut machine = Esp32C3::new(RomImage::from_elf(&elf(revision)).unwrap(), &config);
-    let (mut uart0, mut usb, mut diagnostics) = (Vec::new(), Vec::new(), Vec::new());
-    let mut stop = StopReason::CycleBudget;
-    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
-    while stop == StopReason::CycleBudget
-        && machine.cycles().get() < BANNER_BUDGET
-        && !text(&uart0).contains(BOOT_LINE)
-    {
-        stop = machine.run_until(Cycles(machine.cycles().get() + SLICE));
-        uart0.extend(machine.take_console(ConsoleChannel::Uart0));
-        usb.extend(machine.take_console(ConsoleChannel::UsbSerialJtag));
-        diagnostics.extend(machine.drain_diagnostics());
-    }
+    let mut consoles = Consoles::default();
+    let bounds = Bounds {
+        slice: SLICE,
+        max_cycles: BANNER_BUDGET,
+        max_nanos: BANNER_TIME_BUDGET_NS,
+    };
+    let driven = drive(&mut machine, bounds, &mut consoles, |_, _, seen| {
+        seen.text(ConsoleChannel::Uart0).contains(BOOT_LINE)
+    });
     Boot {
-        uart0: text(&uart0),
-        usb: text(&usb),
-        diagnostics,
-        stop,
+        uart0: consoles.text(ConsoleChannel::Uart0),
+        usb: consoles.text(ConsoleChannel::UsbSerialJtag),
+        diagnostics: consoles.diagnostics,
+        driven,
         trace_hash: machine.trace_hash(),
         cycles: machine.cycles().get(),
+        usb_left: machine.flush_console(ConsoleChannel::UsbSerialJtag),
     }
 }
 
@@ -150,6 +155,35 @@ fn rev3_rom_prints_the_same_banner_on_usb_serial_jtag() {
     );
 }
 
+/// With no host, or a host whose port is closed, nobody takes the ROM's first USB packet: the ROM
+/// waits for room 5,000 times, gives up and drops the rest of its USB output, and its banner on
+/// UART0 goes on (report USJ §B.1, §F.3).
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn rev3_rom_keeps_its_first_usb_packet_without_a_host_that_takes_it_and_goes_on() {
+    for usb_host in [UsbHost::Absent, UsbHost::Attached] {
+        let boot = boot(
+            3,
+            SocConfig {
+                usb_host,
+                ..SocConfig::default()
+            },
+        );
+        assert!(
+            boot.uart0
+                .starts_with(&banner("esp32c3-api1-20210207", "Feb  7 2021")),
+            "{usb_host:?}: UART0 printed {:?}",
+            boot.uart0
+        );
+        assert_eq!(boot.usb, "", "{usb_host:?}: the host took nothing");
+        assert_eq!(
+            String::from_utf8_lossy(&boot.usb_left),
+            "ESP-ROM:esp32c3-api1-20210207\r\n",
+            "{usb_host:?}: the first packet only"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR"]
 fn rev0_and_rev101_roms_print_their_own_banners() {
@@ -179,7 +213,7 @@ fn assert_strict_boot_reaches_the_banner(rom_revision: u16, banner_text: &str) {
     assert!(
         boot.uart0.starts_with(banner_text),
         "rev{rom_revision} stopped early: {:?}\nUART0: {:?}",
-        boot.stop,
+        boot.driven,
         boot.uart0
     );
     assert!(
@@ -233,6 +267,9 @@ const STUB_CODE: [u8; 4] = [0x6f, 0, 0, 0];
 const ROM_HANG_PC: u32 = 0x4004_7ed2;
 /// The ROM path from the banner to the bootloader entry is about 121,000 instructions (FB §1 item 1).
 const FLASH_BOOT_BUDGET: u64 = 40_000_000;
+/// The device time of a flash boot: ten times what [`FLASH_BOOT_BUDGET`] lasts at 20 MHz, for the
+/// same reason as [`BANNER_TIME_BUDGET_NS`].
+const FLASH_BOOT_TIME_BUDGET_NS: u64 = 20 * SECOND_NS;
 const INVALID_HEADER_BLANK: &str = "invalid header: 0xffffffff\n";
 
 fn stub_spec() -> ImageSpec {
@@ -250,7 +287,7 @@ struct FlashBoot {
     /// UART0 output after the three banner lines, carriage returns dropped.
     after_banner: String,
     diagnostics: Vec<Diagnostic>,
-    stop: StopReason,
+    driven: Driven,
     pc: u32,
     trace_hash: Option<u64>,
 }
@@ -264,31 +301,34 @@ fn flash_boot(flash: Option<Vec<u8>>, config: SocConfig, done: impl Fn(&str) -> 
         None => Esp32C3::new(rom, &config),
     };
     let banner_text = banner("esp32c3-api1-20210207", "Feb  7 2021");
-    let (mut uart0, mut diagnostics) = (Vec::new(), Vec::new());
-    let mut stop = StopReason::CycleBudget;
-    let mut extra_slices = 1;
-    let after = |bytes: &[u8]| {
-        let text = String::from_utf8_lossy(bytes).replace('\r', "");
-        text.strip_prefix(&banner_text)
+    let after = |consoles: &Consoles| {
+        consoles
+            .text(ConsoleChannel::Uart0)
+            .strip_prefix(&banner_text)
             .map(str::to_owned)
             .unwrap_or_default()
     };
-    while stop == StopReason::CycleBudget && machine.cycles().get() < FLASH_BOOT_BUDGET {
-        if done(&after(&uart0)) {
-            if extra_slices == 0 {
-                break;
-            }
-            extra_slices -= 1;
+    let mut consoles = Consoles::default();
+    let bounds = Bounds {
+        slice: SLICE,
+        max_cycles: FLASH_BOOT_BUDGET,
+        max_nanos: FLASH_BOOT_TIME_BUDGET_NS,
+    };
+    let mut extra_slices = 1;
+    let driven = drive(&mut machine, bounds, &mut consoles, |_, _, seen| {
+        if !done(&after(seen)) {
+            return false;
         }
-        stop = machine.run_until(Cycles(machine.cycles().get() + SLICE));
-        uart0.extend(machine.take_console(ConsoleChannel::Uart0));
-        let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
-        diagnostics.extend(machine.drain_diagnostics());
-    }
+        if extra_slices == 0 {
+            return true;
+        }
+        extra_slices -= 1;
+        false
+    });
     FlashBoot {
-        after_banner: after(&uart0),
-        diagnostics,
-        stop,
+        after_banner: after(&consoles),
+        diagnostics: consoles.diagnostics,
+        driven,
         pc: machine.pc(),
         trace_hash: machine.trace_hash(),
     }
@@ -327,7 +367,7 @@ fn rom_loads_a_synthetic_bootloader_and_jumps_to_its_entry() {
         Vec::new(),
         "nothing unmodelled, no exception, on the whole flash path"
     );
-    assert_eq!(boot.stop, StopReason::CycleBudget);
+    assert_eq!(boot.driven, Driven::Done);
     assert_eq!(boot.pc, STUB_ENTRY, "the ROM jumped into the image");
 }
 
@@ -352,7 +392,7 @@ fn blank_flash_prints_invalid_header_forever() {
         boot.after_banner
     );
     assert_eq!(boot.diagnostics, Vec::new());
-    assert_eq!(boot.stop, StopReason::CycleBudget, "a loop, not a stop");
+    assert_eq!(boot.driven, Driven::Done, "a loop, not a stop");
 }
 
 #[test]
@@ -479,8 +519,13 @@ fn two_flash_boots_are_identical_down_to_the_trace_hash() {
 const SECOND_NS: u64 = 1_000_000_000;
 /// Where the watchdogs catch the ROM of a blank chip: in its UART routine
 /// (`ROM3:uart_tx_one_char_uart.part.0@0x4004c0be`), in the loop that waits for room in the FIFO
-/// while it prints `invalid header`.
-const ROM_UART_WAIT_PC: u32 = 0x4004_c0d4;
+/// while it prints `invalid header`. Its four instructions, as the rev3 ROM ELF disassembles:
+/// `lw a4,0(a3)` reads `UART_STATUS`, `srli a4,a4,0x10` and `andi a4,a4,896` keep the top bits of
+/// `TXFIFO_CNT`, `bnez a4,0x4004c0d4` loops while the FIFO holds 128 bytes or more. Which of the
+/// four a watchdog expiry finds depends on the phase of the loop against the expiry, which
+/// anything that changes the time the ROM spends elsewhere (its USB-Serial-JTAG output, for one)
+/// moves: these tests pin the loop, and the trace hashes pin the run.
+const ROM_UART_WAIT_LOOP: [u32; 4] = [0x4004_c0d4, 0x4004_c0d6, 0x4004_c0d8, 0x4004_c0dc];
 /// Cycles between two looks at the machine in the watchdog tests: 50 us at the 20 MHz the ROM
 /// runs at, the resolution the instant of a reset is observed with.
 const WATCHDOG_SLICE: u64 = 1_000;
@@ -530,35 +575,33 @@ fn run_to_resets(
     limit_ns: u64,
     done: impl Fn(&str) -> bool,
 ) -> WatchdogRun {
-    let (mut uart0, mut reset_seen_at, mut diagnostics) = (Vec::new(), Vec::new(), Vec::new());
-    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace('\r', "");
-    while !(machine.resets() >= resets && done(&text(&uart0))) {
-        assert!(
-            machine.cycles().get() < FLASH_BOOT_BUDGET * 4
-                && machine.device_time_nanos() < limit_ns,
-            "budget exhausted after {} resets, at {} ns of device time and {} cycles (limits: {limit_ns} ns, {} cycles); console:\n{}",
-            machine.resets(),
-            machine.device_time_nanos(),
-            machine.cycles().get(),
-            FLASH_BOOT_BUDGET * 4,
-            text(&uart0)
-        );
-        let stop = machine.run_until(Cycles(machine.cycles().get() + WATCHDOG_SLICE));
-        assert!(
-            matches!(stop, StopReason::CycleBudget | StopReason::Asleep),
-            "{stop:?}"
-        );
+    let mut reset_seen_at = Vec::new();
+    let mut consoles = Consoles::default();
+    let bounds = Bounds {
+        slice: WATCHDOG_SLICE,
+        max_cycles: FLASH_BOOT_BUDGET * 4,
+        max_nanos: limit_ns,
+    };
+    let driven = drive(&mut machine, bounds, &mut consoles, |machine, _, seen| {
         if machine.resets() > u64::try_from(reset_seen_at.len()).unwrap() {
             reset_seen_at.push(machine.device_time_nanos());
         }
-        uart0.extend(machine.take_console(ConsoleChannel::Uart0));
-        let _ = machine.take_console(ConsoleChannel::UsbSerialJtag);
-        diagnostics.extend(machine.drain_diagnostics());
-    }
+        machine.resets() >= resets && done(&seen.text(ConsoleChannel::Uart0))
+    });
+    assert_eq!(
+        driven,
+        Driven::Done,
+        "after {} resets, at {} ns of device time and {} cycles (limits: {limit_ns} ns, {} cycles); console:\n{}",
+        machine.resets(),
+        machine.device_time_nanos(),
+        machine.cycles().get(),
+        FLASH_BOOT_BUDGET * 4,
+        consoles.text(ConsoleChannel::Uart0)
+    );
     WatchdogRun {
-        console: text(&uart0),
+        console: consoles.text(ConsoleChannel::Uart0),
         reset_seen_at,
-        diagnostics,
+        diagnostics: consoles.diagnostics,
         repeated: machine.most_repeated_diagnostics(8),
     }
 }
@@ -584,22 +627,39 @@ fn a_blank_flash_is_reset_by_the_main_watchdog_then_by_the_rtc_watchdog() {
             .nth(1)
             .is_some_and(|rest| rest.contains(INVALID_HEADER_BLANK))
     });
-    // Strict mode: nothing unmodelled. The journal holds the resets and nothing else: the two of
-    // main watchdog 0 found the ROM at the same instruction, so they are one entry counted
-    // twice, and the RTC watchdog found it there too.
+    // Strict mode: nothing unmodelled. The journal holds the resets and nothing else, each cause
+    // and PC once, at its first occurrence; a reset that found the ROM at the same instruction
+    // as an earlier one of its cause is counted with it. Taken back in the order they came, the
+    // three resets are those of main watchdog 0 twice, then of the RTC watchdog, each in the
+    // loop where the ROM waits for room in the UART FIFO.
+    let repeated: Vec<((ResetCause, u32), u64)> = run
+        .repeated
+        .iter()
+        .map(|(diagnostic, count)| (reset_entries(std::slice::from_ref(diagnostic))[0], *count))
+        .collect();
+    let resets: Vec<(ResetCause, u32)> = reset_entries(&run.diagnostics)
+        .into_iter()
+        .flat_map(|entry| {
+            let count = repeated
+                .iter()
+                .find(|(other, _)| *other == entry)
+                .map_or(1, |&(_, count)| count);
+            std::iter::repeat_n(entry, usize::try_from(count).unwrap())
+        })
+        .collect();
     assert_eq!(
-        reset_entries(&run.diagnostics),
+        resets.iter().map(|&(cause, _)| cause).collect::<Vec<_>>(),
         [
-            (ResetCause::Mwdt0Core, ROM_UART_WAIT_PC),
-            (ResetCause::RtcWatchdogSystem, ROM_UART_WAIT_PC),
-        ]
+            ResetCause::Mwdt0Core,
+            ResetCause::Mwdt0Core,
+            ResetCause::RtcWatchdogSystem
+        ],
+        "journal {:?}, repeated {repeated:?}",
+        run.diagnostics
     );
-    assert_eq!(
-        run.repeated
-            .iter()
-            .map(|(diagnostic, count)| (reset_entries(std::slice::from_ref(diagnostic))[0], *count))
-            .collect::<Vec<_>>(),
-        [((ResetCause::Mwdt0Core, ROM_UART_WAIT_PC), 2)]
+    assert!(
+        resets.iter().all(|(_, pc)| ROM_UART_WAIT_LOOP.contains(pc)),
+        "every reset finds the ROM in its wait for room in the UART FIFO: {resets:?}"
     );
     // A reset is seen at the first look after it: the loop looks every `WATCHDOG_SLICE` cycles, 50 us
     // at 20 MHz, so a reset is seen up to 50 us after its instant. The window of 100 us is that
@@ -651,11 +711,11 @@ fn a_blank_flash_is_reset_by_the_main_watchdog_then_by_the_rtc_watchdog() {
             lines[*boot..*next].join("\n")
         );
     }
-    // The ROM was printing `invalid header` when it was reset: the line the next boot prints
-    // names the instruction the journal names.
-    let saved_pc = format!("Saved PC:{ROM_UART_WAIT_PC:#010x}");
-    assert_eq!(lines[boots[1] + 1], saved_pc);
-    assert_eq!(lines[boots[2] + 1], saved_pc);
+    // The ROM was printing `invalid header` when it was reset: the line each boot after a reset
+    // by main watchdog 0 prints names the instruction the journal names for that reset.
+    for (boot, (_, pc)) in boots[1..3].iter().zip(&resets[..2]) {
+        assert_eq!(lines[boot + 1], format!("Saved PC:{pc:#010x}"));
+    }
     assert_eq!(
         lines[boots[3] + 1],
         INVALID_HEADER_BLANK.trim_end(),

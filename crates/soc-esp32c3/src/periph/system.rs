@@ -24,21 +24,29 @@ const PERIP_RST_EN1: u32 = svd_regs::esp32c3::addr("SYSTEM", "PERIP_RST_EN1") - 
 /// `esp_system_reset_modules_on_exit` pulses it, and what it resets is not documented: the timer
 /// groups have their own bits (IR §4.3, §7 question 1; TW §F.1). Bits 13 and 15 reset the timer
 /// groups (`SYSTEM_TIMERGROUP_RST`, `SYSTEM_TIMERGROUP1_RST`). A bit of no module listed here is
-/// stored and resets nothing; two of them belong to modules the model has and are not acted on:
-/// bit 23, `SYSTEM_USB_DEVICE_RST` (`system_reg.h:371`), and bit 28, `SYSTEM_APB_SARADC_RST`
-/// (`system_reg.h:341`).
+/// stored and resets nothing; one of them belongs to a module the model has and is not acted on:
+/// bit 28, `SYSTEM_APB_SARADC_RST` (`system_reg.h:341`).
+///
+/// Bit 23, `SYSTEM_USB_DEVICE_RST` (`system_reg.h:371`), resets USB-Serial-JTAG
+/// (`usb_serial_jtag_ll_reset_register`, `ll.h:296-311`; report USJ §A), which the startup of
+/// ESP-IDF leaves alone (`IDF:esp_system/port/soc/esp32c3/clk.c:289`).
+///
+/// ASSUMPTION: the pulse resets the block as a core reset does and the host does not see it: it
+/// stays attached, with its frames and the packets it is sending (report USJ §R.1). A board whose
+/// firmware pulses the bit with a host attached, read from both sides, settles it.
 ///
 /// ASSUMPTION: a module is reset when its bit goes from 0 to 1 and is not held in reset while the
 /// bit stays set. Report IR §8 item 16 says a module is in reset while its bit is 1: on silicon a
 /// module whose bit is still set (the SHA accelerator at power-on, `PERIP_RST_EN1` resets to
 /// `0x1FE`) would not answer, and writes made during a hold would not stick. Writing a register of
 /// a module while its reset bit is 1, on a chip, settles it.
-const RESETS_0: [(u32, Module); 6] = [
+const RESETS_0: [(u32, Module); 7] = [
     (1 << 1, Module::Spi01),
     (1 << 2, Module::Uart0),
     (1 << 5, Module::Uart1),
     (1 << 13, Module::Timg0),
     (1 << 15, Module::Timg1),
+    (1 << 23, Module::UsbDevice),
     (1 << 29, Module::Systimer),
 ];
 /// `PERIP_RST_EN1` bit 2, `SYSTEM_CRYPTO_SHA_RST` (`system_reg.h:553`): the only crypto module
@@ -370,7 +378,7 @@ mod tests {
         sys.write(
             ctx,
             PERIP_RST_EN0,
-            reset0 | (1 << 13) | (1 << 15) | (1 << 5),
+            reset0 | (1 << 13) | (1 << 15) | (1 << 5) | (1 << 23),
         );
         // `PERIP_RST_EN1` holds the crypto modules in reset at power-on (reset value 0x1FE): the
         // bootloader released the SHA accelerator to use it.
@@ -386,6 +394,7 @@ mod tests {
                 Event::ModuleReset(Module::Uart1),
                 Event::ModuleReset(Module::Timg0),
                 Event::ModuleReset(Module::Timg1),
+                Event::ModuleReset(Module::UsbDevice),
                 Event::ModuleReset(Module::Sha)
             ]
         );
