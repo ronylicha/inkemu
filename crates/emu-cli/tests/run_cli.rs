@@ -953,24 +953,93 @@ fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_res
 }
 
 /// A second stage that stops the watchdogs, prints `ready` on UART0, then echoes on UART0 what
-/// it receives, polling `STATUS.RXFIFO_CNT`.
+/// it receives, polling `STATUS.RXFIFO_CNT`. Before each byte it writes it waits for room in the
+/// transmit FIFO, as the ROM's `uart_tx_one_char` does (`TXFIFO_CNT` below 128, `uart.rs`): the
+/// ROM enters it with the FIFO still full of its last lines, and a byte written to a full FIFO
+/// is lost, on the device as here.
 fn ready_then_echo() -> Vec<u32> {
-    use cpu_rv32::asm::{beq, jal, lbu, lw, sw};
-    use soc_esp32c3::test_support::{T0, T1, print_program};
-    let uart0 = svd_regs::esp32c3::addr("UART0", "FIFO");
+    use cpu_rv32::asm::{addi, beq, blt, jal, lb, lbu, lui, lw, sw};
+    use soc_esp32c3::test_support::{T0, T1};
+    let fifo = svd_regs::esp32c3::addr("UART0", "FIFO");
+    let status = svd_regs::esp32c3::addr("UART0", "STATUS");
+    // `T0` holds the base of UART0, which is the address of its FIFO: `lui` keeps only the page.
+    assert_eq!(fifo & 0xFFF, 0, "the FIFO opens its page");
+    let status = (status - fifo).cast_signed();
+    // `STATUS` [25:16] is `TXFIFO_CNT`, at most 128: its bit 7, the sign bit of the byte at
+    // offset 2 of the register, is set exactly when the FIFO is full. `lb` sign-extends it, and
+    // `blt` against `x0` loops back to the `lb` while it is set.
+    let wait_for_room = [lb(T1, T0, status + 2), blt(T1, 0, -4)];
     let mut program = stop_watchdogs();
-    program.extend(print_program(uart0, b"ready"));
-    program.extend([
-        lbu(T1, T0, 0x1C),
-        beq(T1, 0, -4),
-        lw(T1, T0, 0),
-        sw(T1, T0, 0),
-        jal(0, -16),
-    ]);
+    program.push(lui(T0, fifo));
+    for &byte in b"ready" {
+        program.extend(wait_for_room);
+        program.extend([addi(T1, 0, i32::from(byte)), sw(T1, T0, 0)]);
+    }
+    // The loop of the echo: wait for a byte (`STATUS` [9:0] is `RXFIFO_CNT`, at most 128: its
+    // low byte), wait for room, read the byte, write it, and back to the first instruction, 6
+    // words up.
+    program.extend([lbu(T1, T0, status), beq(T1, 0, -4)]);
+    program.extend(wait_for_room);
+    program.extend([lw(T1, T0, 0), sw(T1, T0, 0), jal(0, -24)]);
     program
 }
 
-/// The run of the echo firmware with the console script `body`, to 50 ms of device time.
+/// The first bytes of a second stage that leave the transmit FIFO of UART0 full, as the ROM
+/// leaves it when it enters the image: 129 bytes, the first of which goes on the line at once
+/// and the 128 others wait (`uart.rs`, `FIFO_BYTES`).
+fn uart0_fifo_left_full() -> Vec<u32> {
+    soc_esp32c3::test_support::print_program(svd_regs::esp32c3::addr("UART0", "FIFO"), &[b'.'; 129])
+}
+
+/// The echo firmware without the ROM, entered with the transmit FIFO of UART0 full: `ready` and
+/// the echo of what the host typed come after the 129 bytes already there, and no byte is
+/// dropped. The host types at power-on, so that the echo too finds the FIFO full: the three
+/// bytes are in the receive FIFO long before `ready` is out of the firmware.
+#[test]
+fn the_echo_firmware_waits_for_room_in_the_transmit_fifo_the_rom_leaves_full() {
+    use soc_esp32c3::test_support::{Bounds, Consoles, Driven, drive, flat_rom};
+    use soc_esp32c3::{ConsoleChannel, Esp32C3, SocConfig};
+    let mut program = uart0_fifo_left_full();
+    program.extend(ready_then_echo());
+    let mut machine = Esp32C3::new(flat_rom(&program), &SocConfig::default());
+    let now = machine.device_time();
+    machine
+        .send_console(ConsoleChannel::Uart0, now, b"hi\r")
+        .unwrap();
+    // 137 bytes leave UART0 at its reset settings, 55 520 cycles of the 160 MHz time base each
+    // (347 us), under 48 ms of device time: one second and twenty million cycles are far more
+    // than the run needs, and bound it if it hangs.
+    let bounds = Bounds {
+        slice: 1_000,
+        max_cycles: 20_000_000,
+        max_nanos: 1_000_000_000,
+    };
+    let mut consoles = Consoles::default();
+    let end = drive(&mut machine, bounds, &mut consoles, |_, _, seen| {
+        seen.bytes(ConsoleChannel::Uart0).ends_with(b"readyhi\r")
+    });
+    let sent = consoles.bytes(ConsoleChannel::Uart0);
+    assert_eq!(end, Driven::Done, "{:?}", String::from_utf8_lossy(sent));
+    assert_eq!(sent, [&[b'.'; 129][..], b"readyhi\r"].concat());
+    assert!(
+        consoles.diagnostics.is_empty(),
+        "{:?}",
+        consoles.diagnostics
+    );
+}
+
+/// The device time the scripted runs below are given. In a run of the CI cut at 50 ms, the last
+/// byte of the ROM's lines (`entry 0x40380000`) had left UART0, the CPU clock at 20 MHz; some
+/// 186 bytes, 16 ms of line, come out before `ready`. From that last byte on, `ready` follows
+/// the bytes of the ROM still in the FIFO: its 5 bytes leave within 5 byte times, 0.43 ms at
+/// 115 200 baud and 10 bits a byte (86.8 us each). The script then types `hi\r`, whose echo ends
+/// about one byte time after its third byte comes in: 4 byte times, 0.35 ms. Everything is over
+/// before 51 ms; 100 ms is twice that, and costs two million cycles of the busy loop of the
+/// second stage in the run that waits for ever.
+const SCRIPTED_RUN_SECONDS: &str = "0.1";
+
+/// The run of the echo firmware with the console script `body`, to [`SCRIPTED_RUN_SECONDS`] of
+/// device time.
 fn scripted_run(rom_dir: &str, body: &str) -> std::process::Output {
     let (_flash_dir, flash) = flash_image_of(&ready_then_echo());
     let (_script_dir, script) = console_script(body);
@@ -980,7 +1049,7 @@ fn scripted_run(rom_dir: &str, body: &str) -> std::process::Output {
             "--device",
             "x4",
             "--max-time",
-            "0.05",
+            SCRIPTED_RUN_SECONDS,
             "--rom-dir",
             rom_dir,
         ])
