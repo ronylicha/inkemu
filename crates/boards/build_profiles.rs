@@ -11,9 +11,18 @@ fn is_device_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Whether `path` is what an editor or the system keeps beside a file, never a profile: a hidden
+/// name (`.x4.toml`, and the lock `.#x4.toml` Emacs keeps as a link to nothing while it edits
+/// `x4.toml`) or a backup (`x4.toml~`).
+fn is_kept_by_an_editor(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy())
+        .is_some_and(|name| name.starts_with('.') || name.ends_with('~'))
+}
+
 /// The ids of the profiles in `dir`, sorted: the order does not depend on the order the file
 /// system lists the directory in. A file or directory whose name has no `toml` extension is not a
-/// profile and is left alone.
+/// profile and is left alone, and so is what an editor keeps beside a file.
 ///
 /// # Errors
 /// What a person must fix, cause then remedy: a name that is not a device id, an extension that
@@ -24,6 +33,9 @@ pub fn profile_ids(dir: &Path) -> Result<Vec<String>, String> {
     let mut ids = Vec::new();
     for entry in entries {
         let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
+        if is_kept_by_an_editor(&path) {
+            continue;
+        }
         let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
             continue;
         };
@@ -37,7 +49,12 @@ pub fn profile_ids(dir: &Path) -> Result<Vec<String>, String> {
             ));
         }
         // `metadata` follows a link: a link to a file is a file, a link to nothing is an error.
-        let metadata = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let metadata = std::fs::metadata(&path).map_err(|e| {
+            format!(
+                "{}: {e}; remove it, or restore the file it links to",
+                path.display()
+            )
+        })?;
         if !metadata.is_file() {
             return Err(format!(
                 "{}: a profile is a file, and this is not one; rename or remove it",

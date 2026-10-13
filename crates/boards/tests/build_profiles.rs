@@ -44,6 +44,38 @@ fn the_profiles_are_the_toml_files_sorted_by_id() {
     );
 }
 
+/// What an editor or the system keeps beside a file is no profile, whatever its extension: a
+/// hidden file, an editor's lock (`.#x4.toml`, a link to nothing while Emacs edits `x4.toml`) and a
+/// backup (`x4.toml~`).
+#[test]
+fn hidden_lock_and_backup_files_are_left_alone() {
+    let dir = directory("hidden");
+    file(&dir, "x3.toml");
+    file(&dir, ".x5.toml");
+    file(&dir, "x6.toml~");
+    std::fs::create_dir(dir.join(".d.toml")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("rony@host.1234:1700000000", dir.join(".#x3.toml")).unwrap();
+    #[cfg(not(unix))]
+    file(&dir, ".#x3.toml");
+    assert_eq!(build_profiles::profile_ids(&dir).unwrap(), ["x3"]);
+}
+
+/// A profile name whose link leads nowhere is refused with what to do.
+#[cfg(unix)]
+#[test]
+fn a_link_to_nothing_is_refused_with_its_remedy() {
+    let dir = directory("dangling");
+    file(&dir, "x3.toml");
+    std::os::unix::fs::symlink("no-such-file", dir.join("x9.toml")).unwrap();
+    let error = build_profiles::profile_ids(&dir).unwrap_err();
+    assert!(
+        error.contains("x9.toml: ")
+            && error.ends_with("; remove it, or restore the file it links to"),
+        "{error}"
+    );
+}
+
 #[test]
 fn an_extension_in_another_case_is_refused_not_skipped() {
     for extension in ["TOML", "Toml", "tOML"] {
