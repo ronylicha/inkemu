@@ -54,8 +54,8 @@ pub struct MemoryMap {
 }
 
 /// The memory map of every chip family inkemu models. Adding a chip family is one entry here, one
-/// in [`SHIPPED`], and its directory in `third_party/esp-idf-bootloader/`; a chip without an
-/// entry is refused before its segments are looked at.
+/// in [`SHIPPED`], its directory in `third_party/esp-idf-bootloader/`, and a `SocFamily` variant
+/// in the `boards` crate; a chip without an entry is refused before its segments are looked at.
 pub static MEMORY_MAPS: [MemoryMap; 1] = [MemoryMap {
     chip: ChipId::Esp32C3,
     // ESP32-C3 Technical Reference Manual, "System and Memory": DRAM, then IRAM.
@@ -167,8 +167,8 @@ pub struct ShippedBootloader {
 }
 
 /// Every bootloader inkemu ships. Adding a chip family is one entry here, its [`MemoryMap`] in
-/// [`MEMORY_MAPS`], and its directory in `third_party/esp-idf-bootloader/`; a device with a chip
-/// already here needs its profile only.
+/// [`MEMORY_MAPS`], its directory in `third_party/esp-idf-bootloader/`, and a `SocFamily` variant
+/// in the `boards` crate; a device with a chip already here needs its profile only.
 pub static SHIPPED: [ShippedBootloader; 1] = [ShippedBootloader {
     id: "esp-idf-v5.5.2-esp32c3-dio",
     chip: ChipId::Esp32C3,
