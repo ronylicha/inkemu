@@ -538,12 +538,19 @@ pub enum Driven {
 /// sees the machine (to feed it input dated from what it sent), what this call took
 /// ([`Consoles::take`]) and everything taken so far. A call that ends because a watched console
 /// spoke, or because the CPU slept a while, is followed by the next.
+///
+/// # Panics
+/// When `bounds.slice` is 0: no call would move the machine on, and the loop would never end.
 pub fn drive(
     machine: &mut Esp32C3,
     bounds: Bounds,
     consoles: &mut Consoles,
     mut done: impl FnMut(&mut Esp32C3, &[(ConsoleChannel, Vec<u8>)], &Consoles) -> bool,
 ) -> Driven {
+    assert!(
+        bounds.slice > 0,
+        "a slice of 0 cycles moves the machine on by nothing; give drive a slice of 1 cycle or more"
+    );
     loop {
         let cycles = machine.cycles().get();
         if cycles >= bounds.max_cycles || machine.device_time_nanos() >= bounds.max_nanos {
@@ -617,36 +624,125 @@ mod tests {
             },
         );
         assert_eq!(end, Driven::Stopped(StopReason::Idle));
-        let mut spinning = machine(&[HANG]);
-        let tight = Bounds {
-            max_cycles: 5_500,
-            ..WIDE
-        };
-        let end = drive(&mut spinning, tight, &mut Consoles::default(), |_, _, _| {
-            false
-        });
+        // A driver that missed a bound would call a machine that has nothing left to do in its
+        // budget again and again: each of these calls must return.
+        let (end, cycles) = within(
+            std::time::Duration::from_secs(60),
+            "drive went on past its bound of cycles",
+            || {
+                let mut spinning = machine(&[HANG]);
+                let tight = Bounds {
+                    max_cycles: 5_500,
+                    ..WIDE
+                };
+                let end = drive(&mut spinning, tight, &mut Consoles::default(), |_, _, _| {
+                    false
+                });
+                (end, spinning.cycles().get())
+            },
+        );
         assert_eq!(end, Driven::OutOfBounds);
         // The last call stops at the bound, not a slice later: the instruction that crosses it
         // completes (a jump is 2 cycles).
-        assert!(
-            (5_500..5_510).contains(&spinning.cycles().get()),
-            "{:?}",
-            spinning.cycles()
+        assert!((5_500..5_510).contains(&cycles), "{cycles}");
+        // A jump is 100 ns at 20 MHz, so instruction boundaries fall every 100 ns: one of these
+        // two bounds is one of them, which the run reaches exactly, and the other is not.
+        for max_nanos in [10_000, 10_050] {
+            let (end, nanos) = within(
+                std::time::Duration::from_secs(60),
+                "drive went on past its bound of device time",
+                move || {
+                    let mut spinning = machine(&[HANG]);
+                    let short = Bounds { max_nanos, ..WIDE };
+                    let end = drive(&mut spinning, short, &mut Consoles::default(), |_, _, _| {
+                        false
+                    });
+                    (end, spinning.device_time_nanos())
+                },
+            );
+            assert_eq!(end, Driven::OutOfBounds);
+            // Ends at the first instruction boundary at or past the bound.
+            assert!(
+                (max_nanos..max_nanos + 100).contains(&nanos),
+                "{nanos} for a bound of {max_nanos}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "a slice of 0 cycles moves the machine on by nothing")]
+    fn drive_refuses_a_slice_of_0_cycles() {
+        // Without the refusal, each call would end where it started and the loop never would.
+        within(
+            std::time::Duration::from_secs(60),
+            "drive called a machine again and again for 0 cycles",
+            || {
+                let mut m = machine(&[HANG]);
+                let empty = Bounds { slice: 0, ..WIDE };
+                drive(&mut m, empty, &mut Consoles::default(), |_, _, _| false)
+            },
         );
-        let short = Bounds {
-            max_nanos: 10_000,
-            ..WIDE
-        };
-        let mut spinning = machine(&[HANG]);
-        let end = drive(&mut spinning, short, &mut Consoles::default(), |_, _, _| {
-            false
-        });
-        assert_eq!(end, Driven::OutOfBounds);
-        // Ends within an instruction of the bound (a jump at 20 MHz: 100 ns).
+    }
+
+    #[test]
+    fn take_keeps_the_diagnostics_and_the_flash_writes_of_every_take() {
+        // A read and a write of an unmodelled register (two diagnostics: they differ in
+        // direction), an erase and a program of the flash, then `a\r\nb` on UART0: taken in calls
+        // of a few cycles, so that each comes in a take of its own.
+        let ledc = unmodeled_register().addr;
+        let mut program = load_register(ledc).to_vec();
+        program.extend(flash_erase_sector(0x9000));
+        program.extend(store_register(ledc, 0));
+        program.extend(flash_program(0x9020, &[0xFA]));
+        program.extend(print_program(UART0, b"a\r\nb"));
+        program.push(HANG);
+        let mut m = Esp32C3::with_flash(flat_rom(&program), vec![0; 0xA000], &SocConfig::default())
+            .unwrap();
+        let mut consoles = Consoles::default();
+        let mut takes_with_something = 0;
+        // 2 ms at 20 MHz: the four bytes take 350 us on the line at 115 200 baud.
+        while m.cycles().get() < 40_000 {
+            let next = m.cycles() + 7;
+            m.run_until(next);
+            let before = (consoles.diagnostics.len(), consoles.flash_writes.len());
+            consoles.take(&mut m);
+            if (consoles.diagnostics.len(), consoles.flash_writes.len()) != before {
+                takes_with_something += 1;
+            }
+        }
         assert!(
-            (10_000..10_100).contains(&spinning.device_time_nanos()),
-            "{}",
-            spinning.device_time_nanos()
+            takes_with_something > 1,
+            "they came in {takes_with_something} take: {consoles:?}"
+        );
+        assert!(
+            matches!(
+                consoles.diagnostics[..],
+                [
+                    Diagnostic::UnmodeledMmio { addr: read, .. },
+                    Diagnostic::UnmodeledMmio { addr: written, .. },
+                ] if read == ledc && written == ledc
+            ),
+            "{:?}",
+            consoles.diagnostics
+        );
+        assert_eq!(
+            consoles.flash_writes,
+            [
+                FlashWrite::Erase {
+                    start: 0x9000,
+                    len: 0x1000
+                },
+                FlashWrite::Program {
+                    address: 0x9020,
+                    data: vec![0xFA]
+                },
+            ]
+        );
+        assert_eq!(consoles.bytes(ConsoleChannel::Uart0), b"a\r\nb");
+        assert_eq!(
+            consoles.text(ConsoleChannel::Uart0),
+            "a\nb",
+            "the carriage returns are dropped from the text, not from the bytes"
         );
     }
 
