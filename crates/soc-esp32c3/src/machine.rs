@@ -654,11 +654,11 @@ impl Esp32C3 {
     /// # Errors
     /// [`InputError::InThePast`] when `at` is before [`Esp32C3::device_time`];
     /// [`InputError::TooManyHostChanges`] when [`MAX_PENDING_HOST_CHANGES`] changes are still to
-    /// come. Nothing changes then.
+    /// come, those due by now not counted. Nothing changes then.
     pub fn set_usb_host(&mut self, at: Cycles, state: UsbHost) -> Result<(), InputError> {
         self.check_date(at)?;
         let usb = &mut self.bus.periph.usb_serial_jtag;
-        if usb.host_changes_pending() >= MAX_PENDING_HOST_CHANGES {
+        if usb.host_changes_pending(&mut self.bus.ctx) >= MAX_PENDING_HOST_CHANGES {
             return Err(InputError::TooManyHostChanges);
         }
         usb.set_host(&mut self.bus.ctx, at, state);
@@ -670,10 +670,12 @@ impl Esp32C3 {
         self.bus.periph.usb_serial_jtag.host(&mut self.bus.ctx)
     }
 
-    /// The changes of the USB host still to come.
-    #[must_use]
-    pub fn usb_host_changes_pending(&self) -> usize {
-        self.bus.periph.usb_serial_jtag.host_changes_pending()
+    /// The changes of the USB host still to come, those due by now applied first.
+    pub fn usb_host_changes_pending(&mut self) -> usize {
+        self.bus
+            .periph
+            .usb_serial_jtag
+            .host_changes_pending(&mut self.bus.ctx)
     }
 
     /// Watches `channel` or stops watching it. While a channel is watched, each byte it hands to

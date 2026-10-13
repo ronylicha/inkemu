@@ -298,9 +298,9 @@ impl UsbSerialJtag {
         !self.tx.is_empty()
     }
 
-    /// How many changes of the host are still to come.
-    #[must_use]
-    pub fn host_changes_pending(&self) -> usize {
+    /// How many changes of the host are still to come, those due by now applied first.
+    pub fn host_changes_pending(&mut self, ctx: &mut Ctx) -> usize {
+        self.settle(ctx);
         self.host_changes.len()
     }
 
@@ -1059,12 +1059,24 @@ mod tests {
         let mut usb = UsbSerialJtag::new(UsbHost::Absent);
         usb.set_host(ctx, Cycles(2 * FRAME), UsbHost::Absent);
         usb.set_host(ctx, Cycles(FRAME), UsbHost::Attached);
-        assert_eq!(usb.host_changes_pending(), 2);
+        assert_eq!(usb.host_changes_pending(ctx), 2);
         run_to(ctx, &mut usb, Cycles(FRAME));
         assert_eq!(usb.host(ctx), UsbHost::Attached);
         run_to(ctx, &mut usb, Cycles(2 * FRAME));
         assert_eq!(usb.host(ctx), UsbHost::Absent);
-        assert_eq!(usb.host_changes_pending(), 0);
+        assert_eq!(usb.host_changes_pending(ctx), 0);
+    }
+
+    #[test]
+    fn a_change_of_the_host_due_by_now_is_not_counted_as_to_come() {
+        // The machine bounds the changes still to come: one due but not yet applied (no call has
+        // reached the block since its date) takes no room.
+        let ctx = &mut Ctx::default();
+        let mut usb = open();
+        usb.set_host(ctx, Cycles(FRAME), UsbHost::Attached);
+        ctx.sleep_until(Cycles(FRAME));
+        assert_eq!(usb.host_changes_pending(ctx), 0);
+        assert_eq!(usb.host(ctx), UsbHost::Attached);
     }
 
     #[test]
