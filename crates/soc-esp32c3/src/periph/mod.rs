@@ -537,6 +537,7 @@ impl Peripherals {
             Module::Timg1 => self.timg1.reset(ctx),
             Module::Systimer => self.systimer.reset(ctx),
             Module::Sha => self.sha = Sha::new(),
+            Module::UsbDevice => self.usb_serial_jtag.reset(ctx),
         }
     }
 
@@ -1272,6 +1273,23 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_of_the_usb_device_empties_usb_serial_jtag_and_keeps_its_host() {
+        // `PERIP_RST_EN0` bit 23 (report USJ §A, §R.1).
+        let ctx = &mut Ctx::default();
+        let mut p = peripherals(ctx);
+        let usb = |name| svd_regs::esp32c3::addr("USB_DEVICE", name);
+        let source = 1 << 26;
+        write(&mut p, ctx, usb("EP1"), u32::from(b'x'));
+        write(&mut p, ctx, usb("INT_ENA"), 1 << 3);
+        assert_eq!(ctx.sources() & source, source, "SERIAL_IN_EMPTY, enabled");
+        p.deliver(ctx, Event::ModuleReset(Module::UsbDevice));
+        assert_eq!(read(&mut p, ctx, usb("INT_ENA")), Some(0));
+        assert_eq!(ctx.sources() & source, 0);
+        assert_eq!(p.usb_serial_jtag.take_written(), [], "the byte is lost");
+        assert_eq!(p.usb_serial_jtag.host(ctx), UsbHost::Open, "the host stays");
+    }
+
+    #[test]
     fn delivering_the_reset_of_a_module_posts_no_signal() {
         // `settle_signals` ends because a delivery posts nothing: only a write to `SYSTEM` does.
         let ctx = &mut Ctx::default();
@@ -1284,6 +1302,7 @@ mod tests {
             Module::Timg1,
             Module::Systimer,
             Module::Sha,
+            Module::UsbDevice,
         ] {
             p.deliver(ctx, Event::ModuleReset(module));
             assert_eq!(ctx.take_signal(), None, "{module:?}");

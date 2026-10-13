@@ -206,8 +206,9 @@ impl UsbSerialJtag {
         }
     }
 
-    /// A core reset returns the block to its reset values and empties both FIFOs and the
-    /// committed packet; what the host took stays for the console. `FRAM_NUM` reads 0 until the
+    /// A core reset, or `SYSTEM.PERIP_RST_EN0` bit 23 (`USB_DEVICE_RST`), returns the block to
+    /// its reset values and empties both FIFOs and the committed packet; what the host took
+    /// stays for the console. `FRAM_NUM` reads 0 until the
     /// next frame starts. The host is no part of the chip: its state, its frames and the packets
     /// it is sending go on; the next of them comes the host latency after the reset, as after
     /// the OUT FIFO was read whole.

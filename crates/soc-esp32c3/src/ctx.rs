@@ -77,6 +77,7 @@ pub enum Module {
     Timg1,
     Systimer,
     Sha,
+    UsbDevice,
 }
 
 /// What a device is called for, besides register accesses: at the instant it asked for (a wake-up),
