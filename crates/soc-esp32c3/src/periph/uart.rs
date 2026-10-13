@@ -6,22 +6,18 @@
 //! §4.1). Reception and the UART interrupts arrive in SP1b-3d.
 use crate::clock::XTAL_PERIOD;
 use crate::ctx::{Ctx, Deadline, Event};
-use crate::diag::Unsupported;
+use crate::diag::{UartFeature, Unsupported};
 use crate::periph::{Accepted, Storage};
 use emu_core::{Cycles, Peripheral};
 use std::collections::VecDeque;
 
-/// `INT_CLR` is write-only and accepted; the three others are stored.
+/// `INT_CLR` is write-only and accepted; the two others are stored.
 pub(crate) fn accepted() -> Vec<Accepted> {
     let mut rows = Vec::new();
     for peripheral in ["UART0", "UART1"] {
         for (register, not_modeled) in [
             ("INT_ENA", "interrupt enables: nothing is raised"),
             ("INT_CLR", "interrupt clear: nothing is pending"),
-            (
-                "CONF0",
-                "frame format: a byte is 10 bit times (the transmit FIFO reset acts)",
-            ),
             ("CONF1", "FIFO thresholds"),
         ] {
             rows.push(Accepted::svd(peripheral, register, not_modeled, "SP1b-3d"));
@@ -77,14 +73,40 @@ const SCLK_SEL_XTAL: u32 = 3;
 /// `CONF0` bit 18 `TXFIFO_RST`: empties the transmit FIFO (`ROM3:Uart_Init@0x4004c306` sets it,
 /// then clears it; BC §G.2).
 const TXFIFO_RST: u32 = 1 << 18;
-/// ASSUMPTION: a byte is 10 bit times on the wire (a start bit, 8 data bits, a stop bit), whatever
-/// `CONF0` says. The ROM and ESP-IDF consoles use this format; another one would only change how
-/// long a byte takes. SP1b-3d gives the frame format its effect, with the receive side; a byte
-/// timed on a chip configured for another format (two stop bits, a parity bit) settles what each
-/// field adds.
-const BITS_PER_BYTE: u64 = 10;
-/// Device time is kept in sixteenths of a time-base cycle here: a bit lasts a whole number of them.
-const SUBCYCLES: u64 = 16;
+/// The frame format of `CONF0` (report UR §5.1, from `uart_ll_set_parity`,
+/// `uart_ll_set_data_bit_num` and `uart_ll_set_stop_bits`, `IDF:hal/esp32c3/include/hal/uart_ll.h`):
+/// bit 1 `PARITY_EN` adds a parity bit; bits [3:2] `BIT_NUM` give 5 + `BIT_NUM` data bits;
+/// bits [5:4] `STOP_BIT_NUM` give 1, 1.5 or 2 stop bits for 1, 2 or 3.
+const PARITY_EN: u32 = 1 << 1;
+const BIT_NUM_SHIFT: u32 = 2;
+const STOP_BIT_NUM_SHIFT: u32 = 4;
+const TWO_BITS: u32 = 0b11;
+/// The modes of `CONF0` the model refuses by name when they are set (report UR §10).
+const CONF0_REFUSED: [(u32, UartFeature); 3] = [
+    (1 << 14, UartFeature::Loopback),
+    (1 << 19, UartFeature::InvertedRx),
+    (1 << 27, UartFeature::Autobaud),
+];
+/// Device time is kept in thirty-seconds of a time-base cycle here: a bit lasts a whole number of
+/// sixteenths (the fraction of `CLKDIV`), and a frame may end on half a bit (1.5 stop bits).
+const SUBCYCLES: u64 = 32;
+
+/// The length of a frame in half bit times: a start bit, the data bits, the parity bit, the stop
+/// bits (report UR §5.1, §6). `RS485_CONF.DL0_EN`/`DL1_EN` would each add a bit; the model
+/// refuses RS485 mode instead.
+///
+/// ASSUMPTION: `STOP_BIT_NUM` = 0, which no source defines (report UR A4), lasts one stop bit;
+/// it is refused by name when written. A frame timed on a chip set that way settles it.
+fn frame_half_bits(conf0: u32) -> u64 {
+    let data_bits = 5 + u64::from((conf0 >> BIT_NUM_SHIFT) & TWO_BITS);
+    let parity_bits = u64::from((conf0 & PARITY_EN) >> 1);
+    let stop_half_bits = match (conf0 >> STOP_BIT_NUM_SHIFT) & TWO_BITS {
+        2 => 3,
+        3 => 4,
+        _ => 2,
+    };
+    2 * (1 + data_bits + parity_bits) + stop_half_bits
+}
 
 #[derive(Debug)]
 pub struct Uart {
@@ -202,10 +224,11 @@ impl Uart {
         }
     }
 
-    /// The time one byte takes, in sixteenths of a time-base cycle: 10 bits, each `CLKDIV` (with
-    /// its fraction) cycles of the source clock divided by `SCLK_DIV_NUM + 1`. The fractional
-    /// divider of the source clock (`SCLK_DIV_A/B`) is ignored: it resets to 0 and no measured
-    /// code writes it.
+    /// The time one byte takes, in thirty-seconds of a time-base cycle: the bits of a frame
+    /// ([`frame_half_bits`]), each `CLKDIV` (with its fraction) cycles of the source clock divided
+    /// by `SCLK_DIV_NUM + 1`. The fractional divider of the source clock (`SCLK_DIV_A/B`) is
+    /// ignored: it resets to 0 and no measured code writes it. The 10 bit times of 8N1 give the
+    /// durations the model gave every byte before it read the frame format.
     ///
     /// ASSUMPTION: the divider is what the register holds, down to 0. An integer part of 0 with
     /// a fraction divides by that fraction of a cycle, and a `CLKDIV` of 0 gives a byte no
@@ -215,10 +238,31 @@ impl Uart {
     fn byte_time(&self, source_period: u64) -> u64 {
         let clkdiv = self.config.read(CLKDIV).unwrap_or(0);
         let clk_conf = self.config.read(CLK_CONF).unwrap_or(0);
-        let divider = u64::from(clkdiv & CLKDIV_INTEGER_MASK) * SUBCYCLES
+        let conf0 = self.config.read(CONF0).unwrap_or(0);
+        // The divider in sixteenths of a source-clock cycle, a frame in half bits: the product
+        // is in thirty-seconds.
+        let divider = u64::from(clkdiv & CLKDIV_INTEGER_MASK) * 16
             + u64::from((clkdiv >> CLKDIV_FRAG_SHIFT) & CLKDIV_FRAG_MASK);
         let source_divider = u64::from((clk_conf >> SCLK_DIV_NUM_SHIFT) & SCLK_DIV_NUM_MASK) + 1;
-        BITS_PER_BYTE * divider * source_divider * source_period
+        frame_half_bits(conf0) * divider * source_divider * source_period
+    }
+
+    /// Refuses by name the modes of `conf0` the model does not have (report UR §10, A4).
+    fn refuse_modes(&self, ctx: &mut Ctx, conf0: u32) {
+        for (bit, feature) in CONF0_REFUSED {
+            if conf0 & bit != 0 {
+                ctx.unsupported(Unsupported::UartFeature {
+                    uart: self.index,
+                    feature,
+                });
+            }
+        }
+        if (conf0 >> STOP_BIT_NUM_SHIFT) & TWO_BITS == 0 {
+            ctx.unsupported(Unsupported::UartFeature {
+                uart: self.index,
+                feature: UartFeature::NoStopBit,
+            });
+        }
     }
 
     fn send(&mut self, ctx: &mut Ctx, byte: u8) {
@@ -278,6 +322,7 @@ impl Peripheral<Ctx> for Uart {
                     // The byte in the shift register is on the wire already: it goes on.
                     self.in_flight.truncate(1);
                 }
+                self.refuse_modes(ctx, value);
                 self.config.write(offset, value)
             }
             _ => self.config.write(offset, value),
@@ -295,8 +340,9 @@ mod tests {
     /// What the ROM and the bootloader leave: the crystal undivided, 347 + 3/16 (BA §7).
     const CLKDIV_115200: u32 = 0x0030_015B;
     const CLK_CONF_XTAL: u32 = 0x0370_0000;
-    /// One byte at 115 200 baud: 10 x (347 x 16 + 3) x 4 sixteenths, 13 887.5 cycles, 86.8 us.
-    const BYTE_SUBCYCLES: u64 = 10 * (347 * 16 + 3) * 4;
+    /// One byte at 115 200 baud, 8N1: 20 half bits x (347 x 16 + 3) x 4 thirty-seconds,
+    /// 13 887.5 cycles, 86.8 us.
+    const BYTE_SUBCYCLES: u64 = 20 * (347 * 16 + 3) * 4;
 
     fn console(ctx: &mut Ctx) -> Uart {
         let mut uart = Uart::new(0, UART0);
@@ -692,6 +738,108 @@ mod tests {
         assert_eq!(uart.take_tx(ctx.now()), b"b");
     }
 
+    /// The instant, in cycles, at which the first byte written now to an idle transmitter has
+    /// left, for a frame of `half_bits` half bit times at 115 200 baud on the crystal.
+    fn gone_after(half_bits: u64) -> Cycles {
+        Cycles((half_bits * (347 * 16 + 3) * 4).div_ceil(SUBCYCLES))
+    }
+
+    #[test]
+    fn a_byte_lasts_its_start_bit_its_data_bits_its_parity_bit_and_its_stop_bits() {
+        // UR §5.1, §6: start + (5 + BIT_NUM) + PARITY_EN + stop (1, 1.5 or 2 for STOP_BIT_NUM 1,
+        // 2, 3). The ROM's `0x0400001C` and the reset value are 8N1: 10 bit times.
+        for (conf0, half_bits, format) in [
+            (0x0400_001C, 20, "8N1"),
+            (0x1000_001C, 20, "8N1, the reset value"),
+            (0x0400_001E, 22, "8E1"),
+            (0x0400_001F, 22, "8O1"),
+            (0x0400_003C, 22, "8N2"),
+            (0x0400_003E, 24, "8E2"),
+            (0x0400_0010, 14, "5N1"),
+            (0x0400_001A, 20, "7E1"),
+            (0x0400_002C, 21, "8N1.5"),
+        ] {
+            let ctx = &mut Ctx::default();
+            let mut uart = console(ctx);
+            assert!(uart.write(ctx, CONF0, conf0));
+            uart.write(ctx, FIFO, u32::from(b'f'));
+            assert_eq!(ctx.next_wake(), Some(gone_after(half_bits)), "{format}");
+            assert_eq!(ctx.take_unsupported(), None, "{format}");
+        }
+    }
+
+    #[test]
+    fn half_a_stop_bit_is_kept_over_a_line_of_bytes() {
+        // 8N1.5 at 115 200 baud: 10.5 bit times a byte; 128 bytes end at 128 x 10.5 bit times,
+        // not at 128 x 10 or 128 x 11.
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        uart.write(ctx, CONF0, 0x0400_002C);
+        for byte in 0..128u32 {
+            uart.write(ctx, FIFO, byte);
+        }
+        ctx.sleep_until(gone_after(128 * 21));
+        assert_eq!(uart.take_tx(ctx.now()).len(), 128);
+        assert_eq!(
+            ctx.next_wake(),
+            Some(gone_after(21)),
+            "the first wake-up is kept"
+        );
+    }
+
+    #[test]
+    fn a_change_of_frame_format_applies_to_the_bytes_written_after_it() {
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        uart.write(ctx, FIFO, u32::from(b'a'));
+        uart.write(ctx, CONF0, 0x0400_003E);
+        uart.write(ctx, FIFO, u32::from(b'b'));
+        ctx.sleep_until(gone_after(20));
+        assert_eq!(uart.take_tx(ctx.now()), b"a", "8N1, as written");
+        ctx.sleep_until(gone_after(20 + 23));
+        assert_eq!(uart.take_tx(ctx.now()), []);
+        ctx.sleep_until(gone_after(20 + 24));
+        assert_eq!(uart.take_tx(ctx.now()), b"b", "8E2: 12 bit times");
+    }
+
+    #[test]
+    fn loopback_an_inverted_receive_line_autobaud_and_no_stop_bit_are_refused_by_name() {
+        // UR §10: refused when set; the value is stored all the same.
+        for (bits, feature) in [
+            (1 << 14, UartFeature::Loopback),
+            (1 << 19, UartFeature::InvertedRx),
+            (1 << 27, UartFeature::Autobaud),
+        ] {
+            let ctx = &mut Ctx::default();
+            let mut uart = Uart::new(1, UART1);
+            assert!(uart.write(ctx, CONF0, 0x0400_001C | bits));
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::UartFeature { uart: 1, feature })
+            );
+            assert_eq!(uart.read(ctx, CONF0), Some(0x0400_001C | bits));
+            assert!(uart.write(ctx, CONF0, 0x0400_001C));
+            assert_eq!(ctx.take_unsupported(), None, "cleared: nothing to refuse");
+        }
+    }
+
+    #[test]
+    fn a_frame_without_a_stop_bit_is_refused_and_timed_with_one() {
+        // UR A4: STOP_BIT_NUM = 0 has no documented frame.
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        uart.write(ctx, CONF0, 0x0400_000C);
+        assert_eq!(
+            ctx.take_unsupported(),
+            Some(Unsupported::UartFeature {
+                uart: 0,
+                feature: UartFeature::NoStopBit
+            })
+        );
+        uart.write(ctx, FIFO, u32::from(b's'));
+        assert_eq!(ctx.next_wake(), Some(gone_after(20)));
+    }
+
     #[test]
     fn the_wake_up_of_bytes_dropped_by_a_fifo_reset_finds_nothing_to_do() {
         let ctx = &mut Ctx::default();
@@ -706,8 +854,9 @@ mod tests {
         assert_eq!(ctx.take_due(), Some(Event::Uart(0)));
         uart.wake(ctx);
         assert_eq!(ctx.next_wake(), Some(last_gone));
-        uart.write(ctx, CONF0, TXFIFO_RST);
-        uart.write(ctx, CONF0, 0);
+        // The pulse of `Uart_Init`, with an 8N1 frame around it.
+        uart.write(ctx, CONF0, 0x0400_001C | TXFIFO_RST);
+        uart.write(ctx, CONF0, 0x0400_001C);
         ctx.sleep_until(last_gone);
         assert_eq!(ctx.take_due(), Some(Event::Uart(0)));
         uart.wake(ctx);

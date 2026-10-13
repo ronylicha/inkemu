@@ -72,6 +72,51 @@ pub enum Unsupported {
     /// frequency for: the RC fast clock (2), or no documented source (0). The byte is timed with
     /// the crystal.
     UartClock { uart: u8, sclk_sel: u32 },
+    /// A UART field set to a mode the model does not have (report UR §10): the register keeps
+    /// the value, and the UART goes on as if the field were clear.
+    UartFeature { uart: u8, feature: UartFeature },
+}
+
+/// A UART mode the model refuses by name when software sets it (report UR §10, A4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UartFeature {
+    /// `CONF0.LOOPBACK`: the transmitter drives the receiver.
+    Loopback,
+    /// `CONF0.RXD_INV`: the receive line is inverted.
+    InvertedRx,
+    /// `CONF0.AUTOBAUD_EN`: the baud rate is detected from the line.
+    Autobaud,
+    /// `CONF0.STOP_BIT_NUM` = 0: a frame with no documented stop bit (report UR A4).
+    NoStopBit,
+}
+
+impl UartFeature {
+    /// The register field, then what it asks for, then what the model does instead and the
+    /// remedy, as the message says them.
+    const fn describe(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            UartFeature::Loopback => (
+                "CONF0.LOOPBACK",
+                "to loop its transmitter back to its receiver",
+                "its bytes still go to the host and its receiver hears only the host; clear CONF0.LOOPBACK",
+            ),
+            UartFeature::InvertedRx => (
+                "CONF0.RXD_INV",
+                "to invert its receive line",
+                "the host's bytes are received as they were sent; clear CONF0.RXD_INV",
+            ),
+            UartFeature::Autobaud => (
+                "CONF0.AUTOBAUD_EN",
+                "to detect its baud rate from the line",
+                "the baud rate stays the one CLKDIV sets; set the baud rate with CLKDIV",
+            ),
+            UartFeature::NoStopBit => (
+                "CONF0.STOP_BIT_NUM = 0",
+                "for a frame without a stop bit",
+                "its bytes are timed with one stop bit; write STOP_BIT_NUM 1, 2 or 3 (1, 1.5 or 2 stop bits)",
+            ),
+        }
+    }
 }
 
 impl From<FlashRefusal> for Unsupported {
@@ -200,6 +245,15 @@ impl Unsupported {
                 f,
                 "RTC_CNTL.CLK_CONF selects an RTC slow clock inkemu does not model (value {clk_conf:#010x}, pc {pc:#010x}), so the RTC timer and the RTC watchdog keep counting the 136 kHz RC oscillator; select the RC oscillator (ANA_CLK_RTC_SEL = 0) or expect their durations to differ from the device"
             ),
+            Unsupported::UartOverflow { .. }
+            | Unsupported::UartClock { .. }
+            | Unsupported::UartFeature { .. } => self.describe_serial(pc, f),
+        }
+    }
+
+    /// The messages of the refusals of the serial ports, for [`Unsupported::describe`].
+    fn describe_serial(self, pc: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
             Unsupported::UartOverflow { uart } => write!(
                 f,
                 "a byte was written to UART{uart} while its 128-byte transmit FIFO was full (pc {pc:#010x}), so inkemu dropped the byte; wait for room in the FIFO (UART.STATUS TXFIFO_CNT) before writing"
@@ -208,6 +262,15 @@ impl Unsupported {
                 f,
                 "UART{uart} sent a byte with a source clock inkemu does not model (CLK_CONF.SCLK_SEL = {sclk_sel}, pc {pc:#010x}), so the byte was timed with the 40 MHz crystal and its duration differs from the device; select the crystal (SCLK_SEL = 3) or APB_CLK (SCLK_SEL = 1)"
             ),
+            Unsupported::UartFeature { uart, feature } => {
+                let (field, asked, instead) = feature.describe();
+                write!(
+                    f,
+                    "UART{uart} was set {asked} ({field}, pc {pc:#010x}), which inkemu does not model, so {instead}"
+                )
+            }
+            // INVARIANT: `describe` hands only the refusals above to this function.
+            _ => Ok(()),
         }
     }
 }
@@ -308,6 +371,7 @@ impl Diagnostic {
                 Unsupported::SlowClock { .. } => (9, 0, 0),
                 Unsupported::UartOverflow { uart } => (12, u32::from(uart), 0),
                 Unsupported::UartClock { uart, sclk_sel } => (13, u32::from(uart), sclk_sel),
+                Unsupported::UartFeature { uart, feature } => (23, u32::from(uart), feature as u32),
                 // A command is 1 to 16 bits long, so 0 is free for "no command phase".
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
@@ -759,6 +823,10 @@ mod tests {
                 uart: 1,
                 sclk_sel: 2,
             }),
+            unsupported(Unsupported::UartFeature {
+                uart: 0,
+                feature: UartFeature::Loopback,
+            }),
             unsupported(Unsupported::FlashProgramLength { addr: 0x4100_9000 }),
             unsupported(Unsupported::FlashCommandBits { cmd: 0x0300_0000 }),
             unsupported(Unsupported::FlashSuspend { sus_ctrl: 0x20 }),
@@ -909,6 +977,24 @@ mod tests {
                 "UART{uart}, SCLK_SEL {sclk_sel}"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_uart_feature_is_listed_once_per_uart_and_feature() {
+        let feature = |uart, feature, pc| Diagnostic::Unsupported {
+            what: Unsupported::UartFeature { uart, feature },
+            pc,
+        };
+        let mut d = Diagnostics::new(false);
+        d.record(feature(0, UartFeature::Loopback, 0x4200_0000));
+        d.record(feature(0, UartFeature::Loopback, 0x4200_0010));
+        d.record(feature(1, UartFeature::Loopback, 0x4200_0000));
+        d.record(feature(0, UartFeature::Autobaud, 0x4200_0000));
+        assert_eq!(d.distinct(), 3, "per UART and feature, whatever the pc");
+        assert_eq!(
+            d.occurrences(&feature(0, UartFeature::Loopback, 0x4200_0020)),
+            2
+        );
     }
 
     #[test]
@@ -1125,13 +1211,54 @@ mod tests {
             ),
         ];
         for (diagnostic, needle) in texts {
-            let text = diagnostic.to_string();
-            assert!(text.contains(needle), "{text}");
-            assert!(text.contains("pc 0x40"), "{text}");
-            let (cause, remedy) = text
-                .split_once("; ")
-                .unwrap_or_else(|| panic!("no remedy in: {text}"));
-            assert!(!cause.is_empty() && !remedy.is_empty(), "{text}");
+            assert_cause_then_remedy(&diagnostic, needle);
+        }
+    }
+
+    fn assert_cause_then_remedy(diagnostic: &Diagnostic, needle: &str) {
+        let text = diagnostic.to_string();
+        assert!(text.contains(needle), "{text}");
+        assert!(text.contains("pc 0x40"), "{text}");
+        let (cause, remedy) = text
+            .split_once("; ")
+            .unwrap_or_else(|| panic!("no remedy in: {text}"));
+        assert!(!cause.is_empty() && !remedy.is_empty(), "{text}");
+    }
+
+    #[test]
+    fn the_refusals_of_the_serial_ports_state_the_cause_then_the_remedy() {
+        let texts = [
+            (
+                Unsupported::UartFeature {
+                    uart: 1,
+                    feature: UartFeature::Loopback,
+                },
+                "UART1 was set to loop its transmitter back to its receiver (CONF0.LOOPBACK, pc 0x40381000), which inkemu does not model",
+            ),
+            (
+                Unsupported::UartFeature {
+                    uart: 0,
+                    feature: UartFeature::InvertedRx,
+                },
+                "(CONF0.RXD_INV, pc 0x40381000)",
+            ),
+            (
+                Unsupported::UartFeature {
+                    uart: 0,
+                    feature: UartFeature::Autobaud,
+                },
+                "(CONF0.AUTOBAUD_EN, pc 0x40381000)",
+            ),
+            (
+                Unsupported::UartFeature {
+                    uart: 0,
+                    feature: UartFeature::NoStopBit,
+                },
+                "(CONF0.STOP_BIT_NUM = 0, pc 0x40381000)",
+            ),
+        ];
+        for (what, needle) in texts {
+            assert_cause_then_remedy(&unsupported(what), needle);
         }
     }
 
