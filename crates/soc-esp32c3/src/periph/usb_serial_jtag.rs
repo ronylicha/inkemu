@@ -355,12 +355,15 @@ impl UsbSerialJtag {
 
     /// Asks to be called at the next instant something happens that the firmware can see: the
     /// host takes the committed packet, a packet of the host arrives, the host changes, and,
-    /// only while `SOF` is enabled, the next frame starts.
+    /// only while `SOF` is enabled and lowered, the next frame starts. A frame that starts while
+    /// `SOF` is still raised changes nothing the firmware sees (`FRAM_NUM` is worked out when it
+    /// is read); the write of `INT_CLR` that lowers it arms the call again.
     fn arm(&mut self, ctx: &mut Ctx) {
-        let next_frame = (self.int_ena & SOF != 0)
+        let next_frame = (self.int_ena & SOF != 0 && self.int_raw & SOF == 0)
             .then(|| {
-                self.attached_at
-                    .map(|attached_at| attached_at.saturating_add(self.frames_raised * FRAME))
+                self.attached_at.map(|attached_at| {
+                    attached_at.saturating_add(self.frames_raised.saturating_mul(FRAME))
+                })
             })
             .flatten();
         let next_change = self.host_changes.front().map(|&(at, _)| at);
@@ -923,6 +926,36 @@ mod tests {
         assert!(ctx.take_due().is_some());
         usb.wake(ctx);
         assert_eq!(ctx.sources(), USB_SOURCE);
+    }
+
+    #[test]
+    fn a_raised_sof_asks_for_no_call_until_it_is_cleared() {
+        let ctx = &mut Ctx::default();
+        let mut usb = UsbSerialJtag::new(UsbHost::Attached);
+        usb.write(ctx, INT_ENA, SOF);
+        assert_eq!(ctx.sources(), USB_SOURCE, "the SOF of frame 0");
+        assert_eq!(ctx.next_wake(), None, "the line is high already");
+        ctx.sleep_until(Cycles(3 * FRAME + 5));
+        usb.write(ctx, INT_CLR, SOF);
+        assert_eq!(ctx.sources(), 0);
+        assert_eq!(ctx.next_wake(), Some(Cycles(4 * FRAME)), "the next frame");
+        ctx.sleep_until(Cycles(4 * FRAME));
+        assert!(ctx.take_due().is_some());
+        usb.wake(ctx);
+        assert_eq!(ctx.sources(), USB_SOURCE);
+        assert_eq!(ctx.next_wake(), None);
+        assert_eq!(usb.read(ctx, FRAM_NUM), Some(4));
+    }
+
+    #[test]
+    fn frames_counted_up_to_the_end_of_device_time_do_not_overflow() {
+        let ctx = &mut Ctx::default();
+        let mut usb = UsbSerialJtag::new(UsbHost::Attached);
+        ctx.sleep_until(Cycles(u64::MAX - 5));
+        usb.write(ctx, INT_CLR, SOF);
+        usb.write(ctx, INT_ENA, SOF);
+        assert_eq!(ctx.next_wake(), None, "the next frame is past the end");
+        assert_eq!(ctx.sources(), 0);
     }
 
     #[test]
