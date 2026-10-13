@@ -202,8 +202,10 @@ impl UsbSerialJtag {
     }
 
     /// A core reset returns the block to its reset values and empties both FIFOs and the
-    /// committed packet; what the host took stays for the console. The host is no part of the
-    /// chip: its state, its frames and the packets it is sending go on.
+    /// committed packet; what the host took stays for the console. `FRAM_NUM` reads 0 until the
+    /// next frame starts. The host is no part of the chip: its state, its frames and the packets
+    /// it is sending go on; the next of them comes the host latency after the reset, as after
+    /// the OUT FIFO was read whole.
     ///
     /// ASSUMPTION: a core reset resets the block, as it resets "the whole digital system"
     /// (TRM §6.1.3, report IR §4.2), without the host seeing a detach; a CPU reset
@@ -217,6 +219,7 @@ impl UsbSerialJtag {
         self.committed = None;
         self.out_fifo.clear();
         self.out_free_since = ctx.now().get();
+        self.frame_number = 0;
         self.int_raw = SERIAL_IN_EMPTY;
         self.int_ena = 0;
         self.drive(ctx);
@@ -820,7 +823,11 @@ mod tests {
         send(ctx, &mut usb, b"lost");
         usb.reset(ctx);
         assert_eq!(ctx.sources(), 0, "INT_ENA back to 0");
-        assert_eq!(usb.read(ctx, INT_RAW).unwrap() & !SOF, SERIAL_IN_EMPTY);
+        assert_eq!(
+            usb.read(ctx, INT_RAW),
+            Some(SERIAL_IN_EMPTY),
+            "the SOF of frame 0 is gone, frame 1 has not started"
+        );
         assert_eq!(
             read_packet(ctx, &mut usb),
             [],
@@ -831,6 +838,35 @@ mod tests {
         run_to(ctx, &mut usb, Cycles(11 * HOST_LATENCY));
         assert_eq!(read_packet(ctx, &mut usb), b"later");
         assert_eq!(usb.host(ctx), UsbHost::Open);
+    }
+
+    #[test]
+    fn after_a_core_reset_the_next_packet_of_the_host_comes_the_host_latency_later() {
+        // The reset empties the OUT FIFO: the host sends again as after the FIFO is read whole.
+        let ctx = &mut Ctx::default();
+        let mut usb = open();
+        usb.receive(ctx, Cycles::ZERO, &[b'a'; 2 * PACKET_BYTES]);
+        run_to(ctx, &mut usb, Cycles(2 * HOST_LATENCY));
+        usb.reset(ctx);
+        assert_eq!(read_packet(ctx, &mut usb), [], "the first packet is lost");
+        run_to(ctx, &mut usb, Cycles(3 * HOST_LATENCY - 1));
+        assert_eq!(read_packet(ctx, &mut usb), []);
+        run_to(ctx, &mut usb, Cycles(3 * HOST_LATENCY));
+        assert_eq!(read_packet(ctx, &mut usb), [b'a'; PACKET_BYTES]);
+    }
+
+    #[test]
+    fn a_core_reset_sets_fram_num_to_0_until_the_next_frame() {
+        let ctx = &mut Ctx::default();
+        let mut usb = UsbSerialJtag::new(UsbHost::Attached);
+        ctx.sleep_until(Cycles(3 * FRAME + 7));
+        assert_eq!(usb.read(ctx, FRAM_NUM), Some(3));
+        usb.reset(ctx);
+        assert_eq!(usb.read(ctx, FRAM_NUM), Some(0), "the SVD's reset value");
+        assert_eq!(usb.read(ctx, INT_RAW), Some(SERIAL_IN_EMPTY));
+        ctx.sleep_until(Cycles(4 * FRAME));
+        assert_eq!(usb.read(ctx, FRAM_NUM), Some(4), "the host's frames go on");
+        assert_eq!(usb.read(ctx, INT_RAW), Some(SERIAL_IN_EMPTY | SOF));
     }
 
     #[test]
