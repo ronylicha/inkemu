@@ -8,29 +8,22 @@
 //! A byte the host sends lands in the receive FIFO one frame after its start bit (report UR
 //! §5.4): the bytes of one input go out back to back from the device time they are given, at the
 //! rate and in the frame the UART is set to. `STATUS` and a read of `FIFO` work the count out from
-//! device time when they are accessed (ADR 0003 §4), and the UART asks to be called at the
-//! instant each byte lands. The UART interrupts arrive with the next part of this plan.
+//! device time when they are accessed (ADR 0003 §4), and the UART asks to be called at each
+//! instant a byte lands or an interrupt condition begins.
+//!
+//! The interrupt (report UR §4): sources 21 (`UART_INTR_MAP`) and 22 (`UART1_INTR_MAP`), level,
+//! driven as `INT_RAW & INT_ENA != 0` after every change, as the SYSTIMER drives its own. Five
+//! bits of `INT_RAW` have an effect: `RXFIFO_FULL`, `TXFIFO_EMPTY`, `RXFIFO_OVF`, `RXFIFO_TOUT`
+//! and `TX_DONE` (report UR §10); the others are never set.
 use crate::clock::XTAL_PERIOD;
-use crate::ctx::{Ctx, Deadline, Event};
+use crate::ctx::{Ctx, Deadline, Event, Source};
 use crate::diag::{UartFeature, Unsupported};
-use crate::periph::{Accepted, Storage};
+use crate::periph::Storage;
 use emu_core::{Cycles, Peripheral};
 use std::collections::VecDeque;
 
-/// `INT_CLR` is write-only and accepted; the two others are stored.
-pub(crate) fn accepted() -> Vec<Accepted> {
-    let mut rows = Vec::new();
-    for peripheral in ["UART0", "UART1"] {
-        for (register, not_modeled) in [
-            ("INT_ENA", "interrupt enables: nothing is raised"),
-            ("INT_CLR", "interrupt clear: nothing is pending"),
-            ("CONF1", "FIFO thresholds"),
-        ] {
-            rows.push(Accepted::svd(peripheral, register, not_modeled, "SP1b-3d"));
-        }
-    }
-    rows
-}
+/// The interrupt source of each UART (report UR §4).
+const SOURCES: [Source; 2] = [Source::of("UART_INTR_MAP"), Source::of("UART1_INTR_MAP")];
 
 /// The model serves UART0 and UART1, whose register offsets are identical: those of UART0 name them.
 const fn reg(name: &str) -> u32 {
@@ -38,6 +31,8 @@ const fn reg(name: &str) -> u32 {
 }
 
 const FIFO: u32 = reg("FIFO");
+const INT_RAW: u32 = reg("INT_RAW");
+const INT_ST: u32 = reg("INT_ST");
 const INT_ENA: u32 = reg("INT_ENA");
 const INT_CLR: u32 = reg("INT_CLR");
 const CLKDIV: u32 = reg("CLKDIV");
@@ -80,6 +75,21 @@ const RX_SCLK_EN: u32 = 1 << 25;
 /// model has one block each and refuses another size.
 const MEM_SIZES: u32 = 0b111_1110;
 const ONE_BLOCK_EACH: u32 = 0b001_0010;
+/// `MEM_CONF` bits [25:16] `RX_TOUT_THRHD`: the receive timeout, in bit times (report UR §5.2).
+const RX_TOUT_THRHD_SHIFT: u32 = 16;
+const TEN_BITS: u32 = 0x3FF;
+/// `CONF1` (report UR §2.2): bits [8:0] `RXFIFO_FULL_THRHD`, [17:9] `TXFIFO_EMPTY_THRHD`, bit 18
+/// `DIS_RX_DAT_OVF` ("Disable UART Rx data overflow detect"), bit 21 `RX_TOUT_EN`.
+const NINE_BITS: u32 = 0x1FF;
+const TXFIFO_EMPTY_THRHD_SHIFT: u32 = 9;
+const DIS_RX_DAT_OVF: u32 = 1 << 18;
+const RX_TOUT_EN: u32 = 1 << 21;
+/// The bits of `INT_RAW` the model sets (`uart_struct.h:20-45`, report UR §2.3).
+const RXFIFO_FULL: u32 = 1 << 0;
+const TXFIFO_EMPTY: u32 = 1 << 1;
+const RXFIFO_OVF: u32 = 1 << 4;
+const RXFIFO_TOUT: u32 = 1 << 8;
+const TX_DONE: u32 = 1 << 14;
 /// `FSM_STATUS` bits [7:4] `ST_UTX_OUT`: 0 when the transmitter is idle, the only value software
 /// tests (`ROM3:uart_tx_wait_idle@0x4004c4c6`; BA §7).
 /// ASSUMPTION: while a byte is being sent the field reads 1. The other states are not documented
@@ -167,9 +177,15 @@ pub struct Uart {
     line_free_at: u64,
     /// The receive FIFO.
     rx: VecDeque<u8>,
+    /// `INT_RAW`.
+    int_raw: u32,
+    /// The instant the last byte landed, while the receive timeout of that idle period has not
+    /// come: `None` once it came, and from the start bit of the next byte to its landing.
+    idle_since: Option<u64>,
     /// The call at the next instant the device has something to do: a byte of its transmitter
     /// leaves (so that a CPU that waits for an interrupt with bytes on their way out sleeps
-    /// until they have left, not for ever), or a byte of the host lands.
+    /// until they have left, not for ever), a byte of the host lands, the receive timeout comes,
+    /// or the transmit FIFO falls below its threshold.
     wake: Deadline,
 }
 
@@ -190,6 +206,10 @@ impl Uart {
             receiving: None,
             line_free_at: 0,
             rx: VecDeque::new(),
+            // `TXFIFO_EMPTY` at reset: the SVD's `0x00000002`, the condition with an empty FIFO
+            // and the reset threshold, 96.
+            int_raw: TXFIFO_EMPTY,
+            idle_since: None,
             wake: Deadline::default(),
         }
     }
@@ -203,6 +223,10 @@ impl Uart {
         self.config = Storage::for_offsets(self.base, &CONFIG);
         self.in_flight.clear();
         self.rx.clear();
+        self.int_raw = 0;
+        self.idle_since = None;
+        self.assert_levels();
+        self.drive(ctx);
         self.arm(ctx);
     }
 
@@ -256,12 +280,22 @@ impl Uart {
         self.arm(ctx);
     }
 
-    /// Asks to be called when the last byte of the transmitter will have left, and when the next
-    /// byte of the host lands.
+    /// Asks to be called at the next instant an interrupt condition can begin: the last byte of
+    /// the transmitter leaves (`TX_DONE`), the transmit FIFO falls below its threshold
+    /// (`TXFIFO_EMPTY`), the next byte of the host lands (`RXFIFO_FULL`, `RXFIFO_OVF`), the
+    /// receive timeout comes (`RXFIFO_TOUT`). A landing that changes no bit is a call all the
+    /// same: one per byte received, the price of being right whatever the firmware enables.
     fn arm(&mut self, ctx: &mut Ctx) {
         let next_landing = self.next_landing(ctx);
         let last_gone = self.in_flight.back().map(|&(gone_at, _)| gone_at);
-        for instant in [last_gone, next_landing].into_iter().flatten() {
+        // A timeout that is not enabled raises nothing at its instant: no call.
+        let timeout_enabled = self.config.read(CONF1).unwrap_or(0) & RX_TOUT_EN != 0;
+        let timeout = self.timeout_at(ctx).filter(|_| timeout_enabled);
+        let below_threshold = self.tx_below_threshold_at();
+        for instant in [last_gone, next_landing, timeout, below_threshold]
+            .into_iter()
+            .flatten()
+        {
             self.wake.arm(
                 ctx,
                 Cycles(instant.div_ceil(SUBCYCLES)),
@@ -284,10 +318,38 @@ impl Uart {
         )
     }
 
+    /// The instant the transmit FIFO count falls below `TXFIFO_EMPTY_THRHD`, when it is not below
+    /// it yet: once `n − threshold` of the `n` bytes on their way out have left (the first is in
+    /// the shift register, so the count is `n − 1`). A threshold of 0 is never crossed.
+    fn tx_below_threshold_at(&self) -> Option<u64> {
+        let threshold = usize::try_from(self.tx_empty_threshold()).unwrap_or(usize::MAX);
+        let on_the_way = self.in_flight.len();
+        if threshold == 0 || on_the_way <= threshold {
+            return None;
+        }
+        self.in_flight
+            .get(on_the_way - threshold - 1)
+            .map(|&(gone_at, _)| gone_at)
+    }
+
+    fn tx_empty_threshold(&self) -> u32 {
+        (self.config.read(CONF1).unwrap_or(0) >> TXFIFO_EMPTY_THRHD_SHIFT) & NINE_BITS
+    }
+
+    /// The instant the receive timeout of the current idle period comes: `RX_TOUT_THRHD` bit
+    /// times after the last byte landed (report UR §5.2), timed with the settings of now.
+    fn timeout_at(&self, ctx: &mut Ctx) -> Option<u64> {
+        let since = self.idle_since?;
+        let threshold = (self.config.read(MEM_CONF).unwrap_or(0) >> RX_TOUT_THRHD_SHIFT) & TEN_BITS;
+        Some(since.saturating_add(u64::from(threshold) * self.bit_time(self.source_period(ctx))))
+    }
+
     /// Brings the device to now: the bytes whose last bit has gone move to the console, the bytes
-    /// of the host whose frame has ended land, in the order of their instants.
+    /// of the host whose frame has ended land, and the receive timeout comes, in the order of
+    /// their instants; the interrupt source follows.
     fn settle(&mut self, ctx: &mut Ctx) {
         let now = ctx.now().get().saturating_mul(SUBCYCLES);
+        let was_sending = !self.in_flight.is_empty();
         while let Some(&(gone_at, byte)) = self.in_flight.front() {
             if gone_at > now {
                 break;
@@ -295,32 +357,103 @@ impl Uart {
             self.tx.push(byte);
             self.in_flight.pop_front();
         }
-        // INVARIANT: each pass lands a byte or ends the loop, and the bytes are those the caller
-        // handed over within its bound (`host_pending`).
+        if was_sending && self.in_flight.is_empty() {
+            self.int_raw |= TX_DONE;
+        }
+        // INVARIANT: each pass lands a byte, starts one, ends the timeout or ends the loop, and
+        // the bytes are those the caller handed over within its bound (`host_pending`).
         loop {
+            let timeout = self.timeout_at(ctx).filter(|&at| at <= now);
             if self.receiving.is_none() {
                 let Some(&(date, byte)) = self.host.front() else {
+                    if timeout.is_some() {
+                        self.time_out();
+                        continue;
+                    }
                     break;
                 };
                 let starts_at = date.max(self.line_free_at);
+                // A start bit at the instant the timeout comes finds the line idle until then:
+                // the timeout comes first.
+                if timeout.is_some_and(|at| at <= starts_at) {
+                    self.time_out();
+                    continue;
+                }
                 if starts_at > now {
                     break;
                 }
                 // The frame of a byte is the one the UART is set to when it starts: a register
-                // write settles before it changes the setting.
+                // write settles before it changes the setting. A start bit ends the idle line:
+                // the timeout it put off is not asked for again (`arm`), and the landing starts
+                // the count again.
                 let lands_at = starts_at.saturating_add(self.byte_time(self.source_period(ctx)));
                 self.host.pop_front();
                 self.receiving = Some((lands_at, byte));
                 self.line_free_at = lands_at;
+                self.idle_since = None;
             }
             match self.receiving {
                 Some((lands_at, byte)) if lands_at <= now => {
                     self.receiving = None;
                     self.land(ctx, byte);
+                    self.idle_since = Some(lands_at);
                 }
                 _ => break,
             }
         }
+        self.assert_levels();
+        self.drive(ctx);
+    }
+
+    /// The receive timeout came: it is raised when it is enabled and the FIFO holds data, and
+    /// comes once per idle period.
+    ///
+    /// ASSUMPTION: `RXFIFO_TOUT` needs a byte in the FIFO and an idle line for `RX_TOUT_THRHD`
+    /// bit times after the last byte landed; a read of the FIFO does not start the count again;
+    /// it comes once per idle period (report UR A3). QEMU raises it with an empty FIFO; ESP-IDF
+    /// leaves a byte in the FIFO "in order to trigger `uart_intr_rxfifo_tout`" (`uart.c:1275-1277`).
+    /// A logic analyser on the receive line of a chip, with a GPIO toggled by the handler,
+    /// settles it.
+    fn time_out(&mut self) {
+        self.idle_since = None;
+        let conf1 = self.config.read(CONF1).unwrap_or(0);
+        if conf1 & RX_TOUT_EN != 0 && !self.rx.is_empty() {
+            self.int_raw |= RXFIFO_TOUT;
+        }
+    }
+
+    /// Sets the bits whose condition holds now.
+    ///
+    /// ASSUMPTION: `RXFIFO_FULL` (the FIFO holds more than `RXFIFO_FULL_THRHD` bytes) and
+    /// `TXFIFO_EMPTY` (the transmit FIFO holds fewer than `TXFIFO_EMPTY_THRHD`) are levels: a
+    /// write of `INT_CLR` while the condition holds sets the bit again at once, and a set bit
+    /// stays until it is cleared, after the condition ends too; "more than" is strict (report UR
+    /// A1, from "receives more data than"). The ESP-IDF driver works with either reading (it
+    /// drains the FIFO before it clears `RXFIFO_FULL`, and disables `TXFIFO_EMPTY` before it
+    /// clears it), and so does the ROM's download handler. Clearing the bit on a chip with the
+    /// FIFO above the threshold, and sending exactly `RXFIFO_FULL_THRHD` bytes, settles it.
+    fn assert_levels(&mut self) {
+        let conf1 = self.config.read(CONF1).unwrap_or(0);
+        let full_threshold = usize::try_from(conf1 & NINE_BITS).unwrap_or(usize::MAX);
+        if self.rx.len() > full_threshold {
+            self.int_raw |= RXFIFO_FULL;
+        }
+        let in_fifo = self.in_flight.len().saturating_sub(1);
+        if in_fifo < usize::try_from(self.tx_empty_threshold()).unwrap_or(usize::MAX) {
+            self.int_raw |= TXFIFO_EMPTY;
+        }
+    }
+
+    /// The level of the source: `INT_ST`, `INT_RAW & INT_ENA`, other than 0.
+    fn drive(&self, ctx: &mut Ctx) {
+        // INVARIANT: the machine builds UART 0 and UART 1 only.
+        if let Some(&source) = SOURCES.get(usize::from(self.index)) {
+            ctx.irq(source, self.int_status() != 0);
+        }
+    }
+
+    fn int_status(&self) -> u32 {
+        self.int_raw & self.config.read(INT_ENA).unwrap_or(0)
     }
 
     /// A byte of the host has been received whole: it enters the FIFO.
@@ -337,6 +470,9 @@ impl Uart {
         }
         if self.rx.len() >= FIFO_BYTES {
             ctx.unsupported(Unsupported::UartRxOverflow { uart: self.index });
+            if self.config.read(CONF1).unwrap_or(0) & DIS_RX_DAT_OVF == 0 {
+                self.int_raw |= RXFIFO_OVF;
+            }
             return;
         }
         self.rx.push_back(byte);
@@ -393,15 +529,24 @@ impl Uart {
     /// says what the chip does below a divider of 1 (ESP-IDF never programs one); a byte timed on
     /// a chip with `CLKDIV` = 0 settles it.
     fn byte_time(&self, source_period: u64) -> u64 {
+        let conf0 = self.config.read(CONF0).unwrap_or(0);
+        frame_half_bits(conf0) * self.half_bit_time(source_period)
+    }
+
+    /// The time of one bit, in thirty-seconds of a time-base cycle: what `RX_TOUT_THRHD` counts.
+    fn bit_time(&self, source_period: u64) -> u64 {
+        2 * self.half_bit_time(source_period)
+    }
+
+    /// Half a bit time, in thirty-seconds of a time-base cycle: the divider in sixteenths of a
+    /// source-clock cycle.
+    fn half_bit_time(&self, source_period: u64) -> u64 {
         let clkdiv = self.config.read(CLKDIV).unwrap_or(0);
         let clk_conf = self.config.read(CLK_CONF).unwrap_or(0);
-        let conf0 = self.config.read(CONF0).unwrap_or(0);
-        // The divider in sixteenths of a source-clock cycle, a frame in half bits: the product
-        // is in thirty-seconds.
         let divider = u64::from(clkdiv & CLKDIV_INTEGER_MASK) * 16
             + u64::from((clkdiv >> CLKDIV_FRAG_SHIFT) & CLKDIV_FRAG_MASK);
         let source_divider = u64::from((clk_conf >> SCLK_DIV_NUM_SHIFT) & SCLK_DIV_NUM_MASK) + 1;
-        frame_half_bits(conf0) * divider * source_divider * source_period
+        divider * source_divider * source_period
     }
 
     /// Refuses by name the modes of `conf0` the model does not have (report UR §10, A4).
@@ -466,6 +611,8 @@ impl Peripheral<Ctx> for Uart {
                 ST_UTX_OUT_BUSY
             }),
             MEM_RX_STATUS => Some(self.mem_rx_status),
+            INT_RAW => Some(self.int_raw),
+            INT_ST => Some(self.int_status()),
             _ => self.config.read(offset),
         }
     }
@@ -477,8 +624,12 @@ impl Peripheral<Ctx> for Uart {
                 self.send(ctx, value.to_le_bytes()[0]);
                 true
             }
-            // No interrupt condition is modelled yet, so there is nothing to clear.
-            INT_CLR => true,
+            // Write 1 to clear (`uart_reg.h:422-530`); a level whose condition holds is set again
+            // below (`assert_levels`).
+            INT_CLR => {
+                self.int_raw &= !value;
+                true
+            }
             CONF0 => {
                 if value & TXFIFO_RST != 0 {
                     // The byte in the shift register is on the wire already: it goes on.
@@ -510,7 +661,10 @@ impl Peripheral<Ctx> for Uart {
             }
             _ => self.config.write(offset, value),
         };
-        // The baud rate or the frame may have changed: so has the instant the next byte lands.
+        // A threshold, an enable or a clear may have changed a bit or the level; the baud rate
+        // or the frame may have changed the instant the next byte lands.
+        self.assert_levels();
+        self.drive(ctx);
         self.arm(ctx);
         accepted
     }
@@ -707,22 +861,301 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_clear_is_accepted_and_the_interrupt_state_is_unmodeled() {
+    fn the_raw_state_resets_to_txfifo_empty_and_int_st_is_the_enabled_part_of_it() {
+        // SVD: INT_RAW resets to 0x00000002; UR §4: INT_ST = INT_RAW & INT_ENA.
         let ctx = &mut Ctx::default();
         let mut uart = Uart::new(0, UART0);
-        assert!(uart.write(ctx, INT_CLR, 0xFFFF_FFFF));
+        assert_eq!(uart.read(ctx, INT_RAW), Some(TXFIFO_EMPTY));
+        assert_eq!(uart.read(ctx, INT_ST), Some(0));
+        assert_eq!(ctx.sources(), 0);
+        uart.write(ctx, INT_ENA, TXFIFO_EMPTY);
+        assert_eq!(uart.read(ctx, INT_ST), Some(TXFIFO_EMPTY));
+        assert_eq!(ctx.sources(), 1 << 21, "source 21, UART_INTR_MAP");
+        uart.write(ctx, INT_CLR, 0xFFFF_FFFF);
         assert_eq!(
-            uart.read(ctx, reg("INT_RAW")),
-            None,
-            "interrupts are not modelled yet"
+            uart.read(ctx, INT_RAW),
+            Some(TXFIFO_EMPTY),
+            "a level set again at once: the FIFO is still below its threshold"
         );
-        assert_eq!(uart.read(ctx, reg("INT_ST")), None);
+        uart.write(ctx, INT_ENA, 0);
+        assert_eq!(ctx.sources(), 0, "disabled: the source falls");
+        assert!(
+            !uart.write(ctx, INT_RAW, 0),
+            "set by the device, cleared through INT_CLR"
+        );
+        assert!(!uart.write(ctx, INT_ST, 0), "read-only");
+    }
+
+    /// What `uart_driver_install` leaves (UR §3.3, run S2, as the chip reads back): the timeout at
+    /// 100 bit times and enabled, the full threshold at 120, the transmit threshold at its reset
+    /// value 96, `INT_ENA` = `0x00080195`.
+    fn driver(ctx: &mut Ctx) -> Uart {
+        let mut uart = console(ctx);
+        uart.write(ctx, INT_ENA, 0);
+        uart.write(ctx, INT_CLR, 0x7FFFF);
+        uart.write(ctx, MEM_CONF, 0x0064_0012);
+        uart.write(ctx, CONF1, 0x0020_C078);
+        uart.write(ctx, INT_ENA, 0x0008_0195);
+        assert_eq!(ctx.take_unsupported(), None);
+        uart
+    }
+
+    /// The instant of the timeout after the `n`th byte sent at 0 lands: 100 bit times later.
+    fn timed_out_after(n: u64) -> Cycles {
+        Cycles((n * 20 * (347 * 16 + 3) * 4 + 100 * 2 * (347 * 16 + 3) * 4).div_ceil(SUBCYCLES))
+    }
+
+    #[test]
+    fn a_short_burst_raises_the_timeout_100_bit_times_after_its_last_byte_and_the_handler_reads_it()
+    {
+        // UR §9.2: `bc\r\n` in one burst; UR §3.3: the handler reads INT_ST, STATUS, each byte,
+        // AT_CMD_CHAR twice, writes INT_CLR = 0x101 and reads INT_ST again.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        uart.receive(ctx, Cycles::ZERO, b"bc\r\n");
+        run_to(ctx, &mut uart, landed(4));
+        assert_eq!(
+            uart.read(ctx, INT_ST),
+            Some(0),
+            "four bytes: under the threshold of 120"
+        );
+        assert_eq!(
+            ctx.next_wake(),
+            Some(timed_out_after(4)),
+            "the call at the timeout"
+        );
+        ctx.sleep_until(Cycles(timed_out_after(4).get() - 1));
+        assert_eq!(uart.read(ctx, INT_ST), Some(0));
+        ctx.sleep_until(timed_out_after(4));
+        assert_eq!(ctx.take_due(), Some(Event::Uart(0)));
+        uart.wake(ctx);
+        assert_eq!(
+            ctx.sources(),
+            1 << 21,
+            "raised at its instant, before any access"
+        );
+        assert_eq!(uart.read(ctx, INT_ST), Some(RXFIFO_TOUT));
+        assert_eq!(uart.read(ctx, STATUS).unwrap() & 0x3FF, 4);
+        let read: Vec<u32> = (0..4).map(|_| uart.read(ctx, FIFO).unwrap()).collect();
+        assert_eq!(read, [98, 99, 13, 10]);
+        assert_eq!(uart.read(ctx, AT_CMD_CHAR), Some(0x32B));
+        uart.write(ctx, INT_CLR, RXFIFO_TOUT | RXFIFO_FULL);
+        assert_eq!(uart.read(ctx, INT_ST), Some(0));
+        assert_eq!(ctx.sources(), 0);
+        assert_eq!(ctx.take_unsupported(), None);
+    }
+
+    #[test]
+    fn the_timeout_comes_once_per_idle_period_and_never_with_an_empty_fifo() {
+        // UR A3: QEMU raises it as soon as the timeout is configured; the chip needs data.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        ctx.sleep_until(timed_out_after(10));
+        assert_eq!(uart.read(ctx, INT_RAW).unwrap() & RXFIFO_TOUT, 0, "no data");
+        assert_eq!(ctx.next_wake(), None);
+        // A byte, read before the timeout: the FIFO is empty when it comes.
+        uart.receive(ctx, Cycles::ZERO, b"a");
+        let start = ctx.now();
+        ctx.sleep_until(start + landed(1).get());
+        uart.read(ctx, FIFO);
+        ctx.sleep_until(start + timed_out_after(1).get());
+        assert_eq!(
+            uart.read(ctx, INT_RAW).unwrap() & RXFIFO_TOUT,
+            0,
+            "empty FIFO"
+        );
+        // Two bytes, one left in the FIFO: the timeout comes, once.
+        let start = ctx.now();
+        uart.receive(ctx, start, b"xy");
+        ctx.sleep_until(start + landed(2).get());
+        uart.read(ctx, FIFO);
+        ctx.sleep_until(start + timed_out_after(2).get());
+        assert_eq!(
+            uart.read(ctx, INT_RAW).unwrap() & RXFIFO_TOUT,
+            RXFIFO_TOUT,
+            "a read does not start the count again"
+        );
+        uart.write(ctx, INT_CLR, RXFIFO_TOUT);
+        ctx.sleep_until(start + timed_out_after(20).get());
+        assert_eq!(
+            uart.read(ctx, INT_RAW).unwrap() & RXFIFO_TOUT,
+            0,
+            "once per idle period"
+        );
+    }
+
+    #[test]
+    fn a_byte_that_starts_before_the_timeout_comes_puts_it_off() {
+        // A start bit ends the idle line: a byte that follows within 100 bit times of the last one
+        // puts the timeout 100 bit times after itself.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        uart.receive(ctx, Cycles::ZERO, b"1");
+        let second_at = Cycles(timed_out_after(1).get() - 1_000);
+        uart.receive(ctx, second_at, b"2");
+        run_to(ctx, &mut uart, timed_out_after(1));
+        assert_eq!(uart.read(ctx, INT_RAW).unwrap() & RXFIFO_TOUT, 0);
+        ctx.sleep_until(second_at + timed_out_after(1).get());
+        assert_eq!(uart.read(ctx, INT_RAW).unwrap() & RXFIFO_TOUT, RXFIFO_TOUT);
+    }
+
+    #[test]
+    fn a_byte_that_starts_at_the_instant_the_timeout_comes_finds_it_come() {
+        // The line was idle until then. A timeout of 2 bit times after one byte ends on a whole
+        // cycle: 444 400 + 2 x 44 440 thirty-seconds, 16 665 cycles.
+        let ctx = &mut Ctx::default();
+        let mut uart = driver(ctx);
+        uart.write(ctx, MEM_CONF, 0x0002_0012);
+        uart.receive(ctx, Cycles::ZERO, b"1");
+        uart.receive(ctx, Cycles(16_665), b"2");
+        run_to(ctx, &mut uart, Cycles(16_665));
+        assert_eq!(uart.read(ctx, INT_RAW).unwrap() & RXFIFO_TOUT, RXFIFO_TOUT);
+    }
+
+    #[test]
+    fn more_bytes_than_the_full_threshold_raise_rxfifo_full_and_a_clear_while_they_stay_does_not_lower_it()
+     {
+        // UR A1: count > threshold, and a level.
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        uart.write(ctx, CONF1, 0x0000_C004); // full threshold 4
+        uart.write(ctx, INT_ENA, RXFIFO_FULL);
+        uart.receive(ctx, Cycles::ZERO, b"12345");
+        run_to(ctx, &mut uart, landed(4));
+        assert_eq!(
+            uart.read(ctx, INT_ST),
+            Some(0),
+            "four bytes: not more than 4"
+        );
+        assert_eq!(ctx.next_wake(), Some(landed(5)));
+        ctx.sleep_until(landed(5));
+        assert_eq!(ctx.take_due(), Some(Event::Uart(0)));
+        uart.wake(ctx);
+        assert_eq!(ctx.sources(), 1 << 21);
+        uart.write(ctx, INT_CLR, RXFIFO_FULL);
+        assert_eq!(
+            uart.read(ctx, INT_ST),
+            Some(RXFIFO_FULL),
+            "five bytes are still there"
+        );
+        uart.read(ctx, FIFO);
+        assert_eq!(
+            uart.read(ctx, INT_ST),
+            Some(RXFIFO_FULL),
+            "set until cleared"
+        );
+        uart.write(ctx, INT_CLR, RXFIFO_FULL);
+        assert_eq!(
+            uart.read(ctx, INT_ST),
+            Some(0),
+            "four left: cleared for good"
+        );
+        assert_eq!(ctx.sources(), 0);
+    }
+
+    #[test]
+    fn a_byte_that_finds_the_fifo_full_raises_rxfifo_ovf_unless_detection_is_off() {
+        for (conf1, raised) in [(0x0000_C060, RXFIFO_OVF), (0x0004_C060, 0)] {
+            let ctx = &mut Ctx::default();
+            let mut uart = console(ctx);
+            uart.write(ctx, CONF1, conf1);
+            let sent: Vec<u8> = (0..=128).collect();
+            uart.receive(ctx, Cycles::ZERO, &sent);
+            ctx.sleep_until(landed(128));
+            assert_eq!(uart.read(ctx, INT_RAW).unwrap() & RXFIFO_OVF, 0);
+            ctx.sleep_until(landed(129));
+            assert_eq!(
+                uart.read(ctx, INT_RAW).unwrap() & RXFIFO_OVF,
+                raised,
+                "{conf1:#x}"
+            );
+            assert_eq!(
+                ctx.take_unsupported(),
+                Some(Unsupported::UartRxOverflow { uart: 0 }),
+                "dropped and counted either way"
+            );
+        }
+    }
+
+    #[test]
+    fn the_transmit_fifo_falling_below_its_threshold_raises_txfifo_empty_at_that_instant() {
+        // UR §3.3: with no transmit buffer, the driver enables TXFIFO_EMPTY at threshold 10 and
+        // waits for it; without it the first long burst blocks for ever (UR A10).
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        uart.write(ctx, CONF1, 10 << TXFIFO_EMPTY_THRHD_SHIFT);
+        for byte in 0..20u32 {
+            uart.write(ctx, FIFO, byte);
+        }
+        uart.write(ctx, INT_CLR, TXFIFO_EMPTY);
+        uart.write(ctx, INT_ENA, TXFIFO_EMPTY);
+        assert_eq!(
+            uart.read(ctx, INT_ST),
+            Some(0),
+            "19 in the FIFO, 1 on the wire"
+        );
+        // Ten bytes have to leave: the FIFO then holds 9.
+        let below = Cycles((10 * BYTE_SUBCYCLES).div_ceil(SUBCYCLES));
+        run_to(ctx, &mut uart, Cycles(below.get() - 1));
+        assert_eq!(uart.read(ctx, INT_ST), Some(0));
+        assert_eq!(ctx.next_wake(), Some(below), "the call at the crossing");
+        ctx.sleep_until(below);
+        assert_eq!(ctx.take_due(), Some(Event::Uart(0)));
+        uart.wake(ctx);
+        assert_eq!(ctx.sources(), 1 << 21);
+        assert_eq!(uart.read(ctx, INT_ST), Some(TXFIFO_EMPTY));
+    }
+
+    #[test]
+    fn tx_done_is_raised_when_the_last_byte_has_left_and_not_again_while_idle() {
+        let ctx = &mut Ctx::default();
+        let mut uart = console(ctx);
+        uart.write(ctx, INT_ENA, TX_DONE);
+        uart.write(ctx, FIFO, u32::from(b'k'));
+        uart.write(ctx, FIFO, u32::from(b'o'));
+        after_bytes(ctx, 1);
+        assert_eq!(uart.read(ctx, INT_ST), Some(0));
+        after_bytes(ctx, 1);
+        assert_eq!(uart.read(ctx, INT_ST), Some(TX_DONE));
+        uart.write(ctx, INT_CLR, TX_DONE);
+        after_bytes(ctx, 5);
+        assert_eq!(uart.read(ctx, INT_ST), Some(0), "an event, not a level");
+    }
+
+    #[test]
+    fn uart1_drives_source_22_and_a_reset_lowers_it() {
+        let ctx = &mut Ctx::default();
+        let mut uart1 = Uart::new(1, UART1);
+        uart1.write(ctx, INT_ENA, TXFIFO_EMPTY);
+        assert_eq!(ctx.sources(), 1 << 22, "UART1_INTR_MAP");
+        uart1.reset(ctx);
+        assert_eq!(ctx.sources(), 0, "INT_ENA back to 0");
+        assert_eq!(uart1.read(ctx, INT_RAW), Some(TXFIFO_EMPTY));
     }
 
     /// The instant, in cycles, at which the `n`th byte (from 1) the host sends at 0 has landed,
     /// at 115 200 baud 8N1 on the crystal.
     fn landed(n: u64) -> Cycles {
         gone_after(20 * n)
+    }
+
+    /// Moves device time to `instant` as the machine would: each call the UART asked for is
+    /// delivered at its own instant on the way. A UART that asks for a call at the instant it is
+    /// called again and again fails the test instead of hanging it.
+    fn run_to(ctx: &mut Ctx, uart: &mut Uart, instant: Cycles) {
+        let mut calls = 0;
+        while let Some(next) = ctx.next_wake().filter(|&next| next <= instant) {
+            ctx.sleep_until(next);
+            while ctx.take_due().is_some() {
+                calls += 1;
+                assert!(
+                    calls < 1_000,
+                    "the UART asks for a call at {next:?} for ever"
+                );
+                uart.wake(ctx);
+            }
+        }
+        ctx.sleep_until(instant);
     }
 
     fn rx_count(ctx: &mut Ctx, uart: &mut Uart) -> u32 {

@@ -275,7 +275,6 @@ pub fn accepted_without_effect() -> Vec<Accepted> {
         gpio::accepted(),
         sensitive::accepted(),
         system::accepted(),
-        uart::accepted(),
         intmatrix::accepted(),
         assist_debug::accepted(),
         extmem::accepted(),

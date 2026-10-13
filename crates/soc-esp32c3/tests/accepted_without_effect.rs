@@ -42,7 +42,7 @@ fn the_documented_table_is_the_one_the_code_builds() {
 /// before it ends, and its name is removed from this list by its last task. A plan to come that
 /// owns no row (SP1b-3e today) is not in the list: it is added with its first row.
 /// The list holds the table only: a comment or a document that names an heir is not read here.
-const PLANS_TO_COME: [&str; 7] = ["SP1b-3d", "SP1b-3f", "SP1b-4", "SP2", "SP5a", "SP5b", "SP8"];
+const PLANS_TO_COME: [&str; 6] = ["SP1b-3f", "SP1b-4", "SP2", "SP5a", "SP5b", "SP8"];
 
 #[test]
 fn every_row_hands_its_register_to_a_plan_that_is_still_to_come() {
