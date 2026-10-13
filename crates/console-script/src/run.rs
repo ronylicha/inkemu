@@ -68,7 +68,8 @@ impl ScriptRun {
     /// [`RunError`] when the machine refuses an input. A script that [`Script::parse`] accepted
     /// stays within the bounds the machine puts on how much it holds; what a script cannot know
     /// is the device time its `wait-for` steps reach, so a `send` on a UART dated after about
-    /// 114 years of device time is refused ([`InputError::BeyondTheLine`]).
+    /// 114 years of device time is refused ([`InputError::BeyondTheLine`]). The machine then
+    /// watches no channel for the script: the steps before the refused one stay handed over.
     pub fn start(script: &Script, machine: &mut Esp32C3) -> Result<ScriptRun, RunError> {
         let mut watched: Vec<(ConsoleChannel, usize)> = Vec::new();
         for (index, step) in script.steps().iter().enumerate() {
@@ -90,7 +91,11 @@ impl ScriptRun {
             last_dated: None,
             watched,
         };
-        run.advance(machine)?;
+        // A refused step hands back no run to stop: the channels watched above are let go here.
+        if let Err(error) = run.advance(machine) {
+            run.stop(machine);
+            return Err(error);
+        }
         Ok(run)
     }
 
@@ -572,6 +577,24 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.line, 4);
         assert!(matches!(error.source, InputError::BeyondTheLine { .. }));
+    }
+
+    #[test]
+    fn a_script_refused_at_its_start_leaves_no_channel_watched() {
+        // No run is handed back to stop: the consoles are back to their pace at once.
+        let mut program = print_program(UART0, b"abc");
+        program.extend([wfi(), HANG]);
+        let mut m = machine(&program);
+        let error = ScriptRun::start(
+            &script(
+                "wait 18446744073s\nwait 18446744073s\nsend uart1 \"x\"\nwait-for uart0 \"a\"\n",
+            ),
+            &mut m,
+        )
+        .unwrap_err();
+        assert!(matches!(error.source, InputError::BeyondTheLine { .. }));
+        assert_ne!(m.run_until(Cycles(1_000_000)), StopReason::ConsoleOutput);
+        assert_eq!(m.take_console(ConsoleChannel::Uart0), b"abc");
     }
 
     #[test]
