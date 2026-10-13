@@ -75,6 +75,12 @@ pub enum Unsupported {
     /// A UART field set to a mode the model does not have (report UR §10): the register keeps
     /// the value, and the UART goes on as if the field were clear.
     UartFeature { uart: u8, feature: UartFeature },
+    /// A byte of the host that found the 128-byte receive FIFO of a UART full: dropped.
+    /// ASSUMPTION: the new byte is lost and the 128 stay (report UR A2); 200 bytes sent to a FIFO
+    /// nobody reads, on a chip, settle it.
+    UartRxOverflow { uart: u8 },
+    /// A read of the receive FIFO of a UART while it was empty: 0 was returned (report UR A6).
+    UartEmptyRead { uart: u8 },
 }
 
 /// A UART mode the model refuses by name when software sets it (report UR §10, A4).
@@ -88,6 +94,10 @@ pub enum UartFeature {
     Autobaud,
     /// `CONF0.STOP_BIT_NUM` = 0: a frame with no documented stop bit (report UR A4).
     NoStopBit,
+    /// `MEM_CONF.RX_SIZE` or `TX_SIZE` other than one 128-byte block.
+    FifoSize,
+    /// `RS485_CONF` other than 0.
+    Rs485,
 }
 
 impl UartFeature {
@@ -114,6 +124,16 @@ impl UartFeature {
                 "CONF0.STOP_BIT_NUM = 0",
                 "for a frame without a stop bit",
                 "its bytes are timed with one stop bit; write STOP_BIT_NUM 1, 2 or 3 (1, 1.5 or 2 stop bits)",
+            ),
+            UartFeature::FifoSize => (
+                "MEM_CONF.RX_SIZE or TX_SIZE other than 1",
+                "to give its FIFOs another share of the UART memory",
+                "each FIFO keeps 128 bytes; leave RX_SIZE and TX_SIZE at 1",
+            ),
+            UartFeature::Rs485 => (
+                "RS485_CONF other than 0",
+                "to RS485 mode",
+                "it sends and receives as a plain UART; write RS485_CONF = 0",
             ),
         }
     }
@@ -247,7 +267,9 @@ impl Unsupported {
             ),
             Unsupported::UartOverflow { .. }
             | Unsupported::UartClock { .. }
-            | Unsupported::UartFeature { .. } => self.describe_serial(pc, f),
+            | Unsupported::UartFeature { .. }
+            | Unsupported::UartRxOverflow { .. }
+            | Unsupported::UartEmptyRead { .. } => self.describe_serial(pc, f),
         }
     }
 
@@ -269,6 +291,14 @@ impl Unsupported {
                     "UART{uart} was set {asked} ({field}, pc {pc:#010x}), which inkemu does not model, so {instead}"
                 )
             }
+            Unsupported::UartRxOverflow { uart } => write!(
+                f,
+                "a byte the host sent found the 128-byte receive FIFO of UART{uart} full (pc {pc:#010x}), so it was dropped and the 128 bytes stay; read the FIFO sooner, or send less at once"
+            ),
+            Unsupported::UartEmptyRead { uart } => write!(
+                f,
+                "UART{uart}.FIFO was read while the receive FIFO was empty (pc {pc:#010x}), so 0 was returned; read only the number of bytes UART.STATUS RXFIFO_CNT gives"
+            ),
             // INVARIANT: `describe` hands only the refusals above to this function.
             _ => Ok(()),
         }
@@ -372,6 +402,8 @@ impl Diagnostic {
                 Unsupported::UartOverflow { uart } => (12, u32::from(uart), 0),
                 Unsupported::UartClock { uart, sclk_sel } => (13, u32::from(uart), sclk_sel),
                 Unsupported::UartFeature { uart, feature } => (23, u32::from(uart), feature as u32),
+                Unsupported::UartRxOverflow { uart } => (24, u32::from(uart), 0),
+                Unsupported::UartEmptyRead { uart } => (25, u32::from(uart), 0),
                 // A command is 1 to 16 bits long, so 0 is free for "no command phase".
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
@@ -1255,6 +1287,28 @@ mod tests {
                     feature: UartFeature::NoStopBit,
                 },
                 "(CONF0.STOP_BIT_NUM = 0, pc 0x40381000)",
+            ),
+            (
+                Unsupported::UartFeature {
+                    uart: 0,
+                    feature: UartFeature::FifoSize,
+                },
+                "(MEM_CONF.RX_SIZE or TX_SIZE other than 1, pc 0x40381000)",
+            ),
+            (
+                Unsupported::UartFeature {
+                    uart: 0,
+                    feature: UartFeature::Rs485,
+                },
+                "UART0 was set to RS485 mode (RS485_CONF other than 0, pc 0x40381000)",
+            ),
+            (
+                Unsupported::UartRxOverflow { uart: 1 },
+                "a byte the host sent found the 128-byte receive FIFO of UART1 full (pc 0x40381000)",
+            ),
+            (
+                Unsupported::UartEmptyRead { uart: 0 },
+                "UART0.FIFO was read while the receive FIFO was empty (pc 0x40381000), so 0 was returned",
             ),
         ];
         for (what, needle) in texts {

@@ -521,8 +521,8 @@ impl Peripherals {
                 self.spi0 = Spi0::new();
                 self.spi1.reset();
             }
-            Module::Uart0 => self.uart0.reset(ctx.now()),
-            Module::Uart1 => self.uart1.reset(ctx.now()),
+            Module::Uart0 => self.uart0.reset(ctx),
+            Module::Uart1 => self.uart1.reset(ctx),
             Module::Timg0 => self.timg0.reset(ctx),
             Module::Timg1 => self.timg1.reset(ctx),
             Module::Systimer => self.systimer.reset(ctx),
@@ -584,8 +584,8 @@ impl Peripherals {
         self.ana_i2c.reset();
         self.apb_saradc = AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED);
         self.radio_power = AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED);
-        self.uart0.reset(ctx.now());
-        self.uart1.reset(ctx.now());
+        self.uart0.reset(ctx);
+        self.uart1.reset(ctx);
         self.usb_serial_jtag.reset();
         // No rebuilt device asserts an interrupt source, and `SYSTEM` selects the reset clock again.
         // The timer groups and the SYSTIMER go last: each withdraws its wake-up, so that none of

@@ -469,9 +469,9 @@ impl Esp32C3 {
     /// of a run whose firmware writes without end.
     pub fn take_console(&mut self, channel: ConsoleChannel) -> Vec<u8> {
         match channel {
-            ConsoleChannel::Uart0 => self.bus.periph.uart0.take_tx(self.bus.ctx.now()),
+            ConsoleChannel::Uart0 => self.bus.periph.uart0.take_tx(&mut self.bus.ctx),
             ConsoleChannel::UsbSerialJtag => self.bus.periph.usb_serial_jtag.take_tx(),
-            ConsoleChannel::Uart1 => self.bus.periph.uart1.take_tx(self.bus.ctx.now()),
+            ConsoleChannel::Uart1 => self.bus.periph.uart1.take_tx(&mut self.bus.ctx),
         }
     }
 
