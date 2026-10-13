@@ -51,6 +51,17 @@ impl Frequency {
         let nanos = u128::from(cycles.0) * NANOS_PER_SECOND / u128::from(self.hz());
         u64::try_from(nanos).unwrap_or(u64::MAX)
     }
+
+    /// Converts `nanos` nanoseconds to cycles, rounded up: the first cycle boundary at or after
+    /// that time, so that a duration is never cut short. Saturates at `u64::MAX`.
+    #[must_use]
+    pub fn nanos_to_cycles(&self, nanos: u128) -> Cycles {
+        let cycles = nanos
+            .checked_mul(u128::from(self.hz()))
+            // An overflow of the product is far beyond `u64::MAX` cycles: it saturates as well.
+            .map_or(u128::MAX, |product| product.div_ceil(NANOS_PER_SECOND));
+        Cycles(u64::try_from(cycles).unwrap_or(u64::MAX))
+    }
 }
 
 impl Frequency {
@@ -80,6 +91,28 @@ mod tests {
         assert_eq!(f.cycles_to_nanos(Cycles(160)), 1_000);
         // u64::MAX cycles at 160 MHz ≈ 1.15e20 ns, beyond u64: the conversion saturates.
         assert_eq!(f.cycles_to_nanos(Cycles(u64::MAX)), u64::MAX);
+    }
+
+    #[test]
+    fn nanos_convert_to_cycles_rounded_up_and_saturating() {
+        // 160 MHz: 0.16 cycle a nanosecond.
+        let f = Frequency::from_hz(160_000_000).unwrap();
+        assert_eq!(f.nanos_to_cycles(0), Cycles(0));
+        assert_eq!(f.nanos_to_cycles(1), Cycles(1));
+        assert_eq!(f.nanos_to_cycles(25), Cycles(4));
+        assert_eq!(f.nanos_to_cycles(26), Cycles(5));
+        assert_eq!(f.nanos_to_cycles(160), Cycles(26));
+        assert_eq!(f.nanos_to_cycles(1_000_000_000), Cycles(160_000_000));
+        assert_eq!(
+            f.nanos_to_cycles(u128::from(u64::MAX)),
+            Cycles(2_951_479_051_793_528_259)
+        );
+        // Beyond `u64::MAX` cycles, and beyond what the product can hold: saturated.
+        assert_eq!(
+            f.nanos_to_cycles(u128::from(u64::MAX) * 7),
+            Cycles(u64::MAX)
+        );
+        assert_eq!(f.nanos_to_cycles(u128::MAX), Cycles(u64::MAX));
     }
 
     #[test]
