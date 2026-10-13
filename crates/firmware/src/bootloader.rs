@@ -223,7 +223,8 @@ impl ShippedBootloader {
 #[derive(Debug, PartialEq, Eq)]
 pub struct KnownBootloader {
     pub name: &'static str,
-    /// SHA-256 of the file, in lower-case hexadecimal.
+    /// SHA-256 of the image, from its header to the end of its trailer, in lower-case
+    /// hexadecimal: of the whole file for a bootloader.bin, which ends with its trailer.
     pub sha256: &'static str,
 }
 
@@ -408,13 +409,21 @@ fn overlaps(range: (u32, u32), addr: u32, len: usize) -> bool {
     u64::from(addr) < u64::from(range.1) && end > u64::from(range.0)
 }
 
-/// What `bytes` is known as: shipped, known, or described by its descriptor.
-fn identify(bytes: &[u8], image: &FirmwareImage) -> BootloaderIdentity {
-    let sha256 = sha256_hex(bytes);
-    if let Some(entry) = SHIPPED.iter().find(|entry| entry.sha256 == sha256) {
+/// What the bootloader `image`, read from `bytes`, is known as among `shipped` and `known`, or
+/// as its descriptor describes it. The hash is that of the image, from its header to the end of
+/// its trailer: the first 0x8000 bytes of a dump hold a bootloader followed by erased bytes.
+fn identify_in(
+    bytes: &[u8],
+    image: &FirmwareImage,
+    shipped: &'static [ShippedBootloader],
+    known: &'static [KnownBootloader],
+) -> BootloaderIdentity {
+    // `image` was parsed from `bytes`, so its trailer ends within them: `get` never falls back.
+    let sha256 = sha256_hex(bytes.get(..image.len).unwrap_or(bytes));
+    if let Some(entry) = shipped.iter().find(|entry| entry.sha256 == sha256) {
         return BootloaderIdentity::Shipped(entry);
     }
-    if let Some(known) = KNOWN.iter().find(|known| known.sha256 == sha256) {
+    if let Some(known) = known.iter().find(|known| known.sha256 == sha256) {
         return BootloaderIdentity::Known(known);
     }
     match image
@@ -523,7 +532,7 @@ pub fn check_bootloader(
         warnings.push(BootloaderWarning::DigestMismatch);
     }
     Ok(BootloaderReport {
-        identity: identify(bytes, &image),
+        identity: identify_in(bytes, &image, &SHIPPED, &KNOWN),
         warnings,
     })
 }
@@ -932,6 +941,23 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_bootloader_read_from_the_start_of_a_dump_is_named() {
+        // The first 0x8000 bytes of a flash dump: the bootloader, then erased bytes.
+        let mut padded = shipped_bytes().to_vec();
+        padded.resize(0x8000, 0xFF);
+        let report = check_bootloader(&padded, &X4).unwrap();
+        assert_eq!(report.identity, BootloaderIdentity::Shipped(&SHIPPED[0]));
+        // Another bootloader is named by the hash of its image, not of the file.
+        let built = build_image(&bootloader_spec());
+        let mut padded = built.clone();
+        padded.resize(0x8000, 0xFF);
+        assert!(matches!(
+            check_bootloader(&padded, &X4).unwrap().identity,
+            BootloaderIdentity::Described { sha256, .. } if sha256 == sha256_hex(&built)
+        ));
+    }
+
+    #[test]
     fn a_known_bootloader_is_named() {
         assert_eq!(
             KNOWN[0].sha256,
@@ -939,6 +965,25 @@ mod tests {
         );
         let identity = BootloaderIdentity::Known(&KNOWN[0]);
         assert!(identity.to_string().contains("Arduino-ESP32"), "{identity}");
+        // A bootloader whose hash is in the table of known ones is named by it, padded or not.
+        let built = build_image(&bootloader_spec());
+        let known: &'static [KnownBootloader] = Box::leak(Box::new([KnownBootloader {
+            name: "a test bootloader",
+            sha256: Box::leak(sha256_hex(&built).into_boxed_str()),
+        }]));
+        let mut padded = built.clone();
+        padded.resize(0x8000, 0xFF);
+        for bytes in [&built, &padded] {
+            let image = FirmwareImage::parse(bytes).unwrap();
+            assert_eq!(
+                identify_in(bytes, &image, &SHIPPED, known),
+                BootloaderIdentity::Known(&known[0])
+            );
+            assert!(matches!(
+                identify_in(bytes, &image, &SHIPPED, &KNOWN),
+                BootloaderIdentity::Described { .. }
+            ));
+        }
         // A descriptor with an application's magic is an application, whatever else it holds.
         let mut spec = bootloader_spec();
         spec.segments[0].1 = app_desc_bytes("1", "demo", "v5.5.2");
