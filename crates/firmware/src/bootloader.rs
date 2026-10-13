@@ -10,7 +10,8 @@ use crate::chip::{ChipId, FlashSize, SpiMode};
 use crate::device::{Device, revision};
 use crate::error::FirmwareError;
 use crate::image::{
-    FirmwareImage, HEADER_LEN, IMAGE_MAGIC, Segment, XOTA_MAGIC, first_segment_data,
+    FirmwareImage, HASH_APPENDED_OFFSET, HEADER_LEN, IMAGE_MAGIC, SHA256_LEN, Segment, XOTA_MAGIC,
+    c_string, first_segment_data, le_u32,
 };
 use crate::partition::PARTITION_TABLE_OFFSET;
 use sha2::{Digest, Sha256};
@@ -27,9 +28,6 @@ const DESC_IDF_VER: (usize, usize) = (8, 32);
 const DESC_DATE_TIME: (usize, usize) = (40, 24);
 /// Header byte 3: flash size in the high nibble, flash frequency in the low one.
 const SIZE_FREQ_OFFSET: usize = 3;
-/// Header byte 23: non-zero when a SHA-256 digest ends the image.
-const HASH_APPENDED_OFFSET: usize = 23;
-const SHA256_LEN: usize = 32;
 /// Header byte 2: the SPI mode. A bootloader runs in QIO, QOUT, DIO or DOUT (0 to 3).
 const SPI_MODE_OFFSET: usize = 2;
 const LAST_BOOTLOADER_MODE: u8 = 3;
@@ -120,12 +118,6 @@ pub struct BootloaderDesc {
     pub date_time: String,
 }
 
-fn c_string(bytes: &[u8], (at, len): (usize, usize)) -> String {
-    let field = &bytes[at..at + len];
-    let end = field.iter().position(|&b| b == 0).unwrap_or(len);
-    String::from_utf8_lossy(&field[..end]).into_owned()
-}
-
 impl BootloaderDesc {
     /// Returns `None` when the segment does not start with a bootloader descriptor.
     #[must_use]
@@ -133,14 +125,8 @@ impl BootloaderDesc {
         if segment.len() < DESC_LEN || segment[0] != BOOTLOADER_DESC_MAGIC {
             return None;
         }
-        let version = u32::from_le_bytes([
-            segment[DESC_VERSION],
-            segment[DESC_VERSION + 1],
-            segment[DESC_VERSION + 2],
-            segment[DESC_VERSION + 3],
-        ]);
         Some(BootloaderDesc {
-            version,
+            version: le_u32(segment, DESC_VERSION),
             idf_ver: c_string(segment, DESC_IDF_VER),
             date_time: c_string(segment, DESC_DATE_TIME),
         })

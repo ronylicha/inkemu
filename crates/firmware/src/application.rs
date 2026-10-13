@@ -7,7 +7,7 @@ use crate::bootloader::{BootloaderDesc, memory_map};
 use crate::chip::ChipId;
 use crate::device::{Device, revision};
 use crate::error::FirmwareError;
-use crate::image::{FirmwareImage, HEADER_LEN, IMAGE_MAGIC, XOTA_MAGIC};
+use crate::image::FirmwareImage;
 use crate::partition::{PARTITION_TABLE_OFFSET, Partition};
 
 /// The bootloader ignores a revision bound of 0 or 65535 (`IS_FIELD_SET`,
@@ -106,6 +106,20 @@ pub enum ApplicationError {
     EfuseBlockTooNew { accepted: u16, device: u16 },
 }
 
+impl ApplicationError {
+    /// The refusal of a file that [`FirmwareImage::parse`] refuses: what it is when it is no
+    /// image (an OTA update, a whole flash image, too short, another format), damaged otherwise.
+    fn from_parse(error: FirmwareError) -> ApplicationError {
+        match error {
+            FirmwareError::EncryptedOta => ApplicationError::EncryptedOta,
+            FirmwareError::FlashImage => ApplicationError::FlashImage,
+            FirmwareError::TooShort { len } => ApplicationError::TooShort { len },
+            FirmwareError::BadMagic { found } => ApplicationError::NotAnImage { found },
+            damage => ApplicationError::Damaged(damage),
+        }
+    }
+}
+
 /// Checks the application `bytes` for `device`, to be written into `slot`. The application is
 /// never rewritten: what the bootloader would refuse is refused here, before boot.
 ///
@@ -116,19 +130,7 @@ pub fn check_application(
     device: &Device,
     slot: &Partition,
 ) -> Result<ApplicationReport, ApplicationError> {
-    if bytes.starts_with(XOTA_MAGIC) {
-        return Err(ApplicationError::EncryptedOta);
-    }
-    if crate::flash_image::has_partition_table(bytes) {
-        return Err(ApplicationError::FlashImage);
-    }
-    if bytes.len() < HEADER_LEN {
-        return Err(ApplicationError::TooShort { len: bytes.len() });
-    }
-    if bytes[0] != IMAGE_MAGIC {
-        return Err(ApplicationError::NotAnImage { found: bytes[0] });
-    }
-    let image = FirmwareImage::parse(bytes).map_err(ApplicationError::Damaged)?;
+    let image = FirmwareImage::parse(bytes).map_err(ApplicationError::from_parse)?;
     let Some(desc) = image.app_desc.clone() else {
         return Err(if !is_bootloader(&image) {
             ApplicationError::NoDescriptor

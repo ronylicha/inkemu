@@ -18,11 +18,12 @@ pub const MAX_SEGMENTS: u8 = 16;
 pub const CHECKSUM_SEED: u8 = 0xEF;
 /// The checksum byte is the last byte of a 16-byte block (`position % 16 == 15`).
 pub const TRAILER_ALIGN: usize = 16;
-const SHA256_LEN: usize = 32;
+/// Length of a SHA-256 digest.
+pub(crate) const SHA256_LEN: usize = 32;
 /// Segment data is written in whole 32-bit words.
 const SEGMENT_ALIGN: u32 = 4;
 /// Header byte 23: non-zero when a SHA-256 digest follows the checksum.
-const HASH_APPENDED_OFFSET: usize = 23;
+pub(crate) const HASH_APPENDED_OFFSET: usize = 23;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
@@ -55,6 +56,14 @@ pub(crate) fn le_u16(b: &[u8], at: usize) -> u16 {
 
 pub(crate) fn le_u32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+/// The string of the field `(offset, size)` of a descriptor: NUL-terminated within the field, or
+/// the whole field.
+pub(crate) fn c_string(bytes: &[u8], (at, len): (usize, usize)) -> String {
+    let field = &bytes[at..at + len];
+    let end = field.iter().position(|&b| b == 0).unwrap_or(len);
+    String::from_utf8_lossy(&field[..end]).into_owned()
 }
 
 /// The data of the first segment of the image `bytes` starts with, read in place and cut at the

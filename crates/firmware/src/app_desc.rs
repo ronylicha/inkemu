@@ -1,4 +1,5 @@
 //! `esp_app_desc_t`, found at the start of the first segment (ESP-IDF `esp_app_format.h`).
+use crate::image::{SHA256_LEN, c_string, le_u16, le_u32};
 
 /// `ESP_APP_DESC_MAGIC_WORD`: first word of the descriptor.
 pub const APP_DESC_MAGIC: u32 = 0xABCD_5432;
@@ -13,7 +14,6 @@ const TIME: (usize, usize) = (80, 16);
 const DATE: (usize, usize) = (96, 16);
 const IDF_VER: (usize, usize) = (112, 32);
 const ELF_SHA256: usize = 144;
-const SHA256_LEN: usize = 32;
 /// `min_efuse_blk_rev_full` and `max_efuse_blk_rev_full` (`esp_app_desc.h` of ESP-IDF v5.5).
 const MIN_EFUSE_BLOCK_REVISION: usize = 176;
 const MAX_EFUSE_BLOCK_REVISION: usize = 178;
@@ -31,20 +31,6 @@ pub struct AppDesc {
     /// "no bound", as the bootloader reads them (`bootloader_common_loader.c`, `IS_FIELD_SET`).
     pub min_efuse_block_revision: u16,
     pub max_efuse_block_revision: u16,
-}
-
-fn c_string(bytes: &[u8], (at, len): (usize, usize)) -> String {
-    let field = &bytes[at..at + len];
-    let end = field.iter().position(|&b| b == 0).unwrap_or(len);
-    String::from_utf8_lossy(&field[..end]).into_owned()
-}
-
-fn le_u16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
-
-fn le_u32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
 
 impl AppDesc {
