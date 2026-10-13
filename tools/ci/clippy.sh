@@ -25,6 +25,6 @@ if [ "$code" -ne 0 ]; then
   exit 1
 fi
 if grep -q 'does not refer to' "$log"; then
-  echo "error: a path banned by a clippy.toml names nothing (the lines that say \"does not refer to\" above), so the call it was meant to refuse compiles; correct the path in the three clippy.toml and in crates/boards/tests/host_io_ban.rs" >&2
+  echo "error: a path banned by a clippy.toml names nothing (the lines that say \"does not refer to\" above), so the call it was meant to refuse compiles; correct the path in every clippy.toml that bans host I/O and in crates/boards/tests/host_io_ban.rs" >&2
   exit 1
 fi

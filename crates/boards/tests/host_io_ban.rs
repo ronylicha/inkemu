@@ -1,5 +1,5 @@
-//! The ban on host I/O of `firmware`, `boards` and `soc-esp32c3` lives in one `clippy.toml` per
-//! crate, because clippy reads the one nearest to a crate and no other. Three copies can drift, and
+//! The ban on host I/O of `firmware`, `boards`, `soc-esp32c3` and `console-script` lives in one
+//! `clippy.toml` per crate, because clippy reads the one nearest to a crate and no other. Copies can drift, and
 //! an entry removed from all of them is silent: clippy then accepts the call. This test holds the
 //! copies equal, holds the workspace settings in each, and names every call the ban must refuse.
 #![allow(clippy::disallowed_methods)] // reads the clippy.toml files: it is a test of the build
@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 /// The crates that do no host I/O: a graphical front end and the WebAssembly build use them.
-const CRATES: [&str; 3] = ["firmware", "boards", "soc-esp32c3"];
+const CRATES: [&str; 4] = ["firmware", "boards", "soc-esp32c3", "console-script"];
 
 /// Every path the ban refuses, by kind. A path missing from a `clippy.toml` is a call that
 /// compiles again; a new one is added here and to each copy.
@@ -117,7 +117,7 @@ fn paths(table: &toml::Table, key: &str) -> Vec<String> {
 }
 
 #[test]
-fn the_three_copies_of_the_ban_are_the_same_file() {
+fn the_copies_of_the_ban_are_the_same_file() {
     let texts: Vec<(String, String)> = CRATES
         .iter()
         .map(|name| {
