@@ -790,7 +790,11 @@ mod tests {
         let mut program = print(USB, b"ok");
         program.extend([addi(T1, 0, 1), sw(T1, T0, 4), HANG]);
         let mut m = machine(&program);
+        // The host takes the packet 50 us after `WR_DONE`: 1 000 cycles at the 20 MHz of
+        // power-on.
         m.run_until(Cycles(500));
+        assert_eq!(m.take_console(ConsoleChannel::UsbSerialJtag), b"");
+        m.run_until(Cycles(1_500));
         assert_eq!(m.take_console(ConsoleChannel::UsbSerialJtag), b"ok");
         assert_eq!(
             m.take_console(ConsoleChannel::Uart0),

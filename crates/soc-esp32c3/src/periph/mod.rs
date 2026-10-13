@@ -43,7 +43,7 @@ pub use system::System;
 pub use systimer::Systimer;
 pub use timg::Timg;
 pub use uart::Uart;
-pub use usb_serial_jtag::UsbSerialJtag;
+pub use usb_serial_jtag::{UsbHost, UsbSerialJtag};
 
 /// A register whose value the emulator stores although the hardware effect is not modelled
 /// (decision D12). The lists of these are what the storage of each model is built from, and what
@@ -471,7 +471,7 @@ impl Peripherals {
             radio_power: AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED),
             uart0: Uart::new(0, UART0_BASE),
             uart1: Uart::new(1, UART1_BASE),
-            usb_serial_jtag: UsbSerialJtag::new(),
+            usb_serial_jtag: UsbSerialJtag::new(config.usb_host),
         };
         periph.rtc_cntl.wake(ctx);
         periph.timg0.wake(ctx);

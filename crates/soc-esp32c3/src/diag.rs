@@ -83,6 +83,9 @@ pub enum Unsupported {
     UartEmptyRead { uart: u8 },
     /// A read of `USB_DEVICE.EP1` while the OUT FIFO was empty: 0 was returned (report USJ O.6).
     UsbEmptyRead,
+    /// A write of `USB_DEVICE.EP1` while the IN endpoint had no room: the byte was ignored
+    /// (report USJ O.6).
+    UsbInFull,
 }
 
 /// A UART mode the model refuses by name when software sets it (report UR §10, A4).
@@ -272,7 +275,8 @@ impl Unsupported {
             | Unsupported::UartFeature { .. }
             | Unsupported::UartRxOverflow { .. }
             | Unsupported::UartEmptyRead { .. }
-            | Unsupported::UsbEmptyRead => self.describe_serial(pc, f),
+            | Unsupported::UsbEmptyRead
+            | Unsupported::UsbInFull => self.describe_serial(pc, f),
         }
     }
 
@@ -305,6 +309,10 @@ impl Unsupported {
             Unsupported::UsbEmptyRead => write!(
                 f,
                 "USB_DEVICE.EP1 was read while the OUT FIFO was empty (pc {pc:#010x}), so 0 was returned; read EP1 only while EP1_CONF.SERIAL_OUT_EP_DATA_AVAIL is set"
+            ),
+            Unsupported::UsbInFull => write!(
+                f,
+                "a byte was written to USB_DEVICE.EP1 while the IN endpoint had no room (pc {pc:#010x}), so it was ignored; write EP1 only while EP1_CONF.SERIAL_IN_EP_DATA_FREE is set"
             ),
             // INVARIANT: `describe` hands only the refusals above to this function.
             _ => Ok(()),
@@ -412,6 +420,7 @@ impl Diagnostic {
                 Unsupported::UartRxOverflow { uart } => (24, u32::from(uart), 0),
                 Unsupported::UartEmptyRead { uart } => (25, u32::from(uart), 0),
                 Unsupported::UsbEmptyRead => (26, 0, 0),
+                Unsupported::UsbInFull => (27, 0, 0),
                 // A command is 1 to 16 bits long, so 0 is free for "no command phase".
                 Unsupported::FlashTransfer { command_bits, .. } => {
                     (11, command_bits.unwrap_or(0), 0)
@@ -1321,6 +1330,10 @@ mod tests {
             (
                 Unsupported::UsbEmptyRead,
                 "USB_DEVICE.EP1 was read while the OUT FIFO was empty (pc 0x40381000)",
+            ),
+            (
+                Unsupported::UsbInFull,
+                "a byte was written to USB_DEVICE.EP1 while the IN endpoint had no room (pc 0x40381000)",
             ),
         ];
         for (what, needle) in texts {
