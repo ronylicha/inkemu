@@ -56,7 +56,7 @@ The reference image (`hello_world` of ESP-IDF v5.5.2, saved as `flash_hello.bin`
 inkemu: Xteink X4 (ESP32-C3 v0.3, mask ROM rev3); timing model datasheet-uncalibrated (not calibrated); flash: flash_hello.bin (16777216 bytes in 16 MiB)
 inkemu: reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x3fc8eb10
 inkemu: cycle limit reached; raise --max-cycles to run longer
-inkemu: stopped at pc 0x4004c0d4 after 50000000 cycles (33222007 instructions)
+inkemu: stopped at pc 0x4004c0d6 after 50000000 cycles (33218861 instructions)
 inkemu: 11459206 us of device time; CPU clock at 160 MHz
 inkemu: USB host open
 inkemu: flash at start: sha256 fc05ef5dbe85372e1da52abdec3bfcbbb110738a60163734666095fcd8c39bf2
@@ -69,7 +69,7 @@ With `--max-time 5` instead, the run stops in the middle of the countdown, while
 ```text
 inkemu: Xteink X4 (ESP32-C3 v0.3, mask ROM rev3); timing model datasheet-uncalibrated (not calibrated); flash: flash_hello.bin (16777216 bytes in 16 MiB)
 inkemu: device-time limit reached; raise --max-time to run longer
-inkemu: stopped at pc 0x40381d1a after 27292718 cycles (18157194 instructions)
+inkemu: stopped at pc 0x40381d1a after 27292714 cycles (18155657 instructions)
 inkemu: 5000000 us of device time; CPU clock at 160 MHz; the CPU is asleep, waiting for an interrupt
 inkemu: USB host open
 inkemu: flash at start: sha256 fc05ef5dbe85372e1da52abdec3bfcbbb110738a60163734666095fcd8c39bf2
@@ -106,7 +106,7 @@ Reading restart counter from NVS ... The value is not initialized yet!
 …
 inkemu: Xteink X4 (ESP32-C3 v0.3, mask ROM rev3); timing model datasheet-uncalibrated (not calibrated); flash: flash_nvs.bin (16777216 bytes in 16 MiB), kept in x4.bin
 inkemu: device-time limit reached; raise --max-time to run longer
-inkemu: stopped at pc 0x40381d1a after 27896916 cycles (18606474 instructions)
+inkemu: stopped at pc 0x40381d1a after 27896912 cycles (18604937 instructions)
 inkemu: 5000000 us of device time; CPU clock at 160 MHz; the CPU is asleep, waiting for an interrupt
 inkemu: USB host open
 inkemu: flash at start: sha256 c3f0eed129d85de6c0f959d481bb99101d14d18ec6fab8bfd11c541128ec757f
