@@ -468,8 +468,9 @@ pub fn execute(
 /// [`execute`], with a console script that started on `machine` ([`ScriptRun::start`]): after
 /// each call of the machine the bytes of every console are shown to it, so that its steps are
 /// handed to the machine at their dates; the summary says how far it got. A step the machine
-/// refuses is said in `log` and ends the script there; a script that [`console_script`] read
-/// stays within the bounds of the machine, so this does not happen from a file.
+/// refuses is said in `log` and ends the script there, its channels no longer watched
+/// ([`ScriptRun::stop`]); from a file, only a `send` on a UART dated after about 114 years of
+/// device time is (`InputError::BeyondTheLine`).
 pub fn execute_with_script(
     machine: &mut Esp32C3,
     options: &RunOptions,
@@ -506,6 +507,8 @@ pub fn execute_with_script(
         {
             let _ = writeln!(log, "error: {e}");
             observing = false;
+            // Nothing reads the consoles for the script any more: they go back to their pace.
+            run.stop(machine);
         }
         console_usable = matches!(console_open, Ok(true));
         // The stop line carries the violation: listing it as a warning too would print it twice.
@@ -787,6 +790,47 @@ mod tests {
             "{log}"
         );
         assert_eq!(code, EXIT_SCRIPT_INCOMPLETE);
+    }
+
+    #[test]
+    fn a_step_the_machine_refuses_ends_the_script_and_its_channels_go_back_to_their_pace() {
+        // After `ready`, a send dated past the last instant UART0 times is refused: the log says
+        // so, and UART0 is watched no more, so its next byte ends no call.
+        let mut m = machine(&ready_then_echo(), MachineOptions::default());
+        let script = Script::parse(
+            format!(
+                "{VERSION_LINE}\nwait-for uart0 \"ready\"\nwait 18446744073s\nsend uart0 \"x\"\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut run = ScriptRun::start(&script, &mut m).unwrap();
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        let options = RunOptions {
+            max_device_nanos: Some(20_000_000),
+            ..UNLIMITED
+        };
+        execute_with_script(
+            &mut m,
+            &options,
+            Some(&mut run),
+            &NOT_INTERRUPTED,
+            &reader_stays,
+            &mut console,
+            &mut log,
+        );
+        assert!(
+            text(&log).contains("error: console script, line 4: uart0 cannot take an input dated"),
+            "{}",
+            text(&log)
+        );
+        m.send_console(ConsoleChannel::Uart0, m.device_time(), b"z")
+            .unwrap();
+        assert_ne!(
+            m.run_until(m.cycles() + 1_000_000),
+            StopReason::ConsoleOutput
+        );
+        assert_eq!(m.take_console(ConsoleChannel::Uart0), b"z");
     }
 
     #[test]
