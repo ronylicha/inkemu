@@ -105,7 +105,8 @@ pub enum Event {
     Systimer,
     /// Wake-up of UART 0 or 1: a byte may have left or landed, or an interrupt condition begun.
     Uart(u8),
-    /// Wake-up of USB-Serial-JTAG: a packet of the host may have reached the OUT FIFO.
+    /// Wake-up of USB-Serial-JTAG: the host may have changed, taken the committed IN packet or
+    /// sent a packet to the OUT FIFO, or a frame may have started while `SOF` is enabled.
     UsbSerialJtag,
     /// Wake-up of a timer group: its timer or its watchdog may have reached a deadline.
     Timg(Group),

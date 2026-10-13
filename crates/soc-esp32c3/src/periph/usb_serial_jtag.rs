@@ -176,9 +176,10 @@ impl UsbSerialJtag {
     /// The block at power-on, with `host` as the host is when the chip starts.
     ///
     /// ASSUMPTION: a host attached at power-on starts its frames at device time 0 and raises no
-    /// `USB_BUS_RESET`: `INT_RAW` reads its reset value, `0x8`, until something happens. The bus
-    /// reset of an enumeration after power-on is not modelled; a capture of `INT_RAW` on a board
-    /// plugged in before power-on settles it.
+    /// `USB_BUS_RESET`: frame 0 starts at 0 and sets `SOF`, so the first read of `INT_RAW` gives
+    /// `0xA` with such a host and its reset value, `0x8`, with an absent one. The bus reset of an
+    /// enumeration after power-on is not modelled; a capture of `INT_RAW` on a board plugged in
+    /// before power-on settles it.
     #[must_use]
     pub fn new(host: UsbHost) -> UsbSerialJtag {
         let base = svd_regs::esp32c3::addr("USB_DEVICE", "EP1");
@@ -443,6 +444,10 @@ impl UsbSerialJtag {
         self.sent_bytes = self.sent_bytes.saturating_sub(packet.len().max(1));
         if packet.is_empty() {
             // A zero-length packet leaves the FIFO empty: the next one can follow.
+            //
+            // ASSUMPTION: it sets `OUT_EP1_ZERO_PAYLOAD` but not `SERIAL_OUT_RECV_PKT`: no byte
+            // reaches the FIFO, and report USJ §R.1 names only the first. A capture of `INT_RAW`
+            // after a host sends a zero-length packet settles it.
             self.int_raw |= OUT_EP1_ZERO_PAYLOAD;
             self.out_free_since = at;
         } else {
@@ -560,6 +565,12 @@ impl Peripheral<Ctx> for UsbSerialJtag {
                 self.int_raw &= !value;
                 true
             }
+            // `INT_RAW` is set by the block and cleared through `INT_CLR`; `INT_ST` and
+            // `FRAM_NUM` are read-only. A write to one of them changes nothing and is reported as
+            // unmodelled, as UART and TIMG do with theirs: the header gives `INT_RAW` the access
+            // R/WTC/SS without saying what a write does, report USJ §R.1 has writes ignored, and
+            // no consumer on the paths read writes it (report USJ §A).
+            INT_RAW | INT_ST | FRAM_NUM => false,
             _ => self.stored.write(offset, value),
         };
         self.drive(ctx);
@@ -640,8 +651,24 @@ mod tests {
         assert_eq!(usb.read(ctx, reg("CONF0")), Some(0x4204), "stored");
         assert!(!usb.write(ctx, reg("JFIFO_ST"), 0), "read-only");
         assert!(!usb.write(ctx, reg("FRAM_NUM"), 0), "read-only");
+        assert!(!usb.write(ctx, INT_ST, 0), "read-only");
+        assert!(
+            !usb.write(ctx, INT_RAW, INTERRUPT_BITS),
+            "set by the block, cleared through INT_CLR"
+        );
+        assert_eq!(
+            usb.read(ctx, INT_RAW),
+            Some(0x8),
+            "the write changed nothing"
+        );
         assert_eq!(usb.read(ctx, 0x7C), None, "no register there");
         assert_eq!(ctx.sources(), 0);
+        // With the default host, attached and open at power-on, frame 0 starts at 0.
+        assert_eq!(
+            UsbSerialJtag::default().read(ctx, INT_RAW),
+            Some(0xA),
+            "SERIAL_IN_EMPTY and SOF"
+        );
     }
 
     #[test]
