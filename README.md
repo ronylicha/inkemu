@@ -120,7 +120,10 @@ Reading restart counter from NVS ... Done
 Restart counter = 1
 …
 inkemu: Xteink X4 (ESP32-C3 v0.3, mask ROM rev3); timing model datasheet-uncalibrated (not calibrated); flash: x4.bin (flash file, 16 MiB)
-…
+inkemu: device-time limit reached; raise --max-time to run longer
+inkemu: stopped at pc 0x40381d1a after 27503374 cycles (18341463 instructions)
+inkemu: 5000000 us of device time; CPU clock at 160 MHz; the CPU is asleep, waiting for an interrupt
+inkemu: USB host open
 inkemu: flash at start: sha256 cfab4ffe5187eeea8ec2ee6e9794886289282f0242ce56aad2842144a6ffb17b
 inkemu: flash at end: sha256 7ad0acf62e5a4e20aa6d47be0f1d922a7b89cb204941feac1ab2fea71363b709; 1 of its 4 KiB sectors was modified; saved to x4.bin
 ```
