@@ -60,8 +60,9 @@ pub struct DeviceProfile {
     pub soc: SocFamily,
     pub chip_revision: ChipRevision,
     pub flash: FlashConfig,
-    /// The partition table an application is booted with, checked against the flash when the
-    /// profile is loaded.
+    /// The partition table an application is booted with, checked when the profile is loaded:
+    /// against the flash, against what ESP-IDF's bootloader boots, and for the slot the
+    /// application is written to, which it always has.
     pub partitions: PartitionTable,
     /// The bootloader inkemu ships for this device, selected by its chip family.
     pub bootloader: &'static ShippedBootloader,
@@ -94,7 +95,7 @@ pub enum ProfileError {
         expected: String,
         found: String,
     },
-    #[error("{origin}: the partition table of the profile does not fit its flash: {source}")]
+    #[error("{origin}: the partition table of the profile is refused: {source}")]
     Partitions {
         origin: String,
         source: PartitionError,
@@ -454,6 +455,14 @@ impl DeviceProfile {
                 origin: origin.to_owned(),
                 source,
             })?;
+        // Refused here rather than when a firmware is composed: a device a front end lists can
+        // always be given an application.
+        if partitions.application_slot().is_none() {
+            return Err(ProfileError::Partitions {
+                origin: origin.to_owned(),
+                source: PartitionError::NoApplicationSlot,
+            });
+        }
         let bootloader = select_bootloader(origin, raw.soc.family.chip_id())?;
         Ok(DeviceProfile {
             id: raw.id,
@@ -637,12 +646,14 @@ mod tests {
 
     #[test]
     fn a_partition_row_is_read_with_its_subtype_and_flags() {
+        // The factory row after it is the slot an application is written to.
         let text = VALID
             .replace("subtype = \"factory\"", "subtype = \"ota_15\"")
             .replace(
                 "size = 0x10000\n",
                 "size = 0x10000\nencrypted = true\nreadonly = true\n",
-            );
+            )
+            + &partition_row("factory", "app", "factory", 0x2_0000, 0x1_0000);
         let profile = DeviceProfile::from_toml("demo.toml", &text).unwrap();
         let entry = &profile.partitions.entries[0];
         assert_eq!(
@@ -718,7 +729,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.to_string().starts_with("demo.toml: the partition table of the profile does not fit its flash: partition `app` starts at 0x11000"),
+            err.to_string().starts_with("demo.toml: the partition table of the profile is refused: partition `app` starts at 0x11000"),
             "{err}"
         );
         let overlap = format!(
@@ -739,6 +750,102 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A `[[partition]]` row of `VALID`'s flash.
+    fn partition_row(name: &str, kind: &str, subtype: &str, offset: u32, size: u32) -> String {
+        format!(
+            "\n[[partition]]\nname = \"{name}\"\ntype = \"{kind}\"\nsubtype = \"{subtype}\"\noffset = {offset:#x}\nsize = {size:#x}\n"
+        )
+    }
+
+    #[test]
+    fn a_table_without_the_slot_the_application_is_written_to_is_refused_at_load() {
+        let head = VALID.split("\n[[partition]]").next().unwrap();
+        let nvs = partition_row("nvs", "data", "nvs", 0x9000, 0x5000);
+        let otadata = partition_row("otadata", "data", "ota", 0xE000, 0x2000);
+        let app = |name: &str, subtype: &str, offset: u32| {
+            partition_row(name, "app", subtype, offset, 0x10_0000)
+        };
+        for rows in [
+            vec![nvs.clone(), otadata.clone()],
+            vec![
+                otadata.clone(),
+                app("app1", "ota_1", 0x1_0000),
+                app("app2", "ota_2", 0x11_0000),
+            ],
+            vec![app("t", "test", 0x1_0000)],
+        ] {
+            let text = format!("{head}{}", rows.concat());
+            let err = DeviceProfile::from_toml("demo.toml", &text).unwrap_err();
+            assert_eq!(
+                err,
+                ProfileError::Partitions {
+                    origin: "demo.toml".into(),
+                    source: PartitionError::NoApplicationSlot
+                },
+                "{text}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "demo.toml: the partition table of the profile is refused: the table has neither a factory application nor an ota_0 slot, and inkemu writes the application to the factory slot, else to ota_0; add an app partition of subtype factory or ota_0"
+            );
+        }
+        let text = format!("{head}{nvs}{otadata}{}", app("app0", "ota_0", 0x1_0000));
+        assert!(DeviceProfile::from_toml("demo.toml", &text).is_ok());
+    }
+
+    #[test]
+    fn a_table_the_shipped_bootloader_would_not_boot_is_refused_at_load() {
+        let head = VALID
+            .split("\n[[partition]]")
+            .next()
+            .unwrap()
+            .replace("size_mib = 4", "size_mib = 16")
+            .replace("0xEF4016", "0x9D6018");
+        let nvs = partition_row("nvs", "data", "nvs", 0x9000, 0x5000);
+        let otadata = partition_row("otadata", "data", "ota", 0xE000, 0x2000);
+        let app = |name: &str, subtype: &str, offset: u32| {
+            partition_row(name, "app", subtype, offset, 0x10_0000)
+        };
+        let refusal = |rows: &[&String]| {
+            let text = format!(
+                "{head}{}",
+                rows.iter().map(|r| r.as_str()).collect::<String>()
+            );
+            match DeviceProfile::from_toml("demo.toml", &text) {
+                Err(ProfileError::Partitions { source, .. }) => source,
+                other => panic!("{other:?}"),
+            }
+        };
+        let (app0, app1) = (
+            app("app0", "ota_0", 0x1_0000),
+            app("app1", "ota_0", 0x11_0000),
+        );
+        assert_eq!(
+            refusal(&[&nvs, &otadata, &app0, &app1]),
+            PartitionError::DuplicateAppSubtype {
+                first: "app0".into(),
+                second: "app1".into(),
+                subtype: 0x10
+            }
+        );
+        let (f1, f2) = (
+            app("f1", "factory", 0x1_0000),
+            app("f2", "factory", 0x11_0000),
+        );
+        assert!(matches!(
+            refusal(&[&nvs, &otadata, &f1, &f2]),
+            PartitionError::DuplicateAppSubtype { subtype: 0, .. }
+        ));
+        let small = partition_row("otadata", "data", "ota", 0xE000, 0x1000);
+        assert_eq!(
+            refusal(&[&nvs, &small, &app0]),
+            PartitionError::OtadataSize {
+                name: "otadata".into(),
+                size: 0x1000
+            }
+        );
     }
 
     #[test]

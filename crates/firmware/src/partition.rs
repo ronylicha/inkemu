@@ -147,6 +147,12 @@ pub enum PartitionError {
         "the otadata partition `{name}` is {size:#x} bytes, not the 0x2000 bytes of its two 4 KiB entries; set its size to 0x2000"
     )]
     OtadataSize { name: String, size: u32 },
+    /// The table has no slot for [`PartitionTable::application_slot`]. [`PartitionTable::to_bytes`]
+    /// does not refuse it, a table of data partitions being valid; a device profile does.
+    #[error(
+        "the table has neither a factory application nor an ota_0 slot, and inkemu writes the application to the factory slot, else to ota_0; add an app partition of subtype factory or ota_0"
+    )]
+    NoApplicationSlot,
     #[error(
         "entry {index} of the partition table is not a valid entry; use a table read from offset 0x8000 of a valid flash dump"
     )]
@@ -549,6 +555,7 @@ mod tests {
                 first: "a".into(),
                 second: "b".into(),
             },
+            PartitionError::NoApplicationSlot,
             PartitionError::BadEntryMagic { index: 3 },
             PartitionError::Md5Mismatch,
         ];

@@ -40,10 +40,10 @@ pub struct ComposedFlash {
 /// Why no flash can be composed. Each message states the cause, then the remedy.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ComposeError {
-    #[error("the partition table of the device does not fit its flash: {0}")]
+    #[error("the partition table of the device is refused: {0}")]
     Table(PartitionError),
     #[error(
-        "the partition table of the device has neither a factory application nor an ota_0 slot, so the bootloader would find no application to start; choose a device whose table has one"
+        "the partition table of the device has neither a factory application nor an ota_0 slot, and inkemu writes the application to the factory slot, else to ota_0; choose a device whose table has one"
     )]
     NoApplicationSlot,
     #[error(transparent)]
@@ -222,9 +222,22 @@ mod tests {
         ));
         let mut no_app = xteink_x4_stock();
         no_app.entries.retain(|p| p.ptype != TYPE_APP);
+        let err = compose(&X4, &no_app, &application(), shipped()).unwrap_err();
+        assert_eq!(err, ComposeError::NoApplicationSlot);
+        assert!(
+            err.to_string().contains(
+                "and inkemu writes the application to the factory slot, else to ota_0; choose"
+            ),
+            "{err}"
+        );
+        // The prefix of a refused table states no cause of its own: the table's error does.
+        let mut empty = xteink_x4_stock();
+        empty.entries.clear();
         assert_eq!(
-            compose(&X4, &no_app, &application(), shipped()),
-            Err(ComposeError::NoApplicationSlot)
+            compose(&X4, &empty, &application(), shipped())
+                .unwrap_err()
+                .to_string(),
+            "the partition table of the device is refused: the partition table is empty; add at least one partition"
         );
     }
 
