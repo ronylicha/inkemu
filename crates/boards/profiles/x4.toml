@@ -23,7 +23,13 @@ jedec_id = 0x9D6018
 # the application in the slot the bootloader starts on a blank otadata (the factory application,
 # else ota_0). The stock table of the X4, compiled byte for byte as
 # tests/fixtures/partitions/x4-stock.bin; CrossPoint's partitions.csv is the same table
-# (docs/research/flash-writes-and-crosspoint-boot.md, section J).
+# (docs/research/flash-writes-and-crosspoint-boot.md, section J). Offsets and sizes are those of
+# real X4 units: the flashers detect an X4 by them (docs/research/xteink-hardware.md, section 3.2).
+# ASSUMPTION: the names, the flags and the MD5 entry of the X4 table are not established. They come
+# from tables written for the X4 by third parties (CrossPoint's partitions.csv, Trusty's, the
+# sample's default_16MB.csv, Sticky's compiled table), not from a dump of a retail unit, and the
+# flashers compare only type, subtype, offset and size. A dump of the first 0x9000 bytes of a
+# retail unit settles it.
 [[partition]]
 name = "nvs"
 type = "data"
