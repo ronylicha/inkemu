@@ -8,7 +8,7 @@ use crate::chip::ChipId;
 use crate::device::{Device, revision};
 use crate::error::FirmwareError;
 use crate::image::{FirmwareImage, HEADER_LEN, IMAGE_MAGIC, XOTA_MAGIC};
-use crate::partition::Partition;
+use crate::partition::{PARTITION_TABLE_OFFSET, Partition};
 
 /// The bootloader ignores a revision bound of 0 or 65535 (`IS_FIELD_SET`,
 /// `bootloader_common_loader.c` of ESP-IDF v5.5.2).
@@ -55,9 +55,13 @@ pub enum ApplicationError {
     #[error("the firmware is damaged: {0}")]
     Damaged(FirmwareError),
     #[error(
-        "the firmware is a 2nd-stage bootloader (it carries a bootloader descriptor at 0x20), not an application; give it as the bootloader (`--bootloader`), and the application .bin as the firmware"
+        "the firmware is a 2nd-stage bootloader (a bootloader descriptor at 0x20, or segments that all load into internal RAM), not an application; give it as the bootloader (`--bootloader`), and the application .bin as the firmware"
     )]
     Bootloader,
+    #[error(
+        "the firmware is {len} bytes and starts with a 2nd-stage bootloader, so it is a whole flash image, but its partition table at 0x8000 does not parse; use an intact dump as the flash (`--flash`), or the application .bin of its build as the firmware"
+    )]
+    FlashImageWithoutTable { len: usize },
     #[error(
         "the firmware has no application descriptor at 0x20 (esp_app_desc_t), which every ESP-IDF application carries and the bootloader reads; use the application .bin of an ESP-IDF build"
     )]
@@ -125,12 +129,15 @@ pub fn check_application(
         return Err(ApplicationError::NotAnImage { found: bytes[0] });
     }
     let image = FirmwareImage::parse(bytes).map_err(ApplicationError::Damaged)?;
-    let first = image.segments.first().map(|s| s.data.as_slice());
     let Some(desc) = image.app_desc.clone() else {
-        return Err(if first.and_then(BootloaderDesc::parse).is_some() {
-            ApplicationError::Bootloader
-        } else {
+        return Err(if !is_bootloader(&image) {
             ApplicationError::NoDescriptor
+        } else if bytes.len() > PARTITION_TABLE_OFFSET as usize {
+            // A bootloader ends below the table: more is a dump or a merged image, whose table
+            // `has_partition_table` did not find.
+            ApplicationError::FlashImageWithoutTable { len: bytes.len() }
+        } else {
+            ApplicationError::Bootloader
         });
     };
     if image.chip != device.chip {
@@ -158,6 +165,19 @@ pub fn check_application(
         desc,
         image_len: image.len,
     })
+}
+
+/// Whether `image`, which carries no application descriptor, is a 2nd-stage bootloader: it carries
+/// a bootloader descriptor, which ESP-IDF writes from v5.1, or every segment loads into the
+/// internal RAM of its chip and none into a window of the flash, as the mask ROM loads a
+/// bootloader and never an application.
+fn is_bootloader(image: &FirmwareImage) -> bool {
+    let described = image
+        .segments
+        .first()
+        .and_then(|segment| BootloaderDesc::parse(&segment.data))
+        .is_some();
+    described || memory_map(image.chip).is_some_and(|map| map.loads_only_into_ram(&image.segments))
 }
 
 /// The revision bounds the bootloader checks before it starts an application: the chip's
@@ -269,8 +289,9 @@ mod tests {
             refusal(&build_image(&bootloader_spec())),
             ApplicationError::Bootloader
         );
+        // No descriptor, and code in a window of the flash: an application without its descriptor.
         let spec = ImageSpec {
-            segments: vec![(0x4038_0000, vec![0; 8])],
+            segments: vec![(0x4200_0020, vec![0; 8]), (0x4038_0000, vec![0; 8])],
             ..ImageSpec::default()
         };
         assert_eq!(refusal(&build_image(&spec)), ApplicationError::NoDescriptor);
@@ -279,6 +300,49 @@ mod tests {
             refusal(&[0x00; 64]),
             ApplicationError::NotAnImage { found: 0 }
         );
+    }
+
+    #[test]
+    fn a_bootloader_without_a_descriptor_is_named_by_where_it_loads() {
+        // ESP-IDF before v5.1 writes no bootloader descriptor; every segment loads into RAM.
+        let mut spec = bootloader_spec();
+        spec.segments[0].1[0] = 0;
+        let err = refusal(&build_image(&spec));
+        assert_eq!(err, ApplicationError::Bootloader);
+        assert_eq!(
+            err.to_string(),
+            "the firmware is a 2nd-stage bootloader (a bootloader descriptor at 0x20, or segments that all load into internal RAM), not an application; give it as the bootloader (`--bootloader`), and the application .bin as the firmware"
+        );
+        // One segment in a window of the flash makes it an application without its descriptor.
+        spec.segments.push((0x3C00_0020, vec![0; 8]));
+        assert_eq!(refusal(&build_image(&spec)), ApplicationError::NoDescriptor);
+        // An image without segments is no bootloader.
+        spec.segments.clear();
+        assert_eq!(refusal(&build_image(&spec)), ApplicationError::NoDescriptor);
+    }
+
+    #[test]
+    fn a_dump_whose_partition_table_does_not_parse_is_named_a_flash_image() {
+        let mut no_descriptor = bootloader_spec();
+        no_descriptor.segments[0].1[0] = 0;
+        for spec in [bootloader_spec(), no_descriptor] {
+            let mut dump = build_flash_image(&spec);
+            dump[0x8010] ^= 1;
+            dump.resize(16 << 20, 0xFF);
+            let err = refusal(&dump);
+            assert_eq!(
+                err,
+                ApplicationError::FlashImageWithoutTable { len: 16 << 20 }
+            );
+            assert_eq!(
+                err.to_string(),
+                "the firmware is 16777216 bytes and starts with a 2nd-stage bootloader, so it is a whole flash image, but its partition table at 0x8000 does not parse; use an intact dump as the flash (`--flash`), or the application .bin of its build as the firmware"
+            );
+        }
+        // A bootloader followed by erased bytes up to the table is the bootloader alone.
+        let mut bootloader = build_image(&bootloader_spec());
+        bootloader.resize(0x8000, 0xFF);
+        assert_eq!(refusal(&bootloader), ApplicationError::Bootloader);
     }
 
     #[test]
@@ -451,6 +515,7 @@ mod tests {
             ApplicationError::NotAnImage { found: 1 },
             ApplicationError::Damaged(FirmwareError::HashMismatch),
             ApplicationError::Bootloader,
+            ApplicationError::FlashImageWithoutTable { len: 0x100_0000 },
             ApplicationError::NoDescriptor,
             ApplicationError::ChipMismatch {
                 expected: ChipId::Esp32C3,

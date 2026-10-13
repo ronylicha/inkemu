@@ -8,7 +8,7 @@
 use crate::chip::{ChipId, FlashSize, SpiMode};
 use crate::device::{Device, revision};
 use crate::error::FirmwareError;
-use crate::image::{FirmwareImage, HEADER_LEN, IMAGE_MAGIC, XOTA_MAGIC};
+use crate::image::{FirmwareImage, HEADER_LEN, IMAGE_MAGIC, Segment, XOTA_MAGIC};
 use crate::partition::PARTITION_TABLE_OFFSET;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -87,6 +87,15 @@ impl MemoryMap {
     /// Whether `len` bytes at `addr` lie whole in internal RAM.
     fn in_ram(&self, addr: u32, len: usize) -> bool {
         self.ram.iter().any(|&ram| within(ram, addr, len))
+    }
+
+    /// Whether `segments` are laid out as a bootloader's: at least one, and every one in internal
+    /// RAM, so none in a window of the flash (the two never overlap; a test holds every map to it).
+    pub(crate) fn loads_only_into_ram(&self, segments: &[Segment]) -> bool {
+        !segments.is_empty()
+            && segments
+                .iter()
+                .all(|segment| self.in_ram(segment.load_addr, segment.data.len()))
     }
 
     /// Whether the ROM loads `len` bytes at `addr`: word-aligned, in internal RAM, clear of its
@@ -917,6 +926,14 @@ mod tests {
                 "{}",
                 map.chip
             );
+            // `MemoryMap::loads_only_into_ram` relies on it: RAM is never a window of the flash.
+            for &(start, end) in map.ram {
+                assert!(
+                    !map.in_flash_window(start, (end - start) as usize),
+                    "{}",
+                    map.chip
+                );
+            }
         }
         for entry in &SHIPPED {
             assert!(memory_map(entry.chip).is_some(), "{}", entry.id);
