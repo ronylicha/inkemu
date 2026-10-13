@@ -58,6 +58,7 @@ inkemu: reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x3fc8
 inkemu: cycle limit reached; raise --max-cycles to run longer
 inkemu: stopped at pc 0x4004c0d4 after 50000000 cycles (33222007 instructions)
 inkemu: 11459206 us of device time; CPU clock at 160 MHz
+inkemu: USB host open
 inkemu: flash at start: sha256 fc05ef5dbe85372e1da52abdec3bfcbbb110738a60163734666095fcd8c39bf2
 ```
 
@@ -70,6 +71,7 @@ inkemu: Xteink X4 (ESP32-C3 v0.3, mask ROM rev3); timing model datasheet-uncalib
 inkemu: device-time limit reached; raise --max-time to run longer
 inkemu: stopped at pc 0x40381d1a after 27292718 cycles (18157194 instructions)
 inkemu: 5000000 us of device time; CPU clock at 160 MHz; the CPU is asleep, waiting for an interrupt
+inkemu: USB host open
 inkemu: flash at start: sha256 fc05ef5dbe85372e1da52abdec3bfcbbb110738a60163734666095fcd8c39bf2
 ```
 
@@ -106,6 +108,7 @@ inkemu: Xteink X4 (ESP32-C3 v0.3, mask ROM rev3); timing model datasheet-uncalib
 inkemu: device-time limit reached; raise --max-time to run longer
 inkemu: stopped at pc 0x40381d1a after 27896916 cycles (18606474 instructions)
 inkemu: 5000000 us of device time; CPU clock at 160 MHz; the CPU is asleep, waiting for an interrupt
+inkemu: USB host open
 inkemu: flash at start: sha256 c3f0eed129d85de6c0f959d481bb99101d14d18ec6fab8bfd11c541128ec757f
 inkemu: flash at end: sha256 cfab4ffe5187eeea8ec2ee6e9794886289282f0242ce56aad2842144a6ffb17b; 1 of its 4 KiB sectors was modified; saved to x4.bin
 
@@ -223,7 +226,7 @@ wait-for usb-serial-jtag "ready"
 inkemu run --device x4 --firmware app.bin --console-script steps.txt --max-time 30
 ```
 
-- **Steps**, one per line, in order: `send CHANNEL "BYTES"` sends at the time of the step; `wait 250ms` (units `ns`, `us`, `ms`, `s`) moves that time on; `wait-for CHANNEL "TEXT"` moves it to the device time at which the last byte of `TEXT` reached the host, searched in what the channel sent from the time of the step on; `usb-host absent|attached|open` changes the USB host at that time. `CHANNEL` is `uart0`, `uart1` or `usb-serial-jtag`. Strings take `\r`, `\n`, `\t`, `\\`, `\"` and `\xHH`; any other character is sent as its UTF-8 bytes, and nothing is translated: Enter is `\r`, as a terminal sends it. `#` begins a comment, on the first line too. The script is UTF-8 without a byte order mark, its lines ended by LF or CRLF.
+- **Steps**, one per line, in order: `send CHANNEL "BYTES"` sends at the time of the step; `wait 250ms` (units `ns`, `us`, `ms`, `s`) moves that time on; `wait-for CHANNEL "TEXT"` moves it to the device time at which the last byte of `TEXT` reached the host, searched in what the channel sent from the time of the step on; `usb-host absent|attached|open` changes the USB host at that time. `CHANNEL` is `uart0`, `uart1` or `usb-serial-jtag`. Strings take `\r`, `\n`, `\t`, `\\`, `\"` and `\xHH`; any other character is sent as its UTF-8 bytes, and nothing is translated: Enter is `\r`, as a terminal sends it. `#` begins a comment. The first line is `inkemu-console-script 1`, a comment allowed after it. The script is UTF-8 without a byte order mark, its lines ended by LF or CRLF.
 - **Time**: the waits after a `wait-for` are added up, and rounded up to a cycle of the device's 160 MHz time base once. A `wait-for` searches only what its channel sent from the time of its step on, so the text a channel sent before a `wait` is not found by the `wait-for` after it. Steps at one time reach the device in their order, except that a `usb-host` step applies before a `send usb-serial-jtag` of that time; a packet of the host reaches the device 50 µs after its time, while the port is open.
 - **The host** of the UARTs sends at the rate and in the frame the UART is set to. On USB-Serial-JTAG it sends 64-byte packets; it is `open` unless `--usb-host` says otherwise: `attached` is a cable without a program reading the port (the device sees frames, its output is not read), `absent` no cable.
 - **Refusals**: a script is read whole before the run starts, and every refusal names its line and its column, then what to write instead. The limits are those of `crates/console-script/src/parse.rs` (1 MiB of script, 10,000 steps, 1,024 bytes a send, 256 bytes a text to wait for).
