@@ -153,6 +153,30 @@ mod tests {
         assert_eq!(&flash.bytes[..given.len()], &given[..]);
     }
 
+    /// The command line names built-in devices only, all of a revision the shipped bootloader
+    /// starts: a device of an earlier one reaches this module through a front end that loads its
+    /// profile, and this test pins what `inkemu run` would print after `error: `.
+    #[test]
+    fn a_device_no_shipped_bootloader_starts_needs_a_bootloader_given_and_boots_with_one() {
+        let text = include_str!("../../boards/profiles/x4.toml")
+            .replace("revision = \"v0.3\"", "revision = \"v0.2\"");
+        let old = DeviceProfile::from_toml("x4-v0.2.toml", &text).unwrap();
+        assert!(old.bootloader.is_err(), "the profile loads and says so");
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_image(&ImageSpec::default());
+        let firmware = file_with(&dir, "app.bin", &app);
+        let err = compose(&old, &firmware, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "device x4: the bootloader inkemu ships for this device (esp-idf-v5.5.2-esp32c3-dio) requires chip revision v0.3 or later and the device is v0.2: it would reset the chip for ever; give a bootloader built for v0.2 (`--bootloader`), or choose a device of revision v0.3 or later"
+        );
+        let given = build_image(&bootloader_spec());
+        let bootloader = file_with(&dir, "bootloader.bin", &given);
+        let flash = compose(&old, &firmware, Some(&bootloader)).unwrap();
+        assert_eq!(&flash.bytes[..given.len()], &given[..]);
+        assert_eq!(&flash.bytes[0x1_0000..0x1_0000 + app.len()], &app[..]);
+    }
+
     #[test]
     fn a_refusal_names_the_file_it_is_about() {
         let dir = tempfile::tempdir().unwrap();

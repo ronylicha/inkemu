@@ -278,8 +278,7 @@ fn profile_for(id: &str) -> Result<DeviceProfile, boards::ProfileError> {
         | boards::ProfileError::MissingFlash { .. }
         | boards::ProfileError::IdMismatch { .. }
         | boards::ProfileError::Partitions { .. }
-        | boards::ProfileError::NoBootloader { .. }
-        | boards::ProfileError::ShippedNeedsLaterChip { .. }) => other,
+        | boards::ProfileError::NoBootloader { .. }) => other,
     })
 }
 

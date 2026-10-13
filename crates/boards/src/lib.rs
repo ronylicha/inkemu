@@ -69,8 +69,26 @@ pub struct DeviceProfile {
     /// against the flash, against what ESP-IDF's bootloader boots, and for the slot the
     /// application is written to, which it always has.
     pub partitions: PartitionTable,
-    /// The bootloader inkemu ships for this device, selected by its chip family.
+    /// The bootloader inkemu ships for this device, selected by its chip family, when it starts
+    /// the chip revision of the device; otherwise why no bootloader inkemu ships starts it. Such
+    /// a device is still described: it boots behind a bootloader its user gives (ADR 0005).
+    pub bootloader: Result<&'static ShippedBootloader, NoShippedBootloader>,
+}
+
+/// Why no bootloader inkemu ships can start a device: the one it ships for the chip family
+/// requires a later chip revision than the device's, and would reset the chip for ever (SB §B).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the bootloader inkemu ships for {} ({}) requires chip revision {} or later and the device is {}: it would reset the chip for ever, and inkemu ships no bootloader for an earlier revision; give a bootloader built for {} (`--bootloader`)",
+    bootloader.chip, bootloader.id, revision(bootloader.min_chip_revision),
+    revision(*device_revision), revision(*device_revision)
+)]
+pub struct NoShippedBootloader {
+    /// The bootloader inkemu ships for the chip family of the device, which does not start it;
+    /// its `min_chip_revision` is the lowest revision it starts.
     pub bootloader: &'static ShippedBootloader,
+    /// The chip revision of the device, `major * 100 + minor`.
+    pub device_revision: u16,
 }
 
 /// Run-time choices that are not properties of the device.
@@ -109,18 +127,6 @@ pub enum ProfileError {
         "{origin}: inkemu ships no bootloader for {chip} with a flash driven in DIO; choose a chip family inkemu ships a bootloader for"
     )]
     NoBootloader { origin: String, chip: ChipId },
-    #[error(
-        "{origin}: the bootloader inkemu ships for {chip} ({id}) requires chip revision {} or later and the profile says {}: it would reset the chip for ever, and inkemu ships no bootloader for an earlier revision; write a revision of {} or later in [soc]",
-        revision(*required), revision(*device), revision(*required)
-    )]
-    ShippedNeedsLaterChip {
-        origin: String,
-        chip: ChipId,
-        id: &'static str,
-        /// The revisions, as `major * 100 + minor`.
-        required: u16,
-        device: u16,
-    },
 }
 
 #[derive(Deserialize)]
@@ -416,9 +422,9 @@ impl DeviceProfile {
     /// # Errors
     /// [`ProfileError::Parse`] with the line of the first problem,
     /// [`ProfileError::MissingFlash`] when the profile has no `[flash]` table,
-    /// [`ProfileError::Partitions`] when its table is refused, [`ProfileError::NoBootloader`] when
-    /// inkemu ships no bootloader for its chip, or [`ProfileError::ShippedNeedsLaterChip`] when the
-    /// one it ships does not start its chip revision.
+    /// [`ProfileError::Partitions`] when its table is refused, or [`ProfileError::NoBootloader`]
+    /// when inkemu ships no bootloader for its chip. A chip revision below the minimum of that
+    /// bootloader is no refusal: [`DeviceProfile::bootloader`] says so.
     pub fn from_toml(origin: &str, text: &str) -> Result<DeviceProfile, ProfileError> {
         let raw: RawProfile = toml::from_str(text).map_err(|e| ProfileError::Parse {
             origin: origin.to_owned(),
@@ -446,19 +452,19 @@ impl DeviceProfile {
                 source: PartitionError::NoApplicationSlot,
             });
         }
-        let chip = raw.soc.family.chip_id();
-        let bootloader = select_bootloader(origin, chip)?;
-        // Refused here rather than when a firmware is composed: the bootloader a front end shows
-        // for a device starts that device. ADR 0005.
-        if bootloader.min_chip_revision > raw.soc.revision.full() {
-            return Err(ProfileError::ShippedNeedsLaterChip {
-                origin: origin.to_owned(),
-                chip,
-                id: bootloader.id,
-                required: bootloader.min_chip_revision,
-                device: raw.soc.revision.full(),
-            });
-        }
+        let shipped = select_bootloader(origin, raw.soc.family.chip_id())?;
+        let device_revision = raw.soc.revision.full();
+        // A chip below the minimum of the shipped bootloader still loads: a board of that
+        // revision exists, and boots behind a bootloader its user gives. A front end shows the
+        // state, never a bootloader that does not start the device (ADR 0005).
+        let bootloader = if shipped.min_chip_revision > device_revision {
+            Err(NoShippedBootloader {
+                bootloader: shipped,
+                device_revision,
+            })
+        } else {
+            Ok(shipped)
+        };
         Ok(DeviceProfile {
             id: raw.id,
             name: raw.name,
@@ -509,13 +515,25 @@ impl DeviceProfile {
     /// the slot the bootloader starts, and nothing else (`firmware::compose`).
     ///
     /// # Errors
-    /// [`ComposeError`] when the application or the bootloader is refused.
+    /// [`ComposeError`] when the application or the bootloader is refused, and
+    /// [`ComposeError::ShippedNeedsLaterChip`] when no bootloader is given and none inkemu ships
+    /// starts the device ([`DeviceProfile::bootloader`]).
     pub fn compose_flash(
         &self,
         application: &[u8],
         bootloader: Option<&[u8]>,
     ) -> Result<ComposedFlash, ComposeError> {
-        let bootloader = bootloader.map_or(Bootloader::Shipped(self.bootloader), Bootloader::Given);
+        let bootloader = match (bootloader, self.bootloader) {
+            (Some(given), _) => Bootloader::Given(given),
+            (None, Ok(shipped)) => Bootloader::Shipped(shipped),
+            (None, Err(none)) => {
+                return Err(ComposeError::ShippedNeedsLaterChip {
+                    id: none.bootloader.id,
+                    required: none.bootloader.min_chip_revision,
+                    device: none.device_revision,
+                });
+            }
+        };
         firmware::compose(
             &self.firmware_device(),
             &self.partitions,
@@ -630,19 +648,18 @@ mod tests {
             let flash_size = profile.firmware_device().flash_size;
             assert!(profile.partitions.to_bytes(flash_size).is_ok(), "{id}");
             assert!(profile.partitions.application_slot().is_some(), "{id}");
+            let shipped = profile
+                .bootloader
+                .unwrap_or_else(|none| panic!("{id}: a bootloader that starts it: {none}"));
             assert_eq!(
-                profile.bootloader.chip,
+                shipped.chip,
                 profile.soc.chip_id(),
                 "{id}: a bootloader for its chip"
-            );
-            assert!(
-                profile.bootloader.min_chip_revision <= profile.chip_revision.full(),
-                "{id}: a bootloader that starts its chip revision"
             );
         }
         for id in ["x3", "x4"] {
             let profile = builtin(id).unwrap();
-            assert_eq!(profile.bootloader, &firmware::SHIPPED[0], "{id}");
+            assert_eq!(profile.bootloader, Ok(&firmware::SHIPPED[0]), "{id}");
             let slot = profile.partitions.application_slot().unwrap();
             assert_eq!(
                 (slot.name.as_str(), slot.offset),
@@ -676,9 +693,8 @@ mod tests {
         assert!(select_bootloader("demo.toml", ChipId::Esp32C3).is_ok());
     }
 
-    #[test]
-    fn a_profile_whose_chip_is_older_than_its_shipped_bootloader_is_refused_at_load() {
-        // The X4 with a v0.2 chip: the bootloader inkemu ships for the ESP32-C3 requires v0.3.
+    /// The X4 with a v0.2 chip: the bootloader inkemu ships for the ESP32-C3 requires v0.3.
+    fn x4_at_v0_2() -> DeviceProfile {
         let text = include_str!("../profiles/x4.toml").replace(
             "revision = \"v0.3\"",
             "revision = \"v0.2\"\n# an earlier chip",
@@ -687,24 +703,31 @@ mod tests {
             text.contains("an earlier chip"),
             "the revision line was found"
         );
-        let err = DeviceProfile::from_toml("x4-v0.2.toml", &text).unwrap_err();
+        DeviceProfile::from_toml("x4-v0.2.toml", &text).unwrap()
+    }
+
+    #[test]
+    fn a_profile_whose_chip_is_older_than_its_shipped_bootloader_loads_and_says_none_starts_it() {
+        let old = x4_at_v0_2();
+        let none = old.bootloader.unwrap_err();
         assert_eq!(
-            err,
-            ProfileError::ShippedNeedsLaterChip {
-                origin: "x4-v0.2.toml".into(),
-                chip: ChipId::Esp32C3,
-                id: "esp-idf-v5.5.2-esp32c3-dio",
-                required: 3,
-                device: 2,
+            none,
+            NoShippedBootloader {
+                bootloader: &firmware::SHIPPED[0],
+                device_revision: 2,
             }
         );
         assert_eq!(
-            err.to_string(),
-            "x4-v0.2.toml: the bootloader inkemu ships for ESP32-C3 (esp-idf-v5.5.2-esp32c3-dio) requires chip revision v0.3 or later and the profile says v0.2: it would reset the chip for ever, and inkemu ships no bootloader for an earlier revision; write a revision of v0.3 or later in [soc]"
+            none.to_string(),
+            "the bootloader inkemu ships for ESP32-C3 (esp-idf-v5.5.2-esp32c3-dio) requires chip revision v0.3 or later and the device is v0.2: it would reset the chip for ever, and inkemu ships no bootloader for an earlier revision; give a bootloader built for v0.2 (`--bootloader`)"
         );
-        // The revision the bootloader requires is accepted.
-        let at_the_minimum = include_str!("../profiles/x4.toml");
-        assert!(DeviceProfile::from_toml("x4.toml", at_the_minimum).is_ok());
+        // The revision the bootloader requires is the first it starts.
+        let at_the_minimum =
+            DeviceProfile::from_toml("x4.toml", include_str!("../profiles/x4.toml"));
+        assert_eq!(
+            at_the_minimum.unwrap().bootloader,
+            Ok(&firmware::SHIPPED[0])
+        );
     }
 
     #[test]
@@ -909,14 +932,26 @@ mod tests {
         let x4 = builtin("x4").unwrap();
         let app = build_image(&ImageSpec::default());
         let flash = x4.compose_flash(&app, None).unwrap();
-        assert_eq!(
-            &flash.bytes[..x4.bootloader.bytes.len()],
-            x4.bootloader.bytes
-        );
+        let shipped = x4.bootloader.unwrap();
+        assert_eq!(&flash.bytes[..shipped.bytes.len()], shipped.bytes);
         assert_eq!(&flash.bytes[0x1_0000..0x1_0000 + app.len()], &app[..]);
         let given = build_image(&bootloader_spec());
         let flash = x4.compose_flash(&app, Some(&given)).unwrap();
         assert_eq!(&flash.bytes[..given.len()], &given[..]);
+        // A chip below the minimum of the shipped bootloader: refused with no bootloader given,
+        // composed behind a given bootloader that accepts it (its minimum revision is v0.0).
+        let old = x4_at_v0_2();
+        assert_eq!(
+            old.compose_flash(&app, None).unwrap_err(),
+            ComposeError::ShippedNeedsLaterChip {
+                id: "esp-idf-v5.5.2-esp32c3-dio",
+                required: 3,
+                device: 2
+            }
+        );
+        let flash = old.compose_flash(&app, Some(&given)).unwrap();
+        assert_eq!(&flash.bytes[..given.len()], &given[..]);
+        assert_eq!(&flash.bytes[0x1_0000..0x1_0000 + app.len()], &app[..]);
     }
 
     #[test]
