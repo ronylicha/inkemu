@@ -1,10 +1,19 @@
 //! The text of a console script, and the steps it is made of.
 //!
-//! One step per line, in order; `#` begins a comment; blank lines are ignored. The first line is
-//! [`VERSION_LINE`]. Strings are between double quotes, with the escapes `\r`, `\n`, `\t`, `\\`,
-//! `\"` and `\xHH`; every other character is sent as its UTF-8 bytes. Nothing is translated: Enter
-//! is `\r`, as a terminal sends it (report UR §10). Every value read from the text is bounded by a
-//! constant before anything is allocated for it.
+//! The text is UTF-8 without a byte order mark, its lines ended by LF or CRLF. One step per line,
+//! in order; `#` begins a comment; blank lines are ignored. The first line is [`VERSION_LINE`],
+//! a comment allowed after it. Strings are between double quotes, with the escapes `\r`, `\n`,
+//! `\t`, `\\`, `\"` and `\xHH`; every other character is sent as its UTF-8 bytes. Nothing is
+//! translated: Enter is `\r`, as a terminal sends it (report UR §10). Every value read from the
+//! text is bounded by a constant before anything is allocated for it, and a message quotes the
+//! text of the script with its control characters escaped.
+//!
+//! Steps dated at one instant reach the machine in their order, with one exception: the machine
+//! applies a change of the USB host before anything else of that instant
+//! (`soc-esp32c3/src/periph/usb_serial_jtag.rs`, `settle`), so a `usb-host` step applies before a
+//! `send usb-serial-jtag` of the same time, whatever their order in the script. A packet of the
+//! host reaches the device 50 us after its time, while the host's port is open: `send
+//! usb-serial-jtag "x"` then `usb-host absent` at one time sends nothing.
 use soc_esp32c3::{ConsoleChannel, UsbHost};
 use std::fmt;
 
@@ -81,40 +90,57 @@ pub enum ScriptErrorKind {
         "the text is not UTF-8; save the script as UTF-8, and write other bytes as \\xHH between double quotes"
     )]
     NotUtf8,
+    #[error(
+        "the script begins with a byte order mark (U+FEFF); save it as UTF-8 without a byte order mark"
+    )]
+    ByteOrderMark,
+    #[error(
+        "a carriage return is not followed by a line feed (the line endings of an old Mac, or a carriage return within a line); save the script with LF or CRLF line endings, and write a carriage return to send as \\r between double quotes"
+    )]
+    BareCarriageReturn,
     #[error("the first line is not `{VERSION_LINE}`; make it the first line of the script")]
     NoVersionLine,
     #[error(
-        "the script is written for version `{found}` of the format, and inkemu reads version 1; write it for version 1"
+        "the script is written for version `{}` of the format, and inkemu reads version 1; write it for version 1",
+        Quoted(.found)
     )]
     UnknownVersion { found: String },
     #[error("the line is {len} bytes long, more than {MAX_LINE_BYTES}; split the step in several")]
     LineTooLong { len: usize },
     #[error("the script has more than {MAX_STEPS} steps; split it in several scripts")]
     TooManySteps,
-    #[error("`{word}` is no step; write send, wait, wait-for or usb-host")]
+    #[error("`{}` is no step; write send, wait, wait-for or usb-host", Quoted(.word))]
     UnknownStep { word: String },
     #[error("`{step}` needs {what}; write it after `{step}`")]
     Missing {
         step: &'static str,
         what: &'static str,
     },
-    #[error("`{word}` is no channel; write uart0, uart1 or usb-serial-jtag")]
+    #[error("`{}` is no channel; write uart0, uart1 or usb-serial-jtag", Quoted(.word))]
     UnknownChannel { word: String },
-    #[error("`{word}` is no state of the USB host; write absent, attached or open")]
+    #[error(
+        "`{}` is no state of the USB host; write absent, attached or open",
+        Quoted(.word)
+    )]
     UnknownHostState { word: String },
     #[error(
-        "`{word}` is no duration; write a whole number and its unit, ns, us, ms or s, like 250ms"
+        "`{}` is no duration; write a whole number and its unit, ns, us, ms or s, like 250ms",
+        Quoted(.word)
     )]
     BadDuration { word: String },
     #[error(
-        "`{word}` is more nanoseconds than device time can count (584 years); give a shorter wait"
+        "`{}` is more nanoseconds than device time can count (584 years); give a shorter wait",
+        Quoted(.word)
     )]
     DurationTooLong { word: String },
     #[error("a string is expected here; write the bytes between double quotes")]
     NotAString,
     #[error("the string has no closing double quote; close it on the same line")]
     UnclosedString,
-    #[error("`{escape}` is no escape; write \\r, \\n, \\t, \\\\, \\\" or \\x and two hex digits")]
+    #[error(
+        "`{}` is no escape; write \\r, \\n, \\t, \\\\, \\\" or \\x and two hex digits",
+        Quoted(.escape)
+    )]
     BadEscape { escape: String },
     #[error("the string holds more than {MAX_SEND_BYTES} bytes; split it in several sends")]
     SendTooLong,
@@ -126,8 +152,33 @@ pub enum ScriptErrorKind {
         "the sends of the script hold more than {MAX_TOTAL_BYTES} bytes; send less, or split the script"
     )]
     TooManyBytes,
-    #[error("`{text}` follows the step; remove it, or begin a comment with #")]
+    #[error("`{}` follows the step; remove it, or begin a comment with #", Quoted(.text))]
     Trailing { text: String },
+}
+
+/// The most characters of the script a message quotes: what is longer is cut, and the cut said.
+const MAX_QUOTED_CHARS: usize = 40;
+
+/// Text of the script, as a message quotes it. A script is untrusted: its control characters and
+/// those that print nothing (`ESC`, `BEL`, a carriage return, a change of writing direction) are
+/// written as escapes (`\u{1b}`, `\r`), so that a script cannot move the cursor, retitle the
+/// terminal or hide a message through the messages of a front end; and a long word is cut.
+struct Quoted<'a>(&'a str);
+
+impl fmt::Display for Quoted<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for c in self.0.chars().take(MAX_QUOTED_CHARS) {
+            match c {
+                // Printable as they are; the message quotes the text between backquotes.
+                '\\' | '"' | '\'' => write!(f, "{c}")?,
+                other => write!(f, "{}", other.escape_debug())?,
+            }
+        }
+        if self.0.chars().nth(MAX_QUOTED_CHARS).is_some() {
+            write!(f, "…")?;
+        }
+        Ok(())
+    }
 }
 
 impl Script {
@@ -143,43 +194,38 @@ impl Script {
             let (before, _) = bytes.split_at(e.valid_up_to());
             // INVARIANT: `before` is the valid UTF-8 prefix the error reports.
             let before = std::str::from_utf8(before).unwrap_or_default();
-            let line = before.matches('\n').count() + 1;
-            let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
-            at(
-                line,
-                before[line_start..].chars().count() + 1,
-                ScriptErrorKind::NotUtf8,
-            )
+            let (line, column) = place(before, before.len());
+            at(line, column, ScriptErrorKind::NotUtf8)
         })?;
+        if text.starts_with('\u{FEFF}') {
+            return Err(at(1, 1, ScriptErrorKind::ByteOrderMark));
+        }
+        // A line ends with LF or CRLF: a carriage return alone would hide the end of a line, or
+        // put an invisible byte in a string.
+        if let Some((pos, _)) = text
+            .match_indices('\r')
+            .find(|&(pos, _)| !text[pos + 1..].starts_with('\n'))
+        {
+            let (line, column) = place(text, pos);
+            return Err(at(line, column, ScriptErrorKind::BareCarriageReturn));
+        }
         let mut lines = text
             .split('\n')
             .enumerate()
             .map(|(index, line)| (index + 1, line.strip_suffix('\r').unwrap_or(line)));
-        match lines.next() {
-            Some((_, VERSION_LINE)) => {}
-            Some((_, first)) => {
-                let kind = match first.strip_prefix("inkemu-console-script ") {
-                    Some(found) => ScriptErrorKind::UnknownVersion {
-                        found: found.trim().to_owned(),
-                    },
-                    None => ScriptErrorKind::NoVersionLine,
-                };
-                return Err(at(1, 1, kind));
-            }
-            None => return Err(at(1, 1, ScriptErrorKind::NoVersionLine)),
+        // `split` gives one line at least, the empty text included.
+        let (_, first) = lines.next().unwrap_or((1, ""));
+        Cursor {
+            line: checked_line(1, first)?,
+            pos: 0,
+            number: 1,
         }
+        .version()?;
         let mut steps = Vec::new();
         let mut total = 0usize;
         for (number, line) in lines {
-            if line.len() > MAX_LINE_BYTES {
-                return Err(at(
-                    number,
-                    1,
-                    ScriptErrorKind::LineTooLong { len: line.len() },
-                ));
-            }
             let mut cursor = Cursor {
-                line,
+                line: checked_line(number, line)?,
                 pos: 0,
                 number,
             };
@@ -212,6 +258,28 @@ impl Script {
 
 fn at(line: usize, column: usize, kind: ScriptErrorKind) -> ScriptError {
     ScriptError { line, column, kind }
+}
+
+/// The line and the column, in characters from 1, of byte offset `pos` of `text`.
+fn place(text: &str, pos: usize) -> (usize, usize) {
+    let before = &text[..pos];
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    (
+        before.matches('\n').count() + 1,
+        before[line_start..].chars().count() + 1,
+    )
+}
+
+/// Line `number`, refused when it is longer than [`MAX_LINE_BYTES`].
+fn checked_line(number: usize, line: &str) -> Result<&str, ScriptError> {
+    if line.len() > MAX_LINE_BYTES {
+        return Err(at(
+            number,
+            1,
+            ScriptErrorKind::LineTooLong { len: line.len() },
+        ));
+    }
+    Ok(line)
 }
 
 /// Reads one line.
@@ -285,6 +353,44 @@ impl<'a> Cursor<'a> {
                 );
             }
         };
+        self.end()?;
+        Ok(Some(action))
+    }
+
+    /// The first line: the name of the format and its version, a comment allowed after them.
+    fn version(&mut self) -> Result<(), ScriptError> {
+        // INVARIANT: the version line is a name, a space and a version: the fallback is never
+        // taken.
+        let (name, version) = VERSION_LINE.split_once(' ').unwrap_or((VERSION_LINE, ""));
+        match self.word() {
+            Some((_, word)) if word == name => {}
+            _ => return self.refuse(0, ScriptErrorKind::NoVersionLine),
+        }
+        match self.word() {
+            Some((_, word)) if word == version => {}
+            Some((start, word)) => {
+                return self.refuse(
+                    start,
+                    ScriptErrorKind::UnknownVersion {
+                        found: word.to_owned(),
+                    },
+                );
+            }
+            None => {
+                return self.refuse(
+                    self.pos,
+                    ScriptErrorKind::Missing {
+                        step: "inkemu-console-script",
+                        what: "the version of the format (1)",
+                    },
+                );
+            }
+        }
+        self.end()
+    }
+
+    /// The end of a line: nothing but spaces, or a comment.
+    fn end(&mut self) -> Result<(), ScriptError> {
         self.skip_spaces();
         let rest = &self.line[self.pos..];
         if !rest.is_empty() && !rest.starts_with('#') {
@@ -295,7 +401,7 @@ impl<'a> Cursor<'a> {
                 },
             );
         }
-        Ok(Some(action))
+        Ok(())
     }
 
     fn channel(&mut self, step: &'static str) -> Result<ConsoleChannel, ScriptError> {
@@ -606,6 +712,146 @@ mod tests {
             Script::parse(b"inkemu-console-script 1\r\n").unwrap(),
             Script::default()
         );
+        // Spaces and a comment after the version, as after a step.
+        for line in [
+            "inkemu-console-script 1 ",
+            "inkemu-console-script 1\t# v1",
+            "  inkemu-console-script  1",
+        ] {
+            assert_eq!(
+                Script::parse(line.as_bytes()),
+                Ok(Script::default()),
+                "{line:?}"
+            );
+        }
+        let refused = |text: &str| {
+            let error = Script::parse(text.as_bytes()).unwrap_err();
+            (error.line, error.column, error.kind)
+        };
+        assert_eq!(
+            refused("inkemu-console-script 1 x\n"),
+            (
+                1,
+                25,
+                ScriptErrorKind::Trailing {
+                    text: "x".to_owned()
+                }
+            )
+        );
+        assert_eq!(
+            refused("inkemu-console-script 12\n"),
+            (
+                1,
+                23,
+                ScriptErrorKind::UnknownVersion {
+                    found: "12".to_owned()
+                }
+            )
+        );
+        assert_eq!(
+            refused("inkemu-console-script\n"),
+            (
+                1,
+                22,
+                ScriptErrorKind::Missing {
+                    step: "inkemu-console-script",
+                    what: "the version of the format (1)",
+                }
+            )
+        );
+        assert_eq!(
+            refused("inkemu-console-script1\n"),
+            (1, 1, ScriptErrorKind::NoVersionLine)
+        );
+        // The first line is held to the length of every line before it is quoted.
+        let long = format!("inkemu-console-script {}", "9".repeat(MAX_LINE_BYTES));
+        assert_eq!(
+            refused(&long),
+            (1, 1, ScriptErrorKind::LineTooLong { len: long.len() })
+        );
+    }
+
+    #[test]
+    fn a_byte_order_mark_and_a_carriage_return_alone_are_refused_for_what_they_are() {
+        let refused = |text: &str| {
+            let error = Script::parse(text.as_bytes()).unwrap_err();
+            (error.line, error.column, error.kind)
+        };
+        assert_eq!(
+            refused(&format!("\u{FEFF}{VERSION_LINE}\n")),
+            (1, 1, ScriptErrorKind::ByteOrderMark)
+        );
+        // The line endings of an old Mac: the first carriage return ends the version line.
+        assert_eq!(
+            refused(&format!("{VERSION_LINE}\rwait 1ms\r")),
+            (1, 24, ScriptErrorKind::BareCarriageReturn)
+        );
+        // A carriage return within a line, and one that ends the file.
+        assert_eq!(
+            refused(&format!("{VERSION_LINE}\r\nsend uart0 \"é\ra\"\r\n")),
+            (2, 14, ScriptErrorKind::BareCarriageReturn)
+        );
+        assert_eq!(
+            refused(&format!("{VERSION_LINE}\r\nwait 1ms\r")),
+            (2, 9, ScriptErrorKind::BareCarriageReturn)
+        );
+        let message = ScriptErrorKind::BareCarriageReturn.to_string();
+        assert!(message.contains("LF or CRLF"), "{message}");
+    }
+
+    #[test]
+    fn a_message_quotes_the_script_with_its_control_characters_escaped_and_cut() {
+        // A hostile script cannot write terminal sequences through a message: ESC, BEL, a
+        // carriage return and a change of writing direction are written as escapes.
+        let error = script("jump\u{1b}]0;owned\u{7}\u{202e}x").unwrap_err();
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "line 2, column 1: `jump\\u{1b}]0;owned\\u{7}\\u{202e}x` is no step; write send, wait, wait-for or usb-host"
+        );
+        for kind in [
+            ScriptErrorKind::UnknownVersion {
+                found: "1\u{1b}[2J".into(),
+            },
+            ScriptErrorKind::UnknownChannel {
+                word: "\u{1b}[2J".into(),
+            },
+            ScriptErrorKind::UnknownHostState {
+                word: "\u{1b}[2J".into(),
+            },
+            ScriptErrorKind::BadDuration {
+                word: "\u{1b}[2J".into(),
+            },
+            ScriptErrorKind::DurationTooLong {
+                word: "\u{1b}[2J".into(),
+            },
+            ScriptErrorKind::BadEscape {
+                escape: "\\\u{1b}".into(),
+            },
+            ScriptErrorKind::Trailing {
+                text: "\u{1b}[2J\r".into(),
+            },
+        ] {
+            let message = kind.to_string();
+            assert!(!message.chars().any(char::is_control), "{message:?}");
+            assert!(message.contains("\\u{1b}"), "{message:?}");
+        }
+        // Backslashes and quotes print as they are; a long word is cut, and the cut said.
+        let long = "w".repeat(100);
+        assert_eq!(
+            ScriptErrorKind::Trailing { text: long }.to_string(),
+            format!(
+                "`{}…` follows the step; remove it, or begin a comment with #",
+                "w".repeat(40)
+            )
+        );
+        assert_eq!(
+            ScriptErrorKind::BadEscape {
+                escape: "\\q\"".into()
+            }
+            .to_string(),
+            "`\\q\"` is no escape; write \\r, \\n, \\t, \\\\, \\\" or \\x and two hex digits"
+        );
     }
 
     #[test]
@@ -797,6 +1043,21 @@ mod tests {
             refusal(&format!("{sends}send uart0 \"x\"\n")),
             (over, 1, ScriptErrorKind::TooManyBytes)
         );
+        // A file of exactly the most bytes is read: the version line, then comment lines.
+        let mut file = format!("{VERSION_LINE}\n").into_bytes();
+        while file.len() < MAX_SCRIPT_BYTES {
+            let room = MAX_SCRIPT_BYTES - file.len();
+            let line = room.min(MAX_LINE_BYTES);
+            file.push(b'#');
+            file.extend(std::iter::repeat_n(b'c', line - 1));
+            if file.len() < MAX_SCRIPT_BYTES {
+                // The line ends where the next begins.
+                let last = file.len() - 1;
+                file[last] = b'\n';
+            }
+        }
+        assert_eq!(file.len(), MAX_SCRIPT_BYTES);
+        assert_eq!(Script::parse(&file), Ok(Script::default()));
         let file = vec![b'#'; MAX_SCRIPT_BYTES + 1];
         assert_eq!(
             Script::parse(&file).unwrap_err(),
@@ -815,6 +1076,8 @@ mod tests {
         let kinds = [
             ScriptErrorKind::TooLong { len: 9 },
             ScriptErrorKind::NotUtf8,
+            ScriptErrorKind::ByteOrderMark,
+            ScriptErrorKind::BareCarriageReturn,
             ScriptErrorKind::NoVersionLine,
             ScriptErrorKind::UnknownVersion { found: "2".into() },
             ScriptErrorKind::LineTooLong { len: 9 },
