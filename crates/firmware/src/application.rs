@@ -339,25 +339,49 @@ mod tests {
         let mut bytes = build_image(&ImageSpec::default());
         bytes[3] = 0x5F;
         refresh_digest(&mut bytes);
+        let err = refusal(&bytes);
         assert_eq!(
-            refusal(&bytes),
+            err,
             ApplicationError::LargerFlash {
                 header: 32,
                 device: 16
             }
+        );
+        assert_eq!(
+            err.to_string(),
+            "the header of the firmware says 32 MB of flash and the device has 16 MB; use the firmware built for 16 MB, or choose a device with at least 32 MB"
         );
     }
 
     #[test]
     fn the_chip_revision_bounds_are_those_the_bootloader_checks() {
         // Header bytes 15..17: min_chip_rev_full; 17..19: max_chip_rev_full.
+        let err = refusal(&with_header(15, 4));
         assert_eq!(
-            refusal(&with_header(15, 4)),
+            err,
             ApplicationError::ChipTooOld {
                 required: 4,
                 device: 3,
                 option: Some("CONFIG_ESP32C3_REV_MIN")
             }
+        );
+        assert_eq!(
+            err.to_string(),
+            "the firmware requires chip revision v0.4 or later and the device is v0.3: the bootloader would refuse to start it; use a build for v0.3 (CONFIG_ESP32C3_REV_MIN), or choose a device of revision v0.4 or later"
+        );
+        // A chip inkemu has no memory map for: the option is not named.
+        let mut esp32s3 = with_header(15, 4);
+        esp32s3[12..14].copy_from_slice(&9u16.to_le_bytes());
+        refresh_digest(&mut esp32s3);
+        let device = Device {
+            chip: ChipId::Esp32S3,
+            ..X4
+        };
+        assert_eq!(
+            check_application(&esp32s3, &device, &slot(0x64_0000))
+                .unwrap_err()
+                .to_string(),
+            "the firmware requires chip revision v0.4 or later and the device is v0.3: the bootloader would refuse to start it; use a build for v0.3, or choose a device of revision v0.4 or later"
         );
         assert!(check_application(&with_header(15, 3), &X4, &slot(0x64_0000)).is_ok());
         assert_eq!(

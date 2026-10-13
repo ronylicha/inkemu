@@ -792,12 +792,17 @@ mod tests {
                 found: ChipId::Esp32S3
             }
         );
+        let err = refusal(&with(3, 0x5F));
         assert_eq!(
-            refusal(&with(3, 0x5F)),
+            err,
             BootloaderError::LargerFlash {
                 header: 32,
                 device: 16
             }
+        );
+        assert_eq!(
+            err.to_string(),
+            "the header of the bootloader says 32 MB of flash and the device has 16 MB: the application would abort when it finds the smaller chip; give a bootloader built for 16 MB, or no bootloader to use the one inkemu ships"
         );
     }
 
