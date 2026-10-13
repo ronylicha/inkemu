@@ -506,6 +506,102 @@ fn a_device_node_given_as_flash_is_refused_at_once() {
         .stderr(contains("/dev/zero").and(contains("is not a regular file; use the path of")));
 }
 
+/// Runs `inkemu run --device x4 --max-cycles 1000 <args>` with an empty ROM directory, `pipe`
+/// being a named pipe among the files `args` gives, and tells whether the command opened the pipe.
+///
+/// Opening a pipe for reading waits for a writer that never comes: a command that opened it would
+/// wait for ever. No wall-clock limit decides the outcome. Between looks at whether the command
+/// ended, the test opens the pipe for writing without waiting (`O_NONBLOCK`), which the system
+/// refuses (`ENXIO`) while no reader holds it, and grants as soon as the command opened it to
+/// read, even while that open still waits. Each look ends in one of two outcomes the command
+/// decides: it ended, or it opened the pipe, and granting the write end lets its open return.
+/// [`HANG_LIMIT`] only turns a command that does neither into a failure.
+#[cfg(unix)]
+fn run_on_a_pipe(
+    pipe: &std::path::Path,
+    rom_dir: &std::path::Path,
+    args: &[&std::ffi::OsStr],
+) -> (bool, std::process::Output) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_inkemu"))
+        .args(["run", "--device", "x4", "--max-cycles", "1000", "--rom-dir"])
+        .arg(rom_dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + HANG_LIMIT;
+    let opened = loop {
+        if child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(pipe)
+        {
+            // A reader holds the pipe: the command opened it.
+            Ok(_writer) => break true,
+            Err(e) if e.raw_os_error() == Some(nix::errno::Errno::ENXIO as i32) => {}
+            Err(e) => panic!("opening {} to write: {e}", pipe.display()),
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the command neither ended nor opened {}", pipe.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    if opened {
+        // Whatever it does next, its outcome is decided.
+        let _ = child.kill();
+    }
+    (opened, child.wait_with_output().unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pipe_given_as_flash_firmware_or_bootloader_is_refused_without_being_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipe = dir.path().join("pipe.bin");
+    make_fifo(&pipe);
+    let app = dir.path().join("app.bin");
+    std::fs::write(&app, build_image(&ImageSpec::default())).unwrap();
+    let rom_dir = dir.path().join("rom");
+    for (option, args) in [
+        (
+            "--flash",
+            vec![std::ffi::OsStr::new("--flash"), pipe.as_os_str()],
+        ),
+        (
+            "--firmware",
+            vec![std::ffi::OsStr::new("--firmware"), pipe.as_os_str()],
+        ),
+        (
+            "--bootloader",
+            vec![
+                std::ffi::OsStr::new("--firmware"),
+                app.as_os_str(),
+                std::ffi::OsStr::new("--bootloader"),
+                pipe.as_os_str(),
+            ],
+        ),
+    ] {
+        let (opened, output) = run_on_a_pipe(&pipe, &rom_dir, &args);
+        let log = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!opened, "{option}: the pipe was opened: {log}");
+        assert_eq!(output.status.code(), Some(2), "{option}: {log}");
+        assert!(
+            log.contains("pipe.bin")
+                && log.contains("is not a regular file")
+                && !log.contains(MISSING_ROM),
+            "{option}: {log}"
+        );
+    }
+}
+
 #[test]
 fn run_help_documents_the_flash_option_and_what_strict_stops_on() {
     let output = inkemu()
