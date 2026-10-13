@@ -1,5 +1,6 @@
 //! `inkemu run`: drives a machine and relays its console and diagnostics.
-use crate::exit::{EXIT_ERROR, EXIT_IDLE, EXIT_OK, EXIT_STRICT_MMIO};
+use crate::exit::{EXIT_ERROR, EXIT_IDLE, EXIT_OK, EXIT_SCRIPT_INCOMPLETE, EXIT_STRICT_MMIO};
+use console_script::{ScriptRun, ScriptStatus};
 use emu_core::Cycles;
 use soc_esp32c3::diag::MAX_DISTINCT_DIAGNOSTICS;
 use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, StopReason};
@@ -333,15 +334,18 @@ fn log_console_error(log: &mut dyn Write, outcome: &io::Result<bool>) {
 /// selected console has nothing to write, `reader_gone` is asked instead, once, if `watch` says
 /// this pass is one that asks: a firmware that prints nothing would otherwise run on for a
 /// reader that left.
+///
+/// The bytes of every channel are given back, for a console script to read.
 fn relay_selected_console(
     machine: &mut Esp32C3,
     selected: ConsoleChannel,
     console: &mut dyn Write,
     watch: &mut ReaderWatch,
     reader_gone: &dyn Fn() -> bool,
-) -> io::Result<bool> {
+) -> (io::Result<bool>, Vec<(ConsoleChannel, Vec<u8>)>) {
     let executed = machine.cycles().get();
     let mut outcome = Ok(true);
+    let mut taken = Vec::with_capacity(ConsoleChannel::ALL.len());
     for channel in ConsoleChannel::ALL {
         let bytes = machine.take_console(channel);
         if channel == selected {
@@ -351,8 +355,43 @@ fn relay_selected_console(
                 relay(console, &bytes)
             };
         }
+        taken.push((channel, bytes));
     }
-    outcome
+    (outcome, taken)
+}
+
+/// The exit code of a run that ended with `code` and ran a console script whose status is
+/// `script`: a run that would exit 0 exits [`EXIT_SCRIPT_INCOMPLETE`] when the script is not
+/// through. Any other code is kept: it says more about the run (a `--strict-mmio` stop, a CPU
+/// that waits for ever, a console or a flash file that could not be written).
+#[must_use]
+pub fn exit_code_with_script(code: u8, script: Option<&ScriptStatus>) -> u8 {
+    match script {
+        Some(status) if code == EXIT_OK && *status != ScriptStatus::Complete => {
+            EXIT_SCRIPT_INCOMPLETE
+        }
+        _ => code,
+    }
+}
+
+/// The line of the summary that says how far the console script got.
+fn say_script(log: &mut dyn Write, status: &ScriptStatus, steps: usize) {
+    let _ = match status {
+        ScriptStatus::Complete => {
+            writeln!(log, "inkemu: console script through ({steps} steps)")
+        }
+        ScriptStatus::WaitingFor { step } => writeln!(
+            log,
+            "inkemu: console script not through: line {} ({step}) was still waiting; raise --max-time or --max-cycles, or check that the firmware prints that text on that console",
+            step.line
+        ),
+        ScriptStatus::Ahead { step, at } => writeln!(
+            log,
+            "inkemu: console script not through: line {} ({step}) is dated at {} us of device time, after the end of the run; raise --max-time or --max-cycles",
+            step.line,
+            soc_esp32c3::clock::TIME_BASE.cycles_to_nanos(*at) / 1_000
+        ),
+    };
 }
 
 /// Says in `log` why a run ended as [`RunEnd::ConsoleClosed`].
@@ -423,6 +462,25 @@ pub fn execute(
     console: &mut dyn Write,
     log: &mut dyn Write,
 ) -> RunEnd {
+    execute_with_script(machine, options, None, interrupt, reader_gone, console, log)
+}
+
+/// [`execute`], with a console script that started on `machine` ([`ScriptRun::start`]): after
+/// each call of the machine the bytes of every console are shown to it, so that its steps are
+/// handed to the machine at their dates; the summary says how far it got. A step the machine
+/// refuses is said in `log` and ends the script there; a script that [`console_script`] read
+/// stays within the bounds of the machine, so this does not happen from a file.
+pub fn execute_with_script(
+    machine: &mut Esp32C3,
+    options: &RunOptions,
+    mut script: Option<&mut ScriptRun>,
+    interrupt: &Interrupt,
+    reader_gone: &dyn Fn() -> bool,
+    console: &mut dyn Write,
+    log: &mut dyn Write,
+) -> RunEnd {
+    // Whether the script still reads the consoles: not after a step the machine refused.
+    let mut observing = true;
     // Whether the console has taken everything it was given. A console that failed, or whose
     // reader went away, is not written to again: a strict stop goes on to its own end after it,
     // and must not report the same failure a second time.
@@ -440,8 +498,15 @@ pub fn execute(
             .max_cycles
             .map_or(slice_end, |max| max.min(slice_end));
         let stop = machine.run_within(Cycles(limit), options.max_device_nanos);
-        let console_open =
+        let (console_open, taken) =
             relay_selected_console(machine, options.console, console, &mut reader, reader_gone);
+        if observing
+            && let Some(run) = script.as_deref_mut()
+            && let Err(e) = run.observe(machine, &taken)
+        {
+            let _ = writeln!(log, "error: {e}");
+            observing = false;
+        }
         console_usable = matches!(console_open, Ok(true));
         // The stop line carries the violation: listing it as a warning too would print it twice.
         let violation = match &stop {
@@ -504,6 +569,10 @@ pub fn execute(
         machine.device_time_nanos() / 1_000,
         frequency_text(machine.cpu_frequency().hz())
     );
+    let _ = writeln!(log, "inkemu: USB host {}", machine.usb_host().name());
+    if let Some(run) = script {
+        say_script(log, &run.status(machine.device_time()), run.step_count());
+    }
     summarize_diagnostics(machine, log);
     if let Some(hash) = machine.trace_hash() {
         let _ = writeln!(log, "trace-hash {hash:016x}");
@@ -532,7 +601,9 @@ fn frequency_text(hz: u64) -> String {
 mod tests {
     use super::*;
     use boards::MachineOptions;
-    use cpu_rv32::asm::{addi, bne, jal, lui, sw, wfi};
+    use console_script::{Script, VERSION_LINE};
+    use cpu_rv32::asm::{addi, beq, bne, jal, lbu, lui, lw, sw, wfi};
+    use soc_esp32c3::UsbHost;
     use soc_esp32c3::test_support::{
         HANG, T0, T1, flat_rom, load_register, print_program, stop_watchdogs, store_register,
         unmodeled_register, within,
@@ -561,6 +632,7 @@ mod tests {
     const STRICT: MachineOptions = MachineOptions {
         strict_mmio: true,
         trace_hash: false,
+        usb_host: UsbHost::Open,
     };
     static NOT_INTERRUPTED: Interrupt = Interrupt::new();
     /// Ctrl-C pressed once before the run starts.
@@ -641,6 +713,134 @@ mod tests {
             &mut log,
         );
         log.lines
+    }
+
+    /// Prints `ready` on UART0, then echoes what UART0 receives.
+    fn ready_then_echo() -> Vec<u32> {
+        printing(
+            UART0,
+            b"ready",
+            &[
+                lbu(T1, T0, 0x1C),
+                beq(T1, 0, -4),
+                lw(T1, T0, 0),
+                sw(T1, T0, 0),
+                jal(0, -16),
+            ],
+        )
+    }
+
+    /// Runs `program` with the console script `body` to 20 ms of device time: the console, the
+    /// log, and the exit code of the run.
+    fn scripted(program: &[u32], body: &str) -> (String, String, u8) {
+        let mut m = machine(program, MachineOptions::default());
+        let script = Script::parse(format!("{VERSION_LINE}\n{body}").as_bytes()).unwrap();
+        let mut run = ScriptRun::start(&script, &mut m).unwrap();
+        let (mut console, mut log) = (Vec::new(), Vec::new());
+        let options = RunOptions {
+            max_device_nanos: Some(20_000_000),
+            ..UNLIMITED
+        };
+        let end = execute_with_script(
+            &mut m,
+            &options,
+            Some(&mut run),
+            &NOT_INTERRUPTED,
+            &reader_stays,
+            &mut console,
+            &mut log,
+        );
+        let status = run.status(m.device_time());
+        let code = exit_code_with_script(end.exit_code(), Some(&status));
+        (text(&console), text(&log), code)
+    }
+
+    #[test]
+    fn a_console_script_reads_the_consoles_and_its_summary_line_says_it_went_through() {
+        let (console, log, code) = scripted(
+            &ready_then_echo(),
+            "wait-for uart0 \"ready\"\nsend uart0 \"ok\\r\"\n",
+        );
+        assert_eq!(console, "readyok\r");
+        assert!(
+            log.contains("inkemu: USB host open\ninkemu: console script through (2 steps)\n"),
+            "{log}"
+        );
+        assert_eq!(code, EXIT_OK);
+    }
+
+    #[test]
+    fn a_console_script_not_through_turns_an_exit_0_into_5_and_says_where_it_stopped() {
+        let (_, log, code) = scripted(&ready_then_echo(), "wait-for uart0 \"never\"\n");
+        assert!(
+            log.contains(
+                "inkemu: console script not through: line 2 (wait-for uart0 \"never\") was still waiting; raise --max-time or --max-cycles, or check that the firmware prints that text on that console\n"
+            ),
+            "{log}"
+        );
+        assert_eq!(code, EXIT_SCRIPT_INCOMPLETE);
+        let (_, log, code) = scripted(&ready_then_echo(), "wait 1s\nsend uart0 \"late\"\n");
+        assert!(
+            log.contains(
+                "inkemu: console script not through: line 3 (send uart0 \"late\") is dated at 1000000 us of device time, after the end of the run; raise --max-time or --max-cycles\n"
+            ),
+            "{log}"
+        );
+        assert_eq!(code, EXIT_SCRIPT_INCOMPLETE);
+    }
+
+    #[test]
+    fn a_script_not_through_changes_no_exit_code_but_0() {
+        let waiting = ScriptStatus::Ahead {
+            step: console_script::Step {
+                line: 2,
+                action: console_script::Action::Wait { nanos: 1 },
+            },
+            at: Cycles(1),
+        };
+        for end in RunEnd::ALL {
+            let code = end.exit_code();
+            let expected = if code == EXIT_OK {
+                EXIT_SCRIPT_INCOMPLETE
+            } else {
+                code
+            };
+            assert_eq!(
+                exit_code_with_script(code, Some(&waiting)),
+                expected,
+                "{end:?}"
+            );
+            assert_eq!(
+                exit_code_with_script(code, Some(&ScriptStatus::Complete)),
+                code
+            );
+            assert_eq!(exit_code_with_script(code, None), code);
+        }
+    }
+
+    #[test]
+    fn the_summary_says_the_usb_host_at_the_end_of_the_run() {
+        let mut m = machine(
+            &[HANG],
+            MachineOptions {
+                usb_host: UsbHost::Attached,
+                ..MachineOptions::default()
+            },
+        );
+        let mut log = Vec::new();
+        execute(
+            &mut m,
+            &options(1_000),
+            &NOT_INTERRUPTED,
+            &reader_stays,
+            &mut Vec::new(),
+            &mut log,
+        );
+        assert!(
+            text(&log).contains("inkemu: USB host attached\n"),
+            "{}",
+            text(&log)
+        );
     }
 
     #[test]
@@ -1048,6 +1248,7 @@ mod tests {
                 MachineOptions {
                     strict_mmio: false,
                     trace_hash: true,
+                    usb_host: UsbHost::Open,
                 },
             );
             let (mut console, mut log) = (Vec::new(), Vec::new());
@@ -1556,6 +1757,7 @@ mod tests {
                 MachineOptions {
                     strict_mmio: false,
                     trace_hash: true,
+                    usb_host: UsbHost::Open,
                 },
             );
             let (mut console, mut log) = (Vec::new(), Vec::new());
@@ -2043,6 +2245,7 @@ mod tests {
         const TRACED: MachineOptions = MachineOptions {
             strict_mmio: false,
             trace_hash: true,
+            usb_host: UsbHost::Open,
         };
         let program = printing(UART0, b"x", &[HANG]);
         let hash_line = |log: &[u8]| {

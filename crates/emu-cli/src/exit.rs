@@ -10,6 +10,9 @@ pub const EXIT_ERROR: u8 = 2;
 pub const EXIT_STRICT_MMIO: u8 = 3;
 /// `inkemu run`: the CPU waits for an interrupt and none can come.
 pub const EXIT_IDLE: u8 = 4;
+/// `inkemu run --console-script`: the run ended, by a limit, Ctrl-C or a reader that went away,
+/// before the script was through: it waited for a text, or a step is dated after the end.
+pub const EXIT_SCRIPT_INCOMPLETE: u8 = 5;
 
 /// `inkemu run`: a second Ctrl-C ended the process before the run began its summary; once the
 /// summary has begun, Ctrl-C ends nothing. The value shells give a process ended by `SIGINT`
@@ -29,6 +32,8 @@ Exit codes:
      window that may differ from the device)
   4  the CPU waits for an interrupt and none can come: no interrupt line is pending and no device
      has anything scheduled
+  5  the run would have exited 0, but the --console-script was not through: it was waiting for a
+     text, or one of its steps is dated after the end of the run
 130  Ctrl-C was pressed a second time before the run began its summary: no summary was printed,
      and the flash file is the one of before. Once the summary has begun, Ctrl-C ends nothing:
      the summary and the save of the flash file complete, with the exit code of the end of the run";
@@ -44,7 +49,13 @@ mod tests {
         let codes = RunEnd::ALL
             .iter()
             .map(|end| (format!("{end:?}"), end.exit_code()))
-            .chain([("a second Ctrl-C".to_owned(), EXIT_SECOND_INTERRUPT)]);
+            .chain([
+                ("a second Ctrl-C".to_owned(), EXIT_SECOND_INTERRUPT),
+                (
+                    "a console script not through".to_owned(),
+                    EXIT_SCRIPT_INCOMPLETE,
+                ),
+            ]);
         for (end, code) in codes {
             assert!(
                 format!("\n{RUN_EXIT_CODES_HELP}").contains(&format!("\n{code:>3}  ")),

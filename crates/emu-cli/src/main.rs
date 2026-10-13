@@ -1,6 +1,7 @@
 //! inkemu command-line interface.
 use boards::{DeviceProfile, MachineOptions};
 use clap::{Parser, Subcommand};
+use console_script::ScriptRun;
 use cpu_rv32::{HartConfig, MisalignedPolicy};
 use emu_cli::exit::{EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, RUN_EXIT_CODES_HELP};
 use emu_cli::firmware_file;
@@ -9,11 +10,14 @@ use emu_cli::flash_state::{self, Input, RunFlash, Seed};
 use emu_cli::rom_store::{
     self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
 };
-use emu_cli::run::{Interrupt, RunOptions, execute, parse_device_seconds, relay};
+use emu_cli::run::{
+    Interrupt, RunOptions, execute_with_script, exit_code_with_script, parse_device_seconds, relay,
+};
 use emu_cli::rvtest::{RunResult, TestMachine};
+use emu_cli::script_file;
 use emu_cli::term::sanitize;
 use firmware::BootloaderWarning;
-use soc_esp32c3::ConsoleChannel;
+use soc_esp32c3::{ConsoleChannel, RomImage, UsbHost};
 use std::fmt::Write as _;
 use std::io;
 use std::ops::ControlFlow;
@@ -122,6 +126,20 @@ enum Command {
         /// Which console of the device goes to standard output.
         #[arg(long, value_enum, default_value_t = ConsoleArg::Uart0)]
         console: ConsoleArg,
+        /// What the host sends to the consoles, and when: a text file whose first line is
+        /// `inkemu-console-script 1`, then one step per line: `send CHANNEL "BYTES"`, `wait 250ms`,
+        /// `wait-for CHANNEL "TEXT"` (the next steps are dated from the device time the text
+        /// reached the host), `usb-host absent|attached|open`. CHANNEL is uart0, uart1 or
+        /// usb-serial-jtag; strings take \r \n \t \\ \" \xHH, and Enter is \r. Every step is dated
+        /// in device time, so two runs with the same script are the same run. A script not through
+        /// when the run ends makes it exit 5.
+        #[arg(long, value_name = "FILE")]
+        console_script: Option<PathBuf>,
+        /// The USB host on the USB-Serial-JTAG port when the device starts: absent (no cable),
+        /// attached (the port closed: frames, nothing read) or open (a program reads and writes
+        /// the port).
+        #[arg(long, value_enum, default_value_t = UsbHostArg::Open)]
+        usb_host: UsbHostArg,
         /// Use the ROM ELF files of this directory and never download.
         #[arg(long)]
         rom_dir: Option<PathBuf>,
@@ -153,6 +171,23 @@ impl From<ConsoleArg> for ConsoleChannel {
             ConsoleArg::Uart0 => ConsoleChannel::Uart0,
             ConsoleArg::Uart1 => ConsoleChannel::Uart1,
             ConsoleArg::UsbSerialJtag => ConsoleChannel::UsbSerialJtag,
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum UsbHostArg {
+    Absent,
+    Attached,
+    Open,
+}
+
+impl From<UsbHostArg> for UsbHost {
+    fn from(arg: UsbHostArg) -> UsbHost {
+        match arg {
+            UsbHostArg::Absent => UsbHost::Absent,
+            UsbHostArg::Attached => UsbHost::Attached,
+            UsbHostArg::Open => UsbHost::Open,
         }
     }
 }
@@ -204,6 +239,8 @@ fn main() -> ExitCode {
             max_time,
             strict_mmio,
             console,
+            console_script,
+            usb_host,
             rom_dir,
             trace_hash,
         } => run_device(
@@ -216,9 +253,11 @@ fn main() -> ExitCode {
                 reset: reset_flash,
             },
             rom_dir,
+            console_script.as_deref(),
             MachineOptions {
                 strict_mmio,
                 trace_hash,
+                usb_host: usb_host.into(),
             },
             &RunOptions {
                 max_cycles,
@@ -309,11 +348,17 @@ fn run_device(
     device: &str,
     flash: &FlashOptions<'_>,
     rom_dir: Option<PathBuf>,
+    console_script: Option<&Path>,
     machine_options: MachineOptions,
     run_options: &RunOptions,
 ) -> ExitCode {
     let profile = match profile_for(device) {
         Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    // Read before anything else of the run: a refused script needs no flash and no ROM.
+    let script = match console_script.map(script_file::read_script).transpose() {
+        Ok(script) => script,
         Err(e) => return fail(&e),
     };
     let flash_size = profile.flash.size();
@@ -356,27 +401,9 @@ fn run_device(
         None => format!("flash: {}", fresh.note),
     };
     let entry = rom_store::rom_entry_for(profile.chip_revision);
-    let http = HttpFetch;
-    let mut stderr = io::stderr();
-    let announcing;
-    // An explicit directory is read only; without one the cache downloads on first use.
-    let source = match rom_dir {
-        Some(dir) => RomSource::Directory(dir),
-        None => match rom_store::default_cache_dir() {
-            Ok(dir) => {
-                announcing = AnnouncingFetch::new(&http, &mut stderr, &ESP_ROM_ELFS, &dir);
-                RomSource::Cache {
-                    dir,
-                    fetch: &announcing,
-                    user_named: false,
-                }
-            }
-            Err(e) => return fail(&e),
-        },
-    };
-    let rom = match rom_store::load_rom(&source, &ESP_ROM_ELFS, entry) {
+    let rom = match load_rom(rom_dir, entry) {
         Ok(rom) => rom,
-        Err(e) => return fail(&e),
+        Err(code) => return code,
     };
     let mut machine = match content {
         Some(bytes) => match profile.instantiate_with_flash(rom, bytes, machine_options) {
@@ -394,6 +421,15 @@ fn run_device(
         io::stderr(),
         &format_args!("{}; {flash_note}", header(&profile, entry, &machine)),
     );
+    // The steps before the first wait are dated now, at power-on.
+    let mut script_run = match script
+        .as_ref()
+        .map(|script| ScriptRun::start(script, &mut machine))
+        .transpose()
+    {
+        Ok(run) => run,
+        Err(e) => return fail(&e),
+    };
     let interrupt = Arc::new(Interrupt::new());
     if let Err(e) = watch_ctrl_c(&interrupt) {
         write_line(
@@ -403,24 +439,52 @@ fn run_device(
             ),
         );
     }
-    let end = execute(
+    let end = execute_with_script(
         &mut machine,
         run_options,
+        script_run.as_mut(),
         &interrupt,
         &stdout_reader_gone,
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     );
+    let script_status = script_run
+        .as_ref()
+        .map(|run| run.status(machine.device_time()));
     // The run is over: what follows is no part of it, and of no trace. Since the first line of
     // its summary Ctrl-C ends nothing (`execute` told `interrupt`): the summary and the save of
     // the flash file are bounded (one write of the flash and one flush to the disk), and they
     // complete; the exit code is the one of the end above.
     let code = if run_flash.finish(&machine, &mut io::stderr().lock()) {
-        end.exit_code()
+        exit_code_with_script(end.exit_code(), script_status.as_ref())
     } else {
         end.exit_code_without_its_flash()
     };
     ExitCode::from(code)
+}
+
+/// The mask ROM of `entry`, from `rom_dir`, read only, or from the cache, which downloads it on
+/// first use. A refusal is printed, and its exit code given back.
+fn load_rom(rom_dir: Option<PathBuf>, entry: &RomEntry) -> Result<RomImage, ExitCode> {
+    let http = HttpFetch;
+    let mut stderr = io::stderr();
+    let announcing;
+    // An explicit directory is read only; without one the cache downloads on first use.
+    let source = match rom_dir {
+        Some(dir) => RomSource::Directory(dir),
+        None => match rom_store::default_cache_dir() {
+            Ok(dir) => {
+                announcing = AnnouncingFetch::new(&http, &mut stderr, &ESP_ROM_ELFS, &dir);
+                RomSource::Cache {
+                    dir,
+                    fetch: &announcing,
+                    user_named: false,
+                }
+            }
+            Err(e) => return Err(fail(&e)),
+        },
+    };
+    rom_store::load_rom(&source, &ESP_ROM_ELFS, entry).map_err(|e| fail(&e))
 }
 
 /// The flash a run starts from when nothing is kept from an earlier run.

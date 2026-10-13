@@ -22,6 +22,7 @@ goblin.workspace = true
 thiserror.workspace = true
 soc-esp32c3.workspace = true
 boards.workspace = true
+console-script.workspace = true
 sha2.workspace = true
 ureq.workspace = true
 flate2.workspace = true

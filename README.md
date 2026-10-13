@@ -163,6 +163,8 @@ Options:
       --max-time <SECONDS>       Stop when this many seconds of device time have elapsed since power-on (a decimal number: 30, 2.5, 0.001). Device time goes on while the CPU sleeps and across resets
       --strict-mmio              Stop at the first access to a register the emulator does not model, 8/16-bit write to a peripheral register, operation the emulator cannot perform faithfully, access to flash that is not mapped, or read through a flash window that may differ from the device (exit code 3)
       --console <CONSOLE>        Which console of the device goes to standard output [default: uart0] [possible values: uart0, uart1, usb-serial-jtag]
+      --console-script <FILE>    What the host sends to the consoles, and when: a text file whose first line is `inkemu-console-script 1`, then one step per line: `send CHANNEL "BYTES"`, `wait 250ms`, `wait-for CHANNEL "TEXT"` (the next steps are dated from the device time the text reached the host), `usb-host absent|attached|open`. CHANNEL is uart0, uart1 or usb-serial-jtag; strings take \r \n \t \\ \" \xHH, and Enter is \r. Every step is dated in device time, so two runs with the same script are the same run. A script not through when the run ends makes it exit 5
+      --usb-host <USB_HOST>      The USB host on the USB-Serial-JTAG port when the device starts: absent (no cable), attached (the port closed: frames, nothing read) or open (a program reads and writes the port) [default: open] [possible values: absent, attached, open]
       --rom-dir <ROM_DIR>        Use the ROM ELF files of this directory and never download
       --trace-hash               Print the execution trace hash at the end (determinism checks)
   -h, --help                     Print help
@@ -178,6 +180,8 @@ Exit codes:
      window that may differ from the device)
   4  the CPU waits for an interrupt and none can come: no interrupt line is pending and no device
      has anything scheduled
+  5  the run would have exited 0, but the --console-script was not through: it was waiting for a
+     text, or one of its steps is dated after the end of the run
 130  Ctrl-C was pressed a second time before the run began its summary: no summary was printed,
      and the flash file is the one of before. Once the summary has begun, Ctrl-C ends nothing:
      the summary and the save of the flash file complete, with the exit code of the end of the run

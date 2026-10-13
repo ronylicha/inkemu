@@ -8,4 +8,5 @@ pub mod reader;
 pub mod rom_store;
 pub mod run;
 pub mod rvtest;
+pub mod script_file;
 pub mod term;

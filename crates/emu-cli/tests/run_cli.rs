@@ -183,6 +183,69 @@ fn a_console_the_device_does_not_have_exits_2_and_lists_the_three_it_has() {
 }
 
 #[test]
+fn a_usb_host_state_the_port_does_not_have_exits_2_and_lists_the_three_it_has() {
+    inkemu()
+        .args(["run", "--device", "x4", "--usb-host", "closed"])
+        .assert()
+        .code(2)
+        .stderr(
+            contains("'--usb-host <USB_HOST>'")
+                .and(contains("absent"))
+                .and(contains("attached"))
+                .and(contains("open")),
+        );
+}
+
+/// A console script with `body` after its version line, in a directory that lives as long as
+/// the value.
+fn console_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("steps.txt");
+    std::fs::write(&path, format!("inkemu-console-script 1\n{body}")).unwrap();
+    (dir, path)
+}
+
+#[test]
+fn a_refused_console_script_exits_2_at_its_line_and_column_before_any_rom_is_read() {
+    let (dir, script) = console_script("wait 3\n");
+    let empty_rom_dir = dir.path().join("roms");
+    std::fs::create_dir(&empty_rom_dir).unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--rom-dir"])
+        .arg(&empty_rom_dir)
+        .arg("--console-script")
+        .arg(&script)
+        .assert()
+        .code(2)
+        .stderr(
+            contains("steps.txt, line 2, column 6: `3` is no duration; write a whole number")
+                .and(contains("rom").not()),
+        );
+    inkemu()
+        .args(["run", "--device", "x4", "--rom-dir"])
+        .arg(&empty_rom_dir)
+        .arg("--console-script")
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "is not a regular file; give the path of the file itself",
+        ));
+}
+
+#[test]
+fn run_help_documents_the_console_script_and_the_usb_host() {
+    inkemu().args(["run", "--help"]).assert().code(0).stdout(
+        contains("--console-script <FILE>")
+            .and(contains("inkemu-console-script 1"))
+            .and(contains("wait-for CHANNEL"))
+            .and(contains("--usb-host <USB_HOST>"))
+            .and(contains("[default: open]"))
+            .and(contains("\n  5  ")),
+    );
+}
+
+#[test]
 fn rom_fetch_requires_a_device_or_all() {
     inkemu().args(["rom", "fetch"]).assert().code(2);
 }
@@ -838,6 +901,75 @@ fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_res
     assert_eq!(
         trace_hash_line(&log),
         trace_hash_line(&String::from_utf8_lossy(&second.stderr))
+    );
+}
+
+/// A second stage that stops the watchdogs, prints `ready` on UART0, then echoes on UART0 what
+/// it receives, polling `STATUS.RXFIFO_CNT`.
+fn ready_then_echo() -> Vec<u32> {
+    use cpu_rv32::asm::{beq, jal, lbu, lw, sw};
+    use soc_esp32c3::test_support::{T0, T1, print_program};
+    let uart0 = svd_regs::esp32c3::addr("UART0", "FIFO");
+    let mut program = stop_watchdogs();
+    program.extend(print_program(uart0, b"ready"));
+    program.extend([
+        lbu(T1, T0, 0x1C),
+        beq(T1, 0, -4),
+        lw(T1, T0, 0),
+        sw(T1, T0, 0),
+        jal(0, -16),
+    ]);
+    program
+}
+
+/// The run of the echo firmware with the console script `body`, to 50 ms of device time.
+fn scripted_run(rom_dir: &str, body: &str) -> std::process::Output {
+    let (_flash_dir, flash) = flash_image_of(&ready_then_echo());
+    let (_script_dir, script) = console_script(body);
+    inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--max-time",
+            "0.05",
+            "--rom-dir",
+            rom_dir,
+        ])
+        .arg("--flash")
+        .arg(&flash)
+        .arg("--console-script")
+        .arg(&script)
+        .timeout(HANG_LIMIT)
+        .output()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_console_script_types_into_the_firmware_after_its_prompt() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let output = scripted_run(&rom_dir, "wait-for uart0 \"ready\"\nsend uart0 \"hi\\r\"\n");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{log}");
+    let console = String::from_utf8_lossy(&output.stdout);
+    assert!(console.ends_with("readyhi\r"), "{console:?}");
+    assert!(
+        log.contains("inkemu: USB host open\ninkemu: console script through (2 steps)\n"),
+        "{log}"
+    );
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_console_script_still_waiting_when_the_run_ends_exits_5() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let output = scripted_run(&rom_dir, "wait-for uart0 \"login:\"\n");
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(5), "{log}");
+    assert!(
+        log.contains("inkemu: console script not through: line 2 (wait-for uart0 \"login:\") was still waiting; "),
+        "{log}"
     );
 }
 
