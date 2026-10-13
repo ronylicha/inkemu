@@ -503,6 +503,7 @@ impl Peripherals {
             }
             Event::Uart(0) => self.uart0.wake(ctx),
             Event::Uart(_) => self.uart1.wake(ctx),
+            Event::UsbSerialJtag => self.usb_serial_jtag.wake(ctx),
             Event::ModuleReset(module) => self.reset_module(ctx, module),
         }
     }
@@ -585,7 +586,7 @@ impl Peripherals {
         self.radio_power = AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED);
         self.uart0.reset(ctx);
         self.uart1.reset(ctx);
-        self.usb_serial_jtag.reset();
+        self.usb_serial_jtag.reset(ctx);
         // No rebuilt device asserts an interrupt source, and `SYSTEM` selects the reset clock again.
         // The timer groups and the SYSTIMER go last: each withdraws its wake-up, so that none of
         // the replaced devices leaves a call behind, and drives its sources low.

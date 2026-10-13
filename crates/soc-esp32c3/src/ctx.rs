@@ -103,8 +103,10 @@ pub enum Event {
     CacheInvalidated,
     /// Wake-up of the SYSTIMER: one of its comparators may have an alarm due.
     Systimer,
-    /// Wake-up of UART 0 or 1: its transmitter may have gone idle.
+    /// Wake-up of UART 0 or 1: a byte may have left or landed, or an interrupt condition begun.
     Uart(u8),
+    /// Wake-up of USB-Serial-JTAG: a packet of the host may have reached the OUT FIFO.
+    UsbSerialJtag,
     /// Wake-up of a timer group: its timer or its watchdog may have reached a deadline.
     Timg(Group),
     /// Wake-up of `RTC_CNTL`: the RTC watchdog may have reached a stage timeout.

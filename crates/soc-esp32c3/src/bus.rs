@@ -836,7 +836,7 @@ mod tests {
         // of the time base).
         b.ctx.sleep_until(emu_core::Cycles(60_000));
         assert_eq!(b.periph.uart0.take_tx(&mut b.ctx), b"U");
-        assert_eq!(b.periph.usb_serial_jtag.take_tx(), b"J");
+        assert_eq!(b.periph.usb_serial_jtag.take_tx(&mut b.ctx), b"J");
         assert_eq!(b.ctx.diag.drain(), []);
     }
 
