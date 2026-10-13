@@ -3137,6 +3137,60 @@ fn the_warnings_of_a_given_bootloader_are_printed_before_the_rom_is_looked_for()
     );
 }
 
+/// The header of a run names the bootloader it was given: by its descriptor and the SHA-256 of
+/// its image, or by that hash alone when it has no descriptor. The header is printed once the ROM
+/// is loaded.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn the_header_of_a_run_names_the_bootloader_it_was_given() {
+    use firmware::builder::bootloader_spec;
+    let rom = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let dir = tempfile::tempdir().unwrap();
+    let firmware = dir.path().join("app.bin");
+    std::fs::write(&firmware, build_image(&ImageSpec::default())).unwrap();
+    // ESP-IDF before v5.1 writes no bootloader descriptor: its magic word is cleared here.
+    let mut without_descriptor = bootloader_spec();
+    without_descriptor.segments[0].1[0] = 0;
+    for (image, named) in [
+        (
+            build_image(&bootloader_spec()),
+            "behind a bootloader of ESP-IDF v5.5.2-test built Oct 13 2026 10:00:00, sha256 ",
+        ),
+        (
+            build_image(&without_descriptor),
+            "behind a bootloader without a descriptor, sha256 ",
+        ),
+    ] {
+        let bootloader = dir.path().join("bootloader.bin");
+        std::fs::write(&bootloader, &image).unwrap();
+        let output = inkemu()
+            .args([
+                "run",
+                "--device",
+                "x4",
+                "--max-cycles",
+                "1000",
+                "--rom-dir",
+                &rom,
+            ])
+            .arg("--firmware")
+            .arg(&firmware)
+            .arg("--bootloader")
+            .arg(&bootloader)
+            .timeout(HANG_LIMIT)
+            .assert()
+            .code(0)
+            .get_output()
+            .clone();
+        let log = String::from_utf8_lossy(&output.stderr).into_owned();
+        let expected = format!(
+            "{named}{}, under the partition table of the profile",
+            sha256_of(&bootloader)
+        );
+        assert!(log.contains(&expected), "`{expected}` is missing:\n{log}");
+    }
+}
+
 #[test]
 fn a_firmware_is_a_seed_like_an_image_and_the_flash_file_rules_apply() {
     let app = build_image(&ImageSpec::default());
