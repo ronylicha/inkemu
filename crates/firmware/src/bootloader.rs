@@ -30,9 +30,6 @@ const SHA256_LEN: usize = 32;
 /// Header byte 2: the SPI mode. A bootloader runs in QIO, QOUT, DIO or DOUT (0 to 3).
 const SPI_MODE_OFFSET: usize = 2;
 const LAST_BOOTLOADER_MODE: u8 = 3;
-/// The longest segment the ROM loads (`docs/research/esp32c3-rom-flash-boot.md`, **RFB** below,
-/// §F step 4).
-const MAX_SEGMENT_LEN: usize = 0x10_0000;
 
 /// Where the mask ROM of a chip family loads a 2nd-stage bootloader, and what it refuses: the
 /// rules a bootloader given for a device of that family is checked against. Every range is
@@ -64,7 +61,7 @@ pub static MEMORY_MAPS: [MemoryMap; 1] = [MemoryMap {
     ram: &[(0x3FC8_0000, 0x3FCE_0000), (0x4037_C000, 0x403E_0000)],
     // The same chapter: the data bus window, then the instruction bus window, of the flash.
     flash_windows: &[(0x3C00_0000, 0x3C80_0000), (0x4200_0000, 0x4280_0000)],
-    // RFB §F step 5.
+    // `docs/research/esp32c3-rom-flash-boot.md` (**RFB** below), §F step 5.
     rom_reserved: (0x3FCD_E160, 0x3FCD_F664),
     // RFB §F step 1: 0 to 2, and 15.
     rom_speeds: &[0, 1, 2, 0xF],
@@ -93,12 +90,11 @@ impl MemoryMap {
     }
 
     /// Whether the ROM loads `len` bytes at `addr`: word-aligned, in internal RAM, clear of its
-    /// own stack and data.
+    /// own stack and data. The ROM also refuses a segment longer than 1 MiB
+    /// (`docs/research/esp32c3-rom-flash-boot.md`, §F step 4), which no range of
+    /// [`MemoryMap::ram`] holds, so lying in RAM covers it.
     fn loads(&self, addr: u32, len: usize) -> bool {
-        addr.is_multiple_of(4)
-            && len <= MAX_SEGMENT_LEN
-            && self.in_ram(addr, len)
-            && !overlaps(self.rom_reserved, addr, len)
+        addr.is_multiple_of(4) && self.in_ram(addr, len) && !overlaps(self.rom_reserved, addr, len)
     }
 }
 
@@ -746,6 +742,8 @@ mod tests {
             (0x3FCD_FFFC, 0x8),  // runs past the end of DRAM
             (0x403D_FFF8, 0x10), // runs past the end of IRAM
             (0x3FC8_0002, 8),    // not word-aligned
+            (0x3FC7_FFFC, 8),    // starts below DRAM
+            (0x4037_BFFC, 8),    // starts below IRAM
         ] {
             let mut spec = bootloader_spec();
             spec.segments.push((addr, vec![0; len]));
@@ -767,6 +765,46 @@ mod tests {
             refusal(&build_image(&spec)).to_string(),
             "segment 2 of the bootloader (8 bytes at 0x50000000) is not where the mask ROM loads a bootloader (word-aligned, at most 1 MiB, in internal RAM, clear of 0x3fcde160-0x3fcdf663); rebuild it, or use the one inkemu ships"
         );
+    }
+
+    #[test]
+    fn a_segment_at_either_end_of_ram_is_loaded() {
+        for (addr, len) in [
+            (0x3FC8_0000, 8), // the start of DRAM
+            (0x3FCD_FFF8, 8), // the end of DRAM
+            (0x4037_C000, 8), // the start of IRAM
+            (0x403D_FFF8, 8), // the end of IRAM
+        ] {
+            let mut spec = bootloader_spec();
+            spec.segments.push((addr, vec![0; len]));
+            assert!(
+                check_bootloader(&build_image(&spec), &X4).is_ok(),
+                "{addr:#x}+{len:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_segment_in_either_window_of_the_flash_is_an_applications() {
+        for addr in [0x3C00_0020, 0x4200_0020] {
+            let mut spec = bootloader_spec();
+            spec.segments.push((addr, vec![0; 8]));
+            assert_eq!(
+                refusal(&build_image(&spec)),
+                BootloaderError::FlashMapped { index: 2, addr },
+                "{addr:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_speed_code_the_rom_accepts_is_accepted() {
+        for speed in [0, 1, 2, 0xF] {
+            let mut bytes = build_image(&bootloader_spec());
+            bytes[3] = (bytes[3] & 0xF0) | speed;
+            refresh_digest(&mut bytes);
+            assert!(check_bootloader(&bytes, &X4).is_ok(), "speed {speed}");
+        }
     }
 
     #[test]
@@ -873,6 +911,12 @@ mod tests {
     fn every_modelled_chip_has_one_memory_map() {
         for map in &MEMORY_MAPS {
             assert_eq!(memory_map(map.chip), Some(map), "{}", map.chip);
+            // `MemoryMap::loads` relies on it for the ROM's 1 MiB limit on a segment.
+            assert!(
+                map.ram.iter().all(|&(start, end)| end - start <= 0x10_0000),
+                "{}",
+                map.chip
+            );
         }
         for entry in &SHIPPED {
             assert!(memory_map(entry.chip).is_some(), "{}", entry.id);
