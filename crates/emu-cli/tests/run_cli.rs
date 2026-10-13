@@ -2909,19 +2909,187 @@ fn every_input_that_cannot_be_booted_from_an_application_is_refused_before_boot(
             "; give a bootloader built for v0.3",
         ),
     ] {
-        let assert = run_with_firmware(&application, given.as_deref(), &[])
-            .code(2)
-            .stdout(predicate::str::is_empty());
-        let log = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+        assert_refused_before_boot(case, &application, given.as_deref(), cause, remedy);
+    }
+}
+
+/// `image` with the 16-bit header field at `at` set to `value`, its digest refreshed: only that
+/// field is wrong.
+fn with_header_field(image: &[u8], at: usize, value: u16) -> Vec<u8> {
+    let mut image = image.to_vec();
+    image[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    firmware::builder::refresh_digest(&mut image);
+    image
+}
+
+/// `image` whose header says 32 MB of flash (byte 3, high nibble 5), its digest refreshed.
+fn with_32_mb_of_flash(image: &[u8]) -> Vec<u8> {
+    let mut image = image.to_vec();
+    image[3] = 0x5F;
+    firmware::builder::refresh_digest(&mut image);
+    image
+}
+
+/// The test application whose descriptor accepts the eFuse block revisions `min..=max`
+/// (`min_efuse_blk_rev_full` and `max_efuse_blk_rev_full`, bytes 176..180); those of the X4 are
+/// v1.2.
+fn with_efuse_blocks(min: u16, max: u16) -> Vec<u8> {
+    let mut desc = firmware::builder::app_desc_bytes("1.0.0", "demo", "v5.5.2");
+    desc[176..178].copy_from_slice(&min.to_le_bytes());
+    desc[178..180].copy_from_slice(&max.to_le_bytes());
+    let mut spec = ImageSpec::default();
+    spec.segments[0].1 = desc;
+    build_image(&spec)
+}
+
+/// `image` whose checksum, the byte before the appended digest, is wrong, its digest refreshed so
+/// that only the checksum is; and the cause the refusal states.
+fn with_a_wrong_checksum(image: &[u8]) -> (Vec<u8>, String) {
+    let mut image = image.to_vec();
+    let at = image.len() - 33;
+    let computed = image[at];
+    image[at] ^= 1;
+    firmware::builder::refresh_digest(&mut image);
+    let cause = format!(
+        "the firmware is damaged: checksum mismatch (stored {:#04x}, computed {computed:#04x})",
+        computed ^ 1
+    );
+    (image, cause)
+}
+
+/// What the bootloader or the mask ROM would refuse in an application or a bootloader, refused
+/// by `run_with_firmware` before boot, each message whole: its cause, then its remedy.
+#[test]
+fn what_the_bootloader_or_the_rom_would_refuse_is_refused_before_boot_in_whole_words() {
+    use firmware::builder::bootloader_spec;
+    let app = build_image(&ImageSpec::default());
+    let bootloader = build_image(&bootloader_spec());
+    // Code in a window of the flash and no descriptor: an application without its descriptor.
+    let no_descriptor = build_image(&ImageSpec {
+        segments: vec![(0x4200_0020, vec![0; 8]), (0x4038_0000, vec![0; 8])],
+        ..ImageSpec::default()
+    });
+    let (bad_checksum, checksum_cause) = with_a_wrong_checksum(&app);
+    // An application longer than the 0x8000 bytes below the partition table, given as the
+    // bootloader.
+    let mut long_application = ImageSpec::default();
+    long_application
+        .segments
+        .push((0x3C01_0000, vec![0; 0x9000]));
+    let long_application = build_image(&long_application);
+    // A flash image, a bootloader at its start, whose partition table does not parse.
+    let mut damaged_table = build_flash_image(&bootloader_spec());
+    damaged_table[0x8010] ^= 1;
+    let damaged_table_cause = format!(
+        "the firmware is {} bytes and starts with a 2nd-stage bootloader, so it is a whole flash image, but its partition table at 0x8000 does not parse",
+        damaged_table.len()
+    );
+    // Header bytes 15..17 are min_chip_rev_full, 17..19 max_chip_rev_full.
+    for (case, application, given, cause, remedy) in [
+        (
+            "no application descriptor",
+            no_descriptor,
+            None,
+            "the firmware has no application descriptor at 0x20 (esp_app_desc_t), which every ESP-IDF application carries and the bootloader reads",
+            "; use the application .bin of an ESP-IDF build\n",
+        ),
+        (
+            "a later chip revision required",
+            with_header_field(&app, 15, 4),
+            None,
+            "the firmware requires chip revision v0.4 or later and the device is v0.3: the bootloader would refuse to start it",
+            "; use a build for v0.3 (CONFIG_ESP32C3_REV_MIN), or choose a device of revision v0.4 or later\n",
+        ),
+        (
+            "an earlier chip revision required",
+            with_header_field(&app, 17, 2),
+            None,
+            "the firmware accepts chip revisions up to v0.2 and the device is v0.3: the bootloader would refuse to start it",
+            "; use a build that accepts v0.3, or choose a device of revision v0.2 or earlier\n",
+        ),
+        (
+            "a later eFuse block revision required",
+            with_efuse_blocks(103, 199),
+            None,
+            "the firmware requires eFuse block revision v1.3 or later and the chip has v1.2: the bootloader would refuse to start it",
+            "; use a build that accepts v1.2\n",
+        ),
+        (
+            "an earlier eFuse block revision required",
+            with_efuse_blocks(0, 101),
+            None,
+            "the firmware accepts eFuse block revisions up to v1.1 and the chip has v1.2: the bootloader would refuse to start it",
+            "; use a build that accepts v1.2\n",
+        ),
+        (
+            "more flash in the header of the firmware than the device has",
+            with_32_mb_of_flash(&app),
+            None,
+            "the header of the firmware says 32 MB of flash and the device has 16 MB",
+            "; use the firmware built for 16 MB, or choose a device with at least 32 MB\n",
+        ),
+        (
+            "a wrong checksum",
+            bad_checksum,
+            None,
+            checksum_cause.as_str(),
+            "; re-download the file or rebuild the firmware\n",
+        ),
+        (
+            "a flash image whose partition table does not parse",
+            damaged_table,
+            None,
+            damaged_table_cause.as_str(),
+            "; use an intact dump as the flash (`--flash`), or the application .bin of its build as the firmware\n",
+        ),
+        (
+            "more flash in the header of the bootloader than the device has",
+            app.clone(),
+            Some(with_32_mb_of_flash(&bootloader)),
+            "the header of the bootloader says 32 MB of flash and the device has 16 MB: the application would abort when it finds the smaller chip",
+            "; give a bootloader built for 16 MB, or no bootloader to use the one inkemu ships\n",
+        ),
+        (
+            "an application longer than a bootloader can be, as the bootloader",
+            app.clone(),
+            Some(long_application),
+            "the bootloader is an application image (it carries an application descriptor at 0x20)",
+            "; use it as the firmware (`--firmware`), and give no bootloader or the bootloader.bin of its build\n",
+        ),
+    ] {
+        assert!(remedy.ends_with('\n'), "{case}: the remedy ends the line");
+        assert_refused_before_boot(case, &application, given.as_deref(), cause, remedy);
+    }
+}
+
+/// `run_with_firmware(application, given)` exits 2 before it looks for the ROM, with an error
+/// that holds `cause` and `remedy`; a `remedy` that ends the line follows `cause` at once, so
+/// that the two are the whole message.
+fn assert_refused_before_boot(
+    what: &str,
+    application: &[u8],
+    given: Option<&[u8]>,
+    cause: &str,
+    remedy: &str,
+) {
+    let assert = run_with_firmware(application, given, &[])
+        .code(2)
+        .stdout(predicate::str::is_empty());
+    let log = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        log.starts_with("error: ") && log.contains(cause) && log.contains(remedy),
+        "{what}: {log}"
+    );
+    if remedy.ends_with('\n') {
         assert!(
-            log.starts_with("error: ") && log.contains(cause) && log.contains(remedy),
-            "{case}: {log}"
-        );
-        assert!(
-            !log.contains(MISSING_ROM),
-            "{case}: refused before the ROM: {log}"
+            log.contains(&format!("{cause}{remedy}")),
+            "{what}: the whole message: {log}"
         );
     }
+    assert!(
+        !log.contains(MISSING_ROM),
+        "{what}: refused before the ROM: {log}"
+    );
 }
 
 #[test]
@@ -2934,6 +3102,37 @@ fn a_firmware_and_a_bootloader_that_pass_are_taken_to_the_rom() {
             .code(2)
             .stderr(contains(MISSING_ROM));
     }
+}
+
+#[test]
+fn the_warnings_of_a_given_bootloader_are_printed_before_the_rom_is_looked_for() {
+    use firmware::builder::{bootloader_spec, refresh_digest};
+    // A header that says 4 MB of flash, and an appended digest that does not match: both are
+    // warnings, and the run goes on to the ROM.
+    let mut bootloader = build_image(&bootloader_spec());
+    bootloader[3] = 0x2F;
+    refresh_digest(&mut bootloader);
+    let last = bootloader.len() - 1;
+    bootloader[last] ^= 1;
+    let assert = run_with_firmware(&build_image(&ImageSpec::default()), Some(&bootloader), &[])
+        .code(2)
+        .stdout(predicate::str::is_empty());
+    let log = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        lines.get(..2),
+        Some(
+            &[
+                "warning: the header of the bootloader says 4 MB of flash and the device has 16 MB; the application is told 4 MB and uses no more; rebuild the bootloader for 16 MB to use the whole flash",
+                "warning: the SHA-256 appended to the bootloader does not match it; the mask ROM boots it anyway, as a chip without secure boot does, and prints four lines that say so; rebuild the bootloader if it was not changed on purpose",
+            ][..]
+        ),
+        "{log}"
+    );
+    assert!(
+        lines.get(2).is_some_and(|line| line.contains(MISSING_ROM)),
+        "{log}"
+    );
 }
 
 #[test]
@@ -2959,10 +3158,15 @@ fn a_firmware_is_a_seed_like_an_image_and_the_flash_file_rules_apply() {
     run_with_flash_file(&file, &["--firmware", firmware_arg, "--reset-flash"])
         .code(2)
         .stderr(contains(MISSING_ROM));
-    // The firmware cannot be the flash file, nor --bootloader.
+    // The firmware cannot be the flash file, nor --bootloader. The remedy keeps the file: a reset
+    // of the flash file would replace the firmware with the flash.
+    let keeps_the_file = || {
+        contains("; give --flash-file another path to keep the file as it is\n")
+            .and(contains("--reset-flash").not())
+    };
     run_with_flash_file(&firmware, &["--firmware", firmware_arg])
         .code(2)
-        .stderr(contains("--firmware and --flash-file name the same file"));
+        .stderr(contains("--firmware and --flash-file name the same file").and(keeps_the_file()));
     let other = dir.path().join("other.bin");
     run_with_flash_file(
         &firmware,
@@ -2974,7 +3178,7 @@ fn a_firmware_is_a_seed_like_an_image_and_the_flash_file_rules_apply() {
         ],
     )
     .code(2)
-    .stderr(contains("--bootloader and --flash-file name the same file"));
+    .stderr(contains("--bootloader and --flash-file name the same file").and(keeps_the_file()));
     assert_eq!(std::fs::read(&firmware).unwrap(), app, "never written");
 }
 
