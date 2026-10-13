@@ -3064,6 +3064,38 @@ fn what_the_bootloader_or_the_rom_would_refuse_is_refused_before_boot_in_whole_w
     }
 }
 
+/// A file given as the bootloader that is no bootloader at all — not an image, an encrypted
+/// update, a whole flash image — refused by `run_with_firmware` before boot, each message whole.
+#[test]
+fn what_is_no_bootloader_at_all_is_refused_as_the_bootloader_in_whole_words() {
+    use firmware::builder::bootloader_spec;
+    let app = build_image(&ImageSpec::default());
+    let mut xota = b"XOTA".to_vec();
+    xota.resize(512, 0);
+    for (case, given, cause, remedy) in [
+        (
+            "not an image",
+            vec![0x7F; 64],
+            "the bootloader is not an ESP-IDF image: its first byte is 0x7f, expected 0xe9",
+            "; give the bootloader.bin of a build, or no bootloader to use the one inkemu ships\n",
+        ),
+        (
+            "an encrypted update",
+            xota,
+            "the bootloader is an encrypted OTA update (.xota), not a bootloader",
+            "; give the bootloader.bin of a build, or no bootloader to use the one inkemu ships\n",
+        ),
+        (
+            "a whole flash image",
+            build_flash_image(&bootloader_spec()),
+            "the bootloader is a whole flash image (a partition table follows it at 0x8000), not a bootloader alone",
+            "; use it as the flash (`--flash`), and give no firmware (`--firmware`): the image holds its own application\n",
+        ),
+    ] {
+        assert_refused_before_boot(case, &app, Some(&given), cause, remedy);
+    }
+}
+
 /// `run_with_firmware(application, given)` exits 2 before it looks for the ROM, with an error
 /// that holds `cause` and `remedy`; a `remedy` that ends the line follows `cause` at once, so
 /// that the two are the whole message.

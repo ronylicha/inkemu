@@ -308,7 +308,7 @@ pub enum BootloaderError {
     )]
     EncryptedOta,
     #[error(
-        "the bootloader is a whole flash image (a partition table follows it at 0x8000), not a bootloader alone; use the file as the flash (`inkemu run --flash`)"
+        "the bootloader is a whole flash image (a partition table follows it at 0x8000), not a bootloader alone; use it as the flash (`--flash`), and give no firmware (`--firmware`): the image holds its own application"
     )]
     FlashImage,
     #[error(
