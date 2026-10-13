@@ -12,6 +12,7 @@ use emu_cli::rom_store::{
 use emu_cli::run::{Interrupt, RunOptions, execute, parse_device_seconds, relay};
 use emu_cli::rvtest::{RunResult, TestMachine};
 use emu_cli::term::sanitize;
+use firmware::BootloaderWarning;
 use soc_esp32c3::ConsoleChannel;
 use std::fmt::Write as _;
 use std::io;
@@ -331,23 +332,28 @@ fn run_device(
             }
         }
     }
-    let (seed, fresh_note) = match starting_flash(&profile, flash) {
+    let fresh = match starting_flash(&profile, flash) {
         Ok(started) => started,
         Err(code) => return code,
     };
     // From here on the flash file is locked, until the process ends.
-    let (run_flash, content) = match RunFlash::begin(flash.file, flash.reset, seed, flash_size) {
-        Ok(begun) => begun,
-        Err(e) => return fail(&e),
-    };
+    let (run_flash, content) =
+        match RunFlash::begin(flash.file, flash.reset, fresh.seed, flash_size) {
+            Ok(begun) => begun,
+            Err(e) => return fail(&e),
+        };
+    // Said once the flash file accepts the seed: a run refused for its flash file says only why.
+    for warning in &fresh.warnings {
+        write_line(io::stderr(), &format_args!("warning: {warning}"));
+    }
     let flash_note = match flash.file {
         Some(path) if run_flash.starts_from_the_file() => format!(
             "flash: {} (flash file, {} MiB)",
             file_name(path),
             flash_size >> 20
         ),
-        Some(path) => format!("flash: {fresh_note}, kept in {}", file_name(path)),
-        None => format!("flash: {fresh_note}"),
+        Some(path) => format!("flash: {}, kept in {}", fresh.note, file_name(path)),
+        None => format!("flash: {}", fresh.note),
     };
     let entry = rom_store::rom_entry_for(profile.chip_revision);
     let http = HttpFetch;
@@ -417,14 +423,22 @@ fn run_device(
     ExitCode::from(code)
 }
 
-/// What the flash holds when nothing is kept from an earlier run (`None`: erased), and how the
-/// header line of the run names it. A refusal is printed, and its exit code given back.
-fn starting_flash(
-    profile: &DeviceProfile,
-    flash: &FlashOptions<'_>,
-) -> Result<(Option<Seed>, String), ExitCode> {
+/// The flash a run starts from when nothing is kept from an earlier run.
+struct Starting {
+    /// What the flash holds (`None`: erased).
+    seed: Option<Seed>,
+    /// How the header line of the run names it.
+    note: String,
+    /// What the check of a given bootloader found that does not stop the run, printed only once
+    /// the flash file accepts the seed.
+    warnings: Vec<BootloaderWarning>,
+}
+
+/// The flash a run starts from when nothing is kept from an earlier run. A refusal is printed,
+/// and its exit code given back.
+fn starting_flash(profile: &DeviceProfile, flash: &FlashOptions<'_>) -> Result<Starting, ExitCode> {
     let flash_size = profile.flash.size();
-    Ok(match (flash.image, flash.firmware) {
+    let (seed, note, warnings) = match (flash.image, flash.firmware) {
         (Some(path), _) => match flash_file::load(path, profile.soc.chip_id(), flash_size) {
             Ok(bytes) => {
                 let note = format!(
@@ -437,15 +451,12 @@ fn starting_flash(
                     input: Input::Flash,
                     content: bytes,
                 };
-                (Some(seed), note)
+                (Some(seed), note, Vec::new())
             }
             Err(e) => return Err(fail(&e)),
         },
         (None, Some(path)) => match firmware_file::compose(profile, path, flash.bootloader) {
             Ok(composed) => {
-                for warning in &composed.warnings {
-                    write_line(io::stderr(), &format_args!("warning: {warning}"));
-                }
                 let app = &composed.application;
                 let note = format!(
                     "{} ({} {}, ESP-IDF {}) in {} at {:#x}, behind {}, under the partition table of the profile ({} MiB)",
@@ -462,11 +473,20 @@ fn starting_flash(
                     input: Input::Firmware,
                     content: composed.bytes,
                 };
-                (Some(seed), note)
+                (Some(seed), note, composed.warnings)
             }
             Err(e) => return Err(fail(&e)),
         },
-        (None, None) => (None, format!("erased ({} MiB)", flash_size >> 20)),
+        (None, None) => (
+            None,
+            format!("erased ({} MiB)", flash_size >> 20),
+            Vec::new(),
+        ),
+    };
+    Ok(Starting {
+        seed,
+        note,
+        warnings,
     })
 }
 

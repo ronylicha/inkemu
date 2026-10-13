@@ -3169,6 +3169,33 @@ fn the_warnings_of_a_given_bootloader_are_printed_before_the_rom_is_looked_for()
     );
 }
 
+/// A run refused for its flash file prints no warning about a bootloader it will never boot: the
+/// refusal is the whole of what it says.
+#[test]
+fn a_run_refused_for_its_flash_file_prints_no_warning_of_its_bootloader() {
+    use firmware::builder::{bootloader_spec, refresh_digest};
+    let mut bootloader = build_image(&bootloader_spec());
+    bootloader[3] = 0x2F;
+    refresh_digest(&mut bootloader);
+    let dir = tempfile::tempdir().unwrap();
+    let kept = dir.path().join("x4.bin");
+    std::fs::write(&kept, vec![0xFF; 16 << 20]).unwrap();
+    let assert = run_with_firmware(
+        &build_image(&ImageSpec::default()),
+        Some(&bootloader),
+        &["--flash-file", kept.to_str().unwrap()],
+    )
+    .code(2)
+    .stdout(predicate::str::is_empty());
+    let log = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        log.starts_with("error: both --firmware and the flash file ")
+            && log.contains("x4.bin, which exists, were given")
+            && log.lines().count() == 1,
+        "{log}"
+    );
+}
+
 /// The header of a run names the bootloader it was given: by its descriptor and the SHA-256 of
 /// its image, or by that hash alone when it has no descriptor. The header is printed once the ROM
 /// is loaded.
