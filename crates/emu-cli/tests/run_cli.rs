@@ -4122,10 +4122,10 @@ fn pinned_in_sums(sums: &str, file: &str) -> String {
         .unwrap_or_else(|| panic!("{}: no line for {file}", path.display()))
 }
 
-/// The trace of the run of `adc_wait_panic` below, as the CI prints it. The image is built for the
-/// first time with this test: its hash is read from the log of the job `reference-boot`, where
-/// the test fails and prints the hash of the run, and written here; until then this names none.
-const ADC_WAIT_PANIC_TRACE: &str = "trace-hash not pinned yet";
+/// The trace of the run of `adc_wait_panic` below, as the CI prints it: measured by the job
+/// `reference-boot` of run 38498719362 (2026-10-14), where every other assertion of the test
+/// passed and this one printed the hash of the run.
+const ADC_WAIT_PANIC_TRACE: &str = "trace-hash b217bc3b287080ae";
 
 /// The path `CrossPoint` 1.6.5 and the stock firmware of the X4 take under inkemu (they are tested
 /// on the machine of a user who has them, `tests/real_firmware.rs`), with an application this
