@@ -74,11 +74,11 @@ const _: () = assert!(
         && reg("CPU_INT_PRI_31") == CPU_INT_PRI_0 + REGISTER_BYTES * (LINES - 1)
 );
 
-/// Bits [4:0] of a `<SRC>_MAP` register: the CPU line; 0 routes the source nowhere.
+/// Bits `[4:0]` of a `<SRC>_MAP` register: the CPU line; 0 routes the source nowhere.
 const MAP_MASK: u32 = 0x1F;
-/// Bits [3:0] of a priority or threshold register.
+/// Bits `[3:0]` of a priority or threshold register.
 const PRIORITY_MASK: u32 = 0xF;
-/// Bits [31:1] of the per-line registers: line 0 does not exist.
+/// Bits `[31:1]` of the per-line registers: line 0 does not exist.
 const LINES_MASK: u32 = !1;
 /// `CLOCK_GATE.CLK_EN`, bit 0 (reset value 1 in the SVD).
 const CLOCK_GATE_MASK: u32 = 1;

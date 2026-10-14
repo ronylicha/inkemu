@@ -26,7 +26,7 @@ const SLP_REJECT_CAUSE: u32 = reg("SLP_REJECT_CAUSE");
 const SLP_WAKEUP_CAUSE: u32 = reg("SLP_WAKEUP_CAUSE");
 const DIG_PWC: u32 = reg("DIG_PWC");
 
-/// `SLP_TIMER1`: bits [15:0] `SLP_VAL_HI`, the high 16 bits of the 48-bit target, and bit 16
+/// `SLP_TIMER1`: bits `[15:0]` `SLP_VAL_HI`, the high 16 bits of the 48-bit target, and bit 16
 /// `MAIN_TIMER_ALARM_EN`, write-only (`rtc_cntl_reg.h:166-178`). `rtc_cntl_ll_set_wakeup_timer`
 /// writes the target, clears the interrupt, then sets the enable (`rtc_cntl_ll.h:18-25`).
 const SLP_VAL_HI: u32 = 0xFFFF;
@@ -43,7 +43,7 @@ const STATE0_STORED: u32 = SLEEP_EN | SLP_REJECT | SLP_WAKEUP | 1 << 22;
 /// The bits of `STATE0` that would raise something the model does not have (P9 of the plan
 /// names the choice; the message, the remedy).
 const STATE0_SIGNALS: u32 = SLP_REJECT | SLP_WAKEUP | SW_CPU_INT;
-/// `WAKEUP_STATE` bits [31:15] `WAKEUP_ENA` (`rtc_cntl_reg.h:554-560`); the rest reads 0.
+/// `WAKEUP_STATE` bits `[31:15]` `WAKEUP_ENA` (`rtc_cntl_reg.h:554-560`); the rest reads 0.
 const WAKEUP_ENA_SHIFT: u32 = 15;
 const WAKEUP_STATE_STORED: u32 = 0xFFFF_8000;
 /// Bit 3 of `WAKEUP_ENA` and of `SLP_WAKEUP_CAUSE`, the RTC timer (`RTC_TIMER_TRIG_EN`,

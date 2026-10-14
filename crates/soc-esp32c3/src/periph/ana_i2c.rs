@@ -21,7 +21,7 @@ const ANA_CONFIG2: u32 = 0x48;
 const HOSTS: usize = 2;
 const CONFIG_REGISTERS: usize = 3;
 
-/// Command word: [7:0] block, [15:8] register, [23:16] data, bit 24 write, bit 25 busy.
+/// Command word: `[7:0]` block, `[15:8]` register, `[23:16]` data, bit 24 write, bit 25 busy.
 const CMD_DATA_SHIFT: u32 = 16;
 const CMD_DATA_MASK: u32 = 0xFF << CMD_DATA_SHIFT;
 const CMD_WRITE: u32 = 1 << 24;

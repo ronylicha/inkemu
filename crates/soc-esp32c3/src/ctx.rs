@@ -31,7 +31,7 @@ impl Source {
     /// register table of the chip: in a `const` the compiler runs it once, in a function body it
     /// would run at every call, on a path firmware can take once per instruction.
     ///
-    /// The check is on the position: a register inside the first [`MAP_REGISTERS`] words of the
+    /// The check is on the position: a register inside the first `MAP_REGISTERS` words of the
     /// block is taken to be a map register, as the SVD lays them out (a test pins that).
     ///
     /// # Panics
@@ -287,7 +287,7 @@ impl Ctx {
     /// Asks for `event` to be delivered at device time `at`; an instant already past is the
     /// present time, and delivered by the next delivery pass.
     ///
-    /// The clamp to the present time is what makes a delivery pass fair ([`Ctx::deliver_due`]):
+    /// The clamp to the present time is what makes a delivery pass fair (`Ctx::deliver_due`):
     /// a wake-up scheduled during a pass has a cycle at or after the present time, which is at or
     /// after the cycle of every wake-up due when the pass began, and a larger id, so it sorts
     /// after all of them whatever instant its device asked for.

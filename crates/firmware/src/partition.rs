@@ -4,7 +4,7 @@
 //! find its application where inkemu writes it: two application rows of one subtype, which the
 //! script accepts, are refused too.
 //!
-//! Every error message states the cause and a correction ("<cause>; <imperative remedy>").
+//! Every error message states the cause and a correction (`"<cause>; <imperative remedy>"`).
 use crate::chip::FlashSize;
 use md5::{Digest, Md5};
 use thiserror::Error;

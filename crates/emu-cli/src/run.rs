@@ -454,7 +454,7 @@ fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
 /// (warnings, then the summary, whose first line says why the run ended — or, when the console
 /// failed, that it did) to `log`.
 ///
-/// Output is relayed every [`SLICE_CYCLES`] cycles so a long run shows progress. Both limits of
+/// Output is relayed every `SLICE_CYCLES` cycles so a long run shows progress. Both limits of
 /// `options` are given to every call of the machine: the cycle limit ends a run whose CPU
 /// executes, the device-time limit also ends one whose CPU sleeps, and the first one reached
 /// ends the run (the cycle limit when both are reached at the same instruction boundary).
@@ -468,7 +468,7 @@ fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
 ///   whatever ends the run: from then on a request no longer ends the process ([`Interrupt`]).
 /// - The state of its reader. A write to a console whose reader went away says so by failing;
 ///   the passes that had nothing to write ask `reader_gone` instead, the first of them and then
-///   one in [`SILENT_PASSES_PER_QUESTION`] or one per slice of executed cycles ([`ReaderWatch`]),
+///   one in `SILENT_PASSES_PER_QUESTION` or one per slice of executed cycles (`ReaderWatch`),
 ///   and a yes ends the run as [`RunEnd::ConsoleClosed`]. A caller that cannot tell passes a
 ///   function that always says no: the limits then bound a run that prints nothing.
 ///

@@ -14,7 +14,7 @@ pub const MMU_ENTRY_INVALID: u32 = 1 << 8;
 /// `SOC_MMU_VALID_VAL_MASK`: the flash page number.
 const PAGE_NUMBER_MASK: u32 = 0xFF;
 /// ASSUMPTION: an entry is 9 bits wide, as the QEMU oracle stores it (0xFFFFFFFF reads back 0x1FF).
-/// `CACHE_MMU_FAULT_CONTENT` is 10 bits wide, so silicon may keep bit 9; software only uses [8:0].
+/// `CACHE_MMU_FAULT_CONTENT` is 10 bits wide, so silicon may keep bit 9; software only uses `[8:0]`.
 const ENTRY_BITS: u32 = 0x1FF;
 const ENTRY_BYTES: u32 = 4;
 const PAGE_SHIFT: u32 = 16;

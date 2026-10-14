@@ -76,7 +76,7 @@ const USB_BUS_RESET: u32 = 1 << 9;
 const OUT_EP1_ZERO_PAYLOAD: u32 = 1 << 10;
 /// `INT_ENA` and `INT_CLR` take the 19 bits of `USB_SERIAL_JTAG_LL_INTR_MASK` (`ll.h:19`).
 const INTERRUPT_BITS: u32 = 0x7FFFF;
-/// `FRAM_NUM` holds the 11-bit number of the last frame (`SOF_FRAME_INDEX` [10:0]).
+/// `FRAM_NUM` holds the 11-bit number of the last frame (`SOF_FRAME_INDEX` `[10:0]`).
 const FRAME_NUMBERS: u64 = 2048;
 /// Size of a full-speed bulk packet: the hardware sends a full FIFO without waiting for `WR_DONE`.
 /// Source: ESP-IDF v5.5.2 `components/hal/esp32c3/include/hal/usb_serial_jtag_ll.h`, note on

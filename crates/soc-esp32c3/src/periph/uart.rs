@@ -61,7 +61,7 @@ const CONFIG: [u32; 9] = [
     AT_CMD_CHAR,
     MEM_CONF,
 ];
-/// `STATUS` bits [9:0] `RXFIFO_CNT` and [25:16] `TXFIFO_CNT`.
+/// `STATUS` bits `[9:0]` `RXFIFO_CNT` and `[25:16]` `TXFIFO_CNT`.
 const FIFO_COUNTS: u32 = 0x03FF_03FF;
 const TXFIFO_CNT_SHIFT: u32 = 16;
 /// `CONF0` bit 17 `RXFIFO_RST`: empties the receive FIFO; a byte that lands while it is set is
@@ -70,15 +70,15 @@ const RXFIFO_RST: u32 = 1 << 17;
 /// `CLK_CONF` bit 25 `RX_SCLK_EN`: the receiver's clock; a byte that lands while it is clear is
 /// lost (report UR §5.4 point 5, A8).
 const RX_SCLK_EN: u32 = 1 << 25;
-/// `MEM_CONF` bits [3:1] `RX_SIZE` and [6:4] `TX_SIZE`: the 128-byte blocks of the UART memory
+/// `MEM_CONF` bits `[3:1]` `RX_SIZE` and `[6:4]` `TX_SIZE`: the 128-byte blocks of the UART memory
 /// each FIFO has. Both are 1 at reset and in every measured configuration (report UR §2.2); the
 /// model has one block each and refuses another size.
 const MEM_SIZES: u32 = 0b111_1110;
 const ONE_BLOCK_EACH: u32 = 0b001_0010;
-/// `MEM_CONF` bits [25:16] `RX_TOUT_THRHD`: the receive timeout, in bit times (report UR §5.2).
+/// `MEM_CONF` bits `[25:16]` `RX_TOUT_THRHD`: the receive timeout, in bit times (report UR §5.2).
 const RX_TOUT_THRHD_SHIFT: u32 = 16;
 const TEN_BITS: u32 = 0x3FF;
-/// `CONF1` (report UR §2.2): bits [8:0] `RXFIFO_FULL_THRHD`, [17:9] `TXFIFO_EMPTY_THRHD`, bit 18
+/// `CONF1` (report UR §2.2): bits `[8:0]` `RXFIFO_FULL_THRHD`, `[17:9]` `TXFIFO_EMPTY_THRHD`, bit 18
 /// `DIS_RX_DAT_OVF` ("Disable UART Rx data overflow detect"), bit 21 `RX_TOUT_EN`.
 const NINE_BITS: u32 = 0x1FF;
 const TXFIFO_EMPTY_THRHD_SHIFT: u32 = 9;
@@ -90,7 +90,7 @@ const TXFIFO_EMPTY: u32 = 1 << 1;
 const RXFIFO_OVF: u32 = 1 << 4;
 const RXFIFO_TOUT: u32 = 1 << 8;
 const TX_DONE: u32 = 1 << 14;
-/// `FSM_STATUS` bits [7:4] `ST_UTX_OUT`: 0 when the transmitter is idle, the only value software
+/// `FSM_STATUS` bits `[7:4]` `ST_UTX_OUT`: 0 when the transmitter is idle, the only value software
 /// tests (`ROM3:uart_tx_wait_idle@0x4004c4c6`; BA §7).
 /// ASSUMPTION: while a byte is being sent the field reads 1. The other states are not documented
 /// in the reports and nothing on the measured paths tells them apart.
@@ -98,14 +98,14 @@ const ST_UTX_OUT_BUSY: u32 = 1 << 4;
 /// The transmit FIFO holds 128 bytes: the ROM waits while `TXFIFO_CNT` is 128 or more
 /// (`ROM3:uart_tx_one_char_uart.part.0@0x4004c0be`; BC §G.2).
 const FIFO_BYTES: usize = 128;
-/// `CLKDIV`: bits [11:0] the integer part of the divider, bits [23:20] its fraction in sixteenths
+/// `CLKDIV`: bits `[11:0]` the integer part of the divider, bits `[23:20]` its fraction in sixteenths
 /// (`ROM3:uart_div_modify@0x4004c20c` writes both: `0x30015B` is 347 + 3/16; BC §G.2, BA §7).
 const CLKDIV_INTEGER_MASK: u32 = 0xFFF;
 const CLKDIV_FRAG_SHIFT: u32 = 20;
 const CLKDIV_FRAG_MASK: u32 = 0xF;
-/// `CLK_CONF`: bits [19:12] `SCLK_DIV_NUM`, the divider of the source clock minus one (the
+/// `CLK_CONF`: bits `[19:12]` `SCLK_DIV_NUM`, the divider of the source clock minus one (the
 /// bootloader clears it: `bootloader_console_init`, store at `0x403cc8b6` in trace F1), bits
-/// [21:20] `SCLK_SEL`, 1 = `APB_CLK` (`case UART_SCLK_APB: hw->clk_conf.sclk_sel = 1;`,
+/// `[21:20]` `SCLK_SEL`, 1 = `APB_CLK` (`case UART_SCLK_APB: hw->clk_conf.sclk_sel = 1;`,
 /// `components/hal/esp32c3/include/hal/uart_ll.h:175-176`, ESP-IDF v5.5.2), 3 = the crystal
 /// (`ROM3:Uart_Init` sets 3, store at `0x4004c2e2` in trace F1; BA §7: "the UART core clock is
 /// the crystal"; reset value 3 in `uart_reg.h:1189`, ESP-IDF v5.5.2).
@@ -120,8 +120,8 @@ const SCLK_SEL_XTAL: u32 = 3;
 const TXFIFO_RST: u32 = 1 << 18;
 /// The frame format of `CONF0` (report UR §5.1, from `uart_ll_set_parity`,
 /// `uart_ll_set_data_bit_num` and `uart_ll_set_stop_bits`, `IDF:hal/esp32c3/include/hal/uart_ll.h`):
-/// bit 1 `PARITY_EN` adds a parity bit; bits [3:2] `BIT_NUM` give 5 + `BIT_NUM` data bits;
-/// bits [5:4] `STOP_BIT_NUM` give 1, 1.5 or 2 stop bits for 1, 2 or 3.
+/// bit 1 `PARITY_EN` adds a parity bit; bits `[3:2]` `BIT_NUM` give 5 + `BIT_NUM` data bits;
+/// bits `[5:4]` `STOP_BIT_NUM` give 1, 1.5 or 2 stop bits for 1, 2 or 3.
 const PARITY_EN: u32 = 1 << 1;
 const BIT_NUM_SHIFT: u32 = 2;
 const STOP_BIT_NUM_SHIFT: u32 = 4;
