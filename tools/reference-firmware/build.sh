@@ -5,7 +5,7 @@
 #   flash_nvs.bin      the nvs_rw_value_cxx example, which keeps a restart counter in NVS;
 #   flash_nvs_ota.bin  the same application under the stock partition table of the X4
 #                      (tests/fixtures/partitions/x4-stock.bin), whose bootloader writes otadata;
-# and four applications alone, which the tests boot behind the bootloader inkemu ships:
+# and five applications alone, which the tests boot behind the bootloader inkemu ships:
 # uart_select.bin, usb_serial_jtag_echo.bin and usb_serial_jtag_console.bin (the serial consoles),
 # adc_wait_panic.bin (the wait for the SAR ADC that stops CrossPoint, its panic and core dump), and
 # deep_sleep_timer.bin (three deep sleeps woken by the RTC timer, then one with no wake source).

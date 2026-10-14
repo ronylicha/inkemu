@@ -13,12 +13,19 @@
  *
  * ESP-IDF enters the sleep through rtc_deep_sleep_start (CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP
  * keeps its default, y), which takes the CRC of the RTC fast memory with the unit of SYSTEM; the
- * ROM checks it at each wake before it calls the wake stub.
+ * ROM checks it at each wake before it calls the wake stub. When the CRC does not match, the ROM
+ * skips the stub without a word and boots from flash all the same, and the stub ESP-IDF provides
+ * does nothing on this chip; so the app brings its own stub, which counts its runs in RTC memory,
+ * and each life prints the count. Life N sees N - 1 only if the CRC matched at each wake and the
+ * stub ran from RTC fast memory. The stub follows the rules of ESP-IDF v5.5.2
+ * (docs/en/api-guides/deep-sleep-stub.rst): it lives in RTC fast memory (RTC_IRAM_ATTR), calls
+ * the default stub first, and touches only RTC memory, since flash is not mapped yet.
  */
 #include <inttypes.h>
 #include <stdio.h>
 #include <sys/time.h>
 #include "esp_attr.h"
+#include "esp_err.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 
@@ -30,6 +37,15 @@
 static RTC_DATA_ATTR uint32_t lives;
 /* The time of day, in microseconds, at which the last life went to sleep. */
 static RTC_DATA_ATTR int64_t slept_at_us;
+/* The times the wake stub below ran: once at each wake from deep sleep. */
+static RTC_DATA_ATTR uint32_t stub_runs;
+
+/* Overrides the weak stub of ESP-IDF, which the ROM calls at a wake once the CRC matched. */
+void RTC_IRAM_ATTR esp_wake_deep_sleep(void)
+{
+    esp_default_wake_deep_sleep();
+    stub_runs++;
+}
 
 static int64_t now_us(void)
 {
@@ -70,13 +86,14 @@ void app_main(void)
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     printf("deep_sleep_timer: life %" PRIu32 ", reset by %s (%d), woken by %s (%d)\n", lives,
            reset_name(reason), (int)reason, wake_name(cause), (int)cause);
+    printf("deep_sleep_timer: wake stub ran %" PRIu32 " times\n", stub_runs);
     if (cause == ESP_SLEEP_WAKEUP_TIMER) {
         printf("deep_sleep_timer: slept %" PRId64 " ms\n", (woke_at_us - slept_at_us) / 1000);
     }
     if (lives <= TIMED_LIVES) {
         printf("deep_sleep_timer: sleeping %u ms on the RTC timer\n",
                (unsigned)(SLEEP_US / 1000));
-        esp_sleep_enable_timer_wakeup(SLEEP_US);
+        ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(SLEEP_US));
     } else {
         printf("deep_sleep_timer: sleeping with no wake source\n");
     }

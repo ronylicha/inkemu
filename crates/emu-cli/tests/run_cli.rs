@@ -4216,8 +4216,11 @@ const SLEPT_MS: std::ops::Range<u64> = 2_000..3_000;
 /// Deep sleep and the wake by the RTC timer (F1, F2, F11), with an application this repository
 /// builds: `deep_sleep_timer` counts its lives in RTC memory and sleeps 2 s on the RTC timer three
 /// times; each wake is a core reset of cause 5, which the ROM prints as `rst:0x5 (DSLEEP)`, the
-/// count survives it, and ESP-IDF reads the wake cause "timer". Life 4 sleeps with no wake source:
-/// the run ends there, the device asleep, with exit code 0.
+/// count survives it, and ESP-IDF reads the wake cause "timer". The app brings its own wake stub,
+/// which counts its runs in RTC memory: life N reads N - 1 only if the ROM found the CRC of the
+/// RTC fast memory right at each wake and ran the stub from it, a path the console would not show
+/// otherwise, since the ROM boots from flash all the same when the CRC is wrong. Life 4 sleeps
+/// with no wake source: the run ends there, the device asleep, with exit code 0.
 ///
 /// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
 #[test]
@@ -4248,12 +4251,17 @@ fn x4_runs_the_deep_sleep_timer_reference_firmware_through_three_wakes_into_a_sl
     let mut expected = vec![
         "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n".to_owned(),
         "deep_sleep_timer: life 1, reset by power-on (1), woken by nothing (0)\n".to_owned(),
+        "deep_sleep_timer: wake stub ran 0 times\n".to_owned(),
         "deep_sleep_timer: sleeping 2000 ms on the RTC timer\n".to_owned(),
     ];
     for life in 2..=4 {
         expected.push(wake.to_owned());
         expected.push(format!(
             "deep_sleep_timer: life {life}, reset by deep sleep (8), woken by the RTC timer (4)\n"
+        ));
+        expected.push(format!(
+            "deep_sleep_timer: wake stub ran {} times\n",
+            life - 1
         ));
         expected.push("deep_sleep_timer: slept ".to_owned());
         expected.push(if life < 4 {
@@ -4270,17 +4278,33 @@ fn x4_runs_the_deep_sleep_timer_reference_firmware_through_three_wakes_into_a_sl
         from += at + expected.len();
     }
     assert_eq!(console.matches("rst:").count(), 4, "{console}");
-    for slept in console.lines().filter_map(|line| {
-        line.strip_prefix("deep_sleep_timer: slept ")
-            .and_then(|rest| rest.strip_suffix(" ms"))
-    }) {
-        let slept: u64 = slept
-            .parse()
-            .unwrap_or_else(|e| panic!("`{slept}`: {e}\n{console}"));
+    assert_eq!(
+        console.matches("deep_sleep_timer: wake stub ran ").count(),
+        4,
+        "{console}"
+    );
+    let slept: Vec<u64> = console
+        .lines()
+        .filter_map(|line| line.strip_prefix("deep_sleep_timer: slept "))
+        .map(|rest| {
+            let ms = rest
+                .strip_suffix(" ms")
+                .unwrap_or_else(|| panic!("`{rest}` does not end in ` ms`:\n{console}"));
+            ms.parse()
+                .unwrap_or_else(|e| panic!("`{ms}`: {e}\n{console}"))
+        })
+        .collect();
+    assert_eq!(slept.len(), 3, "one slept line per wake:\n{console}");
+    for slept in slept {
         assert!(SLEPT_MS.contains(&slept), "slept {slept} ms:\n{console}");
     }
+    let woken = "inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset; the CPU had stopped at pc ";
+    assert_eq!(
+        log.matches(woken).count(),
+        3,
+        "one wake line per wake:\n{log}"
+    );
     for line in [
-        "inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset; the CPU had stopped at pc ",
         "\ninkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here\n",
         " us of device time; it waits for nothing: the firmware enabled no wake source\n",
     ] {
