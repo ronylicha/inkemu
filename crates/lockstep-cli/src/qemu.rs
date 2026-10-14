@@ -285,9 +285,14 @@ fn check(status: ExitStatus) -> Result<(), QemuError> {
 }
 
 /// How many times [`clean_up`] removes the container and looks again before it gives up, and
-/// how long it waits between two tries: 10 s in all.
-const REMOVE_TRIES: u32 = 50;
+/// how long it waits between two tries: 120 s in all, as long as Docker is given to start QEMU.
+/// A daemon slow enough to miss the open timeout is slow to create the container too: measured
+/// on 2026-10-14 on a loaded host, it created one about two minutes after `docker run`, after a
+/// first version of this loop, bounded at 10 s, had killed the client and left.
+const REMOVE_TRIES: u32 = 600;
 const REMOVE_POLL: Duration = Duration::from_millis(200);
+/// After this many tries, 10 s, the user is told what the tool waits for.
+const REMOVE_NOTICE: u32 = 50;
 
 /// What [`clean_up`] needs of Docker, behind a trait so that its logic is tested without one.
 trait Docker {
@@ -317,21 +322,29 @@ enum Cleanup {
     Left,
 }
 
-/// Removes the container `name` without a race with a slow daemon. A container the daemon
-/// creates late, after a first removal found nothing, is removed by a later try: the removal is
-/// repeated until the client has exited (it does once its container is gone, or never started)
-/// and Docker says the container does not exist, [`REMOVE_TRIES`] times at most, `poll` apart.
-/// Past that the client is killed and one more removal made.
+/// Removes the container `name` without a race with a slow daemon. The client is not killed
+/// while the daemon may still create the container: it exits by itself once the daemon answers,
+/// since a container removed while it is being created cannot be started. The removal is
+/// repeated until the client has exited and Docker says the container does not exist,
+/// [`REMOVE_TRIES`] times at most, `poll` apart; `notice` is called once after
+/// [`REMOVE_NOTICE`] tries. Past the bound the client is killed and one more removal made.
 fn clean_up(
     docker: &mut impl Docker,
     client: &mut impl Client,
     name: &str,
     poll: Duration,
+    notice: impl FnOnce(),
 ) -> Cleanup {
-    for _ in 0..REMOVE_TRIES {
+    let mut notice = Some(notice);
+    for tries in 0..REMOVE_TRIES {
         docker.remove(name);
         if client.exited() && docker.exists(name) == Some(false) {
             return Cleanup::Removed;
+        }
+        if tries + 1 == REMOVE_NOTICE
+            && let Some(notice) = notice.take()
+        {
+            notice();
         }
         std::thread::sleep(poll);
     }
@@ -408,7 +421,20 @@ impl Client for Child {
 
 impl Drop for Qemu {
     fn drop(&mut self) {
-        let cleanup = clean_up(&mut HostDocker, &mut self.child, &self.name, REMOVE_POLL);
+        let name = self.name.clone();
+        let cleanup = clean_up(
+            &mut HostDocker,
+            &mut self.child,
+            &self.name,
+            REMOVE_POLL,
+            || {
+                eprintln!(
+                    "inkemu-lockstep: waiting for Docker to release the container {name} \
+                     (up to {} s)",
+                    REMOVE_POLL.as_millis() * u128::from(REMOVE_TRIES) / 1000
+                );
+            },
+        );
         if let Some(warning) = cleanup_warning(cleanup, &self.name) {
             eprintln!("{warning}");
         }
@@ -565,8 +591,9 @@ mod tests {
         }
     }
 
-    /// Runs [`clean_up`] on `docker` and a client linked to it; whether the client was killed.
-    fn run(docker: &mut FakeDocker, stuck: bool) -> (Cleanup, bool) {
+    /// Runs [`clean_up`] on `docker` and a client linked to it; whether the client was killed,
+    /// and whether the user was told of the wait.
+    fn run(docker: &mut FakeDocker, stuck: bool) -> (Cleanup, bool, bool) {
         let done = std::cell::Cell::new(false);
         let mut client = FakeClient {
             gone: &done,
@@ -577,13 +604,16 @@ mod tests {
             docker,
             done: &done,
         };
+        let told = std::cell::Cell::new(0);
         let cleanup = clean_up(
             &mut linked,
             &mut client,
             &container_name(42, 7),
             Duration::ZERO,
+            || told.set(told.get() + 1),
         );
-        (cleanup, client.killed)
+        assert!(told.get() <= 1, "told once at most");
+        (cleanup, client.killed, told.get() == 1)
     }
 
     #[test]
@@ -598,11 +628,17 @@ mod tests {
         // The first removal finds nothing; the daemon creates the container afterwards, while
         // the client still waits for it, and a later try removes it.
         let mut docker = FakeDocker::new(Some(9), true);
-        let (cleanup, killed) = run(&mut docker, false);
+        let (cleanup, killed, told) = run(&mut docker, false);
         assert_eq!(cleanup, Cleanup::Removed);
-        assert!(docker.removed && !docker.exists && !killed);
+        assert!(docker.removed && !docker.exists && !killed && !told);
         assert!(docker.removals > 1, "removed after it appeared");
         assert_eq!(cleanup_warning(cleanup, "inkemu-lockstep-42-7"), None);
+        // As measured: the daemon creates it minutes later, long after a 10 s bound. The client
+        // is not killed meanwhile, the user is told of the wait, and the container is removed.
+        let mut docker = FakeDocker::new(Some(4 * REMOVE_NOTICE), true);
+        let (cleanup, killed, told) = run(&mut docker, false);
+        assert_eq!(cleanup, Cleanup::Removed);
+        assert!(docker.removed && !killed && told);
     }
 
     #[test]
@@ -610,7 +646,7 @@ mod tests {
         let name = container_name(42, 7);
         // The container exists and every removal fails.
         let mut docker = FakeDocker::new(Some(1), false);
-        let (cleanup, killed) = run(&mut docker, false);
+        let (cleanup, killed, _) = run(&mut docker, false);
         assert_eq!(cleanup, Cleanup::Left);
         assert!(killed, "the client is killed past the bound");
         assert_eq!(docker.removals, REMOVE_TRIES + 1);
@@ -622,9 +658,9 @@ mod tests {
         // The daemon never creates the container and the client waits for it forever: the
         // client is killed, and the name is given in case the daemon creates it later.
         let mut docker = FakeDocker::new(None, true);
-        let (cleanup, killed) = run(&mut docker, true);
+        let (cleanup, killed, told) = run(&mut docker, true);
         assert_eq!(cleanup, Cleanup::Unconfirmed);
-        assert!(killed);
+        assert!(killed && told);
         let warning = cleanup_warning(cleanup, &name).unwrap();
         assert!(warning.contains(&name), "{warning}");
     }
