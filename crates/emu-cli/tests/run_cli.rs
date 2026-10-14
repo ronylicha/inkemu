@@ -149,6 +149,64 @@ fn a_file_that_is_no_session_exits_2_before_any_rom_is_read() {
         ));
 }
 
+/// A session comes from anywhere: one whose profile text holds an escape sequence, which TOML
+/// refuses and whose line the refusal quotes, reaches the terminal escaped.
+#[test]
+fn a_session_whose_profile_would_drive_the_terminal_is_refused_with_its_text_escaped() {
+    use sha2::{Digest as _, Sha256};
+    let text = boards::builtin_toml("x4").unwrap().to_owned();
+    let session = session::Session {
+        rom: session::RomIdentity {
+            revision: 3,
+            sha256: [0; 32],
+        },
+        profile: session::ProfileText {
+            id: "x4".to_owned(),
+            text: text.clone(),
+        },
+        flash: vec![0xFF; 16 << 20],
+        limits: session::Limits::default(),
+        usb_host: soc_esp32c3::UsbHost::Open,
+        inputs: Vec::new(),
+        outcome: session::Outcome {
+            end: session::End::Idle,
+            device_time: emu_core::Cycles(0),
+            cycles: 0,
+            instructions: 0,
+            trace_hash: 0,
+            flash_sha256: [0; 32],
+            consoles: [[0; 32]; 3],
+        },
+    };
+    let mut bytes = session.to_bytes().unwrap();
+    // The writer refuses such a text: the file is changed afterwards, its SHA-256 redone.
+    let hostile = text.replacen("name = \"Xteink X4\"", "name = \"\u{1b}[2Jnk X4\"", 1);
+    for (from, to) in [
+        (text.as_bytes().to_vec(), hostile.as_bytes().to_vec()),
+        (
+            Sha256::digest(text.as_bytes()).to_vec(),
+            Sha256::digest(hostile.as_bytes()).to_vec(),
+        ),
+    ] {
+        let at = bytes
+            .windows(from.len())
+            .position(|window| window == from.as_slice())
+            .unwrap();
+        bytes[at..at + to.len()].copy_from_slice(&to);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hostile.inkrec");
+    std::fs::write(&path, &bytes).unwrap();
+    inkemu()
+        .arg("replay")
+        .arg(&path)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::function(|err: &[u8]| !err.contains(&0x1b)))
+        .stderr(contains("is refused: ").and(contains("\\u{1b}[2Jnk X4")));
+}
+
 #[test]
 fn record_refuses_the_path_of_a_file_the_run_reads_before_any_rom_is_read() {
     let dir = tempfile::tempdir().unwrap();

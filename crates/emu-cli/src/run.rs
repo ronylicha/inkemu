@@ -388,6 +388,19 @@ pub fn exit_code_with_script(code: u8, script: Option<&ScriptStatus>) -> u8 {
     }
 }
 
+/// The exit code of a run that ended as `end` with its console script at `script`, `saved`
+/// telling whether what the run writes once it is over (its flash file, its session) was
+/// written: when something was not, the code says so ([`RunEnd::exit_code_without_its_flash`])
+/// whatever the script did.
+#[must_use]
+pub fn exit_code_of_run(end: RunEnd, script: Option<&ScriptStatus>, saved: bool) -> u8 {
+    if saved {
+        exit_code_with_script(end.exit_code(), script)
+    } else {
+        end.exit_code_without_its_flash()
+    }
+}
+
 /// The line of the summary that says how far the console script got.
 fn say_script(log: &mut dyn Write, status: &ScriptStatus, steps: usize) {
     let _ = match status {
@@ -1019,6 +1032,30 @@ mod tests {
                 code
             );
             assert_eq!(exit_code_with_script(code, None), code);
+        }
+    }
+
+    #[test]
+    fn a_run_whose_flash_file_or_session_was_not_written_exits_as_one_without_its_flash() {
+        let waiting = ScriptStatus::WaitingFor {
+            step: console_script::Step {
+                line: 2,
+                action: console_script::Action::Wait { nanos: 1 },
+            },
+        };
+        for end in RunEnd::ALL {
+            for script in [None, Some(&waiting), Some(&ScriptStatus::Complete)] {
+                assert_eq!(
+                    exit_code_of_run(end, script, true),
+                    exit_code_with_script(end.exit_code(), script),
+                    "{end:?}"
+                );
+                assert_eq!(
+                    exit_code_of_run(end, script, false),
+                    end.exit_code_without_its_flash(),
+                    "{end:?}: a script not through says nothing more than a lost write"
+                );
+            }
         }
     }
 

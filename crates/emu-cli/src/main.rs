@@ -4,28 +4,28 @@ use clap::{Parser, Subcommand};
 use console_script::ScriptRun;
 use cpu_rv32::{HartConfig, MisalignedPolicy};
 use emu_cli::exit::{
-    EXIT_DIVERGED, EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, REPLAY_EXIT_CODES_HELP,
+    EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, REPLAY_EXIT_CODES_HELP,
     RUN_EXIT_CODES_HELP,
 };
 use emu_cli::firmware_file;
 use emu_cli::flash_file;
 use emu_cli::flash_state::{self, Input, RunFlash, Seed};
-use emu_cli::record::{Recorder, Verdict, replay_options, verdict};
+use emu_cli::record::{Recorder, record_session, replay_options, report_replay, start_replay};
 use emu_cli::rom_store::{
     self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
 };
 use emu_cli::run::{
-    Interrupt, RunEnd, RunExtras, RunOptions, execute_with_script, exit_code_with_script,
-    parse_device_seconds, relay,
+    Interrupt, RunExtras, RunOptions, execute_with_script, exit_code_of_run, parse_device_seconds,
+    relay,
 };
 use emu_cli::rvtest::{RunResult, TestMachine};
 use emu_cli::script_file;
 use emu_cli::session_file::{self, Claimed};
 use emu_cli::term::sanitize;
 use firmware::BootloaderWarning;
-use session::{ConsoleDigests, Limits, ProfileText, Replay, ReplayError, RomIdentity};
+use session::{ConsoleDigests, Limits, ProfileText, RomIdentity};
 use sha2::{Digest as _, Sha256};
-use soc_esp32c3::{ConsoleChannel, Esp32C3, RomImage, UsbHost};
+use soc_esp32c3::{ConsoleChannel, RomImage, UsbHost};
 use std::fmt::Write as _;
 use std::io;
 use std::ops::ControlFlow;
@@ -576,15 +576,14 @@ fn run_device(
     // session, and their flushes to the disk), and they complete; the exit code is the one of
     // the end above.
     let flash_saved = run_flash.finish(&machine, &mut io::stderr().lock());
-    let session_saved = recorder
-        .zip(record)
-        .is_none_or(|(recorder, path)| record_session(recorder, &machine, end, path));
-    let code = if flash_saved && session_saved {
-        exit_code_with_script(end.exit_code(), script_status.as_ref())
-    } else {
-        end.exit_code_without_its_flash()
-    };
-    ExitCode::from(code)
+    let session_saved = recorder.zip(record).is_none_or(|(recorder, path)| {
+        record_session(recorder, &machine, end, path, &mut io::stderr().lock())
+    });
+    ExitCode::from(exit_code_of_run(
+        end,
+        script_status.as_ref(),
+        flash_saved && session_saved,
+    ))
 }
 
 /// Refuses a file the run only reads (`--flash`, `--firmware`, `--bootloader`) that is the flash
@@ -662,45 +661,11 @@ fn refuse_record_path(
     boards::builtin_toml(device).map(Some).map_err(|e| fail(&e))
 }
 
-/// Writes the session of the run of `machine`, which ended as `end`, to `path`, and says so;
-/// `false`, after saying why, when it cannot be written.
-fn record_session(recorder: Recorder, machine: &Esp32C3, end: RunEnd, path: &Path) -> bool {
-    let written = recorder
-        .finish(machine, end)
-        .map_err(|e| e.to_string())
-        .and_then(|session| {
-            let bytes = session.to_bytes().map_err(|e| e.to_string())?;
-            session_file::write_session(path, &bytes).map_err(|e| e.to_string())?;
-            Ok(session)
-        });
-    match written {
-        Ok(session) => {
-            write_line(
-                io::stderr(),
-                &format_args!(
-                    "inkemu: session recorded in {} ({} inputs); `inkemu replay` replays it",
-                    file_name(path),
-                    session.inputs.len()
-                ),
-            );
-            true
-        }
-        Err(e) => {
-            write_line(
-                io::stderr(),
-                &format_args!(
-                    "error: the run is not recorded in {}: {e}",
-                    sanitize(&path.display().to_string())
-                ),
-            );
-            false
-        }
-    }
-}
-
 /// `inkemu replay`: replays the session in `path` as a run shows its console, then compares what
 /// it gives with what the session recorded (G6). It reads no path of the recording and writes
-/// nothing.
+/// nothing of the run, not even the flash; without `rom_dir`, the ROM cache downloads the ROM on
+/// first use, as for `run`. A session comes from anywhere: what it says reaches the terminal
+/// with its control characters escaped.
 fn run_replay(path: &Path, console: Option<ConsoleChannel>, rom_dir: Option<PathBuf>) -> ExitCode {
     let session = match session_file::read_session(path) {
         Ok(session) => session,
@@ -709,23 +674,16 @@ fn run_replay(path: &Path, console: Option<ConsoleChannel>, rom_dir: Option<Path
     // The reader rebuilt it once already: it is the device of the session.
     let profile = match session.profile.device() {
         Ok(profile) => profile,
-        Err(e) => return fail(&e),
+        Err(e) => return fail(&sanitize(&e.to_string())),
     };
     let entry = rom_store::rom_entry_for(profile.chip_revision);
     let rom = match load_rom(rom_dir, entry) {
         Ok(rom) => rom,
         Err(code) => return code,
     };
-    let mut machine = match Replay::start(&session, rom) {
-        Ok(replay) => replay.into_machine(),
-        Err(e @ ReplayError::Rom { .. }) => {
-            return fail(&format_args!(
-                "{e}: this inkemu loads ROM revision {} for the device, from `inkemu rom fetch --device {}` or --rom-dir; a session recorded on another ROM replays with the inkemu that recorded it",
-                entry.rom_revision,
-                sanitize(&profile.id)
-            ));
-        }
-        Err(e) => return fail(&e),
+    let mut machine = match start_replay(&session, rom, entry.rom_revision) {
+        Ok(machine) => machine,
+        Err(message) => return fail(&message),
     };
     let (shown, origin) = shown_console(&profile, console);
     let options = replay_options(&session, shown);
@@ -760,37 +718,13 @@ fn run_replay(path: &Path, console: Option<ConsoleChannel>, rom_dir: Option<Path
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     );
-    if let Some(cut) = session.limits.cut {
-        write_line(
-            io::stderr(),
-            &format_args!(
-                "inkemu: the session was cut by {} at {} us of device time when it was recorded; its replay stops there",
-                cut.reason.name(),
-                soc_esp32c3::clock::TIME_BASE.cycles_to_nanos(cut.at) / 1_000
-            ),
-        );
-    }
-    match verdict(&session, &machine, end, digests) {
-        Ok(Verdict::Identical) => {
-            write_line(
-                io::stderr(),
-                &"inkemu: the replay gives what the session recorded: the same end, device time, cycles, instructions, trace hash, final flash and consoles",
-            );
-            ExitCode::SUCCESS
-        }
-        Ok(Verdict::Diverged(divergence)) => {
-            write_line(
-                io::stderr(),
-                &format_args!("inkemu: the replay diverges from the session: {divergence}"),
-            );
-            ExitCode::from(EXIT_DIVERGED)
-        }
-        Ok(Verdict::Cut(reason)) => fail(&format_args!(
-            "the replay was cut by {} before the end of its session: nothing was compared; let it run to its end",
-            reason.name()
-        )),
-        Err(e) => fail(&e),
-    }
+    ExitCode::from(report_replay(
+        &session,
+        &machine,
+        end,
+        digests,
+        &mut io::stderr().lock(),
+    ))
 }
 
 /// The part of the first line of a run that names its flash: the flash file it starts from, or
@@ -944,7 +878,8 @@ fn watch_ctrl_c(interrupt: &Arc<Interrupt>) -> Result<(), ctrlc::Error> {
 }
 
 /// The one line that says what is being emulated, how much to trust its timing and which console
-/// is shown (`console_note`).
+/// is shown (`console_note`). The name of the profile is escaped: a replay takes it from a
+/// session, which comes from anywhere.
 fn header(
     profile: &DeviceProfile,
     entry: &RomEntry,
@@ -954,7 +889,7 @@ fn header(
     let timing = machine.timing_model();
     format!(
         "inkemu: {} (ESP32-C3 {}, mask ROM rev{}); timing model {} ({}); {console_note}",
-        profile.name,
+        sanitize(&profile.name),
         profile.chip_revision,
         entry.rom_revision,
         timing.name(),
@@ -1236,6 +1171,27 @@ mod tests {
                 "; console: usb-serial-jtag (the default of the device profile; --console shows another)"
             ),
             "{line}"
+        );
+    }
+
+    /// A replay takes its profile from a session, which comes from anywhere: a name that would
+    /// drive the terminal reaches it escaped.
+    #[test]
+    fn the_first_line_escapes_the_name_of_the_profile() {
+        use soc_esp32c3::test_support::{HANG, flat_rom};
+        let text = boards::builtin_toml("x4").unwrap().replacen(
+            "name = \"Xteink X4\"",
+            "name = \"\\u001b]0;title\\u0007X4\"",
+            1,
+        );
+        let profile = DeviceProfile::from_named_toml("x4", "the profile of the session", &text)
+            .expect("a name may hold any character");
+        let entry = rom_store::rom_entry_for(profile.chip_revision);
+        let machine = profile.instantiate(flat_rom(&[HANG]), MachineOptions::default());
+        let line = header(&profile, entry, &machine, "console: uart0 (--console)");
+        assert!(
+            line.starts_with("inkemu: \\u{1b}]0;title\\u{7}X4 (ESP32-C3 "),
+            "{line:?}"
         );
     }
 

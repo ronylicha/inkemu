@@ -25,12 +25,10 @@ pub enum SessionFileError {
         "the session {path} held more than {MAX_SESSION_BYTES} bytes when it was read (it grew while it was being read); give a file that nothing else writes"
     )]
     Grew { path: String },
-    #[error("the session {path} is refused: {source}")]
-    Refused {
-        path: String,
-        #[source]
-        source: ReadError,
-    },
+    /// `detail` is what the [`ReadError`] says, its control characters escaped: a refusal can
+    /// quote the file (a line of the text of its profile), and a session comes from anywhere.
+    #[error("the session {path} is refused: {detail}")]
+    Refused { path: String, detail: String },
     #[error("--record names {path}, which is {what}; give --record another path")]
     Claimed { path: String, what: String },
     #[error(
@@ -82,9 +80,9 @@ pub fn read_session(path: &Path) -> Result<Session, SessionFileError> {
         },
         ReadFailure::Grew(_) => SessionFileError::Grew { path: shown(path) },
     })?;
-    Session::from_bytes(&bytes).map_err(|source| SessionFileError::Refused {
+    Session::from_bytes(&bytes).map_err(|refusal: ReadError| SessionFileError::Refused {
         path: shown(path),
-        source,
+        detail: sanitize(&refusal.to_string()),
     })
 }
 
