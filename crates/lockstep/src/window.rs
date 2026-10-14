@@ -65,7 +65,7 @@ pub fn window(name: &str) -> Option<&'static Window> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table::{DIFFERENCES, Treatment};
+    use crate::table::{DIFFERENCES, Location, Treatment};
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
@@ -98,21 +98,36 @@ mod tests {
         }
     }
 
+    /// Where a treatment acts, and whether only after a reset: a register's copies, a counter, a
+    /// slow clock. An entry after a reset adds bits to the copies of the same address
+    /// (`Difference::registers_at`), so it is owned apart.
+    fn owned(treatment: &Treatment) -> Vec<(bool, Location)> {
+        match *treatment {
+            Treatment::Registers(registers) => registers
+                .iter()
+                .map(|register| (false, Location::Mmio(register.address)))
+                .collect(),
+            Treatment::RegistersAfterReset(registers) => registers
+                .iter()
+                .map(|register| (true, Location::Mmio(register.address)))
+                .collect(),
+            Treatment::Counter { location, .. } => vec![(false, location)],
+            Treatment::SlowClock { register, .. } => vec![(false, Location::Mmio(register))],
+            _ => Vec::new(),
+        }
+    }
+
     #[test]
-    fn a_register_is_named_by_one_row_of_a_window() {
+    fn a_register_counter_or_clock_is_named_by_one_row_of_a_window() {
         for window in WINDOWS {
             let mut owner = BTreeMap::new();
             for row in window.rows {
                 for treatment in row.treatments {
-                    if let Treatment::Registers(registers) = treatment {
-                        for register in *registers {
-                            let first = *owner.entry(register.address).or_insert(row.number);
-                            assert_eq!(
-                                first, row.number,
-                                "window {}: {:#010x}",
-                                window.name, register.address
-                            );
-                        }
+                    // Two entries of a row at one address (an SPI1 data register, one per
+                    // command) are one owner.
+                    for site in owned(treatment) {
+                        let first = *owner.entry(site).or_insert(row.number);
+                        assert_eq!(first, row.number, "window {}: {site:?}", window.name);
                     }
                 }
             }

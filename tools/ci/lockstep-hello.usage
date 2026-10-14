@@ -5,7 +5,6 @@
 # less often fails the run (exit 3), so a model change that makes an admitted difference show up
 # more often, or less, is seen. Measure again and update this file, with the documentation, when
 # such a change is meant.
-row  1: 5572920 uses
 row  2: 6813950 uses
 row  3: 15 uses
 row  4: 188988 uses
@@ -13,7 +12,7 @@ row  5: 1118166 uses
 row  6: 6483 uses
 row  7: 40 uses
 row  8: 162 uses
-row  9: 162 uses
+row  9: 165 uses
 row 10: 132 uses
 row 11: 549 uses
 row 12: 268 uses
@@ -31,5 +30,5 @@ row 23: 28892 uses
 row 24: 2 uses
 row 25: 4789611 uses
 row 26: 13 uses
-row 27: 51 uses
+row 27: 46 uses
 row 28: 4 uses

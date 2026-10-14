@@ -8,8 +8,8 @@
 use cpu_rv32::asm::{addi, csrrs, csrrw, lui, lw, sw};
 use lockstep::table::PMP_RWX;
 use lockstep::{
-    Cause, CpuState, Difference, End, Field, KeptCsr, Location, Lockstep, Register, Site, Target,
-    TraceReader, Treatment, Window, WindowEnd, render_block,
+    Cause, CpuState, Difference, End, Field, Kept, KeptCsr, Location, Lockstep, Register, Site,
+    Target, TraceReader, Treatment, Window, WindowEnd, kept, render_block,
 };
 use soc_esp32c3::memmap::{ROM_BASE, SRAM_DBUS_BASE};
 use soc_esp32c3::test_support::{HANG, flat_rom, store_register};
@@ -120,7 +120,7 @@ fn a_reset_of_both_sides_ends_a_window_that_crosses_none_and_is_crossed_otherwis
 
 /// QEMU's states of `states` after the first reset, with `value` in `reg` until the life after
 /// it writes `reg`, at state `written` (exclusive), as QEMU keeps a register through its reset.
-fn kept(states: &mut [CpuState], reg: u8, value: u32, written: usize) {
+fn keep_in_qemu(states: &mut [CpuState], reg: u8, value: u32, written: usize) {
     let first = resets(states)[0];
     for state in &mut states[first..written] {
         state.set(Field::X(reg), value);
@@ -130,7 +130,10 @@ fn kept(states: &mut [CpuState], reg: u8, value: u32, written: usize) {
 const KEPT_S1: &[Difference] = &[Difference {
     number: 1,
     summary: "s1 and a0, kept by QEMU at its reset",
-    treatments: &[Treatment::KeptAtReset(&[Field::X(S1), Field::X(A0)])],
+    treatments: &[Treatment::KeptAtReset(&[
+        kept(Field::X(S1), 0),
+        kept(Field::X(A0), 0),
+    ])],
 }];
 
 #[test]
@@ -140,7 +143,7 @@ fn a_register_qemu_keeps_through_its_reset_is_held_until_written_and_a_read_of_i
     let mut states = record(&program, 16);
     let first = resets(&states)[0];
     let end = states.len();
-    kept(&mut states, S1, 0x55, end);
+    keep_in_qemu(&mut states, S1, 0x55, end);
     let (end, _, _) = compare(&text(&states), &program, &window(KEPT_S1, 1));
     let End::Divergence(report) = end else {
         panic!("a read of the held s1: {end:?}");
@@ -163,7 +166,7 @@ fn a_register_qemu_keeps_through_its_reset_is_held_until_written_and_a_read_of_i
     let program = lives(&[addi(S1, 0, 0x55), addi(A1, S1, 1)]);
     let mut states = record(&program, 16);
     let first = resets(&states)[0];
-    kept(&mut states, S1, 0x55, first + 1);
+    keep_in_qemu(&mut states, S1, 0x55, first + 1);
     let (end, lockstep, target) = compare(&text(&states), &program, &window(KEPT_S1, 1));
     assert_eq!(end, End::Window(WindowEnd::Reset));
     assert_eq!(
@@ -179,7 +182,7 @@ fn a_register_qemu_keeps_through_its_reset_is_held_until_written_and_a_read_of_i
     // Held at another value than the one QEMU had before its reset, it is a divergence: the row
     // admits only what QEMU kept.
     let mut states = record(&program, 16);
-    kept(&mut states, S1, 0x56, first + 1);
+    keep_in_qemu(&mut states, S1, 0x56, first + 1);
     let (end, _, _) = compare(&text(&states), &program, &window(KEPT_S1, 1));
     assert!(matches!(end, End::Divergence(_)), "{end:?}");
 }
@@ -198,7 +201,7 @@ fn a_held_register_stored_to_memory_holds_the_register_it_is_loaded_back_into() 
     let first = resets(&states)[0];
     // The second life's s1 is written by its fourth instruction; a0, loaded by its third, holds
     // QEMU's 0x55 until the end of the trace.
-    kept(&mut states, S1, 0x55, first + 4);
+    keep_in_qemu(&mut states, S1, 0x55, first + 4);
     for state in &mut states[first + 3..] {
         if state.pc() != ROM_BASE || state.get(Field::X(A0)) != 0 {
             state.set(Field::X(A0), 0x55);
@@ -220,7 +223,7 @@ fn a_held_register_stored_to_memory_holds_the_register_it_is_loaded_back_into() 
     let program = lives(&body);
     let mut states = record(&program, 30);
     let first = resets(&states)[0];
-    kept(&mut states, S1, 0x55, first + 3);
+    keep_in_qemu(&mut states, S1, 0x55, first + 3);
     let (end, _, _) = compare(&text(&states), &program, &window(KEPT_S1, 1));
     assert!(
         matches!(&end, End::Divergence(report) if report.cause == Cause::ReadKeptAtReset { field: Field::X(S1) }),
@@ -299,6 +302,102 @@ fn a_csr_qemu_partly_keeps_reads_as_inkemus_with_the_kept_bits_it_held_before_th
     assert_eq!(lockstep.usage(&target).uses(1), 1);
     // Keeping L or A as well is not what the row says.
     let (end, _, _) = compare(&qemu(0x8F), &program, &window(PMP, 1));
+    assert!(matches!(end, End::Divergence(_)), "{end:?}");
+}
+
+#[test]
+fn a_csr_qemu_partly_keeps_is_compared_once_the_life_after_the_reset_writes_it() {
+    // Each life writes 0 to pmpcfg0 and reads it into a0, then leaves R, W, X set: the second
+    // life's read follows its own write, which the kept bits no longer explain.
+    let program = lives(&[
+        csrrw(0, PMPCFG0, 0),
+        csrrs(A0, PMPCFG0, 0),
+        addi(A1, 0, 0x07),
+        csrrw(0, PMPCFG0, A1),
+    ]);
+    let states = record(&program, 30);
+    let at = resets(&states);
+    let mut qemu = states.clone();
+    // QEMU reads the R, W, X bits of the first life after the second life wrote 0: a model that
+    // lost the write would read so, and the row must not admit it.
+    for state in &mut qemu[at[0] + 2..=at[1]] {
+        state.set(Field::X(A0), 0x07);
+    }
+    let (end, _, _) = compare(&text(&qemu[..=at[1]]), &program, &window(PMP, 1));
+    assert!(
+        matches!(&end, End::Divergence(report) if report.index == u64::try_from(at[0] + 1).unwrap()),
+        "{end:?}"
+    );
+}
+
+#[test]
+fn a_register_of_the_rows_after_a_reset_is_compared_once_the_life_after_it_stores_to_it() {
+    // The second life stores to UART0.CLKDIV, then loads it: the copy after the reset no longer
+    // holds, and a difference is a divergence.
+    let program = lives(&[lui(5, 0x6000_0000), sw(0, 5, 0x14), lw(A1, 5, 0x14)]);
+    let states = record(&program, 30);
+    let at = resets(&states);
+    let mut qemu = states;
+    for state in &mut qemu[at[0] + 3..=at[1]] {
+        let read = state.x(A1);
+        state.set(Field::X(A1), read ^ 0x0F);
+    }
+    let (end, _, _) = compare(&text(&qemu[..=at[1]]), &program, &window(AFTER_RESET, 1));
+    assert!(
+        matches!(&end, End::Divergence(report) if report.index == u64::try_from(at[0] + 2).unwrap()),
+        "{end:?}"
+    );
+}
+
+const KEPT_S1_AT_1: &[Difference] = &[Difference {
+    number: 1,
+    summary: "s1, kept by QEMU at its reset, declared 1 at inkemu's",
+    treatments: &[Treatment::KeptAtReset(&[kept(Field::X(S1), 1)])],
+}];
+
+#[test]
+fn a_hold_starts_only_from_the_reset_value_the_row_declares() {
+    // inkemu's reset leaves s1 at 0; a row that declares 1 does not hold the difference.
+    let program = lives(&[addi(S1, 0, 0x55), addi(A1, S1, 1)]);
+    let mut states = record(&program, 16);
+    let first = resets(&states)[0];
+    keep_in_qemu(&mut states, S1, 0x55, first + 1);
+    let (end, _, _) = compare(&text(&states), &program, &window(KEPT_S1_AT_1, 1));
+    assert!(
+        matches!(&end, End::Divergence(report) if report.cause == Cause::State),
+        "{end:?}"
+    );
+}
+
+const KEPT_MPIE: &[Difference] = &[Difference {
+    number: 1,
+    summary: "mstatus.MPIE, kept by QEMU at its reset",
+    treatments: &[Treatment::KeptAtReset(&[Kept {
+        field: Field::Mstatus,
+        bits: 1 << 7,
+        reset: 0,
+    }])],
+}];
+
+#[test]
+fn of_a_partly_held_csr_only_the_held_bits_may_differ() {
+    // Each life writes MPIE at its end; QEMU keeps it through its reset, until the second life
+    // writes it again (a write, not a read-modify-write, which would read the held bit).
+    let program = lives(&[NOP, NOP, addi(A1, 0, 0x80), csrrw(0, 0x300, A1)]);
+    let states = record(&program, 30);
+    let at = resets(&states);
+    let qemu = |bits: u32| {
+        let mut states = states.clone();
+        for state in &mut states[at[0]..at[0] + 4] {
+            state.set(Field::Mstatus, state.get(Field::Mstatus) | bits);
+        }
+        text(&states[..=at[1]])
+    };
+    let (end, lockstep, target) = compare(&qemu(0x80), &program, &window(KEPT_MPIE, 1));
+    assert_eq!(end, End::Window(WindowEnd::Reset));
+    assert!(lockstep.usage(&target).uses(1) > 0);
+    // MIE as well is not what the row holds.
+    let (end, _, _) = compare(&qemu(0x88), &program, &window(KEPT_MPIE, 1));
     assert!(matches!(end, End::Divergence(_)), "{end:?}");
 }
 

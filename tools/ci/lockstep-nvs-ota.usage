@@ -3,14 +3,13 @@
 # whose bootloader writes otadata, from power-on through the reset esp_restart asks for to the
 # second one. Measured on 2026-10-14 (QEMU esp_develop_9.2.2_20250817 in espressif/idf:v5.5.2).
 # Passed to --expect-usage by the CI step that compares flash_nvs_ota.bin.
-row  1: 6462597 uses
 row  2: 7701891 uses
 row  3: 15 uses
 row  4: 188988 uses
 row  5: 1118182 uses
 row  6: 7150 uses
 row  8: 169 uses
-row  9: 162 uses
+row  9: 165 uses
 row 10: 126 uses
 row 11: 549 uses
 row 12: 268 uses
@@ -27,7 +26,7 @@ row 22: 388 uses
 row 23: 28892 uses
 row 24: 2 uses
 row 26: 13 uses
-row 27: 51 uses
+row 27: 46 uses
 row 29: 529 uses
 row 30: 2 uses
 row 31: 5176490 uses

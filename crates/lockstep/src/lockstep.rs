@@ -4,15 +4,21 @@
 use crate::report::{Adoption, Cause, HistoryEntry, Nearest, Report};
 use crate::state::{CpuState, Field};
 use crate::table::{
-    CPU_INT_THRESH, Difference, Drift, HELLO, Location, MEIP, MIP, Register, SPI1_CMD,
-    SPI1_CMD_USR, SPI1_USER2, Site, Treatment, absent_in_qemu,
+    CPU_INT_THRESH, Difference, Drift, Location, MEIP, MIP, MODULE_RESETS,
+    PERIP_RST_EN_AT_POWER_ON, Register, SPI1_CMD, SPI1_CMD_USR, SPI1_USER2, SYSTEM_PERIP_RST_EN0,
+    SYSTEM_PERIP_RST_EN1, Site, Treatment, absent_in_qemu,
 };
 use crate::trace::{QemuTrap, TraceEvent};
 use crate::usage::{Check, Usage};
 use crate::window::Window;
 use cpu_rv32::{CsrOp, Decoded, Instr, LoadOp, StoreOp};
+use soc_esp32c3::memmap::{PERIPH_BASE, PERIPH_SIZE};
 use soc_esp32c3::{CompatActs, Esp32C3, Executed, Stepped, StopReason};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// The peripheral space of the machine's address map: the only words an entry of
+/// [`Treatment::RegistersAfterReset`] names, whose stores the comparison notes.
+const PERIPHERALS: std::ops::Range<u32> = PERIPH_BASE..PERIPH_BASE + PERIPH_SIZE;
 
 /// Nanoseconds in a second, for the slow clock's cycles at an instant of device time.
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -97,6 +103,25 @@ struct CounterState {
     /// The updates QEMU may have made of its counter since the last read
     /// ([`Drift::Truncated`]).
     updates: u64,
+}
+
+/// A quantity [`Treatment::KeptAtReset`] holds after a reset: the row, the bits held, and the two
+/// values, QEMU's from before the reset and inkemu's reset value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Held {
+    row: u16,
+    bits: u32,
+    qemu: u32,
+    inkemu: u32,
+}
+
+impl Held {
+    /// Whether the two sides show the held values in the held bits, and agree on every other.
+    const fn holds(self, q: u32, i: u32) -> bool {
+        (q ^ self.qemu) & self.bits == 0
+            && (i ^ self.inkemu) & self.bits == 0
+            && (q ^ i) & !self.bits == 0
+    }
 }
 
 /// How a read of a location is held, by the kind of row that names it.
@@ -206,12 +231,19 @@ pub struct Lockstep {
     resets: u64,
     /// The resets of both sides the comparison goes on through; the next one ends the window.
     resets_to_cross: u32,
-    /// The quantities the last reset left different under a row of [`Treatment::KeptAtReset`]:
-    /// the row, QEMU's value (the one it had before the reset) and inkemu's (its reset value).
-    kept: BTreeMap<Field, (u16, u32, u32)>,
-    /// The words of memory an instruction stored a held quantity to, with the same row and
-    /// values: a word load that gives both back holds its destination in turn.
-    kept_memory: BTreeMap<u32, (u16, u32, u32)>,
+    /// The quantities the last reset left different under a row of [`Treatment::KeptAtReset`].
+    kept: BTreeMap<Field, Held>,
+    /// The words of memory an instruction stored a held register to, with the same hold: a word
+    /// load that gives both values back holds its destination in turn.
+    kept_memory: BTreeMap<u32, Held>,
+    /// The words of peripherals stored to since the last reset that reached them: an entry of
+    /// [`Treatment::RegistersAfterReset`] holds only until its register is stored to.
+    stored_since_reset: BTreeSet<u32>,
+    /// What the last word stores left in `SYSTEM.PERIP_RST_EN0` and `PERIP_RST_EN1`, which a CPU
+    /// reset keeps, to see the bits a store sets.
+    perip_rst_en: [u32; 2],
+    /// The modules of [`MODULE_RESETS`] the machine reset at a pulse QEMU ignores.
+    modules_reset: BTreeSet<usize>,
     /// inkemu's value of each CSR of [`Treatment::CsrKeptAtReset`] before the last instruction
     /// executed, and before the last reset crossed.
     csrs_before_step: BTreeMap<u16, u32>,
@@ -219,6 +251,9 @@ pub struct Lockstep {
     history: VecDeque<HistoryEntry>,
     /// The CSRs an instruction has written since power-on, for the pairs that hold until then.
     written: BTreeSet<u16>,
+    /// The CSRs an instruction has written whole (`csrrw`, `csrrwi`) since power-on or the last
+    /// reset crossed.
+    replaced: BTreeSet<u16>,
     /// Compared blocks left in which QEMU may still show `MEIP` after a threshold store.
     meip_lag: u8,
     /// `SPI1.USER2` as the last word store left it, and the opcode of the last user command.
@@ -232,14 +267,10 @@ pub struct Lockstep {
 }
 
 impl Lockstep {
-    /// A comparison of a machine at power-on under the rows of the window `hello`, ending at the
-    /// first reset of both sides, or after `limit` compared instructions when one is given.
-    #[must_use]
-    pub fn new(target: &impl Target, limit: Option<u64>) -> Lockstep {
-        Lockstep::with_rows(target, HELLO, limit)
-    }
-
-    /// The same under another table: for the tests of the policy.
+    /// A comparison of a machine at power-on under `rows`, ending at the first reset of both
+    /// sides, or after `limit` compared instructions when one is given: for the tests of the
+    /// policy, on traces written for them. A comparison of a firmware is a window's
+    /// ([`Lockstep::for_window`]): a table belongs to a window, which it serves whole.
     #[must_use]
     pub fn with_rows(
         target: &impl Target,
@@ -262,10 +293,14 @@ impl Lockstep {
             resets_to_cross: 0,
             kept: BTreeMap::new(),
             kept_memory: BTreeMap::new(),
+            stored_since_reset: BTreeSet::new(),
+            perip_rst_en: PERIP_RST_EN_AT_POWER_ON,
+            modules_reset: BTreeSet::new(),
             csrs_before_step: BTreeMap::new(),
             csrs_before_reset: BTreeMap::new(),
             history: VecDeque::with_capacity(HISTORY),
             written: BTreeSet::new(),
+            replaced: BTreeSet::new(),
             meip_lag: 0,
             spi1_user2: 0,
             spi1_command: None,
@@ -465,17 +500,20 @@ impl Lockstep {
     }
 
     /// Both sides reset after the same instruction and the comparison goes on. Nothing of the
-    /// machine changes: the chip resets only its CPU at the reset `esp_restart` asks for (TRM
-    /// §6.1), the machine with it, and QEMU its whole machine; every difference that leaves is a
-    /// row of the window's table, or a divergence. What the comparison knew of QEMU starts again
-    /// as at power-on, as QEMU itself does: no CSR has been written since, the counters' gaps are
-    /// fixed again by their next read (QEMU's counters restart from 0), no SPI1 command has run and
-    /// no threshold store is pending. The device time of a slow clock's capture stays: the RTC
-    /// timer of the chip, and of the machine, goes on through a CPU reset, and QEMU has none.
+    /// machine changes: the machine resets its CPU at the reset `esp_restart` asks for, as the
+    /// chip does (TRM §6.1), and QEMU resets its machine; every difference that leaves is a row
+    /// of the window's table, or a divergence. What the comparison knew of QEMU starts again as
+    /// at power-on: no CSR and no register has been written since, the counters' gaps are fixed
+    /// again by their next read (QEMU's counters go on through its reset, inkemu's restart: a gap
+    /// is refixed, nothing is assumed of its origin), no SPI1 command has run and no threshold
+    /// store is pending. The device time
+    /// of a slow clock's capture stays: the RTC timer of the chip, and of the machine, goes on
+    /// through a CPU reset, and QEMU has none.
     ///
-    /// The quantities a row of [`Treatment::KeptAtReset`] names are held when they differ, QEMU's
-    /// being the value it had before the reset (`last`, the state the instruction that asked for
-    /// it started from, which that instruction did not write) and inkemu's its reset value.
+    /// A quantity a row of [`Treatment::KeptAtReset`] names is held when it differs in the held
+    /// bits, QEMU's value being the one it had before the reset (`last`, the state the
+    /// instruction that asked for it started from, which that instruction did not write) and
+    /// inkemu's the reset value the row declares.
     fn cross_reset(
         &mut self,
         target: &impl Target,
@@ -486,6 +524,7 @@ impl Lockstep {
         self.resets = target.resets();
         self.counts.resets_crossed += 1;
         self.written.clear();
+        self.replaced.clear();
         self.meip_lag = 0;
         self.spi1_user2 = 0;
         self.spi1_command = None;
@@ -494,6 +533,7 @@ impl Lockstep {
         }
         self.kept.clear();
         self.kept_memory.clear();
+        self.stored_since_reset.clear();
         self.csrs_before_reset = self.csrs_before_step.clone();
         let written = executed
             .filter(|executed| executed.trap.is_none())
@@ -503,13 +543,27 @@ impl Lockstep {
         let inkemu = target.state();
         for row in self.rows {
             for treatment in row.treatments {
-                let Treatment::KeptAtReset(fields) = treatment else {
+                let Treatment::KeptAtReset(quantities) = treatment else {
                     continue;
                 };
-                for &field in *fields {
+                for kept in *quantities {
+                    let field = kept.field;
                     let (q, i) = (qemu.get(field), inkemu.get(field));
-                    if q != i && q == last.get(field) && !written.contains(&field) {
-                        self.kept.insert(field, (row.number, q, i));
+                    let bits = kept.bits;
+                    let differs_as_declared = (q ^ i) & bits != 0
+                        && (q ^ last.get(field)) & bits == 0
+                        && (i ^ kept.reset) & bits == 0
+                        && !written.contains(&field);
+                    if differs_as_declared {
+                        self.kept.insert(
+                            field,
+                            Held {
+                                row: row.number,
+                                bits,
+                                qemu: q,
+                                inkemu: i,
+                            },
+                        );
                     }
                 }
             }
@@ -528,7 +582,7 @@ impl Lockstep {
         }
         let decoded = executed.instruction?;
         let instr = decoded.instr;
-        let held = |kept: &BTreeMap<Field, (u16, u32, u32)>, reg: u8| {
+        let held = |kept: &BTreeMap<Field, Held>, reg: u8| {
             (reg != 0 && kept.contains_key(&Field::X(reg))).then_some(Field::X(reg))
         };
         if let Instr::Store { op, rs1, rs2, .. } = instr {
@@ -586,11 +640,11 @@ impl Lockstep {
         let Some(address) = data_address(decoded, &self.before) else {
             return;
         };
-        if let Some(&(row, q, i)) = self.kept_memory.get(&address)
+        if let Some(&hold) = self.kept_memory.get(&address)
             && rd != 0
-            && (qemu.x(rd), target.state().x(rd)) == (q, i)
+            && hold.holds(qemu.x(rd), target.state().x(rd))
         {
-            self.kept.insert(Field::X(rd), (row, q, i));
+            self.kept.insert(Field::X(rd), hold);
         }
     }
 
@@ -671,7 +725,7 @@ impl Lockstep {
             return None;
         }
         let word = address & !3;
-        let after_reset = self.counts.resets_crossed > 0;
+        let after_reset = self.after_reset_at(word);
         let Some(row) = self
             .rows
             .iter()
@@ -911,8 +965,46 @@ impl Lockstep {
         if differ == 0 {
             return Some(0);
         }
+        // From the first instruction since the reset that writes the CSR whole (`csrrw`,
+        // `csrrwi`), it holds what the life after the reset wrote: the kept bits explain nothing
+        // any more, and it is compared. A `csrrs` or `csrrc` writes back the value it read, which
+        // the row admitted, with some bits set or cleared: the difference it carries is the
+        // reset's, and the row goes on holding it.
+        if self.replaced.contains(&csr) {
+            return None;
+        }
         let before = *self.csrs_before_reset.get(&csr)?;
         (theirs == mine | (before & kept) && differ & !mask == 0).then_some(differ)
+    }
+
+    /// Whether the entries of [`Treatment::RegistersAfterReset`] at the word `address` hold: a
+    /// reset left the register in different states on the two sides (a reset of both sides
+    /// crossed, or a reset of its module the machine made at a pulse QEMU ignores), and no store
+    /// reached the word since.
+    fn after_reset_at(&self, address: u32) -> bool {
+        let reset = self.counts.resets_crossed > 0
+            || self
+                .modules_reset
+                .iter()
+                .any(|&m| (MODULE_RESETS[m].first..=MODULE_RESETS[m].last).contains(&address));
+        reset && !self.stored_since_reset.contains(&address)
+    }
+
+    /// A word store of `value` to `SYSTEM.PERIP_RST_EN0` or `PERIP_RST_EN1`: the modules whose
+    /// bit it sets are reset in the machine (`soc_esp32c3::periph::system`, a reset at the bit
+    /// going from 0 to 1) and not in QEMU, whose `SYSTEM` ignores the store; the copies after a
+    /// reset hold again for their registers.
+    fn note_module_resets(&mut self, address: u32, value: u32) {
+        let index = usize::from(address == SYSTEM_PERIP_RST_EN1);
+        let rising = value & !self.perip_rst_en[index];
+        self.perip_rst_en[index] = value;
+        for (m, module) in MODULE_RESETS.iter().enumerate() {
+            if module.register == address && rising & module.bit != 0 {
+                self.modules_reset.insert(m);
+                self.stored_since_reset
+                    .retain(|word| !(module.first..=module.last).contains(word));
+            }
+        }
     }
 
     /// A read of a slow clock QEMU does not model: QEMU reads `qemu`, and inkemu the cycles of
@@ -1015,16 +1107,16 @@ impl Lockstep {
     /// The rows that admit a word load from `address` whose two values differ by `differ`, QEMU's
     /// being `theirs`, each with the site and the bits it takes: the register entries there whose
     /// condition holds, those of [`Treatment::RegistersAfterReset`] once a reset of both sides
-    /// was crossed. Together they must cover every differing bit and agree with QEMU's value; a
-    /// bit goes to the first entry that declares it, in the order of the table. `None` when no
-    /// entry is there, or they do not cover the read.
+    /// was crossed and until a store to the register. Together they must cover every differing
+    /// bit and agree with QEMU's value; a bit goes to the first entry that declares it, in the
+    /// order of the table. `None` when no entry is there, or they do not cover the read.
     fn admitted_register_read(
         &self,
         address: u32,
         differ: u32,
         theirs: u32,
     ) -> Option<Vec<(u16, Site, u32)>> {
-        let after_reset = self.counts.resets_crossed > 0;
+        let after_reset = self.after_reset_at(address);
         let entries: Vec<(u16, &Register)> = self
             .rows
             .iter()
@@ -1097,6 +1189,9 @@ impl Lockstep {
         match decoded.instr {
             Instr::Csr { op, src, csr, .. } if op == CsrOp::Rw || src != 0 => {
                 self.written.insert(csr);
+                if op == CsrOp::Rw {
+                    self.replaced.insert(csr);
+                }
                 self.note_counter_origin(Location::Csr(csr));
             }
             Instr::Store { op, rs2, .. } => {
@@ -1105,12 +1200,18 @@ impl Lockstep {
                 };
                 self.note_counter_update(|(first, last)| (first..=last).contains(&address));
                 self.note_counter_origin(Location::Mmio(address & !3));
+                if PERIPHERALS.contains(&address) {
+                    self.stored_since_reset.insert(address & !3);
+                }
                 if op != StoreOp::W {
                     return;
                 }
                 let value = self.before.x(rs2);
                 self.note_capture(address, value, target);
                 match address {
+                    SYSTEM_PERIP_RST_EN0 | SYSTEM_PERIP_RST_EN1 => {
+                        self.note_module_resets(address, value);
+                    }
                     SPI1_USER2 => self.spi1_user2 = value,
                     SPI1_CMD if value & SPI1_CMD_USR != 0 => {
                         self.spi1_command = Some(self.spi1_user2.to_le_bytes()[0]);
@@ -1167,10 +1268,10 @@ impl Lockstep {
         let mut differing = Vec::new();
         for field in Field::all() {
             let (q, i) = (qemu.get(field), inkemu.get(field));
-            if let Some(&(row, held_q, held_i)) = self.kept.get(&field) {
-                if (q, i) == (held_q, held_i) {
+            if let Some(&hold) = self.kept.get(&field) {
+                if hold.holds(q, i) {
                     if let Some(location) = Location::of(field) {
-                        self.usage.record(row, Site::at(location), 0, 0);
+                        self.usage.record(hold.row, Site::at(location), 0, 0);
                     }
                     continue;
                 }

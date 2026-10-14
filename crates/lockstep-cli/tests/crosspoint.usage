@@ -3,7 +3,6 @@
 # from power-on to its first access to a register QEMU does not have, APB_SARADC.APB_TSENS_CTRL.
 # Measured on 2026-10-14 in local (QEMU esp_develop_9.2.2_20250817 in espressif/idf:v5.5.2); the
 # file of CrossPoint is the user's and never runs in the CI. Read by tests/crosspoint.rs.
-row  1: 31088721 uses
 row  2: 31088421 uses
 row  3: 15 uses
 row  5: 429162 uses

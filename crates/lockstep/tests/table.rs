@@ -93,9 +93,19 @@ fn lines_of(treatment: &Treatment) -> Vec<String> {
             }
         )],
         Treatment::ExternalInterrupt { lag } => vec![format!("meip retard {lag}")],
-        Treatment::KeptAtReset(fields) => fields
+        Treatment::KeptAtReset(quantities) => quantities
             .iter()
-            .map(|field| format!("gardé au reset {field}"))
+            .map(|kept| {
+                let bits = if kept.bits == u32::MAX {
+                    String::new()
+                } else {
+                    format!(" bits 0x{:08X}", kept.bits)
+                };
+                format!(
+                    "gardé au reset {}{bits} reset 0x{:08X}",
+                    kept.field, kept.reset
+                )
+            })
             .collect(),
         Treatment::CsrKeptAtReset(csrs) => csrs
             .iter()
@@ -178,7 +188,8 @@ fn location_text(location: Location) -> String {
 #[test]
 fn the_table_of_the_documentation_is_the_table_of_the_tool() {
     let text = documentation();
-    let tool: Vec<(u16, BTreeSet<String>)> = lockstep::DIFFERENCES
+    // A retired row stays in the summary, its number kept, with no treatment.
+    let mut tool: Vec<(u16, BTreeSet<String>)> = lockstep::DIFFERENCES
         .iter()
         .map(|row| {
             (
@@ -189,7 +200,13 @@ fn the_table_of_the_documentation_is_the_table_of_the_tool() {
                     .collect(),
             )
         })
+        .chain(
+            lockstep::RETIRED
+                .iter()
+                .map(|row| (row.number, BTreeSet::new())),
+        )
         .collect();
+    tool.sort_by_key(|(number, _)| *number);
     assert_eq!(summary(&text), tool);
 }
 
@@ -274,8 +291,13 @@ fn the_windows_of_the_documentation_are_the_windows_of_the_tool() {
 }
 
 #[test]
-fn the_rows_are_numbered_from_1_without_a_gap() {
-    let numbers: Vec<u16> = lockstep::DIFFERENCES.iter().map(|row| row.number).collect();
+fn the_rows_and_the_retired_rows_are_numbered_from_1_without_a_gap() {
+    let mut numbers: Vec<u16> = lockstep::DIFFERENCES
+        .iter()
+        .map(|row| row.number)
+        .chain(lockstep::RETIRED.iter().map(|row| row.number))
+        .collect();
+    numbers.sort_unstable();
     let expected: Vec<u16> = (1..=u16::try_from(numbers.len()).unwrap()).collect();
     assert_eq!(numbers, expected);
 }

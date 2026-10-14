@@ -29,23 +29,24 @@ pub enum Treatment {
     /// ([`soc_esp32c3::Esp32C3::external_interrupt_as_qemu`]); QEMU may keep it up `lag`
     /// instructions after a store to `CPU_INT_THRESH` has brought that line down.
     ExternalInterrupt { lag: u8 },
-    /// (i) What a reset of both sides leaves different: the chip resets only its CPU at the reset
-    /// `esp_restart` asks for, inkemu's CPU takes its reset values (`cpu_rv32::Hart::reset`),
-    /// and QEMU, which resets its whole machine, leaves these quantities as they were before the
-    /// reset. Each is held to exactly those two values, QEMU's from before the reset and inkemu's
-    /// from its reset, until an instruction writes it or a trap changes it; an instruction that
-    /// reads one while it is held is a divergence, since the two sides would compute from
+    /// (i) What a reset of both sides leaves different in the compared state: inkemu's CPU takes
+    /// its reset values (`cpu_rv32::Hart::reset`), and QEMU leaves these quantities as they were
+    /// before the reset. Each [`Kept`] is held, in its bits, to exactly those two values,
+    /// QEMU's from before the reset and inkemu's from its reset, which must be the reset value
+    /// the row declares, until an instruction writes it or a trap changes it; an instruction
+    /// that reads one while it is held is a divergence, since the two sides would compute from
     /// different values.
-    KeptAtReset(&'static [Field]),
-    /// (ii) CSRs QEMU does not print, some bits of which its reset keeps where the chip's CPU
-    /// reset, as inkemu's, clears them: after a reset of both sides, a read into a register gives
-    /// in QEMU inkemu's value with those of the kept bits inkemu held before the reset set again
-    /// ([`KeptCsr`]), or inkemu's value itself; the register takes QEMU's bits, within the mask.
+    KeptAtReset(&'static [Kept]),
+    /// (ii) CSRs QEMU does not print, some bits of which its reset keeps where inkemu's CPU reset
+    /// clears them: after a reset of both sides, and until an instruction writes the CSR whole
+    /// (`csrrw`, `csrrwi`; a `csrrs` or `csrrc` writes back the value it read, and carries the
+    /// difference), a read into a register gives in QEMU inkemu's value with those of the kept
+    /// bits inkemu held before the reset set again ([`KeptCsr`]), or inkemu's value itself; the
+    /// register takes QEMU's bits, within the mask.
     CsrKeptAtReset(&'static [KeptCsr]),
-    /// (ii) Registers a CPU reset leaves as the life before it set them, where QEMU's reset of
-    /// its whole machine takes them back to its reset values: the same copy as
-    /// [`Treatment::Registers`], made only after a reset of both sides, on top of what the
-    /// entries of `Registers` at the same address take.
+    /// (ii) Registers the two resets leave in different states: the same copy as
+    /// [`Treatment::Registers`], made only after a reset of both sides and until the first store
+    /// to the register since, on top of what the entries of `Registers` at the same address take.
     RegistersAfterReset(&'static [Register]),
     /// (ii) Registers of a peripheral the two model differently, or of one QEMU lacks: an access
     /// to one of them is admitted (it does not end the window), and a word load from one takes
@@ -103,6 +104,41 @@ pub struct Register {
     /// at the store of `CMD.USR`): the register holds that command's answer.
     pub after_command: Option<u8>,
 }
+
+/// A quantity of [`Treatment::KeptAtReset`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub field: Field,
+    /// The bits held: those measured to differ after the reset; every other bit is compared.
+    pub bits: u32,
+    /// inkemu's value after a reset (`cpu_rv32::Hart::reset`): a hold starts only when inkemu
+    /// shows it, so that a reset of inkemu that leaves another value is a divergence.
+    pub reset: u32,
+}
+
+/// A quantity held whole, whose reset value in inkemu is `reset`.
+#[must_use]
+pub const fn kept(field: Field, reset: u32) -> Kept {
+    Kept {
+        field,
+        bits: u32::MAX,
+        reset,
+    }
+}
+
+/// A row number no longer in use, kept so that a number always names the same difference
+/// (`docs/lockstep-differences.md`, where its section says why it went).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retired {
+    pub number: u16,
+    pub summary: &'static str,
+}
+
+/// The retired rows.
+pub const RETIRED: &[Retired] = &[Retired {
+    number: 1,
+    summary: "mstatus.MPP: retired on 2026-10-14, inkemu's MPP is the chip's (TRM register 1.5)",
+}];
 
 /// A CSR of [`Treatment::CsrKeptAtReset`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,10 +305,9 @@ impl Difference {
                     Treatment::ExternalInterrupt { .. } => {
                         Box::new(std::iter::once((Site::at(Location::Csr(MIP)), MEIP)))
                     }
-                    Treatment::KeptAtReset(fields) => Box::new(
-                        fields
-                            .iter()
-                            .filter_map(|&field| Location::of(field))
+                    Treatment::KeptAtReset(kept) => Box::new(
+                        kept.iter()
+                            .filter_map(|kept| Location::of(kept.field))
                             .map(|location| (Site::at(location), 0)),
                     ),
                     Treatment::Registers(registers) | Treatment::RegistersAfterReset(registers) => {
@@ -377,6 +412,48 @@ pub const CPU_INT_THRESH: u32 = 0x600C_2194;
 pub const SPI1_CMD: u32 = 0x6000_2000;
 pub const SPI1_CMD_USR: u32 = 1 << 18;
 pub const SPI1_USER2: u32 = 0x6000_2020;
+/// A module the machine resets when a store sets its bit of `SYSTEM.PERIP_RST_EN0/1`, and QEMU,
+/// whose `SYSTEM` reads 0 there and ignores the store (`hw/riscv/esp32c3_clk.c`,
+/// `esp32c3_clock_read`/`esp32c3_clock_write`, default case), does not: `register` and `bit`, and
+/// the registers it resets, `first..=last`. These are the modules of `RESETS_0` and `RESETS_1` in
+/// `soc_esp32c3::periph::system`, at their addresses in the SVD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModuleReset {
+    pub register: u32,
+    pub bit: u32,
+    pub first: u32,
+    pub last: u32,
+}
+
+/// `SYSTEM.PERIP_RST_EN1` (the SVD; a test checks it).
+pub const SYSTEM_PERIP_RST_EN1: u32 = 0x600C_001C;
+/// The values of `PERIP_RST_EN0` and `PERIP_RST_EN1` at power-on (the SVD), which a CPU reset
+/// keeps.
+pub const PERIP_RST_EN_AT_POWER_ON: [u32; 2] = [0, 0x0000_01FE];
+
+/// The modules the machine resets at a pulse of their bit.
+pub const MODULE_RESETS: &[ModuleReset] = &[
+    // SPI01 resets SPI0 and SPI1.
+    module_reset(SYSTEM_PERIP_RST_EN0, 1, 0x6000_2000, 0x6000_23FF),
+    module_reset(SYSTEM_PERIP_RST_EN0, 1, 0x6000_3000, 0x6000_33FF),
+    module_reset(SYSTEM_PERIP_RST_EN0, 2, 0x6000_0000, 0x6000_00FF),
+    module_reset(SYSTEM_PERIP_RST_EN0, 5, 0x6001_0000, 0x6001_00FF),
+    module_reset(SYSTEM_PERIP_RST_EN0, 13, 0x6001_F000, 0x6001_F0FF),
+    module_reset(SYSTEM_PERIP_RST_EN0, 15, 0x6002_0000, 0x6002_00FF),
+    module_reset(SYSTEM_PERIP_RST_EN0, 23, 0x6004_3000, 0x6004_30FF),
+    module_reset(SYSTEM_PERIP_RST_EN0, 29, 0x6002_3000, 0x6002_30FF),
+    module_reset(SYSTEM_PERIP_RST_EN1, 2, 0x6003_B000, 0x6003_B0FF),
+];
+
+const fn module_reset(register: u32, bit: u32, first: u32, last: u32) -> ModuleReset {
+    ModuleReset {
+        register,
+        bit: 1 << bit,
+        first,
+        last,
+    }
+}
+
 /// The cycle counter at its machine and user addresses (`mpccr`, `upccr`).
 pub const MPCCR: u16 = 0x7E2;
 pub const UPCCR: u16 = 0x802;
@@ -408,23 +485,10 @@ const fn admit(address: u32) -> Register {
     copy(address, 0)
 }
 
-/// Row 1. Rows 1 to 24 were measured on the first life of `flash_hello.bin` (SP1b-4c): every mask
+/// Row 2. Rows 2 to 24 were measured on the first life of `flash_hello.bin` (SP1b-4c): every mask
 /// is the bits measured to differ there (`docs/lockstep-differences.md` gives the measure and the
 /// source of each). A window that shows another bit, or reaches another register, fails until a
-/// row of its own admits it with its evidence.
-pub const ROW_MSTATUS_MPP: Difference = Difference {
-    number: 1,
-    summary: "mstatus.MPP: QEMU 0 throughout, inkemu wires it to machine mode",
-    treatments: &[Treatment::Pair {
-        field: Field::Mstatus,
-        bits: 0x0000_1800,
-        qemu: 0,
-        inkemu: 0x0000_1800,
-        until_written: false,
-    }],
-};
-
-/// Row 2.
+/// row of its own admits it with its evidence. Row 1 is retired ([`RETIRED`]).
 pub const ROW_MIE_AT_POWER_ON: Difference = Difference {
     number: 2,
     summary: "mie at power-on: QEMU 0x0EEE, inkemu 0, until mie is written",
@@ -562,7 +626,7 @@ pub const ROW_RTC_CNTL: Difference = Difference {
             copy(0x6000_8088, 0x0057_5010),
             copy(0x6000_808C, 0xBA80_5480),
             copy(0x6000_8090, 0xF807_FA14),
-            copy(0x6000_80AC, 0x04B0_0000),
+            copy(0x6000_80AC, 0x84B0_0000),
             copy(0x6000_80D8, 0x7BFF_C030),
             copy(0x6000_810C, 0x0000_0007),
             copy(0x6000_811C, 0xC000_0000),
@@ -739,8 +803,8 @@ pub const ROW_SYSTEM: Difference = Difference {
         copy(0x600C_000C, 0x0000_0001),
         copy(0x600C_0010, 0xF9C1_E06F),
         copy(0x600C_0014, 0x0000_0204),
-        copy(0x600C_0018, 0xA86D_BBEE),
-        copy(0x600C_001C, 0x0000_01FE),
+        copy(0x600C_0018, 0xFF7F_FFFF),
+        copy(0x600C_001C, 0xFFFF_FFFF),
         copy(0x600C_0020, 0x0000_00FF),
         copy(0x600C_0024, 0x0200_1001),
         copy(0x600C_0040, 0x0000_0007),
@@ -818,25 +882,36 @@ pub const ROW_HELLO_KEPT_AT_RESET: Difference = Difference {
     number: 25,
     summary: "flash_hello.bin, at its reset: QEMU keeps registers and CSRs the chip's CPU reset sets",
     treatments: &[Treatment::KeptAtReset(&[
-        Field::X(1),
-        Field::X(2),
-        Field::X(3),
-        Field::X(4),
-        Field::X(5),
-        Field::X(8),
-        Field::X(9),
-        Field::X(11),
-        Field::X(12),
-        Field::X(13),
-        Field::X(14),
-        Field::X(15),
-        Field::X(16),
-        Field::X(17),
-        Field::X(28),
-        Field::Mstatus,
-        Field::Mtvec,
-        Field::Mepc,
+        kept(Field::X(1), 0),
+        kept(Field::X(2), 0),
+        kept(Field::X(3), 0),
+        kept(Field::X(4), 0),
+        kept(Field::X(5), 0),
+        kept(Field::X(8), 0),
+        kept(Field::X(9), 0),
+        kept(Field::X(11), 0),
+        kept(Field::X(12), 0),
+        kept(Field::X(13), 0),
+        kept(Field::X(14), 0),
+        kept(Field::X(15), 0),
+        kept(Field::X(16), 0),
+        kept(Field::X(17), 0),
+        kept(Field::X(28), 0),
+        MSTATUS_MPIE_KEPT,
+        kept(Field::Mtvec, MTVEC_AT_RESET),
+        kept(Field::Mepc, 0),
     ])],
+};
+
+/// inkemu's `mtvec` after a reset: vectored, base 0 (`cpu_rv32::csr`, the ESP32-C3 core).
+const MTVEC_AT_RESET: u32 = 1;
+
+/// `mstatus.MPIE`, the one bit of `mstatus` QEMU keeps at its reset where inkemu's reset, as the
+/// chip's (TRM §1.4.2), leaves 0.
+const MSTATUS_MPIE_KEPT: Kept = Kept {
+    field: Field::Mstatus,
+    bits: 1 << 7,
+    reset: 0,
 };
 
 /// The R, W and X bits of the four entries of a `pmpcfg` register (RISC-V privileged
@@ -889,7 +964,6 @@ pub const ROW_AFTER_RESET: Difference = Difference {
         copy(0x6000_8080, 0x1000_0000),
         copy(0x6000_8088, 0x0000_0800),
         copy(0x6000_808C, 0x0040_0000),
-        copy(0x6000_80AC, 0x8000_0000),
         copy(0x6000_9004, 0x0000_0002),
         copy(0x6000_9008, 0x0000_0002),
         copy(0x6000_900C, 0x0000_0002),
@@ -915,8 +989,6 @@ pub const ROW_AFTER_RESET: Difference = Difference {
         copy(0x6002_004C, 0x4E20_0000),
         copy(0x6004_0018, 0x0063_0000),
         copy(0x600C_0008, 0x0000_0001),
-        copy(0x600C_0018, 0x5712_4411),
-        copy(0x600C_001C, 0xFFFF_FE01),
         copy(0x600C_0024, 0x0100_0000),
         copy(0x600C_4078, 0x0000_0023),
         copy(0x600C_4084, 0x0000_003F),
@@ -971,28 +1043,28 @@ pub const ROW_NVS_KEPT_AT_RESET: Difference = Difference {
     number: 31,
     summary: "flash_nvs.bin, at its reset: QEMU keeps registers and CSRs the chip's CPU reset sets",
     treatments: &[Treatment::KeptAtReset(&[
-        Field::X(1),
-        Field::X(2),
-        Field::X(3),
-        Field::X(4),
-        Field::X(5),
-        Field::X(7),
-        Field::X(8),
-        Field::X(9),
-        Field::X(11),
-        Field::X(12),
-        Field::X(13),
-        Field::X(14),
-        Field::X(15),
-        Field::X(16),
-        Field::X(17),
-        Field::X(28),
-        Field::X(29),
-        Field::X(30),
-        Field::X(31),
-        Field::Mstatus,
-        Field::Mtvec,
-        Field::Mepc,
+        kept(Field::X(1), 0),
+        kept(Field::X(2), 0),
+        kept(Field::X(3), 0),
+        kept(Field::X(4), 0),
+        kept(Field::X(5), 0),
+        kept(Field::X(7), 0),
+        kept(Field::X(8), 0),
+        kept(Field::X(9), 0),
+        kept(Field::X(11), 0),
+        kept(Field::X(12), 0),
+        kept(Field::X(13), 0),
+        kept(Field::X(14), 0),
+        kept(Field::X(15), 0),
+        kept(Field::X(16), 0),
+        kept(Field::X(17), 0),
+        kept(Field::X(28), 0),
+        kept(Field::X(29), 0),
+        kept(Field::X(30), 0),
+        kept(Field::X(31), 0),
+        MSTATUS_MPIE_KEPT,
+        kept(Field::Mtvec, MTVEC_AT_RESET),
+        kept(Field::Mepc, 0),
     ])],
 };
 
@@ -1164,7 +1236,6 @@ pub const ROW_CROSSPOINT_ASSIST_DEBUG: Difference = Difference {
 
 /// The rows of the window `hello` ([`crate::window::WINDOWS`]).
 pub const HELLO: &[Difference] = &[
-    ROW_MSTATUS_MPP,
     ROW_MIE_AT_POWER_ON,
     ROW_MTVEC_MODE_AT_POWER_ON,
     ROW_MEIP,
@@ -1196,7 +1267,6 @@ pub const HELLO: &[Difference] = &[
 
 /// The rows of the window `nvs`.
 pub const NVS: &[Difference] = &[
-    ROW_MSTATUS_MPP,
     ROW_MIE_AT_POWER_ON,
     ROW_MTVEC_MODE_AT_POWER_ON,
     ROW_MEIP,
@@ -1229,7 +1299,6 @@ pub const NVS: &[Difference] = &[
 
 /// The rows of the window `nvs-ota`: those of `nvs`, and row 33.
 pub const NVS_OTA: &[Difference] = &[
-    ROW_MSTATUS_MPP,
     ROW_MIE_AT_POWER_ON,
     ROW_MTVEC_MODE_AT_POWER_ON,
     ROW_MEIP,
@@ -1263,7 +1332,6 @@ pub const NVS_OTA: &[Difference] = &[
 
 /// Every row of the table, in the order of `docs/lockstep-differences.md`: those of every window.
 pub const DIFFERENCES: &[Difference] = &[
-    ROW_MSTATUS_MPP,
     ROW_MIE_AT_POWER_ON,
     ROW_MTVEC_MODE_AT_POWER_ON,
     ROW_MEIP,
@@ -1309,7 +1377,6 @@ pub const DIFFERENCES: &[Difference] = &[
 /// The rows of the window `crosspoint`, compared in local only (`CrossPoint` 1.6.5 cannot be
 /// distributed): rows of the first life of `hello` it uses whole, row 33, and its own.
 pub const CROSSPOINT: &[Difference] = &[
-    ROW_MSTATUS_MPP,
     ROW_MIE_AT_POWER_ON,
     ROW_MTVEC_MODE_AT_POWER_ON,
     ROW_CYCLE_COUNTER,
@@ -1414,6 +1481,25 @@ mod tests {
         assert_eq!(SYSTIMER_UNIT0_VALUE_LO, addr("SYSTIMER", "UNIT0_VALUE_LO"));
         assert_eq!(SYSTIMER_UNIT1_VALUE_LO, addr("SYSTIMER", "UNIT1_VALUE_LO"));
         assert_eq!(SYSTEM_PERIP_RST_EN0, addr("SYSTEM", "PERIP_RST_EN0"));
+        assert_eq!(SYSTEM_PERIP_RST_EN1, addr("SYSTEM", "PERIP_RST_EN1"));
+        // The first register of every module a pulse resets.
+        let firsts = [
+            ("SPI1", "CMD"),
+            ("SPI0", "CTRL"),
+            ("UART0", "FIFO"),
+            ("UART1", "FIFO"),
+            ("TIMG0", "T0CONFIG"),
+            ("TIMG1", "T0CONFIG"),
+            ("USB_DEVICE", "EP1"),
+            ("SYSTIMER", "CONF"),
+            ("SHA", "MODE"),
+        ];
+        for (module, (peripheral, register)) in MODULE_RESETS.iter().zip(firsts) {
+            assert!(
+                (module.first..=module.last).contains(&addr(peripheral, register)),
+                "{peripheral}"
+            );
+        }
         let systimer = QEMU_DEVICES.iter().find(|d| d.name == "SYSTIMER").unwrap();
         assert_eq!(SYSTIMER, (systimer.first, systimer.last));
     }
