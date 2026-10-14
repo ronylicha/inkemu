@@ -154,6 +154,10 @@ pub fn csrrs(rd: u8, csr: u16, rs1: u8) -> u32 {
     csr_insn(csr, rs1, 2, rd)
 }
 #[must_use]
+pub fn csrrc(rd: u8, csr: u16, rs1: u8) -> u32 {
+    csr_insn(csr, rs1, 3, rd)
+}
+#[must_use]
 pub fn csrrwi(rd: u8, csr: u16, uimm: u8) -> u32 {
     csr_insn(csr, uimm, 5, rd)
 }
