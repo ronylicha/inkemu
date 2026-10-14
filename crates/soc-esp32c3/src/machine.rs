@@ -2023,7 +2023,7 @@ mod tests {
         );
         // CRC-32/ISO-HDLC of "12345678".
         assert_eq!(bus_word(&mut m, result), 0x9AE0_DAAF);
-        assert!(m.drain_diagnostics().is_empty());
+        assert_eq!(m.drain_diagnostics(), []);
     }
 
     #[test]
