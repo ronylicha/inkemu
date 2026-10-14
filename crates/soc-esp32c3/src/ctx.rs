@@ -257,6 +257,12 @@ impl Ctx {
         self.now = self.now + cpu_cycles.saturating_mul(self.clock.cpu_period());
     }
 
+    /// Device time moves on by `cycles` cycles of the time base, whatever the CPU clock: the
+    /// timing model `qemu-icount` prices an instruction in time, not in CPU cycles.
+    pub(crate) fn advance_time_base(&mut self, cycles: u64) {
+        self.now = self.now + cycles;
+    }
+
     /// Device time jumps to `instant` while the CPU sleeps. Time never goes back: an instant in the
     /// past changes nothing.
     pub(crate) fn sleep_until(&mut self, instant: Cycles) {

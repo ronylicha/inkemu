@@ -126,6 +126,9 @@ pub struct Systimer {
     int_ena: u32,
     int_raw: u32,
     wake: Deadline,
+    /// `QemuCompat::systimer_no_alarm_on_stopped_counter`: a comparator compares only a counter
+    /// that runs. Kept across a reset of the block: it is a property of the machine.
+    no_alarm_on_stopped_counter: bool,
 }
 
 /// Splits a register offset inside a block of `pairs` `(HI, LO)` pairs whose first register is at
@@ -189,7 +192,16 @@ impl Systimer {
             int_ena: 0,
             int_raw: 0,
             wake: Deadline::default(),
+            no_alarm_on_stopped_counter: false,
         }
+    }
+
+    /// The block as Espressif's QEMU has it, for the lockstep (`QemuCompat`): a comparator raises
+    /// no alarm while its counter is stopped.
+    #[must_use]
+    pub fn with_qemu_compat(mut self, no_alarm_on_stopped_counter: bool) -> Systimer {
+        self.no_alarm_on_stopped_counter = no_alarm_on_stopped_counter;
+        self
     }
 
     /// The block is reset (`SYSTEM.PERIP_RST_EN0` bit 29, or a core reset): it is built again at
@@ -197,7 +209,7 @@ impl Systimer {
     /// and over leaves no call behind in the scheduler.
     pub(crate) fn reset(&mut self, ctx: &mut Ctx) {
         self.wake.cancel(ctx);
-        *self = Systimer::new(ctx.now());
+        *self = Systimer::new(ctx.now()).with_qemu_compat(self.no_alarm_on_stopped_counter);
         // The rebuilt block drives its interrupt sources low.
         self.wake(ctx);
     }
@@ -257,8 +269,10 @@ impl Systimer {
             }
             let unit = self.unit_of(index);
             let count = self.count(unit, now);
+            let compares =
+                !self.no_alarm_on_stopped_counter || self.units[unit].counter.is_running();
             let comparator = &mut self.comparators[index];
-            if let Some(next) = comparator.next {
+            if compares && let Some(next) = comparator.next {
                 let late = count.wrapping_sub(next) & COUNT_MASK;
                 if late < PASSED_WINDOW {
                     self.int_raw |= 1 << index;
@@ -598,6 +612,27 @@ mod tests {
             assert_eq!(counter(ctx, &mut timer, 1) / u64::from(TICK_COUNTS), tick);
             timer.write(ctx, INT_CLR, 1);
         }
+    }
+
+    #[test]
+    fn as_qemu_has_it_the_tick_set_up_raises_no_early_alarm_and_then_ticks() {
+        // `QemuCompat::systimer_no_alarm_on_stopped_counter`: the target-mode comparator enabled
+        // on the stopped counter 1 compares nothing; the period alarms come as on the chip.
+        let ctx = &mut Ctx::default();
+        let mut timer = Systimer::new(ctx.now()).with_qemu_compat(true);
+        after(ctx, 12_345);
+        program_the_tick(ctx, &mut timer);
+        assert_eq!(timer.read(ctx, INT_RAW), Some(0), "no early alarm");
+        assert_eq!(ctx.sources(), 0);
+        let start = ctx.now();
+        assert_eq!(ctx.next_wake(), Some(start + TICK));
+        ctx.sleep_until(start + TICK);
+        pump(ctx, &mut timer);
+        assert_eq!(timer.read(ctx, INT_ST), Some(1), "the first tick");
+        assert_eq!(counter(ctx, &mut timer, 1) / u64::from(TICK_COUNTS), 1);
+        // A reset of the block keeps the setting: it belongs to the machine.
+        timer.reset(ctx);
+        assert!(timer.no_alarm_on_stopped_counter);
     }
 
     #[test]

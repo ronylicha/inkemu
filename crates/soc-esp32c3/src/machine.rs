@@ -2,6 +2,7 @@
 use crate::bus::SocBus;
 use crate::clock;
 use crate::config::SocConfig;
+use crate::config::Timing;
 use crate::ctx::Event;
 use crate::diag::{Diagnostic, Unsupported};
 use crate::flash::{FlashDevice, FlashImageError, FlashWrite, NorFlash};
@@ -11,8 +12,8 @@ use crate::periph::UsbHost;
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
 use cpu_rv32::{
-    DatasheetTiming, Exception, Hart, HartConfig, InterruptModel, MisalignedPolicy, StepOutcome,
-    VendorCsrs,
+    Boundary, DatasheetTiming, Decoded, Exception, Hart, HartConfig, InterruptModel,
+    MisalignedPolicy, QemuIcountTiming, StepOutcome, Trap, VendorCsrs,
 };
 use emu_core::{Cycles, Frequency, TimingModel, TraceHash};
 
@@ -195,6 +196,92 @@ fn limit_instant(nanos: u64) -> Cycles {
     clock::TIME_BASE.nanos_to_cycles(u128::from(nanos))
 }
 
+/// Under the timing model `qemu-icount`, `ICOUNT_TIME_BASE_CYCLES` cycles of the time base last
+/// as long as `ICOUNT_INSTRUCTIONS` instructions: 25 instructions of 8 ns (QEMU's `-icount 3`,
+/// 2^3 ns each) are 200 ns, 32 cycles of 6.25 ns. Device time after n instructions is the whole
+/// number of cycles at or below n × 8 ns: a counter of any clock that is a whole number of
+/// time-base cycles (the SYSTIMER at 16 MHz, APB at 80 MHz) then reads what QEMU's, which
+/// truncates n × 8 ns to its own period, reads.
+const ICOUNT_TIME_BASE_CYCLES: u64 = 32;
+const ICOUNT_INSTRUCTIONS: u64 = 25;
+const _: () = assert!(
+    clock::TIME_BASE.hz() * 8 * ICOUNT_INSTRUCTIONS == ICOUNT_TIME_BASE_CYCLES * 1_000_000_000
+);
+
+/// How the machine turns an instruction into device time ([`SocConfig::timing`]).
+#[derive(Clone, Copy, Debug)]
+enum Pricing {
+    /// Each instruction lasts its CPU cycles at the CPU clock.
+    Datasheet,
+    /// Each instruction lasts 8 ns; `owed` is the fraction of a time-base cycle, in 25ths, the
+    /// instructions so far have not yet moved device time by.
+    QemuIcount { owed: u64 },
+}
+
+impl Pricing {
+    fn model(self) -> &'static dyn TimingModel {
+        match self {
+            Pricing::Datasheet => &DatasheetTiming,
+            Pricing::QemuIcount { .. } => &QemuIcountTiming,
+        }
+    }
+}
+
+/// What one turn of the run loop did.
+enum Turn {
+    /// Only when the turn was asked to stop at an instruction boundary: the hart is about to
+    /// execute its next instruction, and nothing was done.
+    Ready,
+    /// The hart stepped (an instruction, an interrupt taken, or a wait), then the machine stops
+    /// for `stop` when it is set.
+    Stepped {
+        outcome: StepOutcome,
+        stop: Option<StopReason>,
+    },
+    /// The chip slept deeply for a while, then stops for `stop` when it is set.
+    DeepSlept { stop: Option<StopReason> },
+}
+
+/// The sleeps one call has gone through, for the bounds of [`StopReason::Asleep`].
+#[derive(Default)]
+struct Slept {
+    duration: u64,
+    count: u32,
+}
+
+impl Slept {
+    /// Counts one sleep of `duration` cycles; whether the call has slept enough to return.
+    fn add(&mut self, duration: u64) -> bool {
+        self.duration = self.duration.saturating_add(duration);
+        self.count += 1;
+        self.duration >= SLEEP_SLICE || self.count >= MAX_FRUITLESS_WAKES
+    }
+}
+
+/// One instruction as [`Esp32C3::step`] executed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Executed {
+    /// The address it was fetched from.
+    pub pc: u32,
+    /// The instruction as decoded; `None` when its fetch faulted.
+    pub instruction: Option<Decoded>,
+    /// The exception it raised, `None` when it retired.
+    pub trap: Option<Trap>,
+}
+
+/// What one call of [`Esp32C3::step`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stepped {
+    /// The instruction executed; `None` when the machine stopped before one.
+    pub executed: Option<Executed>,
+    /// The interrupt line the CPU took after it, before the next instruction.
+    pub interrupt: Option<u32>,
+    /// The CPU waited (`wfi`) after it, until a line ended the wait.
+    pub slept: bool,
+    /// The reason the machine stopped, if it did: the next instruction was not reached.
+    pub stop: Option<StopReason>,
+}
+
 /// What one sleep of the CPU came to.
 enum Sleep {
     /// Device time moved to the next instant something was due, by this many cycles of the time
@@ -213,7 +300,9 @@ enum Sleep {
 pub struct Esp32C3 {
     hart: Hart,
     bus: SocBus,
-    timing: DatasheetTiming,
+    pricing: Pricing,
+    /// CPU cycles between the selection of an interrupt line and the instant the CPU can take it.
+    interrupt_latency: u64,
     trace: Option<TraceHash>,
     /// The line the interrupt controller selects, and the device time from which the CPU sees it.
     selected: Option<(u32, Cycles)>,
@@ -276,7 +365,11 @@ impl Esp32C3 {
         Esp32C3 {
             hart: Hart::new(RESET_PC, hart_config),
             bus,
-            timing: DatasheetTiming,
+            pricing: match config.timing {
+                Timing::Datasheet => Pricing::Datasheet,
+                Timing::QemuIcount => Pricing::QemuIcount { owed: 0 },
+            },
+            interrupt_latency: config.interrupt_latency(),
             trace: config.trace_hash.then(TraceHash::new),
             selected: None,
             resets: 0,
@@ -317,102 +410,258 @@ impl Esp32C3 {
     ///   the same limit to every call.
     pub fn run_within(&mut self, cycles: Cycles, device_time_nanos: Option<u64>) -> StopReason {
         let deadline = device_time_nanos.map(limit_instant);
-        let mut slept: u64 = 0;
-        let mut sleeps: u32 = 0;
+        let mut slept = Slept::default();
         while self.hart.cycles.get() < cycles.get() {
             if deadline.is_some_and(|deadline| self.bus.ctx.now() >= deadline) {
                 return StopReason::TimeBudget;
             }
-            if self.powered_down {
-                // Deep sleep: device time jumps to the next call of the RTC domain, the one part
-                // of the chip with power, without an instruction (F1).
-                let duration = match self.sleep_deeply(deadline) {
-                    Sleep::Until(duration) => duration,
-                    Sleep::NothingDue => return StopReason::DeepSleep,
-                    Sleep::CutAtDeadline => return StopReason::TimeBudget,
-                };
-                slept = slept.saturating_add(duration);
-                sleeps += 1;
-                if let Some(violation) = self.bus.ctx.diag.take_violation() {
-                    return StopReason::StrictMmio(violation);
+            match self.turn(deadline, &mut slept, false) {
+                Turn::Stepped {
+                    stop: Some(reason), ..
                 }
-                if self.watched_output() {
-                    return StopReason::ConsoleOutput;
+                | Turn::DeepSlept { stop: Some(reason) } => return reason,
+                Turn::Ready | Turn::Stepped { stop: None, .. } | Turn::DeepSlept { stop: None } => {
                 }
-                if slept >= SLEEP_SLICE || sleeps >= MAX_FRUITLESS_WAKES {
-                    return StopReason::Asleep;
-                }
-                continue;
-            }
-            let pc = self.hart.pc;
-            self.bus.set_pc(pc);
-            let before = self.hart.cycles.get();
-            // The stack pointer the instruction started with, for the report of an exception.
-            // It is read before the step and must stay there: after it the value would be the
-            // same only for as long as a faulting instruction leaves every register untouched,
-            // which is the hart's business, not this loop's.
-            let sp = self.hart.x[STACK_POINTER];
-            match self.hart.step(&mut self.bus, &self.timing) {
-                StepOutcome::Waiting => {
-                    // The CPU idles: device time jumps to the next instant a device asked for.
-                    let duration = match self.sleep(deadline) {
-                        Sleep::Until(duration) => duration,
-                        Sleep::NothingDue => return StopReason::Idle,
-                        Sleep::CutAtDeadline => return StopReason::TimeBudget,
-                    };
-                    slept = slept.saturating_add(duration);
-                    sleeps += 1;
-                    self.service(pc);
-                    if let Some(violation) = self.bus.ctx.diag.take_violation() {
-                        return StopReason::StrictMmio(violation);
-                    }
-                    if self.watched_output() {
-                        return StopReason::ConsoleOutput;
-                    }
-                    if slept >= SLEEP_SLICE || sleeps >= MAX_FRUITLESS_WAKES {
-                        return StopReason::Asleep;
-                    }
-                    continue;
-                }
-                StepOutcome::Interrupted { cause } => {
-                    // The CPU took the line: the controller marks the edge it had latched for it as
-                    // claimed (the latch stays until the firmware writes `CPU_INT_CLEAR` with
-                    // the bit of the line set), and the lines are evaluated again.
-                    self.bus.periph.intmatrix.claim(cause);
-                    self.bus.ctx.interrupts_changed();
-                }
-                // An `ecall` is a request to the trap handler, not a fault worth reporting.
-                StepOutcome::Trapped { trap, .. } if trap.cause != Exception::EcallM => {
-                    self.bus.ctx.diag.record(Diagnostic::Exception {
-                        cause: trap.cause,
-                        tval: trap.tval,
-                        pc,
-                        sp,
-                    });
-                }
-                _ => {}
-            }
-            // Device time follows the CPU: the cycles of this instruction, at the clock it ran on.
-            self.bus.ctx.advance(self.hart.cycles.get() - before);
-            if let Some(trace) = &mut self.trace {
-                trace.mix_u32(pc);
-            }
-            if self.needs_service() {
-                self.service(pc);
-                // A watched byte leaves at an instant its device asked to be called at: the
-                // service of that call is the boundary it is seen at.
-                if self.watched_output() {
-                    if let Some(violation) = self.bus.ctx.diag.take_violation() {
-                        return StopReason::StrictMmio(violation);
-                    }
-                    return StopReason::ConsoleOutput;
-                }
-            }
-            if let Some(violation) = self.bus.ctx.diag.take_violation() {
-                return StopReason::StrictMmio(violation);
             }
         }
         StopReason::CycleBudget
+    }
+
+    /// Executes the next instruction as [`Esp32C3::run_within`] would, then brings the machine to
+    /// the boundary of the instruction after it: the interrupt the CPU takes before that one is
+    /// taken, and a `wfi` is slept through until a line ends it. The state read afterwards
+    /// ([`Esp32C3::pc`], [`Esp32C3::x`], [`Esp32C3::csr`]) is the state the next instruction
+    /// starts from: what a debugger shows, and what a lockstep compares (decision H1).
+    ///
+    /// A call ends when that boundary is reached, or when the machine stops on its own: the CPU
+    /// waits and nothing can wake it ([`StopReason::Idle`]), it has slept through one
+    /// [`SLEEP_SLICE`] or [`MAX_FRUITLESS_WAKES`] sleeps ([`StopReason::Asleep`]), the chip is in
+    /// a deep sleep nothing ends ([`StopReason::DeepSleep`]), a watched console has output
+    /// ([`StopReason::ConsoleOutput`]), or `--strict-mmio` met something unmodelled. A call
+    /// made away from a boundary (after [`Esp32C3::run_within`] left an interrupt to take) takes
+    /// it first, as a run would. There is no limit of cycles or device time: the bounds of a
+    /// sleep are the limit.
+    pub fn step(&mut self) -> Stepped {
+        let mut slept = Slept::default();
+        let mut stepped = Stepped {
+            executed: None,
+            interrupt: None,
+            slept: false,
+            stop: None,
+        };
+        // The instruction. Turns before it are those of a call made away from a boundary.
+        loop {
+            let pc = self.hart.pc;
+            match self.turn(None, &mut slept, false) {
+                Turn::Stepped { outcome, stop } => {
+                    let trap = match outcome {
+                        StepOutcome::Retired { .. } => None,
+                        StepOutcome::Trapped { trap, .. } => Some(trap),
+                        StepOutcome::Interrupted { .. } | StepOutcome::Waiting => {
+                            if stop.is_some() {
+                                stepped.stop = stop;
+                                return stepped;
+                            }
+                            continue;
+                        }
+                    };
+                    stepped.executed = Some(Executed {
+                        pc,
+                        instruction: self.hart.last_instruction(),
+                        trap,
+                    });
+                    if stop.is_some() {
+                        stepped.stop = stop;
+                        return stepped;
+                    }
+                    break;
+                }
+                Turn::DeepSlept { stop: Some(stop) } => {
+                    stepped.stop = Some(stop);
+                    return stepped;
+                }
+                Turn::DeepSlept { stop: None } | Turn::Ready => {}
+            }
+        }
+        // The boundary of the next instruction: a sleep, and the interrupt taken.
+        loop {
+            match self.turn(None, &mut slept, true) {
+                Turn::Ready => return stepped,
+                Turn::Stepped { outcome, stop } => {
+                    match outcome {
+                        StepOutcome::Interrupted { cause } => stepped.interrupt = Some(cause),
+                        StepOutcome::Waiting => stepped.slept = true,
+                        StepOutcome::Retired { .. } | StepOutcome::Trapped { .. } => {}
+                    }
+                    if stop.is_some() {
+                        stepped.stop = stop;
+                        return stepped;
+                    }
+                }
+                Turn::DeepSlept { stop } => {
+                    if stop.is_some() {
+                        stepped.stop = stop;
+                        return stepped;
+                    }
+                }
+            }
+        }
+    }
+
+    /// One turn of the run loop: a step of the hart and what the machine does after it, or one
+    /// step of a deep sleep. With `boundary_only`, the hart only acts on what stands before its
+    /// next instruction ([`Hart::take_boundary`]) and the turn is [`Turn::Ready`] when nothing
+    /// does.
+    fn turn(&mut self, deadline: Option<Cycles>, slept: &mut Slept, boundary_only: bool) -> Turn {
+        if self.powered_down {
+            return self.deep_sleep_turn(deadline, slept);
+        }
+        let pc = self.hart.pc;
+        self.bus.set_pc(pc);
+        let outcome = if boundary_only {
+            match self.hart.take_boundary() {
+                Boundary::Ready => return Turn::Ready,
+                Boundary::Interrupted { cause } => StepOutcome::Interrupted { cause },
+                Boundary::Waiting => StepOutcome::Waiting,
+            }
+        } else {
+            self.step_hart(pc)
+        };
+        match outcome {
+            StepOutcome::Waiting => {
+                return Turn::Stepped {
+                    outcome,
+                    stop: self.wait(pc, deadline, slept),
+                };
+            }
+            StepOutcome::Interrupted { cause } => {
+                // The CPU took the line: the controller marks the edge it had latched for it as
+                // claimed (the latch stays until the firmware writes `CPU_INT_CLEAR` with
+                // the bit of the line set), and the lines are evaluated again.
+                self.bus.periph.intmatrix.claim(cause);
+                self.bus.ctx.interrupts_changed();
+            }
+            StepOutcome::Retired { .. } | StepOutcome::Trapped { .. } => {}
+        }
+        if let Some(trace) = &mut self.trace {
+            trace.mix_u32(pc);
+        }
+        if self.needs_service() {
+            self.service(pc);
+            // A watched byte leaves at an instant its device asked to be called at: the
+            // service of that call is the boundary it is seen at.
+            if self.watched_output() {
+                let stop = match self.bus.ctx.diag.take_violation() {
+                    Some(violation) => StopReason::StrictMmio(violation),
+                    None => StopReason::ConsoleOutput,
+                };
+                return Turn::Stepped {
+                    outcome,
+                    stop: Some(stop),
+                };
+            }
+        }
+        Turn::Stepped {
+            outcome,
+            stop: self
+                .bus
+                .ctx
+                .diag
+                .take_violation()
+                .map(StopReason::StrictMmio),
+        }
+    }
+
+    /// One step of a deep sleep: device time jumps to the next call of the RTC domain, the one
+    /// part of the chip with power, without an instruction (F1).
+    fn deep_sleep_turn(&mut self, deadline: Option<Cycles>, slept: &mut Slept) -> Turn {
+        let duration = match self.sleep_deeply(deadline) {
+            Sleep::Until(duration) => duration,
+            Sleep::NothingDue => {
+                return Turn::DeepSlept {
+                    stop: Some(StopReason::DeepSleep),
+                };
+            }
+            Sleep::CutAtDeadline => {
+                return Turn::DeepSlept {
+                    stop: Some(StopReason::TimeBudget),
+                };
+            }
+        };
+        let enough = slept.add(duration);
+        let stop = if let Some(violation) = self.bus.ctx.diag.take_violation() {
+            Some(StopReason::StrictMmio(violation))
+        } else if self.watched_output() {
+            Some(StopReason::ConsoleOutput)
+        } else {
+            enough.then_some(StopReason::Asleep)
+        };
+        Turn::DeepSlept { stop }
+    }
+
+    /// One step of the hart at `pc`: an instruction, an interrupt taken, or a wait. An exception
+    /// is reported, and device time moves on by what the step cost.
+    fn step_hart(&mut self, pc: u32) -> StepOutcome {
+        // The stack pointer the instruction started with, for the report of an exception. It is
+        // read before the step and must stay there: after it the value would be the same only for
+        // as long as a faulting instruction leaves every register untouched, which is the hart's
+        // business, not this loop's.
+        let sp = self.hart.x[STACK_POINTER];
+        let before = self.hart.cycles.get();
+        let outcome = self.hart.step(&mut self.bus, self.pricing.model());
+        if let StepOutcome::Trapped { trap, .. } = outcome
+            // An `ecall` is a request to the trap handler, not a fault worth reporting.
+            && trap.cause != Exception::EcallM
+        {
+            self.bus.ctx.diag.record(Diagnostic::Exception {
+                cause: trap.cause,
+                tval: trap.tval,
+                pc,
+                sp,
+            });
+        }
+        if !matches!(outcome, StepOutcome::Waiting) {
+            self.advance_device_time(outcome, self.hart.cycles.get() - before);
+        }
+        outcome
+    }
+
+    /// The CPU idles: device time jumps to the next instant a device asked for, and what was due
+    /// then is served. Returns the reason to stop, if there is one.
+    fn wait(&mut self, pc: u32, deadline: Option<Cycles>, slept: &mut Slept) -> Option<StopReason> {
+        let duration = match self.sleep(deadline) {
+            Sleep::Until(duration) => duration,
+            Sleep::NothingDue => return Some(StopReason::Idle),
+            Sleep::CutAtDeadline => return Some(StopReason::TimeBudget),
+        };
+        let enough = slept.add(duration);
+        self.service(pc);
+        if let Some(violation) = self.bus.ctx.diag.take_violation() {
+            Some(StopReason::StrictMmio(violation))
+        } else if self.watched_output() {
+            Some(StopReason::ConsoleOutput)
+        } else {
+            enough.then_some(StopReason::Asleep)
+        }
+    }
+
+    /// Device time follows the CPU: the cycles of what the hart did, at the clock it ran on, or
+    /// 8 ns per instruction executed under `qemu-icount`, where taking an interrupt costs none.
+    fn advance_device_time(&mut self, outcome: StepOutcome, cpu_cycles: u64) {
+        match &mut self.pricing {
+            Pricing::Datasheet => self.bus.ctx.advance(cpu_cycles),
+            Pricing::QemuIcount { owed } => {
+                if matches!(
+                    outcome,
+                    StepOutcome::Retired { .. } | StepOutcome::Trapped { .. }
+                ) {
+                    *owed += ICOUNT_TIME_BASE_CYCLES;
+                    let cycles = *owed / ICOUNT_INSTRUCTIONS;
+                    *owed %= ICOUNT_INSTRUCTIONS;
+                    self.bus.ctx.advance_time_base(cycles);
+                }
+            }
+        }
     }
 
     /// Whether a watched channel has handed bytes to the host that no call has taken.
@@ -478,7 +727,7 @@ impl Esp32C3 {
                 Some((line, visible_at))
             }
             (Some(line), _) => {
-                let latency = INTERRUPT_LATENCY_CYCLES * self.bus.ctx.clock().cpu_period();
+                let latency = self.interrupt_latency * self.bus.ctx.clock().cpu_period();
                 Some((line, self.bus.ctx.now() + latency))
             }
         };
@@ -962,7 +1211,31 @@ impl Esp32C3 {
     /// The model that prices each instruction, so a front end can say whether timing is calibrated.
     #[must_use]
     pub fn timing_model(&self) -> &dyn TimingModel {
-        &self.timing
+        self.pricing.model()
+    }
+
+    /// The 32 integer registers, `x0` first (always 0).
+    #[must_use]
+    pub const fn x(&self) -> [u32; 32] {
+        self.hart.x
+    }
+
+    /// Writes integer register `reg` (1 to 31; `x0` and a number of 32 or more change nothing).
+    /// For a lockstep that copies into the machine a value the oracle read from a device the two
+    /// model differently (decision H3, treatment ii); a debugger's register write.
+    pub fn set_x(&mut self, reg: usize, value: u32) {
+        if (1..32).contains(&reg) {
+            self.hart.x[reg] = value;
+        }
+    }
+
+    /// A CSR as an instruction would read it at this instant, `None` for one the CPU does not
+    /// have. Reading it has no effect.
+    #[must_use]
+    pub fn csr(&self, address: u16) -> Option<u32> {
+        self.hart
+            .csr
+            .read(address, self.hart.cycles, self.hart.instret)
     }
 
     /// Fingerprint of the executed PC sequence, when [`SocConfig::trace_hash`] is set.
@@ -4290,5 +4563,193 @@ mod tests {
         assert_eq!(m.input_pending(ConsoleChannel::Uart1), pending + 1);
         assert!(m.input_journal().is_forgone());
         assert_eq!(m.input_journal().inputs(), []);
+    }
+
+    /// The program of `a_software_interrupt_is_taken_four_cpu_cycles_after_it_becomes_pending`:
+    /// software interrupt 0 routed to line 3, `MIE` set, the source raised. Returns it with the
+    /// address of the store that raises the source.
+    fn software_interrupt_program() -> (Vec<u32>, u32) {
+        let mut body = Vec::new();
+        body.extend([lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)]);
+        body.extend(route("CPU_INTR_FROM_CPU_0_MAP", 3));
+        body.push(csrrwi(0, MSTATUS, MSTATUS_MIE));
+        body.extend(store_register(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"), 1));
+        let store = ROM_BASE + 4 * u32::try_from(body.len()).unwrap() - 4;
+        body.extend([NOP; 16]);
+        (with_vectors(&body), store)
+    }
+
+    fn qemu_icount() -> SocConfig {
+        SocConfig {
+            timing: Timing::QemuIcount,
+            ..SocConfig::default()
+        }
+    }
+
+    #[test]
+    fn stepping_runs_the_same_instructions_as_a_run() {
+        let (program, _) = software_interrupt_program();
+        let traced = SocConfig {
+            trace_hash: true,
+            ..SocConfig::default()
+        };
+        let mut run = machine_with(&program, traced);
+        assert_eq!(run.run_until(Cycles(2_000)), StopReason::CycleBudget);
+        let mut stepped = machine_with(&program, traced);
+        while stepped.instructions() < run.instructions() {
+            assert_eq!(stepped.step().stop, None);
+        }
+        assert_eq!(
+            (
+                stepped.pc(),
+                stepped.x(),
+                stepped.cycles(),
+                stepped.device_time_nanos(),
+                stepped.trace_hash()
+            ),
+            (
+                run.pc(),
+                run.x(),
+                run.cycles(),
+                run.device_time_nanos(),
+                run.trace_hash()
+            )
+        );
+        assert_eq!(
+            stepped.csr(0x342),
+            Some(0x8000_0003),
+            "the interrupt was taken"
+        );
+    }
+
+    #[test]
+    fn a_step_takes_the_interrupt_due_after_its_instruction() {
+        let (program, store) = software_interrupt_program();
+        // `qemu-icount` has no latency: the line the store raises is taken right after it.
+        let mut m = machine_with(&program, qemu_icount());
+        let stepped = loop {
+            let stepped = m.step();
+            assert_eq!(stepped.stop, None);
+            if stepped.executed.as_ref().is_some_and(|e| e.pc == store) {
+                break stepped;
+            }
+        };
+        let executed = stepped.executed.unwrap();
+        assert_eq!(executed.trap, None);
+        assert!(matches!(
+            executed.instruction.unwrap().instr,
+            cpu_rv32::Instr::Store { .. }
+        ));
+        assert_eq!(stepped.interrupt, Some(3));
+        assert!(!stepped.slept);
+        assert_eq!(
+            m.pc(),
+            VECTORS + 4 * 3,
+            "the handler is the next instruction"
+        );
+        assert_eq!(m.csr(0x341), Some(store + 4), "mepc");
+        // With the TRM's latency of 4 cycles, the line is not visible yet after the store.
+        let mut m = machine(&program);
+        let stepped = loop {
+            let stepped = m.step();
+            if stepped.executed.as_ref().is_some_and(|e| e.pc == store) {
+                break stepped;
+            }
+        };
+        assert_eq!(stepped.interrupt, None);
+    }
+
+    #[test]
+    fn a_step_sleeps_through_a_wfi_to_the_interrupt_that_ends_it() {
+        // A one-shot alarm 1 ms ahead (16 000 counts at 16 MHz), its interrupt routed to line 4.
+        let mut body = stop_watchdogs();
+        body.extend([lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0)]);
+        body.extend(route("SYSTIMER_TARGET0_INT_MAP", 4));
+        body.extend(store_register(reg("SYSTIMER", "INT_ENA"), 1));
+        body.extend(store_register(reg("SYSTIMER", "TARGET0_LO"), 16_000));
+        body.extend(store_register(reg("SYSTIMER", "COMP0_LOAD"), 1));
+        body.extend(store_register(
+            reg("SYSTIMER", "CONF"),
+            0x4600_0000 | (1 << 24),
+        ));
+        body.push(csrrwi(0, MSTATUS, MSTATUS_MIE));
+        let at_wfi = ROM_BASE + 4 * u32::try_from(body.len()).unwrap();
+        body.extend([wfi(), HANG]);
+        let mut m = machine_with(&with_vectors(&body), qemu_icount());
+        let stepped = loop {
+            let stepped = m.step();
+            assert_eq!(stepped.stop, None);
+            if stepped.executed.as_ref().is_some_and(|e| e.pc == at_wfi) {
+                break stepped;
+            }
+        };
+        assert!(stepped.slept);
+        assert_eq!(stepped.interrupt, Some(4));
+        assert_eq!(m.pc(), VECTORS + 4 * 4);
+        assert!(m.device_time_nanos() >= 1_000_000, "slept to the alarm");
+        // A wfi nothing can end stops the step that executed it, once the watchdogs the reset
+        // values arm are stopped.
+        let mut body = stop_watchdogs();
+        let at_wfi = ROM_BASE + 4 * u32::try_from(body.len()).unwrap();
+        body.extend([wfi(), HANG]);
+        let mut idle = machine_with(&body, qemu_icount());
+        let stepped = loop {
+            let stepped = idle.step();
+            if stepped.stop.is_some() {
+                break stepped;
+            }
+        };
+        assert!(stepped.slept);
+        assert_eq!(stepped.stop, Some(StopReason::Idle));
+        assert_eq!(stepped.executed.map(|e| e.pc), Some(at_wfi));
+    }
+
+    #[test]
+    fn registers_and_csrs_are_read_and_an_integer_register_written() {
+        let mut m = machine(&[lui(T0, VECTORS), cpu_rv32::asm::csrrw(0, MTVEC, T0), HANG]);
+        m.step();
+        m.step();
+        assert_eq!(m.x()[usize::from(T0)], VECTORS);
+        assert_eq!(m.csr(0x305), Some(VECTORS | 1), "mtvec, vectored");
+        assert_eq!(m.csr(0x7FF), None, "no such CSR");
+        m.set_x(7, 0xDEAD_BEEF);
+        m.set_x(0, 1);
+        m.set_x(32, 1);
+        assert_eq!((m.x()[7], m.x()[0]), (0xDEAD_BEEF, 0));
+    }
+
+    #[test]
+    fn qemu_icount_prices_25_instructions_at_200_ns_whatever_the_clock() {
+        let to_pll_160 = [
+            store_register(reg("SYSTEM", "CPU_PER_CONF"), 1),
+            store_register(reg("SYSTEM", "SYSCLK_CONF"), 1 << 10),
+        ]
+        .concat();
+        let mut program = vec![NOP; 25];
+        program.extend(&to_pll_160);
+        program.extend([NOP; 25]);
+        program.push(HANG);
+        let mut m = machine_with(&program, qemu_icount());
+        assert_eq!(m.timing_model().name(), "qemu-icount");
+        for _ in 0..25 {
+            m.step();
+        }
+        assert_eq!(m.device_time_nanos(), 200, "at 20 MHz");
+        assert_eq!(m.cpu_frequency().hz(), 20_000_000);
+        for _ in 0..to_pll_160.len() {
+            m.step();
+        }
+        assert_eq!(m.cpu_frequency().hz(), 160_000_000);
+        let before = m.device_time_nanos();
+        for _ in 0..25 {
+            m.step();
+        }
+        assert_eq!(m.device_time_nanos() - before, 200, "at 160 MHz");
+        // The datasheet model prices the same 25 instructions in cycles of the 20 MHz clock.
+        let mut datasheet = machine(&program);
+        for _ in 0..25 {
+            datasheet.step();
+        }
+        assert_eq!(datasheet.device_time_nanos(), 1_250);
     }
 }

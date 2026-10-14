@@ -466,7 +466,8 @@ impl Peripherals {
             ana_i2c: AnaI2c::new(),
             timg0: Timg::new(Group::Timg0, flash_boot, ctx),
             timg1: Timg::new(Group::Timg1, flash_boot, ctx),
-            systimer: Systimer::new(ctx.now()),
+            systimer: Systimer::new(ctx.now())
+                .with_qemu_compat(config.qemu_compat.systimer_no_alarm_on_stopped_counter),
             apb_saradc: AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED),
             radio_power: AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED),
             uart0: Uart::new(0, UART0_BASE),
