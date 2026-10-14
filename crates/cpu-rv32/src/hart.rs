@@ -77,6 +77,19 @@ pub struct Hart {
     /// The line an outside controller presents ([`InterruptModel::Controller`]).
     pub(crate) external: Option<u32>,
     pub(crate) dcache: DecodeCache,
+    /// The last instruction fetched and decoded ([`Hart::last_instruction`]).
+    last: Option<Decoded>,
+}
+
+/// What [`Hart::take_boundary`] did before the next instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Boundary {
+    /// Nothing stands in the way: the next [`Hart::step`] executes the instruction at `pc`.
+    Ready,
+    /// The hart took the interrupt on this line: `pc` is its handler.
+    Interrupted { cause: u32 },
+    /// The hart waits in `wfi` and no line is pending.
+    Waiting,
 }
 
 impl Hart {
@@ -92,6 +105,7 @@ impl Hart {
             waiting: false,
             external: None,
             dcache: DecodeCache::new(),
+            last: None,
         }
     }
 
@@ -164,12 +178,15 @@ impl Hart {
         }
     }
 
-    /// Executes one instruction, or takes one pending interrupt, or reports that the hart is waiting.
-    pub fn step(&mut self, bus: &mut dyn Bus, timing: &dyn TimingModel) -> StepOutcome {
+    /// What stands between the hart and its next instruction, acted on: a `wfi` that a pending
+    /// line ends, then the interrupt the hart takes. [`Hart::step`] does this first; a caller that
+    /// wants the state the next instruction starts from (a lockstep, a debugger) calls it alone
+    /// until it returns [`Boundary::Ready`].
+    pub fn take_boundary(&mut self) -> Boundary {
         let pending = self.pending_line();
         if self.waiting {
             if pending.is_none() {
-                return StepOutcome::Waiting;
+                return Boundary::Waiting;
             }
             // `wfi` ends on any pending line, even when `mstatus.MIE` keeps it from being taken:
             // one set in both `mip` and `mie` (the standard model), or the one a controller
@@ -180,12 +197,33 @@ impl Hart {
             && let Some(line) = pending
         {
             self.enter_trap(MCAUSE_INTERRUPT | line, 0);
-            return StepOutcome::Interrupted { cause: line };
+            return Boundary::Interrupted { cause: line };
+        }
+        Boundary::Ready
+    }
+
+    /// The last instruction the hart fetched and decoded, whether it retired or raised an
+    /// exception; `None` before the first one and after a fetch that faulted.
+    #[must_use]
+    pub const fn last_instruction(&self) -> Option<Decoded> {
+        self.last
+    }
+
+    /// Executes one instruction, or takes one pending interrupt, or reports that the hart is waiting.
+    pub fn step(&mut self, bus: &mut dyn Bus, timing: &dyn TimingModel) -> StepOutcome {
+        match self.take_boundary() {
+            Boundary::Waiting => return StepOutcome::Waiting,
+            Boundary::Interrupted { cause } => return StepOutcome::Interrupted { cause },
+            Boundary::Ready => {}
         }
         let (decoded, fetch_stall) = match self.fetch_decoded(bus) {
             Ok(fetched) => fetched,
-            Err(trap) => return self.trap(trap, timing.instr_cycles(InstrClass::System)),
+            Err(trap) => {
+                self.last = None;
+                return self.trap(trap, timing.instr_cycles(InstrClass::System));
+            }
         };
+        self.last = Some(decoded);
         match self.execute(decoded, bus) {
             Ok(done) => {
                 let cycles = timing.instr_cycles(done.class) + fetch_stall + done.stall;
@@ -968,6 +1006,54 @@ mod tests {
         assert_eq!(h.x[1], 1);
         h.set_interrupt_pending(3, false);
         assert_eq!(h.csr.mip, 0);
+    }
+
+    #[test]
+    fn the_boundary_takes_a_pending_interrupt_without_executing_the_next_instruction() {
+        let (mut h, mut m) = machine(&[addi(1, 0, 1), addi(2, 0, 2)], MisalignedPolicy::Trap);
+        assert_eq!(h.take_boundary(), Boundary::Ready);
+        run(&mut h, &mut m, 1);
+        assert!(h.csr.write(MIE, 1 << 7));
+        assert!(h.csr.write(MSTATUS, MSTATUS_MIE));
+        h.set_interrupt_pending(7, true);
+        assert_eq!(h.take_boundary(), Boundary::Interrupted { cause: 7 });
+        assert_eq!(h.pc, TRAP_VECTOR, "the handler is next");
+        assert_eq!(h.csr.mepc, 4, "the instruction it interrupted");
+        assert_eq!((h.x[2], h.instret), (0, 1), "nothing else executed");
+        // `MIE` is clear in the handler: nothing more stands before its first instruction.
+        assert_eq!(h.take_boundary(), Boundary::Ready);
+    }
+
+    #[test]
+    fn the_boundary_ends_a_wfi_on_a_line_even_with_interrupts_masked() {
+        let (mut h, mut m) = machine(&[wfi(), addi(1, 0, 1)], MisalignedPolicy::Trap);
+        assert!(h.csr.write(MIE, 1 << 3));
+        run(&mut h, &mut m, 1);
+        assert_eq!(h.take_boundary(), Boundary::Waiting);
+        h.set_interrupt_pending(3, true);
+        assert_eq!(h.take_boundary(), Boundary::Ready);
+        assert!(!h.is_waiting());
+        assert_eq!(
+            (h.pc, h.x[1]),
+            (4, 0),
+            "the instruction after wfi has not run"
+        );
+    }
+
+    #[test]
+    fn the_last_instruction_is_the_one_just_executed_and_none_after_a_fetch_fault() {
+        let (mut h, mut m) = machine(&[addi(1, 0, 1), jal(0, 0x2_0000)], MisalignedPolicy::Trap);
+        assert_eq!(h.last_instruction(), None);
+        run(&mut h, &mut m, 1);
+        assert_eq!(h.last_instruction().map(|d| d.raw), Some(addi(1, 0, 1)));
+        run(&mut h, &mut m, 1);
+        assert_eq!(h.last_instruction().map(|d| d.raw), Some(jal(0, 0x2_0000)));
+        // The jump left the 64 KiB of RAM: the next fetch faults.
+        assert!(matches!(
+            h.step(&mut m, &OneCycle),
+            StepOutcome::Trapped { .. }
+        ));
+        assert_eq!(h.last_instruction(), None);
     }
 
     fn c3_machine(program: &[u32]) -> (Hart, Ram) {

@@ -56,10 +56,53 @@ impl TimingModel for DatasheetTiming {
     }
 }
 
+/// The timing of Espressif's QEMU run with `-icount 3`: every instruction is one cycle, whatever
+/// its class (QEMU's virtual clock counts instructions, 2^3 ns each, and nothing else). The chip
+/// model turns instructions into device time at 8 ns each; this model only says that no class costs
+/// more than another. It exists for the lockstep against QEMU (decision H2) and describes QEMU,
+/// not a chip: it is not calibrated.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QemuIcountTiming;
+
+impl TimingModel for QemuIcountTiming {
+    fn name(&self) -> &'static str {
+        "qemu-icount"
+    }
+
+    fn is_calibrated(&self) -> bool {
+        false
+    }
+
+    fn instr_cycles(&self, _class: InstrClass) -> u32 {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use emu_core::{InstrClass, TimingModel};
+
+    #[test]
+    fn the_qemu_icount_model_prices_every_class_at_one_cycle() {
+        let t = QemuIcountTiming;
+        assert_eq!(t.name(), "qemu-icount");
+        assert!(!t.is_calibrated());
+        for c in [
+            InstrClass::Alu,
+            InstrClass::Mul,
+            InstrClass::Div,
+            InstrClass::Load,
+            InstrClass::Store,
+            InstrClass::BranchTaken,
+            InstrClass::BranchNotTaken,
+            InstrClass::Jump,
+            InstrClass::Csr,
+            InstrClass::System,
+        ] {
+            assert_eq!(t.instr_cycles(c), 1);
+        }
+    }
     // `default()` is the required constructor (Task 7 interface); clippy would prefer the unit literal.
     #[allow(clippy::default_constructed_unit_structs)]
     #[test]
