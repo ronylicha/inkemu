@@ -348,16 +348,16 @@ struct RunRequest {
 }
 
 impl RunRequest {
-    /// The options of a run of `profile`, and the part of its first line that names the console
-    /// shown ([`console_note`]).
-    fn resolve(&self, profile: &DeviceProfile) -> (RunOptions, String) {
+    /// The options of a run of `profile` whose USB host starts as `usb_host`, and the part of its
+    /// first line that names the console shown ([`console_note`]).
+    fn resolve(&self, profile: &DeviceProfile, usb_host: UsbHost) -> (RunOptions, String) {
         let (console, origin) = shown_console(profile, self.console);
         let options = RunOptions {
             max_cycles: self.max_cycles,
             max_device_nanos: self.max_device_nanos,
             console,
         };
-        (options, console_note(console, origin))
+        (options, console_note(console, origin, usb_host))
     }
 }
 
@@ -382,15 +382,26 @@ fn shown_console(
 }
 
 /// The part of the first line of a run that names the console shown and where the choice came
-/// from: a user who sees nothing knows which console to ask for instead.
-fn console_note(channel: ConsoleChannel, origin: ConsoleOrigin) -> String {
-    match origin {
+/// from: a user who sees nothing knows which console to ask for instead. When the console is
+/// USB-Serial-JTAG and the USB host does not start open, the device sends nothing there until a
+/// host opens the port, and the note says so and how to see the output.
+fn console_note(channel: ConsoleChannel, origin: ConsoleOrigin, usb_host: UsbHost) -> String {
+    let mut note = match origin {
         ConsoleOrigin::Option => format!("console: {} (--console)", channel.name()),
         ConsoleOrigin::Profile => format!(
             "console: {} (the default of the device profile; --console shows another)",
             channel.name()
         ),
+    };
+    if channel == ConsoleChannel::UsbSerialJtag && usb_host != UsbHost::Open {
+        // Writing to a `String` cannot fail.
+        let _ = write!(
+            note,
+            "; the USB host starts {}: nothing reaches this console until a host opens the port, so --usb-host open or --console uart0 shows the output",
+            usb_host.name()
+        );
     }
+    note
 }
 
 /// The last component of `path`, for a line that names a file the user gave: escaped, since it
@@ -414,7 +425,7 @@ fn run_device(
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
-    let (run_options, console_note) = request.resolve(&profile);
+    let (run_options, console_note) = request.resolve(&profile, machine_options.usb_host);
     // Read before anything else of the run: a refused script needs no flash and no ROM.
     let script = match console_script.map(script_file::read_script).transpose() {
         Ok(script) => script,
@@ -880,18 +891,107 @@ mod tests {
                 "{id}"
             );
             assert_eq!(
-                console_note(channel, origin),
+                console_note(channel, origin, UsbHost::Open),
                 "console: usb-serial-jtag (the default of the device profile; --console shows another)"
             );
             for asked in ConsoleChannel::ALL {
                 let (channel, origin) = shown_console(&profile, Some(asked));
                 assert_eq!((channel, origin), (asked, ConsoleOrigin::Option), "{id}");
                 assert_eq!(
-                    console_note(channel, origin),
+                    console_note(channel, origin, UsbHost::Open),
                     format!("console: {} (--console)", asked.name())
                 );
             }
         }
+    }
+
+    /// `resolve` is what a run calls: the console it gives the run and the one its note names are
+    /// the profile's without `--console` and the option's with it, and the limits pass through.
+    #[test]
+    fn resolve_gives_the_run_the_console_its_note_names() {
+        let profile = profile_for("x4").unwrap();
+        for (asked, shown, note) in [
+            (
+                None,
+                ConsoleChannel::UsbSerialJtag,
+                "console: usb-serial-jtag (the default of the device profile; --console shows another)",
+            ),
+            (
+                Some(ConsoleChannel::Uart0),
+                ConsoleChannel::Uart0,
+                "console: uart0 (--console)",
+            ),
+        ] {
+            let request = RunRequest {
+                max_cycles: Some(7),
+                max_device_nanos: Some(11),
+                console: asked,
+            };
+            let (options, resolved_note) = request.resolve(&profile, UsbHost::Open);
+            assert_eq!(options.console, shown, "{asked:?}");
+            assert_eq!(resolved_note, note, "{asked:?}");
+            assert_eq!(
+                (options.max_cycles, options.max_device_nanos),
+                (Some(7), Some(11))
+            );
+        }
+    }
+
+    /// The first line of a run carries the console note between the timing model and what
+    /// follows it.
+    #[test]
+    fn the_first_line_names_the_console_of_the_profile() {
+        use soc_esp32c3::test_support::{HANG, flat_rom};
+        let profile = profile_for("x4").unwrap();
+        let entry = rom_store::rom_entry_for(profile.chip_revision);
+        let machine = profile.instantiate(flat_rom(&[HANG]), MachineOptions::default());
+        let request = RunRequest {
+            max_cycles: None,
+            max_device_nanos: None,
+            console: None,
+        };
+        let (_, note) = request.resolve(&profile, UsbHost::Open);
+        let line = header(&profile, entry, &machine, &note);
+        assert!(line.starts_with("inkemu: Xteink X4 (ESP32-C3 "), "{line}");
+        assert!(
+            line.ends_with(
+                "; console: usb-serial-jtag (the default of the device profile; --console shows another)"
+            ),
+            "{line}"
+        );
+    }
+
+    /// A USB-Serial-JTAG console whose host does not start open shows nothing until a host opens
+    /// the port: the note says so and how to see the output. Another console, or an open host,
+    /// gets no such clause.
+    #[test]
+    fn the_console_note_says_when_the_usb_host_keeps_the_console_silent() {
+        for host in [UsbHost::Absent, UsbHost::Attached] {
+            for origin in [ConsoleOrigin::Profile, ConsoleOrigin::Option] {
+                let note = console_note(ConsoleChannel::UsbSerialJtag, origin, host);
+                assert!(
+                    note.ends_with(&format!(
+                        "; the USB host starts {}: nothing reaches this console until a host opens the port, so --usb-host open or --console uart0 shows the output",
+                        host.name()
+                    )),
+                    "{note}"
+                );
+            }
+        }
+        for host in UsbHost::ALL {
+            for channel in [ConsoleChannel::Uart0, ConsoleChannel::Uart1] {
+                let note = console_note(channel, ConsoleOrigin::Option, host);
+                assert_eq!(note, format!("console: {} (--console)", channel.name()));
+            }
+        }
+        assert!(
+            !console_note(
+                ConsoleChannel::UsbSerialJtag,
+                ConsoleOrigin::Profile,
+                UsbHost::Open
+            )
+            .contains("USB host")
+        );
     }
 
     /// `--console` is optional, and nothing but the profile picks the console when it is absent.
