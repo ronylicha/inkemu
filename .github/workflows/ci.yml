@@ -243,9 +243,9 @@ jobs:
       # changed register whatever the rows say. The step after puts a fault in a peripheral's
       # model, which only a row holds.
       - name: The lockstep finds a fault put in inkemu
-        # The tool gives Docker 300 s to start QEMU and 300 s to remove its container, every
-        # docker call included (about 10 minutes when Docker never answers); each step leaves
-        # room for that and its run.
+        # The tool gives Docker 300 s to start QEMU and about 300 s to remove its container,
+        # every docker call included (about 10 minutes when Docker never answers); each step
+        # leaves room for that and its run.
         timeout-minutes: 15
         run: |
           source tools/conformance/versions.env

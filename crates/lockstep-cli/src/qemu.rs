@@ -320,9 +320,11 @@ fn check(status: ExitStatus) -> Result<(), QemuError> {
 /// enough to miss the open timeout is slow to create the container too: measured on 2026-10-14
 /// on a loaded host, it created one about two minutes after `docker run`, after a first version
 /// of this loop, bounded at 10 s, had killed the client and left. Every `docker` call, the last
-/// removal and look included, ends within it (each one is killed after [`DOCKER_CALL_TIMEOUT`],
-/// and none starts too late to end in time: [`LAST_CALL_START`]). With [`OPEN_TIMEOUT`], a run
-/// that cannot start QEMU ends within about 10 minutes; the CI's lockstep steps give it more.
+/// removal and look included, ends within about this long (each one is killed after
+/// [`DOCKER_CALL_TIMEOUT`], and none starts too late to end in time: [`LAST_CALL_START`]; a
+/// killed call adds up to [`DOCKER_CALL_POLL`] of polling and the kill itself, and so does the
+/// kill of the client). With [`OPEN_TIMEOUT`], a run that cannot start QEMU ends within about 10
+/// minutes; the CI's lockstep steps give it more.
 const REMOVE_BOUND: Duration = Duration::from_secs(300);
 /// How long [`clean_up`] waits between two tries.
 const REMOVE_POLL: Duration = Duration::from_millis(200);
@@ -333,7 +335,7 @@ const REMOVE_NOTICE: Duration = Duration::from_secs(10);
 const DOCKER_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// The latest time on the clean-up's clock a `docker` call of its loop may start, or a wait of
 /// it end: that call, then the last removal and look after the loop, three calls at most, still
-/// end within [`REMOVE_BOUND`].
+/// end within about [`REMOVE_BOUND`].
 const LAST_CALL_START: Duration =
     REMOVE_BOUND.saturating_sub(DOCKER_CALL_TIMEOUT.saturating_mul(3));
 /// How often a bounded `docker` call is looked at.
@@ -394,7 +396,7 @@ enum Cleanup {
 /// repeated until the client has exited and Docker says the container does not exist,
 /// [`REMOVE_POLL`] apart; `notice` is called once after [`REMOVE_NOTICE`]. No call starts after
 /// [`LAST_CALL_START`] on `clock`; then the client is killed and one more removal made, so that
-/// the whole clean-up ends within [`REMOVE_BOUND`].
+/// the whole clean-up ends within about [`REMOVE_BOUND`].
 fn clean_up(
     docker: &mut impl Docker,
     client: &mut impl Client,
