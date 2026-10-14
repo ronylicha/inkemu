@@ -19,19 +19,46 @@ une divergence (décision H3). Deux contrôles tiennent ce tableau :
     sert ailleurs), ou un bit de son masque jamais pris à QEMU.
   - Une fenêtre coupée par `--max-instructions` liste ce qu'elle laisse inutilisé sans échouer.
   - L'outil imprime cet usage à chaque exécution, avec le plus grand mouvement de chaque compteur.
-    La CI épingle le nombre d'usages de chaque ligne (`--expect-usage
-    tools/ci/lockstep-hello.usage`, code 3 s'il change).
+    La CI épingle le nombre d'usages de chaque ligne de chaque fenêtre (`--expect-usage
+    tools/ci/lockstep-<fenêtre>.usage`, code 3 s'il change).
+- **Chaque fenêtre a ses lignes** (SP1b-4d, décision J3). Une fenêtre compare un firmware ; elle dit
+  combien de resets des deux côtés la comparaison traverse, sa borne éventuelle, et la liste des
+  lignes qui valent pour elle. Une ligne a les mêmes paramètres dans toutes les fenêtres qui la
+  prennent, et chacune de ces fenêtres l'utilise entièrement ; un firmware qui montre d'autres bits ou
+  d'autres registres reçoit une ligne à lui, mesurée sur lui. `crates/lockstep/tests/table.rs`
+  compare aussi la section « Les fenêtres » à `lockstep::WINDOWS`.
 
 QEMU : `esp_develop_9.2.2_20250817`, celui de l'image `espressif/idf:v5.5.2`
-(`tools/conformance/versions.env`). Les lignes ont été mesurées le 2026-10-14 sur
-`flash_hello.bin` (ROM, bootloader, application jusqu'à `esp_restart`, 3 402 169 instructions
-comparées) ; chaque masque est l'ensemble des bits mesurés différents, rien de plus. Un firmware qui
+(`tools/conformance/versions.env`). Les lignes 1 à 24 ont été mesurées le 2026-10-14 (SP1b-4c) sur la
+première vie de `flash_hello.bin` (ROM, bootloader, application jusqu'à `esp_restart`, 3 402 169
+instructions comparées), les lignes suivantes le même jour (SP1b-4d) sur les fenêtres qu'elles
+nomment ; chaque masque est l'ensemble des bits mesurés différents, rien de plus. Un firmware qui
 montre un autre bit, ou touche un autre registre, échoue jusqu'à ce qu'une ligne l'admette avec sa
 preuve.
 
-## La fenêtre (H4, corrigée le 2026-10-14)
+## Les fenêtres (SP1b-4d)
 
-La comparaison s'arrête, sans divergence, au premier reset des deux côtés à la fois, et au premier
+Chaque fenêtre, avec le nombre d'instructions comparées, sa fin et la date de la mesure, que la CI
+épingle (`--expect-compared`, `--expect-end`, `--expect-usage`). « Resets » est le nombre de resets
+des deux côtés que la comparaison traverse ; le suivant termine la fenêtre.
+
+| Fenêtre | Firmware | Resets | Borne | Lignes | Comparées | Fin |
+|---|---|---|---|---|---|---|
+| hello | `flash_hello.bin` | 1 | — | 1–28 | 6 813 949 | reset |
+| nvs | `flash_nvs.bin` | 1 | — | 1–6, 8–24, 26, 27, 29–32 | 7 680 555 | reset |
+
+- **hello** : la ROM, le bootloader, `app_main` et le compte à rebours, le reset que demande
+  `esp_restart`, puis une seconde vie entière, jusqu'au second reset. 2 224 interruptions prises par
+  les deux côtés à la même instruction, 100 blocs réimprimés et 20 préemptés écartés.
+- **nvs** : de même pour `nvs_rw_value_cxx`, qui écrit son compteur de redémarrages dans la NVS avant
+  chaque `esp_restart` : les programmes et les effacements de la flash par SPI1, sous QEMU comme sous
+  inkemu, sont dans la fenêtre. 2 224 interruptions, 114 blocs réimprimés, 20 préemptés.
+
+## La fin d'une fenêtre (H4, corrigée le 2026-10-14, puis par SP1b-4d)
+
+La comparaison traverse les resets des deux côtés à la fois que sa fenêtre déclare (SP1b-4d,
+décisions J1 et J2, ci-dessous), et s'arrête au suivant. Elle s'arrête aussi, sans divergence, à la
+borne de la fenêtre quand elle en a une, et au premier
 accès (chargement ou rangement, de toute largeur) à une adresse de la fenêtre des périphériques
 (`0x6000_0000`–`0x600F_FFFF`) qu'aucun périphérique de QEMU ne couvre, sauf quand une ligne nomme ce
 registre. Un reset d'un seul côté est une divergence. Les périphériques de QEMU sont ceux de son
@@ -71,13 +98,38 @@ SENSITIVE, ASSIST_DEBUG), les registres du composant absents du SVD (le maître 
 radio : FE, FE2, NRX, BB) et les registres au-delà de ce que QEMU modélise d'un bloc (RTC_CNTL au-delà
 de `0x1FF`, SYSTEM au-delà de `0x9B`).
 
+### Traverser un reset (SP1b-4d)
+
+`esp_restart` finit par `esp_rom_software_reset_cpu(0)` (ESP-IDF v5.5.2,
+`components/esp_system/port/soc/esp32c3/system_internal.c`, lu dans l'image épinglée) : le bit
+`SW_PROCPU_RST` de `RTC_CNTL.OPTIONS0`, la cause `RTC_SW_CPU_RST` (0x0C), un reset du CPU, qui « ne
+réinitialise que le cœur » (TRM §6.1, tableau 6.1-1). Avant lui, `esp_restart` remet lui-même à zéro
+UART, SPI0/1, SYSTIMER, DMA, la crypto et la radio (`SYSTEM.PERIP_RST_EN0/1`, `CORE_RST_EN`). inkemu
+modélise les deux (`ResetCause::SoftwareCpu`, niveau `ResetLevel::Cpu`) ; QEMU, lui, réinitialise sa
+machine entière. La référence est la puce : inkemu n'est pas modifié.
+
+Au reset des deux côtés, rien de la machine n'est touché. Ce que le lockstep savait de QEMU repart
+comme à la mise sous tension : aucun CSR écrit (les paires « jusqu'à écriture » valent de nouveau),
+l'écart des compteurs refixé par leur prochaine lecture (QEMU repart de 0), aucune commande SPI1,
+aucun retard de `MEIP`. La capture du temporisateur RTC reste : celui de la puce compte à travers un
+reset du CPU, et QEMU n'en a pas. Tout ce que les deux resets laissent différent est une ligne
+mesurée sur la fenêtre (lignes 25 à 28, 31 et 32), ou une divergence ; aucune resynchronisation.
+
 ## Traitements, par ordre de préférence (H3)
 
 - **(i) paire de valeurs** : des bits d'un CSR comparé valent exactement une valeur dans QEMU et une
   autre dans inkemu ; les autres bits sont comparés, et une lecture du CSR dans un registre est tenue
   à la même paire. Une paire « jusqu'à écriture » ne vaut que jusqu'à ce qu'une instruction écrive le
   CSR. Le bit `MEIP` de `mip` (ligne 4) est tenu à la ligne que la matrice de QEMU calcule dans l'état
-  du contrôleur d'inkemu.
+  du contrôleur d'inkemu. **(i) gardé au reset** (SP1b-4d) : un registre entier ou un CSR comparé que
+  QEMU garde à son reset, là où le reset du CPU de la puce, comme celui d'inkemu, le remet à sa valeur
+  de reset. Au reset, s'ils diffèrent, la valeur de QEMU doit être celle qu'il avait avant le reset
+  (l'état d'où partait l'instruction qui l'a demandé, qu'elle n'écrit pas), et celle d'inkemu sa valeur
+  de reset ; la paire tient exactement jusqu'à ce qu'une instruction l'écrive ou qu'un piège change
+  l'une ou l'autre. Une instruction qui le lit pendant ce temps est une divergence (cause « read …,
+  which the last reset left different »), sauf un rangement d'un mot : il porte la paire en mémoire,
+  comme un prologue de fonction sauve un registre qu'il rendra, et le chargement d'un mot qui la rend
+  exactement des deux côtés tient sa destination à son tour ; un autre rangement sur ce mot l'efface.
 - **(ii) copie de bits** : après un chargement d'un mot depuis un registre nommé, le registre
   destination d'inkemu prend les bits du masque tels que QEMU les a chargés, les autres bits devant
   être égaux. Un registre de masque 0 est un accès admis à un registre que QEMU n'a pas : rien n'est
@@ -86,7 +138,13 @@ de `0x1FF`, SYSTEM au-delà de `0x9B`).
   son propre modèle, et l'écart avec celle de QEMU (d'une autre origine) ne peut bouger que comme la
   ligne le dit et le source. Une lecture dans la borne prend la valeur de QEMU ; au-delà, c'est une
   divergence. **(ii) horloge lente** : un temporisateur que QEMU n'a pas doit valoir, dans inkemu,
-  les cycles de sa fréquence déclarée au temps de l'appareil de sa capture.
+  les cycles de sa fréquence déclarée au temps de l'appareil de sa capture. **(ii) copie après
+  reset** (SP1b-4d) : la même copie de bits, faite seulement après un reset des deux côtés, en plus
+  de ce que prennent les registres des lignes (ii) à la même adresse (un bit va à la première ligne
+  qui le déclare). **(ii) CSR gardé au reset** (SP1b-4d) : un CSR que QEMU n'imprime pas, dont son
+  reset garde certains bits ; après un reset, une lecture doit donner dans QEMU la valeur d'inkemu
+  avec, en plus, ceux de ces bits qu'inkemu avait juste avant le reset, et la destination prend les
+  bits de QEMU, dans le masque mesuré.
 - **(iii) resynchronisation** à un PC d'ancrage : aucune ligne n'en a eu besoin.
 - **(iv) réglage `QemuCompat`** de la machine, désactivé par défaut, que seul le lockstep allume,
   quand la différence change le flot de contrôle et qu'aucun des trois premiers ne suffit. La ligne
@@ -94,35 +152,44 @@ de `0x1FF`, SYSTEM au-delà de `0x9B`).
 
 ## Tableau
 
-La colonne « Usages » donne ce que chaque ligne a fait dans la fenêtre de `flash_hello.bin` : une
-comparaison qu'une paire règle, une valeur copiée, un accès admis, une action d'un réglage.
+La colonne « Usages » donne ce que chaque ligne a fait dans chaque fenêtre qui la prend : une
+comparaison qu'une paire règle, une valeur copiée, un accès admis, une action d'un réglage. Les
+usages de SP1b-4c (première vie de `flash_hello.bin` seule) sont dans l'ADR 0008.
 
 | N° | Différence | Traitement | Source | Usages |
 |---|---|---|---|---|
-| 1 | `mstatus.MPP` : QEMU lit 0, inkemu « machine » | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MSTATUS_MPP_M`) ; mesure | 2 781 658 |
-| 2 | `mie` au reset : QEMU `0x0EEE`, inkemu 0, jusqu'à ce que le firmware l'écrive | (i) paire | oracle §1c piège 6 ; `target/riscv/esp_cpu.c` | 3 402 170 |
-| 3 | `mtvec.MODE` au reset : QEMU direct, inkemu vectorisé, jusqu'à l'écriture de `mtvec` | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MTVEC_VECTORED`) ; oracle §1c | 15 |
-| 4 | `mip.MEIP` : la ligne de la matrice de QEMU, trois instructions en retard après un rangement du seuil qui la fait tomber | (i) paire | `hw/riscv/esp32c3_intmatrix.c` ; `target/riscv/esp_cpu.c` ; mesure | 94 494 |
-| 5 | Le compteur de cycles : les deux comptent 6,25 ns du temps de l'appareil, celui de QEMU depuis sa première lecture | (iv) réglage ; (ii) compteur tenu | `target/riscv/esp_cpu.c` (`esp_cpu_get_cycles`) ; mesure | 566 442 |
-| 6 | UART0 : niveaux de ligne, compte de FIFO et valeurs de reset que QEMU ne modélise pas | (ii) copie | mesure ; `info mtree -f` (`esp_soc.uart`) | 3 165 |
-| 7 | SPI1 : la flash de QEMU ne répond pas à SFDP, laisse `W0` périmé et n'a pas les valeurs de reset | (ii) copie | oracle §1b (`Unknown cmd 5a`) ; mesure | 20 |
-| 8 | SPI0, absent de QEMU : la configuration flash du cache | (ii) copie | `info mtree -f` ; mesure | 81 |
-| 9 | RTC_CNTL : QEMU ne modélise que `OPTIONS0`, `RESET_STATE` et `STORE0`–`7` | (ii) horloge lente ; (ii) copie | `hw/misc/esp32c3_rtc_cntl.c` ; `clk_tree_defs.h` ; mesure | 92 |
-| 10 | eFuse : les mots où les eFuses vierges de QEMU et ceux de la X4 diffèrent | (ii) copie | oracle §1d ; carryover SP1b-2 ligne 17 ; mesure | 67 |
-| 11 | IO_MUX, absent de QEMU : la configuration des broches GPIO0–21 | (ii) copie | `info mtree -f` ; SVD ; mesure | 284 |
-| 12 | Le maître I²C analogique, absent de QEMU : les accès regi2c de la ROM | (ii) copie | carryover SP1b-2 lignes 7 et 8 ; mesure | 147 |
-| 13 | La mise sous tension de la radio par `rtc_sleep_pu`, absente de QEMU : BB, NRX, FE, FE2 | (ii) copie | ESP-IDF v5.5.2 `rtc_sleep.c` ; `esp32c3-bootloader-accesses.md` lignes 31–33 | 14 |
-| 14 | TIMG0 et TIMG1 : valeurs de reset des chiens de garde, portes d'horloge, calibration RTC | (ii) copie | `timers-and-watchdogs` §G lignes 1, 5 et 8 ; mesure | 13 |
-| 15 | SYSTIMER : les compteurs de QEMU perdent une fraction d'unité à chaque mise à jour et se lisent toujours valides | (ii) copie ; (ii) compteur tenu | `hw/timer/esp_systimer.c` ; SVD ; mesure | 2 220 |
-| 16 | APB_CTRL, absent de QEMU : horloges Wi-Fi et alimentation des mémoires | (ii) copie | `info mtree -f` ; mesure | 21 |
-| 17 | `RNG.DATA` : QEMU rend le `rand()` de l'hôte | (ii) copie | `hw/riscv/esp32c3.c` (`A_SYSCON_RND_DATA_REG`) | 1 604 |
-| 18 | APB_SARADC, absent de QEMU : les sept registres de la source d'entropie du bootloader | (ii) copie | ESP-IDF v5.5.2 `bootloader_random_esp32c3.c` ; `esp32c3-bootloader-accesses.md` lignes 79–85 | 48 |
-| 19 | USB-Serial-JTAG : `SERIAL_IN_EP_DATA_FREE`, que QEMU lit 0 | (ii) copie | carryover SP1b-2 ligne 22 ; mesure | 7 033 |
-| 20 | SYSTEM : portes d'horloge, resets et choix d'horloge que le modèle d'horloge de QEMU tient autrement | (ii) copie | `timers-and-watchdogs` §G ligne 12 ; mesure | 46 |
-| 21 | SENSITIVE, absent de QEMU : la protection mémoire qu'ESP-IDF installe | (ii) copie | `info mtree -f` ; mesure | 77 |
-| 22 | EXTMEM : bits d'alimentation, de gel et de synchronisation que le cache de QEMU ne tient pas | (ii) copie | carryover SP1b-2 ligne 3 ; mesure | 24 |
-| 23 | ASSIST_DEBUG, absent de QEMU : le moniteur de pile de FreeRTOS | (ii) copie | `timers-and-watchdogs` §G ligne 13 ; mesure | 14 447 |
-| 24 | SYSTIMER : pas d'alarme tant que le compteur est arrêté | (iv) réglage | `timers-and-watchdogs` §A.4 et §G ligne 10 ; `hw/timer/esp_systimer.c` | 1 |
+| 1 | `mstatus.MPP` : QEMU lit 0, inkemu « machine » | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MSTATUS_MPP_M`) ; mesure | hello 5 572 920 ; nvs 6 441 342 |
+| 2 | `mie` au reset : QEMU `0x0EEE`, inkemu 0, jusqu'à ce que le firmware l'écrive | (i) paire | oracle §1c piège 6 ; `target/riscv/esp_cpu.c` | hello 6 813 950 ; nvs 7 680 556 |
+| 3 | `mtvec.MODE` au reset : QEMU direct, inkemu vectorisé, jusqu'à l'écriture de `mtvec` | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MTVEC_VECTORED`) ; oracle §1c | hello 15 ; nvs 15 |
+| 4 | `mip.MEIP` : la ligne de la matrice de QEMU, trois instructions en retard après un rangement du seuil qui la fait tomber | (i) paire | `hw/riscv/esp32c3_intmatrix.c` ; `target/riscv/esp_cpu.c` ; mesure | hello 188 988 ; nvs 188 988 |
+| 5 | Le compteur de cycles : les deux comptent 6,25 ns du temps de l'appareil, celui de QEMU depuis sa première lecture | (iv) réglage ; (ii) compteur tenu | `target/riscv/esp_cpu.c` (`esp_cpu_get_cycles`) ; mesure | hello 1 118 166 ; nvs 1 118 170 |
+| 6 | UART0 : niveaux de ligne, compte de FIFO et valeurs de reset que QEMU ne modélise pas | (ii) copie | mesure ; `info mtree -f` (`esp_soc.uart`) | hello 6 483 ; nvs 6 601 |
+| 7 | SPI1 : la flash de QEMU ne répond pas à SFDP, laisse `W0` périmé et n'a pas les valeurs de reset | (ii) copie | oracle §1b (`Unknown cmd 5a`) ; mesure | hello 40 |
+| 8 | SPI0, absent de QEMU : la configuration flash du cache | (ii) copie | `info mtree -f` ; mesure | hello 162 ; nvs 162 |
+| 9 | RTC_CNTL : QEMU ne modélise que `OPTIONS0`, `RESET_STATE` et `STORE0`–`7` | (ii) horloge lente ; (ii) copie | `hw/misc/esp32c3_rtc_cntl.c` ; `clk_tree_defs.h` ; mesure | hello 162 ; nvs 162 |
+| 10 | eFuse : les mots où les eFuses vierges de QEMU et ceux de la X4 diffèrent | (ii) copie | oracle §1d ; carryover SP1b-2 ligne 17 ; mesure | hello 132 ; nvs 126 |
+| 11 | IO_MUX, absent de QEMU : la configuration des broches GPIO0–21 | (ii) copie | `info mtree -f` ; SVD ; mesure | hello 549 ; nvs 549 |
+| 12 | Le maître I²C analogique, absent de QEMU : les accès regi2c de la ROM | (ii) copie | carryover SP1b-2 lignes 7 et 8 ; mesure | hello 268 ; nvs 268 |
+| 13 | La mise sous tension de la radio par `rtc_sleep_pu`, absente de QEMU : BB, NRX, FE, FE2 | (ii) copie | ESP-IDF v5.5.2 `rtc_sleep.c` ; `esp32c3-bootloader-accesses.md` lignes 31–33 | hello 28 ; nvs 28 |
+| 14 | TIMG0 et TIMG1 : valeurs de reset des chiens de garde, portes d'horloge, calibration RTC | (ii) copie | `timers-and-watchdogs` §G lignes 1, 5 et 8 ; mesure | hello 24 ; nvs 24 |
+| 15 | SYSTIMER : les compteurs de QEMU perdent une fraction d'unité à chaque mise à jour et se lisent toujours valides | (ii) copie ; (ii) compteur tenu | `hw/timer/esp_systimer.c` ; SVD ; mesure | hello 4 442 ; nvs 4 714 |
+| 16 | APB_CTRL, absent de QEMU : horloges Wi-Fi et alimentation des mémoires | (ii) copie | `info mtree -f` ; mesure | hello 43 ; nvs 43 |
+| 17 | `RNG.DATA` : QEMU rend le `rand()` de l'hôte | (ii) copie | `hw/riscv/esp32c3.c` (`A_SYSCON_RND_DATA_REG`) | hello 3 208 ; nvs 3 208 |
+| 18 | APB_SARADC, absent de QEMU : les sept registres de la source d'entropie du bootloader | (ii) copie | ESP-IDF v5.5.2 `bootloader_random_esp32c3.c` ; `esp32c3-bootloader-accesses.md` lignes 79–85 | hello 96 ; nvs 96 |
+| 19 | USB-Serial-JTAG : `SERIAL_IN_EP_DATA_FREE`, que QEMU lit 0 | (ii) copie | carryover SP1b-2 ligne 22 ; mesure | hello 14 218 ; nvs 14 231 |
+| 20 | SYSTEM : portes d'horloge, resets et choix d'horloge que le modèle d'horloge de QEMU tient autrement | (ii) copie | `timers-and-watchdogs` §G ligne 12 ; mesure | hello 83 ; nvs 83 |
+| 21 | SENSITIVE, absent de QEMU : la protection mémoire qu'ESP-IDF installe | (ii) copie | `info mtree -f` ; mesure | hello 154 ; nvs 154 |
+| 22 | EXTMEM : bits d'alimentation, de gel et de synchronisation que le cache de QEMU ne tient pas | (ii) copie | carryover SP1b-2 ligne 3 ; mesure | hello 46 ; nvs 442 |
+| 23 | ASSIST_DEBUG, absent de QEMU : le moniteur de pile de FreeRTOS | (ii) copie | `timers-and-watchdogs` §G ligne 13 ; mesure | hello 28 892 ; nvs 28 892 |
+| 24 | SYSTIMER : pas d'alarme tant que le compteur est arrêté | (iv) réglage | `timers-and-watchdogs` §A.4 et §G ligne 10 ; `hw/timer/esp_systimer.c` | hello 2 ; nvs 2 |
+| 25 | `flash_hello.bin`, à son reset : QEMU garde des registres et des CSR que le reset du CPU de la puce remet à leur valeur de reset | (i) gardé au reset | `cpu_rv32::Hart::reset` ; TRM §6.1 ; mesure | hello 4 789 611 |
+| 26 | PMP : le reset de QEMU garde les bits R, W, X de chaque entrée, celui du CPU de la puce les efface | (ii) CSR gardé au reset | spécification privilégiée RISC-V §3.7.1 ; mesure | hello 13 ; nvs 13 |
+| 27 | Après `esp_restart` : registres que le reset de la puce et celui de QEMU laissent dans des états différents | (ii) copie après reset | TRM §6.1 ; ESP-IDF v5.5.2 `system_internal.c` ; mesure | hello 51 ; nvs 51 |
+| 28 | `flash_hello.bin`, après son reset : les registres de SPI1 que le bootloader relit | (ii) copie après reset | mesure | hello 4 |
+| 29 | `flash_nvs.bin`, SPI1 : la ligne 7, et la flash de QEMU qui garde `WEL` après un programme ou un effacement | (ii) copie | `esp-idf-storage-flash-traffic.md` (résultat clé 5) ; mesure | nvs 600 |
+| 30 | `flash_nvs.bin`, EXTMEM : la synchronisation du cache autour des écritures de la flash | (ii) copie | mesure | nvs 2 |
+| 31 | `flash_nvs.bin`, à son reset : comme la ligne 25, avec d'autres registres | (i) gardé au reset | `cpu_rv32::Hart::reset` ; TRM §6.1 ; mesure | nvs 5 108 772 |
+| 32 | `flash_nvs.bin`, après son reset : les registres de SPI1 que le bootloader relit | (ii) copie après reset | mesure | nvs 4 |
 
 Les sources de QEMU sont celles de la branche `esp-develop` d'`espressif/qemu`. « Mesure » renvoie à
 la mesure du 2026-10-14 : chaque registre de la fenêtre lu ou écrit, les valeurs des deux côtés à
@@ -137,7 +204,8 @@ csr numéro> écart <unités> origines <…>` (l'écart tenu à ses unités de c
 `compteur <adresse> recul par mise à jour <premier>-<dernier> origines <…>` (l'écart ne descend que
 d'une unité par mise à jour possible de QEMU entre deux lectures), `horloge lente <adresse> capture
 <adresse> bit <n> <fréquence> Hz écart <cycles> qemu <valeur>`, `réglage <nom du champ de
-QemuCompat>`. Une origine est un CSR écrit ou une adresse où un rangement est fait.
+QemuCompat>`, et depuis SP1b-4d `gardé au reset <registre ou CSR>`, `csr gardé au reset <adresse>
+bits gardés <bits> masque <bits>`, `après reset registre <adresse> masque <bits>`. Une origine est un CSR écrit ou une adresse où un rangement est fait.
 
 ### Ligne 1 — `mstatus.MPP`
 
@@ -691,6 +759,220 @@ Paramètres :
 réglage systimer_no_alarm_on_stopped_counter
 ```
 
+### Ligne 25 — `flash_hello.bin` : ce que QEMU garde à son reset
+
+Au reset que demande `esp_restart`, le reset du CPU d'inkemu remet les registres entiers à 0
+(`cpu_rv32::Hart::reset`, marqué ASSUMPTION : l'architecture les laisse indéfinis, et la ROM écrit
+chaque registre qu'elle lit), `mtvec` à 1, `mepc` à 0 et `mstatus` à sa valeur de reset ; QEMU, qui
+réinitialise sa machine, garde les registres entiers, `mtvec`, `mepc` et le bit `MPIE` de `mstatus`.
+Mesure : au reset, QEMU montre exactement les valeurs d'avant le reset, et ces dix-huit grandeurs
+diffèrent ; aucune autre, sauf `mie`, que la ligne 2 tient comme à la mise sous tension. Chacune est
+tenue jusqu'à ce qu'une instruction l'écrive ou qu'un piège la change : la plupart dans les 6 000
+premières instructions de la ROM, `mepc` au premier tick de la seconde vie, 2,38 millions
+d'instructions plus loin, et `tp` juste après. Aucune instruction ne les lit entre-temps, sauf des
+rangements d'un mot sur la pile et des chargements qui les rendent : le mot `0x3FCDE6F4`, où la
+valeur de `s1` d'avant le reset a été rangée, rechargé avec la même paire. La règle la plus stricte
+(toute autre lecture est une divergence) passe donc : rien ne calcule avec une valeur que le reset a
+laissée.
+
+Paramètres :
+
+```text
+gardé au reset x1/ra
+gardé au reset x2/sp
+gardé au reset x3/gp
+gardé au reset x4/tp
+gardé au reset x5/t0
+gardé au reset x8/s0
+gardé au reset x9/s1
+gardé au reset x11/a1
+gardé au reset x12/a2
+gardé au reset x13/a3
+gardé au reset x14/a4
+gardé au reset x15/a5
+gardé au reset x16/a6
+gardé au reset x17/a7
+gardé au reset x28/t3
+gardé au reset mstatus
+gardé au reset mtvec
+gardé au reset mepc
+```
+
+### Ligne 26 — la configuration PMP
+
+Le bootloader de la seconde vie lit `pmpcfg0` à `pmpcfg3` (`csrrs`) avant de les écrire. inkemu,
+dont le reset du CPU remet tous les CSR à zéro, lit 0 ; QEMU lit les bits R, W, X que la première vie
+avait mis, sans les bits L et A : la spécification privilégiée RISC-V (§3.7.1) demande seulement
+qu'un reset efface A et L, et QEMU garde le reste. Mesure : à chaque lecture, la valeur de QEMU est
+celle d'inkemu plus les bits R, W, X qu'inkemu avait juste avant le reset (`0x89888F88` avant le
+reset pour `pmpcfg0`, `0x01000700` lu par QEMU). inkemu ne fait pas respecter la PMP (SP1b-4f) : la
+copie ne change que le registre destination. Mêmes masques dans `hello` et `nvs`.
+
+Paramètres :
+
+```text
+csr gardé au reset 0x3A0 bits gardés 0x07070707 masque 0x01000700
+csr gardé au reset 0x3A1 bits gardés 0x07070707 masque 0x00050103
+csr gardé au reset 0x3A2 bits gardés 0x07070707 masque 0x07000507
+csr gardé au reset 0x3A3 bits gardés 0x07070707 masque 0x00000300
+```
+
+### Ligne 27 — après `esp_restart`
+
+Après le reset, la ROM, le bootloader et l'application relisent des registres que la première vie a
+écrits. Le reset du CPU de la puce les garde (TRM §6.1), sauf ce qu'`esp_restart` remet lui-même à
+zéro par `SYSTEM.PERIP_RST_EN0/1` ; QEMU remet tout à ses valeurs de reset. Les deux sens se
+montrent : QEMU lit sa valeur de reset là où inkemu lit ce que la première vie a laissé (les
+`IN_SEL` de GPIO0–1, `0x30`, rangés par `esp_restart` ; les bits `FUN_IE` des broches ; RTC_CNTL ;
+TIMG0 et TIMG1 ; SYSTEM ; EXTMEM ; le PC qu'`ASSIST_DEBUG` a enregistré au reset, `0x40048B92`, que
+la ROM imprime en `Saved PC`), ou garde l'ancienne valeur là où inkemu a remis UART0 à zéro avec
+`SYSTEM_UART_RST` (`CLKDIV` : QEMU `0x30015B`, le diviseur que la ROM avait programmé, inkemu
+`0x2B6`, sa valeur de reset). Chaque registre est nommé avec les bits mesurés différents dans la
+seconde vie, au-delà de ce que les lignes 1 à 24 prennent déjà à la même adresse ; la copie ne se
+fait qu'après un reset : dans la première vie, ces bits restent comparés. Mêmes registres et mêmes
+masques dans `hello` et `nvs`.
+
+Paramètres :
+
+```text
+après reset registre 0x60000014 masque 0x003003ED
+après reset registre 0x60000078 masque 0x00001000
+après reset registre 0x60002010 masque 0x000003E0
+après reset registre 0x60002028 masque 0x00000017
+après reset registre 0x60004154 masque 0x00000030
+après reset registre 0x60004158 masque 0x00000030
+après reset registre 0x60008024 masque 0x00010000
+après reset registre 0x60008028 masque 0x00010000
+après reset registre 0x6000802C masque 0x00000200
+après reset registre 0x60008030 masque 0x00010000
+après reset registre 0x60008080 masque 0x10000000
+après reset registre 0x60008088 masque 0x00000800
+après reset registre 0x6000808C masque 0x00400000
+après reset registre 0x600080AC masque 0x80000000
+après reset registre 0x60009004 masque 0x00000002
+après reset registre 0x60009008 masque 0x00000002
+après reset registre 0x6000900C masque 0x00000002
+après reset registre 0x60009010 masque 0x00000002
+après reset registre 0x60009014 masque 0x00000002
+après reset registre 0x60009018 masque 0x00000002
+après reset registre 0x6000901C masque 0x00000002
+après reset registre 0x60009020 masque 0x00000002
+après reset registre 0x60009024 masque 0x00000002
+après reset registre 0x60009028 masque 0x00000002
+après reset registre 0x6000902C masque 0x00000002
+après reset registre 0x60009030 masque 0x00000002
+après reset registre 0x60009034 masque 0x00000002
+après reset registre 0x60009038 masque 0x00000002
+après reset registre 0x60009040 masque 0x00000002
+après reset registre 0x60009044 masque 0x00000002
+après reset registre 0x60009048 masque 0x00000002
+après reset registre 0x6000904C masque 0x00000002
+après reset registre 0x60009050 masque 0x00000002
+après reset registre 0x6001F048 masque 0x383B0000
+après reset registre 0x6001F04C masque 0x4E200000
+après reset registre 0x6001F068 masque 0x04013000
+après reset registre 0x6002004C masque 0x4E200000
+après reset registre 0x60040018 masque 0x00630000
+après reset registre 0x600C0008 masque 0x00000001
+après reset registre 0x600C0018 masque 0x57124411
+après reset registre 0x600C001C masque 0xFFFFFE01
+après reset registre 0x600C0024 masque 0x01000000
+après reset registre 0x600C4078 masque 0x00000023
+après reset registre 0x600C4084 masque 0x0000003F
+après reset registre 0x600CE008 masque 0x00000300
+après reset registre 0x600CE048 masque 0x40048B92
+```
+
+### Ligne 28 — `flash_hello.bin` : SPI1 après le reset
+
+Deux registres de SPI1 que le bootloader de la seconde vie relit après les avoir écrits, et que la
+première vie avait laissés autrement dans inkemu (`CLOCK`, `USER2`) : leurs bits différents ne sont
+pas les mêmes dans `hello` et dans `nvs` (ligne 32), qui n'ont pas laissé la flash dans le même état.
+
+Paramètres :
+
+```text
+après reset registre 0x60002018 masque 0x00000080
+après reset registre 0x60002020 masque 0x0000009F
+```
+
+### Ligne 29 — `flash_nvs.bin` : SPI1
+
+La ligne 7, sauf `W0` après `RDSR` (`0x05`) : `nvs_rw_value_cxx` programme et efface la flash, et la
+flash de QEMU garde `WEL` (le bit 1 de l'état) après la fin d'un programme ou d'un effacement, là où
+une puce l'efface (`esp-idf-storage-flash-traffic.md`, résultat clé 5, et le test « WEL reads 0 after
+a program » de `soc-esp32c3/src/flash.rs`). Mesure : 48 des 50 lectures de `W0` après `RDSR`
+diffèrent, par les octets hauts que QEMU laisse périmés, et 16 d'entre elles aussi par `WEL` (`0x02`
+chez QEMU, 0 chez inkemu). La copie fait voir
+`WEL` à ESP-IDF comme sous QEMU, qui envoie alors `WRDI` et un `RDSR` de plus à chaque programme :
+c'est le chemin que la copie laisse dans inkemu, et sans le lockstep inkemu envoie six commandes par
+programme au lieu de neuf.
+
+Paramètres :
+
+```text
+registre 0x60002034 masque 0x00000002
+registre 0x60002058 masque 0x001860FF après 0x5A
+registre 0x60002058 masque 0xFFFFFF02 après 0x05
+registre 0x60002098 masque 0x00000014
+registre 0x6000209C masque 0x0A002000
+registre 0x600020DC masque 0x00000001
+```
+
+### Ligne 30 — `flash_nvs.bin` : EXTMEM
+
+`ICACHE_SYNC_CTRL` (`0x600C4030`), que l'écriture de la flash fait attendre : QEMU et inkemu ne
+tiennent pas le même bit 11. Mesure : deux lectures différentes sur 112.
+
+Paramètres :
+
+```text
+registre 0x600C4030 masque 0x00000800
+```
+
+### Ligne 31 — `flash_nvs.bin` : ce que QEMU garde à son reset
+
+Comme la ligne 25 ; avant son reset, `nvs_rw_value_cxx` laisse aussi `t2`, `t4`, `t5` et `t6`
+différents de 0.
+
+Paramètres :
+
+```text
+gardé au reset x1/ra
+gardé au reset x2/sp
+gardé au reset x3/gp
+gardé au reset x4/tp
+gardé au reset x5/t0
+gardé au reset x7/t2
+gardé au reset x8/s0
+gardé au reset x9/s1
+gardé au reset x11/a1
+gardé au reset x12/a2
+gardé au reset x13/a3
+gardé au reset x14/a4
+gardé au reset x15/a5
+gardé au reset x16/a6
+gardé au reset x17/a7
+gardé au reset x28/t3
+gardé au reset x29/t4
+gardé au reset x30/t5
+gardé au reset x31/t6
+gardé au reset mstatus
+gardé au reset mtvec
+gardé au reset mepc
+```
+
+### Ligne 32 — `flash_nvs.bin` : SPI1 après le reset
+
+Comme la ligne 28, avec les bits mesurés dans `nvs`.
+
+Paramètres :
+
+```text
+après reset registre 0x60002018 masque 0x10000080
+après reset registre 0x60002020 masque 0x00000005
+```
+
 ## Pourquoi la ligne 24 n'est pas une resynchronisation
 
 Aucune lecture de registre n'explique l'interruption précoce, donc rien à copier ; faire exécuter à
@@ -702,7 +984,8 @@ seulement.
 ## Ce qui n'est pas comparé
 
 - Les CSR que QEMU n'imprime pas ou qu'inkemu n'a pas sous ce nom : PMP, `mcountinhibit`, `mpcer`,
-  `mpcmr`. Un rangement n'est comparé qu'à travers les chargements qui le relisent.
+  `mpcmr`, sinon à travers leurs lectures dans un registre (ligne 26 pour la PMP). Un rangement n'est
+  comparé qu'à travers les chargements qui le relisent.
 - Un bloc qu'une interruption a préempté (ci-dessous) : l'état qu'il porte est comparé au premier
   bloc du gestionnaire, `mepc` et `mcause` compris.
 - Ce que les copies de valeurs et les réglages remplacent (moniteur de pile, changement d'horloge,
@@ -713,8 +996,8 @@ seulement.
 ## Ce qui n'est pas une différence
 
 Deux sortes de blocs de la trace de QEMU ne sont pas des états d'instruction et sont écartés (ADR
-0008) : un bloc réimprimé à l'identique quand le budget d'instructions de QEMU se recharge (50 dans la
-fenêtre, jamais deux de suite ; un deuxième à l'identique est comparé comme une instruction exécutée,
-sauf un saut sur lui-même reconnu sur ses bits et l'état de QEMU), et un bloc dont QEMU prend
-l'interruption avant d'exécuter l'instruction (10 dans la fenêtre). Le temps est aligné par le modèle
+0008) : un bloc réimprimé à l'identique quand le budget d'instructions de QEMU se recharge (100 dans
+`hello`, 114 dans `nvs`, jamais deux de suite ; un deuxième à l'identique est comparé comme une
+instruction exécutée, sauf un saut sur lui-même reconnu sur ses bits et l'état de QEMU), et un bloc
+dont QEMU prend l'interruption avant d'exécuter l'instruction (20 dans chacune). Le temps est aligné par le modèle
 `qemu-icount` (décision H2), pas par une ligne.

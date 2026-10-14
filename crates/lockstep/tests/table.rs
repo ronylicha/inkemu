@@ -219,6 +219,57 @@ fn every_row_of_the_documentation_declares_the_parameters_of_the_tool() {
     );
 }
 
+/// The rows of the section « Les fenêtres »: name, firmware, resets, bound, row numbers.
+fn windows(text: &str) -> Vec<(String, String, u32, Option<u64>, Vec<u16>)> {
+    let section = text
+        .split("## Les fenêtres")
+        .nth(1)
+        .expect("a section « Les fenêtres »");
+    let section = section.split("\n## ").next().unwrap();
+    let number = |cell: &str| -> u64 { cell.replace(' ', "").parse().unwrap() };
+    section
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let firmware = cells.get(2)?.strip_prefix('`')?.strip_suffix('`')?;
+            let rows = cells[5]
+                .split(',')
+                .flat_map(|part| {
+                    let part = part.trim();
+                    let (first, last) = part.split_once('–').unwrap_or((part, part));
+                    let (first, last): (u16, u16) = (first.parse().unwrap(), last.parse().unwrap());
+                    first..=last
+                })
+                .collect();
+            let bound = (cells[4] != "—").then(|| number(cells[4]));
+            Some((
+                cells[1].to_owned(),
+                firmware.to_owned(),
+                u32::try_from(number(cells[3])).unwrap(),
+                bound,
+                rows,
+            ))
+        })
+        .collect()
+}
+
+#[test]
+fn the_windows_of_the_documentation_are_the_windows_of_the_tool() {
+    let tool: Vec<(String, String, u32, Option<u64>, Vec<u16>)> = lockstep::WINDOWS
+        .iter()
+        .map(|window| {
+            (
+                window.name.to_owned(),
+                window.firmware.to_owned(),
+                window.resets,
+                window.bound,
+                window.rows.iter().map(|row| row.number).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(windows(&documentation()), tool);
+}
+
 #[test]
 fn the_rows_are_numbered_from_1_without_a_gap() {
     let numbers: Vec<u16> = lockstep::DIFFERENCES.iter().map(|row| row.number).collect();

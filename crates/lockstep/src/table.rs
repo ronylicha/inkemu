@@ -239,6 +239,19 @@ impl Difference {
             .filter(move |register| register.address == address)
     }
 
+    /// Every register entry of the row, before a reset and after one.
+    pub fn registers_at_all(&self) -> impl Iterator<Item = &'static Register> + '_ {
+        self.treatments
+            .iter()
+            .filter_map(|treatment| match treatment {
+                Treatment::Registers(registers) | Treatment::RegistersAfterReset(registers) => {
+                    Some(registers.iter())
+                }
+                _ => None,
+            })
+            .flatten()
+    }
+
     /// Every site the row declares, with the bits a run must take from QEMU there for the
     /// declaration to be used whole (decision H3): a pair's bits, `MEIP`, a register's mask. A
     /// register admitted with no bit, a counter and a clock are used by a read.
@@ -1196,16 +1209,38 @@ mod tests {
         }
     }
 
+    /// A register is named by one row of a window (`window.rs` holds that); here, every register
+    /// is a word, and a row that copies only after a reset names none its own window's rows copy
+    /// before one with the same bits.
     #[test]
-    fn every_register_is_word_aligned_and_in_one_row() {
-        let mut owner = std::collections::BTreeMap::new();
-        for row in DIFFERENCES {
-            for treatment in row.treatments {
-                if let Treatment::Registers(registers) = treatment {
-                    for register in *registers {
-                        assert_eq!(register.address % 4, 0, "{:#010x}", register.address);
-                        let first = *owner.entry(register.address).or_insert(row.number);
-                        assert_eq!(first, row.number, "{:#010x}", register.address);
+    fn every_register_is_word_aligned_and_an_after_reset_entry_adds_bits() {
+        for window in crate::WINDOWS {
+            let mut before = std::collections::BTreeMap::new();
+            for row in window.rows {
+                for register in row.registers_at_all() {
+                    assert_eq!(register.address % 4, 0, "{:#010x}", register.address);
+                }
+                for treatment in row.treatments {
+                    if let Treatment::Registers(registers) = treatment {
+                        for register in *registers {
+                            *before.entry(register.address).or_insert(0) |= register.mask;
+                        }
+                    }
+                }
+            }
+            for row in window.rows {
+                for treatment in row.treatments {
+                    if let Treatment::RegistersAfterReset(registers) = treatment {
+                        for register in *registers {
+                            let earlier = before.get(&register.address).copied().unwrap_or(0);
+                            assert_eq!(
+                                register.mask & earlier,
+                                0,
+                                "window {}: {:#010x}",
+                                window.name,
+                                register.address
+                            );
+                        }
                     }
                 }
             }
