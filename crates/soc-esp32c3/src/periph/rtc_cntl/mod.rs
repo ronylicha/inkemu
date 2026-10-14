@@ -6,11 +6,23 @@
 //! This block is in the RTC power domain: a CPU reset and a core reset leave it as it is, RTC
 //! watchdog counter included; a system reset returns its registers to their reset values; nothing
 //! but a power-on stops the RTC timer (TRM §9.3.3; TW §D.2).
+//!
+//! The RTC timer (`timer`), the RTC watchdog (`wdt`) and the super watchdog (`swd`) have a module
+//! each; the registers they share and the wake-up of the block are here.
+mod swd;
+mod timer;
+mod wdt;
+
+#[cfg(test)]
+use swd::{SWD_AUTO_FEED_EN, SWD_FEED, SWD_FEED_REQUEST, SWD_RST_FLAG_CLR};
+#[cfg(test)]
+use wdt::{ACTION_INTERRUPT, ACTION_RESET_CPU, ACTION_RESET_RTC, ACTION_RESET_SYSTEM, WDT_FEED};
+
 use crate::clock::SECOND;
 use crate::ctx::{Ctx, Deadline, Event, Source};
 use crate::diag::Unsupported;
 use crate::periph::counter::{Counter, Rate};
-use crate::periph::stages::{self, STAGES as WDT_STAGES};
+use crate::periph::stages::STAGES as WDT_STAGES;
 use crate::periph::{Accepted, RTC_CNTL_BASE, Storage, consecutive, half_of, index_in};
 use crate::reset::{CAUSE_POWER_ON, ResetCause};
 use emu_core::{Cycles, Peripheral};
@@ -34,8 +46,6 @@ const TIME_HIGH1: u32 = reg("TIME_HIGH1");
 /// `TIME_UPDATE` bit 31, write-only: captures the RTC timer (
 /// `rtc_cntl_ll_get_rtc_time`, `IDF:hal/esp32c3/include/hal/rtc_cntl_ll.h:74-80`).
 const TIME_UPDATE_TRIGGER: u32 = 1 << 31;
-/// The RTC timer is 48 bits wide: 16 bits in `TIME_HIGH0` (TRM §9.3.3).
-const RTC_TIME_MASK: u64 = (1 << 48) - 1;
 const RESET_STATE: u32 = reg("RESET_STATE");
 const INT_ENA: u32 = reg("INT_ENA_RTC");
 const INT_RAW: u32 = reg("INT_RAW_RTC");
@@ -92,17 +102,6 @@ const WDT_DELAY_SEL_MASK: u32 = 0b11;
 /// [30:28] for stage 0 to [21:19] for stage 3 (`rwdt_ll_config_stage`, line 113), bit 12
 /// `FLASHBOOT_MOD_EN` (`rwdt_ll_set_flashboot_en`, line 196). The rest is stored.
 const WDT_EN: u32 = 1 << 31;
-const WDT_STAGE0_SHIFT: u32 = 28;
-const WDT_STAGE_BITS: u32 = 3;
-const WDT_STAGE_MASK: u32 = 0b111;
-const WDT_FLASHBOOT_MOD_EN: u32 = 1 << 12;
-/// `WDTFEED` bit 31 feeds (`rwdt_ll_feed`, line 266).
-const WDT_FEED: u32 = 1 << 31;
-/// Stage actions (`IDF:hal/include/hal/wdt_types.h`; TW §D.5).
-const ACTION_INTERRUPT: u32 = 1;
-const ACTION_RESET_CPU: u32 = 2;
-const ACTION_RESET_SYSTEM: u32 = 3;
-const ACTION_RESET_RTC: u32 = 4;
 
 /// `SWD_CONF` (reset `0x04B00000`): bit 31 `AUTO_FEED_EN`, bit 30 `DISABLE`, bit 29 `FEED` and bit
 /// 28 `RST_FLAG_CLR` (write-only), bits [27:18] `SIGNAL_WIDTH`, bit 17 `BYPASS_RST`, bit 1
@@ -119,25 +118,11 @@ const ACTION_RESET_RTC: u32 = 4;
 /// of the RTC interrupt registers (`RTC_CNTL_SWD_INT_ENA`, `_RAW`, `_ST`, `_CLR`:
 /// `rtc_cntl_reg.h:583, 639, 695, 751`).
 const SWD_CONF_RESET: u32 = 0x04B0_0000;
-const SWD_AUTO_FEED_EN: u32 = 1 << 31;
-const SWD_DISABLE: u32 = 1 << 30;
-const SWD_FEED: u32 = 1 << 29;
-const SWD_RST_FLAG_CLR: u32 = 1 << 28;
-const SWD_BYPASS_RST: u32 = 1 << 17;
 const SWD_FEED_INT: u32 = 1 << 1;
 const SWD_RESET_FLAG: u32 = 1 << 0;
-const SWD_CONF_STORED: u32 = 0xCFFE_0000;
 /// The key of the super watchdog, and the reset value of `SWD_WPROTECT` (`RTC_CNTL_SWD_WKEY`,
 /// default `0x8f1d312a`, `rtc_cntl_reg.h:1758`). The SVD gives 0 and is wrong on this point too.
 const SWD_KEY: u32 = 0x8F1D_312A;
-/// `FIB_SEL` bit 2, `RTC_CNTL_FIB_SUPER_WDT_RST` (`rtc_cntl_reg.h:2341`), reset value 1.
-const FIB_SUPER_WDT_RST: u32 = 1 << 2;
-/// ASSUMPTION: the super watchdog asks to be fed after 0.9 s and resets after 1 s. The TRM gives
-/// "slightly less than one second" for the period and "about 100 ms" before it for the request
-/// (§12.3; TW §C.4); the circuit is analog and no figure is published. A real chip left unfed,
-/// observed with the feed-request interrupt enabled, settles it.
-const SWD_FEED_REQUEST: u64 = 9 * SECOND / 10;
-const SWD_TIMEOUT: u64 = SECOND;
 
 const STORE_COUNT: usize = 8;
 /// `RTC_CNTL_STORE0..7`: they survive a reset; the ROM keeps the APB frequency in STORE5.
@@ -331,65 +316,6 @@ impl RtcCntl {
         self.wake(ctx);
     }
 
-    fn rtc_time(&self, now: Cycles) -> u64 {
-        self.timer.value(now) & RTC_TIME_MASK
-    }
-
-    /// Whether the flash-boot protection runs the watchdog (TRM §12.2.2.4; TW §D.4).
-    ///
-    /// ASSUMPTION: as for the main watchdog (`Timg::flash_boot_protection`), the protection is off
-    /// when the chip is not strapped to boot from flash (TW §I question 4). A boot of a chip
-    /// strapped for download, with the RTC watchdog counting, settles it.
-    const fn flash_boot_protection(&self) -> bool {
-        self.flash_boot && self.wdt_config0 & WDT_FLASHBOOT_MOD_EN != 0
-    }
-
-    /// The action of a stage.
-    ///
-    /// ASSUMPTION: under the flash-boot protection stage 0 is a system reset after the timeout
-    /// `WDTCONFIG1` holds, whatever `STG0` says. The TRM gives the action (§12.2.2.4); that the
-    /// timeout is the programmed one matters after `esp_restart`, which programs 1 s and sets the
-    /// protection bit without `EN` (`IDF:esp_system/port/soc/esp32c3/system_internal.c:71-80`; TW
-    /// §C.3, §I question 3). A slow second boot on a real chip settles it.
-    fn stage_action(&self, stage: usize) -> u32 {
-        if stage == 0 && self.flash_boot_protection() {
-            return ACTION_RESET_RTC;
-        }
-        // INVARIANT: `stage` is below `WDT_STAGES` (4), so the shift stays inside the register.
-        let shift = WDT_STAGE0_SHIFT - WDT_STAGE_BITS * u32::try_from(stage).unwrap_or(0);
-        (self.wdt_config0 >> shift) & WDT_STAGE_MASK
-    }
-
-    /// The timeout of a stage, in slow-clock cycles. Stage 0 lasts `WDTCONFIG1 << (1 + delay)`,
-    /// which is why `rwdt_ll_config_stage` writes its value shifted the other way (`rwdt_ll.h:119`;
-    /// TRM §12.2.2.2; TW §C.3).
-    ///
-    /// ASSUMPTION: a stage lasts at least one count, so a timeout of 0 counts as 1: what a stage
-    /// timeout of 0 does on silicon is not documented. Programming 0 on a chip and timing the
-    /// reset settles it.
-    fn stage_timeout(&self, stage: usize) -> u64 {
-        let written = u64::from(self.wdt_timeout[stage]);
-        let counted = if stage == 0 {
-            written << (1 + self.wdt_delay_sel)
-        } else {
-            written
-        };
-        counted.max(1)
-    }
-
-    /// Whether the super watchdog can reset the chip.
-    ///
-    /// ASSUMPTION: its reset is out of software's hands, and inactive, until `FIB_SEL` bit 2 is
-    /// cleared; `BYPASS_RST` and `DISABLE` switch it off, and `AUTO_FEED_EN` makes the controller
-    /// feed it for ever. This reading comes from the bootloader code that hands the reset to
-    /// software (`bootloader_soc.c:10-19`) and from the absence of any `rst:0x12` in the logs of
-    /// chips that never reach the bootloader (TW §C.4, §I question 11). A chip running the ROM
-    /// with the three bits as they are out of reset, observed for several seconds, settles it.
-    fn swd_armed(&self) -> bool {
-        self.config.read(FIB_SEL).unwrap_or(FIB_SUPER_WDT_RST) & FIB_SUPER_WDT_RST == 0
-            && self.swd_conf & (SWD_AUTO_FEED_EN | SWD_DISABLE | SWD_BYPASS_RST) == 0
-    }
-
     /// Raises what is due at the present time, then asks to be woken for the next deadline.
     fn evaluate(&mut self, ctx: &mut Ctx, from_register_write: bool) {
         let now = ctx.now();
@@ -421,62 +347,6 @@ impl RtcCntl {
         self.drive(ctx);
     }
 
-    /// Lets the RTC watchdog go through the stages whose timeout the count has reached, and returns
-    /// the instant of the next expiry. The walk and its rules are those of every watchdog of the
-    /// chip ([`stages::walk`]); what is this device's own is the action of a stage that ended.
-    fn walk_stages(
-        &mut self,
-        ctx: &mut Ctx,
-        now: Cycles,
-        from_register_write: bool,
-    ) -> Option<Cycles> {
-        let timeouts: [u64; WDT_STAGES] = std::array::from_fn(|stage| self.stage_timeout(stage));
-        // The actions as they are when the walk begins: no expiry changes a register they are
-        // read from.
-        let actions: [u32; WDT_STAGES] = std::array::from_fn(|stage| self.stage_action(stage));
-        let int_raw = &mut self.int_raw;
-        stages::walk(
-            &mut self.wdt,
-            &mut self.wdt_stage,
-            timeouts,
-            now,
-            from_register_write,
-            |ended| match actions[ended] {
-                ACTION_INTERRUPT => *int_raw |= INT_WDT,
-                // ASSUMPTION: action 2 resets the CPU whatever `PROCPU_RESET_EN` (`WDTCONFIG0` bit
-                // 11) holds (TW §D.5, §I question 5). Clearing the bit on a chip whose stage
-                // resets the CPU, and seeing whether the CPU still resets, settles it.
-                ACTION_RESET_CPU => ctx.request_reset(ResetCause::RtcWatchdogCpu),
-                ACTION_RESET_SYSTEM => ctx.request_reset(ResetCause::RtcWatchdogCore),
-                ACTION_RESET_RTC => ctx.request_reset(ResetCause::RtcWatchdogSystem),
-                // An "off" stage was waited for and does nothing when it ends: the assumption is
-                // marked on the walk.
-                _ => {}
-            },
-        )
-    }
-
-    /// The super watchdog at the present time; returns the instant it next needs a call.
-    fn step_super_watchdog(&mut self, ctx: &mut Ctx, now: Cycles) -> Option<Cycles> {
-        if !self.swd_armed() {
-            self.swd_fed_at = None;
-            return None;
-        }
-        let fed_at = *self.swd_fed_at.get_or_insert(now);
-        let waited = now.get().saturating_sub(fed_at.get());
-        if waited >= SWD_TIMEOUT {
-            self.swd_conf |= SWD_RESET_FLAG;
-            self.swd_fed_at = None;
-            ctx.request_reset(ResetCause::SuperWatchdog);
-            None
-        } else if waited >= SWD_FEED_REQUEST {
-            self.int_raw |= INT_SWD;
-            Some(fed_at + SWD_TIMEOUT)
-        } else {
-            Some(fed_at + SWD_FEED_REQUEST)
-        }
-    }
-
     /// Drives the `RTC_CORE` source to the level of the enabled RTC interrupts.
     fn drive(&self, ctx: &mut Ctx) {
         ctx.irq(RTC_CORE, self.int_raw & self.int_ena != 0);
@@ -484,45 +354,6 @@ impl RtcCntl {
 
     /// The device time of a wake-up has come, or the block was just built or reset.
     pub(crate) fn wake(&mut self, ctx: &mut Ctx) {
-        self.evaluate(ctx, false);
-    }
-
-    /// A write to a watchdog register other than the key: dropped unless the key is in place.
-    fn write_watchdog(&mut self, ctx: &mut Ctx, offset: u32, value: u32) {
-        if self.wdt_key != WDT_KEY {
-            return;
-        }
-        match offset {
-            WDTCONFIG0 => self.wdt_config0 = value,
-            WDTFEED => {
-                if value & WDT_FEED != 0 {
-                    self.wdt.set(0, ctx.now());
-                    self.wdt_stage = 0;
-                }
-            }
-            _ => {
-                // INVARIANT: the caller passes one of the four stage timeout registers besides
-                // the two above; any other offset changes nothing.
-                if let Some(stage) = index_in(offset, WDTCONFIG1, WDT_STAGES) {
-                    self.wdt_timeout[stage] = value;
-                }
-            }
-        }
-        self.evaluate(ctx, true);
-    }
-
-    fn write_super_watchdog(&mut self, ctx: &mut Ctx, value: u32) {
-        if self.swd_key != SWD_KEY {
-            return;
-        }
-        self.swd_conf = (self.swd_conf & SWD_RESET_FLAG) | (value & SWD_CONF_STORED);
-        if value & SWD_RST_FLAG_CLR != 0 {
-            self.swd_conf &= !SWD_RESET_FLAG;
-        }
-        if value & SWD_FEED != 0 {
-            self.swd_fed_at = Some(ctx.now());
-            self.int_raw &= !INT_SWD;
-        }
         self.evaluate(ctx, false);
     }
 }
