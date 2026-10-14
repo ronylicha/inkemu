@@ -1006,6 +1006,13 @@ pub const ROW_NVS_SPI1_AFTER_RESET: Difference = Difference {
     ])],
 };
 
+/// Row 33, measured on both lives of `flash_nvs_ota.bin` (SP1b-4d).
+pub const ROW_NVS_OTA_SPI1_STATUS: Difference = Difference {
+    number: 33,
+    summary: "flash_nvs_ota.bin, SPI1.RD_STATUS: the ROM reads WEL that QEMU's flash keeps",
+    treatments: &[Treatment::Registers(&[copy(0x6000_202C, 0x0000_0002)])],
+};
+
 /// The rows of the window `hello` ([`crate::window::WINDOWS`]).
 pub const HELLO: &[Difference] = &[
     ROW_MSTATUS_MPP,
@@ -1071,6 +1078,40 @@ pub const NVS: &[Difference] = &[
     ROW_NVS_SPI1_AFTER_RESET,
 ];
 
+/// The rows of the window `nvs-ota`: those of `nvs`, and row 33.
+pub const NVS_OTA: &[Difference] = &[
+    ROW_MSTATUS_MPP,
+    ROW_MIE_AT_POWER_ON,
+    ROW_MTVEC_MODE_AT_POWER_ON,
+    ROW_MEIP,
+    ROW_CYCLE_COUNTER,
+    ROW_UART0,
+    ROW_SPI0,
+    ROW_RTC_CNTL,
+    ROW_EFUSE,
+    ROW_IO_MUX,
+    ROW_REGI2C,
+    ROW_RADIO,
+    ROW_TIMG,
+    ROW_SYSTIMER,
+    ROW_APB_CTRL,
+    ROW_RNG,
+    ROW_APB_SARADC,
+    ROW_USB_SERIAL_JTAG,
+    ROW_SYSTEM,
+    ROW_SENSITIVE,
+    ROW_EXTMEM,
+    ROW_ASSIST_DEBUG,
+    ROW_SYSTIMER_STOPPED,
+    ROW_PMP_KEPT_AT_RESET,
+    ROW_AFTER_RESET,
+    ROW_NVS_SPI1,
+    ROW_NVS_EXTMEM,
+    ROW_NVS_KEPT_AT_RESET,
+    ROW_NVS_SPI1_AFTER_RESET,
+    ROW_NVS_OTA_SPI1_STATUS,
+];
+
 /// Every row of the table, in the order of `docs/lockstep-differences.md`: those of every window.
 pub const DIFFERENCES: &[Difference] = &[
     ROW_MSTATUS_MPP,
@@ -1105,6 +1146,7 @@ pub const DIFFERENCES: &[Difference] = &[
     ROW_NVS_EXTMEM,
     ROW_NVS_KEPT_AT_RESET,
     ROW_NVS_SPI1_AFTER_RESET,
+    ROW_NVS_OTA_SPI1_STATUS,
 ];
 
 /// A peripheral QEMU instantiates, by its first and last byte: the flattened memory tree of

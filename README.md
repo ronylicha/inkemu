@@ -285,7 +285,7 @@ cargo run --release -p inkemu-lockstep -- --window hello \
     --expect-usage tools/ci/lockstep-hello.usage
 ```
 
-- `--window` names what is compared and under which rows: `hello` (`flash_hello.bin`) and `nvs` (`flash_nvs.bin`) go through the reset `esp_restart` asks for and end at the next one. The windows, their rows and their pinned counts are listed in [docs/lockstep-differences.md](docs/lockstep-differences.md). `--firmware FILE` gives an application image instead of `--flash`: the flash both sides boot is composed as `inkemu run --firmware` composes it, behind the bootloader inkemu ships.
+- `--window` names what is compared and under which rows: `hello` (`flash_hello.bin`), `nvs` (`flash_nvs.bin`) and `nvs-ota` (`flash_nvs_ota.bin`) go through the reset `esp_restart` asks for and end at the next one. The windows, their rows and their pinned counts are listed in [docs/lockstep-differences.md](docs/lockstep-differences.md). `--firmware FILE` gives an application image instead of `--flash`: the flash both sides boot is composed as `inkemu run --firmware` composes it, behind the bootloader inkemu ships.
 - inkemu runs under the timing model `qemu-icount`: 8 ns per instruction, no interrupt latency, so that the timers of both sides fire on the same instruction. Every difference the comparison admits is a numbered row of [docs/lockstep-differences.md](docs/lockstep-differences.md), with its source and its exact parameters. A row is one of:
   - a CSR whose bits hold a known pair of values;
   - a register or a CSR QEMU keeps through its reset where the chip's CPU reset clears it, held until written;
@@ -306,7 +306,7 @@ cargo run --release -p inkemu-lockstep -- --window hello \
   - `4`: inkemu stopped on its own;
   - `5`: a row, a register or a bit was never used, or a row was used outside what it declares;
   - `130`: Ctrl-C (the container is removed whatever ends the run).
-- The CI runs the command above and the window `nvs` in the `reference-boot` job, then three more times, each time with a fault put in inkemu on purpose, which must diverge: in a register of the CPU before the reset and after it, and in a read of the SYSTIMER's model. See [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md) (French).
+- The CI runs the command above and the windows `nvs` and `nvs-ota` in the `reference-boot` job, then three more times, each time with a fault put in inkemu on purpose, which must diverge: in a register of the CPU before the reset and after it, and in a read of the SYSTIMER's model. See [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md) (French).
 
 ## Why
 
@@ -426,7 +426,7 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
 
 `inkemu-lockstep` est un outil de développement de l'espace de travail, absent de l'`inkemu` distribué (voir la commande de la partie anglaise). Il exécute une image flash dans le QEMU d'Espressif et dans inkemu et compare, après chaque instruction, le PC, `x1`–`x31` et les huit CSR machine que les deux ont (`mstatus`, `mie`, `mip`, `mtvec`, `mepc`, `mcause`, `mtval`, `mscratch`). QEMU ne tourne que dans l'image épinglée `espressif/idf:v5.5.2` (`tools/conformance/versions.env`), jamais sur l'hôte : il faut Docker et l'image déjà téléchargée (l'outil ne la télécharge pas), l'image flash, une flash entière de la taille du profil, est montée en lecture seule, et lancer QEMU demande un hôte Unix (`--trace` fonctionne partout).
 
-- `--window` dit ce qui est comparé et sous quelles lignes : `hello` (`flash_hello.bin`) et `nvs` (`flash_nvs.bin`) traversent le reset que demande `esp_restart` et finissent au suivant. Les fenêtres, leurs lignes et leurs comptes épinglés sont dans [docs/lockstep-differences.md](docs/lockstep-differences.md). `--firmware FICHIER` donne une image d'application au lieu de `--flash` : la flash que les deux côtés démarrent est composée comme `inkemu run --firmware` la compose, derrière le bootloader livré.
+- `--window` dit ce qui est comparé et sous quelles lignes : `hello` (`flash_hello.bin`), `nvs` (`flash_nvs.bin`) et `nvs-ota` (`flash_nvs_ota.bin`) traversent le reset que demande `esp_restart` et finissent au suivant. Les fenêtres, leurs lignes et leurs comptes épinglés sont dans [docs/lockstep-differences.md](docs/lockstep-differences.md). `--firmware FICHIER` donne une image d'application au lieu de `--flash` : la flash que les deux côtés démarrent est composée comme `inkemu run --firmware` la compose, derrière le bootloader livré.
 - inkemu tourne sous le modèle de temps `qemu-icount` : 8 ns par instruction, aucune latence d'interruption, pour que les timers des deux côtés se déclenchent à la même instruction. Chaque différence admise est une ligne numérotée de [docs/lockstep-differences.md](docs/lockstep-differences.md), avec sa source et ses paramètres exacts. Une ligne est l'une de ces formes :
   - un CSR dont des bits valent une paire de valeurs connue ;
   - un registre ou un CSR que QEMU garde à son reset là où le reset du CPU de la puce le remet à zéro, tenu jusqu'à son écriture ;
@@ -447,7 +447,7 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
   - `4` : inkemu s'est arrêté de lui-même ;
   - `5` : une ligne, un registre ou un bit jamais utilisé, ou une ligne utilisée hors de ce qu'elle déclare ;
   - `130` : Ctrl-C (le conteneur est supprimé quoi qu'il arrive).
-- La CI l'exécute, avec la fenêtre `nvs`, dans le job `reference-boot`, puis trois fois encore, chacune avec une faute mise exprès dans inkemu, qui doit diverger : dans un registre du CPU avant le reset et après, et dans une lecture du modèle du SYSTIMER. Voir l'[ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md).
+- La CI l'exécute, avec les fenêtres `nvs` et `nvs-ota`, dans le job `reference-boot`, puis trois fois encore, chacune avec une faute mise exprès dans inkemu, qui doit diverger : dans un registre du CPU avant le reset et après, et dans une lecture du modèle du SYSTIMER. Voir l'[ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md).
 
 ### Pourquoi
 

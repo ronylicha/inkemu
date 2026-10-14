@@ -40,6 +40,13 @@ pub const WINDOWS: &[Window] = &[
         bound: None,
         rows: table::NVS,
     },
+    Window {
+        name: "nvs-ota",
+        firmware: "flash_nvs_ota.bin",
+        resets: 1,
+        bound: None,
+        rows: table::NVS_OTA,
+    },
 ];
 
 /// The window called `name`.

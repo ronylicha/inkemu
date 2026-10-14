@@ -223,6 +223,19 @@ jobs:
             --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
             --expect-compared 7680555 --expect-end reset \
             --expect-usage tools/ci/lockstep-nvs.usage
+      # Window nvs-ota: the same application under the stock partition table of the X4, whose
+      # bootloader writes otadata at every boot.
+      - name: Compare flash_nvs_ota.bin with QEMU after every instruction, through its reset
+        timeout-minutes: 25
+        run: |
+          source tools/conformance/versions.env
+          cargo run --release -p inkemu-lockstep -- --window nvs-ota \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_nvs_ota.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --expect-compared 7701890 --expect-end reset \
+            --expect-usage tools/ci/lockstep-nvs-ota.usage
       # The same run with a fault put in the CPU's state on purpose (bit 0 of t0 changed once a
       # million instructions are compared, a hook of the development binary only): the lockstep
       # must find it against the real QEMU, exit 1 and name the instruction. This proves the path

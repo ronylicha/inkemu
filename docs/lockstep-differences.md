@@ -46,6 +46,7 @@ des deux côtés que la comparaison traverse ; le suivant termine la fenêtre.
 |---|---|---|---|---|---|---|
 | hello | `flash_hello.bin` | 1 | — | 1–28 | 6 813 949 | reset |
 | nvs | `flash_nvs.bin` | 1 | — | 1–6, 8–24, 26, 27, 29–32 | 7 680 555 | reset |
+| nvs-ota | `flash_nvs_ota.bin` | 1 | — | 1–6, 8–24, 26, 27, 29–33 | 7 701 890 | reset |
 
 - **hello** : la ROM, le bootloader, `app_main` et le compte à rebours, le reset que demande
   `esp_restart`, puis une seconde vie entière, jusqu'au second reset. 2 224 interruptions prises par
@@ -53,6 +54,19 @@ des deux côtés que la comparaison traverse ; le suivant termine la fenêtre.
 - **nvs** : de même pour `nvs_rw_value_cxx`, qui écrit son compteur de redémarrages dans la NVS avant
   chaque `esp_restart` : les programmes et les effacements de la flash par SPI1, sous QEMU comme sous
   inkemu, sont dans la fenêtre. 2 224 interruptions, 114 blocs réimprimés, 20 préemptés.
+- **nvs-ota** : la même application sous la table de partitions d'origine de la X4, dont le
+  bootloader écrit `otadata` à chaque démarrage ; les lignes de `nvs` et la ligne 33. 2 224
+  interruptions, 118 blocs réimprimés, 20 préemptés.
+
+Les autres firmwares de référence n'ont pas de fenêtre (SP1b-4d, décision J5) : chacun s'arrête,
+mesuré le 2026-10-14, dans le démarrage de son application, à un artefact de la livraison des
+interruptions de QEMU, sans fin à lui avant. `adc_wait_panic` (3 986 033 instructions comparées),
+`uart_select` (3 963 178), `usb_serial_jtag_console` (3 848 562) et `deep_sleep_timer` (3 921 093) :
+le premier tick de FreeRTOS tombe pendant que le CPU exécute, et QEMU le prend deux instructions
+après inkemu (dans `hello` et `nvs`, chaque tick tombe dans un `wfi`). `usb_serial_jtag_echo`
+(2 525 511) : après que le gestionnaire d'interruptions a rouvert `MIE`, QEMU montre `MEIP` alors que
+sa matrice, calculée sur l'état du contrôleur d'inkemu, ne lève pas la ligne. La note de passation de
+SP1b-4d donne la mesure.
 
 ## La fin d'une fenêtre (H4, corrigée le 2026-10-14, puis par SP1b-4d)
 
@@ -158,38 +172,39 @@ usages de SP1b-4c (première vie de `flash_hello.bin` seule) sont dans l'ADR 000
 
 | N° | Différence | Traitement | Source | Usages |
 |---|---|---|---|---|
-| 1 | `mstatus.MPP` : QEMU lit 0, inkemu « machine » | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MSTATUS_MPP_M`) ; mesure | hello 5 572 920 ; nvs 6 441 342 |
-| 2 | `mie` au reset : QEMU `0x0EEE`, inkemu 0, jusqu'à ce que le firmware l'écrive | (i) paire | oracle §1c piège 6 ; `target/riscv/esp_cpu.c` | hello 6 813 950 ; nvs 7 680 556 |
-| 3 | `mtvec.MODE` au reset : QEMU direct, inkemu vectorisé, jusqu'à l'écriture de `mtvec` | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MTVEC_VECTORED`) ; oracle §1c | hello 15 ; nvs 15 |
-| 4 | `mip.MEIP` : la ligne de la matrice de QEMU, trois instructions en retard après un rangement du seuil qui la fait tomber | (i) paire | `hw/riscv/esp32c3_intmatrix.c` ; `target/riscv/esp_cpu.c` ; mesure | hello 188 988 ; nvs 188 988 |
-| 5 | Le compteur de cycles : les deux comptent 6,25 ns du temps de l'appareil, celui de QEMU depuis sa première lecture | (iv) réglage ; (ii) compteur tenu | `target/riscv/esp_cpu.c` (`esp_cpu_get_cycles`) ; mesure | hello 1 118 166 ; nvs 1 118 170 |
-| 6 | UART0 : niveaux de ligne, compte de FIFO et valeurs de reset que QEMU ne modélise pas | (ii) copie | mesure ; `info mtree -f` (`esp_soc.uart`) | hello 6 483 ; nvs 6 601 |
+| 1 | `mstatus.MPP` : QEMU lit 0, inkemu « machine » | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MSTATUS_MPP_M`) ; mesure | hello 5 572 920 ; nvs 6 441 342 ; nvs-ota 6 462 597 |
+| 2 | `mie` au reset : QEMU `0x0EEE`, inkemu 0, jusqu'à ce que le firmware l'écrive | (i) paire | oracle §1c piège 6 ; `target/riscv/esp_cpu.c` | hello 6 813 950 ; nvs 7 680 556 ; nvs-ota 7 701 891 |
+| 3 | `mtvec.MODE` au reset : QEMU direct, inkemu vectorisé, jusqu'à l'écriture de `mtvec` | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MTVEC_VECTORED`) ; oracle §1c | hello 15 ; nvs 15 ; nvs-ota 15 |
+| 4 | `mip.MEIP` : la ligne de la matrice de QEMU, trois instructions en retard après un rangement du seuil qui la fait tomber | (i) paire | `hw/riscv/esp32c3_intmatrix.c` ; `target/riscv/esp_cpu.c` ; mesure | hello 188 988 ; nvs 188 988 ; nvs-ota 188 988 |
+| 5 | Le compteur de cycles : les deux comptent 6,25 ns du temps de l'appareil, celui de QEMU depuis sa première lecture | (iv) réglage ; (ii) compteur tenu | `target/riscv/esp_cpu.c` (`esp_cpu_get_cycles`) ; mesure | hello 1 118 166 ; nvs 1 118 170 ; nvs-ota 1 118 182 |
+| 6 | UART0 : niveaux de ligne, compte de FIFO et valeurs de reset que QEMU ne modélise pas | (ii) copie | mesure ; `info mtree -f` (`esp_soc.uart`) | hello 6 483 ; nvs 6 601 ; nvs-ota 7 150 |
 | 7 | SPI1 : la flash de QEMU ne répond pas à SFDP, laisse `W0` périmé et n'a pas les valeurs de reset | (ii) copie | oracle §1b (`Unknown cmd 5a`) ; mesure | hello 40 |
-| 8 | SPI0, absent de QEMU : la configuration flash du cache | (ii) copie | `info mtree -f` ; mesure | hello 162 ; nvs 162 |
-| 9 | RTC_CNTL : QEMU ne modélise que `OPTIONS0`, `RESET_STATE` et `STORE0`–`7` | (ii) horloge lente ; (ii) copie | `hw/misc/esp32c3_rtc_cntl.c` ; `clk_tree_defs.h` ; mesure | hello 162 ; nvs 162 |
-| 10 | eFuse : les mots où les eFuses vierges de QEMU et ceux de la X4 diffèrent | (ii) copie | oracle §1d ; carryover SP1b-2 ligne 17 ; mesure | hello 132 ; nvs 126 |
-| 11 | IO_MUX, absent de QEMU : la configuration des broches GPIO0–21 | (ii) copie | `info mtree -f` ; SVD ; mesure | hello 549 ; nvs 549 |
-| 12 | Le maître I²C analogique, absent de QEMU : les accès regi2c de la ROM | (ii) copie | carryover SP1b-2 lignes 7 et 8 ; mesure | hello 268 ; nvs 268 |
-| 13 | La mise sous tension de la radio par `rtc_sleep_pu`, absente de QEMU : BB, NRX, FE, FE2 | (ii) copie | ESP-IDF v5.5.2 `rtc_sleep.c` ; `esp32c3-bootloader-accesses.md` lignes 31–33 | hello 28 ; nvs 28 |
-| 14 | TIMG0 et TIMG1 : valeurs de reset des chiens de garde, portes d'horloge, calibration RTC | (ii) copie | `timers-and-watchdogs` §G lignes 1, 5 et 8 ; mesure | hello 24 ; nvs 24 |
-| 15 | SYSTIMER : les compteurs de QEMU perdent une fraction d'unité à chaque mise à jour et se lisent toujours valides | (ii) copie ; (ii) compteur tenu | `hw/timer/esp_systimer.c` ; SVD ; mesure | hello 4 442 ; nvs 4 714 |
-| 16 | APB_CTRL, absent de QEMU : horloges Wi-Fi et alimentation des mémoires | (ii) copie | `info mtree -f` ; mesure | hello 43 ; nvs 43 |
-| 17 | `RNG.DATA` : QEMU rend le `rand()` de l'hôte | (ii) copie | `hw/riscv/esp32c3.c` (`A_SYSCON_RND_DATA_REG`) | hello 3 208 ; nvs 3 208 |
-| 18 | APB_SARADC, absent de QEMU : les sept registres de la source d'entropie du bootloader | (ii) copie | ESP-IDF v5.5.2 `bootloader_random_esp32c3.c` ; `esp32c3-bootloader-accesses.md` lignes 79–85 | hello 96 ; nvs 96 |
-| 19 | USB-Serial-JTAG : `SERIAL_IN_EP_DATA_FREE`, que QEMU lit 0 | (ii) copie | carryover SP1b-2 ligne 22 ; mesure | hello 14 218 ; nvs 14 231 |
-| 20 | SYSTEM : portes d'horloge, resets et choix d'horloge que le modèle d'horloge de QEMU tient autrement | (ii) copie | `timers-and-watchdogs` §G ligne 12 ; mesure | hello 83 ; nvs 83 |
-| 21 | SENSITIVE, absent de QEMU : la protection mémoire qu'ESP-IDF installe | (ii) copie | `info mtree -f` ; mesure | hello 154 ; nvs 154 |
-| 22 | EXTMEM : bits d'alimentation, de gel et de synchronisation que le cache de QEMU ne tient pas | (ii) copie | carryover SP1b-2 ligne 3 ; mesure | hello 46 ; nvs 442 |
-| 23 | ASSIST_DEBUG, absent de QEMU : le moniteur de pile de FreeRTOS | (ii) copie | `timers-and-watchdogs` §G ligne 13 ; mesure | hello 28 892 ; nvs 28 892 |
-| 24 | SYSTIMER : pas d'alarme tant que le compteur est arrêté | (iv) réglage | `timers-and-watchdogs` §A.4 et §G ligne 10 ; `hw/timer/esp_systimer.c` | hello 2 ; nvs 2 |
+| 8 | SPI0, absent de QEMU : la configuration flash du cache | (ii) copie | `info mtree -f` ; mesure | hello 162 ; nvs 162 ; nvs-ota 169 |
+| 9 | RTC_CNTL : QEMU ne modélise que `OPTIONS0`, `RESET_STATE` et `STORE0`–`7` | (ii) horloge lente ; (ii) copie | `hw/misc/esp32c3_rtc_cntl.c` ; `clk_tree_defs.h` ; mesure | hello 162 ; nvs 162 ; nvs-ota 162 |
+| 10 | eFuse : les mots où les eFuses vierges de QEMU et ceux de la X4 diffèrent | (ii) copie | oracle §1d ; carryover SP1b-2 ligne 17 ; mesure | hello 132 ; nvs 126 ; nvs-ota 126 |
+| 11 | IO_MUX, absent de QEMU : la configuration des broches GPIO0–21 | (ii) copie | `info mtree -f` ; SVD ; mesure | hello 549 ; nvs 549 ; nvs-ota 549 |
+| 12 | Le maître I²C analogique, absent de QEMU : les accès regi2c de la ROM | (ii) copie | carryover SP1b-2 lignes 7 et 8 ; mesure | hello 268 ; nvs 268 ; nvs-ota 268 |
+| 13 | La mise sous tension de la radio par `rtc_sleep_pu`, absente de QEMU : BB, NRX, FE, FE2 | (ii) copie | ESP-IDF v5.5.2 `rtc_sleep.c` ; `esp32c3-bootloader-accesses.md` lignes 31–33 | hello 28 ; nvs 28 ; nvs-ota 28 |
+| 14 | TIMG0 et TIMG1 : valeurs de reset des chiens de garde, portes d'horloge, calibration RTC | (ii) copie | `timers-and-watchdogs` §G lignes 1, 5 et 8 ; mesure | hello 24 ; nvs 24 ; nvs-ota 24 |
+| 15 | SYSTIMER : les compteurs de QEMU perdent une fraction d'unité à chaque mise à jour et se lisent toujours valides | (ii) copie ; (ii) compteur tenu | `hw/timer/esp_systimer.c` ; SVD ; mesure | hello 4 442 ; nvs 4 714 ; nvs-ota 4 678 |
+| 16 | APB_CTRL, absent de QEMU : horloges Wi-Fi et alimentation des mémoires | (ii) copie | `info mtree -f` ; mesure | hello 43 ; nvs 43 ; nvs-ota 43 |
+| 17 | `RNG.DATA` : QEMU rend le `rand()` de l'hôte | (ii) copie | `hw/riscv/esp32c3.c` (`A_SYSCON_RND_DATA_REG`) | hello 3 208 ; nvs 3 208 ; nvs-ota 3 208 |
+| 18 | APB_SARADC, absent de QEMU : les sept registres de la source d'entropie du bootloader | (ii) copie | ESP-IDF v5.5.2 `bootloader_random_esp32c3.c` ; `esp32c3-bootloader-accesses.md` lignes 79–85 | hello 96 ; nvs 96 ; nvs-ota 96 |
+| 19 | USB-Serial-JTAG : `SERIAL_IN_EP_DATA_FREE`, que QEMU lit 0 | (ii) copie | carryover SP1b-2 ligne 22 ; mesure | hello 14 218 ; nvs 14 231 ; nvs-ota 14 384 |
+| 20 | SYSTEM : portes d'horloge, resets et choix d'horloge que le modèle d'horloge de QEMU tient autrement | (ii) copie | `timers-and-watchdogs` §G ligne 12 ; mesure | hello 83 ; nvs 83 ; nvs-ota 83 |
+| 21 | SENSITIVE, absent de QEMU : la protection mémoire qu'ESP-IDF installe | (ii) copie | `info mtree -f` ; mesure | hello 154 ; nvs 154 ; nvs-ota 154 |
+| 22 | EXTMEM : bits d'alimentation, de gel et de synchronisation que le cache de QEMU ne tient pas | (ii) copie | carryover SP1b-2 ligne 3 ; mesure | hello 46 ; nvs 442 ; nvs-ota 388 |
+| 23 | ASSIST_DEBUG, absent de QEMU : le moniteur de pile de FreeRTOS | (ii) copie | `timers-and-watchdogs` §G ligne 13 ; mesure | hello 28 892 ; nvs 28 892 ; nvs-ota 28 892 |
+| 24 | SYSTIMER : pas d'alarme tant que le compteur est arrêté | (iv) réglage | `timers-and-watchdogs` §A.4 et §G ligne 10 ; `hw/timer/esp_systimer.c` | hello 2 ; nvs 2 ; nvs-ota 2 |
 | 25 | `flash_hello.bin`, à son reset : QEMU garde des registres et des CSR que le reset du CPU de la puce remet à leur valeur de reset | (i) gardé au reset | `cpu_rv32::Hart::reset` ; TRM §6.1 ; mesure | hello 4 789 611 |
-| 26 | PMP : le reset de QEMU garde les bits R, W, X de chaque entrée, celui du CPU de la puce les efface | (ii) CSR gardé au reset | spécification privilégiée RISC-V §3.7.1 ; mesure | hello 13 ; nvs 13 |
-| 27 | Après `esp_restart` : registres que le reset de la puce et celui de QEMU laissent dans des états différents | (ii) copie après reset | TRM §6.1 ; ESP-IDF v5.5.2 `system_internal.c` ; mesure | hello 51 ; nvs 51 |
+| 26 | PMP : le reset de QEMU garde les bits R, W, X de chaque entrée, celui du CPU de la puce les efface | (ii) CSR gardé au reset | spécification privilégiée RISC-V §3.7.1 ; mesure | hello 13 ; nvs 13 ; nvs-ota 13 |
+| 27 | Après `esp_restart` : registres que le reset de la puce et celui de QEMU laissent dans des états différents | (ii) copie après reset | TRM §6.1 ; ESP-IDF v5.5.2 `system_internal.c` ; mesure | hello 51 ; nvs 51 ; nvs-ota 51 |
 | 28 | `flash_hello.bin`, après son reset : les registres de SPI1 que le bootloader relit | (ii) copie après reset | mesure | hello 4 |
-| 29 | `flash_nvs.bin`, SPI1 : la ligne 7, et la flash de QEMU qui garde `WEL` après un programme ou un effacement | (ii) copie | `esp-idf-storage-flash-traffic.md` (résultat clé 5) ; mesure | nvs 600 |
-| 30 | `flash_nvs.bin`, EXTMEM : la synchronisation du cache autour des écritures de la flash | (ii) copie | mesure | nvs 2 |
-| 31 | `flash_nvs.bin`, à son reset : comme la ligne 25, avec d'autres registres | (i) gardé au reset | `cpu_rv32::Hart::reset` ; TRM §6.1 ; mesure | nvs 5 108 772 |
-| 32 | `flash_nvs.bin`, après son reset : les registres de SPI1 que le bootloader relit | (ii) copie après reset | mesure | nvs 4 |
+| 29 | `flash_nvs.bin`, SPI1 : la ligne 7, et la flash de QEMU qui garde `WEL` après un programme ou un effacement | (ii) copie | `esp-idf-storage-flash-traffic.md` (résultat clé 5) ; mesure | nvs 600 ; nvs-ota 529 |
+| 30 | `flash_nvs.bin`, EXTMEM : la synchronisation du cache autour des écritures de la flash | (ii) copie | mesure | nvs 2 ; nvs-ota 2 |
+| 31 | `flash_nvs.bin`, à son reset : comme la ligne 25, avec d'autres registres | (i) gardé au reset | `cpu_rv32::Hart::reset` ; TRM §6.1 ; mesure | nvs 5 108 772 ; nvs-ota 5 176 490 |
+| 32 | `flash_nvs.bin`, après son reset : les registres de SPI1 que le bootloader relit | (ii) copie après reset | mesure | nvs 4 ; nvs-ota 4 |
+| 33 | `flash_nvs_ota.bin`, SPI1 : `RD_STATUS`, où la ROM lit le `WEL` que la flash de QEMU garde | (ii) copie | `esp-idf-storage-flash-traffic.md` (résultat clé 5) ; mesure | nvs-ota 10 |
 
 Les sources de QEMU sont celles de la branche `esp-develop` d'`espressif/qemu`. « Mesure » renvoie à
 la mesure du 2026-10-14 : chaque registre de la fenêtre lu ou écrit, les valeurs des deux côtés à
@@ -971,6 +986,19 @@ Paramètres :
 ```text
 après reset registre 0x60002018 masque 0x10000080
 après reset registre 0x60002020 masque 0x00000005
+```
+
+### Ligne 33 — `flash_nvs_ota.bin` : `SPI1.RD_STATUS`
+
+Sous la table de partitions de la X4, le bootloader écrit `otadata` à chaque démarrage, et la ROM
+relit ensuite l'état de la flash dans `RD_STATUS` (`0x6000202C`) : QEMU y montre `WEL` (bit 1), que
+sa flash garde après le programme, là où une puce l'a effacé (comme la ligne 29). Mesure : dix
+lectures différentes sur 34, sur ce seul bit, dans les deux vies.
+
+Paramètres :
+
+```text
+registre 0x6000202C masque 0x00000002
 ```
 
 ## Pourquoi la ligne 24 n'est pas une resynchronisation
