@@ -1207,6 +1207,27 @@ mod tests {
         assert!(m.cycles().get() < 100, "stopped right after the access");
     }
 
+    /// SPI1 `+0x54`, which the SVD omits and ESP-IDF v4.4 polls before each status read of the
+    /// flash, is a register of the model: a strict run reads it idle and goes on.
+    #[test]
+    fn spi1_fsm_is_read_idle_without_a_diagnostic_under_strict_mmio() {
+        // Written out: the SVD has no name for it, which is what the test is about.
+        const SPI1_FSM: u32 = 0x6000_2054;
+        assert!(
+            svd_regs::esp32c3::lookup(SPI1_FSM).is_none(),
+            "the SVD omits it"
+        );
+        let config = SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        };
+        let [page, load] = load_register(SPI1_FSM);
+        let mut m = machine_with(&[page, load, HANG], config);
+        assert_eq!(m.run_until(Cycles(200)), StopReason::CycleBudget);
+        assert_eq!(m.drain_diagnostics(), []);
+        assert_eq!(bus_word(&mut m, SPI1_FSM), 0x200);
+    }
+
     /// A program that echoes on UART0 every byte it receives: it polls `STATUS.RXFIFO_CNT` (its
     /// low byte), reads `FIFO`, writes the byte back.
     fn echo_uart0() -> Vec<u32> {

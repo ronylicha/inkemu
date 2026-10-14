@@ -176,6 +176,17 @@ const SPI1_ACCEPTED: [Accepted; 9] = [
 const SPI0_MOSI_DLEN: u32 = SPI0_BASE + 0x24;
 const SPI0_MISO_DLEN: u32 = SPI0_BASE + 0x28;
 const SPI0_FSM: u32 = addr("SPI0", "FSM") - SPI0_BASE;
+/// SPI1 `+0x54`: `SPI_MEM_FSM_REG`, the same register as SPI0 `FSM`, whose offset it shares. The SVD
+/// lists it for SPI0 only; ESP-IDF's `spi_mem_reg.h` (v4.4.7 `include/soc/`, v5.5.2
+/// `register/soc/`) defines `SPI_MEM_FSM_REG(i)` at `+0x054` of both controllers: `CSPI_ST` [3:0]
+/// and `EM_ST` [6:4] read-only, the state of the SPI0 machines; `CSPI_LOCK_DELAY_TIME` [11:7]
+/// read-write, reset 4 (report `docs/research/spi1-fsm-and-usj-reset.md`, §A.1). ESP-IDF v4.4.7
+/// reads it through SPI1 to learn whether the controller is idle (`spimem_flash_ll_host_idle`,
+/// `fsm.spi0_mst_st == 0`, polled by `spi_flash_chip_generic_wait_idle`, §A.2); v5.5.2 reads
+/// `CMD` [3:0] instead.
+const SPI1_FSM: u32 = SPI0_FSM;
+/// `FSM` [11:7], `CSPI_LOCK_DELAY_TIME`: the one field a write changes.
+const FSM_LOCK_DELAY: u32 = 0x1F << 7;
 const WHY_SPI0: &str =
     "cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly";
 const SPI0_ACCEPTED: [Accepted; 12] = [
@@ -330,6 +341,15 @@ pub struct Spi1 {
     /// Like the journal it belongs to the run. One counter per opcode a byte can hold: its size
     /// does not depend on what the firmware sends.
     sent: [u64; OPCODES],
+    /// `FSM` read through SPI1 ([`SPI1_FSM`]): the lock delay last written in [11:7], every other
+    /// bit 0.
+    fsm: u32,
+}
+
+/// The reset value of `FSM`, the SVD's for SPI0: `0x200`, the lock delay 4 and the two state
+/// machines idle.
+fn fsm_reset_value() -> u32 {
+    svd_regs::esp32c3::find("SPI0", "FSM").map_or(0, |r| r.reset_value)
 }
 
 /// The opcodes a command byte can hold.
@@ -343,6 +363,7 @@ impl Spi1 {
             flash,
             journal: FlashJournal::default(),
             sent: [0; OPCODES],
+            fsm: fsm_reset_value(),
         }
     }
 
@@ -373,6 +394,7 @@ impl Spi1 {
     /// version that goes down is safe: every reset builds a new decode cache.
     pub(crate) fn reset(&mut self) {
         self.registers = Spi1::reset_registers();
+        self.fsm = fsm_reset_value();
     }
 
     /// The chip, for the cache windows of the bus.
@@ -716,12 +738,28 @@ impl Peripheral<Ctx> for Spi1 {
             // Every command bit self-clears and the state nibbles read idle (FB §C rows 9 and 11).
             return Some(0);
         }
+        if offset == SPI1_FSM {
+            // A transfer completes inside the write of `CMD` that starts it, and the cache is not
+            // modelled: no state machine is ever seen busy, so both state fields read 0, idle
+            // (report `docs/research/spi1-fsm-and-usj-reset.md`, §A.3). A busy value would
+            // contradict `CMD` reading 0 and could hold `wait_idle` for ever.
+            // ASSUMPTION: SPI1 `+0x54` reads the register SPI0 `FSM` holds, as the ESP-IDF headers
+            // define one register for both controllers; the value read through SPI1 on a chip is
+            // not measured. A read of `0x60002054` on a chip at rest settles it (`0x200` expected).
+            return Some(self.fsm);
+        }
         self.registers.read(offset)
     }
 
     fn write(&mut self, ctx: &mut Ctx, offset: u32, value: u32) -> bool {
         if offset == CMD {
             self.run(ctx, value);
+            return true;
+        }
+        if offset == SPI1_FSM {
+            // The state fields are read-only; the lock delay acts only on a resume after a
+            // suspend, which is refused by name (`FlashSuspend`), so storing it is all it does.
+            self.fsm = value & FSM_LOCK_DELAY;
             return true;
         }
         if offset == FLASH_SUS_CTRL {
@@ -780,6 +818,34 @@ mod tests {
             assert_eq!(spi.read(ctx, offset), Some(reset), "{register}");
         }
         assert_eq!(spi.read(ctx, CMD), Some(0));
+    }
+
+    /// `0x60002054`, which ESP-IDF v4.4.7 polls through SPI1 before each status read
+    /// (`spimem_flash_ll_host_idle`): `FSM`, idle, without a diagnostic.
+    #[test]
+    fn spi1_fsm_reads_idle_and_keeps_only_its_lock_delay() {
+        let ctx = &mut Ctx::default();
+        let mut spi = spi1();
+        assert_eq!(SPI1_BASE + SPI1_FSM, 0x6000_2054);
+        assert_eq!(
+            spi.read(ctx, SPI1_FSM),
+            Some(0x200),
+            "the reset value of SPI0 FSM"
+        );
+        // What `spimem_flash_ll_host_idle` tests: `spi0_mst_st`, bits [6:4].
+        assert_eq!(spi.read(ctx, SPI1_FSM).map(|v| v & 0x70), Some(0));
+        // A transfer completes inside its write: the machines are idle right after it.
+        spi.write(ctx, CMD, CMD_RDSR);
+        assert_eq!(spi.read(ctx, SPI1_FSM), Some(0x200));
+        // Only `CSPI_LOCK_DELAY_TIME` [11:7] is written; the state fields stay idle.
+        assert!(spi.write(ctx, SPI1_FSM, 0xFFFF_FFFF));
+        assert_eq!(spi.read(ctx, SPI1_FSM), Some(0xF80));
+        assert!(spi.write(ctx, SPI1_FSM, 0x7F | (9 << 7)));
+        assert_eq!(spi.read(ctx, SPI1_FSM), Some(9 << 7));
+        assert_eq!(ctx.take_unsupported(), None);
+        // A reset of the controller gives it back its reset value.
+        spi.reset();
+        assert_eq!(spi.read(ctx, SPI1_FSM), Some(0x200));
     }
 
     #[test]
