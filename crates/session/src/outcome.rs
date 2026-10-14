@@ -36,6 +36,19 @@ pub struct Cut {
     pub reason: CutReason,
 }
 
+impl Cut {
+    /// Whether a replay can stop exactly at the instant of the cut: whether the nanoseconds of
+    /// the instant, the unit [`Esp32C3::run_within`] takes a device-time limit in, give it back.
+    /// They do up to about 584 years of device time, the most a `u64` of nanoseconds counts;
+    /// past it they saturate, and a replay would stop earlier. A session holds no later cut:
+    /// such a run is refused when it is recorded, and such a file when it is read.
+    #[must_use]
+    pub fn is_replayable(self) -> bool {
+        let nanos = TIME_BASE.cycles_to_nanos(self.at);
+        TIME_BASE.nanos_to_cycles(u128::from(nanos)) == self.at
+    }
+}
+
 /// The options of a run that change what the machine does or where the run ends (ADR 0004
 /// point 1), and the cut of a run the host ended (G5).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -57,7 +70,8 @@ impl Limits {
     /// The cut is an instant in cycles of the time base, and `run_within` takes nanoseconds,
     /// which it rounds up to a cycle: the nanoseconds of the instant rounded down give that
     /// instant back exactly, a cycle of the time base (6.25 ns) being longer than a nanosecond,
-    /// up to the 584 years a `u64` of nanoseconds counts: a limit of a run is never longer.
+    /// up to the 584 years a `u64` of nanoseconds counts, past which a session holds no cut
+    /// ([`Cut::is_replayable`]).
     #[must_use]
     pub fn run_limits(&self) -> (Option<u64>, Option<u64>) {
         let cut = self.cut.map(|cut| TIME_BASE.cycles_to_nanos(cut.at));
@@ -230,60 +244,66 @@ impl Outcome {
 
     /// Every quantity that differs between this outcome, the recorded one, and `replayed`, in
     /// the order of G3: the end, device time, cycles, instructions, the trace hash, the flash,
-    /// then each console.
+    /// then each console. The values are compared as they are; only those that differ are put
+    /// into words.
     #[must_use]
     pub fn differences(&self, replayed: &Outcome) -> Vec<Difference> {
-        let time =
-            |instant: Cycles| format!("{} ns of device time", TIME_BASE.cycles_to_nanos(instant));
         let mut found = Vec::new();
-        let mut compare = |quantity: Quantity, recorded: String, again: String| {
-            if recorded != again {
+        let mut compare = |quantity: Quantity, differs: bool, show: &dyn Fn(&Outcome) -> String| {
+            if differs {
                 found.push(Difference {
                     quantity,
-                    recorded,
-                    replayed: again,
+                    recorded: show(self),
+                    replayed: show(replayed),
                 });
             }
         };
-        compare(
-            Quantity::End,
-            self.end.name().to_owned(),
-            replayed.end.name().to_owned(),
-        );
+        compare(Quantity::End, self.end != replayed.end, &|o| {
+            o.end.name().to_owned()
+        });
         compare(
             Quantity::DeviceTime,
-            time(self.device_time),
-            time(replayed.device_time),
+            self.device_time != replayed.device_time,
+            &|o| device_time_text(o.device_time),
         );
-        compare(
-            Quantity::Cycles,
-            self.cycles.to_string(),
-            replayed.cycles.to_string(),
-        );
+        compare(Quantity::Cycles, self.cycles != replayed.cycles, &|o| {
+            o.cycles.to_string()
+        });
         compare(
             Quantity::Instructions,
-            self.instructions.to_string(),
-            replayed.instructions.to_string(),
+            self.instructions != replayed.instructions,
+            &|o| o.instructions.to_string(),
         );
         compare(
             Quantity::TraceHash,
-            format!("{:016x}", self.trace_hash),
-            format!("{:016x}", replayed.trace_hash),
+            self.trace_hash != replayed.trace_hash,
+            &|o| format!("{:016x}", o.trace_hash),
         );
         compare(
             Quantity::FinalFlash,
-            hex(&self.flash_sha256),
-            hex(&replayed.flash_sha256),
+            self.flash_sha256 != replayed.flash_sha256,
+            &|o| hex(&o.flash_sha256),
         );
         for channel in ConsoleChannel::ALL {
             let at = place(channel);
             compare(
                 Quantity::Console(channel),
-                hex(&self.consoles[at]),
-                hex(&replayed.consoles[at]),
+                self.consoles[at] != replayed.consoles[at],
+                &|o| hex(&o.consoles[at]),
             );
         }
         found
+    }
+}
+
+/// An instant of device time in words: in nanoseconds, or in cycles of the time base past the
+/// 584 years a `u64` of nanoseconds counts, where two instants would show the same nanoseconds.
+fn device_time_text(instant: Cycles) -> String {
+    let nanos = TIME_BASE.cycles_to_nanos(instant);
+    if TIME_BASE.nanos_to_cycles(u128::from(nanos)) == instant {
+        format!("{nanos} ns of device time")
+    } else {
+        format!("{} cycles of the time base of device time", instant.get())
     }
 }
 
@@ -331,9 +351,10 @@ impl fmt::Display for Divergence {
         let Some((first, others)) = self.0.split_first() else {
             return f.write_str("nothing differs");
         };
+        // The quantities are singular (the end) and plural (the cycles): no verb agrees with both.
         write!(
             f,
-            "{} was {} when recorded and is {} in the replay",
+            "{}: {} when recorded, {} in the replay",
             first.quantity, first.recorded, first.replayed
         )?;
         if !others.is_empty() {
@@ -390,7 +411,7 @@ mod tests {
         );
         assert_eq!(
             Divergence(differences).to_string(),
-            "the instructions was 19 when recorded and is 18 in the replay; also different: the trace hash, the SHA-256 of console usb-serial-jtag"
+            "the instructions: 19 when recorded, 18 in the replay; also different: the trace hash, the SHA-256 of console usb-serial-jtag"
         );
         let time = Outcome {
             device_time: Cycles(320),
@@ -398,8 +419,44 @@ mod tests {
         };
         assert_eq!(
             Divergence(outcome().differences(&time)).to_string(),
-            "the device time was 1000 ns of device time when recorded and is 2000 ns of device time in the replay"
+            "the device time: 1000 ns of device time when recorded, 2000 ns of device time in the replay"
         );
+    }
+
+    #[test]
+    fn instants_whose_nanoseconds_saturate_are_compared_and_shown_as_they_are() {
+        // Past 584 years both instants show u64::MAX nanoseconds: they differ all the same.
+        let late = Outcome {
+            device_time: Cycles(u64::MAX - 1),
+            ..outcome()
+        };
+        let later = Outcome {
+            device_time: Cycles(u64::MAX),
+            ..outcome()
+        };
+        let differences = late.differences(&later);
+        assert_eq!(differences.len(), 1);
+        assert_eq!(differences[0].quantity, Quantity::DeviceTime);
+        assert_eq!(
+            differences[0].recorded,
+            format!("{} cycles of the time base of device time", u64::MAX - 1)
+        );
+        assert_ne!(differences[0].recorded, differences[0].replayed);
+    }
+
+    #[test]
+    fn a_cut_is_replayable_up_to_the_last_instant_whose_nanoseconds_count() {
+        let cut = |at| Cut {
+            at: Cycles(at),
+            reason: CutReason::Interrupted,
+        };
+        // The last instant a limit of `u64::MAX` nanoseconds reaches, rounded up to a cycle of
+        // the time base (6.25 ns): past it, the nanoseconds saturate there.
+        let last = u64::try_from((u128::from(u64::MAX) * 4).div_ceil(25)).unwrap();
+        assert!(cut(0).is_replayable());
+        assert!(cut(last).is_replayable());
+        assert!(!cut(last + 1).is_replayable());
+        assert!(!cut(u64::MAX).is_replayable());
     }
 
     #[test]

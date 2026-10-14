@@ -14,21 +14,21 @@
 //!
 //! The reader allocates from no length it reads: every length is checked against a constant
 //! bound and against the bytes left in the file before anything is copied, and the inputs are
-//! pushed one by one as they are read.
+//! pushed one by one as they are read. The flash is inflated into the size of the device of the
+//! profile, checked against the size the file gives and against [`MAX_FLASH_BYTES`] first.
 use crate::outcome::{Cut, CutReason, End, Limits, Outcome, hex, place};
 use boards::{DeviceProfile, ProfileError};
 use emu_core::Cycles;
-use flate2::Compression;
-use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
 use sha2::{Digest as _, Sha256};
 use soc_esp32c3::flash::{MAX_FLASH_BYTES, MIN_FLASH_BYTES};
 use soc_esp32c3::{
     AcceptedInput, ConsoleChannel, InputJournal, MAX_JOURNAL_CONSOLE_BYTES,
-    MAX_JOURNAL_HOST_CHANGES, RomImage, UsbHost,
+    MAX_JOURNAL_CONSOLE_CHUNKS, MAX_JOURNAL_HOST_CHANGES, MAX_JOURNAL_INPUTS, RomImage, UsbHost,
 };
 use std::fmt;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 
 /// The first line of a session, its version: a later format changes the number.
 pub const VERSION_LINE: &str = "inkemu-session 1";
@@ -49,10 +49,21 @@ pub const MAX_DEFLATED_FLASH_BYTES: usize = MAX_FLASH as usize + MAX_FLASH as us
 /// The most input on one console channel over the run, each chunk counting for `max(len, 1)`
 /// bytes: the bound of the machine's journal, that of ADR 0006 on what is pending.
 pub const MAX_CONSOLE_BYTES: usize = MAX_JOURNAL_CONSOLE_BYTES;
+/// The most chunks on one console channel over the run: the bound of the machine's journal,
+/// which a channel filled with full packets of USB-Serial-JTAG reaches with
+/// [`MAX_CONSOLE_BYTES`].
+pub const MAX_CONSOLE_CHUNKS: usize = MAX_JOURNAL_CONSOLE_CHUNKS;
 /// The most changes of the USB host over the run.
 pub const MAX_HOST_CHANGES: usize = MAX_JOURNAL_HOST_CHANGES;
-/// The most inputs a session holds: a chunk of the consoles costs one byte at least.
-pub const MAX_INPUTS: usize = 3 * MAX_CONSOLE_BYTES + MAX_HOST_CHANGES;
+/// The most inputs a session holds: the chunks of the three consoles and the changes of the USB
+/// host, 65 536.
+pub const MAX_INPUTS: usize = MAX_JOURNAL_INPUTS;
+/// The most memory the inputs of a session take once read ([`Session::inputs`]): its entries,
+/// each of a fixed size, and the bytes of its consoles, each channel at its bound. The
+/// allocator adds its own overhead to each chunk that holds bytes, at most [`MAX_INPUTS`] of
+/// them: about 7 MiB in all on a 64-bit host, whatever the file.
+pub const MAX_INPUTS_MEMORY_BYTES: usize =
+    MAX_INPUTS * size_of::<AcceptedInput>() + 3 * MAX_CONSOLE_BYTES;
 
 const MAX_FLASH: u32 = MAX_FLASH_BYTES;
 const SHA256_BYTES: usize = 32;
@@ -62,8 +73,9 @@ const CONSOLE_INPUT_HEAD: usize = 1 + 8 + 4;
 const HOST_INPUT_BYTES: usize = 1 + 8 + 1;
 const OUTCOME_BYTES: usize = 1 + 4 * 8 + SHA256_BYTES * 4;
 /// The longest session: every field at its bound. A console input of `n` bytes costs
-/// `CONSOLE_INPUT_HEAD + n` bytes of file and at least `max(n, 1)` of its channel's bound, so a
-/// channel's inputs take at most `CONSOLE_INPUT_HEAD + 1` bytes of file per byte of the bound.
+/// `CONSOLE_INPUT_HEAD + n` bytes of file, one of its channel's chunks and at least `max(n, 1)`
+/// of its bytes, so a channel's inputs take at most `CONSOLE_INPUT_HEAD` bytes of file per chunk
+/// and one per byte of the bound.
 pub const MAX_SESSION_BYTES: usize = MAGIC.len()
     + 2
     + SHA256_BYTES
@@ -81,7 +93,7 @@ pub const MAX_SESSION_BYTES: usize = MAGIC.len()
     + 9
     + 1
     + 4
-    + 3 * MAX_CONSOLE_BYTES * (CONSOLE_INPUT_HEAD + 1)
+    + 3 * (MAX_CONSOLE_CHUNKS * CONSOLE_INPUT_HEAD + MAX_CONSOLE_BYTES)
     + MAX_HOST_CHANGES * HOST_INPUT_BYTES
     + OUTCOME_BYTES;
 
@@ -159,8 +171,10 @@ pub enum Field {
     InputCount,
     /// Input `n`, counted from 0.
     Input(usize),
-    /// The inputs of a console channel, all of them.
+    /// The inputs of a console channel, all of them, by their bytes.
     ConsoleInputs(ConsoleChannel),
+    /// The inputs of a console channel, all of them, by their number.
+    ConsoleChunks(ConsoleChannel),
     HostChanges,
     End,
     DeviceTime,
@@ -190,7 +204,12 @@ impl fmt::Display for Field {
             Field::UsbHost => f.write_str("the USB host at power-on"),
             Field::InputCount => f.write_str("the number of inputs"),
             Field::Input(index) => write!(f, "input {index}"),
-            Field::ConsoleInputs(channel) => write!(f, "the inputs of {}", channel.name()),
+            Field::ConsoleInputs(channel) => {
+                write!(f, "the bytes of the inputs of {}", channel.name())
+            }
+            Field::ConsoleChunks(channel) => {
+                write!(f, "the number of inputs of {}", channel.name())
+            }
             Field::HostChanges => f.write_str("the changes of the USB host"),
             Field::End => f.write_str("the end"),
             Field::DeviceTime => f.write_str("the device time"),
@@ -230,6 +249,15 @@ pub enum ReadError {
     )]
     Invalid { field: Field, value: u64 },
     #[error(
+        "{field} is not UTF-8 text from its byte {at} on; the file is damaged or was not written by inkemu"
+    )]
+    NotUtf8 { field: Field, at: usize },
+    #[error(
+        "the cut is at {at} cycles of the time base of device time, past the 584 years a replay can stop at; the file is damaged or was not written by inkemu",
+        at = at.get()
+    )]
+    CutBeyondReplay { at: Cycles },
+    #[error(
         "{field} computes to {computed}, not the {recorded} the session gives; the file was changed or damaged"
     )]
     Sha256Mismatch {
@@ -239,6 +267,10 @@ pub enum ReadError {
     },
     #[error("the starting flash cannot be inflated ({detail}); the file is damaged")]
     Inflate { detail: String },
+    #[error(
+        "{count} bytes follow the end of the deflated starting flash, inside its length; the file is damaged or was not written by inkemu"
+    )]
+    UnusedDeflatedBytes { count: usize },
     #[error(
         "the starting flash inflates to {found} bytes, not the {expected} the session gives; the file is damaged"
     )]
@@ -266,9 +298,16 @@ pub enum ReadError {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WriteError {
     #[error(
-        "the run received more input than a session holds ({MAX_CONSOLE_BYTES} bytes on one console, or {MAX_HOST_CHANGES} changes of the USB host), so the machine's journal of it is incomplete; record a run that sends less"
+        "the run received more input than a session holds ({MAX_CONSOLE_BYTES} bytes or {MAX_CONSOLE_CHUNKS} inputs on one console, or {MAX_HOST_CHANGES} changes of the USB host), so the machine's journal of it is incomplete; record a run that sends less, in fewer pieces"
     )]
     IncompleteJournal,
+    #[error("the machine was told to keep no journal of its inputs, so its run cannot be recorded")]
+    ForgoneJournal,
+    #[error(
+        "the run was cut at {at} cycles of the time base of device time, past the 584 years a replay can stop at; a session cannot hold it",
+        at = at.get()
+    )]
+    CutBeyondReplay { at: Cycles },
     #[error("{field} is {value}, more than {max}, which a session cannot hold")]
     TooLarge { field: Field, value: u64, max: u64 },
     #[error(
@@ -295,22 +334,32 @@ pub enum WriteError {
 #[derive(Debug, Default)]
 struct InputBudget {
     console: [usize; 3],
+    chunks: [usize; 3],
     host_changes: usize,
 }
 
 impl InputBudget {
     /// Counts a console input of `len` bytes on `channel`, or names the bound it passes.
     fn console(&mut self, channel: ConsoleChannel, len: usize) -> Result<(), (Field, u64, u64)> {
-        let total = &mut self.console[place(channel)];
-        let after = total.saturating_add(len.max(1));
-        if after > MAX_CONSOLE_BYTES {
+        let at = place(channel);
+        let chunks = self.chunks[at] + 1;
+        if chunks > MAX_CONSOLE_CHUNKS {
+            return Err((
+                Field::ConsoleChunks(channel),
+                chunks as u64,
+                MAX_CONSOLE_CHUNKS as u64,
+            ));
+        }
+        let bytes = self.console[at].saturating_add(len.max(1));
+        if bytes > MAX_CONSOLE_BYTES {
             return Err((
                 Field::ConsoleInputs(channel),
-                after as u64,
+                bytes as u64,
                 MAX_CONSOLE_BYTES as u64,
             ));
         }
-        *total = after;
+        self.chunks[at] = chunks;
+        self.console[at] = bytes;
         Ok(())
     }
 
@@ -369,8 +418,9 @@ impl Session {
     /// the inputs `journal` holds and the `outcome` it came to.
     ///
     /// # Errors
-    /// [`WriteError::IncompleteJournal`] when the journal passed one of its bounds, and the
-    /// errors of [`Session::to_bytes`] for what a reader would refuse.
+    /// [`WriteError::IncompleteJournal`] when the journal passed one of its bounds,
+    /// [`WriteError::ForgoneJournal`] when the machine kept none, and the errors of
+    /// [`Session::to_bytes`] for what a reader would refuse.
     pub fn record(
         rom: RomIdentity,
         profile: ProfileText,
@@ -379,6 +429,9 @@ impl Session {
         journal: &InputJournal,
         outcome: Outcome,
     ) -> Result<Session, WriteError> {
+        if journal.is_forgone() {
+            return Err(WriteError::ForgoneJournal);
+        }
         if !journal.is_complete() {
             return Err(WriteError::IncompleteJournal);
         }
@@ -433,6 +486,9 @@ impl Session {
                 cut: self.limits.cut.is_some(),
             });
         }
+        if let Some(cut) = self.limits.cut.filter(|cut| !cut.is_replayable()) {
+            return Err(WriteError::CutBeyondReplay { at: cut.at });
+        }
         let mut budget = InputBudget::default();
         for input in &self.inputs {
             let counted = match input {
@@ -451,7 +507,7 @@ impl Session {
     /// # Errors
     /// [`WriteError`] when the session holds what a reader would refuse: a profile or a flash
     /// beyond their bounds or not of the same device, more inputs than a session holds, an end
-    /// that does not agree with the cut.
+    /// that does not agree with the cut, a cut no replay can stop at.
     pub fn to_bytes(&self) -> Result<Vec<u8>, WriteError> {
         self.check()?;
         self.encode()
@@ -563,17 +619,11 @@ impl Session {
             sha256: reader.sha256(Field::RomSha256)?,
         };
         let profile = reader.profile()?;
-        let flash = reader.flash()?;
+        // The device first: the flash is inflated into its size, and no other.
         let device = profile
             .device()
             .map_err(|source| ReadError::Profile { source })?;
-        let flash_size = u32::try_from(flash.len()).unwrap_or(u32::MAX);
-        if flash_size != device.flash.size() {
-            return Err(ReadError::FlashOfAnotherDevice {
-                flash: flash_size,
-                device: device.flash.size(),
-            });
-        }
+        let flash = reader.flash(device.flash.size())?;
         let strict_mmio = match reader.u8(Field::StrictMmio)? {
             0 => false,
             1 => true,
@@ -705,9 +755,9 @@ impl<'a> Reader<'a> {
 
     fn text(&mut self, len: usize, field: Field) -> Result<String, ReadError> {
         let bytes = self.take(len, field)?;
-        String::from_utf8(bytes.to_vec()).map_err(|e| ReadError::Invalid {
+        String::from_utf8(bytes.to_vec()).map_err(|e| ReadError::NotUtf8 {
             field,
-            value: e.utf8_error().valid_up_to() as u64,
+            at: e.utf8_error().valid_up_to(),
         })
     }
 
@@ -726,8 +776,9 @@ impl<'a> Reader<'a> {
         let recorded = self.sha256(Field::ProfileSha256)?;
         let computed: [u8; 32] = Sha256::digest(text.as_bytes()).into();
         if computed != recorded {
+            // The text and its digest disagree; which of the two was damaged, nothing tells.
             return Err(ReadError::Sha256Mismatch {
-                field: Field::ProfileText,
+                field: Field::ProfileSha256,
                 recorded: hex(&recorded),
                 computed: hex(&computed),
             });
@@ -735,7 +786,8 @@ impl<'a> Reader<'a> {
         Ok(ProfileText { id, text })
     }
 
-    fn flash(&mut self) -> Result<Vec<u8>, ReadError> {
+    /// The starting flash, which the profile gives `device_size` bytes.
+    fn flash(&mut self, device_size: u32) -> Result<Vec<u8>, ReadError> {
         let size = self.u32(Field::FlashSize)?;
         if size > MAX_FLASH_BYTES {
             return Err(ReadError::TooLarge {
@@ -750,25 +802,16 @@ impl<'a> Reader<'a> {
                 value: size.into(),
             });
         }
+        if size != device_size {
+            return Err(ReadError::FlashOfAnotherDevice {
+                flash: size,
+                device: device_size,
+            });
+        }
         let recorded = self.sha256(Field::FlashSha256)?;
         let deflated_len = self.length(Field::DeflatedFlash, MAX_DEFLATED_FLASH_BYTES)?;
         let deflated = self.take(deflated_len, Field::DeflatedFlash)?;
-        let expected = size as usize;
-        // `size` is at most 16 MiB, checked above: the capacity is bounded by a constant, and
-        // the inflation reads one byte past it at most, to tell a longer flash.
-        let mut flash = Vec::with_capacity(expected);
-        DeflateDecoder::new(deflated)
-            .take(u64::from(size) + 1)
-            .read_to_end(&mut flash)
-            .map_err(|e| ReadError::Inflate {
-                detail: e.to_string(),
-            })?;
-        if flash.len() != expected {
-            return Err(ReadError::InflatedSize {
-                expected: size,
-                found: flash.len(),
-            });
-        }
+        let flash = inflate(deflated, size)?;
         let computed: [u8; 32] = Sha256::digest(&flash).into();
         if computed != recorded {
             return Err(ReadError::Sha256Mismatch {
@@ -804,8 +847,14 @@ impl<'a> Reader<'a> {
                 });
             }
         };
-        let at = Cycles(self.u64(Field::Cut)?);
-        Ok(Some(Cut { at, reason }))
+        let cut = Cut {
+            at: Cycles(self.u64(Field::Cut)?),
+            reason,
+        };
+        if !cut.is_replayable() {
+            return Err(ReadError::CutBeyondReplay { at: cut.at });
+        }
+        Ok(Some(cut))
     }
 
     fn usb_host(&mut self, field: Field) -> Result<UsbHost, ReadError> {
@@ -883,6 +932,40 @@ impl<'a> Reader<'a> {
 
 fn too_large((field, value, max): (Field, u64, u64)) -> ReadError {
     ReadError::TooLarge { field, value, max }
+}
+
+/// The flash the deflated stream `deflated` holds, `size` bytes exactly, the whole stream used: a
+/// stream that does not inflate to `size` bytes, that stops before its last block, or that is
+/// followed by more bytes is refused.
+fn inflate(deflated: &[u8], size: u32) -> Result<Vec<u8>, ReadError> {
+    let expected = size as usize;
+    // `size` was checked against `MAX_FLASH_BYTES` and the device of the profile before: the
+    // capacity is bounded by a constant. The byte past it tells a stream that inflates further.
+    let mut flash = Vec::with_capacity(expected + 1);
+    let mut decompress = Decompress::new(false);
+    let status = decompress
+        .decompress_vec(deflated, &mut flash, FlushDecompress::Finish)
+        .map_err(|e| ReadError::Inflate {
+            detail: e.to_string(),
+        })?;
+    if flash.len() != expected {
+        return Err(ReadError::InflatedSize {
+            expected: size,
+            found: flash.len(),
+        });
+    }
+    if status != Status::StreamEnd {
+        return Err(ReadError::Inflate {
+            detail: "the deflated stream stops before its last block".to_owned(),
+        });
+    }
+    let used = usize::try_from(decompress.total_in()).unwrap_or(usize::MAX);
+    if used < deflated.len() {
+        return Err(ReadError::UnusedDeflatedBytes {
+            count: deflated.len() - used,
+        });
+    }
+    Ok(flash)
 }
 
 #[cfg(test)]

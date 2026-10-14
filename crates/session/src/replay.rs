@@ -7,6 +7,10 @@
 //! (ADR 0006, [`Esp32C3::send_console`]), and a session holds no more input than the machine
 //! takes ahead ([`crate::MAX_CONSOLE_BYTES`], [`crate::MAX_HOST_CHANGES`]). The replay then runs
 //! to the limits of the session, its cut included, and gives the [`Outcome`] its recording gave.
+//!
+//! The machine of a replay keeps no journal of its inputs ([`Esp32C3::forgo_input_journal`]):
+//! the session holds them, and the machine's consoles hold what is still to reach the device, so
+//! the inputs are in memory twice at most, never three times.
 use crate::format::Session;
 use crate::outcome::{ConsoleDigests, End, Limits, NoTraceHash, Outcome, Reached, hex};
 use boards::{MachineOptions, ProfileError};
@@ -61,7 +65,8 @@ pub struct Replay {
 }
 
 impl Replay {
-    /// The machine of `session` on `rom`, at power-on, every input handed over.
+    /// The machine of `session` on `rom`, at power-on, every input handed over, keeping no
+    /// journal of them.
     ///
     /// # Errors
     /// [`ReplayError::Rom`] when `rom` is not the ROM of the session, [`ReplayError::Profile`]
@@ -89,6 +94,7 @@ impl Replay {
         let mut machine = device
             .instantiate_with_flash(rom, session.flash.clone(), options)
             .map_err(|source| ReplayError::Flash { source })?;
+        machine.forgo_input_journal();
         for (index, input) in session.inputs.iter().enumerate() {
             let handed = match input {
                 AcceptedInput::Console { channel, at, bytes } => {

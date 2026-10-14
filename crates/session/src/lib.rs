@@ -19,9 +19,9 @@ mod outcome;
 mod replay;
 
 pub use format::{
-    Field, MAX_CONSOLE_BYTES, MAX_DEFLATED_FLASH_BYTES, MAX_HOST_CHANGES, MAX_INPUTS,
-    MAX_PROFILE_ID_BYTES, MAX_PROFILE_TEXT_BYTES, MAX_SESSION_BYTES, ProfileText, ReadError,
-    RomIdentity, Session, VERSION_LINE, WriteError,
+    Field, MAX_CONSOLE_BYTES, MAX_CONSOLE_CHUNKS, MAX_DEFLATED_FLASH_BYTES, MAX_HOST_CHANGES,
+    MAX_INPUTS, MAX_INPUTS_MEMORY_BYTES, MAX_PROFILE_ID_BYTES, MAX_PROFILE_TEXT_BYTES,
+    MAX_SESSION_BYTES, ProfileText, ReadError, RomIdentity, Session, VERSION_LINE, WriteError,
 };
 pub use outcome::{
     ConsoleDigests, Cut, CutReason, Difference, Divergence, End, Limits, NoTraceHash, Outcome,

@@ -318,6 +318,87 @@ fn the_inputs_of_a_channel_or_the_host_beyond_their_bound_are_refused() {
             ..
         })
     ));
+    // One chunk more than a channel holds, each of them empty: far under the bound on bytes.
+    beyond.inputs = (0..=MAX_CONSOLE_CHUNKS as u64)
+        .map(|at| AcceptedInput::Console {
+            channel: ConsoleChannel::UsbSerialJtag,
+            at: Cycles(at),
+            bytes: Vec::new(),
+        })
+        .collect();
+    let field = Field::ConsoleChunks(ConsoleChannel::UsbSerialJtag);
+    let refused = read(&beyond.encode().unwrap());
+    assert_eq!(
+        refused,
+        ReadError::TooLarge {
+            field,
+            value: MAX_CONSOLE_CHUNKS as u64 + 1,
+            max: MAX_CONSOLE_CHUNKS as u64
+        }
+    );
+    assert_eq!(
+        refused.to_string(),
+        "the number of inputs of usb-serial-jtag is 16385, more than 16384; the file is damaged or was not written by inkemu"
+    );
+    assert!(matches!(
+        beyond.to_bytes(),
+        Err(WriteError::TooLarge { field: f, .. }) if f == field
+    ));
+}
+
+/// A session at every bound of its inputs, each chunk of the consoles holding `chunk` bytes.
+fn session_at_the_bounds(chunk: usize) -> Session {
+    let mut at_the_bounds = session();
+    at_the_bounds.inputs = Vec::new();
+    for channel in ConsoleChannel::ALL {
+        for at in 0..MAX_CONSOLE_CHUNKS as u64 {
+            at_the_bounds.inputs.push(AcceptedInput::Console {
+                channel,
+                at: Cycles(at),
+                bytes: vec![b'k'; chunk],
+            });
+        }
+    }
+    for at in 0..MAX_HOST_CHANGES as u64 {
+        at_the_bounds.inputs.push(AcceptedInput::UsbHost {
+            at: Cycles(at),
+            state: UsbHost::Open,
+        });
+    }
+    at_the_bounds
+}
+
+#[test]
+fn a_session_at_the_bounds_of_its_inputs_takes_a_memory_bounded_by_a_constant() {
+    // Full packets fill both bounds of a channel together; one-byte chunks reach the bound on
+    // chunks with a sixty-fourth of the bytes.
+    const { assert!(MAX_CONSOLE_CHUNKS * 64 == MAX_CONSOLE_BYTES) };
+    for chunk in [64, 1] {
+        let written = session_at_the_bounds(chunk);
+        let bytes = written.to_bytes().unwrap();
+        assert!(bytes.len() <= MAX_SESSION_BYTES, "{}", bytes.len());
+        let read = Session::from_bytes(&bytes).unwrap();
+        assert_eq!(read.inputs.len(), MAX_INPUTS);
+        // What the inputs read take: their entries, as the vector holds them, and the bytes of
+        // each chunk, as its own vector holds them.
+        let entries = read.inputs.capacity() * size_of::<AcceptedInput>();
+        let console_bytes: usize = read
+            .inputs
+            .iter()
+            .map(|input| match input {
+                AcceptedInput::Console { bytes, .. } => bytes.capacity(),
+                AcceptedInput::UsbHost { .. } => 0,
+            })
+            .sum();
+        assert!(console_bytes <= 3 * MAX_CONSOLE_BYTES, "{console_bytes}");
+        assert!(
+            entries + console_bytes <= MAX_INPUTS_MEMORY_BYTES,
+            "{entries} + {console_bytes} > {MAX_INPUTS_MEMORY_BYTES}"
+        );
+        assert_eq!(read, written);
+    }
+    // About 7 MiB, whatever the file: a front end can hold it, a browser too.
+    const { assert!(MAX_INPUTS_MEMORY_BYTES <= 8 * MIB) };
 }
 
 #[test]
@@ -327,26 +408,42 @@ fn a_sha256_that_does_not_match_is_refused_with_its_field() {
         ReadError::Sha256Mismatch { field, .. } => field,
         other => panic!("{other}"),
     };
-    // A byte of the text changed, or of its recorded SHA-256.
+    // A byte of the text changed, or of its recorded SHA-256: the two disagree.
     assert_eq!(
         mismatch(patched(layout.text_len + 10, b"#")),
-        Field::ProfileText
+        Field::ProfileSha256
     );
-    assert_eq!(mismatch(flipped(layout.profile_sha)), Field::ProfileText);
+    assert_eq!(mismatch(flipped(layout.profile_sha)), Field::ProfileSha256);
     assert_eq!(mismatch(flipped(layout.flash_sha)), Field::FlashSha256);
 }
 
 #[test]
 fn a_flash_that_does_not_inflate_to_its_size_or_is_of_another_device_is_refused() {
     let layout = layout(&session().to_bytes().unwrap());
+    let one = u32::try_from(MIB).unwrap();
     let two = u32::try_from(2 * MIB).unwrap();
+    // A size that is not the device's is refused before anything is inflated.
     assert_eq!(
         read(&patched(layout.flash_size, &two.to_le_bytes())),
-        ReadError::InflatedSize {
-            expected: two,
-            found: MIB
+        ReadError::FlashOfAnotherDevice {
+            flash: two,
+            device: one
         }
     );
+    // A stream that inflates to less, or to more, than the size it is given.
+    for (flash, shorter) in [(MIB / 2, true), (2 * MIB, false)] {
+        let mut other = session();
+        other.flash = vec![0xFF; flash];
+        let mut bytes = other.encode().unwrap();
+        bytes[layout.flash_size..layout.flash_size + 4].copy_from_slice(&one.to_le_bytes());
+        match read(&bytes) {
+            ReadError::InflatedSize { expected, found } => {
+                assert_eq!(expected, one);
+                assert_eq!(found < MIB, shorter, "{found}");
+            }
+            other => panic!("{other}"),
+        }
+    }
     // A deflated stream that does not start as one.
     let garbage = patched(layout.deflated_len + 4, &[0xFF; 8]);
     assert!(matches!(
@@ -366,6 +463,54 @@ fn a_flash_that_does_not_inflate_to_its_size_or_is_of_another_device_is_refused(
         other.to_bytes(),
         Err(WriteError::FlashOfAnotherDevice { .. })
     ));
+}
+
+/// The bytes of [`session`] with its deflated flash replaced by `stream`, its length with it.
+fn with_deflated(stream: &[u8]) -> Vec<u8> {
+    let bytes = session().to_bytes().unwrap();
+    let layout = layout(&bytes);
+    let mut out = bytes[..layout.deflated_len].to_vec();
+    out.extend_from_slice(&u32::try_from(stream.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(stream);
+    out.extend_from_slice(&bytes[layout.strict..]);
+    out
+}
+
+/// The flash of [`session`], deflated.
+fn deflated_flash(finish: bool) -> Vec<u8> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&session().flash).unwrap();
+    if finish {
+        encoder.finish().unwrap()
+    } else {
+        // Flushed but not finished: every byte of the flash is there, but the stream has no
+        // last block.
+        encoder.flush().unwrap();
+        encoder.get_ref().clone()
+    }
+}
+
+#[test]
+fn a_deflated_flash_must_be_used_whole_and_end_as_a_stream_ends() {
+    let whole = deflated_flash(true);
+    assert_eq!(
+        Session::from_bytes(&with_deflated(&whole)).unwrap(),
+        session()
+    );
+    // Bytes after the end of the stream, inside the length the file gives it.
+    let mut longer = whole.clone();
+    longer.extend_from_slice(b"xyz");
+    assert_eq!(
+        read(&with_deflated(&longer)),
+        ReadError::UnusedDeflatedBytes { count: 3 }
+    );
+    // A stream that gives every byte of the flash but stops before its last block.
+    let unfinished = deflated_flash(false);
+    assert!(
+        matches!(read(&with_deflated(&unfinished)), ReadError::Inflate { detail } if detail.contains("last block")),
+        "{}",
+        read(&with_deflated(&unfinished))
+    );
 }
 
 #[test]
@@ -399,14 +544,45 @@ fn a_value_no_field_takes_is_refused_with_its_field() {
             value: 9
         }
     );
-    // A profile id that is not UTF-8.
-    assert!(matches!(
+    // A profile id or text that is not UTF-8, from the byte that is not.
+    assert_eq!(
         read(&patched(layout.id_len + 1, &[0xFF])),
-        ReadError::Invalid {
+        ReadError::NotUtf8 {
             field: Field::ProfileId,
-            ..
+            at: 0
         }
-    ));
+    );
+    let not_text = read(&patched(layout.text_len + 4 + 3, &[0xC3]));
+    assert_eq!(
+        not_text,
+        ReadError::NotUtf8 {
+            field: Field::ProfileText,
+            at: 3
+        }
+    );
+    assert_eq!(
+        not_text.to_string(),
+        "the profile text is not UTF-8 text from its byte 3 on; the file is damaged or was not written by inkemu"
+    );
+}
+
+#[test]
+fn a_cut_no_replay_can_stop_at_is_refused_when_written_and_when_read() {
+    let late = Cut {
+        at: Cycles(u64::MAX),
+        reason: CutReason::Interrupted,
+    };
+    assert!(!late.is_replayable());
+    let mut beyond = session();
+    beyond.limits.cut = Some(late);
+    assert_eq!(
+        beyond.to_bytes(),
+        Err(WriteError::CutBeyondReplay { at: late.at })
+    );
+    assert_eq!(
+        read(&beyond.encode().unwrap()),
+        ReadError::CutBeyondReplay { at: late.at }
+    );
 }
 
 #[test]
@@ -458,8 +634,8 @@ fn a_profile_the_session_cannot_rebuild_is_refused() {
 
 #[test]
 fn the_longest_session_is_within_the_bound_the_front_end_reads() {
-    // Each channel at its bound in one-byte inputs, the costliest way to spend it.
-    const PER_CHANNEL: usize = MAX_CONSOLE_BYTES * (CONSOLE_INPUT_HEAD + 1);
+    // Each channel at both its bounds, every chunk with its head.
+    const PER_CHANNEL: usize = MAX_CONSOLE_CHUNKS * CONSOLE_INPUT_HEAD + MAX_CONSOLE_BYTES;
     const { assert!(MAX_SESSION_BYTES > 3 * PER_CHANNEL + MAX_DEFLATED_FLASH_BYTES) };
     // A front end may hold a whole file in memory.
     const { assert!(MAX_SESSION_BYTES < 64 * MIB) };
