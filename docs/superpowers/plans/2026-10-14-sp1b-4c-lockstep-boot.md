@@ -40,8 +40,8 @@ The count of compared instructions is measured locally (R10): 3 402 169 instruct
 ## Review Focus
 
 - **The refactor of the run loop changes nothing by default.** `run_within` and a loop of `step` give the same PCs, cycles and device time → `stepping_runs_the_same_instructions_as_a_run`. The existing tests of `machine.rs` pass unchanged.
-- **The pre-state contract (R1).** `step` returns at the boundary of the next instruction, the interrupt taken and a `wfi` slept through → `a_step_takes_the_interrupt_due_after_its_instruction`, `a_step_sleeps_through_a_wfi`.
-- **`qemu-icount` (H2, R4).** 25 instructions are exactly 200 ns of device time at any CPU clock; no interrupt latency → `qemu_icount_prices_25_instructions_at_200_ns_whatever_the_clock`, `qemu_icount_shows_a_selected_line_at_once`.
+- **The pre-state contract (R1).** `step` returns at the boundary of the next instruction, the interrupt taken and a `wfi` slept through → `a_step_takes_the_interrupt_due_after_its_instruction`, `a_step_sleeps_through_a_wfi_to_the_interrupt_that_ends_it`.
+- **`qemu-icount` (H2, R4).** 25 instructions are exactly 200 ns of device time at any CPU clock; no interrupt latency → `qemu_icount_prices_25_instructions_at_200_ns_whatever_the_clock`, and `a_step_takes_the_interrupt_due_after_its_instruction` (taken right after the store under `qemu-icount`, not yet under the default model).
 - **The policy (H3).** Each treatment has a unit test on a synthetic trace; the dedupe and the preempted block (R3) too.
 - **Acceptance 2.** `a_changed_instruction_is_reported_with_both_states`: a trace written from a machine whose program has one instruction changed diverges at that instruction, the report shows both values and the 64 instructions before.
 - **The table and the tool agree.** `the_table_of_the_documentation_is_the_table_of_the_tool`.
@@ -85,6 +85,7 @@ crates/soc-esp32c3/src/periph/{systimer,mod}.rs             the setting of row 2
 crates/boards/tests/host_io_ban.rs                          six crates (Task 3)
 crates/lockstep/{Cargo.toml,clippy.toml,src/{lib,state,trace,table,lockstep,report}.rs,tests/{policy,table}.rs}   new (Task 3)
 crates/lockstep-cli/{Cargo.toml,src/{main,qemu}.rs}        new: inkemu-lockstep (Task 4)
+crates/lockstep-cli/tests/readme.rs                         the README's command and the CI's counts agree (Task 6)
 ```
 
 ---
@@ -97,41 +98,41 @@ crates/lockstep-cli/{Cargo.toml,src/{main,qemu}.rs}        new: inkemu-lockstep 
 
 **Files:** `crates/cpu-rv32/src/{hart,timing,lib}.rs`; `crates/soc-esp32c3/src/{machine,config,ctx,lib}.rs`, `periph/{systimer,mod}.rs`.
 
-- [ ] **Step 1: Write the failing tests.** `hart.rs`: `take_boundary` takes a pending enabled interrupt, ends a `wfi` on a line even with `MIE` clear, and is `Ready` otherwise; `last_instruction` is the instruction just executed and `None` after a fetch fault. `timing.rs`: `QemuIcountTiming` prices every class at 1. `config.rs`: defaults (`Datasheet`, latency 4, `QemuCompat` off); `QemuIcount` has latency 0 unless set. `machine.rs`: stepping runs the same instructions as a run; a step returns at the next boundary, takes the interrupt due after its instruction, sleeps through a `wfi`; `x`, `set_x` (not `x0`), `csr`; 25 instructions under `qemu-icount` are 200 ns at 20 MHz and at 160 MHz; a selected line is visible at once under `qemu-icount`, after 4 cycles by default. `systimer.rs`: with the setting, a target-mode comparator on a stopped counter raises nothing, and raises once the counter runs.
-- [ ] **Step 2: Code.** Split `Hart::step` into `take_boundary` and the execution; one private `turn` of the run loop shared by `run_within` and `step`; `Pricing` (datasheet, or 8 ns per instruction with the remainder in 25ths); `Ctx::advance_time_base`; `Timing`, `SocConfig::{timing, interrupt_latency_cycles, qemu_compat}`; `Systimer::with_qemu_compat`.
-- [ ] **Step 3: Run** `cargo test -p cpu-rv32 --lib hart timing`, `cargo test -p soc-esp32c3 --lib machine config systimer` → pass.
-- [ ] **Step 4: Commit** (two): `feat(cpu-rv32): the boundary before an instruction, the last instruction, and the timing of QEMU's icount`; `feat(soc-esp32c3): stepping and introspection, the timing model qemu-icount, a configurable interrupt latency and QEMU's SYSTIMER for the lockstep`.
+- [x] **Step 1: Write the failing tests.** `hart.rs`: `take_boundary` takes a pending enabled interrupt, ends a `wfi` on a line even with `MIE` clear, and is `Ready` otherwise; `last_instruction` is the instruction just executed and `None` after a fetch fault. `timing.rs`: `QemuIcountTiming` prices every class at 1. `config.rs`: defaults (`Datasheet`, latency 4, `QemuCompat` off); `QemuIcount` has latency 0 unless set. `machine.rs`: stepping runs the same instructions as a run; a step returns at the next boundary, takes the interrupt due after its instruction, sleeps through a `wfi`; `x`, `set_x` (not `x0`), `csr`; 25 instructions under `qemu-icount` are 200 ns at 20 MHz and at 160 MHz; a selected line is visible at once under `qemu-icount`, after 4 cycles by default. `systimer.rs`: with the setting, a target-mode comparator on a stopped counter raises nothing, and raises once the counter runs.
+- [x] **Step 2: Code.** Split `Hart::step` into `take_boundary` and the execution; one private `turn` of the run loop shared by `run_within` and `step`; `Pricing` (datasheet, or 8 ns per instruction with the remainder in 25ths); `Ctx::advance_time_base`; `Timing`, `SocConfig::{timing, interrupt_latency_cycles, qemu_compat}`; `Systimer::with_qemu_compat`.
+- [x] **Step 3: Run** `cargo test -p cpu-rv32 --lib hart timing`, `cargo test -p soc-esp32c3 --lib machine config systimer` → pass.
+- [x] **Step 4: Commit** (two): `feat(cpu-rv32): the boundary before an instruction, the last instruction, and the timing of QEMU's icount`; `feat(soc-esp32c3): stepping and introspection, the timing model qemu-icount, a configurable interrupt latency and QEMU's SYSTIMER for the lockstep`.
 
 ## Task 3: The crate `lockstep` (H3–H5, H8; R2, R3, R6, R7, R12, R14)
 
 **Files:** create `crates/lockstep/`, `docs/lockstep-differences.md`; modify `Cargo.toml`, `crates/boards/tests/host_io_ban.rs`.
 
-- [ ] **Step 1: Write the failing tests.** `trace.rs`: a real block and a trap line are read; a rendered block reads back; identical blocks share a fingerprint; a line one byte past the bound, a block cut short, without a quantity, too long, or with a value that is not hex is refused with its line. `table.rs`: rows numbered once; every absent block holds its SVD registers. `tests/policy.rs`, on traces written from a machine running a program (`render_block`): the same program compares to the end of the trace; a changed instruction diverges at it with both states and the history (acceptance 2); a duplicate block is dropped, a branch to itself is not; a preempted block is dropped; a reset of QEMU ends the window; an access to an absent block ends it, one a row covers does not; a load from a row's range takes QEMU's value and counts the row; a mask settles its bits only; the limit ends the window. `tests/table.rs`: the documentation's table and `DIFFERENCES` have the same rows and treatments.
-- [ ] **Step 2: Code.** `state` (fields, `CpuState`), `trace` (`TraceReader`, `render_block`), `table` (`Treatment`, `Compat`, `configure`, `DIFFERENCES`, `UNEMULATED`), `lockstep` (`Target` for `Esp32C3`, `Lockstep::feed`/`finish`, `End`, `WindowEnd`, `Counts`), `report`. `clippy.toml`, the sixth copy of the ban.
-- [ ] **Step 3: Run** `cargo test -p lockstep`, `cargo test -p boards --test host_io_ban`, `cargo check --target wasm32-unknown-unknown -p lockstep` → pass.
-- [ ] **Step 4: Commit:** `feat(lockstep): QEMU's trace, the comparison after every instruction under a numbered table of admitted differences, and the report of a divergence`.
+- [x] **Step 1: Write the failing tests.** `trace.rs`: a real block and a trap line are read; a rendered block reads back; identical blocks share a fingerprint; a line one byte past the bound, a block cut short, without a quantity, too long, or with a value that is not hex is refused with its line. `table.rs`: rows numbered once; every absent block holds its SVD registers. `tests/policy.rs`, on traces written from a machine running a program (`render_block`): the same program compares to the end of the trace; a changed instruction diverges at it with both states and the history (acceptance 2); a duplicate block is dropped, a branch to itself is not; a preempted block is dropped; a reset of QEMU ends the window; an access to an absent block ends it, one a row covers does not; a load from a row's range takes QEMU's value and counts the row; a mask settles its bits only; the limit ends the window. `tests/table.rs`: the documentation's table and `DIFFERENCES` have the same rows and treatments.
+- [x] **Step 2: Code.** `state` (fields, `CpuState`), `trace` (`TraceReader`, `render_block`), `table` (`Treatment`, `Compat`, `configure`, `DIFFERENCES`, `UNEMULATED`), `lockstep` (`Target` for `Esp32C3`, `Lockstep::feed`/`finish`, `End`, `WindowEnd`, `Counts`), `report`. `clippy.toml`, the sixth copy of the ban.
+- [x] **Step 3: Run** `cargo test -p lockstep`, `cargo test -p boards --test host_io_ban`, `cargo check --target wasm32-unknown-unknown -p lockstep` → pass.
+- [x] **Step 4: Commit:** `feat(lockstep): QEMU's trace, the comparison after every instruction under a numbered table of admitted differences, and the report of a divergence`.
 
 ## Task 4: `inkemu-lockstep` (H6, H7; R5, R9, R11)
 
 **Files:** create `crates/lockstep-cli/`; modify `Cargo.toml`.
 
-- [ ] **Step 1: Write the failing tests** (`qemu.rs`): QEMU's arguments carry `-icount shift=3,sleep=off`, one instruction per block, `-d cpu,nochain,int`, the read-only drive with `snapshot=on` and the pipe.
-- [ ] **Step 2: Code.** The CLI (`--flash`, `--rom-dir`, `--device`, `--trace`, `--image`, `--qemu`, `--max-instructions`, `--expect-compared`, `--expect-end`), the machine of the profile under `configure`, QEMU in Docker through a named pipe, the summary and the exit codes.
-- [ ] **Step 3: Run** `cargo test -p inkemu-lockstep`; locally, `inkemu-lockstep --flash target/reference-firmware/flash_hello.bin --rom-dir <dir> --expect-compared 3402169 --expect-end reset` → exit 0, twice.
-- [ ] **Step 4: Commit:** `feat(inkemu-lockstep): the development binary that runs QEMU in the pinned image and compares it with inkemu`.
+- [x] **Step 1: Write the failing tests** (`qemu.rs`): QEMU's arguments carry `-icount shift=3,sleep=off`, one instruction per block, `-d cpu,nochain,int`, the read-only drive with `snapshot=on` and the pipe.
+- [x] **Step 2: Code.** The CLI (`--flash`, `--rom-dir`, `--device`, `--trace`, `--image`, `--qemu`, `--max-instructions`, `--expect-compared`, `--expect-end`), the machine of the profile under `configure`, QEMU in Docker through a named pipe, the summary and the exit codes.
+- [x] **Step 3: Run** `cargo test -p inkemu-lockstep`; locally, `inkemu-lockstep --flash target/reference-firmware/flash_hello.bin --rom-dir <dir> --expect-compared 3402169 --expect-end reset` → exit 0, twice.
+- [x] **Step 4: Commit:** `feat(inkemu-lockstep): the development binary that runs QEMU in the pinned image and compares it with inkemu`.
 
 ## Task 5: The CI (H9; R10)
 
 **Files:** `.github/workflows/ci.yml`.
 
-- [ ] **Step 1:** `check`: the WebAssembly step builds `lockstep`. `reference-boot`: the disk is freed and the image pulled whatever the cache of the firmware; a step runs `cargo run --release -p inkemu-lockstep -- --flash … --rom-dir … --image espressif/idf:$ESP_IDF_VERSION --expect-compared 3402169 --expect-end reset`.
-- [ ] **Step 2: Commit:** `ci: the reference-boot job compares flash_hello.bin with QEMU over its first life, and the WebAssembly step builds lockstep`.
+- [x] **Step 1:** `check`: the WebAssembly step builds `lockstep`. `reference-boot`: the disk is freed and the image pulled whatever the cache of the firmware; a step runs `cargo run --release -p inkemu-lockstep -- --flash … --rom-dir … --image espressif/idf:$ESP_IDF_VERSION --expect-compared 3402169 --expect-end reset`.
+- [x] **Step 2: Commit:** `ci: the reference-boot job compares flash_hello.bin with QEMU over its first life, and the WebAssembly step builds lockstep`.
 
 ## Task 6: Documents (H11)
 
 **Files:** `README.md`; create `docs/adr/0008-lockstep-et-differences-admises.md`, `docs/superpowers/notes/2026-10-14-sp1b-4c-carryover.md`.
 
-- [ ] **Step 1:** ADR 0008 (French): the unit of comparison, the policy and its order of preference, the window, QEMU in Docker, the timing of QEMU, what the lockstep proves and what it does not.
-- [ ] **Step 2:** README (EN, then FR): the developer section on `inkemu-lockstep`.
-- [ ] **Step 3:** The hand-over note (French): results, rulings R1–R14, what is left to SP1b-4d and later, limits of proof.
-- [ ] **Step 4: Commit:** `docs: ADR 0008, the lockstep and its admitted differences, the README of inkemu-lockstep, and the hand-over of SP1b-4c`.
+- [x] **Step 1:** ADR 0008 (French): the unit of comparison, the policy and its order of preference, the window, QEMU in Docker, the timing of QEMU, what the lockstep proves and what it does not.
+- [x] **Step 2:** README (EN, then FR): the developer section on `inkemu-lockstep`.
+- [x] **Step 3:** The hand-over note (French): results, rulings R1–R14, what is left to SP1b-4d and later, limits of proof.
+- [x] **Step 4: Commit:** `docs: ADR 0008, the lockstep and its admitted differences, the README of inkemu-lockstep, and the hand-over of SP1b-4c`.

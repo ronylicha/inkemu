@@ -10,7 +10,8 @@ traitements.
 QEMU : `esp_develop_9.2.2_20250817`, celui de l'image `espressif/idf:v5.5.2`. Les lignes ont été
 établies le 2026-10-14 sur `flash_hello.bin` (ROM, bootloader, application jusqu'à `esp_restart`,
 3 402 169 instructions) ; la colonne « Usages » est le nombre de fois où la ligne a servi dans cette
-fenêtre.
+fenêtre : une comparaison qu'un masque règle, une valeur recopiée, un accès admis à un bloc absent ;
+une ligne (iv) compte une fois, pour la machine construite avec son réglage.
 
 ## Traitements, par ordre de préférence (H3)
 
@@ -45,7 +46,7 @@ fenêtre.
 | 15 | SYSTIMER : `VALUE_VALID` se lit toujours 1 dans QEMU, et ses compteurs partent du démarrage de la machine | (ii) recopie | `UNIT0_OP`–`UNIT1_OP` (`0x6002_3004`–`0x6002_3008`), `UNIT0_VALUE_HI`–`UNIT1_VALUE_LO` (`0x6002_3040`–`0x6002_304C`) | timers §G ligne 9 | 2 220 |
 | 16 | APB_CTRL n'est pas un périphérique dans QEMU : `WIFI_CLK_EN` et les registres d'alimentation des mémoires se lisent 0 | (ii) recopie | `APB_CTRL.WIFI_CLK_EN` (`0x6002_6014`), `FRONT_END_MEM_PD`–`MEM_POWER_UP` (`0x6002_609C`–`0x6002_60AC`) | `info mtree -f` (zone `esp32c3.iomem`) | 4 |
 | 17 | `RNG.DATA` : QEMU tire l'aléa de l'hôte, inkemu d'une graine fixe | (ii) recopie | `0x6002_60B0` | carryover ligne 20 ; `docs/research/esp32c3-bootloader-accesses.md` §10 point 5 | 1 604 |
-| 18 | APB_SARADC, que QEMU n'émule pas : la source d'entropie du bootloader le programme puis l'arrête, sans lire de mesure | (ii) recopie, accès admis | `APB_SARADC`, `0x6004_0000`–`0x6004_0057` | `info mtree -f` ; ESP-IDF v5.5.2 `components/bootloader_support/src/bootloader_random_esp32c3.c` ; mesure locale | 19 |
+| 18 | APB_SARADC, que QEMU n'émule pas : la source d'entropie du bootloader le programme puis l'arrête, sans lire de mesure | (ii) recopie, accès admis | `APB_SARADC`, `0x6004_0000`–`0x6004_0057` | `info mtree -f` ; ESP-IDF v5.5.2 `components/bootloader_support/src/bootloader_random_esp32c3.c` ; mesure locale | 67 |
 | 19 | `USB_DEVICE.EP1_CONF` se lit 0 dans QEMU : la ROM attend une place qui ne vient pas, puis renonce | (ii) recopie | `0x6004_3004` | carryover ligne 22 | 7 033 |
 | 20 | SYSTEM : QEMU lit 0 dans les portes d'horloge et les resets des périphériques, et `SYSCLK_CONF` sur la PLL | (ii) recopie | `SYSTEM`, `0x600C_0000`–`0x600C_0027`, `CACHE_CONTROL` (`0x600C_0040`), `SYSCLK_CONF` (`0x600C_0058`) | timers §G ligne 12 ; carryover ligne 6 | 46 |
 | 21 | SENSITIVE n'est pas un périphérique dans QEMU : ses registres se lisent 0 | (ii) recopie | `SENSITIVE`, `0x600C_1000`–`0x600C_1FFF` | `info mtree -f` (zone `esp32c3.iomem`) | 17 |
