@@ -19,10 +19,18 @@
 //!
 //! The dump of a unit holds its NVS, where a firmware keeps settings and network credentials: no
 //! line here reads the flash but to hash it, and a failure quotes console and log lines, never a
-//! byte of the flash.
+//! byte of the flash. The panic handler of ESP-IDF prints the stack of the faulting task, which may
+//! hold what the application read from NVS: a failure leaves those lines out of the console it
+//! quotes ([`without_stack_dump`]).
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
 
 use std::process::Output;
+
+/// How long one run may take on the host before the test fails instead of hanging. It turns a
+/// hang into a failure and says nothing of speed, so it is wide: a run of 5 s of device time took
+/// about 45 s in a release build (measured 2026-10-14), and forty minutes is more than fifty times
+/// that.
+const HANG_LIMIT: std::time::Duration = std::time::Duration::from_mins(40);
 
 /// `crosspoint-1.6.5-x3-x4.bin`, the release asset of `CrossPoint` 1.6.5 for the X3 and the X4
 /// (measured 2026-10-14; `docs/superpowers/specs/2026-10-14-sp1b-3e-design.md`, §2).
@@ -71,14 +79,52 @@ fn rom_dir() -> String {
 }
 
 /// `inkemu run --device x4 --max-time 5` with `input` (`--firmware` or `--flash`) and `more`, on
-/// the console the profile of the X4 names: what a user who types that command sees.
+/// the console the profile of the X4 names: what a user who types that command sees. A run still
+/// going after [`HANG_LIMIT`] is killed and fails the test.
 fn run(input: &str, file: &str, more: &[&str]) -> Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_inkemu"))
+    let output = assert_cmd::Command::new(env!("CARGO_BIN_EXE_inkemu"))
         .args(["run", "--device", "x4", "--max-time", SECONDS])
         .args(["--rom-dir", &rom_dir(), input, file])
         .args(more)
+        .timeout(HANG_LIMIT)
         .output()
-        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.code().is_some(),
+        "the run ended on a signal ({}): killed when it did not end within {HANG_LIMIT:?} on the host, or a crash\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+/// Whether `line` is a line of the stack dump the panic handler of ESP-IDF prints: an address of
+/// eight hex digits, then `: 0x` and the words there (`3fca8140: 0x00000000 0x3fca81a0 …`).
+fn is_stack_dump_line(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() >= 12
+        && bytes[..8].iter().all(u8::is_ascii_hexdigit)
+        && bytes[8..].starts_with(b": 0x")
+}
+
+/// `console` without the lines of the panic's stack dump, which may show RAM the application
+/// filled from the flash, and with a line that says how many were left out.
+fn without_stack_dump(console: &str) -> String {
+    let mut kept = String::new();
+    let mut dropped = 0usize;
+    for line in console.lines() {
+        if is_stack_dump_line(line) {
+            dropped += 1;
+        } else {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    if dropped == 0 {
+        kept
+    } else {
+        format!("{kept}({dropped} lines of the panic's stack dump left out)\n")
+    }
 }
 
 /// What a run printed: its exit code, its console (carriage returns dropped) and its log.
@@ -104,7 +150,7 @@ impl Run {
             let at = self.console[from..].find(expected).unwrap_or_else(|| {
                 panic!(
                     "`{expected}` is missing, or out of order:\n{}",
-                    self.console
+                    without_stack_dump(&self.console)
                 )
             });
             from += at + expected.len();
@@ -245,6 +291,7 @@ fn the_stock_x4_firmware_starts_and_names_what_the_model_lacks() {
         INTERRUPT_WATCHDOG_PANIC,
         "rst:0x3 (RTC_SW_SYS_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
         INTERRUPT_WATCHDOG_PANIC,
+        "rst:0x3 (RTC_SW_SYS_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
     ]);
     assert!(
         lenient
@@ -259,4 +306,33 @@ fn the_stock_x4_firmware_starts_and_names_what_the_model_lacks() {
     // ESP-IDF v4.4 polls SPI1 `FSM` (`0x60002054`) before each status read of the flash.
     lenient.assert_nothing_undocumented();
     assert_strict_stop("--flash", &file, &lenient, "GPIO.PIN13", "0x600040a8");
+}
+
+/// A failure quotes the console without the stack dump of the panic, and says how many lines it
+/// left out; the lines a test looks for, addresses in a backtrace included, stay.
+#[test]
+fn a_quoted_console_leaves_out_the_stack_dump_of_the_panic() {
+    let console = "\
+Guru Meditation Error: Core  0 panic'ed (Interrupt wdt timeout on CPU0).
+MEPC    : 0x42001234  RA      : 0x42005678
+Stack memory:
+3fca8140: 0x00000000 0x3fca81a0 0x42001234 0x00000001
+3FCA8150: 0xdeadbeef 0x00000000 0x00000000 0x00000000
+Backtrace: 0x42001234:0x3fca8140
+3fca8160 is not a dump line
+ELF file SHA256: 0000000000000000
+";
+    assert_eq!(
+        without_stack_dump(console),
+        "\
+Guru Meditation Error: Core  0 panic'ed (Interrupt wdt timeout on CPU0).
+MEPC    : 0x42001234  RA      : 0x42005678
+Stack memory:
+Backtrace: 0x42001234:0x3fca8140
+3fca8160 is not a dump line
+ELF file SHA256: 0000000000000000
+(2 lines of the panic's stack dump left out)
+"
+    );
+    assert_eq!(without_stack_dump("ok\n"), "ok\n");
 }
