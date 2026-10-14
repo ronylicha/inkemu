@@ -158,12 +158,15 @@ enum Command {
         trace_hash: bool,
         /// Record the run in this file, a session that `inkemu replay` replays: the identity of
         /// the ROM (not the ROM), the device profile, the whole flash the run starts from, the
-        /// limits, the USB host at power-on, every input the consoles received with its device
-        /// time, and what the run came to (its end, device time, cycles, instructions, trace
-        /// hash, final flash and consoles). The file is written when the run ends, however it
-        /// ends: a run cut by Ctrl-C or by its reader is recorded with the device time it
-        /// stopped at. A session holds the whole flash: on Unix the file is readable and
-        /// writable by its owner only. Recording turns the trace hash on.
+        /// limits, the USB host at power-on, every input the consoles and the USB host received
+        /// with its device time, and what the run came to (its end, device time, cycles,
+        /// instructions, trace hash, final flash and consoles). The file is written when the run
+        /// ends, however it ends but at a second Ctrl-C: a run cut by Ctrl-C or by its reader is
+        /// recorded with the device time it stopped at. The path may not be a file the run reads
+        /// or writes, even one that does not exist yet (the flash file, its lock and temporary
+        /// files, a ROM file), and its directory must exist. A session holds the whole flash: on
+        /// Unix the file is readable and writable by its owner only. Recording turns the trace
+        /// hash on.
         #[arg(long, value_name = "FILE")]
         record: Option<PathBuf>,
     },

@@ -3970,6 +3970,40 @@ fn the_readme_shows_run_help_as_the_binary_prints_it() {
     assert_eq!(words(block), help);
 }
 
+/// The commands the README shows for recording and replaying a run are commands this inkemu
+/// takes: each one, given `--help` after its arguments, parses (a renamed option or subcommand
+/// would be refused with exit code 2) and prints the help of its subcommand.
+#[test]
+fn the_readme_records_and_replays_with_commands_the_binary_takes() {
+    let readme = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+    )
+    .unwrap();
+    let block = readme
+        .split_once("### Recording and replaying a run\n\n```sh\n")
+        .unwrap_or_else(|| panic!("no example of recording in the README"))
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    let commands: Vec<Vec<&str>> = block
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(commands.len(), 2, "{block}");
+    for words in commands {
+        let (program, args) = words.split_first().unwrap();
+        assert_eq!(*program, "inkemu", "{words:?}");
+        let subcommand = args[0];
+        inkemu()
+            .args(args)
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(contains(format!("Usage: inkemu {subcommand} ")));
+    }
+}
+
 /// `hello_world.bin` and `nvs_rw_value_cxx.bin`, the application images the reference build
 /// merges at 0x10000 (`tools/reference-firmware/SHA256SUMS.inputs`, `SHA256SUMS.inputs-nvs`).
 const HELLO_APPLICATION_SHA256: &str =
