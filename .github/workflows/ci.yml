@@ -192,11 +192,37 @@ jobs:
       # asks for at the end of the countdown, without a divergence outside the table. The number
       # of compared instructions and the end of the window are pinned: a model change that adds or
       # removes an instruction, or an admitted difference that grows into a divergence, fails here.
+      # The tool prints what each row of the table did, and fails (exit 5) if a row was not used or
+      # was used outside what it declares (decision H3). About 90 s of comparison.
       - name: Compare flash_hello.bin with QEMU after every instruction
+        timeout-minutes: 15
         run: |
           source tools/conformance/versions.env
           cargo run --release -p inkemu-lockstep -- \
             --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
             --rom-dir "$RUNNER_TEMP/rom" \
             --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
             --expect-compared 3402169 --expect-end reset
+      # The same run with a fault put in inkemu on purpose (bit 0 of t0 changed once a million
+      # instructions are compared, a hook of the development binary only): the lockstep must find
+      # it against the real QEMU, exit 1 and name the instruction. A comparison that let a wrong
+      # model pass would pass this run too.
+      - name: The lockstep finds a fault put in inkemu
+        timeout-minutes: 10
+        run: |
+          source tools/conformance/versions.env
+          set +e
+          cargo run --release -p inkemu-lockstep -- \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --perturb-after 1000000 > "$RUNNER_TEMP/perturbed.txt" 2>&1
+          code=$?
+          set -e
+          head -80 "$RUNNER_TEMP/perturbed.txt"
+          test "$code" -eq 1 || { echo "exit $code where 1 (divergence) was expected"; exit 1; }
+          grep -q "^divergence after 1000000 compared instructions" "$RUNNER_TEMP/perturbed.txt"
+          grep -q "^instruction .* at 0x" "$RUNNER_TEMP/perturbed.txt"
+          grep -q "^x5/t0 .*<<" "$RUNNER_TEMP/perturbed.txt"
