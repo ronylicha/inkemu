@@ -27,7 +27,7 @@ Deux valeurs viennent de la CI, les deux premières ci-dessous ; tant qu'elles n
 
 - `tools/reference-firmware/SHA256SUMS.inputs-deep-sleep-timer` : absent. La première construction imprime les trois empreintes sous `unpinned SHA256SUMS.inputs-deep-sleep-timer:` et échoue avant de livrer quoi que ce soit ; les recopier dans ce fichier, pousser, et vérifier que la construction suivante (propre) donne les mêmes.
 - `DEEP_SLEEP_TIMER_TRACE` (`crates/emu-cli/tests/run_cli.rs`) : épinglée à `trace-hash 80bd1c43d55b5467`, mesurée par l'exécution CI 38515471946, où toutes les assertions sur la console du test passaient. Les diagnostics n'entrent pas dans l'empreinte (elle ne mélange que la suite des PC exécutés, dans `Esp32C3::run_within`), et l'heure lue pour le journal ne change rien à l'exécution : la correction ci-dessous ne la déplace pas.
-- La ligne `inkemu: reset by the firmware, …` de l'exemple `--max-cycles 50000000` du README (image `hello_world`) porte désormais le temps d'appareil du redémarrage, que seule une exécution de l'image de référence donne : le test ignoré `the_readme_shows_what_the_binary_prints_for_the_reference_firmware` échoue sur cette seule ligne et imprime celle à recopier dans le README.
+- La ligne `inkemu: reset by the firmware, …` de l'exemple `--max-cycles 50000000` du README (image `hello_world`) porte désormais le temps d'appareil du redémarrage, que seule une exécution de l'image de référence donne : le test ignoré `the_readme_shows_what_the_binary_prints_for_the_reference_firmware` échoue sur cette seule ligne et imprime celle à recopier dans le README. Recopiée de l'exécution 38517622875 de la CI : `…, sp 0x3fc8eb10, at 11245787 us of device time`.
 
 ## Correction : un reset, une entrée du journal
 
