@@ -43,6 +43,12 @@ La seconde revue a trouvé le lockstep encore capable de passer avec un inkemu f
 - **R27 (N7, N8).** Une lecture de `mip` prend le `MEIP` que QEMU montrait. Le reset d'inkemu seul est testé.
 - **R28 (I9).** Une seconde faute dans la CI, dans le modèle du SYSTIMER, mesurée en local : code 1 à l'instruction 2 500 668, ligne la plus proche 15. Le commentaire de la CI sur la première faute ne prétend plus ce qu'elle ne prouve pas.
 - **R29 (L5, L7).** L'aléa de QEMU est semé à la seconde de l'hôte. La comparaison n'en dépend pas par construction, et la longueur de la fenêtre n'en dépend pas d'après trois captures (ligne 17, ADR 0008). Un programme de sommeil profond s'ajoute à l'équivalence de `step` et `run_within`, sous les deux modèles de temps.
+- **Conteneur orphelin sur un Docker lent, corrigé.** Vu le 2026-10-14 : le démon a mis plus de 120 s à créer le conteneur. L'outil a fait son unique `docker rm --force` avant que le conteneur n'existe, puis le démon l'a créé, et il est resté, QEMU bloqué à l'ouverture de son tube. Il a fallu le supprimer à la main. Désormais (`qemu.rs`, `clean_up`) :
+  - le conteneur porte un nom propre au processus et à l'instant ;
+  - l'outil le supprime par ce nom et recommence jusqu'à ce que le client `docker run` soit sorti et que `docker inspect` dise qu'il n'existe pas, 50 fois à 200 ms d'intervalle (10 s) ;
+  - au-delà, l'outil tue le client, fait une dernière suppression, et nomme le conteneur sur la sortie d'erreur avec la commande pour le supprimer, s'il existe encore ou si le démon n'avait pas fini de le créer.
+
+  Tests sans Docker, par un Docker et un client injectés : un conteneur créé tard est supprimé ; un conteneur qui résiste, et un démon qui ne le crée jamais, sont nommés. En vivant, sur le Docker chargé, le cas du démon trop lent a donné le message avec le nom, et aucun conteneur n'est resté.
 - **Corrigé en chemin.** L'origine du SYSTIMER était d'abord écrite `0x600C0020`. Un test contre le SVD l'a ramenée à `PERIP_RST_EN0` = `0x600C0018`, et la fenêtre a été remesurée, sans changement.
 
 ## Usage des lignes dans la fenêtre
@@ -106,7 +112,6 @@ Détaillées dans le plan ; les plus engageantes :
   - CrossPoint, en local et daté ; sa fenêtre s'arrêtera au premier accès à un registre que QEMU n'a pas et qu'aucune ligne ne nomme (une mesure de l'ADC, SPI2, I2C0), ou demandera des lignes mesurées ;
   - la build QEMU `20260417` (interruptions perdues avec `MIE` = 0 corrigées) : rien dans la fenêtre de `hello_world` n'en a eu besoin ;
   - le mécanisme du retard de `MEIP` dans QEMU, à lire dans `target/riscv/cpu_helper.c` si un autre firmware montre un autre retard.
-- **L'outil, sur un Docker lent** : quand le démon met plus de 120 s à créer le conteneur, l'outil sort avec 2 et fait son `docker rm --force` avant que le conteneur n'existe ; le démon le crée ensuite, et il reste, QEMU bloqué à l'ouverture de son tube. Vu le 2026-10-14, conteneur supprimé à la main. À corriger : attendre la fin du `docker run` tué avant le `rm`, ou refaire le `rm` après elle.
 - **Sous-projet 2 / 4** : `Esp32C3::step` (avec sa frontière en attente), `x`, `set_x`, `csr` et `Hart::take_boundary` sont l'API du débogueur et du serveur GDB.
 - **Sous-projet 8** : chaque ligne (ii) est une question pour un appareil (valeur de reset, ce que lit la puce).
 

@@ -109,8 +109,9 @@ impl Drop for PipeDirectory {
 }
 
 /// A running QEMU container and the pipe its trace comes through. Dropping it removes the
-/// container (`docker rm --force`), waits for `docker run` and removes the pipe, whatever ended
-/// the run: an error, a panic, Ctrl-C.
+/// container by its name until Docker says it is gone and `docker run` has exited ([`clean_up`],
+/// which a daemon slow to create the container does not outrun), then the pipe, whatever ended
+/// the run: an error, a panic, Ctrl-C. A container it cannot show gone is named on stderr.
 #[derive(Debug)]
 pub struct Qemu {
     name: String,
@@ -146,12 +147,11 @@ impl Qemu {
         qemu: &str,
         interrupted: Interrupted<'_>,
     ) -> Result<Started, QemuError> {
-        let unique = format!(
-            "inkemu-lockstep-{}-{}",
+        let unique = container_name(
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
+                .map_or(0, |d| d.as_nanos()),
         );
         let path = std::env::temp_dir().join(&unique);
         std::fs::create_dir(&path).map_err(|source| QemuError::Directory {
@@ -284,16 +284,141 @@ fn check(status: ExitStatus) -> Result<(), QemuError> {
     }
 }
 
-impl Drop for Qemu {
-    fn drop(&mut self) {
+/// How many times [`clean_up`] removes the container and looks again before it gives up, and
+/// how long it waits between two tries: 10 s in all.
+const REMOVE_TRIES: u32 = 50;
+const REMOVE_POLL: Duration = Duration::from_millis(200);
+
+/// What [`clean_up`] needs of Docker, behind a trait so that its logic is tested without one.
+trait Docker {
+    /// `docker rm --force <name>`; its outcome is read through [`Docker::exists`].
+    fn remove(&mut self, name: &str);
+    /// Whether the container exists (`docker inspect`): `None` when Docker does not say.
+    fn exists(&mut self, name: &str) -> Option<bool>;
+}
+
+/// The `docker run` client of the container.
+trait Client {
+    /// Whether it has exited.
+    fn exited(&mut self) -> bool;
+    /// Kills it and waits for it.
+    fn kill(&mut self);
+}
+
+/// How [`clean_up`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cleanup {
+    /// The client exited and Docker says the container does not exist.
+    Removed,
+    /// The client did not exit within the bound: Docker was still starting the container, and
+    /// may create it after the client is killed.
+    Unconfirmed,
+    /// The container still exists, or Docker would not say.
+    Left,
+}
+
+/// Removes the container `name` without a race with a slow daemon. A container the daemon
+/// creates late, after a first removal found nothing, is removed by a later try: the removal is
+/// repeated until the client has exited (it does once its container is gone, or never started)
+/// and Docker says the container does not exist, [`REMOVE_TRIES`] times at most, `poll` apart.
+/// Past that the client is killed and one more removal made.
+fn clean_up(
+    docker: &mut impl Docker,
+    client: &mut impl Client,
+    name: &str,
+    poll: Duration,
+) -> Cleanup {
+    for _ in 0..REMOVE_TRIES {
+        docker.remove(name);
+        if client.exited() && docker.exists(name) == Some(false) {
+            return Cleanup::Removed;
+        }
+        std::thread::sleep(poll);
+    }
+    let exited = client.exited();
+    client.kill();
+    docker.remove(name);
+    match docker.exists(name) {
+        Some(false) if exited => Cleanup::Removed,
+        Some(false) => Cleanup::Unconfirmed,
+        _ => Cleanup::Left,
+    }
+}
+
+/// What the user is told when the container could not be shown gone: never nothing.
+fn cleanup_warning(cleanup: Cleanup, name: &str) -> Option<String> {
+    match cleanup {
+        Cleanup::Removed => None,
+        Cleanup::Unconfirmed => Some(format!(
+            "inkemu-lockstep: Docker had not finished starting the container {name}; if it \
+             appears, remove it with `docker rm -f {name}`"
+        )),
+        Cleanup::Left => Some(format!(
+            "inkemu-lockstep: the container {name} could not be removed; remove it with \
+             `docker rm -f {name}`"
+        )),
+    }
+}
+
+/// The Docker of the host.
+struct HostDocker;
+
+impl Docker for HostDocker {
+    fn remove(&mut self, name: &str) {
         let _ = Command::new("docker")
-            .args(["rm", "--force", &self.name])
+            .args(["rm", "--force", name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
+
+    fn exists(&mut self, name: &str) -> Option<bool> {
+        let output = Command::new("docker")
+            .args([
+                "inspect",
+                "--type",
+                "container",
+                "--format",
+                "{{.Id}}",
+                name,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        if output.status.success() {
+            return Some(true);
+        }
+        String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("no such")
+            .then_some(false)
+    }
+}
+
+impl Client for Child {
+    fn exited(&mut self) -> bool {
+        matches!(self.try_wait(), Ok(Some(_)))
+    }
+
+    fn kill(&mut self) {
+        let _ = Child::kill(self);
+        let _ = self.wait();
+    }
+}
+
+impl Drop for Qemu {
+    fn drop(&mut self) {
+        let cleanup = clean_up(&mut HostDocker, &mut self.child, &self.name, REMOVE_POLL);
+        if let Some(warning) = cleanup_warning(cleanup, &self.name) {
+            eprintln!("{warning}");
+        }
+    }
+}
+
+/// The name of a run's container, and of its pipe's directory: the process and the instant make
+/// it unique, so that a removal by name never reaches another run's container.
+fn container_name(pid: u32, nanos: u128) -> String {
+    format!("inkemu-lockstep-{pid}-{nanos}")
 }
 
 /// `--mount` for `source` at `target`: a comma would split the option and a path that is not
@@ -355,6 +480,153 @@ mod tests {
             DEFAULT_QEMU.contains(&format!("/{}/", value("QEMU_ESP_BUILD"))),
             "{DEFAULT_QEMU}"
         );
+    }
+
+    /// A Docker whose daemon creates the container on the `appears`-th call (never when `None`),
+    /// and removes it only when `removable`.
+    struct FakeDocker {
+        appears: Option<u32>,
+        removable: bool,
+        looks: u32,
+        exists: bool,
+        removed: bool,
+        removals: u32,
+    }
+
+    impl FakeDocker {
+        fn new(appears: Option<u32>, removable: bool) -> FakeDocker {
+            FakeDocker {
+                appears,
+                removable,
+                looks: 0,
+                exists: false,
+                removed: false,
+                removals: 0,
+            }
+        }
+
+        fn tick(&mut self) {
+            self.looks += 1;
+            if self.appears == Some(self.looks) {
+                self.exists = true;
+            }
+        }
+    }
+
+    impl Docker for FakeDocker {
+        fn remove(&mut self, name: &str) {
+            assert!(name.starts_with("inkemu-lockstep-"), "{name}");
+            self.tick();
+            self.removals += 1;
+            if self.exists && self.removable {
+                self.exists = false;
+                self.removed = true;
+            }
+        }
+
+        fn exists(&mut self, _name: &str) -> Option<bool> {
+            self.tick();
+            Some(self.exists)
+        }
+    }
+
+    /// A `docker run` client that exits once its container has been removed (`gone`), or never
+    /// when `stuck`.
+    struct FakeClient<'a> {
+        gone: &'a std::cell::Cell<bool>,
+        stuck: bool,
+        killed: bool,
+    }
+
+    impl Client for FakeClient<'_> {
+        fn exited(&mut self) -> bool {
+            self.killed || (!self.stuck && self.gone.get())
+        }
+
+        fn kill(&mut self) {
+            self.killed = true;
+        }
+    }
+
+    /// The fake Docker, telling the fake client when its container is gone.
+    struct Linked<'a, 'b> {
+        docker: &'a mut FakeDocker,
+        done: &'b std::cell::Cell<bool>,
+    }
+
+    impl Docker for Linked<'_, '_> {
+        fn remove(&mut self, name: &str) {
+            self.docker.remove(name);
+            self.done.set(self.docker.removed);
+        }
+
+        fn exists(&mut self, name: &str) -> Option<bool> {
+            self.docker.exists(name)
+        }
+    }
+
+    /// Runs [`clean_up`] on `docker` and a client linked to it; whether the client was killed.
+    fn run(docker: &mut FakeDocker, stuck: bool) -> (Cleanup, bool) {
+        let done = std::cell::Cell::new(false);
+        let mut client = FakeClient {
+            gone: &done,
+            stuck,
+            killed: false,
+        };
+        let mut linked = Linked {
+            docker,
+            done: &done,
+        };
+        let cleanup = clean_up(
+            &mut linked,
+            &mut client,
+            &container_name(42, 7),
+            Duration::ZERO,
+        );
+        (cleanup, client.killed)
+    }
+
+    #[test]
+    fn a_container_name_is_unique_to_the_process_and_the_instant() {
+        assert_eq!(container_name(42, 7), "inkemu-lockstep-42-7");
+        assert_ne!(container_name(42, 7), container_name(42, 8));
+        assert_ne!(container_name(42, 7), container_name(43, 7));
+    }
+
+    #[test]
+    fn a_container_the_daemon_creates_late_is_still_removed() {
+        // The first removal finds nothing; the daemon creates the container afterwards, while
+        // the client still waits for it, and a later try removes it.
+        let mut docker = FakeDocker::new(Some(9), true);
+        let (cleanup, killed) = run(&mut docker, false);
+        assert_eq!(cleanup, Cleanup::Removed);
+        assert!(docker.removed && !docker.exists && !killed);
+        assert!(docker.removals > 1, "removed after it appeared");
+        assert_eq!(cleanup_warning(cleanup, "inkemu-lockstep-42-7"), None);
+    }
+
+    #[test]
+    fn a_container_that_will_not_go_or_a_daemon_that_never_starts_it_is_named_on_stderr() {
+        let name = container_name(42, 7);
+        // The container exists and every removal fails.
+        let mut docker = FakeDocker::new(Some(1), false);
+        let (cleanup, killed) = run(&mut docker, false);
+        assert_eq!(cleanup, Cleanup::Left);
+        assert!(killed, "the client is killed past the bound");
+        assert_eq!(docker.removals, REMOVE_TRIES + 1);
+        let warning = cleanup_warning(cleanup, &name).unwrap();
+        assert!(
+            warning.contains(&format!("docker rm -f {name}")),
+            "{warning}"
+        );
+        // The daemon never creates the container and the client waits for it forever: the
+        // client is killed, and the name is given in case the daemon creates it later.
+        let mut docker = FakeDocker::new(None, true);
+        let (cleanup, killed) = run(&mut docker, true);
+        assert_eq!(cleanup, Cleanup::Unconfirmed);
+        assert!(killed);
+        let warning = cleanup_warning(cleanup, &name).unwrap();
+        assert!(warning.contains(&name), "{warning}");
     }
 
     #[test]
