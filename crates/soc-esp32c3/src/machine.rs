@@ -520,7 +520,8 @@ impl Esp32C3 {
     /// timer does not fire. Their wake-ups that fall due meanwhile stay in the scheduler and are
     /// delivered after the core reset of the wake, to devices that reset rebuilt, which find
     /// nothing to do (the contract of [`Event`]). A reset `RTC_CNTL` asks for (the wake, or its
-    /// watchdog when it is left running in sleep) ends the sleep; anything else it raises (an
+    /// watchdog when it is left running in sleep) ends the sleep and rebuilds the digital domain,
+    /// whatever its level (`Peripherals::reset`); anything else it raises (an
     /// interrupt) waits, with the CPU, for a reset.
     fn sleep_deeply(&mut self, deadline: Option<Cycles>) -> Sleep {
         let now = self.bus.ctx.now();
@@ -1969,6 +1970,56 @@ mod tests {
             )),
             "no watchdog reset"
         );
+    }
+
+    #[test]
+    fn a_cpu_reset_that_ends_a_deep_sleep_rebuilds_the_digital_domain() {
+        // Life 1 writes UART0's `CLKDIV`, leaves the RTC watchdog running in sleep with stage 0
+        // set to reset the CPU (action 2, 1 s), and sleeps with no wake source; life 2 hangs.
+        let clkdiv = svd_regs::esp32c3::addr("UART0", "CLKDIV");
+        let clkdiv_reset = svd_regs::esp32c3::lookup(clkdiv).unwrap().reset_value;
+        assert_ne!(clkdiv_reset, 0x123);
+        let store0 = rtc_cntl("STORE0");
+        let mut life_1 = store_register(store0, 1).to_vec();
+        life_1.extend(store_register(clkdiv, 0x123));
+        life_1.extend(store_register(rtc_cntl("WDTCONFIG1"), 68_000));
+        life_1.extend(store_register(rtc_cntl("WDTCONFIG0"), 1 << 31 | 2 << 28));
+        life_1.extend(store_register(rtc_cntl("WAKEUP_STATE"), 0));
+        life_1.extend(store_register(rtc_cntl("DIG_PWC"), 1 << 31));
+        life_1.extend(store_register(rtc_cntl("STATE0"), 1 << 31));
+        let mut program = stop_watchdogs();
+        program.extend(load_register(store0));
+        program.push(bne(T1, 0, i32::try_from(4 * (life_1.len() + 1)).unwrap()));
+        program.extend(life_1);
+        program.push(HANG);
+        let mut m = machine(&program);
+        assert_eq!(
+            m.run_within(Cycles(u64::MAX), Some(1_500_000_000)),
+            StopReason::TimeBudget
+        );
+        assert_eq!(m.resets(), 1);
+        assert_eq!(m.deep_sleep(), None, "the reset ended the sleep");
+        assert!(
+            m.drain_diagnostics().iter().any(|d| matches!(
+                d,
+                Diagnostic::Reset {
+                    cause: ResetCause::RtcWatchdogCpu,
+                    ..
+                }
+            )),
+            "a CPU reset"
+        );
+        assert_eq!(
+            bus_word(&mut m, rtc_cntl("RESET_STATE")) & 0x3F,
+            ResetCause::RtcWatchdogCpu.code(),
+            "the cause keeps its code"
+        );
+        assert_eq!(
+            bus_word(&mut m, clkdiv),
+            clkdiv_reset,
+            "the UART had no power: it starts from its reset value"
+        );
+        assert_eq!(bus_word(&mut m, store0), 1, "the RTC domain is kept");
     }
 
     #[test]
