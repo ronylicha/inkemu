@@ -8,6 +8,7 @@ mod qemu;
 use clap::{Parser, ValueEnum};
 use lockstep::{End, Lockstep, Target, TraceEvent, TraceReader, WindowEnd};
 use soc_esp32c3::{Esp32C3, RomImage};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -53,7 +54,10 @@ enum EndKind {
     Reset,
     /// An access to a register QEMU does not have that no row names.
     Absent,
+    /// `--max-instructions`.
     Limit,
+    /// The window's own bound.
+    Bound,
 }
 
 impl EndKind {
@@ -63,9 +67,18 @@ impl EndKind {
             WindowEnd::Reset => Some(EndKind::Reset),
             WindowEnd::Absent { .. } => Some(EndKind::Absent),
             WindowEnd::Limit => Some(EndKind::Limit),
+            WindowEnd::Bound => Some(EndKind::Bound),
             WindowEnd::TraceEnd => None,
         }
     }
+}
+
+/// The window `--window` names.
+fn window_name(name: &str) -> Result<&'static lockstep::Window, String> {
+    lockstep::window(name).ok_or_else(|| {
+        let names: Vec<&str> = lockstep::WINDOWS.iter().map(|window| window.name).collect();
+        format!("no window {name}; the windows are {}", names.join(", "))
+    })
 }
 
 #[derive(Debug, Parser)]
@@ -76,8 +89,16 @@ impl EndKind {
 )]
 struct Cli {
     /// The flash image, a whole flash of the profile's size (16 MiB for the X4).
+    #[arg(
+        long,
+        required_unless_present = "firmware",
+        conflicts_with = "firmware"
+    )]
+    flash: Option<PathBuf>,
+    /// An application image instead: the flash both sides boot is composed as `inkemu run
+    /// --firmware` composes it, behind the bootloader inkemu ships for the device.
     #[arg(long)]
-    flash: PathBuf,
+    firmware: Option<PathBuf>,
     /// The directory of the mask ROMs (`inkemu rom fetch --rom-dir <dir>`).
     #[arg(long)]
     rom_dir: PathBuf,
@@ -97,6 +118,11 @@ struct Cli {
     /// table such a partial window leaves unused are listed, not failed on.
     #[arg(long)]
     max_instructions: Option<u64>,
+    /// The window: which rows of docs/lockstep-differences.md hold, how many resets of both
+    /// sides the comparison goes on through, and its bound (`hello`, the first one, compares
+    /// `flash_hello.bin`).
+    #[arg(long, value_parser = window_name)]
+    window: &'static lockstep::Window,
     /// Fail (exit 3) unless exactly this many instructions are compared.
     #[arg(long)]
     expect_compared: Option<u64>,
@@ -141,6 +167,10 @@ enum Error {
     Profile(#[from] boards::ProfileError),
     #[error("the flash image {path} does not fit the profile's flash: {detail}")]
     Flash { path: PathBuf, detail: String },
+    #[error("no flash can be composed from {path}: {detail}")]
+    Compose { path: PathBuf, detail: String },
+    #[error("give the flash with --flash or an application with --firmware")]
+    NoFlash,
     #[cfg(unix)]
     #[error(transparent)]
     Qemu(#[from] qemu::QemuError),
@@ -162,9 +192,19 @@ enum Error {
     TraceEnded(u64),
     #[error("{path}: `{line}` is not a line `row N: uses`")]
     Usage { path: PathBuf, line: String },
+    #[error(
+        "{path}: `{line}` names row {row}, which is not a row of the window {window}: the file \
+         pins another window, or a row the window lost"
+    )]
+    UsageRow {
+        path: PathBuf,
+        line: String,
+        row: u16,
+        window: &'static str,
+    },
 }
 
-fn machine(cli: &Cli) -> Result<Esp32C3, Error> {
+fn machine(cli: &Cli) -> Result<(Esp32C3, Flash), Error> {
     let rom_path = cli.rom_dir.join(ROM_FILE);
     let rom = std::fs::read(&rom_path).map_err(|source| Error::Read {
         path: rom_path.clone(),
@@ -177,30 +217,69 @@ fn machine(cli: &Cli) -> Result<Esp32C3, Error> {
             cli.rom_dir.display()
         ))
     })?;
-    let image = std::fs::read(&cli.flash).map_err(|source| Error::Read {
-        path: cli.flash.clone(),
-        source,
-    })?;
     let profile = boards::builtin(&cli.device)?;
     let config = lockstep::table::configure(
         profile.soc_config(boards::MachineOptions::default()),
-        lockstep::DIFFERENCES,
+        cli.window.rows,
     );
+    let flash = flash(cli, &profile)?;
     // QEMU takes a flash of exactly 2, 4, 8 or 16 MiB and refuses any other; inkemu pads a short
     // image. Both must see the same flash: the image is the whole flash of the profile.
     let size = config.flash.size();
-    if u32::try_from(image.len()).ok() != Some(size) {
+    if u32::try_from(flash.bytes.len()).ok() != Some(size) {
         return Err(Error::Flash {
-            path: cli.flash.clone(),
+            path: flash.path.clone(),
             detail: format!(
                 "it holds {} bytes where the profile's flash holds {size}",
-                image.len()
+                flash.bytes.len()
             ),
         });
     }
-    Esp32C3::with_flash(rom, image, &config).map_err(|e| Error::Flash {
-        path: cli.flash.clone(),
-        detail: e.to_string(),
+    let machine =
+        Esp32C3::with_flash(rom, flash.bytes.clone(), &config).map_err(|e| Error::Flash {
+            path: flash.path.clone(),
+            detail: e.to_string(),
+        })?;
+    Ok((machine, flash))
+}
+
+/// The flash both sides boot: the image of `--flash`, or the one composed from `--firmware`.
+#[derive(Debug)]
+struct Flash {
+    /// The file it was read or composed from.
+    path: PathBuf,
+    bytes: Vec<u8>,
+    /// Whether the tool composed it, so that QEMU is given the composed bytes, not the file.
+    composed: bool,
+}
+
+/// Reads `--flash`, or composes the flash of `--firmware` as `inkemu run --firmware` does.
+fn flash(cli: &Cli, profile: &boards::DeviceProfile) -> Result<Flash, Error> {
+    let (path, composed) = match (&cli.flash, &cli.firmware) {
+        (Some(path), _) => (path, false),
+        (None, Some(path)) => (path, true),
+        // clap requires one of the two.
+        (None, None) => return Err(Error::NoFlash),
+    };
+    let bytes = std::fs::read(path).map_err(|source| Error::Read {
+        path: path.clone(),
+        source,
+    })?;
+    let bytes = if composed {
+        profile
+            .compose_flash(&bytes, None)
+            .map_err(|e| Error::Compose {
+                path: path.clone(),
+                detail: e.to_string(),
+            })?
+            .bytes
+    } else {
+        bytes
+    };
+    Ok(Flash {
+        path: path.clone(),
+        bytes,
+        composed,
     })
 }
 
@@ -288,6 +367,7 @@ fn compare(
 /// Reads QEMU's trace from where `cli` says and compares it.
 fn comparison(
     cli: &Cli,
+    flash: &Flash,
     machine: &mut Esp32C3,
     lockstep: &mut Lockstep,
     options: &Options<'_>,
@@ -310,28 +390,39 @@ fn comparison(
             let outcome = compare(&mut reader, machine, lockstep, options)?;
             Ok((outcome, reader.skipped_lines()))
         }
-        None => run_qemu(cli, machine, lockstep, options),
+        None => run_qemu(cli, flash, machine, lockstep, options),
     }
 }
 
 #[cfg(unix)]
 fn run_qemu(
     cli: &Cli,
+    flash: &Flash,
     machine: &mut Esp32C3,
     lockstep: &mut Lockstep,
     options: &Options<'_>,
 ) -> Result<(Outcome, u64), Error> {
-    let flash = std::fs::canonicalize(&cli.flash).map_err(|source| Error::Read {
-        path: cli.flash.clone(),
+    let file = std::fs::canonicalize(&flash.path).map_err(|source| Error::Read {
+        path: flash.path.clone(),
         source,
     })?;
     eprintln!(
-        "inkemu-lockstep: starting QEMU in {} on {}",
+        "inkemu-lockstep: starting QEMU in {} on {}{}",
         cli.image,
-        flash.display()
+        if flash.composed {
+            "the flash composed from "
+        } else {
+            ""
+        },
+        file.display()
     );
+    let given = if flash.composed {
+        qemu::Flash::Composed(&flash.bytes)
+    } else {
+        qemu::Flash::File(&file)
+    };
     let (mut qemu, pipe) =
-        match qemu::Qemu::start(&flash, &cli.image, &cli.qemu, options.interrupted)? {
+        match qemu::Qemu::start(given, &cli.image, &cli.qemu, options.interrupted)? {
             qemu::Started::Running(qemu, pipe) => (qemu, pipe),
             qemu::Started::Interrupted => return Ok((Outcome::Interrupted, 0)),
         };
@@ -349,6 +440,7 @@ fn run_qemu(
 #[cfg(not(unix))]
 fn run_qemu(
     _cli: &Cli,
+    _flash: &Flash,
     _machine: &mut Esp32C3,
     _lockstep: &mut Lockstep,
     _options: &Options<'_>,
@@ -356,15 +448,18 @@ fn run_qemu(
     Err(Error::NotUnix)
 }
 
-/// Whether every row was used exactly as often as `path` says, one line `row N: X uses` each
-/// (as the run prints them; `#` starts a comment), the rows it does not name never. Prints every
-/// row that differs.
-fn usage_as_expected(path: &std::path::Path, usage: &lockstep::Usage) -> Result<bool, Error> {
+/// The uses `path` pins, one line `row N: X uses` each (as the run prints them; `#` starts a
+/// comment), read before the comparison runs: a line that is not one, or that names a row the
+/// window does not have, is an error.
+fn expected_usage(
+    path: &std::path::Path,
+    window: &lockstep::Window,
+) -> Result<BTreeMap<u16, u64>, Error> {
     let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
         path: path.to_owned(),
         source,
     })?;
-    let mut expected = std::collections::BTreeMap::new();
+    let mut expected = BTreeMap::new();
     for line in text
         .lines()
         .map(str::trim)
@@ -383,33 +478,60 @@ fn usage_as_expected(path: &std::path::Path, usage: &lockstep::Usage) -> Result<
                 line: line.to_owned(),
             });
         };
+        if !window.rows.iter().any(|r| r.number == row) {
+            return Err(Error::UsageRow {
+                path: path.to_owned(),
+                line: line.to_owned(),
+                row,
+                window: window.name,
+            });
+        }
         expected.insert(row, uses);
     }
+    Ok(expected)
+}
+
+/// Whether every row of `window` was used exactly as often as `expected` says, the rows it does
+/// not name never. Prints every row that differs.
+fn usage_as_expected(
+    expected: &BTreeMap<u16, u64>,
+    window: &lockstep::Window,
+    usage: &lockstep::Usage,
+) -> bool {
     let mut as_expected = true;
-    for row in lockstep::DIFFERENCES.iter().map(|row| row.number) {
+    for row in window.rows.iter().map(|row| row.number) {
         let (want, got) = (expected.get(&row).copied().unwrap_or(0), usage.uses(row));
         if want != got {
             eprintln!("inkemu-lockstep: row {row} was used {got} times where {want} were expected");
             as_expected = false;
         }
     }
-    Ok(as_expected)
+    as_expected
 }
 
 fn run(cli: &Cli, interrupted: &AtomicBool) -> Result<u8, Error> {
-    let mut machine = machine(cli)?;
-    let mut lockstep = Lockstep::new(&machine, cli.max_instructions);
+    let expected = cli
+        .expect_usage
+        .as_deref()
+        .map(|path| expected_usage(path, cli.window))
+        .transpose()?;
+    let (mut machine, flash) = machine(cli)?;
+    let mut lockstep = Lockstep::for_window(&machine, cli.window, cli.max_instructions);
     let options = Options {
         interrupted,
         perturb_after: cli.perturb_after,
         perturb_systimer_after: cli.perturb_systimer_after,
     };
-    let (outcome, skipped) = comparison(cli, &mut machine, &mut lockstep, &options)?;
+    let (outcome, skipped) = comparison(cli, &flash, &mut machine, &mut lockstep, &options)?;
     let counts = lockstep.counts();
     let usage = lockstep.usage(&machine);
     let summary = format!(
-        "instructions compared: {}\nduplicate blocks dropped: {}\nblocks preempted by an interrupt: {}\ninterrupts taken: {}\ntrace lines skipped: {skipped}\nuse of the rows of docs/lockstep-differences.md:\n{usage}",
-        counts.compared, counts.duplicates, counts.preempted, counts.interrupts,
+        "instructions compared: {}\nduplicate blocks dropped: {}\nblocks preempted by an interrupt: {}\ninterrupts taken: {}\nresets crossed: {}\ntrace lines skipped: {skipped}\nuse of the rows of docs/lockstep-differences.md:\n{usage}",
+        counts.compared,
+        counts.duplicates,
+        counts.preempted,
+        counts.interrupts,
+        counts.resets_crossed,
     );
     let end = match outcome {
         Outcome::Ended(end) => end,
@@ -445,8 +567,8 @@ fn run(cli: &Cli, interrupted: &AtomicBool) -> Result<u8, Error> {
                 );
                 code = EXIT_EXPECTATION;
             }
-            if let Some(path) = &cli.expect_usage
-                && !usage_as_expected(path, &usage)?
+            if let Some(expected) = &expected
+                && !usage_as_expected(expected, cli.window, &usage)
                 && code == 0
             {
                 code = EXIT_EXPECTATION;

@@ -279,22 +279,31 @@ inkemu replay run.inkrec
 ```sh
 tools/reference-firmware/build.sh                       # builds target/reference-firmware/flash_hello.bin
 inkemu rom fetch --all --rom-dir rom
-cargo run --release -p inkemu-lockstep -- \
+cargo run --release -p inkemu-lockstep -- --window hello \
     --flash target/reference-firmware/flash_hello.bin --rom-dir rom \
-    --expect-compared 3402169 --expect-end reset \
+    --expect-compared 6813949 --expect-end reset \
     --expect-usage tools/ci/lockstep-hello.usage
 ```
 
+- `--window` names what is compared and under which rows: `hello` (`flash_hello.bin`), `nvs` (`flash_nvs.bin`) and `nvs-ota` (`flash_nvs_ota.bin`) go through the reset `esp_restart` asks for and end at the next one. The windows, their rows and their pinned counts are listed in [docs/lockstep-differences.md](docs/lockstep-differences.md). `--firmware FILE` gives an application image instead of `--flash`: the flash both sides boot is composed as `inkemu run --firmware` composes it, behind the bootloader inkemu ships.
+- The window `crosspoint` compares CrossPoint 1.6.5 (`crosspoint-1.6.5-x3-x4.bin`), which cannot be distributed: only in local, never in the CI, by an ignored test that refuses any file but the pinned one. Measured on 2026-10-14: 31 088 420 instructions compared, the ROM, the bootloader and the start of the application, up to its read of the temperature sensor, which QEMU does not have.
+
+  ```sh
+  export INKEMU_ROM_ELF_DIR=/path/to/rom
+  export INKEMU_CROSSPOINT_X3_X4=/path/to/crosspoint-1.6.5-x3-x4.bin
+  cargo test --release -p inkemu-lockstep --test crosspoint -- --ignored
+  ```
 - inkemu runs under the timing model `qemu-icount`: 8 ns per instruction, no interrupt latency, so that the timers of both sides fire on the same instruction. Every difference the comparison admits is a numbered row of [docs/lockstep-differences.md](docs/lockstep-differences.md), with its source and its exact parameters. A row is one of:
   - a CSR whose bits hold a known pair of values;
-  - register bits copied from QEMU under a mask, every other bit compared;
+  - a register or a CSR QEMU keeps through its reset where the chip's CPU reset clears it, held until written;
+  - register bits copied from QEMU under a mask, every other bit compared, some only after a reset;
   - a counter both sides read from their own models, whose gap may move only as the row's sourced bound says;
   - QEMU's missing RTC timer, held to the slow clock at device time;
   - a behaviour of QEMU the machine takes on for the lockstep only.
 
   Anything else is a divergence.
 - Every run prints what each row did: registers, bits taken from QEMU, the largest move of each counter, what a setting changed. The run fails if a row, a register of a row or a bit of its mask was never used, or if a row was used outside what it declares; a window cut by `--max-instructions` only lists what it left unused. `--expect-usage FILE` pins how often each row was used.
-- The window ends at a reset of both sides, at an access to a register no QEMU peripheral covers (SPI2, I2C0, a measurement of the SAR ADC, the radio…) unless a row names that register, or at `--max-instructions`. A reset of one side only is a divergence, and a trace that ends before the window does is an error. `--trace FILE` (or `-` for standard input) reads a captured `-d cpu,nochain,int` trace instead of running QEMU.
+- The window goes on through the resets of both sides it declares, with nothing of the machine touched: the chip, as inkemu, resets only its CPU at `esp_restart`, where QEMU resets its whole machine. It ends at the next one, at its own bound if it has one, at an access to a register no QEMU peripheral covers (SPI2, I2C0, a measurement of the SAR ADC, the radio…) unless a row names that register, or at `--max-instructions`. A reset of one side only is a divergence, and a trace that ends before the window does is an error. `--trace FILE` (or `-` for standard input) reads a captured `-d cpu,nochain,int` trace instead of running QEMU.
 - A divergence prints the instruction, the state before it and both states after it with the differences marked, the 64 instructions before it with every value taken from QEMU on the way, and the row that comes nearest to applying.
 - **Exit codes**:
   - `0`: the window ended without a divergence, every row used at every register and bit it declares and within them, as the `--expect-*` options said;
@@ -304,7 +313,7 @@ cargo run --release -p inkemu-lockstep -- \
   - `4`: inkemu stopped on its own;
   - `5`: a row, a register or a bit was never used, or a row was used outside what it declares;
   - `130`: Ctrl-C (the container is removed whatever ends the run).
-- The CI runs the command above in the `reference-boot` job, then twice more, each time with a fault put in inkemu on purpose, which must diverge: once in a register of the CPU, once in a read of the SYSTIMER's model. See [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md) (French).
+- The CI runs the command above and the windows `nvs` and `nvs-ota` in the `reference-boot` job, then four more times, each time with a fault put in inkemu on purpose, which must diverge: in a register of the CPU, and in a read of the SYSTIMER's model, each before the reset and after it. See [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md) (French).
 
 ## Why
 
@@ -332,7 +341,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 
 ## Roadmap
 
-1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3a, interrupts, timers, watchdogs and reset, done; 1b-3b, flash writes and the device's flash file, done; 1b-3c, a firmware given on its own (`--firmware`), done; 1b-3d, the serial consoles in both directions, done; 1b-3e, two real firmwares of the X4 start, done; 1b-3f, deep sleep and the wake by the RTC timer, done; 1b-4a, the documentation without a warning, done; 1b-4b, recording and replaying a run, done; 1b-4c, the lockstep against QEMU over the first life of the reference image, done; the lockstep through a reset and on CrossPoint is next.*
+1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3a, interrupts, timers, watchdogs and reset, done; 1b-3b, flash writes and the device's flash file, done; 1b-3c, a firmware given on its own (`--firmware`), done; 1b-3d, the serial consoles in both directions, done; 1b-3e, two real firmwares of the X4 start, done; 1b-3f, deep sleep and the wake by the RTC timer, done; 1b-4a, the documentation without a warning, done; 1b-4b, recording and replaying a run, done; 1b-4c, the lockstep against QEMU over the first life of the reference image, done; 1b-4d, the lockstep through a reset, on two more reference firmwares, and on CrossPoint in local, done; CoreMark is next.*
 2. X4 peripherals, desktop UI, e-ink rendering: **first visual milestone**
 3. X3 support (UC8253 panel, I2C sensors)
 4. Debugging, resource monitor, headless test runner
@@ -424,16 +433,19 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
 
 `inkemu-lockstep` est un outil de développement de l'espace de travail, absent de l'`inkemu` distribué (voir la commande de la partie anglaise). Il exécute une image flash dans le QEMU d'Espressif et dans inkemu et compare, après chaque instruction, le PC, `x1`–`x31` et les huit CSR machine que les deux ont (`mstatus`, `mie`, `mip`, `mtvec`, `mepc`, `mcause`, `mtval`, `mscratch`). QEMU ne tourne que dans l'image épinglée `espressif/idf:v5.5.2` (`tools/conformance/versions.env`), jamais sur l'hôte : il faut Docker et l'image déjà téléchargée (l'outil ne la télécharge pas), l'image flash, une flash entière de la taille du profil, est montée en lecture seule, et lancer QEMU demande un hôte Unix (`--trace` fonctionne partout).
 
+- `--window` dit ce qui est comparé et sous quelles lignes : `hello` (`flash_hello.bin`), `nvs` (`flash_nvs.bin`) et `nvs-ota` (`flash_nvs_ota.bin`) traversent le reset que demande `esp_restart` et finissent au suivant. Les fenêtres, leurs lignes et leurs comptes épinglés sont dans [docs/lockstep-differences.md](docs/lockstep-differences.md). `--firmware FICHIER` donne une image d'application au lieu de `--flash` : la flash que les deux côtés démarrent est composée comme `inkemu run --firmware` la compose, derrière le bootloader livré.
+- La fenêtre `crosspoint` compare CrossPoint 1.6.5 (`crosspoint-1.6.5-x3-x4.bin`), qui ne peut pas être distribué : en local seulement, jamais dans la CI, par un test ignoré qui refuse tout autre fichier que celui épinglé (voir la commande de la partie anglaise). Mesure du 2026-10-14 : 31 088 420 instructions comparées, la ROM, le bootloader et le début de l'application, jusqu'à sa lecture du capteur de température, que QEMU n'a pas.
 - inkemu tourne sous le modèle de temps `qemu-icount` : 8 ns par instruction, aucune latence d'interruption, pour que les timers des deux côtés se déclenchent à la même instruction. Chaque différence admise est une ligne numérotée de [docs/lockstep-differences.md](docs/lockstep-differences.md), avec sa source et ses paramètres exacts. Une ligne est l'une de ces formes :
   - un CSR dont des bits valent une paire de valeurs connue ;
-  - des bits de registre copiés de QEMU sous un masque, les autres bits comparés ;
+  - un registre ou un CSR que QEMU garde à son reset là où le reset du CPU de la puce le remet à zéro, tenu jusqu'à son écriture ;
+  - des bits de registre copiés de QEMU sous un masque, les autres bits comparés, certains après un reset seulement ;
   - un compteur que chaque côté lit dans son propre modèle, dont l'écart ne bouge que comme la borne sourcée de la ligne le dit ;
   - le temporisateur RTC absent de QEMU, tenu à l'horloge lente au temps de l'appareil ;
   - un comportement de QEMU que la machine adopte pour le lockstep seulement.
 
   Tout le reste est une divergence.
 - Chaque exécution imprime ce que chaque ligne a fait : registres, bits pris à QEMU, plus grand mouvement de chaque compteur, ce qu'un réglage a changé. L'exécution échoue si une ligne, un registre d'une ligne ou un bit de son masque n'a jamais servi, ou si une ligne a servi hors de ce qu'elle déclare. Une fenêtre coupée par `--max-instructions` liste seulement ce qu'elle a laissé inutilisé. `--expect-usage FICHIER` épingle le nombre d'usages de chaque ligne.
-- La fenêtre s'arrête au reset des deux côtés, au premier accès à un registre qu'aucun périphérique de QEMU ne couvre (SPI2, I2C0, une mesure de l'ADC SAR, la radio…) sauf si une ligne nomme ce registre, ou à `--max-instructions`. Un reset d'un seul côté est une divergence, et une trace qui finit avant la fenêtre est une erreur. `--trace FICHIER` (ou `-`) lit une trace `-d cpu,nochain,int` capturée au lieu de lancer QEMU.
+- La fenêtre traverse les resets des deux côtés qu'elle déclare, sans rien toucher de la machine : la puce, comme inkemu, ne réinitialise que son CPU à `esp_restart`, là où QEMU réinitialise toute sa machine. Elle s'arrête au suivant, à sa propre borne si elle en a une, au premier accès à un registre qu'aucun périphérique de QEMU ne couvre (SPI2, I2C0, une mesure de l'ADC SAR, la radio…) sauf si une ligne nomme ce registre, ou à `--max-instructions`. Un reset d'un seul côté est une divergence, et une trace qui finit avant la fenêtre est une erreur. `--trace FICHIER` (ou `-`) lit une trace `-d cpu,nochain,int` capturée au lieu de lancer QEMU.
 - Une divergence affiche l'instruction, l'état d'avant et les deux états d'après avec les différences marquées, les 64 instructions précédentes avec chaque valeur prise à QEMU en chemin, et la ligne du tableau la plus proche.
 - **Codes de sortie** :
   - `0` : fenêtre terminée sans divergence, chaque ligne utilisée à chaque registre et chaque bit qu'elle déclare, et dans ces limites, comme les options `--expect-*` l'annonçaient ;
@@ -443,7 +455,7 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
   - `4` : inkemu s'est arrêté de lui-même ;
   - `5` : une ligne, un registre ou un bit jamais utilisé, ou une ligne utilisée hors de ce qu'elle déclare ;
   - `130` : Ctrl-C (le conteneur est supprimé quoi qu'il arrive).
-- La CI l'exécute dans le job `reference-boot`, puis deux fois encore, chacune avec une faute mise exprès dans inkemu, qui doit diverger : une fois dans un registre du CPU, une fois dans une lecture du modèle du SYSTIMER. Voir l'[ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md).
+- La CI l'exécute, avec les fenêtres `nvs` et `nvs-ota`, dans le job `reference-boot`, puis quatre fois encore, chacune avec une faute mise exprès dans inkemu, qui doit diverger : dans un registre du CPU, et dans une lecture du modèle du SYSTIMER, chacune avant le reset et après. Voir l'[ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md).
 
 ### Pourquoi
 
@@ -459,7 +471,7 @@ Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtens
 
 ### Feuille de route
 
-1. Cœur RV32IMC, ESP32-C3 minimal, chargeur de firmware, CLI : démarrer un firmware jusqu'à ses journaux de console. *1a fait ; 1b-1, squelette du SoC et démarrage de la ROM, fait ; 1b-2, flash et bootloader, fait ; 1b-3a, interruptions, timers, watchdogs et reset, fait ; 1b-3b, écritures en flash et fichier de flash de l'appareil, fait ; 1b-3c, firmware fourni seul (`--firmware`), fait ; 1b-3d, consoles série dans les deux sens, fait ; 1b-3e, démarrage de deux firmwares réels du X4, fait ; 1b-3f, sommeil profond et réveil par le timer RTC, fait ; 1b-4a, documentation sans avertissement, fait ; 1b-4b, enregistrement et rejeu d'une exécution, fait ; 1b-4c, lockstep avec QEMU sur la première vie de l'image de référence, fait ; le lockstep à travers un reset et sur CrossPoint est le suivant.*
+1. Cœur RV32IMC, ESP32-C3 minimal, chargeur de firmware, CLI : démarrer un firmware jusqu'à ses journaux de console. *1a fait ; 1b-1, squelette du SoC et démarrage de la ROM, fait ; 1b-2, flash et bootloader, fait ; 1b-3a, interruptions, timers, watchdogs et reset, fait ; 1b-3b, écritures en flash et fichier de flash de l'appareil, fait ; 1b-3c, firmware fourni seul (`--firmware`), fait ; 1b-3d, consoles série dans les deux sens, fait ; 1b-3e, démarrage de deux firmwares réels du X4, fait ; 1b-3f, sommeil profond et réveil par le timer RTC, fait ; 1b-4a, documentation sans avertissement, fait ; 1b-4b, enregistrement et rejeu d'une exécution, fait ; 1b-4c, lockstep avec QEMU sur la première vie de l'image de référence, fait ; 1b-4d, lockstep à travers un reset, sur deux autres firmwares de référence et sur CrossPoint en local, fait ; CoreMark est le suivant.*
 2. Périphériques du X4, interface de bureau, rendu e-ink : **premier jalon visuel**
 3. Prise en charge du X3 (dalle UC8253, capteurs I2C)
 4. Débogage, moniteur de ressources, exécution de tests sans écran

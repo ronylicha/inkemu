@@ -25,3 +25,7 @@ thiserror.workspace = true
 # `mkfifo`: QEMU writes its trace into a named pipe, the fastest way out of a container.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs"] }
+
+# The local test of CrossPoint checks the SHA-256 of the user's file before running it.
+[dev-dependencies]
+sha2.workspace = true

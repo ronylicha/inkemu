@@ -126,9 +126,10 @@ jobs:
     # the applications and the merged images are never stored in this repository. The cache
     # saves the build and replaces no check: the images are re-hashed on every run. Last, the
     # lockstep (ADR 0008) runs flash_hello.bin in Espressif's QEMU, inside the same pinned image,
-    # and in inkemu, and compares the two after every instruction over the whole first life.
+    # and in inkemu, and compares the two after every instruction, one window per reference image
+    # QEMU covers: through the reset esp_restart asks for, to the next one.
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -187,26 +188,54 @@ jobs:
         run: |
           source tools/conformance/versions.env
           docker pull --quiet "espressif/idf:$ESP_IDF_VERSION"
-      # The lockstep (ADR 0008, docs/lockstep-differences.md): from the first instruction of the
-      # ROM, through the bootloader, app_main and the first tick, to the reset that esp_restart
-      # asks for at the end of the countdown, without a divergence outside the table. The number
-      # of compared instructions, the end of the window and the uses of every row are pinned: a
-      # model change that adds or removes an instruction, an admitted difference that grows into a
-      # divergence, or one that shows up more or less often, fails here (exit 3). The tool prints
-      # what each row of the table did, with the largest move of each counter, and fails (exit 5)
-      # if a row, a register of a row or a bit of its mask was not used, or a row was used outside
-      # what it declares (decision H3). About 90 s of comparison.
-      - name: Compare flash_hello.bin with QEMU after every instruction
-        timeout-minutes: 15
+      # The lockstep (ADR 0008, docs/lockstep-differences.md), window hello: from the first
+      # instruction of the ROM, through the bootloader, app_main and the countdown, through the
+      # reset that esp_restart asks for, and through a second life to the next reset, without a
+      # divergence outside the rows of the window. The number of compared instructions, the end
+      # of the window and the uses of every row are pinned: a model change that adds or removes an
+      # instruction, an admitted difference that grows into a divergence, or one that shows up
+      # more or less often, fails here (exit 3). The tool prints what each row did, with the
+      # largest move of each counter, and fails (exit 5) if a row, a register of a row or a bit of
+      # its mask was not used, or a row was used outside what it declares (decision H3). About
+      # three minutes of comparison.
+      - name: Compare flash_hello.bin with QEMU after every instruction, through its reset
+        timeout-minutes: 25
         run: |
           source tools/conformance/versions.env
-          cargo run --release -p inkemu-lockstep -- \
+          cargo run --release -p inkemu-lockstep -- --window hello \
             --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
             --rom-dir "$RUNNER_TEMP/rom" \
             --image "espressif/idf:$ESP_IDF_VERSION" \
             --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
-            --expect-compared 3402169 --expect-end reset \
+            --expect-compared 6813949 --expect-end reset \
             --expect-usage tools/ci/lockstep-hello.usage
+      # Window nvs: nvs_rw_value_cxx writes its restart counter to NVS (programs and erases of
+      # the flash through SPI1, in QEMU as in inkemu) before each esp_restart; through the first
+      # reset to the second, pinned the same way.
+      - name: Compare flash_nvs.bin with QEMU after every instruction, through its reset
+        timeout-minutes: 25
+        run: |
+          source tools/conformance/versions.env
+          cargo run --release -p inkemu-lockstep -- --window nvs \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_nvs.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --expect-compared 7680555 --expect-end reset \
+            --expect-usage tools/ci/lockstep-nvs.usage
+      # Window nvs-ota: the same application under the stock partition table of the X4, whose
+      # bootloader writes otadata at every boot.
+      - name: Compare flash_nvs_ota.bin with QEMU after every instruction, through its reset
+        timeout-minutes: 25
+        run: |
+          source tools/conformance/versions.env
+          cargo run --release -p inkemu-lockstep -- --window nvs-ota \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_nvs_ota.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --expect-compared 7701890 --expect-end reset \
+            --expect-usage tools/ci/lockstep-nvs-ota.usage
       # The same run with a fault put in the CPU's state on purpose (bit 0 of t0 changed once a
       # million instructions are compared, a hook of the development binary only): the lockstep
       # must find it against the real QEMU, exit 1 and name the instruction. This proves the path
@@ -214,11 +243,14 @@ jobs:
       # changed register whatever the rows say. The step after puts a fault in a peripheral's
       # model, which only a row holds.
       - name: The lockstep finds a fault put in inkemu
-        timeout-minutes: 10
+        # The tool gives Docker 300 s to start QEMU and about 300 s to remove its container,
+        # every docker call included (about 10 minutes when Docker never answers); each step
+        # leaves room for that and its run.
+        timeout-minutes: 15
         run: |
           source tools/conformance/versions.env
           set +e
-          cargo run --release -p inkemu-lockstep -- \
+          cargo run --release -p inkemu-lockstep -- --window hello \
             --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
             --rom-dir "$RUNNER_TEMP/rom" \
             --image "espressif/idf:$ESP_IDF_VERSION" \
@@ -237,11 +269,11 @@ jobs:
       # of the counter to the gap the faulty read left: the gap moves up, which QEMU's truncating
       # counter never does, and the lockstep must report a divergence near row 15.
       - name: The lockstep finds a fault put in the SYSTIMER's model
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           source tools/conformance/versions.env
           set +e
-          cargo run --release -p inkemu-lockstep -- \
+          cargo run --release -p inkemu-lockstep -- --window hello \
             --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
             --rom-dir "$RUNNER_TEMP/rom" \
             --image "espressif/idf:$ESP_IDF_VERSION" \
@@ -253,3 +285,44 @@ jobs:
           test "$code" -eq 1 || { echo "exit $code where 1 (divergence) was expected"; exit 1; }
           grep -q "^divergence after 2500668 compared instructions" "$RUNNER_TEMP/perturbed-systimer.txt"
           grep -q "^nearest row of docs/lockstep-differences.md: 15 " "$RUNNER_TEMP/perturbed-systimer.txt"
+      # The second life is compared, not only reached: the same fault as above, put four million
+      # instructions in, after the reset (instruction 3 402 169), must be found there.
+      - name: The lockstep finds a fault put in inkemu after the reset
+        timeout-minutes: 20
+        run: |
+          source tools/conformance/versions.env
+          set +e
+          cargo run --release -p inkemu-lockstep -- --window hello \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --perturb-after 4000000 > "$RUNNER_TEMP/perturbed-after-reset.txt" 2>&1
+          code=$?
+          set -e
+          head -80 "$RUNNER_TEMP/perturbed-after-reset.txt"
+          test "$code" -eq 1 || { echo "exit $code where 1 (divergence) was expected"; exit 1; }
+          grep -q "^divergence after 4000000 compared instructions" "$RUNNER_TEMP/perturbed-after-reset.txt"
+          grep -q "^x5/t0 .*<<" "$RUNNER_TEMP/perturbed-after-reset.txt"
+          grep -q "^resets crossed: 1$" "$RUNNER_TEMP/perturbed-after-reset.txt"
+      # The rows still hold after the reset: the same fault in the SYSTIMER's model, put five
+      # million instructions in, in the second life, must be found near row 15 (measured on
+      # 2026-10-14: the counter read at instruction 5 700 683).
+      - name: The lockstep finds a fault put in the SYSTIMER's model after the reset
+        timeout-minutes: 20
+        run: |
+          source tools/conformance/versions.env
+          set +e
+          cargo run --release -p inkemu-lockstep -- --window hello \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --perturb-systimer-after 5000000 > "$RUNNER_TEMP/perturbed-systimer-after-reset.txt" 2>&1
+          code=$?
+          set -e
+          head -80 "$RUNNER_TEMP/perturbed-systimer-after-reset.txt"
+          test "$code" -eq 1 || { echo "exit $code where 1 (divergence) was expected"; exit 1; }
+          grep -q "^divergence after 5700683 compared instructions" "$RUNNER_TEMP/perturbed-systimer-after-reset.txt"
+          grep -q "^nearest row of docs/lockstep-differences.md: 15 " "$RUNNER_TEMP/perturbed-systimer-after-reset.txt"
+          grep -q "^resets crossed: 1$" "$RUNNER_TEMP/perturbed-systimer-after-reset.txt"

@@ -93,22 +93,31 @@ fn lines_of(treatment: &Treatment) -> Vec<String> {
             }
         )],
         Treatment::ExternalInterrupt { lag } => vec![format!("meip retard {lag}")],
-        Treatment::Registers(registers) => registers
+        Treatment::KeptAtReset(quantities) => quantities
             .iter()
-            .map(|register| {
-                let mut line = format!(
-                    "registre 0x{:08X} masque 0x{:08X}",
-                    register.address, register.mask
-                );
-                if let Some(command) = register.after_command {
-                    let _ = write!(line, " après 0x{command:02X}");
-                }
-                if let Some(value) = register.qemu {
-                    let _ = write!(line, " qemu 0x{value:08X}");
-                }
-                line
+            .map(|kept| {
+                let bits = if kept.bits == u32::MAX {
+                    String::new()
+                } else {
+                    format!(" bits 0x{:08X}", kept.bits)
+                };
+                format!(
+                    "gardé au reset {}{bits} reset 0x{:08X}",
+                    kept.field, kept.reset
+                )
             })
             .collect(),
+        Treatment::CsrKeptAtReset(csrs) => csrs
+            .iter()
+            .map(|kept| {
+                format!(
+                    "csr gardé au reset 0x{:03X} bits gardés 0x{:08X} masque 0x{:08X}",
+                    kept.csr, kept.kept, kept.mask
+                )
+            })
+            .collect(),
+        Treatment::Registers(registers) => registers.iter().map(register_line).collect(),
+        Treatment::RegistersAfterReset(entries) => entries.iter().map(after_reset_line).collect(),
         Treatment::Counter {
             location,
             drift,
@@ -151,17 +160,47 @@ fn lines_of(treatment: &Treatment) -> Vec<String> {
     }
 }
 
+fn register_line(register: &lockstep::Register) -> String {
+    let mut line = format!(
+        "registre 0x{:08X} masque 0x{:08X}",
+        register.address, register.mask
+    );
+    if let Some(command) = register.after_command {
+        let _ = write!(line, " après 0x{command:02X}");
+    }
+    if let Some(value) = register.qemu {
+        let _ = write!(line, " qemu 0x{value:08X}");
+    }
+    line
+}
+
+fn after_reset_line(entry: &lockstep::AfterReset) -> String {
+    let mut line = format!(
+        "après reset registre 0x{:08X} masque 0x{:08X}",
+        entry.register.address, entry.register.mask
+    );
+    if let Some(value) = entry.inkemu {
+        let _ = write!(line, " inkemu 0x{value:08X}");
+    }
+    if let Some(value) = entry.qemu {
+        let _ = write!(line, " qemu 0x{value:08X}");
+    }
+    line
+}
+
 fn location_text(location: Location) -> String {
     match location {
         Location::Mmio(address) => format!("0x{address:08X}"),
         Location::Csr(csr) => format!("csr 0x{csr:03X}"),
+        Location::Integer(reg) => format!("x{reg}"),
     }
 }
 
 #[test]
 fn the_table_of_the_documentation_is_the_table_of_the_tool() {
     let text = documentation();
-    let tool: Vec<(u16, BTreeSet<String>)> = lockstep::DIFFERENCES
+    // A retired row stays in the summary, its number kept, with no treatment.
+    let mut tool: Vec<(u16, BTreeSet<String>)> = lockstep::DIFFERENCES
         .iter()
         .map(|row| {
             (
@@ -172,7 +211,13 @@ fn the_table_of_the_documentation_is_the_table_of_the_tool() {
                     .collect(),
             )
         })
+        .chain(
+            lockstep::RETIRED
+                .iter()
+                .map(|row| (row.number, BTreeSet::new())),
+        )
         .collect();
+    tool.sort_by_key(|(number, _)| *number);
     assert_eq!(summary(&text), tool);
 }
 
@@ -202,9 +247,68 @@ fn every_row_of_the_documentation_declares_the_parameters_of_the_tool() {
     );
 }
 
+/// A window as the documentation and the test compare it: name, firmware, resets, bound, rows.
+type WindowLine = (String, String, u32, Option<u64>, Vec<u16>);
+
+/// The rows of the section « Les fenêtres ».
+fn windows(text: &str) -> Vec<WindowLine> {
+    let section = text
+        .split("## Les fenêtres")
+        .nth(1)
+        .expect("a section « Les fenêtres »");
+    let section = section.split("\n## ").next().unwrap();
+    let number = |cell: &str| -> u64 { cell.replace(' ', "").parse().unwrap() };
+    section
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let firmware = cells.get(2)?.strip_prefix('`')?.strip_suffix('`')?;
+            let rows = cells[5]
+                .split(',')
+                .flat_map(|part| {
+                    let part = part.trim();
+                    let (first, last) = part.split_once('–').unwrap_or((part, part));
+                    let (first, last): (u16, u16) = (first.parse().unwrap(), last.parse().unwrap());
+                    first..=last
+                })
+                .collect();
+            let bound = (cells[4] != "—").then(|| number(cells[4]));
+            Some((
+                cells[1].to_owned(),
+                firmware.to_owned(),
+                u32::try_from(number(cells[3])).unwrap(),
+                bound,
+                rows,
+            ))
+        })
+        .collect()
+}
+
 #[test]
-fn the_rows_are_numbered_from_1_without_a_gap() {
-    let numbers: Vec<u16> = lockstep::DIFFERENCES.iter().map(|row| row.number).collect();
+fn the_windows_of_the_documentation_are_the_windows_of_the_tool() {
+    let tool: Vec<WindowLine> = lockstep::WINDOWS
+        .iter()
+        .map(|window| {
+            (
+                window.name.to_owned(),
+                window.firmware.to_owned(),
+                window.resets,
+                window.bound,
+                window.rows.iter().map(|row| row.number).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(windows(&documentation()), tool);
+}
+
+#[test]
+fn the_rows_and_the_retired_rows_are_numbered_from_1_without_a_gap() {
+    let mut numbers: Vec<u16> = lockstep::DIFFERENCES
+        .iter()
+        .map(|row| row.number)
+        .chain(lockstep::RETIRED.iter().map(|row| row.number))
+        .collect();
+    numbers.sort_unstable();
     let expected: Vec<u16> = (1..=u16::try_from(numbers.len()).unwrap()).collect();
     assert_eq!(numbers, expected);
 }

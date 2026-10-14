@@ -26,8 +26,14 @@ pub const MHARTID: u16 = 0xF14;
 
 pub const MSTATUS_MIE: u32 = 1 << 3;
 pub const MSTATUS_MPIE: u32 = 1 << 7;
-/// MPP is hard-wired to machine mode (0b11): this hart has no lower privilege mode in scope.
+/// `MPP` = machine mode (0b11). A plain hart has machine mode only: its `MPP` reads this, always.
 pub const MSTATUS_MPP_M: u32 = 0b11 << 11;
+/// The low bit of `MPP`, the one software writes on the ESP32-C3 core: "only lower bit is
+/// writable, write to the higher bit is ignored as it is directly tied to the lower bit" (TRM
+/// §1.5, register 1.5, as quoted in report IR §2.3). `MPP` is 0 (user) or 3 (machine).
+const MSTATUS_MPP_LOW: u32 = 1 << 11;
+/// `TW` (timeout wait), a field of `mstatus` on the ESP32-C3 core (TRM register 1.5).
+const MSTATUS_TW: u32 = 1 << 21;
 const MSTATUS_WRITABLE: u32 = MSTATUS_MIE | MSTATUS_MPIE;
 /// `mtvec.MODE` = 1, vectored.
 const MTVEC_VECTORED: u32 = 1;
@@ -128,7 +134,7 @@ impl CsrFile {
         let cyc = cycles.get().wrapping_add(self.cycle_offset);
         let ret = instret.wrapping_add(self.instret_offset);
         Some(match addr {
-            MSTATUS => self.mstatus | MSTATUS_MPP_M,
+            MSTATUS => self.mstatus | self.mpp_wired(),
             MISA => MISA_RV32IMC,
             MIE => self.mie,
             MIP => self.mip,
@@ -164,7 +170,21 @@ impl CsrFile {
             return false;
         }
         match addr {
-            MSTATUS => self.mstatus = value & MSTATUS_WRITABLE,
+            MSTATUS => {
+                self.mstatus = match self.vendor {
+                    // The ESP32-C3 core has user mode: `MPP` is WARL {0, 3}, set by its low bit,
+                    // and `TW` is stored (TRM register 1.5). Reset value 0 (TRM §1.4.2).
+                    Some(Esp32C3Csrs { .. }) => {
+                        let mpp = if value & MSTATUS_MPP_LOW == 0 {
+                            0
+                        } else {
+                            MSTATUS_MPP_M
+                        };
+                        (value & (MSTATUS_WRITABLE | MSTATUS_TW)) | mpp
+                    }
+                    None => value & MSTATUS_WRITABLE,
+                };
+            }
             MIE => self.mie = value,
             // `mip` pending bits are driven by the interrupt controller, not by software;
             // `misa` is WARL: writes are ignored, the ISA is fixed.
@@ -242,6 +262,37 @@ impl CsrFile {
         self.instret_offset = 0u64.wrapping_sub(instret);
     }
 
+    /// The `MPP` a plain hart reads whatever is stored: machine mode, its only mode. The ESP32-C3
+    /// core stores its `MPP` in [`CsrFile::mstatus`].
+    const fn mpp_wired(&self) -> u32 {
+        match self.vendor {
+            Some(_) => 0,
+            None => MSTATUS_MPP_M,
+        }
+    }
+
+    /// A trap is taken: `MPP` takes the mode the hart was in, machine mode (this hart executes in
+    /// machine mode only; see the limit on `mret`).
+    pub(crate) fn save_privilege_on_trap(&mut self) {
+        if self.vendor.is_some() {
+            self.mstatus |= MSTATUS_MPP_M;
+        }
+    }
+
+    /// `mret`: `MPP` takes the least privileged mode the core has (privileged specification,
+    /// `mret`): user mode on the ESP32-C3 core; a plain hart's `MPP` stays machine mode.
+    ///
+    /// LIMIT (SP1b-4f): this hart executes in machine mode only. An `mret` with `MPP` = 0 enters
+    /// user mode on the chip, where CSR accesses and memory are checked; here it goes on in
+    /// machine mode. No measured firmware does it: the ROM and ESP-IDF run in machine mode
+    /// (report `esp32c3-boot-chain.md`, "Privilege"), and QEMU, which has user mode, would have
+    /// trapped at the next CSR access of every lockstep window.
+    pub(crate) fn return_privilege(&mut self) {
+        if self.vendor.is_some() {
+            self.mstatus &= !MSTATUS_MPP_M;
+        }
+    }
+
     /// Convenience for tests and reset code (counters at zero).
     pub fn write(&mut self, addr: u16, value: u32) -> bool {
         let known = self.write_with_counters(addr, value, Cycles::ZERO, 0);
@@ -270,6 +321,22 @@ mod tests {
         assert!(csr.write(MSTATUS, 0xffff_ffff));
         let status = csr.read(MSTATUS, Cycles::ZERO, 0).unwrap();
         assert_eq!(status, MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_M);
+    }
+
+    #[test]
+    fn esp32c3_mstatus_resets_to_0_and_takes_mpp_from_its_low_bit() {
+        let mut csr = CsrFile::new(VendorCsrs::Esp32C3);
+        assert_eq!(csr.read(MSTATUS, Cycles::ZERO, 0), Some(0));
+        assert!(csr.write(MSTATUS, 0xffff_ffff));
+        assert_eq!(
+            csr.read(MSTATUS, Cycles::ZERO, 0),
+            Some(MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPP_M | MSTATUS_TW)
+        );
+        // The high bit of MPP is tied to the low one: a write of it alone is user mode.
+        assert!(csr.write(MSTATUS, 1 << 12));
+        assert_eq!(csr.read(MSTATUS, Cycles::ZERO, 0), Some(0));
+        assert!(csr.write(MSTATUS, 1 << 11));
+        assert_eq!(csr.read(MSTATUS, Cycles::ZERO, 0), Some(MSTATUS_MPP_M));
     }
 
     #[test]

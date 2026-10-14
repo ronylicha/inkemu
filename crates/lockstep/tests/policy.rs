@@ -6,6 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test: a panic is a test failure
 
 use cpu_rv32::asm::{addi, csrrs, csrrw, csrrwi, lui, lw};
+use lockstep::table::HELLO;
 use lockstep::{
     Cause, CpuState, End, Field, Lockstep, Target, TraceReader, WindowEnd, render_block,
 };
@@ -82,7 +83,7 @@ fn text(entries: &[Entry]) -> String {
 /// Compares `target` with the trace, ending after `limit` instructions when one is given.
 fn compare(trace: &str, target: &mut Esp32C3, limit: Option<u64>) -> (End, Lockstep) {
     let mut reader = TraceReader::new(trace.as_bytes());
-    let mut lockstep = Lockstep::new(target, limit);
+    let mut lockstep = Lockstep::with_rows(target, HELLO, limit);
     while let Some(event) = reader.next_event().unwrap() {
         if let Some(end) = lockstep.feed(event, target) {
             return (end, lockstep);
@@ -646,7 +647,7 @@ fn a_row_of_treatment_iv_is_used_only_by_what_its_setting_did() {
     assert_eq!(config.timing, soc_esp32c3::Timing::QemuIcount);
     // A machine built with the settings that never needed one: no use.
     let target = Esp32C3::new(flat_rom(&[HANG]), &config);
-    let lockstep = Lockstep::new(&target, None);
+    let lockstep = Lockstep::with_rows(&target, HELLO, None);
     let usage = lockstep.usage(&target);
     for row in [5, 24] {
         assert_eq!(usage.uses(row), 0, "row {row}");

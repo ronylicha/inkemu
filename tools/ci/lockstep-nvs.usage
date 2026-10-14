@@ -1,0 +1,33 @@
+# The uses of every row of the window nvs (docs/lockstep-differences.md) as inkemu-lockstep
+# prints them: flash_nvs.bin from power-on, through the reset esp_restart asks for after it has
+# written its restart counter to NVS, to the second one. Measured on 2026-10-14 (QEMU
+# esp_develop_9.2.2_20250817 in espressif/idf:v5.5.2). Passed to --expect-usage by the CI step
+# that compares flash_nvs.bin, as tools/ci/lockstep-hello.usage is for hello.
+row  2: 7680556 uses
+row  3: 15 uses
+row  4: 188988 uses
+row  5: 1118170 uses
+row  6: 6601 uses
+row  8: 162 uses
+row  9: 165 uses
+row 10: 126 uses
+row 11: 549 uses
+row 12: 268 uses
+row 13: 28 uses
+row 14: 24 uses
+row 15: 4714 uses
+row 16: 43 uses
+row 17: 3208 uses
+row 18: 96 uses
+row 19: 14231 uses
+row 20: 83 uses
+row 21: 154 uses
+row 22: 442 uses
+row 23: 28892 uses
+row 24: 2 uses
+row 26: 13 uses
+row 27: 46 uses
+row 29: 600 uses
+row 30: 2 uses
+row 31: 5108772 uses
+row 32: 4 uses

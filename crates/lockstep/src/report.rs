@@ -49,6 +49,9 @@ pub enum Cause {
     /// One side reset after the instruction and the other did not (H4 ends the window only on a
     /// reset of both).
     OneSidedReset { qemu: bool },
+    /// The instruction read a quantity a reset of both sides left different and a row of
+    /// [`crate::Treatment::KeptAtReset`] held: the two sides computed from different values.
+    ReadKeptAtReset { field: Field },
 }
 
 /// A divergence.
@@ -112,13 +115,19 @@ impl fmt::Display for HistoryEntry {
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "divergence after {} compared instructions", self.index)?;
-        if let Cause::OneSidedReset { qemu } = self.cause {
-            writeln!(
+        match self.cause {
+            Cause::OneSidedReset { qemu } => writeln!(
                 f,
                 "{} reset after this instruction and {} did not",
                 if qemu { "QEMU" } else { "inkemu" },
                 if qemu { "inkemu" } else { "QEMU" }
-            )?;
+            )?,
+            Cause::ReadKeptAtReset { field } => writeln!(
+                f,
+                "this instruction read {field}, which the last reset left different on the two \
+                 sides and no instruction had written since"
+            )?,
+            Cause::State => {}
         }
         match &self.executed {
             None => writeln!(f, "at power-on, before the first instruction")?,
