@@ -401,6 +401,25 @@ pub fn exit_code_of_run(end: RunEnd, script: Option<&ScriptStatus>, saved: bool)
     }
 }
 
+/// Says in `log`, when the journal of the inputs of `machine` has passed one of its bounds, that
+/// the run will not be recorded: the user of a recorded run can stop it at once instead of
+/// learning it at its end. Gives whether it said so. A machine told to keep no journal (a
+/// replay) has nothing to say.
+fn say_an_incomplete_journal(machine: &Esp32C3, log: &mut dyn Write) -> bool {
+    let journal = machine.input_journal();
+    if journal.is_complete() || journal.is_forgone() {
+        return false;
+    }
+    let _ = writeln!(
+        log,
+        "warning: the run received more input than a session holds ({} bytes or {} chunks on a console, or {} changes of the USB host): it will not be recorded; stop it now, or record a run that sends less",
+        soc_esp32c3::MAX_JOURNAL_CONSOLE_BYTES,
+        soc_esp32c3::MAX_JOURNAL_CONSOLE_CHUNKS,
+        soc_esp32c3::MAX_JOURNAL_HOST_CHANGES
+    );
+    true
+}
+
 /// The line of the summary that says how far the console script got.
 fn say_script(log: &mut dyn Write, status: &ScriptStatus, steps: usize) {
     let _ = match status {
@@ -563,6 +582,8 @@ pub fn execute_with_script(
     // and must not report the same failure a second time.
     let mut console_usable = true;
     let mut reader = ReaderWatch::default();
+    // Whether the log said that the run received more input than its session holds.
+    let mut journal_said_incomplete = false;
     let mut end = loop {
         if interrupt.is_requested() {
             interrupt.summary_begins();
@@ -582,7 +603,15 @@ pub fn execute_with_script(
                 digests.add(*channel, bytes);
             }
         }
-        if observing
+        let cycle_limit_reached = options
+            .max_cycles
+            .is_some_and(|max| machine.cycles().get() >= max);
+        let pass = pass_end(&console_open, &stop, cycle_limit_reached);
+        // A pass that ends the run hands the script's steps nothing more: what a `wait-for`
+        // found in it would date inputs at the stop or after it, which the run never takes, and
+        // the journal of a session holds only the inputs the run could still use.
+        if pass.is_none()
+            && observing
             && let Some(run) = script.as_deref_mut()
             && let Err(e) = run.observe(machine, &taken)
         {
@@ -590,6 +619,9 @@ pub fn execute_with_script(
             observing = false;
             // Nothing reads the consoles for the script any more: they go back to their pace.
             run.stop(machine);
+        }
+        if digests.is_some() && !journal_said_incomplete {
+            journal_said_incomplete = say_an_incomplete_journal(machine, log);
         }
         console_usable = matches!(console_open, Ok(true));
         // The stop line carries the violation: listing it as a warning too would print it twice.
@@ -603,10 +635,7 @@ pub fn execute_with_script(
                 let _ = writeln!(log, "{}: {diagnostic}", journal_prefix(&diagnostic));
             }
         }
-        let cycle_limit_reached = options
-            .max_cycles
-            .is_some_and(|max| machine.cycles().get() >= max);
-        let Some(end) = pass_end(&console_open, &stop, cycle_limit_reached) else {
+        let Some(end) = pass else {
             continue;
         };
         // The summary begins here: the warnings of the last slice are above, and from the next
@@ -631,6 +660,18 @@ pub fn execute_with_script(
         let flushed = console_usable.then_some(options.console);
         flush_the_other_consoles(machine, flushed, digests);
     }
+    say_where_the_run_stopped(machine, script.as_deref(), log);
+    end
+}
+
+/// The lines of the summary after why the run ended: where the machine stopped, its device
+/// time and clock, its deep sleep, the USB host, how far `script` got, the diagnostics and the
+/// trace hash.
+fn say_where_the_run_stopped(
+    machine: &mut Esp32C3,
+    script: Option<&ScriptRun>,
+    log: &mut dyn Write,
+) {
     let _ = writeln!(
         log,
         "inkemu: stopped at pc {:#010x} after {} cycles ({} instructions)",
@@ -662,7 +703,6 @@ pub fn execute_with_script(
     if let Some(hash) = machine.trace_hash() {
         let _ = writeln!(log, "trace-hash {hash:016x}");
     }
-    end
 }
 
 /// Relays what the firmware had written on `shown` and the device had not sent yet: without it
@@ -1004,6 +1044,153 @@ mod tests {
             StopReason::ConsoleOutput
         );
         assert_eq!(m.take_console(ConsoleChannel::Uart0), b"z");
+    }
+
+    /// A console that takes `left` bytes, then cannot be written.
+    struct FailsAfter {
+        left: usize,
+    }
+    impl io::Write for FailsAfter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.left == 0 {
+                return Err(io::Error::other("disk full"));
+            }
+            let taken = bytes.len().min(self.left);
+            self.left -= taken;
+            Ok(taken)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_pass_that_ends_the_run_hands_the_script_nothing_more() {
+        // The console fails on the `y` of `ready`, the pass in which the `wait-for` finds its
+        // text: the run is over, and the send that follows is not handed to the machine.
+        let mut m = machine(&ready_then_echo(), MachineOptions::default());
+        let script = Script::parse(
+            format!("{VERSION_LINE}\nwait-for uart0 \"ready\"\nsend uart0 \"x\"\n").as_bytes(),
+        )
+        .unwrap();
+        let mut run = ScriptRun::start(&script, &mut m).unwrap();
+        let mut log = Vec::new();
+        let end = execute_with_script(
+            &mut m,
+            &options(BACKSTOP),
+            RunExtras {
+                script: Some(&mut run),
+                digests: None,
+            },
+            &NOT_INTERRUPTED,
+            &reader_stays,
+            &mut FailsAfter { left: 4 },
+            &mut log,
+        );
+        assert_eq!(end, RunEnd::ConsoleError, "{}", text(&log));
+        assert_eq!(
+            m.input_journal().inputs(),
+            &[],
+            "no input handed after the end"
+        );
+        assert!(
+            matches!(run.status(m.device_time()), ScriptStatus::WaitingFor { .. }),
+            "{}",
+            text(&log)
+        );
+    }
+
+    /// Three bytes on UART1, four on UART0 (the console shown), four on USB-Serial-JTAG,
+    /// committed, then the program parks: after 3 000 cycles no byte has left a UART.
+    fn printing_on_every_console() -> Vec<u32> {
+        let mut program = printing(UART1, b"one", &[]);
+        program.extend(printing(UART0, b"zero", &[]));
+        program.extend(printing(
+            USB,
+            b"jtag",
+            &[addi(T1, 0, 1), sw(T1, T0, 4), HANG],
+        ));
+        program
+    }
+
+    #[test]
+    fn the_digests_of_a_session_take_every_console_to_its_last_byte() {
+        let mut expected = ConsoleDigests::default();
+        for (channel, bytes) in [
+            (ConsoleChannel::Uart0, &b"zero"[..]),
+            (ConsoleChannel::Uart1, b"one"),
+            (ConsoleChannel::UsbSerialJtag, b"jtag"),
+        ] {
+            expected.add(channel, bytes);
+        }
+        let expected = expected.finish();
+        let gone = || true;
+        let cases: [(u64, &dyn Fn() -> bool, bool, RunEnd); 4] = [
+            // The limit ends the run: the end flushes the console shown, then the others.
+            (3_000, &reader_stays, false, RunEnd::Budget),
+            // The reader went away in the loop: every console is flushed into the digests only.
+            (3_000, &gone, false, RunEnd::ConsoleClosed),
+            // The console fails at the flush of the end: its bytes are in the digests all the
+            // same, and the others are flushed after it.
+            (3_000, &reader_stays, true, RunEnd::ConsoleError),
+            // The console fails in the loop, every byte having left the UARTs.
+            (BACKSTOP, &reader_stays, true, RunEnd::ConsoleError),
+        ];
+        for (max_cycles, reader_gone, failing, expected_end) in cases {
+            let mut m = machine(&printing_on_every_console(), MachineOptions::default());
+            let mut digests = ConsoleDigests::default();
+            let (mut shown, mut log) = (Vec::new(), Vec::new());
+            let console: &mut dyn io::Write = if failing { &mut Failing } else { &mut shown };
+            let end = execute_with_script(
+                &mut m,
+                &options(max_cycles),
+                RunExtras {
+                    script: None,
+                    digests: Some(&mut digests),
+                },
+                &NOT_INTERRUPTED,
+                reader_gone,
+                console,
+                &mut log,
+            );
+            assert_eq!(end, expected_end, "{}", text(&log));
+            assert_eq!(digests.finish(), expected, "{expected_end:?}");
+        }
+    }
+
+    #[test]
+    fn a_recorded_run_says_once_and_at_once_that_it_received_more_than_a_session_holds() {
+        let run = |digests: Option<&mut ConsoleDigests>, forgo: bool| {
+            let mut m = machine(&[HANG], MachineOptions::default());
+            if forgo {
+                m.forgo_input_journal();
+            }
+            for _ in 0..=soc_esp32c3::MAX_JOURNAL_CONSOLE_CHUNKS {
+                m.send_console(ConsoleChannel::Uart0, m.device_time(), b"")
+                    .unwrap();
+            }
+            let mut log = Vec::new();
+            execute_with_script(
+                &mut m,
+                &options(3 * SLICE_CYCLES),
+                RunExtras {
+                    script: None,
+                    digests,
+                },
+                &NOT_INTERRUPTED,
+                &reader_stays,
+                &mut Vec::new(),
+                &mut log,
+            );
+            text(&log)
+        };
+        let log = run(Some(&mut ConsoleDigests::default()), false);
+        let warning = "warning: the run received more input than a session holds (1048576 bytes or 16384 chunks on a console, or 16384 changes of the USB host): it will not be recorded; stop it now, or record a run that sends less\n";
+        assert!(log.starts_with(warning), "{log}");
+        assert_eq!(log.matches(warning).count(), 1, "{log}");
+        // A run that is not recorded, and a replay, whose machine keeps no journal, say nothing.
+        assert!(!run(None, false).contains("warning:"));
+        assert!(!run(Some(&mut ConsoleDigests::default()), true).contains("warning:"));
     }
 
     #[test]
