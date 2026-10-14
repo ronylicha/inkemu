@@ -4101,3 +4101,103 @@ fn the_shipped_bootloader_is_the_one_the_reference_firmware_build_produced() {
         "nothing follows the bootloader before the table"
     );
 }
+
+/// The SHA-256 pinned for `file` in `tools/reference-firmware/<sums>`, the file the build checks
+/// the binaries against: the one place the hash is written.
+fn pinned_in_sums(sums: &str, file: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/reference-firmware")
+        .join(sums);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e}; the firmware is not pinned yet: see tools/reference-firmware/README.md, \"Adding a firmware\"",
+            path.display()
+        )
+    });
+    text.lines()
+        .find_map(|line| {
+            let (hash, name) = line.split_once("  ")?;
+            (name == file).then(|| hash.to_owned())
+        })
+        .unwrap_or_else(|| panic!("{}: no line for {file}", path.display()))
+}
+
+/// The trace of the run of `adc_wait_panic` below, as the CI prints it. The image is built for the
+/// first time with this test: its hash is read from the log of the job `reference-boot`, where
+/// the test fails and prints the hash of the run, and written here; until then this names none.
+const ADC_WAIT_PANIC_TRACE: &str = "trace-hash not pinned yet";
+
+/// The path `CrossPoint` 1.6.5 and the stock firmware of the X4 take under inkemu (they are tested
+/// on the machine of a user who has them, `tests/real_firmware.rs`), with an application this
+/// repository builds: `adc_wait_panic` reads a register of I2C0, starts a conversion of the SAR
+/// ADC and waits for it with interrupts masked; the interrupt watchdog panics, the panic writes a
+/// core dump to the `coredump` partition of the X4 and restarts the CPU, and the second life finds
+/// the core dump. The registers the model lacks are named in warnings, none is undocumented.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_ADC_WAIT_PANIC_APP"]
+fn x4_runs_the_adc_wait_panic_reference_firmware_through_its_panic_into_a_second_life() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let application = std::env::var("INKEMU_ADC_WAIT_PANIC_APP").expect(
+        "set INKEMU_ADC_WAIT_PANIC_APP to the adc_wait_panic.bin of tools/reference-firmware/build.sh",
+    );
+    assert_eq!(
+        sha256_of(std::path::Path::new(&application)),
+        pinned_in_sums("SHA256SUMS.inputs-adc-wait-panic", "adc_wait_panic.bin"),
+        "{application} is not the pinned adc_wait_panic.bin; rebuild it with tools/reference-firmware/build.sh"
+    );
+    let output = inkemu()
+        .args(["run", "--device", "x4", "--console", "uart0"])
+        .args(["--max-time", "10", "--trace-hash", "--rom-dir", &rom_dir])
+        .arg("--firmware")
+        .arg(&application)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut from = 0;
+    for expected in [
+        "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        "adc_wait_panic: no core dump in flash (",
+        // The documented reset value of `I2C0.SR`, which inkemu returns for a register it lacks.
+        "adc_wait_panic: I2C0 SR 0x0000c000\n",
+        "adc_wait_panic: waiting for the SAR ADC, interrupts masked\n",
+        "Guru Meditation Error: Core  0 panic'ed (Interrupt wdt timeout on CPU0).",
+        "Rebooting...\n",
+        "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        "adc_wait_panic: a core dump is in flash at 0x",
+    ] {
+        let at = console[from..].find(expected).unwrap_or_else(|| {
+            panic!("`{expected}` is missing, or out of order:\n{console}\n{log}")
+        });
+        from += at + expected.len();
+    }
+    assert_eq!(
+        console.matches("Guru Meditation Error").count(),
+        1,
+        "{console}"
+    );
+    assert!(
+        log.contains("\ninkemu: reset by the firmware, a CPU reset (rst:0xc) at pc "),
+        "{log}"
+    );
+    for warning in [
+        "warning: unmodeled register read: I2C0.SR at 0x60013008 ",
+        "warning: unmodeled register write: APB_SARADC.INT_CLR at 0x6004004c ",
+        "warning: unmodeled register write: APB_SARADC.ONETIME_SAMPLE at 0x60040020 ",
+        "warning: unmodeled register read: APB_SARADC.INT_RAW at 0x60040044 ",
+    ] {
+        assert!(log.contains(warning), "`{warning}` is missing:\n{log}");
+    }
+    assert!(!log.contains("no register is documented there"), "{log}");
+    let measured = trace_hash_line(&log);
+    assert_eq!(
+        measured,
+        Some(ADC_WAIT_PANIC_TRACE),
+        "the trace hash of this run is {measured:?}: when the run above is the one intended, pin it in ADC_WAIT_PANIC_TRACE\n{log}"
+    );
+}

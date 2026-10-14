@@ -106,12 +106,15 @@ symbols nvs_rw_value_cxx
 # bootloader inkemu ships (`inkemu run --firmware`): only the application leaves the container.
 # uart_select reads UART0 through the driver and select(); usb_serial_jtag_echo, which ships a
 # sdkconfig.defaults of its own, echoes what the host sends to USB-Serial-JTAG; the third is this
-# directory's own, a console on USB-Serial-JTAG that needs a host reading the port.
+# directory's own, a console on USB-Serial-JTAG that needs a host reading the port. The last one is
+# this directory's too: it waits for the SAR ADC with interrupts masked, as CrossPoint does, until
+# the interrupt watchdog panics, and its next life finds the core dump the panic wrote.
 applications=()
 for project in \
   "$IDF_PATH/examples/peripherals/uart/uart_select:SHA256SUMS.inputs-uart-select" \
   "$IDF_PATH/examples/peripherals/usb_serial_jtag/usb_serial_jtag_echo:SHA256SUMS.inputs-usj-echo" \
-  "/ref/usb_serial_jtag_console:SHA256SUMS.inputs-usj-console"; do
+  "/ref/usb_serial_jtag_console:SHA256SUMS.inputs-usj-console" \
+  "/ref/adc_wait_panic:SHA256SUMS.inputs-adc-wait-panic"; do
   source="${project%%:*}"
   name="$(basename "$source")"
   build_example "$source" "/ref/${project##*:}"

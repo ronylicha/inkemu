@@ -2,7 +2,7 @@
 
 `build.sh [output-dir]` builds, inside the pinned `espressif/idf` Docker image and in one container
 run, the stock ESP-IDF 2nd-stage bootloader and four unmodified ESP-IDF examples for the ESP32-C3,
-and one application of this directory, checks the binaries of each build against its pinned
+and two applications of this directory, checks the binaries of each build against its pinned
 hashes, merges the first two into 16 MB flash images and checks the images against
 `SHA256SUMS.output`. The ESP-IDF version is `ESP_IDF_VERSION` in
 `tools/conformance/versions.env`.
@@ -20,21 +20,29 @@ committed, and nothing is executed on the host: the images are data for inkemu.
 program counter printed by inkemu into a function name: the last symbol whose address is not above
 the PC.
 
-Three applications are built next to them and leave the container alone, without a merged image:
-the tests of the serial consoles (`crates/console-script/tests/reference_firmware.rs`) boot them
-behind the bootloader inkemu ships, as `inkemu run --firmware` does.
+Four applications are built next to them and leave the container alone, without a merged image:
+the tests of the serial consoles (`crates/console-script/tests/reference_firmware.rs`) and of the
+`inkemu` command (`crates/emu-cli/tests/run_cli.rs`) boot them behind the bootloader inkemu ships,
+as `inkemu run --firmware` does.
 
-| Application | Source | What its tests type into it | Pins of its build |
+| Application | Source | What its tests do with it | Pins of its build |
 |---|---|---|---|
-| `uart_select.bin` | `examples/peripherals/uart/uart_select`: UART0 through the driver, `select()` with a 5 s timeout, one log line per byte read | `a`, then `bc\r\n` | `SHA256SUMS.inputs-uart-select` |
-| `usb_serial_jtag_echo.bin` | `examples/peripherals/usb_serial_jtag/usb_serial_jtag_echo`: what the host sends to USB-Serial-JTAG is echoed there and dumped on UART0 | a line, then 90 bytes | `SHA256SUMS.inputs-usj-echo` |
-| `usb_serial_jtag_console.bin` | `usb_serial_jtag_console/` of this directory, ours (Apache-2.0): USB-Serial-JTAG is the console, each line read is echoed; it needs a USB host that reads the port | `hello\r` | `SHA256SUMS.inputs-usj-console` |
+| `uart_select.bin` | `examples/peripherals/uart/uart_select`: UART0 through the driver, `select()` with a 5 s timeout, one log line per byte read | type `a`, then `bc\r\n` | `SHA256SUMS.inputs-uart-select` |
+| `usb_serial_jtag_echo.bin` | `examples/peripherals/usb_serial_jtag/usb_serial_jtag_echo`: what the host sends to USB-Serial-JTAG is echoed there and dumped on UART0 | type a line, then 90 bytes | `SHA256SUMS.inputs-usj-echo` |
+| `usb_serial_jtag_console.bin` | `usb_serial_jtag_console/` of this directory, ours (Apache-2.0): USB-Serial-JTAG is the console, each line read is echoed; it needs a USB host that reads the port | type `hello\r` | `SHA256SUMS.inputs-usj-console` |
+| `adc_wait_panic.bin` | `adc_wait_panic/` of this directory, ours (Apache-2.0): it reads a register of I2C0, starts a conversion of the SAR ADC and waits for its end with interrupts masked, as CrossPoint 1.6.5 does, until the interrupt watchdog panics; the panic writes a core dump to the `coredump` partition, and the next life says it found it | read its two lives, its warnings and its trace hash | `SHA256SUMS.inputs-adc-wait-panic` |
 
 The examples are built as ESP-IDF ships them. Their configuration is `sdkconfig.defaults` of this
 directory, then the example's own `sdkconfig.defaults` when it ships one (`usb_serial_jtag_echo`
 does: `CONFIG_ESP_CONSOLE_SECONDARY_NONE=y`), merged by ESP-IDF in that order, so that the example
 keeps every setting it chose. The example's file is never replaced. `usb_serial_jtag_console` is
-configured the same way, its own file adding `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`.
+configured the same way, its own file adding `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`, and so is
+`adc_wait_panic`, whose file adds the stock partition table of the X4 (`partitions.csv`, a copy of
+`tests/fixtures/partitions/x4-stock.csv`) and `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`.
+
+The firmwares of real units (CrossPoint 1.6.5 and the stock firmware of the X4) are not built here:
+the user who has them runs their tests, `crates/emu-cli/tests/real_firmware.rs`, whose header says
+how. They run nowhere in the CI.
 
 ## Adding a firmware
 
@@ -54,7 +62,8 @@ Run the tests that need the images, those of the machine and those of the `inkem
       INKEMU_NVS_OTA_FLASH="$PWD/target/reference-firmware/flash_nvs_ota.bin" \
       INKEMU_UART_SELECT_APP="$PWD/target/reference-firmware/uart_select.bin" \
       INKEMU_USJ_ECHO_APP="$PWD/target/reference-firmware/usb_serial_jtag_echo.bin" \
-      INKEMU_USJ_CONSOLE_APP="$PWD/target/reference-firmware/usb_serial_jtag_console.bin"
+      INKEMU_USJ_CONSOLE_APP="$PWD/target/reference-firmware/usb_serial_jtag_console.bin" \
+      INKEMU_ADC_WAIT_PANIC_APP="$PWD/target/reference-firmware/adc_wait_panic.bin"
     cargo test --release -p soc-esp32c3 --test reference_boot -- --ignored
     cargo test --release -p emu-cli --test run_cli reference_firmware -- --ignored
     cargo test --release -p console-script --test reference_firmware -- --ignored

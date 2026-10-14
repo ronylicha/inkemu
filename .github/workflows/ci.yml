@@ -109,7 +109,9 @@ jobs:
     # table and once under the stock table of the X4. Three more read their consoles, typed into
     # by a console script: uart_select (UART0), usb_serial_jtag_echo and usb_serial_jtag_console
     # (USB-Serial-JTAG, the last one written for inkemu); they are applications, run behind the
-    # bootloader inkemu ships. The firmware is built here, inside the pinned ESP-IDF image, and
+    # bootloader inkemu ships. One more, adc_wait_panic, also written for inkemu, takes the path
+    # that stops CrossPoint: a wait for the SAR ADC with interrupts masked, the panic of the
+    # interrupt watchdog, a core dump in flash and a second life. The firmware is built here, inside the pinned ESP-IDF image, and
     # checked against pinned SHA-256 values. The bootloader is the one
     # artefact of this build that is committed, under third_party/esp-idf-bootloader/; the
     # applications and the merged images are never stored in this repository. The cache saves
@@ -159,11 +161,12 @@ jobs:
           INKEMU_UART_SELECT_APP: ${{ runner.temp }}/reference-firmware/uart_select.bin
           INKEMU_USJ_ECHO_APP: ${{ runner.temp }}/reference-firmware/usb_serial_jtag_echo.bin
           INKEMU_USJ_CONSOLE_APP: ${{ runner.temp }}/reference-firmware/usb_serial_jtag_console.bin
+          INKEMU_ADC_WAIT_PANIC_APP: ${{ runner.temp }}/reference-firmware/adc_wait_panic.bin
         # Exact test counts, and every suite run whatever the one before it did, as in rom-boot:
         # see tools/ci/run-ignored-tests.sh.
         run: |
           failed=0
           tools/ci/run-ignored-tests.sh 13 --release -p soc-esp32c3 --test reference_boot -- --ignored || failed=1
-          tools/ci/run-ignored-tests.sh 9 --release -p emu-cli --test run_cli reference_firmware -- --ignored || failed=1
+          tools/ci/run-ignored-tests.sh 10 --release -p emu-cli --test run_cli reference_firmware -- --ignored || failed=1
           tools/ci/run-ignored-tests.sh 5 --release -p console-script --test reference_firmware -- --ignored || failed=1
           exit "$failed"
