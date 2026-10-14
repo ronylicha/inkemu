@@ -73,6 +73,11 @@ pub enum QemuError {
     },
     #[error("cannot create the pipe {path}: {source}")]
     Pipe { path: PathBuf, source: nix::Error },
+    #[error("cannot write the composed flash {path}: {source}")]
+    Composed {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("{path} cannot be given to Docker as a mount: it must be UTF-8 and hold no comma")]
     Path { path: PathBuf },
     #[error("cannot start docker: {0}; is Docker installed and running?")]
@@ -123,6 +128,17 @@ pub struct Qemu {
 /// Whether the interrupted flag was raised (Ctrl-C).
 pub type Interrupted<'a> = &'a AtomicBool;
 
+/// The flash QEMU boots: a file of the user's, or one the tool composed, which is written for the
+/// run beside the pipe (owner-only), mounted read-only, and removed with the pipe.
+#[derive(Clone, Copy, Debug)]
+pub enum Flash<'a> {
+    File(&'a Path),
+    Composed(&'a [u8]),
+}
+
+/// The name of a composed flash in the directory of the pipe.
+const COMPOSED_FLASH: &str = "flash.bin";
+
 /// What [`Qemu::start`] ends with.
 pub enum Started {
     Running(Qemu, File),
@@ -132,7 +148,8 @@ pub enum Started {
 
 impl Qemu {
     /// Starts QEMU on `flash` (mounted read-only) in `image`, and returns it with the read end of
-    /// the pipe its trace is written to, once QEMU has opened the other end.
+    /// the pipe its trace is written to, once QEMU has opened the other end. A composed flash is
+    /// first written to the directory of the pipe, readable by its owner only.
     ///
     /// `docker run` is put in a process group of its own: a Ctrl-C at the terminal reaches this
     /// tool only, which then stops the container itself, rather than the container ending its
@@ -142,7 +159,7 @@ impl Qemu {
     /// [`QemuError`] when the pipe cannot be made, a path cannot be mounted, Docker cannot be
     /// started, or the container ends or hangs before QEMU opens the pipe.
     pub fn start(
-        flash: &Path,
+        flash: Flash<'_>,
         image: &str,
         qemu: &str,
         interrupted: Interrupted<'_>,
@@ -168,12 +185,23 @@ impl Qemu {
             path: pipe.clone(),
             source,
         })?;
+        let flash = match flash {
+            Flash::File(path) => path.to_owned(),
+            Flash::Composed(bytes) => {
+                let path = directory.0.join(COMPOSED_FLASH);
+                write_owner_only(&path, bytes).map_err(|source| QemuError::Composed {
+                    path: path.clone(),
+                    source,
+                })?;
+                path
+            }
+        };
         let mut command = Command::new("docker");
         command
             .args(["run", "--rm", "--pull=never", "--name", &unique])
             .args(["--network", "none"])
             .arg("--mount")
-            .arg(bind_mount(flash, FLASH_IN_CONTAINER, true)?)
+            .arg(bind_mount(&flash, FLASH_IN_CONTAINER, true)?)
             .arg("--mount")
             .arg(bind_mount(&directory.0, TRACE_DIR_IN_CONTAINER, false)?)
             .args(["--entrypoint", qemu, image])
@@ -445,6 +473,19 @@ impl Drop for Qemu {
 /// it unique, so that a removal by name never reaches another run's container.
 fn container_name(pid: u32, nanos: u128) -> String {
     format!("inkemu-lockstep-{pid}-{nanos}")
+}
+
+/// Writes `bytes` to a new file at `path` that only its owner can read or write.
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// `--mount` for `source` at `target`: a comma would split the option and a path that is not

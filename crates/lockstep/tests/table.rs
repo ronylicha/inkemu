@@ -93,12 +93,28 @@ fn lines_of(treatment: &Treatment) -> Vec<String> {
             }
         )],
         Treatment::ExternalInterrupt { lag } => vec![format!("meip retard {lag}")],
-        Treatment::Registers(registers) => registers
+        Treatment::KeptAtReset(fields) => fields
+            .iter()
+            .map(|field| format!("gardé au reset {field}"))
+            .collect(),
+        Treatment::CsrKeptAtReset(csrs) => csrs
+            .iter()
+            .map(|kept| {
+                format!(
+                    "csr gardé au reset 0x{:03X} bits gardés 0x{:08X} masque 0x{:08X}",
+                    kept.csr, kept.kept, kept.mask
+                )
+            })
+            .collect(),
+        Treatment::Registers(registers) | Treatment::RegistersAfterReset(registers) => registers
             .iter()
             .map(|register| {
+                let after_reset = matches!(treatment, Treatment::RegistersAfterReset(_));
                 let mut line = format!(
-                    "registre 0x{:08X} masque 0x{:08X}",
-                    register.address, register.mask
+                    "{}registre 0x{:08X} masque 0x{:08X}",
+                    if after_reset { "après reset " } else { "" },
+                    register.address,
+                    register.mask
                 );
                 if let Some(command) = register.after_command {
                     let _ = write!(line, " après 0x{command:02X}");
@@ -155,6 +171,7 @@ fn location_text(location: Location) -> String {
     match location {
         Location::Mmio(address) => format!("0x{address:08X}"),
         Location::Csr(csr) => format!("csr 0x{csr:03X}"),
+        Location::Integer(reg) => format!("x{reg}"),
     }
 }
 

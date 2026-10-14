@@ -4,11 +4,12 @@
 use crate::report::{Adoption, Cause, HistoryEntry, Nearest, Report};
 use crate::state::{CpuState, Field};
 use crate::table::{
-    CPU_INT_THRESH, DIFFERENCES, Difference, Drift, Location, MEIP, MIP, Register, SPI1_CMD,
+    CPU_INT_THRESH, Difference, Drift, HELLO, Location, MEIP, MIP, Register, SPI1_CMD,
     SPI1_CMD_USR, SPI1_USER2, Site, Treatment, absent_in_qemu,
 };
 use crate::trace::{QemuTrap, TraceEvent};
 use crate::usage::{Check, Usage};
+use crate::window::Window;
 use cpu_rv32::{CsrOp, Decoded, Instr, LoadOp, StoreOp};
 use soc_esp32c3::{CompatActs, Esp32C3, Executed, Stepped, StopReason};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -49,6 +50,8 @@ pub trait Target {
     fn compat_acts(&self) -> CompatActs;
     /// Device time since power-on ([`Esp32C3::device_time_nanos`]).
     fn device_time_nanos(&self) -> u64;
+    /// A CSR, compared or not ([`Esp32C3::csr`]); `None` when the core has none at `address`.
+    fn csr(&self, address: u16) -> Option<u32>;
 }
 
 impl Target for Esp32C3 {
@@ -79,6 +82,10 @@ impl Target for Esp32C3 {
     fn device_time_nanos(&self) -> u64 {
         Esp32C3::device_time_nanos(self)
     }
+
+    fn csr(&self, address: u16) -> Option<u32> {
+        Esp32C3::csr(self, address)
+    }
 }
 
 /// Where a counter of [`Treatment::Counter`] stands.
@@ -107,6 +114,12 @@ enum ReadRule {
         bound: u32,
         qemu: u32,
     },
+    KeptCsr {
+        row: u16,
+        csr: u16,
+        kept: u32,
+        mask: u32,
+    },
     Other,
 }
 
@@ -119,8 +132,11 @@ pub enum WindowEnd {
     /// The instruction at `pc` accessed `address`, a register QEMU does not have that no row
     /// names.
     Absent { address: u32, pc: u32 },
-    /// The number of instructions asked for were compared.
+    /// The number of instructions asked for were compared (`--max-instructions`): a partial
+    /// window.
     Limit,
+    /// The window's own bound was reached ([`Window::bound`]): a whole window.
+    Bound,
     /// QEMU's trace ended.
     TraceEnd,
 }
@@ -134,6 +150,7 @@ impl std::fmt::Display for WindowEnd {
                 "access to {address:#010x}, a register QEMU does not have, at pc {pc:#010x}"
             ),
             WindowEnd::Limit => f.write_str("instruction limit"),
+            WindowEnd::Bound => f.write_str("the bound of the window"),
             WindowEnd::TraceEnd => f.write_str("end of the QEMU trace"),
         }
     }
@@ -162,6 +179,8 @@ pub struct Counts {
     pub preempted: u64,
     /// Interrupts both sides took.
     pub interrupts: u64,
+    /// Resets both sides took after the same instruction and the comparison went on through.
+    pub resets_crossed: u32,
 }
 
 /// One comparison, fed QEMU's trace event by event.
@@ -169,6 +188,8 @@ pub struct Counts {
 pub struct Lockstep {
     rows: &'static [Difference],
     limit: Option<u64>,
+    /// The window's own bound ([`Window::bound`]).
+    bound: Option<u64>,
     counts: Counts,
     usage: Usage,
     /// The last block compared: its state and fingerprint.
@@ -183,6 +204,18 @@ pub struct Lockstep {
     /// The last block read, not yet compared ([`Lockstep::feed`]).
     held: Option<(CpuState, u64)>,
     resets: u64,
+    /// The resets of both sides the comparison goes on through; the next one ends the window.
+    resets_to_cross: u32,
+    /// The quantities the last reset left different under a row of [`Treatment::KeptAtReset`]:
+    /// the row, QEMU's value (the one it had before the reset) and inkemu's (its reset value).
+    kept: BTreeMap<Field, (u16, u32, u32)>,
+    /// The words of memory an instruction stored a held quantity to, with the same row and
+    /// values: a word load that gives both back holds its destination in turn.
+    kept_memory: BTreeMap<u32, (u16, u32, u32)>,
+    /// inkemu's value of each CSR of [`Treatment::CsrKeptAtReset`] before the last instruction
+    /// executed, and before the last reset crossed.
+    csrs_before_step: BTreeMap<u16, u32>,
+    csrs_before_reset: BTreeMap<u16, u32>,
     history: VecDeque<HistoryEntry>,
     /// The CSRs an instruction has written since power-on, for the pairs that hold until then.
     written: BTreeSet<u16>,
@@ -199,11 +232,11 @@ pub struct Lockstep {
 }
 
 impl Lockstep {
-    /// A comparison of a machine at power-on under the table of this crate, ending after `limit`
-    /// compared instructions when one is given.
+    /// A comparison of a machine at power-on under the rows of the window `hello`, ending at the
+    /// first reset of both sides, or after `limit` compared instructions when one is given.
     #[must_use]
     pub fn new(target: &impl Target, limit: Option<u64>) -> Lockstep {
-        Lockstep::with_rows(target, DIFFERENCES, limit)
+        Lockstep::with_rows(target, HELLO, limit)
     }
 
     /// The same under another table: for the tests of the policy.
@@ -216,6 +249,7 @@ impl Lockstep {
         Lockstep {
             rows,
             limit,
+            bound: None,
             counts: Counts::default(),
             usage: Usage::default(),
             last_block: None,
@@ -225,6 +259,11 @@ impl Lockstep {
             trap: None,
             held: None,
             resets: target.resets(),
+            resets_to_cross: 0,
+            kept: BTreeMap::new(),
+            kept_memory: BTreeMap::new(),
+            csrs_before_step: BTreeMap::new(),
+            csrs_before_reset: BTreeMap::new(),
             history: VecDeque::with_capacity(HISTORY),
             written: BTreeSet::new(),
             meip_lag: 0,
@@ -233,6 +272,16 @@ impl Lockstep {
             counters: BTreeMap::new(),
             captures: BTreeMap::new(),
         }
+    }
+
+    /// A comparison of a machine at power-on in `window` (SP1b-4d, decision J3): under its rows,
+    /// going on through its resets, ending at its bound; `limit` may cut it shorter.
+    #[must_use]
+    pub fn for_window(target: &impl Target, window: &Window, limit: Option<u64>) -> Lockstep {
+        let mut lockstep = Lockstep::with_rows(target, window.rows, limit);
+        lockstep.resets_to_cross = window.resets;
+        lockstep.bound = window.bound;
+        lockstep
     }
 
     /// Holds what the run did to the table (decision H3, [`Usage::check`]) for a window that
@@ -343,9 +392,11 @@ impl Lockstep {
         let qemu_reset = qemu.pc() == RESET_PC;
         let inkemu_reset = target.resets() != self.resets;
         if qemu_reset && inkemu_reset {
-            return Some(End::Window(WindowEnd::Reset));
-        }
-        if qemu_reset || inkemu_reset {
+            if self.counts.resets_crossed >= self.resets_to_cross {
+                return Some(End::Window(WindowEnd::Reset));
+            }
+            self.cross_reset(target, &qemu, &last, executed.as_ref());
+        } else if qemu_reset || inkemu_reset {
             let inkemu = target.state();
             let differing = Field::all()
                 .filter(|&field| qemu.get(field) != inkemu.get(field))
@@ -361,11 +412,26 @@ impl Lockstep {
         }
         let mut adopted = None;
         if let Some(executed) = &executed {
+            // The instruction that asked for the reset read its registers before it.
+            if !(qemu_reset && inkemu_reset)
+                && let Some(field) = self.read_while_kept(executed)
+            {
+                let inkemu = target.state();
+                return Some(self.divergence(
+                    Cause::ReadKeptAtReset { field },
+                    qemu,
+                    inkemu,
+                    vec![field],
+                    Some(executed.clone()),
+                    interrupt,
+                ));
+            }
             if let Some(end) = self.access(executed) {
                 return Some(end);
             }
             adopted = self.adopt(executed, &last, &qemu, target);
             self.note_effects(executed, &last, target);
+            self.reload_kept(executed, &qemu, target);
         }
         if interrupt.is_some() {
             self.counts.interrupts += 1;
@@ -384,12 +450,148 @@ impl Lockstep {
         }
         self.counts.compared += 1;
         if self
+            .bound
+            .is_some_and(|bound| self.counts.compared >= bound)
+        {
+            return Some(End::Window(WindowEnd::Bound));
+        }
+        if self
             .limit
             .is_some_and(|limit| self.counts.compared >= limit)
         {
             return Some(End::Window(WindowEnd::Limit));
         }
         self.execute(target)
+    }
+
+    /// Both sides reset after the same instruction and the comparison goes on. Nothing of the
+    /// machine changes: the chip resets only its CPU at the reset `esp_restart` asks for (TRM
+    /// §6.1), the machine with it, and QEMU its whole machine; every difference that leaves is a
+    /// row of the window's table, or a divergence. What the comparison knew of QEMU starts again
+    /// as at power-on, as QEMU itself does: no CSR has been written since, the counters' gaps are
+    /// fixed again by their next read (QEMU's counters restart from 0), no SPI1 command has run and
+    /// no threshold store is pending. The device time of a slow clock's capture stays: the RTC
+    /// timer of the chip, and of the machine, goes on through a CPU reset, and QEMU has none.
+    ///
+    /// The quantities a row of [`Treatment::KeptAtReset`] names are held when they differ, QEMU's
+    /// being the value it had before the reset (`last`, the state the instruction that asked for
+    /// it started from, which that instruction did not write) and inkemu's its reset value.
+    fn cross_reset(
+        &mut self,
+        target: &impl Target,
+        qemu: &CpuState,
+        last: &CpuState,
+        executed: Option<&Executed>,
+    ) {
+        self.resets = target.resets();
+        self.counts.resets_crossed += 1;
+        self.written.clear();
+        self.meip_lag = 0;
+        self.spi1_user2 = 0;
+        self.spi1_command = None;
+        for counter in self.counters.values_mut() {
+            *counter = CounterState::default();
+        }
+        self.kept.clear();
+        self.kept_memory.clear();
+        self.csrs_before_reset = self.csrs_before_step.clone();
+        let written = executed
+            .filter(|executed| executed.trap.is_none())
+            .and_then(|executed| executed.instruction)
+            .map(|decoded| writes(decoded.instr))
+            .unwrap_or_default();
+        let inkemu = target.state();
+        for row in self.rows {
+            for treatment in row.treatments {
+                let Treatment::KeptAtReset(fields) = treatment else {
+                    continue;
+                };
+                for &field in *fields {
+                    let (q, i) = (qemu.get(field), inkemu.get(field));
+                    if q != i && q == last.get(field) && !written.contains(&field) {
+                        self.kept.insert(field, (row.number, q, i));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first quantity held by [`Treatment::KeptAtReset`] that `executed` read, and releases
+    /// those it wrote: from its write on, a quantity is compared again.
+    ///
+    /// A word store of a held register is not a read that computes anything: it carries the two
+    /// values to memory ([`Lockstep::reload_kept`]), as a function's prologue saves a register it
+    /// will restore. Any other store to a word that carried a pair ends it.
+    fn read_while_kept(&mut self, executed: &Executed) -> Option<Field> {
+        if self.kept.is_empty() && self.kept_memory.is_empty() {
+            return None;
+        }
+        let decoded = executed.instruction?;
+        let instr = decoded.instr;
+        let held = |kept: &BTreeMap<Field, (u16, u32, u32)>, reg: u8| {
+            (reg != 0 && kept.contains_key(&Field::X(reg))).then_some(Field::X(reg))
+        };
+        if let Instr::Store { op, rs1, rs2, .. } = instr {
+            if let Some(field) = held(&self.kept, rs1) {
+                return Some(field);
+            }
+            let address = data_address(decoded, &self.before)?;
+            let carried = (op == StoreOp::W && address % 4 == 0)
+                .then(|| self.kept.get(&Field::X(rs2)).copied())
+                .flatten();
+            if carried.is_none()
+                && let Some(field) = held(&self.kept, rs2)
+            {
+                return Some(field);
+            }
+            if executed.trap.is_none() {
+                let last = address.wrapping_add(store_bytes(op) - 1);
+                self.kept_memory.remove(&(address & !3));
+                self.kept_memory.remove(&(last & !3));
+                if let Some(pair) = carried {
+                    self.kept_memory.insert(address, pair);
+                }
+            }
+            return None;
+        }
+        if let Some(field) = reads(instr)
+            .into_iter()
+            .find(|field| self.kept.contains_key(field))
+        {
+            return Some(field);
+        }
+        if executed.trap.is_none() {
+            for field in writes(instr) {
+                self.kept.remove(&field);
+            }
+        }
+        None
+    }
+
+    /// A word load from a word that carries a held pair: when the two sides loaded exactly that
+    /// pair, its destination is held in turn, with the row that held the register stored.
+    fn reload_kept(&mut self, executed: &Executed, qemu: &CpuState, target: &impl Target) {
+        if self.kept_memory.is_empty() || executed.trap.is_some() {
+            return;
+        }
+        let Some(decoded) = executed.instruction else {
+            return;
+        };
+        let Instr::Load {
+            op: LoadOp::W, rd, ..
+        } = decoded.instr
+        else {
+            return;
+        };
+        let Some(address) = data_address(decoded, &self.before) else {
+            return;
+        };
+        if let Some(&(row, q, i)) = self.kept_memory.get(&address)
+            && rd != 0
+            && (qemu.x(rd), target.state().x(rd)) == (q, i)
+        {
+            self.kept.insert(Field::X(rd), (row, q, i));
+        }
     }
 
     /// Whether the block is QEMU printing the last one again without having executed it: the
@@ -424,6 +626,16 @@ impl Lockstep {
     /// into calls ([`Esp32C3::step`]).
     fn execute(&mut self, target: &mut impl Target) -> Option<End> {
         self.before = target.state();
+        for row in self.rows {
+            for treatment in row.treatments {
+                if let Treatment::CsrKeptAtReset(csrs) = treatment {
+                    for kept in *csrs {
+                        let value = target.csr(kept.csr).unwrap_or(0);
+                        self.csrs_before_step.insert(kept.csr, value);
+                    }
+                }
+            }
+        }
         let mut stepped = target.step();
         let mut slices = 0;
         while matches!(
@@ -459,10 +671,11 @@ impl Lockstep {
             return None;
         }
         let word = address & !3;
+        let after_reset = self.counts.resets_crossed > 0;
         let Some(row) = self
             .rows
             .iter()
-            .find(|row| row.registers_at(word).next().is_some())
+            .find(|row| row.registers_at(word, after_reset).next().is_some())
         else {
             return Some(End::Window(WindowEnd::Absent {
                 address,
@@ -471,7 +684,7 @@ impl Lockstep {
         };
         // A load that copies bits records its use with them ([`Lockstep::adopt`]).
         if !Self::copies(executed) {
-            let site = self.site_of(word, row.registers_at(word));
+            let site = self.site_of(word, row.registers_at(word, after_reset));
             self.usage.record(row.number, site, 0, 0);
         }
         None
@@ -559,15 +772,34 @@ impl Lockstep {
                 self.usage.record(row, Site::at(location), differ, moved);
                 (row, differ)
             }
-            ReadRule::Other => {
-                let (row, site, bits) = self.admitted_read(location, mine, theirs)?;
-                // An admitted access to a register QEMU lacks is a use even when nothing
-                // differs.
-                let absent = matches!(location, Location::Mmio(address) if absent_in_qemu(address));
-                if bits != 0 || absent {
-                    self.usage.record(row, site, bits, 0);
+            ReadRule::KeptCsr {
+                row,
+                csr,
+                kept,
+                mask,
+            } => {
+                let bits = self.kept_csr_read(csr, kept, mask, mine, theirs)?;
+                if bits != 0 {
+                    self.usage.record(row, Site::at(location), bits, 0);
                 }
                 (row, bits)
+            }
+            ReadRule::Other => {
+                let taken = self.admitted_read(location, mine, theirs)?;
+                // An admitted access to a register QEMU lacks is a use even when nothing
+                // differs: of the first row that names it.
+                let absent = matches!(location, Location::Mmio(address) if absent_in_qemu(address));
+                for (i, &(row, site, bits)) in taken.iter().enumerate() {
+                    if bits != 0 || (absent && differ == 0 && i == 0) {
+                        self.usage.record(row, site, bits, 0);
+                    }
+                }
+                let row = taken
+                    .iter()
+                    .find(|(_, _, bits)| *bits != 0)
+                    .or(taken.first())
+                    .map_or(0, |(row, _, _)| *row);
+                (row, differ)
             }
         };
         if bits == 0 {
@@ -614,6 +846,18 @@ impl Lockstep {
                             qemu,
                         };
                     }
+                    Treatment::CsrKeptAtReset(csrs) => {
+                        if let Some(kept) =
+                            csrs.iter().find(|kept| Location::Csr(kept.csr) == location)
+                        {
+                            return ReadRule::KeptCsr {
+                                row: row.number,
+                                csr: kept.csr,
+                                kept: kept.kept,
+                                mask: kept.mask,
+                            };
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -656,6 +900,19 @@ impl Lockstep {
             };
         }
         Some(u32::try_from(moved.unsigned_abs()).unwrap_or(u32::MAX))
+    }
+
+    /// A read of a CSR of [`Treatment::CsrKeptAtReset`] giving `mine` in inkemu and `theirs` in
+    /// QEMU: equal, or, after a reset of both sides, QEMU's is inkemu's with the bits of `kept`
+    /// that inkemu held just before the reset set again, the difference within `mask`. Returns
+    /// the bits to take.
+    fn kept_csr_read(&self, csr: u16, kept: u32, mask: u32, mine: u32, theirs: u32) -> Option<u32> {
+        let differ = mine ^ theirs;
+        if differ == 0 {
+            return Some(0);
+        }
+        let before = *self.csrs_before_reset.get(&csr)?;
+        (theirs == mine | (before & kept) && differ & !mask == 0).then_some(differ)
     }
 
     /// A read of a slow clock QEMU does not model: QEMU reads `qemu`, and inkemu the cycles of
@@ -724,27 +981,14 @@ impl Lockstep {
         location: Location,
         mine: u32,
         theirs: u32,
-    ) -> Option<(u16, Site, u32)> {
+    ) -> Option<Vec<(u16, Site, u32)>> {
         let differ = mine ^ theirs;
+        if let Location::Mmio(address) = location {
+            return self.admitted_register_read(address, differ, theirs);
+        }
         for row in self.rows {
             for treatment in row.treatments {
                 match (*treatment, location) {
-                    (Treatment::Registers(registers), Location::Mmio(address)) => {
-                        if let Some(register) = registers
-                            .iter()
-                            .find(|r| r.address == address && self.condition_holds(r))
-                        {
-                            let qemu_ok = register.qemu.is_none_or(|value| value == theirs);
-                            if differ & !register.mask == 0 && qemu_ok {
-                                let site = Site {
-                                    location,
-                                    after_command: register.after_command,
-                                };
-                                return Some((row.number, site, differ));
-                            }
-                            return None;
-                        }
-                    }
                     (
                         Treatment::Pair {
                             field,
@@ -759,13 +1003,61 @@ impl Lockstep {
                     {
                         let held =
                             differ & !bits == 0 && theirs & bits == qemu && mine & bits == inkemu;
-                        return held.then_some((row.number, Site::at(location), differ));
+                        return held.then(|| vec![(row.number, Site::at(location), differ)]);
                     }
                     _ => {}
                 }
             }
         }
         None
+    }
+
+    /// The rows that admit a word load from `address` whose two values differ by `differ`, QEMU's
+    /// being `theirs`, each with the site and the bits it takes: the register entries there whose
+    /// condition holds, those of [`Treatment::RegistersAfterReset`] once a reset of both sides
+    /// was crossed. Together they must cover every differing bit and agree with QEMU's value; a
+    /// bit goes to the first entry that declares it, in the order of the table. `None` when no
+    /// entry is there, or they do not cover the read.
+    fn admitted_register_read(
+        &self,
+        address: u32,
+        differ: u32,
+        theirs: u32,
+    ) -> Option<Vec<(u16, Site, u32)>> {
+        let after_reset = self.counts.resets_crossed > 0;
+        let entries: Vec<(u16, &Register)> = self
+            .rows
+            .iter()
+            .flat_map(|row| {
+                row.registers_at(address, after_reset)
+                    .filter(|register| self.condition_holds(register))
+                    .map(move |register| (row.number, register))
+            })
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        let covered = entries
+            .iter()
+            .fold(0, |mask, (_, register)| mask | register.mask);
+        let qemu_ok = entries
+            .iter()
+            .all(|(_, register)| register.qemu.is_none_or(|value| value == theirs));
+        if differ & !covered != 0 || !qemu_ok {
+            return None;
+        }
+        let mut left = differ;
+        let mut taken = Vec::with_capacity(entries.len());
+        for (row, register) in &entries {
+            let bits = left & register.mask;
+            left &= !register.mask;
+            let site = Site {
+                location: Location::Mmio(address),
+                after_command: register.after_command,
+            };
+            taken.push((*row, site, bits));
+        }
+        Some(taken)
     }
 
     /// A read of `mip` into a register, under the row of `MEIP`: inkemu reads no `MEIP`, and the
@@ -875,6 +1167,16 @@ impl Lockstep {
         let mut differing = Vec::new();
         for field in Field::all() {
             let (q, i) = (qemu.get(field), inkemu.get(field));
+            if let Some(&(row, held_q, held_i)) = self.kept.get(&field) {
+                if (q, i) == (held_q, held_i) {
+                    if let Some(location) = Location::of(field) {
+                        self.usage.record(row, Site::at(location), 0, 0);
+                    }
+                    continue;
+                }
+                // A trap changed it, or one side alone: compared from now on.
+                self.kept.remove(&field);
+            }
             let admitted = if field == Field::Mip {
                 self.admitted_mip(q, i, target)
             } else if q == i {
@@ -908,9 +1210,11 @@ impl Lockstep {
     /// A difference of a compared CSR that a pair admits, recorded; `None` when none does.
     fn admitted_pair(&mut self, field: Field, q: u32, i: u32) -> Option<u32> {
         let csr = field.csr()?;
-        let (row, site, bits) = self.admitted_read(Location::Csr(csr), i, q)?;
-        self.usage.record(row, site, bits, 0);
-        Some(bits)
+        let taken = self.admitted_read(Location::Csr(csr), i, q)?;
+        for &(row, site, bits) in &taken {
+            self.usage.record(row, site, bits, 0);
+        }
+        Some(q ^ i)
     }
 
     /// `mip`: with a row of `MEIP`, inkemu shows no `MEIP` and QEMU's is the line QEMU's matrix
@@ -986,7 +1290,7 @@ impl Lockstep {
             .collect();
         let exact = address.and_then(|a| {
             self.rows.iter().find_map(|row| {
-                let masks: Vec<u32> = row.registers_at(a).map(|r| r.mask).collect();
+                let masks: Vec<u32> = row.registers_at(a, true).map(|r| r.mask).collect();
                 let held = row
                     .sites()
                     .any(|(site, _)| site.location == Location::Mmio(a));
@@ -1100,6 +1404,84 @@ pub fn loops_on_itself(raw: u32, state: &CpuState) -> bool {
             }
             _ => false,
         }
+    }
+}
+
+/// The compared quantities an instruction reads: its source registers, the CSR it reads, what
+/// `mret` reads, and `mtvec` for an instruction that always traps. `x0` is not a quantity.
+fn reads(instr: Instr) -> Vec<Field> {
+    let x = |reg: u8| (reg != 0).then_some(Field::X(reg));
+    match instr {
+        Instr::Jalr { rs1, .. } | Instr::Load { rs1, .. } | Instr::OpImm { rs1, .. } => {
+            x(rs1).into_iter().collect()
+        }
+        Instr::Branch { rs1, rs2, .. }
+        | Instr::Store { rs1, rs2, .. }
+        | Instr::Op { rs1, rs2, .. }
+        | Instr::MulDiv { rs1, rs2, .. } => x(rs1).into_iter().chain(x(rs2)).collect(),
+        Instr::Csr {
+            op,
+            rd,
+            src,
+            uimm,
+            csr,
+        } => {
+            let source = (!uimm).then(|| x(src)).flatten();
+            let read = (op != CsrOp::Rw || rd != 0)
+                .then(|| Field::of_csr(csr))
+                .flatten();
+            source.into_iter().chain(read).collect()
+        }
+        Instr::Mret => vec![Field::Mepc, Field::Mstatus],
+        Instr::Ecall | Instr::Ebreak | Instr::Illegal(_) => vec![Field::Mtvec],
+        Instr::Lui { .. }
+        | Instr::Auipc { .. }
+        | Instr::Jal { .. }
+        | Instr::Fence
+        | Instr::FenceI
+        | Instr::Wfi => Vec::new(),
+    }
+}
+
+/// The compared quantities an instruction that does not trap writes: its destination register,
+/// the CSR it writes, and `mstatus` for `mret`.
+fn writes(instr: Instr) -> Vec<Field> {
+    let x = |reg: u8| (reg != 0).then_some(Field::X(reg));
+    match instr {
+        Instr::Lui { rd, .. }
+        | Instr::Auipc { rd, .. }
+        | Instr::Jal { rd, .. }
+        | Instr::Jalr { rd, .. }
+        | Instr::Load { rd, .. }
+        | Instr::OpImm { rd, .. }
+        | Instr::Op { rd, .. }
+        | Instr::MulDiv { rd, .. } => x(rd).into_iter().collect(),
+        Instr::Csr {
+            op, rd, src, csr, ..
+        } => {
+            let written = (op == CsrOp::Rw || src != 0)
+                .then(|| Field::of_csr(csr))
+                .flatten();
+            x(rd).into_iter().chain(written).collect()
+        }
+        Instr::Mret => vec![Field::Mstatus],
+        Instr::Branch { .. }
+        | Instr::Store { .. }
+        | Instr::Fence
+        | Instr::FenceI
+        | Instr::Ecall
+        | Instr::Ebreak
+        | Instr::Wfi
+        | Instr::Illegal(_) => Vec::new(),
+    }
+}
+
+/// The bytes a store writes.
+const fn store_bytes(op: StoreOp) -> u32 {
+    match op {
+        StoreOp::B => 1,
+        StoreOp::H => 2,
+        StoreOp::W => 4,
     }
 }
 

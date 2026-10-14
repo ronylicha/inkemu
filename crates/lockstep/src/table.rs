@@ -29,6 +29,24 @@ pub enum Treatment {
     /// ([`soc_esp32c3::Esp32C3::external_interrupt_as_qemu`]); QEMU may keep it up `lag`
     /// instructions after a store to `CPU_INT_THRESH` has brought that line down.
     ExternalInterrupt { lag: u8 },
+    /// (i) What a reset of both sides leaves different: the chip resets only its CPU at the reset
+    /// `esp_restart` asks for, inkemu's CPU takes its reset values (`cpu_rv32::Hart::reset`),
+    /// and QEMU, which resets its whole machine, leaves these quantities as they were before the
+    /// reset. Each is held to exactly those two values, QEMU's from before the reset and inkemu's
+    /// from its reset, until an instruction writes it or a trap changes it; an instruction that
+    /// reads one while it is held is a divergence, since the two sides would compute from
+    /// different values.
+    KeptAtReset(&'static [Field]),
+    /// (ii) CSRs QEMU does not print, some bits of which its reset keeps where the chip's CPU
+    /// reset, as inkemu's, clears them: after a reset of both sides, a read into a register gives
+    /// in QEMU inkemu's value with those of the kept bits inkemu held before the reset set again
+    /// ([`KeptCsr`]), or inkemu's value itself; the register takes QEMU's bits, within the mask.
+    CsrKeptAtReset(&'static [KeptCsr]),
+    /// (ii) Registers a CPU reset leaves as the life before it set them, where QEMU's reset of
+    /// its whole machine takes them back to its reset values: the same copy as
+    /// [`Treatment::Registers`], made only after a reset of both sides, on top of what the
+    /// entries of `Registers` at the same address take.
+    RegistersAfterReset(&'static [Register]),
     /// (ii) Registers of a peripheral the two model differently, or of one QEMU lacks: an access
     /// to one of them is admitted (it does not end the window), and a word load from one takes
     /// in inkemu QEMU's bits of `mask`, every other bit being compared.
@@ -86,11 +104,35 @@ pub struct Register {
     pub after_command: Option<u8>,
 }
 
-/// What a counter row reads: a peripheral register, or a CSR.
+/// A CSR of [`Treatment::CsrKeptAtReset`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeptCsr {
+    pub csr: u16,
+    /// The bits QEMU's reset keeps.
+    pub kept: u32,
+    /// The bits a read may take from QEMU: those measured to differ.
+    pub mask: u32,
+}
+
+/// Where a row acts: a peripheral register, a CSR, or an integer register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Location {
     Mmio(u32),
     Csr(u16),
+    /// `x1` to `x31`.
+    Integer(u8),
+}
+
+impl Location {
+    /// Where a compared quantity is; `None` for the PC.
+    #[must_use]
+    pub fn of(field: Field) -> Option<Location> {
+        match field {
+            Field::Pc => None,
+            Field::X(reg) => Some(Location::Integer(reg)),
+            csr => csr.csr().map(Location::Csr),
+        }
+    }
 }
 
 impl std::fmt::Display for Location {
@@ -98,6 +140,7 @@ impl std::fmt::Display for Location {
         match self {
             Location::Mmio(address) => write!(f, "{address:#010x}"),
             Location::Csr(csr) => write!(f, "CSR {csr:#05x}"),
+            Location::Integer(reg) => write!(f, "x{reg}"),
         }
     }
 }
@@ -137,10 +180,14 @@ impl Treatment {
     #[must_use]
     pub const fn kind(self) -> &'static str {
         match self {
-            Treatment::Pair { .. } | Treatment::ExternalInterrupt { .. } => "i",
-            Treatment::Registers(_) | Treatment::Counter { .. } | Treatment::SlowClock { .. } => {
-                "ii"
-            }
+            Treatment::Pair { .. }
+            | Treatment::ExternalInterrupt { .. }
+            | Treatment::KeptAtReset(_) => "i",
+            Treatment::Registers(_)
+            | Treatment::RegistersAfterReset(_)
+            | Treatment::CsrKeptAtReset(_)
+            | Treatment::Counter { .. }
+            | Treatment::SlowClock { .. } => "ii",
             Treatment::Compat(_) => "iv",
         }
     }
@@ -174,12 +221,18 @@ pub struct Difference {
 }
 
 impl Difference {
-    /// The registers of the row at `address`, every condition included.
-    pub fn registers_at(&self, address: u32) -> impl Iterator<Item = &'static Register> + '_ {
+    /// The registers of the row at `address`, every condition included, those of
+    /// [`Treatment::RegistersAfterReset`] when `after_reset` (a reset of both sides was crossed).
+    pub fn registers_at(
+        &self,
+        address: u32,
+        after_reset: bool,
+    ) -> impl Iterator<Item = &'static Register> + '_ {
         self.treatments
             .iter()
-            .filter_map(|treatment| match treatment {
+            .filter_map(move |treatment| match treatment {
                 Treatment::Registers(registers) => Some(registers.iter()),
+                Treatment::RegistersAfterReset(registers) if after_reset => Some(registers.iter()),
                 _ => None,
             })
             .flatten()
@@ -203,15 +256,27 @@ impl Difference {
                     Treatment::ExternalInterrupt { .. } => {
                         Box::new(std::iter::once((Site::at(Location::Csr(MIP)), MEIP)))
                     }
-                    Treatment::Registers(registers) => Box::new(registers.iter().map(|register| {
-                        (
-                            Site {
-                                location: Location::Mmio(register.address),
-                                after_command: register.after_command,
-                            },
-                            register.mask,
-                        )
-                    })),
+                    Treatment::KeptAtReset(fields) => Box::new(
+                        fields
+                            .iter()
+                            .filter_map(|&field| Location::of(field))
+                            .map(|location| (Site::at(location), 0)),
+                    ),
+                    Treatment::Registers(registers) | Treatment::RegistersAfterReset(registers) => {
+                        Box::new(registers.iter().map(|register| {
+                            (
+                                Site {
+                                    location: Location::Mmio(register.address),
+                                    after_command: register.after_command,
+                                },
+                                register.mask,
+                            )
+                        }))
+                    }
+                    Treatment::CsrKeptAtReset(csrs) => Box::new(
+                        csrs.iter()
+                            .map(|kept| (Site::at(Location::Csr(kept.csr)), kept.mask)),
+                    ),
                     Treatment::Counter { location, .. } => {
                         Box::new(std::iter::once((Site::at(location), 0)))
                     }
@@ -330,364 +395,703 @@ const fn admit(address: u32) -> Register {
     copy(address, 0)
 }
 
-/// The table, in the order of `docs/lockstep-differences.md`. Every mask is the bits measured to
-/// differ in the window of `flash_hello.bin` (the document gives the measure and the source of
-/// each); a firmware that shows another bit, or reaches another register, fails the run until a
-/// row admits it with its evidence.
+/// Row 1. Rows 1 to 24 were measured on the first life of `flash_hello.bin` (SP1b-4c): every mask
+/// is the bits measured to differ there (`docs/lockstep-differences.md` gives the measure and the
+/// source of each). A window that shows another bit, or reaches another register, fails until a
+/// row of its own admits it with its evidence.
+pub const ROW_MSTATUS_MPP: Difference = Difference {
+    number: 1,
+    summary: "mstatus.MPP: QEMU 0 throughout, inkemu wires it to machine mode",
+    treatments: &[Treatment::Pair {
+        field: Field::Mstatus,
+        bits: 0x0000_1800,
+        qemu: 0,
+        inkemu: 0x0000_1800,
+        until_written: false,
+    }],
+};
+
+/// Row 2.
+pub const ROW_MIE_AT_POWER_ON: Difference = Difference {
+    number: 2,
+    summary: "mie at power-on: QEMU 0x0EEE, inkemu 0, until mie is written",
+    treatments: &[Treatment::Pair {
+        field: Field::Mie,
+        bits: 0x0000_0EEE,
+        qemu: 0x0000_0EEE,
+        inkemu: 0,
+        until_written: true,
+    }],
+};
+
+/// Row 3.
+pub const ROW_MTVEC_MODE_AT_POWER_ON: Difference = Difference {
+    number: 3,
+    summary: "mtvec.MODE at power-on: QEMU direct, inkemu vectored, until mtvec is written",
+    treatments: &[Treatment::Pair {
+        field: Field::Mtvec,
+        bits: 0x0000_0001,
+        qemu: 0,
+        inkemu: 1,
+        until_written: true,
+    }],
+};
+
+/// Row 4.
+pub const ROW_MEIP: Difference = Difference {
+    number: 4,
+    summary: "mip.MEIP: QEMU's interrupt-matrix line, three instructions late after a threshold store",
+    treatments: &[Treatment::ExternalInterrupt { lag: 3 }],
+};
+
+/// Row 5.
+pub const ROW_CYCLE_COUNTER: Difference = Difference {
+    number: 5,
+    summary: "cycle counter: both count 6.25 ns of device time, QEMU's from its first read",
+    treatments: &[
+        Treatment::Compat(Compat::CycleCounterOnTimeBase),
+        Treatment::Counter {
+            location: Location::Csr(MPCCR),
+            drift: Drift::Within(1),
+            origins: &[Location::Csr(MPCCR), Location::Csr(UPCCR)],
+        },
+        Treatment::Counter {
+            location: Location::Csr(UPCCR),
+            drift: Drift::Within(1),
+            origins: &[Location::Csr(MPCCR), Location::Csr(UPCCR)],
+        },
+    ],
+};
+
+/// Row 6.
+pub const ROW_UART0: Difference = Difference {
+    number: 6,
+    summary: "UART0: line levels, FIFO count and reset values QEMU does not model",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6000_001C, 0xE0FF_C000),
+        copy(0x6000_0020, 0x1000_001C),
+        copy(0x6000_006C, 0x0000_0010),
+        copy(0x6000_0078, 0x1672_2500),
+    ])],
+};
+
+/// Row 7.
+pub const ROW_SPI1: Difference = Difference {
+    number: 7,
+    summary: "SPI1: QEMU's flash does not answer SFDP, leaves W0 stale, and lacks reset values",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6000_2034, 0x0000_0002),
+        Register {
+            address: 0x6000_2058,
+            mask: 0x0018_60FF,
+            qemu: None,
+            after_command: Some(0x5A),
+        },
+        Register {
+            address: 0x6000_2058,
+            mask: 0x0018_6000,
+            qemu: None,
+            after_command: Some(0x05),
+        },
+        copy(0x6000_2098, 0x0000_0014),
+        copy(0x6000_209C, 0x0A00_2000),
+        copy(0x6000_20DC, 0x0000_0001),
+    ])],
+};
+
+/// Row 8.
+pub const ROW_SPI0: Difference = Difference {
+    number: 8,
+    summary: "SPI0, absent in QEMU: the cache's flash configuration",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6000_3008, 0x00AC_2008),
+        copy(0x6000_3010, 0x0000_0061),
+        admit(0x6000_3014),
+        copy(0x6000_3018, 0x7000_00C0),
+        copy(0x6000_301C, 0x5C00_0007),
+        copy(0x6000_3020, 0x7000_0003),
+        admit(0x6000_3024),
+        admit(0x6000_3028),
+        admit(0x6000_3034),
+        copy(0x6000_303C, 0x0000_0001),
+        copy(0x6000_3054, 0x0000_0200),
+        copy(0x6000_30DC, 0x0000_0001),
+        admit(0x6000_30E0),
+    ])],
+};
+
+/// Row 9.
+pub const ROW_RTC_CNTL: Difference = Difference {
+    number: 9,
+    summary: "RTC_CNTL: QEMU models OPTIONS0, RESET_STATE and STORE0-7 only",
+    treatments: &[
+        Treatment::SlowClock {
+            register: RTC_TIME_LOW0,
+            capture: RTC_TIME_UPDATE,
+            trigger: 1 << 31,
+            hz: 136_000,
+            bound: 1,
+            qemu: 0,
+        },
+        Treatment::Registers(&[
+            copy(0x6000_8000, 0x1C00_A000),
+            copy(0x6000_801C, 0x3C14_0543),
+            copy(0x6000_8024, 0x0A08_0A09),
+            copy(0x6000_8028, 0x1220_0A09),
+            copy(0x6000_802C, 0x0000_8000),
+            copy(0x6000_8030, 0x0A08_0000),
+            copy(0x6000_8034, 0x00D4_0000),
+            copy(0x6000_8038, 0x0000_3000),
+            copy(0x6000_8040, 0x0000_0200),
+            copy(0x6000_8070, 0x31D8_3298),
+            copy(0x6000_8074, 0x0040_0000),
+            copy(0x6000_8080, 0xA03F_C000),
+            copy(0x6000_8088, 0x0057_5010),
+            copy(0x6000_808C, 0xBA80_5480),
+            copy(0x6000_8090, 0xF807_FA14),
+            copy(0x6000_80AC, 0x04B0_0000),
+            copy(0x6000_80D8, 0x7BFF_C030),
+            copy(0x6000_810C, 0x0000_0007),
+            copy(0x6000_811C, 0xC000_0000),
+        ]),
+    ],
+};
+
+/// Row 10.
+pub const ROW_EFUSE: Difference = Difference {
+    number: 10,
+    summary: "eFuse: the words where QEMU's blank eFuses and the X4's differ",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6000_883C, 0x8000_0000),
+        copy(0x6000_8848, 0x0000_58CF),
+        copy(0x6000_8850, 0x0100_0000),
+        copy(0x6000_8858, 0x0047_D2F2),
+        copy(0x6000_886C, 0xD864_EA40),
+    ])],
+};
+
+/// Row 11.
+pub const ROW_IO_MUX: Difference = Difference {
+    number: 11,
+    summary: "IO_MUX, absent in QEMU: the pad configuration of GPIO0-21",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6000_9004, 0x0000_0B00),
+        copy(0x6000_9008, 0x0000_0B00),
+        copy(0x6000_900C, 0x0000_0B00),
+        copy(0x6000_9010, 0x0000_0B00),
+        copy(0x6000_9014, 0x0000_0B00),
+        copy(0x6000_9018, 0x0000_0B00),
+        copy(0x6000_901C, 0x0000_0B00),
+        copy(0x6000_9020, 0x0000_0B00),
+        copy(0x6000_9024, 0x0000_0B00),
+        copy(0x6000_9028, 0x0000_0B00),
+        copy(0x6000_902C, 0x0000_0B00),
+        copy(0x6000_9030, 0x0000_0B00),
+        copy(0x6000_9034, 0x0000_1F00),
+        copy(0x6000_9038, 0x0000_1F00),
+        copy(0x6000_903C, 0x0000_0F00),
+        copy(0x6000_9040, 0x0000_0F00),
+        copy(0x6000_9044, 0x0000_0F00),
+        copy(0x6000_9048, 0x0000_0F00),
+        copy(0x6000_904C, 0x0000_0B00),
+        copy(0x6000_9050, 0x0000_0B00),
+        copy(0x6000_9054, 0x0000_0B00),
+        copy(0x6000_9058, 0x0000_0B00),
+    ])],
+};
+
+/// Row 12.
+pub const ROW_REGI2C: Difference = Difference {
+    number: 12,
+    summary: "analog I2C master, absent in QEMU: the ROM's regi2c accesses",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6000_E000, 0x05FF_FF9E),
+        copy(0x6000_E044, 0x00FF_FFFF),
+        copy(0x6000_E048, 0x00FF_FFFF),
+    ])],
+};
+
+/// Row 13.
+pub const ROW_RADIO: Difference = Difference {
+    number: 13,
+    summary: "radio power-up of rtc_sleep_pu, absent in QEMU: BB, NRX, FE and FE2",
+    treatments: &[Treatment::Registers(&[
+        admit(0x6000_50F0),
+        admit(0x6000_6090),
+        admit(0x6001_CCD4),
+        admit(0x6001_D054),
+    ])],
+};
+
+/// Row 14.
+pub const ROW_TIMG: Difference = Difference {
+    number: 14,
+    summary: "TIMG0 and TIMG1: watchdog reset values, clock gates and the RTC calibration",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6001_F048, 0x0004_C000),
+        copy(0x6001_F04C, 0x0001_0000),
+        copy(0x6001_F068, 0x0000_8000),
+        copy(0x6001_F06C, 0x024C_3C00),
+        copy(0x6001_F080, 0xFFFF_FF99),
+        copy(0x6001_F0FC, 0x6000_0000),
+        copy(0x6002_0048, 0x0004_C000),
+        copy(0x6002_004C, 0x0001_0000),
+        copy(0x6002_00FC, 0x6000_0000),
+    ])],
+};
+
+/// Row 15.
+pub const ROW_SYSTIMER: Difference = Difference {
+    number: 15,
+    summary: "SYSTIMER: QEMU's counters drop a fraction of a count at each update and always read valid",
+    treatments: &[
+        Treatment::Registers(&[
+            copy(0x6002_3004, 0x2000_0000),
+            copy(0x6002_3008, 0x2000_0000),
+        ]),
+        Treatment::Counter {
+            location: Location::Mmio(SYSTIMER_UNIT0_VALUE_LO),
+            drift: Drift::Truncated {
+                first: SYSTIMER.0,
+                last: SYSTIMER.1,
+            },
+            origins: &[
+                Location::Mmio(SYSTEM_PERIP_RST_EN0),
+                Location::Mmio(SYSTIMER_CONF),
+            ],
+        },
+        Treatment::Counter {
+            location: Location::Mmio(SYSTIMER_UNIT1_VALUE_LO),
+            drift: Drift::Truncated {
+                first: SYSTIMER.0,
+                last: SYSTIMER.1,
+            },
+            origins: &[
+                Location::Mmio(SYSTEM_PERIP_RST_EN0),
+                Location::Mmio(SYSTIMER_CONF),
+            ],
+        },
+    ],
+};
+
+/// Row 16.
+pub const ROW_APB_CTRL: Difference = Difference {
+    number: 16,
+    summary: "APB_CTRL, absent in QEMU: Wi-Fi clocks and memory power",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6002_6014, 0xFFFF_FFFF),
+        admit(0x6002_6018),
+        copy(0x6002_609C, 0x0000_0015),
+        copy(0x6002_60AC, 0x0000_003F),
+    ])],
+};
+
+/// Row 17.
+pub const ROW_RNG: Difference = Difference {
+    number: 17,
+    summary: "RNG: QEMU returns the host's rand()",
+    treatments: &[Treatment::Registers(&[copy(0x6002_60B0, u32::MAX)])],
+};
+
+/// Row 18.
+pub const ROW_APB_SARADC: Difference = Difference {
+    number: 18,
+    summary: "APB_SARADC, absent in QEMU: the seven registers of the bootloader's entropy source",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6004_0000, 0x5883_82C0),
+        copy(0x6004_0004, 0x0106_E1FE),
+        copy(0x6004_000C, 0x00FF_080D),
+        copy(0x6004_0018, 0x009C_FFFF),
+        copy(0x6004_001C, 0x00FF_FFFF),
+        copy(0x6004_0050, 0x8000_00FF),
+        copy(0x6004_0054, 0x0050_000F),
+    ])],
+};
+
+/// Row 19.
+pub const ROW_USB_SERIAL_JTAG: Difference = Difference {
+    number: 19,
+    summary: "USB-Serial-JTAG: SERIAL_IN_EP_DATA_FREE, which QEMU reads 0",
+    treatments: &[Treatment::Registers(&[copy(0x6004_3004, 0x0000_0002)])],
+};
+
+/// Row 20.
+pub const ROW_SYSTEM: Difference = Difference {
+    number: 20,
+    summary: "SYSTEM: clock gates, resets and clock selection QEMU's clock model keeps otherwise",
+    treatments: &[Treatment::Registers(&[
+        copy(0x600C_0000, 0x0000_0040),
+        copy(0x600C_0004, 0x0000_00C0),
+        copy(0x600C_0008, 0x0000_000C),
+        copy(0x600C_000C, 0x0000_0001),
+        copy(0x600C_0010, 0xF9C1_E06F),
+        copy(0x600C_0014, 0x0000_0204),
+        copy(0x600C_0018, 0xA86D_BBEE),
+        copy(0x600C_001C, 0x0000_01FE),
+        copy(0x600C_0020, 0x0000_00FF),
+        copy(0x600C_0024, 0x0200_1001),
+        copy(0x600C_0040, 0x0000_0007),
+        copy(0x600C_0058, 0x0008_0401),
+    ])],
+};
+
+/// Row 21.
+pub const ROW_SENSITIVE: Difference = Difference {
+    number: 21,
+    summary: "SENSITIVE, absent in QEMU: the memory protection ESP-IDF sets up",
+    treatments: &[Treatment::Registers(&[
+        copy(0x600C_101C, 0x0000_000F),
+        admit(0x600C_1090),
+        admit(0x600C_1094),
+        admit(0x600C_1098),
+        admit(0x600C_109C),
+        admit(0x600C_10A0),
+        admit(0x600C_10A4),
+        admit(0x600C_10A8),
+        copy(0x600C_10B0, 0x001C_7FFF),
+        admit(0x600C_10B4),
+        copy(0x600C_10B8, 0x0000_0003),
+        admit(0x600C_10C0),
+        copy(0x600C_10C4, 0x0F0F_F0FF),
+        admit(0x600C_10C8),
+        copy(0x600C_10CC, 0x0000_0003),
+        admit(0x600C_10D8),
+        copy(0x600C_10FC, 0x003F_FFFF),
+        copy(0x600C_1100, 0x0000_0FFF),
+        admit(0x600C_1130),
+        copy(0x600C_1134, 0x0000_0003),
+    ])],
+};
+
+/// Row 22.
+pub const ROW_EXTMEM: Difference = Difference {
+    number: 22,
+    summary: "EXTMEM: power, freeze and sync bits QEMU's cache model does not keep",
+    treatments: &[Treatment::Registers(&[
+        copy(0x600C_4004, 0x0000_0003),
+        copy(0x600C_4008, 0x0000_0005),
+        copy(0x600C_4028, 0x0000_0002),
+        copy(0x600C_40AC, 0x0000_0005),
+        copy(0x600C_40C4, 0x0000_000F),
+        copy(0x600C_40CC, 0x0000_0001),
+    ])],
+};
+
+/// Row 23.
+pub const ROW_ASSIST_DEBUG: Difference = Difference {
+    number: 23,
+    summary: "ASSIST_DEBUG, absent in QEMU: the stack monitor of FreeRTOS",
+    treatments: &[Treatment::Registers(&[
+        copy(0x600C_E000, 0x0000_0300),
+        admit(0x600C_E008),
+        admit(0x600C_E038),
+        admit(0x600C_E03C),
+        admit(0x600C_E044),
+        admit(0x600C_E048),
+        admit(0x600C_E098),
+    ])],
+};
+
+/// Row 24.
+pub const ROW_SYSTIMER_STOPPED: Difference = Difference {
+    number: 24,
+    summary: "SYSTIMER: no alarm while the counter is stopped",
+    treatments: &[Treatment::Compat(Compat::SystimerNoAlarmOnStoppedCounter)],
+};
+
+/// Row 25. Rows 25 to 27 were measured on the second life of `flash_hello.bin` (SP1b-4d), after
+/// the reset `esp_restart` asks for.
+pub const ROW_HELLO_KEPT_AT_RESET: Difference = Difference {
+    number: 25,
+    summary: "flash_hello.bin, at its reset: QEMU keeps registers and CSRs the chip's CPU reset sets",
+    treatments: &[Treatment::KeptAtReset(&[
+        Field::X(1),
+        Field::X(2),
+        Field::X(3),
+        Field::X(4),
+        Field::X(5),
+        Field::X(8),
+        Field::X(9),
+        Field::X(11),
+        Field::X(12),
+        Field::X(13),
+        Field::X(14),
+        Field::X(15),
+        Field::X(16),
+        Field::X(17),
+        Field::X(28),
+        Field::Mstatus,
+        Field::Mtvec,
+        Field::Mepc,
+    ])],
+};
+
+/// The R, W and X bits of the four entries of a `pmpcfg` register (RISC-V privileged
+/// specification, §3.7.1): a reset must clear A and L, and leaves these unspecified.
+pub const PMP_RWX: u32 = 0x0707_0707;
+
+/// Row 26.
+pub const ROW_PMP_KEPT_AT_RESET: Difference = Difference {
+    number: 26,
+    summary: "PMP configuration: QEMU's reset keeps the R, W, X bits of every entry, the chip's CPU reset clears them",
+    treatments: &[Treatment::CsrKeptAtReset(&[
+        KeptCsr {
+            csr: 0x3A0,
+            kept: PMP_RWX,
+            mask: 0x0100_0700,
+        },
+        KeptCsr {
+            csr: 0x3A1,
+            kept: PMP_RWX,
+            mask: 0x0005_0103,
+        },
+        KeptCsr {
+            csr: 0x3A2,
+            kept: PMP_RWX,
+            mask: 0x0700_0507,
+        },
+        KeptCsr {
+            csr: 0x3A3,
+            kept: PMP_RWX,
+            mask: 0x0000_0300,
+        },
+    ])],
+};
+
+/// Row 27.
+pub const ROW_AFTER_RESET: Difference = Difference {
+    number: 27,
+    summary: "after esp_restart: registers the chip's reset and QEMU's leave in different states",
+    treatments: &[Treatment::RegistersAfterReset(&[
+        copy(0x6000_0014, 0x0030_03ED),
+        copy(0x6000_0078, 0x0000_1000),
+        copy(0x6000_2010, 0x0000_03E0),
+        copy(0x6000_2028, 0x0000_0017),
+        copy(0x6000_4154, 0x0000_0030),
+        copy(0x6000_4158, 0x0000_0030),
+        copy(0x6000_8024, 0x0001_0000),
+        copy(0x6000_8028, 0x0001_0000),
+        copy(0x6000_802C, 0x0000_0200),
+        copy(0x6000_8030, 0x0001_0000),
+        copy(0x6000_8080, 0x1000_0000),
+        copy(0x6000_8088, 0x0000_0800),
+        copy(0x6000_808C, 0x0040_0000),
+        copy(0x6000_80AC, 0x8000_0000),
+        copy(0x6000_9004, 0x0000_0002),
+        copy(0x6000_9008, 0x0000_0002),
+        copy(0x6000_900C, 0x0000_0002),
+        copy(0x6000_9010, 0x0000_0002),
+        copy(0x6000_9014, 0x0000_0002),
+        copy(0x6000_9018, 0x0000_0002),
+        copy(0x6000_901C, 0x0000_0002),
+        copy(0x6000_9020, 0x0000_0002),
+        copy(0x6000_9024, 0x0000_0002),
+        copy(0x6000_9028, 0x0000_0002),
+        copy(0x6000_902C, 0x0000_0002),
+        copy(0x6000_9030, 0x0000_0002),
+        copy(0x6000_9034, 0x0000_0002),
+        copy(0x6000_9038, 0x0000_0002),
+        copy(0x6000_9040, 0x0000_0002),
+        copy(0x6000_9044, 0x0000_0002),
+        copy(0x6000_9048, 0x0000_0002),
+        copy(0x6000_904C, 0x0000_0002),
+        copy(0x6000_9050, 0x0000_0002),
+        copy(0x6001_F048, 0x383B_0000),
+        copy(0x6001_F04C, 0x4E20_0000),
+        copy(0x6001_F068, 0x0401_3000),
+        copy(0x6002_004C, 0x4E20_0000),
+        copy(0x6004_0018, 0x0063_0000),
+        copy(0x600C_0008, 0x0000_0001),
+        copy(0x600C_0018, 0x5712_4411),
+        copy(0x600C_001C, 0xFFFF_FE01),
+        copy(0x600C_0024, 0x0100_0000),
+        copy(0x600C_4078, 0x0000_0023),
+        copy(0x600C_4084, 0x0000_003F),
+        copy(0x600C_E008, 0x0000_0300),
+        copy(0x600C_E048, 0x4004_8B92),
+    ])],
+};
+
+/// Row 28.
+pub const ROW_HELLO_SPI1_AFTER_RESET: Difference = Difference {
+    number: 28,
+    summary: "flash_hello.bin, after its reset: the SPI1 registers the bootloader reads back",
+    treatments: &[Treatment::RegistersAfterReset(&[
+        copy(0x6000_2018, 0x0000_0080),
+        copy(0x6000_2020, 0x0000_009F),
+    ])],
+};
+
+/// Row 29. Rows 29 to 32 were measured on both lives of `flash_nvs.bin` (SP1b-4d).
+pub const ROW_NVS_SPI1: Difference = Difference {
+    number: 29,
+    summary: "flash_nvs.bin, SPI1: row 7, and QEMU's flash keeps WEL after a program or an erase",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6000_2034, 0x0000_0002),
+        Register {
+            address: 0x6000_2058,
+            mask: 0x0018_60FF,
+            qemu: None,
+            after_command: Some(0x5A),
+        },
+        Register {
+            address: 0x6000_2058,
+            mask: 0xFFFF_FF02,
+            qemu: None,
+            after_command: Some(0x05),
+        },
+        copy(0x6000_2098, 0x0000_0014),
+        copy(0x6000_209C, 0x0A00_2000),
+        copy(0x6000_20DC, 0x0000_0001),
+    ])],
+};
+
+/// Row 30.
+pub const ROW_NVS_EXTMEM: Difference = Difference {
+    number: 30,
+    summary: "flash_nvs.bin, EXTMEM: the cache sync around flash writes",
+    treatments: &[Treatment::Registers(&[copy(0x600C_4030, 0x0000_0800)])],
+};
+
+/// Row 31.
+pub const ROW_NVS_KEPT_AT_RESET: Difference = Difference {
+    number: 31,
+    summary: "flash_nvs.bin, at its reset: QEMU keeps registers and CSRs the chip's CPU reset sets",
+    treatments: &[Treatment::KeptAtReset(&[
+        Field::X(1),
+        Field::X(2),
+        Field::X(3),
+        Field::X(4),
+        Field::X(5),
+        Field::X(7),
+        Field::X(8),
+        Field::X(9),
+        Field::X(11),
+        Field::X(12),
+        Field::X(13),
+        Field::X(14),
+        Field::X(15),
+        Field::X(16),
+        Field::X(17),
+        Field::X(28),
+        Field::X(29),
+        Field::X(30),
+        Field::X(31),
+        Field::Mstatus,
+        Field::Mtvec,
+        Field::Mepc,
+    ])],
+};
+
+/// Row 32.
+pub const ROW_NVS_SPI1_AFTER_RESET: Difference = Difference {
+    number: 32,
+    summary: "flash_nvs.bin, after its reset: the SPI1 registers the bootloader reads back",
+    treatments: &[Treatment::RegistersAfterReset(&[
+        copy(0x6000_2018, 0x1000_0080),
+        copy(0x6000_2020, 0x0000_0005),
+    ])],
+};
+
+/// The rows of the window `hello` ([`crate::window::WINDOWS`]).
+pub const HELLO: &[Difference] = &[
+    ROW_MSTATUS_MPP,
+    ROW_MIE_AT_POWER_ON,
+    ROW_MTVEC_MODE_AT_POWER_ON,
+    ROW_MEIP,
+    ROW_CYCLE_COUNTER,
+    ROW_UART0,
+    ROW_SPI1,
+    ROW_SPI0,
+    ROW_RTC_CNTL,
+    ROW_EFUSE,
+    ROW_IO_MUX,
+    ROW_REGI2C,
+    ROW_RADIO,
+    ROW_TIMG,
+    ROW_SYSTIMER,
+    ROW_APB_CTRL,
+    ROW_RNG,
+    ROW_APB_SARADC,
+    ROW_USB_SERIAL_JTAG,
+    ROW_SYSTEM,
+    ROW_SENSITIVE,
+    ROW_EXTMEM,
+    ROW_ASSIST_DEBUG,
+    ROW_SYSTIMER_STOPPED,
+    ROW_HELLO_KEPT_AT_RESET,
+    ROW_PMP_KEPT_AT_RESET,
+    ROW_AFTER_RESET,
+    ROW_HELLO_SPI1_AFTER_RESET,
+];
+
+/// The rows of the window `nvs`.
+pub const NVS: &[Difference] = &[
+    ROW_MSTATUS_MPP,
+    ROW_MIE_AT_POWER_ON,
+    ROW_MTVEC_MODE_AT_POWER_ON,
+    ROW_MEIP,
+    ROW_CYCLE_COUNTER,
+    ROW_UART0,
+    ROW_SPI0,
+    ROW_RTC_CNTL,
+    ROW_EFUSE,
+    ROW_IO_MUX,
+    ROW_REGI2C,
+    ROW_RADIO,
+    ROW_TIMG,
+    ROW_SYSTIMER,
+    ROW_APB_CTRL,
+    ROW_RNG,
+    ROW_APB_SARADC,
+    ROW_USB_SERIAL_JTAG,
+    ROW_SYSTEM,
+    ROW_SENSITIVE,
+    ROW_EXTMEM,
+    ROW_ASSIST_DEBUG,
+    ROW_SYSTIMER_STOPPED,
+    ROW_PMP_KEPT_AT_RESET,
+    ROW_AFTER_RESET,
+    ROW_NVS_SPI1,
+    ROW_NVS_EXTMEM,
+    ROW_NVS_KEPT_AT_RESET,
+    ROW_NVS_SPI1_AFTER_RESET,
+];
+
+/// Every row of the table, in the order of `docs/lockstep-differences.md`: those of every window.
 pub const DIFFERENCES: &[Difference] = &[
-    Difference {
-        number: 1,
-        summary: "mstatus.MPP: QEMU 0 throughout, inkemu wires it to machine mode",
-        treatments: &[Treatment::Pair {
-            field: Field::Mstatus,
-            bits: 0x0000_1800,
-            qemu: 0,
-            inkemu: 0x0000_1800,
-            until_written: false,
-        }],
-    },
-    Difference {
-        number: 2,
-        summary: "mie at power-on: QEMU 0x0EEE, inkemu 0, until mie is written",
-        treatments: &[Treatment::Pair {
-            field: Field::Mie,
-            bits: 0x0000_0EEE,
-            qemu: 0x0000_0EEE,
-            inkemu: 0,
-            until_written: true,
-        }],
-    },
-    Difference {
-        number: 3,
-        summary: "mtvec.MODE at power-on: QEMU direct, inkemu vectored, until mtvec is written",
-        treatments: &[Treatment::Pair {
-            field: Field::Mtvec,
-            bits: 0x0000_0001,
-            qemu: 0,
-            inkemu: 1,
-            until_written: true,
-        }],
-    },
-    Difference {
-        number: 4,
-        summary: "mip.MEIP: QEMU's interrupt-matrix line, three instructions late after a threshold store",
-        treatments: &[Treatment::ExternalInterrupt { lag: 3 }],
-    },
-    Difference {
-        number: 5,
-        summary: "cycle counter: both count 6.25 ns of device time, QEMU's from its first read",
-        treatments: &[
-            Treatment::Compat(Compat::CycleCounterOnTimeBase),
-            Treatment::Counter {
-                location: Location::Csr(MPCCR),
-                drift: Drift::Within(1),
-                origins: &[Location::Csr(MPCCR), Location::Csr(UPCCR)],
-            },
-            Treatment::Counter {
-                location: Location::Csr(UPCCR),
-                drift: Drift::Within(1),
-                origins: &[Location::Csr(MPCCR), Location::Csr(UPCCR)],
-            },
-        ],
-    },
-    Difference {
-        number: 6,
-        summary: "UART0: line levels, FIFO count and reset values QEMU does not model",
-        treatments: &[Treatment::Registers(&[
-            copy(0x6000_001C, 0xE0FF_C000),
-            copy(0x6000_0020, 0x1000_001C),
-            copy(0x6000_006C, 0x0000_0010),
-            copy(0x6000_0078, 0x1672_2500),
-        ])],
-    },
-    Difference {
-        number: 7,
-        summary: "SPI1: QEMU's flash does not answer SFDP, leaves W0 stale, and lacks reset values",
-        treatments: &[Treatment::Registers(&[
-            copy(0x6000_2034, 0x0000_0002),
-            Register {
-                address: 0x6000_2058,
-                mask: 0x0018_60FF,
-                qemu: None,
-                after_command: Some(0x5A),
-            },
-            Register {
-                address: 0x6000_2058,
-                mask: 0x0018_6000,
-                qemu: None,
-                after_command: Some(0x05),
-            },
-            copy(0x6000_2098, 0x0000_0014),
-            copy(0x6000_209C, 0x0A00_2000),
-            copy(0x6000_20DC, 0x0000_0001),
-        ])],
-    },
-    Difference {
-        number: 8,
-        summary: "SPI0, absent in QEMU: the cache's flash configuration",
-        treatments: &[Treatment::Registers(&[
-            copy(0x6000_3008, 0x00AC_2008),
-            copy(0x6000_3010, 0x0000_0061),
-            admit(0x6000_3014),
-            copy(0x6000_3018, 0x7000_00C0),
-            copy(0x6000_301C, 0x5C00_0007),
-            copy(0x6000_3020, 0x7000_0003),
-            admit(0x6000_3024),
-            admit(0x6000_3028),
-            admit(0x6000_3034),
-            copy(0x6000_303C, 0x0000_0001),
-            copy(0x6000_3054, 0x0000_0200),
-            copy(0x6000_30DC, 0x0000_0001),
-            admit(0x6000_30E0),
-        ])],
-    },
-    Difference {
-        number: 9,
-        summary: "RTC_CNTL: QEMU models OPTIONS0, RESET_STATE and STORE0-7 only",
-        treatments: &[
-            Treatment::SlowClock {
-                register: RTC_TIME_LOW0,
-                capture: RTC_TIME_UPDATE,
-                trigger: 1 << 31,
-                hz: 136_000,
-                bound: 1,
-                qemu: 0,
-            },
-            Treatment::Registers(&[
-                copy(0x6000_8000, 0x1C00_A000),
-                copy(0x6000_801C, 0x3C14_0543),
-                copy(0x6000_8024, 0x0A08_0A09),
-                copy(0x6000_8028, 0x1220_0A09),
-                copy(0x6000_802C, 0x0000_8000),
-                copy(0x6000_8030, 0x0A08_0000),
-                copy(0x6000_8034, 0x00D4_0000),
-                copy(0x6000_8038, 0x0000_3000),
-                copy(0x6000_8040, 0x0000_0200),
-                copy(0x6000_8070, 0x31D8_3298),
-                copy(0x6000_8074, 0x0040_0000),
-                copy(0x6000_8080, 0xA03F_C000),
-                copy(0x6000_8088, 0x0057_5010),
-                copy(0x6000_808C, 0xBA80_5480),
-                copy(0x6000_8090, 0xF807_FA14),
-                copy(0x6000_80AC, 0x04B0_0000),
-                copy(0x6000_80D8, 0x7BFF_C030),
-                copy(0x6000_810C, 0x0000_0007),
-                copy(0x6000_811C, 0xC000_0000),
-            ]),
-        ],
-    },
-    Difference {
-        number: 10,
-        summary: "eFuse: the words where QEMU's blank eFuses and the X4's differ",
-        treatments: &[Treatment::Registers(&[
-            copy(0x6000_883C, 0x8000_0000),
-            copy(0x6000_8848, 0x0000_58CF),
-            copy(0x6000_8850, 0x0100_0000),
-            copy(0x6000_8858, 0x0047_D2F2),
-            copy(0x6000_886C, 0xD864_EA40),
-        ])],
-    },
-    Difference {
-        number: 11,
-        summary: "IO_MUX, absent in QEMU: the pad configuration of GPIO0-21",
-        treatments: &[Treatment::Registers(&[
-            copy(0x6000_9004, 0x0000_0B00),
-            copy(0x6000_9008, 0x0000_0B00),
-            copy(0x6000_900C, 0x0000_0B00),
-            copy(0x6000_9010, 0x0000_0B00),
-            copy(0x6000_9014, 0x0000_0B00),
-            copy(0x6000_9018, 0x0000_0B00),
-            copy(0x6000_901C, 0x0000_0B00),
-            copy(0x6000_9020, 0x0000_0B00),
-            copy(0x6000_9024, 0x0000_0B00),
-            copy(0x6000_9028, 0x0000_0B00),
-            copy(0x6000_902C, 0x0000_0B00),
-            copy(0x6000_9030, 0x0000_0B00),
-            copy(0x6000_9034, 0x0000_1F00),
-            copy(0x6000_9038, 0x0000_1F00),
-            copy(0x6000_903C, 0x0000_0F00),
-            copy(0x6000_9040, 0x0000_0F00),
-            copy(0x6000_9044, 0x0000_0F00),
-            copy(0x6000_9048, 0x0000_0F00),
-            copy(0x6000_904C, 0x0000_0B00),
-            copy(0x6000_9050, 0x0000_0B00),
-            copy(0x6000_9054, 0x0000_0B00),
-            copy(0x6000_9058, 0x0000_0B00),
-        ])],
-    },
-    Difference {
-        number: 12,
-        summary: "analog I2C master, absent in QEMU: the ROM's regi2c accesses",
-        treatments: &[Treatment::Registers(&[
-            copy(0x6000_E000, 0x05FF_FF9E),
-            copy(0x6000_E044, 0x00FF_FFFF),
-            copy(0x6000_E048, 0x00FF_FFFF),
-        ])],
-    },
-    Difference {
-        number: 13,
-        summary: "radio power-up of rtc_sleep_pu, absent in QEMU: BB, NRX, FE and FE2",
-        treatments: &[Treatment::Registers(&[
-            admit(0x6000_50F0),
-            admit(0x6000_6090),
-            admit(0x6001_CCD4),
-            admit(0x6001_D054),
-        ])],
-    },
-    Difference {
-        number: 14,
-        summary: "TIMG0 and TIMG1: watchdog reset values, clock gates and the RTC calibration",
-        treatments: &[Treatment::Registers(&[
-            copy(0x6001_F048, 0x0004_C000),
-            copy(0x6001_F04C, 0x0001_0000),
-            copy(0x6001_F068, 0x0000_8000),
-            copy(0x6001_F06C, 0x024C_3C00),
-            copy(0x6001_F080, 0xFFFF_FF99),
-            copy(0x6001_F0FC, 0x6000_0000),
-            copy(0x6002_0048, 0x0004_C000),
-            copy(0x6002_004C, 0x0001_0000),
-            copy(0x6002_00FC, 0x6000_0000),
-        ])],
-    },
-    Difference {
-        number: 15,
-        summary: "SYSTIMER: QEMU's counters drop a fraction of a count at each update and always read valid",
-        treatments: &[
-            Treatment::Registers(&[
-                copy(0x6002_3004, 0x2000_0000),
-                copy(0x6002_3008, 0x2000_0000),
-            ]),
-            Treatment::Counter {
-                location: Location::Mmio(SYSTIMER_UNIT0_VALUE_LO),
-                drift: Drift::Truncated {
-                    first: SYSTIMER.0,
-                    last: SYSTIMER.1,
-                },
-                origins: &[
-                    Location::Mmio(SYSTEM_PERIP_RST_EN0),
-                    Location::Mmio(SYSTIMER_CONF),
-                ],
-            },
-            Treatment::Counter {
-                location: Location::Mmio(SYSTIMER_UNIT1_VALUE_LO),
-                drift: Drift::Truncated {
-                    first: SYSTIMER.0,
-                    last: SYSTIMER.1,
-                },
-                origins: &[
-                    Location::Mmio(SYSTEM_PERIP_RST_EN0),
-                    Location::Mmio(SYSTIMER_CONF),
-                ],
-            },
-        ],
-    },
-    Difference {
-        number: 16,
-        summary: "APB_CTRL, absent in QEMU: Wi-Fi clocks and memory power",
-        treatments: &[Treatment::Registers(&[
-            copy(0x6002_6014, 0xFFFF_FFFF),
-            admit(0x6002_6018),
-            copy(0x6002_609C, 0x0000_0015),
-            copy(0x6002_60AC, 0x0000_003F),
-        ])],
-    },
-    Difference {
-        number: 17,
-        summary: "RNG: QEMU returns the host's rand()",
-        treatments: &[Treatment::Registers(&[copy(0x6002_60B0, u32::MAX)])],
-    },
-    Difference {
-        number: 18,
-        summary: "APB_SARADC, absent in QEMU: the seven registers of the bootloader's entropy source",
-        treatments: &[Treatment::Registers(&[
-            copy(0x6004_0000, 0x5883_82C0),
-            copy(0x6004_0004, 0x0106_E1FE),
-            copy(0x6004_000C, 0x00FF_080D),
-            copy(0x6004_0018, 0x009C_FFFF),
-            copy(0x6004_001C, 0x00FF_FFFF),
-            copy(0x6004_0050, 0x8000_00FF),
-            copy(0x6004_0054, 0x0050_000F),
-        ])],
-    },
-    Difference {
-        number: 19,
-        summary: "USB-Serial-JTAG: SERIAL_IN_EP_DATA_FREE, which QEMU reads 0",
-        treatments: &[Treatment::Registers(&[copy(0x6004_3004, 0x0000_0002)])],
-    },
-    Difference {
-        number: 20,
-        summary: "SYSTEM: clock gates, resets and clock selection QEMU's clock model keeps otherwise",
-        treatments: &[Treatment::Registers(&[
-            copy(0x600C_0000, 0x0000_0040),
-            copy(0x600C_0004, 0x0000_00C0),
-            copy(0x600C_0008, 0x0000_000C),
-            copy(0x600C_000C, 0x0000_0001),
-            copy(0x600C_0010, 0xF9C1_E06F),
-            copy(0x600C_0014, 0x0000_0204),
-            copy(0x600C_0018, 0xA86D_BBEE),
-            copy(0x600C_001C, 0x0000_01FE),
-            copy(0x600C_0020, 0x0000_00FF),
-            copy(0x600C_0024, 0x0200_1001),
-            copy(0x600C_0040, 0x0000_0007),
-            copy(0x600C_0058, 0x0008_0401),
-        ])],
-    },
-    Difference {
-        number: 21,
-        summary: "SENSITIVE, absent in QEMU: the memory protection ESP-IDF sets up",
-        treatments: &[Treatment::Registers(&[
-            copy(0x600C_101C, 0x0000_000F),
-            admit(0x600C_1090),
-            admit(0x600C_1094),
-            admit(0x600C_1098),
-            admit(0x600C_109C),
-            admit(0x600C_10A0),
-            admit(0x600C_10A4),
-            admit(0x600C_10A8),
-            copy(0x600C_10B0, 0x001C_7FFF),
-            admit(0x600C_10B4),
-            copy(0x600C_10B8, 0x0000_0003),
-            admit(0x600C_10C0),
-            copy(0x600C_10C4, 0x0F0F_F0FF),
-            admit(0x600C_10C8),
-            copy(0x600C_10CC, 0x0000_0003),
-            admit(0x600C_10D8),
-            copy(0x600C_10FC, 0x003F_FFFF),
-            copy(0x600C_1100, 0x0000_0FFF),
-            admit(0x600C_1130),
-            copy(0x600C_1134, 0x0000_0003),
-        ])],
-    },
-    Difference {
-        number: 22,
-        summary: "EXTMEM: power, freeze and sync bits QEMU's cache model does not keep",
-        treatments: &[Treatment::Registers(&[
-            copy(0x600C_4004, 0x0000_0003),
-            copy(0x600C_4008, 0x0000_0005),
-            copy(0x600C_4028, 0x0000_0002),
-            copy(0x600C_40AC, 0x0000_0005),
-            copy(0x600C_40C4, 0x0000_000F),
-            copy(0x600C_40CC, 0x0000_0001),
-        ])],
-    },
-    Difference {
-        number: 23,
-        summary: "ASSIST_DEBUG, absent in QEMU: the stack monitor of FreeRTOS",
-        treatments: &[Treatment::Registers(&[
-            copy(0x600C_E000, 0x0000_0300),
-            admit(0x600C_E008),
-            admit(0x600C_E038),
-            admit(0x600C_E03C),
-            admit(0x600C_E044),
-            admit(0x600C_E048),
-            admit(0x600C_E098),
-        ])],
-    },
-    Difference {
-        number: 24,
-        summary: "SYSTIMER: no alarm while the counter is stopped",
-        treatments: &[Treatment::Compat(Compat::SystimerNoAlarmOnStoppedCounter)],
-    },
+    ROW_MSTATUS_MPP,
+    ROW_MIE_AT_POWER_ON,
+    ROW_MTVEC_MODE_AT_POWER_ON,
+    ROW_MEIP,
+    ROW_CYCLE_COUNTER,
+    ROW_UART0,
+    ROW_SPI1,
+    ROW_SPI0,
+    ROW_RTC_CNTL,
+    ROW_EFUSE,
+    ROW_IO_MUX,
+    ROW_REGI2C,
+    ROW_RADIO,
+    ROW_TIMG,
+    ROW_SYSTIMER,
+    ROW_APB_CTRL,
+    ROW_RNG,
+    ROW_APB_SARADC,
+    ROW_USB_SERIAL_JTAG,
+    ROW_SYSTEM,
+    ROW_SENSITIVE,
+    ROW_EXTMEM,
+    ROW_ASSIST_DEBUG,
+    ROW_SYSTIMER_STOPPED,
+    ROW_HELLO_KEPT_AT_RESET,
+    ROW_PMP_KEPT_AT_RESET,
+    ROW_AFTER_RESET,
+    ROW_HELLO_SPI1_AFTER_RESET,
+    ROW_NVS_SPI1,
+    ROW_NVS_EXTMEM,
+    ROW_NVS_KEPT_AT_RESET,
+    ROW_NVS_SPI1_AFTER_RESET,
 ];
 
 /// A peripheral QEMU instantiates, by its first and last byte: the flattened memory tree of
