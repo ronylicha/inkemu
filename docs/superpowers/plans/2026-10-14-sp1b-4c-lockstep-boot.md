@@ -163,3 +163,27 @@ could pass with a wrong model. The controller's rulings and how they are impleme
 
 Measured after the fixes: 3 402 169 instructions compared (unchanged), window end at the reset of both sides, all
 24 rows used within their declarations, the same usage live and on the captured trace.
+
+## Second fix round (2026-10-14)
+
+A scoped re-review of the fix round found the lockstep still passing with a wrong inkemu in three places (N1, N2,
+N3), and five minor points (N4–N8), two partial ones (I9, L5) and L7. The controller's rulings:
+
+| # | Ruling | Implementation |
+|---|---|---|
+| R22 (N1) | A counter value read comes from inkemu's own model, fed by the `qemu-icount` device time; a setting may change only the time base or the latch timing, never the model's arithmetic. Compare against QEMU under a sourced bound derived from the time base, adopt within it, count, print the largest move, diverge past it; report the number honestly if the model cannot meet it. | `systimer_counts_as_qemu` and the SYSTIMER shadow removed; `cycle_counter_as_qemu` replaced by `cycle_counter_on_time_base`, which feeds the chip's counter the time base. `Treatment::Counter { location, drift, origins }`: `Drift::Within(1)` for the cycle counter (two floors of the same time from two origins), `Drift::Truncated` for the SYSTIMER (down by at most one count per update QEMU may have made between two reads, never up). `VALUE_VALID` a copy of bit 29 of `UNITn_OP`. Measured: largest move 1 on both rows. |
+| R23 (N2) | Row 9's `TIME_LOW0`: end the window if it survives, else check inkemu's value against device time and the declared slow clock. | Ending the window is ruled out: the five reads come before `app_main`. `Treatment::SlowClock`: QEMU reads 0, inkemu the 136 kHz cycles at the device time of the last capture, within one cycle. Measured: 0. |
+| R24 (N3) | Per-row uses pinned exactly in CI; usage accounting per declared register and mask bit. | `Site` (location and SPI1 condition); `Usage::check` fails on an unused row, site or bit; `--expect-usage tools/ci/lockstep-hello.usage`. |
+| R25 (N4) | Row 4's lag only after the threshold stores that bring the line down. | The lag arms when QEMU showed `MEIP` before the store and its matrix computes it down after. |
+| R26 (N6) | `--max-instructions` reports unused rows instead of failing; a truncated `--trace` exits 2; the library offers the usage check. | `Check { failures, unused_in_partial_window }`, `Lockstep::check_usage`; any end of the trace before the window is an error. |
+| R27 (N7, N8) | A `csrr` of `mip` while QEMU shows `MEIP` does not diverge; a reset of inkemu alone is tested. | `admitted_mip_read` against QEMU's state at the boundary the read started from; policy tests. |
+| R28 (I9) | A second negative CI run that perturbs a peripheral model; no overclaiming comment. | `--perturb-systimer-after N`; the CI expects the divergence near row 15. |
+| R29 (L5, L7) | Document QEMU's time-seeded RNG and what makes the window independent of it; a deep-sleep program in the equivalence test. | Row 17 and ADR 0008; `stepping_goes_through_deep_sleeps_and_their_wakes_as_a_run_does`. |
+
+- [x] **Step 1:** `style(lockstep)`: rustfmt (the CI's `fmt --check` failure).
+- [x] **Step 2:** `fix(lockstep)`: R25, R27.
+- [x] **Step 3:** `fix(lockstep)`: R22, R23, R24, R26, R28, the code of R29, the table, the CI, the README.
+- [x] **Step 4:** `docs`: ADR 0008 (dated section), this section, the hand-over note.
+
+Measured: 3 402 169 instructions compared (unchanged), window end at the reset of both sides, every row, site and
+bit used; the per-row uses are those of `tools/ci/lockstep-hello.usage`.
