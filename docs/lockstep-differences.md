@@ -75,7 +75,8 @@ des deux côtés que la comparaison traverse ; le suivant termine la fenêtre.
   copie donnerait à CrossPoint une valeur qu'aucun des deux côtés n'a mesurée.
 
 Les autres firmwares de référence n'ont pas de fenêtre (SP1b-4d, décision J5) : chacun s'arrête,
-mesuré le 2026-10-14, dans le démarrage de son application, à une différence d'instant
+mesuré le 2026-10-14 puis remesuré le même jour après la correction de `mstatus` dans `cpu-rv32`
+(comptes et causes inchangés), dans le démarrage de son application, à une différence d'instant
 d'interruption dont la cause n'est pas établie, sans fin à lui avant. `adc_wait_panic` (3 986 033
 instructions comparées), `uart_select` (3 963 178), `usb_serial_jtag_console` (3 848 562) et
 `deep_sleep_timer` (3 921 093) : le premier tick de FreeRTOS tombe pendant que le CPU exécute, et

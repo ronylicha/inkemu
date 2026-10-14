@@ -1,6 +1,6 @@
 # ADR 0008 — Lockstep et différences admises
 
-- Date : 2026-10-14 (révisée le même jour après les revues de la politique et de la machine, puis après la seconde revue : section « Révision du 2026-10-14, seconde revue » ; étendue par SP1b-4d : section « Révision du 2026-10-14, SP1b-4d », puis « Révision du 2026-10-14, relectures de SP1b-4d »)
+- Date : 2026-10-14 (révisée le même jour après les revues de la politique et de la machine, puis après la seconde revue : section « Révision du 2026-10-14, seconde revue » ; étendue par SP1b-4d : section « Révision du 2026-10-14, SP1b-4d », puis « Révision du 2026-10-14, relectures de SP1b-4d » et « Révision du 2026-10-14, seconde relecture de SP1b-4d »)
 - Statut : accepté (plan SP1b-4c ; plan SP1b-4d pour la traversée du reset, les fenêtres et CrossPoint)
 - Spec : `docs/superpowers/specs/2026-10-14-sp1b-4c-design.md` (décisions H1–H11, et sa correction du 2026-10-14) ; spec globale §4.4, §10.2 point 10, §10.3 critère 3
 
@@ -177,9 +177,10 @@ plan. Ce que la section précédente disait autrement est corrigé ici.
   la suite des PC est la même.
 - **Les tenues s'arrêtent à ce que la seconde vie écrit (P1–P3, R43).** Une grandeur gardée au reset
   n'est tenue que dans ses bits mesurés (de `mstatus`, `MPIE`) et seulement si inkemu montre la valeur
-  de reset que la ligne déclare ; un CSR gardé au reset, jusqu'à ce qu'une instruction l'écrive en
-  entier (un `csrrs` réécrit la valeur lue, que la ligne a admise) ; une copie après reset, jusqu'au
-  premier rangement dans son registre.
+  de reset que la ligne déclare ; un CSR gardé au reset, dans ses bits gardés que la seconde vie n'a
+  pas écrits (règle corrigée par la seconde relecture, ci-dessous : la première version tenait le
+  CSR jusqu'à un `csrrw` seulement) ; une copie après reset, jusqu'au premier rangement dans son
+  registre, et à la valeur que le reset y laisse (seconde relecture).
 - **Un reset de module que QEMU ignore (R44).** Le `SYSTEM` de QEMU lit 0 et ignore les écritures de
   `PERIP_RST_EN0/1` (`hw/riscv/esp32c3_clk.c`) : quand le firmware pulse un module, inkemu le remet à
   zéro et QEMU non. Une copie après reset vaut de nouveau, jusqu'au rangement suivant, après une telle
@@ -204,3 +205,41 @@ plan. Ce que la section précédente disait autrement est corrigé ici.
   6 813 949, `nvs` 7 680 555, `nvs-ota` 7 701 890 (inchangés) ; usages : ligne 1 retirée, ligne 9
   165 (162), ligne 27 46 (51) dans les trois, les autres inchangés. CrossPoint : voir la note de
   passation.
+
+## Révision du 2026-10-14, seconde relecture de SP1b-4d
+
+Quatre points (B1, I1, m1, m2) ; décisions R48–R51 du plan. Ce que la section précédente disait
+autrement est corrigé ici.
+
+- **Un CSR gardé au reset n'est tenu que dans les bits que la seconde vie n'a pas écrits (B1, R48).**
+  La règle « jusqu'à un `csrrw` » admettait un modèle qui perd un bit effacé : ESP-IDF pose et
+  efface les entrées de la PMP par `csrrs` et `csrrc` (`RV_SET_CSR` et `RV_CLEAR_CSR`, dans
+  `PMP_ENTRY_CFG_SET` et `PMP_ENTRY_CFG_RESET`, `components/riscv/include/riscv/csr.h` de la
+  v5.5.2). L'outil suit désormais, CSR par CSR depuis le reset, les bits écrits : tous pour `csrrw`
+  et `csrrwi`, l'opérande pour `csrrs`, `csrrc`, `csrrsi` et `csrrci`, aucun pour l'opérande `x0`
+  ou l'immédiat 0. Une lecture n'est admise que si la valeur de QEMU est celle d'inkemu plus les bits
+  gardés qu'inkemu avait avant le reset et que la seconde vie n'a pas écrits ; toute autre valeur
+  est une divergence.
+- **Une copie après reset vérifie la valeur que le reset laisse (I1, R49).** Elle admettait toute
+  valeur dans son masque jusqu'au premier rangement. Chaque entrée déclare, dans son masque, la
+  valeur du côté qui a remis le registre à zéro : celle d'inkemu (la valeur de reset du SVD) quand
+  la machine a remis le module du registre à zéro depuis le dernier rangement, celle du reset de
+  QEMU sinon. Une lecture différente où ce côté montre une autre valeur est une divergence. Mesuré
+  le 2026-10-14 sur les trois fenêtres de la CI : chaque lecture admise montre la valeur déclarée
+  (UART0, SPI0/1, TIMG0/1 aux valeurs du SVD chez inkemu ; GPIO, RTC_CNTL, IO_MUX, APB_SARADC,
+  SYSTEM, EXTMEM, ASSIST_DEBUG à 0 chez QEMU). Comptes et usages inchangés : `hello` 6 813 949,
+  `nvs` 7 680 555, `nvs-ota` 7 701 890.
+- **La suppression du conteneur de QEMU est bornée en temps réel (m1, R50).** 300 s sur une
+  horloge, chaque appel à docker tué au-delà de 20 s. Un lancement qui ne peut pas démarrer QEMU
+  finit en 11 minutes environ ; les étapes de faute de la CI passent de 10 à 15 minutes avant le
+  reset, de 15 à 20 après.
+- **Les arrêts des applications composées, remesurés après le changement de `mstatus` (m2, R51).**
+  Sur des traces capturées à nouveau le 2026-10-14, avec la machine de ce commit (`cpu-rv32` et
+  `soc-esp32c3`) : `adc_wait_panic` 3 986 033, `uart_select` 3 963 178, `usb_serial_jtag_console`
+  3 848 562, `deep_sleep_timer` 3 921 093, `usb_serial_jtag_echo` 2 525 511 ; aucun compte ne
+  change, ni aucune cause observée : dans les quatre premières, inkemu prend la ligne 4 (le tick du
+  SYSTIMER) là où QEMU continue ; dans la dernière, QEMU montre `MEIP` et inkemu non. Les
+  applications n'ont pas de fenêtre (R37) : l'outil versionné ne les compare pas, et le relevé a été
+  fait par la copie de mesure de l'outil, sous toute la table. Les fautes de la CI, sur la trace de
+  `hello` : `t0` à 1 000 000 et 4 000 000 (un reset traversé), le SYSTIMER à 2 500 668 et
+  5 700 683 (ligne la plus proche 15) ; inchangées.
