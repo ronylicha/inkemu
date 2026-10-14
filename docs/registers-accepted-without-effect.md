@@ -33,9 +33,11 @@ then rewrites the table below, and nothing else; review the diff before committi
 "Made real by" names the plan that gives the register its effect. Each plan inherits the rows that
 name it. The table has six heirs: SP1b-4, SP2, SP4 (the resource monitor, which needs a power
 model), SP5a, SP5b and SP8. The UART rows SP1b-3d inherited left the table when it gave them their
-effect; of the rows SP1b-3f inherited, `RTC_CNTL.DIG_PWC` left it when deep sleep was modelled, and
-the others went to SP2, SP4, SP5a and SP8, with the registers the deep-sleep path of ESP-IDF writes
-that the model did not know before. The carry-over note
+effect; the rows SP1b-3f inherited went to SP2, SP4, SP5a and SP8, with the registers the
+deep-sleep path of ESP-IDF writes that the model did not know before. A row whose register has one
+bit that acts names that bit in its description, the rest of the register being stored without
+effect: `RTC_CNTL.DIG_PWC` (`DG_WRAP_PD_EN`, which makes a sleep deep), like `RTC_CNTL.OPTIONS0`,
+`RTC_CNTL.FIB_SEL` and `RTC_CNTL.CLK_CONF`. The carry-over note
 `docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` names the rows one by one, as the table
 stood at the end of plan SP1b-3a, when one plan, "SP1b-3b", was to take what five plans now share;
 its first section says which plan takes what.
@@ -89,6 +91,7 @@ its first section says which plan takes what.
 | `0x6000807c` | `RTC_CNTL.BIAS_CONF` | 1 | bias and regulator settings in sleep: no effect to see without a power model | SP4 |
 | `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP8 |
 | `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control: no effect to see without a power model | SP4 |
+| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power domains in sleep (Wi-Fi, BT, CPU, peripherals) and their forced power-up: no effect to see without a power model (DG_WRAP_PD_EN acts: read at the write of SLEEP_EN, set it makes the sleep deep, clear a light sleep, which is refused) | SP4 |
 | `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation and hold in sleep: the pins are not modelled | SP2 |
 | `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | pad hold | SP2 |
 | `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | digital pad hold | SP2 |

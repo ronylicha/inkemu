@@ -152,10 +152,11 @@ const STORE: [u32; STORE_COUNT] = [
 /// it: there is no analog part, no power model, no pad and no radio in this model, and the sleep
 /// it has takes no time to enter or leave (F6: each row names who gives it its effect).
 /// `rtc_sleep_init` writes `OPTIONS0`, `TIMER1`, `ANA_CONF`, `CLK_CONF`, `RTC_CNTL`, `BIAS_CONF`,
-/// `SDIO_CONF`, `DIG_ISO` and `SLP_REJECT_CONF` on the way to a deep sleep (DS §A.1.3); the
-/// startup of an application woken from one reads `GPIO_WAKEUP` (`esp_deep_sleep_wakeup_io_reset`,
-/// DS §A.3.4).
-const ACCEPTED: [Accepted; 22] = [
+/// `SDIO_CONF`, `DIG_PWC`, `DIG_ISO` and `SLP_REJECT_CONF` on the way to a deep sleep (DS
+/// §A.1.3); the startup of an application woken from one reads `GPIO_WAKEUP`
+/// (`esp_deep_sleep_wakeup_io_reset`, DS §A.3.4). Some rows have one bit that acts, named in the
+/// description: the rest of the register is stored without effect.
+const ACCEPTED: [Accepted; 23] = [
     Accepted::svd(
         "RTC_CNTL",
         "OPTIONS0",
@@ -253,6 +254,12 @@ const ACCEPTED: [Accepted; 22] = [
         "RTC_CNTL",
         "PWC",
         "RTC power-domain control: no effect to see without a power model",
+        "SP4",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "DIG_PWC",
+        "digital power domains in sleep (Wi-Fi, BT, CPU, peripherals) and their forced power-up: no effect to see without a power model (DG_WRAP_PD_EN acts: read at the write of SLEEP_EN, set it makes the sleep deep, clear a light sleep, which is refused)",
         "SP4",
     ),
     Accepted::svd(

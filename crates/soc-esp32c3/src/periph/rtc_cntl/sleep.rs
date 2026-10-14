@@ -8,7 +8,9 @@
 //! sleeps; the machine stops the CPU and moves device time to the next call of this block. When
 //! the RTC timer reaches the target of its alarm and the timer is a wake source, the block latches
 //! the cause and asks for the core reset of cause 5 the chip wakes with (F2). With `DG_WRAP_PD_EN`
-//! clear the request is a light sleep, refused and rejected (F4).
+//! clear the request is a light sleep, refused and rejected (F4). `DIG_PWC` itself is an accepted
+//! register of `RTC_CNTL` (its other power-domain switches have no effect without a power model):
+//! this module reads `DG_WRAP_PD_EN` from it at the write of `SLEEP_EN`.
 use super::{INT_SLP_REJECT, INT_SLP_WAKEUP, INT_TIMER_ALARM, RtcCntl, reg};
 use crate::ctx::Ctx;
 use crate::diag::Unsupported;
@@ -22,7 +24,7 @@ const STATE0: u32 = reg("STATE0");
 const WAKEUP_STATE: u32 = reg("WAKEUP_STATE");
 const SLP_REJECT_CAUSE: u32 = reg("SLP_REJECT_CAUSE");
 const SLP_WAKEUP_CAUSE: u32 = reg("SLP_WAKEUP_CAUSE");
-pub(super) const DIG_PWC: u32 = reg("DIG_PWC");
+const DIG_PWC: u32 = reg("DIG_PWC");
 
 /// `SLP_TIMER1`: bits [15:0] `SLP_VAL_HI`, the high 16 bits of the 48-bit target, and bit 16
 /// `MAIN_TIMER_ALARM_EN`, write-only (`rtc_cntl_reg.h:166-178`). `rtc_cntl_ll_set_wakeup_timer`
@@ -84,7 +86,6 @@ pub(super) struct Sleep {
     wakeup_state: u32,
     /// `SLP_WAKEUP_CAUSE`: the source of the last wake, as `WAKEUP_ENA` numbers it.
     wakeup_cause: u32,
-    dig_pwc: u32,
     /// Device time of the entry into deep sleep, while the chip sleeps.
     asleep: Option<Cycles>,
 }
@@ -103,7 +104,6 @@ impl Sleep {
             state0: 0,
             wakeup_state: documented(WAKEUP_STATE) & WAKEUP_STATE_STORED,
             wakeup_cause: 0,
-            dig_pwc: documented(DIG_PWC),
             asleep: None,
         }
     }
@@ -144,7 +144,6 @@ impl RtcCntl {
             // No reject source is modelled: the light sleep the model refuses is rejected without
             // one, and the cause reads 0.
             SLP_REJECT_CAUSE => 0,
-            DIG_PWC => sleep.dig_pwc,
             _ => return None,
         })
     }
@@ -165,7 +164,6 @@ impl RtcCntl {
             }
             STATE0 => self.write_state0(ctx, value),
             WAKEUP_STATE => self.sleep.wakeup_state = value & WAKEUP_STATE_STORED,
-            DIG_PWC => self.sleep.dig_pwc = value,
             // Read-only: the write is reported as unmodelled.
             SLP_WAKEUP_CAUSE | SLP_REJECT_CAUSE => return Some(false),
             _ => return None,
@@ -189,16 +187,17 @@ impl RtcCntl {
 
     /// `SLEEP_EN` was set: a deep sleep begins, or a light one is refused and rejected.
     fn enter_sleep(&mut self, ctx: &mut Ctx) {
-        if self.sleep.dig_pwc & DG_WRAP_PD_EN == 0 {
+        // INVARIANT: `DIG_PWC` is in `ACCEPTED`, which `config` is built from, so the read always
+        // answers and the fallback is never taken.
+        let dig_pwc = self.config.read(DIG_PWC).unwrap_or(0);
+        if dig_pwc & DG_WRAP_PD_EN == 0 {
             // F4. ESP-IDF waits for `SLP_REJECT_INT_RAW` or `SLP_WAKEUP_INT_RAW` after `SLEEP_EN`
             // and returns `ESP_ERR_SLEEP_REJECT` on the first (`rtc_sleep.c:257-276`).
             //
             // ASSUMPTION: `SLEEP_EN` reads 0 once the request is over, rejected or woken from. No
             // code of ESP-IDF reads it back; a chip whose light sleep is rejected, read after the
             // rejection, settles it.
-            ctx.unsupported(Unsupported::LightSleep {
-                dig_pwc: self.sleep.dig_pwc,
-            });
+            ctx.unsupported(Unsupported::LightSleep { dig_pwc });
             self.int_raw |= INT_SLP_REJECT;
             self.sleep.state0 &= !SLEEP_EN;
             return;
