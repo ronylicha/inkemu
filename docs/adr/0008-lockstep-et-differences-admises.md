@@ -1,6 +1,6 @@
 # ADR 0008 — Lockstep et différences admises
 
-- Date : 2026-10-14 (révisée le même jour après les revues de la politique et de la machine, puis après la seconde revue : section « Révision du 2026-10-14, seconde revue » ; étendue par SP1b-4d : section « Révision du 2026-10-14, SP1b-4d », puis « Révision du 2026-10-14, relectures de SP1b-4d » et « Révision du 2026-10-14, seconde relecture de SP1b-4d »)
+- Date : 2026-10-14 (révisée le même jour après les revues de la politique et de la machine, puis après la seconde revue : section « Révision du 2026-10-14, seconde revue » ; étendue par SP1b-4d : section « Révision du 2026-10-14, SP1b-4d », puis « Révision du 2026-10-14, relectures de SP1b-4d », « Révision du 2026-10-14, seconde relecture de SP1b-4d » et « Révision du 2026-10-14, troisième relecture de SP1b-4d »)
 - Statut : accepté (plan SP1b-4c ; plan SP1b-4d pour la traversée du reset, les fenêtres et CrossPoint)
 - Spec : `docs/superpowers/specs/2026-10-14-sp1b-4c-design.md` (décisions H1–H11, et sa correction du 2026-10-14) ; spec globale §4.4, §10.2 point 10, §10.3 critère 3
 
@@ -230,9 +230,11 @@ autrement est corrigé ici.
   SYSTEM, EXTMEM, ASSIST_DEBUG à 0 chez QEMU). Comptes et usages inchangés : `hello` 6 813 949,
   `nvs` 7 680 555, `nvs-ota` 7 701 890.
 - **La suppression du conteneur de QEMU est bornée en temps réel (m1, R50).** 300 s sur une
-  horloge, chaque appel à docker tué au-delà de 20 s. Un lancement qui ne peut pas démarrer QEMU
-  finit en 11 minutes environ ; les étapes de faute de la CI passent de 10 à 15 minutes avant le
-  reset, de 15 à 20 après.
+  horloge, chaque appel à docker tué au-delà de 20 s, et aucun appel commencé trop tard pour finir
+  dans les 300 s (corrigé à la troisième relecture : la borne n'était vérifiée qu'une fois par
+  tour, et le dernier tour avec la suppression finale pouvait la dépasser de 80 s). Un lancement
+  qui ne peut pas démarrer QEMU finit en 10 minutes environ ; les étapes de faute de la CI passent
+  de 10 à 15 minutes avant le reset, de 15 à 20 après.
 - **Les arrêts des applications composées, remesurés après le changement de `mstatus` (m2, R51).**
   Sur des traces capturées à nouveau le 2026-10-14, avec la machine de ce commit (`cpu-rv32` et
   `soc-esp32c3`) : `adc_wait_panic` 3 986 033, `uart_select` 3 963 178, `usb_serial_jtag_console`
@@ -243,3 +245,24 @@ autrement est corrigé ici.
   fait par la copie de mesure de l'outil, sous toute la table. Les fautes de la CI, sur la trace de
   `hello` : `t0` à 1 000 000 et 4 000 000 (un reset traversé), le SYSTIMER à 2 500 668 et
   5 700 683 (ligne la plus proche 15) ; inchangées.
+
+## Révision du 2026-10-14, troisième relecture de SP1b-4d
+
+Trois points mineurs (m-1, m-2, m-3) ; décisions R52–R54 du plan.
+
+- **Ce que QEMU garde d'un CSR s'accumule d'un reset à l'autre (m-2, R52).** La valeur dont part la
+  vie suivante n'était que celle d'inkemu avant le reset : une fenêtre qui traverse deux resets
+  aurait divergé là où QEMU a raison (première vie qui pose R, W, X, deuxième qui n'écrit rien,
+  troisième qui les lit). À chaque reset traversé, elle vaut désormais la valeur d'inkemu avant le
+  reset, plus les bits gardés de la valeur précédente que la vie qui finit n'a pas écrits, calculée
+  avant que les bits écrits soient oubliés. Aucune fenêtre du tableau ne traverse plus d'un reset :
+  les comptes ne changent pas.
+- **Un test par forme d'écriture (m-1, R53)** : `csrrsi`, `csrrci`, `csrrs` dont le registre vaut 0,
+  une instruction qui lève une exception, l'oubli des bits écrits au reset, la tenue à travers une
+  vie qui n'écrit rien, et une impulsion de module suivie d'un reset des deux côtés (la valeur
+  vérifiée est celle d'inkemu). Chacun échoue quand on casse la branche qu'il vise (six mutations
+  faites puis défaites à la main).
+- **La borne du nettoyage est celle annoncée (m-3, R54).** Aucun appel à docker de la boucle ne
+  commence après 240 s (300 s moins trois appels de 20 s) : l'appel en cours, puis la suppression
+  et l'inspection finales, finissent dans les 300 s. Un lancement qui ne peut pas démarrer QEMU
+  finit en 10 minutes environ, et non 11 ; les plafonds des étapes de la CI ne changent pas.
