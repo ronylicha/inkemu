@@ -8,6 +8,7 @@ mod qemu;
 use clap::{Parser, ValueEnum};
 use lockstep::{End, Lockstep, Target, TraceEvent, TraceReader, WindowEnd};
 use soc_esp32c3::{Esp32C3, RomImage};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -191,6 +192,16 @@ enum Error {
     TraceEnded(u64),
     #[error("{path}: `{line}` is not a line `row N: uses`")]
     Usage { path: PathBuf, line: String },
+    #[error(
+        "{path}: `{line}` names row {row}, which is not a row of the window {window}: the file \
+         pins another window, or a row the window lost"
+    )]
+    UsageRow {
+        path: PathBuf,
+        line: String,
+        row: u16,
+        window: &'static str,
+    },
 }
 
 fn machine(cli: &Cli) -> Result<(Esp32C3, Flash), Error> {
@@ -437,19 +448,18 @@ fn run_qemu(
     Err(Error::NotUnix)
 }
 
-/// Whether every row was used exactly as often as `path` says, one line `row N: X uses` each
-/// (as the run prints them; `#` starts a comment), the rows it does not name never. Prints every
-/// row that differs.
-fn usage_as_expected(
+/// The uses `path` pins, one line `row N: X uses` each (as the run prints them; `#` starts a
+/// comment), read before the comparison runs: a line that is not one, or that names a row the
+/// window does not have, is an error.
+fn expected_usage(
     path: &std::path::Path,
     window: &lockstep::Window,
-    usage: &lockstep::Usage,
-) -> Result<bool, Error> {
+) -> Result<BTreeMap<u16, u64>, Error> {
     let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
         path: path.to_owned(),
         source,
     })?;
-    let mut expected = std::collections::BTreeMap::new();
+    let mut expected = BTreeMap::new();
     for line in text
         .lines()
         .map(str::trim)
@@ -468,8 +478,26 @@ fn usage_as_expected(
                 line: line.to_owned(),
             });
         };
+        if !window.rows.iter().any(|r| r.number == row) {
+            return Err(Error::UsageRow {
+                path: path.to_owned(),
+                line: line.to_owned(),
+                row,
+                window: window.name,
+            });
+        }
         expected.insert(row, uses);
     }
+    Ok(expected)
+}
+
+/// Whether every row of `window` was used exactly as often as `expected` says, the rows it does
+/// not name never. Prints every row that differs.
+fn usage_as_expected(
+    expected: &BTreeMap<u16, u64>,
+    window: &lockstep::Window,
+    usage: &lockstep::Usage,
+) -> bool {
     let mut as_expected = true;
     for row in window.rows.iter().map(|row| row.number) {
         let (want, got) = (expected.get(&row).copied().unwrap_or(0), usage.uses(row));
@@ -478,10 +506,15 @@ fn usage_as_expected(
             as_expected = false;
         }
     }
-    Ok(as_expected)
+    as_expected
 }
 
 fn run(cli: &Cli, interrupted: &AtomicBool) -> Result<u8, Error> {
+    let expected = cli
+        .expect_usage
+        .as_deref()
+        .map(|path| expected_usage(path, cli.window))
+        .transpose()?;
     let (mut machine, flash) = machine(cli)?;
     let mut lockstep = Lockstep::for_window(&machine, cli.window, cli.max_instructions);
     let options = Options {
@@ -534,8 +567,8 @@ fn run(cli: &Cli, interrupted: &AtomicBool) -> Result<u8, Error> {
                 );
                 code = EXIT_EXPECTATION;
             }
-            if let Some(path) = &cli.expect_usage
-                && !usage_as_expected(path, cli.window, &usage)?
+            if let Some(expected) = &expected
+                && !usage_as_expected(expected, cli.window, &usage)
                 && code == 0
             {
                 code = EXIT_EXPECTATION;
