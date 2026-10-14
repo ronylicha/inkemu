@@ -1,0 +1,27 @@
+[package]
+name = "inkemu-lockstep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+# A development tool (spec §10.2 item 10, decision H7): never part of the distributed `inkemu`.
+publish = false
+
+[[bin]]
+name = "inkemu-lockstep"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+lockstep.workspace = true
+soc-esp32c3.workspace = true
+boards.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+thiserror.workspace = true
+
+# `mkfifo`: QEMU writes its trace into a named pipe, the fastest way out of a container.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs"] }

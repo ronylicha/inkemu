@@ -2,7 +2,7 @@
 
 **A binary-level emulator for embedded e-ink devices.** inkemu runs the real, unmodified firmware image of a device on a virtual replica of its hardware. You can check how a firmware renders and behaves before you flash it.
 
-> **Status: early development.** inkemu boots the real ESP32-C3 mask ROM from its reset vector. From a full flash image, the ROM loads the stock ESP-IDF second-stage bootloader, which starts the application; the application runs its whole life — FreeRTOS scheduler, tick interrupt, timers, watchdogs — and when it restarts, the chip boots again. The flash is written as on the device: the bootloader records the OTA slot it chose, NVS keeps what the firmware stores, and `--flash-file` keeps the flash of a device from one run to the next. An application `.bin` given on its own boots too: inkemu composes the flash around it with the ESP-IDF bootloader it ships and the partition table of the device. The RV32IMC core is validated against riscv-tests and, through RISCOF, against the Sail reference model. The consoles work in both directions, and two real firmwares of the Xteink X4, CrossPoint 1.6.5 and the stock firmware, start under inkemu up to their first read of the SAR ADC, which comes with the display (sub-project 2). A firmware sleeps in deep sleep and wakes by the RTC timer as the chip does. Next comes the lockstep against QEMU (1b-4). See the [design spec](docs/superpowers/specs/2026-10-11-inkemu-design.md) and the [roadmap](#roadmap).
+> **Status: early development.** inkemu boots the real ESP32-C3 mask ROM from its reset vector. From a full flash image, the ROM loads the stock ESP-IDF second-stage bootloader, which starts the application; the application runs its whole life — FreeRTOS scheduler, tick interrupt, timers, watchdogs — and when it restarts, the chip boots again. The flash is written as on the device: the bootloader records the OTA slot it chose, NVS keeps what the firmware stores, and `--flash-file` keeps the flash of a device from one run to the next. An application `.bin` given on its own boots too: inkemu composes the flash around it with the ESP-IDF bootloader it ships and the partition table of the device. The RV32IMC core is validated against riscv-tests and, through RISCOF, against the Sail reference model. The consoles work in both directions, and two real firmwares of the Xteink X4, CrossPoint 1.6.5 and the stock firmware, start under inkemu up to their first read of the SAR ADC, which comes with the display (sub-project 2). A firmware sleeps in deep sleep and wakes by the RTC timer as the chip does. Compared with Espressif's QEMU after every instruction, the reference image runs its whole first life — ROM, bootloader, `app_main`, the ticks of its countdown, to its restart — without a difference outside a numbered table of admitted ones. See the [design spec](docs/superpowers/specs/2026-10-11-inkemu-design.md) and the [roadmap](#roadmap).
 
 ## Build & try
 
@@ -272,6 +272,40 @@ inkemu replay run.inkrec
 - **`inkemu replay FILE`** checks that the ROM is the one recorded (`--rom-dir` as for `run`), rebuilds the device from the session alone, hands it the recorded inputs, runs it to the same limits, showing the console as `run` does (`--console` chooses it), then compares what it gives with what was recorded. It reads no path of the recording and writes nothing of the run, not even the flash; without `--rom-dir`, the ROM is downloaded into the cache on first use, as for `run`. What the session says reaches the terminal with its control characters escaped. A replay gives the same outcome whatever the host and however it is cut into slices.
 - **Exit codes**: `0` when everything is identical; `6` when the replay diverges, with the first quantity that differs and its two values; `2` for a file that is refused (another version, cut short, a length past its bound, a SHA-256 that does not match, each refusal naming the field), a missing or different ROM, and a replay that Ctrl-C or its reader cut before the end of its session (nothing was compared); `130` for a second Ctrl-C before the replay begins its summary. The format is described in [ADR 0007](docs/adr/0007-format-des-sessions.md) (French).
 
+### For developers: the lockstep against QEMU
+
+`inkemu-lockstep` is a development tool of this workspace, not part of the distributed `inkemu`. It runs a flash image in Espressif's QEMU and in inkemu and compares, after every instruction, the PC, `x1`–`x31` and the eight machine CSRs both have (`mstatus`, `mie`, `mip`, `mtvec`, `mepc`, `mcause`, `mtval`, `mscratch`). QEMU runs only inside the pinned image `espressif/idf:v5.5.2` (`tools/conformance/versions.env`), never on the host: Docker must be installed and the image pulled (the tool does not pull it), the flash image, a whole flash of the profile's size, is mounted read-only, and running QEMU needs a Unix host (`--trace` works anywhere).
+
+```sh
+tools/reference-firmware/build.sh                       # builds target/reference-firmware/flash_hello.bin
+inkemu rom fetch --all --rom-dir rom
+cargo run --release -p inkemu-lockstep -- \
+    --flash target/reference-firmware/flash_hello.bin --rom-dir rom \
+    --expect-compared 3402169 --expect-end reset \
+    --expect-usage tools/ci/lockstep-hello.usage
+```
+
+- inkemu runs under the timing model `qemu-icount`: 8 ns per instruction, no interrupt latency, so that the timers of both sides fire on the same instruction. Every difference the comparison admits is a numbered row of [docs/lockstep-differences.md](docs/lockstep-differences.md), with its source and its exact parameters. A row is one of:
+  - a CSR whose bits hold a known pair of values;
+  - register bits copied from QEMU under a mask, every other bit compared;
+  - a counter both sides read from their own models, whose gap may move only as the row's sourced bound says;
+  - QEMU's missing RTC timer, held to the slow clock at device time;
+  - a behaviour of QEMU the machine takes on for the lockstep only.
+
+  Anything else is a divergence.
+- Every run prints what each row did: registers, bits taken from QEMU, the largest move of each counter, what a setting changed. The run fails if a row, a register of a row or a bit of its mask was never used, or if a row was used outside what it declares; a window cut by `--max-instructions` only lists what it left unused. `--expect-usage FILE` pins how often each row was used.
+- The window ends at a reset of both sides, at an access to a register no QEMU peripheral covers (SPI2, I2C0, a measurement of the SAR ADC, the radio…) unless a row names that register, or at `--max-instructions`. A reset of one side only is a divergence, and a trace that ends before the window does is an error. `--trace FILE` (or `-` for standard input) reads a captured `-d cpu,nochain,int` trace instead of running QEMU.
+- A divergence prints the instruction, the state before it and both states after it with the differences marked, the 64 instructions before it with every value taken from QEMU on the way, and the row that comes nearest to applying.
+- **Exit codes**:
+  - `0`: the window ended without a divergence, every row used at every register and bit it declares and within them, as the `--expect-*` options said;
+  - `1`: a divergence, a reset of one side included;
+  - `2`: an error (arguments, files, Docker, QEMU ending on its own, a trace that is not QEMU's, holds no block or ends early);
+  - `3`: the window ended otherwise than expected, or a row was used a different number of times;
+  - `4`: inkemu stopped on its own;
+  - `5`: a row, a register or a bit was never used, or a row was used outside what it declares;
+  - `130`: Ctrl-C (the container is removed whatever ends the run).
+- The CI runs the command above in the `reference-boot` job, then twice more, each time with a fault put in inkemu on purpose, which must diverge: once in a register of the CPU, once in a read of the SYSTIMER's model. See [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md) (French).
+
 ## Why
 
 Existing simulators for small e-ink devices recompile the firmware sources against a fake display driver. That only works when you have the sources, and it hides the bugs that live in the real hardware path. inkemu takes the opposite approach. It emulates the SoC, the bus and every chip on the board, then boots the vendor's binary through its real boot chain.
@@ -298,7 +332,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 
 ## Roadmap
 
-1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3a, interrupts, timers, watchdogs and reset, done; 1b-3b, flash writes and the device's flash file, done; 1b-3c, a firmware given on its own (`--firmware`), done; 1b-3d, the serial consoles in both directions, done; 1b-3e, two real firmwares of the X4 start, done; 1b-3f, deep sleep and the wake by the RTC timer, done; 1b-4a, the documentation without a warning, done; 1b-4b, recording and replaying a run, done; the lockstep against QEMU is next.*
+1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3a, interrupts, timers, watchdogs and reset, done; 1b-3b, flash writes and the device's flash file, done; 1b-3c, a firmware given on its own (`--firmware`), done; 1b-3d, the serial consoles in both directions, done; 1b-3e, two real firmwares of the X4 start, done; 1b-3f, deep sleep and the wake by the RTC timer, done; 1b-4a, the documentation without a warning, done; 1b-4b, recording and replaying a run, done; 1b-4c, the lockstep against QEMU over the first life of the reference image, done; the lockstep through a reset and on CrossPoint is next.*
 2. X4 peripherals, desktop UI, e-ink rendering: **first visual milestone**
 3. X3 support (UC8253 panel, I2C sensors)
 4. Debugging, resource monitor, headless test runner
@@ -319,6 +353,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 - [ADR 0005](docs/adr/0005-bootloader-embarque.md): the 2nd-stage bootloader inkemu ships, chosen by the device profile and replaceable (French)
 - [ADR 0006](docs/adr/0006-entrees-des-consoles.md): what the host sends to the consoles and the USB host, inputs of a run dated in device time (French)
 - [ADR 0007](docs/adr/0007-format-des-sessions.md): the format of a recorded session, how it is read and how it is replayed (French)
+- [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md): the lockstep against QEMU and its admitted differences (French), with [the table](docs/lockstep-differences.md)
 
 ## Français
 
@@ -326,7 +361,7 @@ Cette partie reprend le document en français, section par section et en plus co
 
 **inkemu est un émulateur au niveau binaire d'appareils embarqués à écran e-ink.** Il exécute l'image réelle d'un firmware, sans la modifier, sur une réplique virtuelle du matériel : on peut vérifier ce qu'un firmware affiche et comment il se comporte avant de le flasher.
 
-**État : début du développement.** inkemu démarre la vraie ROM masquée de l'ESP32-C3 depuis son vecteur de reset. À partir d'une image flash complète, la ROM charge le bootloader de second niveau d'ESP-IDF, qui lance l'application ; celle-ci vit toute sa vie — ordonnanceur FreeRTOS, interruption de tick, timers, watchdogs — et, quand elle redémarre, la puce démarre de nouveau. La flash s'écrit comme sur l'appareil : le bootloader enregistre l'emplacement OTA qu'il a choisi, NVS garde ce que le firmware y range, et `--flash-file` conserve la flash d'un appareil d'une exécution à la suivante. Un `.bin` d'application fourni seul démarre aussi : inkemu compose la flash autour de lui avec le bootloader ESP-IDF qu'il embarque et la table de partitions de l'appareil. Le cœur RV32IMC est validé contre riscv-tests puis, avec RISCOF, contre le modèle de référence Sail. Les consoles fonctionnent dans les deux sens, et deux firmwares réels du Xteink X4, CrossPoint 1.6.5 et le firmware d'origine, démarrent sous inkemu jusqu'à leur première lecture du SAR ADC, qui vient avec l'écran (sous-projet 2). Un firmware dort en sommeil profond et se réveille par le timer RTC comme la puce. Vient ensuite le lockstep avec QEMU (1b-4).
+**État : début du développement.** inkemu démarre la vraie ROM masquée de l'ESP32-C3 depuis son vecteur de reset. À partir d'une image flash complète, la ROM charge le bootloader de second niveau d'ESP-IDF, qui lance l'application ; celle-ci vit toute sa vie — ordonnanceur FreeRTOS, interruption de tick, timers, watchdogs — et, quand elle redémarre, la puce démarre de nouveau. La flash s'écrit comme sur l'appareil : le bootloader enregistre l'emplacement OTA qu'il a choisi, NVS garde ce que le firmware y range, et `--flash-file` conserve la flash d'un appareil d'une exécution à la suivante. Un `.bin` d'application fourni seul démarre aussi : inkemu compose la flash autour de lui avec le bootloader ESP-IDF qu'il embarque et la table de partitions de l'appareil. Le cœur RV32IMC est validé contre riscv-tests puis, avec RISCOF, contre le modèle de référence Sail. Les consoles fonctionnent dans les deux sens, et deux firmwares réels du Xteink X4, CrossPoint 1.6.5 et le firmware d'origine, démarrent sous inkemu jusqu'à leur première lecture du SAR ADC, qui vient avec l'écran (sous-projet 2). Un firmware dort en sommeil profond et se réveille par le timer RTC comme la puce. Comparée au QEMU d'Espressif après chaque instruction, l'image de référence vit toute sa première vie — ROM, bootloader, `app_main`, les ticks de son compte à rebours, jusqu'à son redémarrage — sans différence hors d'un tableau numéroté de différences admises.
 
 ### Construire et essayer
 
@@ -385,6 +420,31 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
 - **`inkemu replay FICHIER`** vérifie que la ROM est celle de l'enregistrement (`--rom-dir` comme pour `run`), reconstruit l'appareil depuis la seule session, lui remet les entrées enregistrées, l'exécute jusqu'aux mêmes limites en affichant la console comme `run` (`--console` la choisit), puis compare ce qu'il obtient à ce qui a été enregistré. Il ne lit aucun chemin de l'enregistrement et n'écrit rien de l'exécution, pas même la flash ; sans `--rom-dir`, la ROM est téléchargée dans le cache à la première utilisation, comme pour `run`. Ce que dit la session parvient au terminal avec ses caractères de contrôle échappés. Un rejeu donne le même résultat quel que soit l'hôte et quel que soit son découpage.
 - **Codes de sortie** : `0` quand tout est identique ; `6` quand le rejeu diverge, avec la première grandeur qui diffère et ses deux valeurs ; `2` pour un fichier refusé (autre version, tronqué, longueur au-delà de sa borne, SHA-256 qui ne correspond pas, chaque refus nommant le champ), une ROM absente ou différente, et un rejeu coupé par Ctrl-C ou par son lecteur avant la fin de sa session (rien n'a été comparé) ; `130` pour un second Ctrl-C avant le résumé du rejeu. Le format est décrit dans l'[ADR 0007](docs/adr/0007-format-des-sessions.md).
 
+### Pour les développeurs : le lockstep avec QEMU
+
+`inkemu-lockstep` est un outil de développement de l'espace de travail, absent de l'`inkemu` distribué (voir la commande de la partie anglaise). Il exécute une image flash dans le QEMU d'Espressif et dans inkemu et compare, après chaque instruction, le PC, `x1`–`x31` et les huit CSR machine que les deux ont (`mstatus`, `mie`, `mip`, `mtvec`, `mepc`, `mcause`, `mtval`, `mscratch`). QEMU ne tourne que dans l'image épinglée `espressif/idf:v5.5.2` (`tools/conformance/versions.env`), jamais sur l'hôte : il faut Docker et l'image déjà téléchargée (l'outil ne la télécharge pas), l'image flash, une flash entière de la taille du profil, est montée en lecture seule, et lancer QEMU demande un hôte Unix (`--trace` fonctionne partout).
+
+- inkemu tourne sous le modèle de temps `qemu-icount` : 8 ns par instruction, aucune latence d'interruption, pour que les timers des deux côtés se déclenchent à la même instruction. Chaque différence admise est une ligne numérotée de [docs/lockstep-differences.md](docs/lockstep-differences.md), avec sa source et ses paramètres exacts. Une ligne est l'une de ces formes :
+  - un CSR dont des bits valent une paire de valeurs connue ;
+  - des bits de registre copiés de QEMU sous un masque, les autres bits comparés ;
+  - un compteur que chaque côté lit dans son propre modèle, dont l'écart ne bouge que comme la borne sourcée de la ligne le dit ;
+  - le temporisateur RTC absent de QEMU, tenu à l'horloge lente au temps de l'appareil ;
+  - un comportement de QEMU que la machine adopte pour le lockstep seulement.
+
+  Tout le reste est une divergence.
+- Chaque exécution imprime ce que chaque ligne a fait : registres, bits pris à QEMU, plus grand mouvement de chaque compteur, ce qu'un réglage a changé. L'exécution échoue si une ligne, un registre d'une ligne ou un bit de son masque n'a jamais servi, ou si une ligne a servi hors de ce qu'elle déclare. Une fenêtre coupée par `--max-instructions` liste seulement ce qu'elle a laissé inutilisé. `--expect-usage FICHIER` épingle le nombre d'usages de chaque ligne.
+- La fenêtre s'arrête au reset des deux côtés, au premier accès à un registre qu'aucun périphérique de QEMU ne couvre (SPI2, I2C0, une mesure de l'ADC SAR, la radio…) sauf si une ligne nomme ce registre, ou à `--max-instructions`. Un reset d'un seul côté est une divergence, et une trace qui finit avant la fenêtre est une erreur. `--trace FICHIER` (ou `-`) lit une trace `-d cpu,nochain,int` capturée au lieu de lancer QEMU.
+- Une divergence affiche l'instruction, l'état d'avant et les deux états d'après avec les différences marquées, les 64 instructions précédentes avec chaque valeur prise à QEMU en chemin, et la ligne du tableau la plus proche.
+- **Codes de sortie** :
+  - `0` : fenêtre terminée sans divergence, chaque ligne utilisée à chaque registre et chaque bit qu'elle déclare, et dans ces limites, comme les options `--expect-*` l'annonçaient ;
+  - `1` : divergence, reset d'un seul côté compris ;
+  - `2` : erreur (arguments, fichiers, Docker, QEMU qui s'arrête de lui-même, trace qui n'est pas celle de QEMU, ne contient aucun bloc ou finit trop tôt) ;
+  - `3` : fenêtre terminée autrement qu'annoncé, ou ligne utilisée un autre nombre de fois ;
+  - `4` : inkemu s'est arrêté de lui-même ;
+  - `5` : une ligne, un registre ou un bit jamais utilisé, ou une ligne utilisée hors de ce qu'elle déclare ;
+  - `130` : Ctrl-C (le conteneur est supprimé quoi qu'il arrive).
+- La CI l'exécute dans le job `reference-boot`, puis deux fois encore, chacune avec une faute mise exprès dans inkemu, qui doit diverger : une fois dans un registre du CPU, une fois dans une lecture du modèle du SYSTIMER. Voir l'[ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md).
+
 ### Pourquoi
 
 Les simulateurs existants pour petits appareils e-ink recompilent les sources du firmware contre un faux pilote d'écran : cela ne marche qu'avec les sources, et cache les bogues du vrai chemin matériel. inkemu fait l'inverse : il émule le SoC, le bus et chaque puce de la carte, puis démarre le binaire du fabricant par sa vraie chaîne de démarrage.
@@ -399,7 +459,7 @@ Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtens
 
 ### Feuille de route
 
-1. Cœur RV32IMC, ESP32-C3 minimal, chargeur de firmware, CLI : démarrer un firmware jusqu'à ses journaux de console. *1a fait ; 1b-1, squelette du SoC et démarrage de la ROM, fait ; 1b-2, flash et bootloader, fait ; 1b-3a, interruptions, timers, watchdogs et reset, fait ; 1b-3b, écritures en flash et fichier de flash de l'appareil, fait ; 1b-3c, firmware fourni seul (`--firmware`), fait ; 1b-3d, consoles série dans les deux sens, fait ; 1b-3e, démarrage de deux firmwares réels du X4, fait ; 1b-3f, sommeil profond et réveil par le timer RTC, fait ; 1b-4a, documentation sans avertissement, fait ; 1b-4b, enregistrement et rejeu d'une exécution, fait ; le lockstep avec QEMU est le suivant.*
+1. Cœur RV32IMC, ESP32-C3 minimal, chargeur de firmware, CLI : démarrer un firmware jusqu'à ses journaux de console. *1a fait ; 1b-1, squelette du SoC et démarrage de la ROM, fait ; 1b-2, flash et bootloader, fait ; 1b-3a, interruptions, timers, watchdogs et reset, fait ; 1b-3b, écritures en flash et fichier de flash de l'appareil, fait ; 1b-3c, firmware fourni seul (`--firmware`), fait ; 1b-3d, consoles série dans les deux sens, fait ; 1b-3e, démarrage de deux firmwares réels du X4, fait ; 1b-3f, sommeil profond et réveil par le timer RTC, fait ; 1b-4a, documentation sans avertissement, fait ; 1b-4b, enregistrement et rejeu d'une exécution, fait ; 1b-4c, lockstep avec QEMU sur la première vie de l'image de référence, fait ; le lockstep à travers un reset et sur CrossPoint est le suivant.*
 2. Périphériques du X4, interface de bureau, rendu e-ink : **premier jalon visuel**
 3. Prise en charge du X3 (dalle UC8253, capteurs I2C)
 4. Débogage, moniteur de ressources, exécution de tests sans écran
@@ -411,7 +471,7 @@ Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtens
 
 ### Documentation
 
-La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) [0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash), [0005](docs/adr/0005-bootloader-embarque.md) (bootloader embarqué), [0006](docs/adr/0006-entrees-des-consoles.md) (entrées des consoles et hôte USB) et [0007](docs/adr/0007-format-des-sessions.md) (format des sessions) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
+La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) [0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash), [0005](docs/adr/0005-bootloader-embarque.md) (bootloader embarqué), [0006](docs/adr/0006-entrees-des-consoles.md) (entrées des consoles et hôte USB), [0007](docs/adr/0007-format-des-sessions.md) (format des sessions) et [0008](docs/adr/0008-lockstep-et-differences-admises.md) (lockstep et différences admises, avec [le tableau](docs/lockstep-differences.md)) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
 
 ### Matériel tiers et licence
 

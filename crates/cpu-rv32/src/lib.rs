@@ -18,6 +18,6 @@ pub mod timing;
 pub mod trap;
 
 pub use csr::VendorCsrs;
-pub use hart::{Hart, HartConfig, InterruptModel, MisalignedPolicy, StepOutcome};
-pub use timing::DatasheetTiming;
+pub use hart::{Boundary, Hart, HartConfig, InterruptModel, MisalignedPolicy, StepOutcome};
+pub use timing::{DatasheetTiming, QemuIcountTiming};
 pub use trap::{Exception, Trap};

@@ -1,0 +1,20 @@
+[package]
+name = "lockstep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+cpu-rv32.workspace = true
+soc-esp32c3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+cpu-rv32 = { workspace = true, features = ["test-support"] }
+soc-esp32c3 = { workspace = true, features = ["test-support"] }
+svd-regs.workspace = true

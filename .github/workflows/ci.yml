@@ -29,13 +29,14 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       - run: cargo test --workspace
       - run: cargo run -p svd-gen -- --check
-      # The model crates, the crates a front end composes a flash with, and the one it replays a
-      # session with, must go on building for `wasm32-unknown-unknown`, the target of the web
-      # version: this step notices a crate that does not build there. It cannot notice host I/O,
-      # which std compiles there and fails at run time: the clippy step above refuses it in
-      # firmware, boards, soc-esp32c3, console-script and session (their clippy.toml).
+      # The model crates, the crates a front end composes a flash with, the one it replays a
+      # session with and the one that compares the model with QEMU must go on building for
+      # `wasm32-unknown-unknown`, the target of the web version: this step notices a crate that
+      # does not build there. It cannot notice host I/O, which std compiles there and fails at run
+      # time: the clippy step above refuses it in firmware, boards, soc-esp32c3, console-script,
+      # session and lockstep (their clippy.toml).
       - name: Build the model for WebAssembly
-        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3 -p firmware -p boards -p console-script -p session
+        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3 -p firmware -p boards -p console-script -p session -p lockstep
       - uses: EmbarkStudios/cargo-deny-action@v2
   coverage:
     runs-on: ubuntu-24.04
@@ -123,7 +124,9 @@ jobs:
     # inside the pinned ESP-IDF image, and checked against pinned SHA-256 values. The bootloader
     # is the one artefact of this build that is committed, under third_party/esp-idf-bootloader/;
     # the applications and the merged images are never stored in this repository. The cache
-    # saves the build and replaces no check: the images are re-hashed on every run.
+    # saves the build and replaces no check: the images are re-hashed on every run. Last, the
+    # lockstep (ADR 0008) runs flash_hello.bin in Espressif's QEMU, inside the same pinned image,
+    # and in inkemu, and compares the two after every instruction over the whole first life.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -140,14 +143,14 @@ jobs:
         with:
           path: ${{ runner.temp }}/reference-firmware
           key: reference-firmware-${{ hashFiles('tools/reference-firmware/**', 'tools/docker/esp-idf/Dockerfile', 'tools/conformance/versions.env', 'tests/fixtures/partitions/x4-stock.bin') }}
-      # The build pulls the pinned ESP-IDF image, which takes 12.5 GB of disk once extracted
-      # (measured on a development host), and GitHub only guarantees 14 GB to a hosted Linux runner:
-      # without room made first, the pull or the Rust build after it can run out of disk. The
-      # directories removed are toolchains preinstalled on the runner image that this job never
-      # uses (.NET, the Android SDK, Haskell, CodeQL); `df` before and after puts the gain in the
-      # job log. Only needed when the firmware is not in the cache.
+      # The pinned ESP-IDF image takes 12.5 GB of disk once extracted (measured on a development
+      # host), and GitHub only guarantees 14 GB to a hosted Linux runner: without room made first,
+      # the pull or the Rust build after it can run out of disk. The directories removed are
+      # toolchains preinstalled on the runner image that this job never uses (.NET, the Android
+      # SDK, Haskell, CodeQL); `df` before and after puts the gain in the job log. Needed on every
+      # run: the build pulls the image when the firmware is not in the cache, and the lockstep
+      # runs QEMU in it whatever the cache.
       - name: Free disk space for the ESP-IDF image
-        if: steps.firmware.outputs.cache-hit != 'true'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
@@ -179,3 +182,74 @@ jobs:
           tools/ci/run-ignored-tests.sh 13 --release -p emu-cli --test run_cli reference_firmware -- --ignored || failed=1
           tools/ci/run-ignored-tests.sh 5 --release -p console-script --test reference_firmware -- --ignored || failed=1
           exit "$failed"
+      # QEMU runs only inside the pinned image (decision H6), the same as the firmware's.
+      - name: Pull the image QEMU runs in
+        run: |
+          source tools/conformance/versions.env
+          docker pull --quiet "espressif/idf:$ESP_IDF_VERSION"
+      # The lockstep (ADR 0008, docs/lockstep-differences.md): from the first instruction of the
+      # ROM, through the bootloader, app_main and the first tick, to the reset that esp_restart
+      # asks for at the end of the countdown, without a divergence outside the table. The number
+      # of compared instructions, the end of the window and the uses of every row are pinned: a
+      # model change that adds or removes an instruction, an admitted difference that grows into a
+      # divergence, or one that shows up more or less often, fails here (exit 3). The tool prints
+      # what each row of the table did, with the largest move of each counter, and fails (exit 5)
+      # if a row, a register of a row or a bit of its mask was not used, or a row was used outside
+      # what it declares (decision H3). About 90 s of comparison.
+      - name: Compare flash_hello.bin with QEMU after every instruction
+        timeout-minutes: 15
+        run: |
+          source tools/conformance/versions.env
+          cargo run --release -p inkemu-lockstep -- \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --expect-compared 3402169 --expect-end reset \
+            --expect-usage tools/ci/lockstep-hello.usage
+      # The same run with a fault put in the CPU's state on purpose (bit 0 of t0 changed once a
+      # million instructions are compared, a hook of the development binary only): the lockstep
+      # must find it against the real QEMU, exit 1 and name the instruction. This proves the path
+      # from a differing register to the report, nothing more: the next comparison sees the
+      # changed register whatever the rows say. The step after puts a fault in a peripheral's
+      # model, which only a row holds.
+      - name: The lockstep finds a fault put in inkemu
+        timeout-minutes: 10
+        run: |
+          source tools/conformance/versions.env
+          set +e
+          cargo run --release -p inkemu-lockstep -- \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --perturb-after 1000000 > "$RUNNER_TEMP/perturbed.txt" 2>&1
+          code=$?
+          set -e
+          head -80 "$RUNNER_TEMP/perturbed.txt"
+          test "$code" -eq 1 || { echo "exit $code where 1 (divergence) was expected"; exit 1; }
+          grep -q "^divergence after 1000000 compared instructions" "$RUNNER_TEMP/perturbed.txt"
+          grep -q "^instruction .* at 0x" "$RUNNER_TEMP/perturbed.txt"
+          grep -q "^x5/t0 .*<<" "$RUNNER_TEMP/perturbed.txt"
+      # A fault in a peripheral's model: once 2.5 million instructions are compared, the next read
+      # of a SYSTIMER counter gives one count more in inkemu (a hook of the development binary
+      # only). Row 15 admits that read, a gap moving down by one count, then holds the next read
+      # of the counter to the gap the faulty read left: the gap moves up, which QEMU's truncating
+      # counter never does, and the lockstep must report a divergence near row 15.
+      - name: The lockstep finds a fault put in the SYSTIMER's model
+        timeout-minutes: 10
+        run: |
+          source tools/conformance/versions.env
+          set +e
+          cargo run --release -p inkemu-lockstep -- \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --perturb-systimer-after 2500000 > "$RUNNER_TEMP/perturbed-systimer.txt" 2>&1
+          code=$?
+          set -e
+          head -80 "$RUNNER_TEMP/perturbed-systimer.txt"
+          test "$code" -eq 1 || { echo "exit $code where 1 (divergence) was expected"; exit 1; }
+          grep -q "^divergence after 2500668 compared instructions" "$RUNNER_TEMP/perturbed-systimer.txt"
+          grep -q "^nearest row of docs/lockstep-differences.md: 15 " "$RUNNER_TEMP/perturbed-systimer.txt"

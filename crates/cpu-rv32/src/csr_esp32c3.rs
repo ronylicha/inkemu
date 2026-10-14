@@ -55,6 +55,18 @@ pub(crate) struct Esp32C3Csrs {
     snapshot_instret: u64,
     pmpcfg: [u8; PMP_ENTRIES],
     pmpaddr: [u32; PMP_ENTRIES],
+    /// The clock the counter counts, when the machine gave it one
+    /// ([`Esp32C3Csrs::count_on_time_base`]); `None` is the CPU cycles of the timing model.
+    time_base: Option<TimeBase>,
+}
+
+/// The time base the counter counts instead of the CPU cycles the timing model prices.
+#[derive(Clone, Copy, Debug, Default)]
+struct TimeBase {
+    /// Cycles of the 160 MHz time base at the instruction executing, as the machine set them.
+    now: u64,
+    /// Reads of the counter by an instruction: what the setting acted on.
+    reads: u64,
 }
 
 #[allow(clippy::cast_possible_truncation)] // deliberate: the counter is 32 bits wide and wraps
@@ -139,7 +151,41 @@ impl Esp32C3Csrs {
         true
     }
 
+    /// From here on the counter counts the time base the machine sets with
+    /// [`Esp32C3Csrs::set_time_base`] instead of the CPU cycles it is given: the same counter,
+    /// with its event and mode registers and its writes, on another clock.
+    pub(crate) fn count_on_time_base(&mut self) {
+        self.time_base = Some(TimeBase::default());
+    }
+
+    pub(crate) fn set_time_base(&mut self, now: u64) {
+        if let Some(time_base) = &mut self.time_base {
+            time_base.now = now;
+        }
+    }
+
+    pub(crate) fn time_base_reads(&self) -> u64 {
+        self.time_base.map_or(0, |time_base| time_base.reads)
+    }
+
+    /// An instruction is about to read `addr`: a read of the counter on the time base is what
+    /// the setting acts on.
+    pub(crate) fn note_read(&mut self, addr: u16) {
+        if let Some(time_base) = &mut self.time_base
+            && matches!(addr, PCCR_MACHINE | PCCR_USER)
+        {
+            time_base.reads += 1;
+        }
+    }
+
+    /// The clock the counter counts: the time base when it has one, else `cycles`.
+    fn clock(&self, cycles: Cycles) -> Cycles {
+        self.time_base
+            .map_or(cycles, |time_base| Cycles(time_base.now))
+    }
+
     pub(crate) fn read(&self, addr: u16, cycles: Cycles, instret: u64) -> Option<u32> {
+        let cycles = self.clock(cycles);
         Some(match addr {
             USTATUS => self.ustatus,
             PCER_MACHINE | PCER_USER => self.pcer,
@@ -150,6 +196,7 @@ impl Esp32C3Csrs {
     }
 
     pub(crate) fn write(&mut self, addr: u16, value: u32, cycles: Cycles, instret: u64) -> bool {
+        let cycles = self.clock(cycles);
         match addr {
             USTATUS => self.ustatus = value & (USTATUS_UIE | USTATUS_UPIE),
             PCER_MACHINE | PCER_USER => {
@@ -244,6 +291,31 @@ mod tests {
         c.write(PCMR_USER, 1, Cycles(0), 0);
         c.write(PCCR_USER, u32::MAX, Cycles(0), 0);
         assert_eq!(c.read(PCCR_USER, Cycles(2), 0), Some(1));
+    }
+
+    #[test]
+    fn on_the_time_base_the_counter_counts_it_with_its_own_registers_and_writes() {
+        // The cycles given (the timing model's) are ignored; the time base is counted, gated by
+        // the event and mode registers, and a write sets the value counting goes on from.
+        let mut c = Esp32C3Csrs::default();
+        c.count_on_time_base();
+        c.set_time_base(100);
+        c.write(PCER_USER, PCER_CYCLES, Cycles(7), 0);
+        c.note_read(PCCR_USER);
+        assert_eq!(c.read(PCCR_USER, Cycles(9), 0), Some(0), "not yet enabled");
+        c.write(PCMR_USER, PCMR_ENABLE, Cycles(9), 0);
+        c.set_time_base(150);
+        c.note_read(PCCR_USER);
+        assert_eq!(c.read(PCCR_USER, Cycles(10), 0), Some(50));
+        assert!(c.write(PCCR_MACHINE, 1000, Cycles(11), 0));
+        c.set_time_base(160);
+        c.note_read(PCCR_MACHINE);
+        assert_eq!(
+            c.read(PCCR_USER, Cycles(12), 0),
+            Some(1010),
+            "one register at both addresses"
+        );
+        assert_eq!(c.time_base_reads(), 3);
     }
 
     #[test]

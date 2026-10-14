@@ -1,0 +1,30 @@
+# The uses of every row of docs/lockstep-differences.md in the window of flash_hello.bin, as
+# inkemu-lockstep prints them, measured on 2026-10-14 (QEMU esp_develop_9.2.2_20250817 in
+# espressif/idf:v5.5.2). The CI step "The lockstep against QEMU" passes this file to
+# --expect-usage: a row used more or less often fails the run (exit 3), so a model change that
+# makes an admitted difference show up more often, or less, is seen. Measure again and update
+# this file, with the documentation, when such a change is meant.
+row  1: 2781658 uses
+row  2: 3402170 uses
+row  3: 15 uses
+row  4: 94494 uses
+row  5: 566442 uses
+row  6: 3165 uses
+row  7: 20 uses
+row  8: 81 uses
+row  9: 92 uses
+row 10: 67 uses
+row 11: 284 uses
+row 12: 147 uses
+row 13: 14 uses
+row 14: 13 uses
+row 15: 2220 uses
+row 16: 21 uses
+row 17: 1604 uses
+row 18: 48 uses
+row 19: 7033 uses
+row 20: 46 uses
+row 21: 77 uses
+row 22: 24 uses
+row 23: 14447 uses
+row 24: 1 uses

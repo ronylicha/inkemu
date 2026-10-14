@@ -28,7 +28,7 @@ pub mod rom;
 pub mod test_support;
 
 pub use chip::ChipRevision;
-pub use config::SocConfig;
+pub use config::{CompatActs, QemuCompat, SocConfig, Timing};
 pub use diag::Diagnostic;
 pub use flash::{
     FlashConfig, FlashConfigError, FlashDevice, FlashImageError, FlashWrite, JedecId, NorFlash,
@@ -38,8 +38,8 @@ pub use inputs::{
     MAX_JOURNAL_HOST_CHANGES, MAX_JOURNAL_INPUTS,
 };
 pub use machine::{
-    ConsoleChannel, DeepSleep, Esp32C3, InputError, MAX_PENDING_HOST_BYTES,
-    MAX_PENDING_HOST_CHANGES, StopReason,
+    ConsoleChannel, DeepSleep, Esp32C3, Executed, InputError, MAX_PENDING_HOST_BYTES,
+    MAX_PENDING_HOST_CHANGES, Stepped, StopReason,
 };
 pub use periph::UsbHost;
 pub use rom::{RomError, RomImage};
