@@ -106,6 +106,7 @@ Détaillées dans le plan ; les plus engageantes :
   - CrossPoint, en local et daté ; sa fenêtre s'arrêtera au premier accès à un registre que QEMU n'a pas et qu'aucune ligne ne nomme (une mesure de l'ADC, SPI2, I2C0), ou demandera des lignes mesurées ;
   - la build QEMU `20260417` (interruptions perdues avec `MIE` = 0 corrigées) : rien dans la fenêtre de `hello_world` n'en a eu besoin ;
   - le mécanisme du retard de `MEIP` dans QEMU, à lire dans `target/riscv/cpu_helper.c` si un autre firmware montre un autre retard.
+- **L'outil, sur un Docker lent** : quand le démon met plus de 120 s à créer le conteneur, l'outil sort avec 2 et fait son `docker rm --force` avant que le conteneur n'existe ; le démon le crée ensuite, et il reste, QEMU bloqué à l'ouverture de son tube. Vu le 2026-10-14, conteneur supprimé à la main. À corriger : attendre la fin du `docker run` tué avant le `rm`, ou refaire le `rm` après elle.
 - **Sous-projet 2 / 4** : `Esp32C3::step` (avec sa frontière en attente), `x`, `set_x`, `csr` et `Hart::take_boundary` sont l'API du débogueur et du serveur GDB.
 - **Sous-projet 8** : chaque ligne (ii) est une question pour un appareil (valeur de reset, ce que lit la puce).
 
