@@ -229,9 +229,9 @@ autrement est corrigé ici.
   (UART0, SPI0/1, TIMG0/1 aux valeurs du SVD chez inkemu ; GPIO, RTC_CNTL, IO_MUX, APB_SARADC,
   SYSTEM, EXTMEM, ASSIST_DEBUG à 0 chez QEMU). Comptes et usages inchangés : `hello` 6 813 949,
   `nvs` 7 680 555, `nvs-ota` 7 701 890.
-- **La suppression du conteneur de QEMU est bornée en temps réel (m1, R50).** 300 s sur une
+- **La suppression du conteneur de QEMU est bornée en temps réel (m1, R50).** Environ 300 s sur une
   horloge, chaque appel à docker tué au-delà de 20 s, et aucun appel commencé trop tard pour finir
-  dans les 300 s (corrigé à la troisième relecture : la borne n'était vérifiée qu'une fois par
+  dans ces 300 s environ (corrigé à la troisième relecture : la borne n'était vérifiée qu'une fois par
   tour, et le dernier tour avec la suppression finale pouvait la dépasser de 80 s). Un lancement
   qui ne peut pas démarrer QEMU finit en 10 minutes environ ; les étapes de faute de la CI passent
   de 10 à 15 minutes avant le reset, de 15 à 20 après.
@@ -259,10 +259,13 @@ Trois points mineurs (m-1, m-2, m-3) ; décisions R52–R54 du plan.
   les comptes ne changent pas.
 - **Un test par forme d'écriture (m-1, R53)** : `csrrsi`, `csrrci`, `csrrs` dont le registre vaut 0,
   une instruction qui lève une exception, l'oubli des bits écrits au reset, la tenue à travers une
-  vie qui n'écrit rien, et une impulsion de module suivie d'un reset des deux côtés (la valeur
-  vérifiée est celle d'inkemu). Chacun échoue quand on casse la branche qu'il vise (six mutations
-  faites puis défaites à la main).
+  vie qui n'écrit rien, un bit gardé qu'une vie entre deux resets efface (ajouté à la quatrième
+  vérification : sans lui, retirer `& !written` du cumul, ou le calculer après l'oubli des bits
+  écrits, laissait les tests verts), et une impulsion de module suivie d'un reset des deux côtés
+  (la valeur vérifiée est celle d'inkemu). Chacun échoue quand on casse la branche qu'il vise :
+  huit mutations, faites puis défaites à la main, chacune fait échouer au moins un de ces tests.
 - **La borne du nettoyage est celle annoncée (m-3, R54).** Aucun appel à docker de la boucle ne
   commence après 240 s (300 s moins trois appels de 20 s) : l'appel en cours, puis la suppression
-  et l'inspection finales, finissent dans les 300 s. Un lancement qui ne peut pas démarrer QEMU
+  et l'inspection finales, finissent dans les 300 s environ (chaque appel tué ajoute jusqu'à 50 ms
+  de sondage et son arrêt, comme celui du client). Un lancement qui ne peut pas démarrer QEMU
   finit en 10 minutes environ, et non 11 ; les plafonds des étapes de la CI ne changent pas.
