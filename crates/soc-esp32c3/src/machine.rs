@@ -448,6 +448,11 @@ impl Esp32C3 {
         // After the reset: a reset asked for by the same instruction ends the sleep at once.
         if self.bus.ctx.take_deep_sleep_entered() {
             self.powered_down = self.bus.periph.rtc_cntl.is_in_deep_sleep();
+            if self.powered_down {
+                // The console channels go no further than this instant whatever a front end
+                // calls during the sleep: where a run is cut changes nothing (F10).
+                self.bus.periph.power_down(&self.bus.ctx);
+            }
         }
         if self.bus.ctx.take_clock_written() {
             self.retune(pc);
@@ -658,7 +663,9 @@ impl Esp32C3 {
     }
 
     /// The bytes that left the device on `channel` since the last call: a UART byte counts once
-    /// its last bit has gone.
+    /// its last bit has gone. While the chip is in deep sleep the channels have no power and go
+    /// no further than the instant it went to sleep: a byte still on its way out then leaves at
+    /// the reset that ends the sleep, wherever the calls cut the run.
     ///
     /// A device keeps the bytes that left until they are taken here, and firmware decides how
     /// many there are. A caller must therefore take **every** channel ([`ConsoleChannel::ALL`]),
@@ -761,7 +768,8 @@ impl Esp32C3 {
     /// # Errors
     /// [`InputError::InThePast`] when `at` is before [`Esp32C3::device_time`];
     /// [`InputError::TooManyHostChanges`] when [`MAX_PENDING_HOST_CHANGES`] changes are still to
-    /// come, those due by now not counted. Nothing changes then.
+    /// come, those due by now not counted, except during a deep sleep, where the block applies
+    /// them at the reset that ends the sleep and they count until then. Nothing changes then.
     pub fn set_usb_host(&mut self, at: Cycles, state: UsbHost) -> Result<(), InputError> {
         self.check_date(at)?;
         let usb = &mut self.bus.periph.usb_serial_jtag;
@@ -777,7 +785,8 @@ impl Esp32C3 {
         self.bus.periph.usb_serial_jtag.host(&mut self.bus.ctx)
     }
 
-    /// The changes of the USB host still to come, those due by now applied first.
+    /// The changes of the USB host still to come, those due by now applied first; during a deep
+    /// sleep, those due since its start too, which the reset that ends it applies.
     pub fn usb_host_changes_pending(&mut self) -> usize {
         self.bus
             .periph
@@ -1798,6 +1807,19 @@ mod tests {
     /// count on UART0 and waits for the byte to leave; lives 1 to 3 sleep 0x2000 slow-clock counts
     /// (60 ms) on the RTC timer, life 4 sleeps with no wake source.
     fn four_lives() -> Vec<u32> {
+        four_lives_waiting(true)
+    }
+
+    /// [`four_lives`], each life sleeping with its byte still on the line when `flushed` is
+    /// false: the byte then leaves at the wake (the assumption on `RtcCntl::enter_sleep`), and
+    /// the byte of life 4 never leaves.
+    fn four_lives_waiting(flushed: bool) -> Vec<u32> {
+        // 8 192 turns are more than the 347 us a byte takes at the reset clock; one is not.
+        let wait = if flushed {
+            lui(T1, 0x2000)
+        } else {
+            addi(T1, 0, 1)
+        };
         let store0 = rtc_cntl("STORE0");
         let mut program = stop_watchdogs();
         program.extend(load_register(store0));
@@ -1807,9 +1829,8 @@ mod tests {
             lui(T3, UART0),
             addi(T1, T2, i32::from(b'0')),
             sw(T1, T3, 0),
-            // 8 192 turns, more than the 347 us a byte takes at the reset clock: the byte has
-            // left before the chip sleeps, as `flush_uarts` sees to.
-            lui(T1, 0x2000),
+            // Flushed, the byte has left before the chip sleeps, as `flush_uarts` sees to.
+            wait,
             addi(T1, T1, -1),
             bne(T1, 0, -4),
         ]);
@@ -1825,23 +1846,56 @@ mod tests {
         program
     }
 
-    type DeepSleepRun = (Vec<u8>, Option<u64>, Cycles, Cycles, u64);
+    /// The console of UART0 as a run took it: with the channel watched, each take with the
+    /// device time it came at; without, every byte in one entry dated 0.
+    type DatedConsole = Vec<(Cycles, Vec<u8>)>;
+    type DeepSleepRun = (DatedConsole, Option<u64>, Cycles, Cycles, u64);
 
-    /// [`four_lives`] in calls of `slice` cycles, to its sleep without end.
-    fn deep_sleep_run(slice: u64) -> DeepSleepRun {
+    /// How a run of [`four_lives_waiting`] is cut into calls: each call runs at most `cycles`
+    /// cycles, and to device time `step` nanoseconds after the end of the last call cut by time.
+    #[derive(Clone, Copy, Debug)]
+    struct Cuts {
+        cycles: u64,
+        step: u64,
+        watched: bool,
+    }
+
+    /// The run in one call, to the first second of device time: no cut falls in a sleep.
+    const WHOLE: Cuts = Cuts {
+        cycles: u64::MAX,
+        step: 1_000_000_000,
+        watched: false,
+    };
+
+    /// [`four_lives_waiting`] cut as `cuts` says, to its sleep without end.
+    fn deep_sleep_run(flushed: bool, cuts: Cuts) -> DeepSleepRun {
         let config = SocConfig {
             trace_hash: true,
             ..SocConfig::default()
         };
-        let mut m = machine_with(&four_lives(), config);
-        let mut uart0 = Vec::new();
+        let mut m = machine_with(&four_lives_waiting(flushed), config);
+        m.watch_console(ConsoleChannel::Uart0, cuts.watched);
+        let mut uart0: DatedConsole = Vec::new();
+        let mut limit = cuts.step;
         loop {
-            let stop = m.run_within(m.cycles() + slice, Some(1_000_000_000));
-            uart0.extend(m.take_console(ConsoleChannel::Uart0));
+            let stop = m.run_within(m.cycles() + cuts.cycles, Some(limit));
+            let bytes = m.take_console(ConsoleChannel::Uart0);
+            if !bytes.is_empty() {
+                let at = if cuts.watched {
+                    m.device_time()
+                } else {
+                    Cycles(0)
+                };
+                match uart0.last_mut() {
+                    Some((last, taken)) if *last == at => taken.extend(bytes),
+                    _ => uart0.push((at, bytes)),
+                }
+            }
             match stop {
                 StopReason::DeepSleep => break,
+                StopReason::TimeBudget => limit += cuts.step,
                 StopReason::CycleBudget | StopReason::Asleep | StopReason::ConsoleOutput => {}
-                other => panic!("slice {slice}: {other:?}"),
+                other => panic!("{cuts:?}: {other:?}"),
             }
         }
         (
@@ -1857,17 +1911,66 @@ mod tests {
     fn a_deep_sleep_run_is_the_same_whatever_its_calls() {
         // F10: the instant of each wake is that of the RTC timer reaching its target, whatever
         // the calls the run is cut into.
-        let whole = deep_sleep_run(u64::MAX);
-        assert_eq!(whole.0, b"1234");
+        let whole = deep_sleep_run(true, WHOLE);
+        assert_eq!(whole.0, [(Cycles(0), b"1234".to_vec())]);
         assert_eq!(whole.4, 3, "three wakes");
         assert!(whole.1.is_some());
         // Three sleeps of 0x2000 counts, 60.2 ms each, and a few instructions per life.
         let three_sleeps = Cycles(3 * 8_192 * 20_000 / 17);
         assert!(whole.2 > three_sleeps, "{:?}", whole.2);
         assert!(whole.2.get() < three_sleeps.get() + clock::SECOND / 100);
-        for slice in [1, 7, 997, 7_919] {
-            assert_eq!(deep_sleep_run(slice), whole, "slice {slice}");
+        for cycles in [1, 7, 997, 7_919] {
+            let cuts = Cuts { cycles, ..WHOLE };
+            assert_eq!(deep_sleep_run(true, cuts), whole, "{cuts:?}");
         }
+    }
+
+    /// Device-time steps that put limits inside the sleeps: whole milliseconds, a prime number of
+    /// nanoseconds, and about one period of the slow clock (7 352.9 ns at 136 kHz), which is not
+    /// a whole number of cycles of the time base.
+    const TIME_STEPS: [u64; 4] = [1_000_000, 7_000_000, 1_000_003, 7_351];
+
+    #[test]
+    fn a_deep_sleep_cut_by_device_time_wakes_at_the_instant_of_an_uncut_run() {
+        // F10 with the limits inside the sleeps: a call that ends in a sleep moves device time to
+        // its limit, and the next call finds the same wake instant from there.
+        let whole = deep_sleep_run(true, WHOLE);
+        for step in TIME_STEPS {
+            let cuts = Cuts { step, ..WHOLE };
+            assert_eq!(deep_sleep_run(true, cuts), whole, "{cuts:?}");
+        }
+        let mixed = Cuts {
+            cycles: 997,
+            step: 1_000_003,
+            watched: false,
+        };
+        assert_eq!(deep_sleep_run(true, mixed), whole, "{mixed:?}");
+    }
+
+    #[test]
+    fn a_byte_on_the_line_at_a_deep_sleep_leaves_at_the_wake_wherever_the_run_is_cut() {
+        // Each life sleeps with its byte still on its way out: the UART has no power, so the byte
+        // leaves at the reset of the wake (the assumption on `RtcCntl::enter_sleep`), and the
+        // calls of a front end during the sleep (take the console, here) do not move it earlier.
+        let watched = Cuts {
+            watched: true,
+            ..WHOLE
+        };
+        let whole = deep_sleep_run(false, watched);
+        let console: Vec<u8> = whole.0.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(console, b"123", "the byte of life 4 never leaves");
+        assert_eq!(whole.0.len(), 3, "one stop per wake: {:?}", whole.0);
+        assert_eq!(whole.4, 3);
+        for step in TIME_STEPS {
+            let cuts = Cuts { step, ..watched };
+            assert_eq!(deep_sleep_run(false, cuts), whole, "{cuts:?}");
+        }
+        let mixed = Cuts {
+            cycles: 7_919,
+            step: 7_000_000,
+            watched: true,
+        };
+        assert_eq!(deep_sleep_run(false, mixed), whole, "{mixed:?}");
     }
 
     #[test]

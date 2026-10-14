@@ -210,8 +210,9 @@ impl RtcCntl {
             });
         }
         // ASSUMPTION: a byte a UART is still sending when the chip goes to sleep leaves at the
-        // wake, when the reset settles the UART, where the chip powers the UART down and loses
-        // it. ESP-IDF waits for every UART to be idle before it sleeps (`flush_uarts`,
+        // wake, when the reset settles the UART (until then the UART goes no further than the
+        // entry, whatever a front end calls: `Uart::power_down`), where the chip powers the
+        // UART down and loses it. ESP-IDF waits for every UART to be idle before it sleeps (`flush_uarts`,
         // `sleep_modes.c:611-618`; DS §A.1.2), so only a firmware that does not would see the
         // difference: its last bytes before the sleep, received by a host on a real board, settle
         // it.

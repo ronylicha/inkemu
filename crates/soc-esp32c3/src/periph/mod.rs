@@ -605,6 +605,16 @@ impl Peripherals {
         self.rtc_cntl.reset(ctx, cause, level == ResetLevel::System);
     }
 
+    /// The chip went into deep sleep at the present time. The devices a front end reaches while
+    /// the CPU is off (the console channels) go no further than this instant until the reset
+    /// that ends the sleep rebuilds them; the others are reached only by the CPU and their
+    /// wake-ups, which a sleeping chip does not deliver (`Esp32C3::sleep_deeply`).
+    pub(crate) fn power_down(&mut self, ctx: &Ctx) {
+        self.uart0.power_down(ctx);
+        self.uart1.power_down(ctx);
+        self.usb_serial_jtag.power_down(ctx);
+    }
+
     fn core_reset(&mut self, ctx: &mut Ctx) {
         self.gpio = Gpio::new(self.strapping);
         self.io_mux = IoMux::new();
