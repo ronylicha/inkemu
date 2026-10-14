@@ -213,11 +213,23 @@ impl UsbSerialJtag {
     /// it is sending go on; the next of them comes the host latency after the reset, as after
     /// the OUT FIFO was read whole.
     ///
-    /// ASSUMPTION: a core reset resets the block, as it resets "the whole digital system"
-    /// (TRM §6.1.3, report IR §4.2), without the host seeing a detach; a CPU reset
-    /// (`esp_restart` on the ESP32-C3) keeps the block, as report IR §4.2 lists for the other
-    /// peripherals, and does not reach this function. The reset table of the TRM, or a chip
-    /// whose USB-Serial-JTAG is read after a watchdog reset, settles it.
+    /// ASSUMPTION: a core reset resets the block, FIFOs included, without the host seeing a
+    /// detach, so the bytes of a packet the firmware had written but not committed (`WR_DONE` or
+    /// the 64th byte) are lost with it; a CPU reset (`esp_restart`, the panic restart of ESP-IDF
+    /// 5.x, `rst:0xc`) keeps the block and does not reach this function, so they leave with the
+    /// next committed packet. TRM §6.1.3 says a core reset resets "the whole digital system ...
+    /// peripherals" without naming this block, and TRM §30.3.4 says the controller "is not
+    /// affected by SRST", a digital system reset triggered over JTAG. ESP-IDF's panic handler
+    /// writes `EP1` byte by byte and never commits, and `esp_restart_noos_dig` (the panic restart
+    /// of 4.4 with memory protection, `rst:0x3`) waits for the UART console only, so the last
+    /// bytes of a 4.4 panic (`Rebooting...`) are lost on USB-Serial-JTAG here and leave on UART0
+    /// only (report `docs/research/spi1-fsm-and-usj-reset.md`, §B: undecidable without a chip).
+    /// If silicon keeps the block across `SW_SYS_RST`, this is too aggressive. A capture of
+    /// USB-Serial-JTAG across a panic of a 4.4 image on a board settles it, or an image that
+    /// writes `abc` to `EP1` without `WR_DONE`, sets `RTC_CNTL_SW_SYS_RST` and reads what the host
+    /// received: `abc` immediately before `ESP-ROM:` means the block survives a core reset (the
+    /// held bytes leave with the banner, committed by its first `\n`, §B.2 and §B.3); the banner
+    /// alone means it was reset.
     pub(crate) fn reset(&mut self, ctx: &mut Ctx) {
         self.settle(ctx);
         self.stored = UsbSerialJtag::new(self.host).stored;

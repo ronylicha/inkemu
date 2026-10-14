@@ -13,7 +13,7 @@ use soc_esp32c3::flash::{
     FlashConfig, FlashConfigError, FlashImageError, JedecId, MAX_FLASH_BYTES, MIB, MIN_FLASH_BYTES,
 };
 use soc_esp32c3::periph::Efuse;
-use soc_esp32c3::{ChipRevision, Esp32C3, RomImage, SocConfig, UsbHost};
+use soc_esp32c3::{ChipRevision, ConsoleChannel, Esp32C3, RomImage, SocConfig, UsbHost};
 use std::fmt;
 
 /// How to write the `jedec_id` key, for the messages that refuse one.
@@ -64,6 +64,10 @@ pub struct DeviceProfile {
     pub name: String,
     pub soc: SocFamily,
     pub chip_revision: ChipRevision,
+    /// The console a front end shows when its user names none: the serial output a user of the
+    /// device reads its firmware on (for the X3 and the X4, USB-Serial-JTAG, where `CrossPoint`
+    /// writes its log; each profile says where its value comes from).
+    pub console: ConsoleChannel,
     pub flash: FlashConfig,
     /// The partition table an application is booted with, checked when the profile is loaded:
     /// against the flash, against what ESP-IDF's bootloader boots, and for the slot the
@@ -110,6 +114,11 @@ pub enum ProfileError {
         sizes = flash_sizes_mib()
     )]
     MissingFlash { origin: String },
+    #[error(
+        "{origin}: the profile has no console key; add one before the first table, the console shown when none is asked for: console = {}",
+        console_names()
+    )]
+    MissingConsole { origin: String },
     #[error("no device named `{id}`; choose one of: {known}")]
     UnknownDevice { id: String, known: String },
     #[error(
@@ -137,6 +146,9 @@ struct RawProfile {
     #[serde(deserialize_with = "profile_id")]
     id: String,
     name: String,
+    /// Optional here so that its absence gets a message that names the key and its values.
+    #[serde(default, deserialize_with = "console")]
+    console: Option<ConsoleChannel>,
     soc: RawSoc,
     /// Optional here so that its absence gets a message that names the table and its keys.
     flash: Option<RawFlash>,
@@ -316,6 +328,39 @@ fn profile_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Strin
     }
 }
 
+/// The names of the consoles a profile can name, sorted and quoted as the key is written, as a
+/// message lists them: `"uart0", "uart1" or "usb-serial-jtag"`.
+fn console_names() -> String {
+    let mut names: Vec<String> = ConsoleChannel::ALL
+        .iter()
+        .map(|channel| format!("\"{}\"", channel.name()))
+        .collect();
+    names.sort();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        _ => names.concat(),
+    }
+}
+
+/// `console`, read where the TOML error can still carry its line: one of the names the command
+/// line and a front end give the consoles ([`ConsoleChannel::name`]).
+fn console<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ConsoleChannel>, D::Error> {
+    let written = String::deserialize(deserializer)?;
+    ConsoleChannel::ALL
+        .into_iter()
+        .find(|channel| channel.name() == written)
+        .map(Some)
+        .ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "the device has no console `{}`; write console = {}",
+                written.escape_debug(),
+                console_names()
+            ))
+        })
+}
+
 /// `size_mib`, validated where the TOML error can still carry its line. The result is in MiB.
 fn flash_size<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
     let written = deserializer.deserialize_any(WholeNumber {
@@ -424,6 +469,7 @@ impl DeviceProfile {
     /// # Errors
     /// [`ProfileError::Parse`] with the line of the first problem,
     /// [`ProfileError::MissingFlash`] when the profile has no `[flash]` table,
+    /// [`ProfileError::MissingConsole`] when it has no `console` key,
     /// [`ProfileError::Partitions`] when its table is refused, or [`ProfileError::NoBootloader`]
     /// when inkemu ships no bootloader for its chip. A chip revision below the minimum of that
     /// bootloader is no refusal: [`DeviceProfile::bootloader`] says so.
@@ -433,6 +479,11 @@ impl DeviceProfile {
             detail: parse_detail(&e),
         })?;
         let RawFlash(flash) = raw.flash.ok_or_else(|| ProfileError::MissingFlash {
+            origin: origin.to_owned(),
+        })?;
+        // Required: which console a device is read on is a fact of its board, and a default here
+        // would show a new device on a console its firmware may not use.
+        let console = raw.console.ok_or_else(|| ProfileError::MissingConsole {
             origin: origin.to_owned(),
         })?;
         let partitions = PartitionTable {
@@ -472,6 +523,7 @@ impl DeviceProfile {
             name: raw.name,
             soc: raw.soc.family,
             chip_revision: raw.soc.revision,
+            console,
             flash,
             partitions,
             bootloader,
@@ -585,7 +637,8 @@ mod tests {
     use super::*;
     use soc_esp32c3::test_support::{HANG, flat_rom};
 
-    const VALID: &str = "id = \"demo\"\nname = \"Demo board\"\n\n[soc]\nfamily = \"esp32c3\"\nrevision = \"v1.1\"\n\n[flash]\nsize_mib = 4\njedec_id = 0xEF4016\n\n[[partition]]\nname = \"app\"\ntype = \"app\"\nsubtype = \"factory\"\noffset = 0x10000\nsize = 0x10000\n";
+    // `console` takes the place of a blank line, so the line numbers the tests below cite stay.
+    const VALID: &str = "id = \"demo\"\nname = \"Demo board\"\nconsole = \"uart0\"\n[soc]\nfamily = \"esp32c3\"\nrevision = \"v1.1\"\n\n[flash]\nsize_mib = 4\njedec_id = 0xEF4016\n\n[[partition]]\nname = \"app\"\ntype = \"app\"\nsubtype = \"factory\"\noffset = 0x10000\nsize = 0x10000\n";
 
     /// A device is one file of `profiles/`: the built-in list is every `*.toml` there, by name.
     #[test]
@@ -974,6 +1027,71 @@ mod tests {
             ("demo", "Demo board")
         );
         assert_eq!(profile.chip_revision.to_string(), "v1.1");
+        assert_eq!(profile.console, ConsoleChannel::Uart0);
+    }
+
+    /// The X3 and the X4 are read on USB-Serial-JTAG: `CrossPoint`, one image for both, writes
+    /// its log there only (`ARDUINO_USB_CDC_ON_BOOT=1`, `docs/research/xteink-hardware.md`, §1.1),
+    /// and the ROM and the bootloader mirror their lines there
+    /// (`docs/research/flash-writes-and-crosspoint-boot.md`, §K.2). The value rests on the
+    /// firmware: whether the X3's connector carries USB data is an assumption of its profile.
+    #[test]
+    fn the_xteink_devices_are_read_on_usb_serial_jtag() {
+        for id in ["x3", "x4"] {
+            assert_eq!(
+                builtin(id).unwrap().console,
+                ConsoleChannel::UsbSerialJtag,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_console_of_the_chip_can_be_named_by_a_profile() {
+        for channel in ConsoleChannel::ALL {
+            let text = VALID.replace("\"uart0\"", &format!("\"{}\"", channel.name()));
+            let profile = DeviceProfile::from_toml("demo.toml", &text).unwrap();
+            assert_eq!(profile.console, channel);
+        }
+    }
+
+    #[test]
+    fn a_profile_without_a_console_is_refused_with_the_values_it_takes() {
+        let err = DeviceProfile::from_toml("demo.toml", &with_line(3, "")).unwrap_err();
+        assert_eq!(
+            err,
+            ProfileError::MissingConsole {
+                origin: "demo.toml".into()
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "demo.toml: the profile has no console key; add one before the first table, the console shown when none is asked for: console = \"uart0\", \"uart1\" or \"usb-serial-jtag\""
+        );
+    }
+
+    #[test]
+    fn an_unknown_console_is_refused_at_its_line_with_the_values_it_takes() {
+        for bad in ["\"uart2\"", "\"USB-Serial-JTAG\"", "\"\"", "0"] {
+            let err = error_for(&with_line(3, &format!("console = {bad}")));
+            assert!(
+                err.starts_with("demo.toml: ") && err.contains("line 3"),
+                "{bad}: {err}"
+            );
+            assert!(
+                err.ends_with("console = \"uart0\", \"uart1\" or \"usb-serial-jtag\"")
+                    || bad == "0",
+                "{bad}: {err}"
+            );
+        }
+        let err = error_for(&with_line(3, "console = \"uart2\""));
+        assert!(
+            err.contains("the device has no console `uart2`; write console = "),
+            "{err}"
+        );
+        // Not a string at all: the parser says so, with the general remedy.
+        let err = error_for(&with_line(3, "console = 0"));
+        assert!(err.ends_with("; correct the device profile"), "{err}");
     }
 
     fn error_for(text: &str) -> String {

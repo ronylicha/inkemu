@@ -45,6 +45,7 @@ its first section says which plan takes what.
 | `0x60002010` | `SPI1.CTRL2` | 1 | CS setup and hold times | SP8 |
 | `0x60002014` | `SPI1.CLOCK` | 1 | SPI clock divider: a transfer takes no time | SP8 |
 | `0x60002034` | `SPI1.MISC` | 1 | chip-select idle level and enables | SP8 |
+| `0x60002054` | `SPI1.FSM` | 1 | CSPI_LOCK_DELAY_TIME, the arbiter lock delay after a resume: nothing is ever suspended | SP8 |
 | `0x60002098` | `SPI1.FLASH_WAITI_CTRL` | 1 | automatic wait for the chip to be idle after a program or an erase: an operation completes at once | SP8 |
 | `0x6000209c` | `SPI1.FLASH_SUS_CTRL` | 1 | program/erase suspend and resume: an operation completes at once (a suspend or resume request is refused by name) | SP8 |
 | `0x600020a4` | `SPI1.SUS_STATUS` | 1 | program/erase suspend state: nothing is ever suspended | SP8 |

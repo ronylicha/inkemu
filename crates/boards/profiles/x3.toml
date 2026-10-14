@@ -1,6 +1,16 @@
 # Xteink X3. Hardware facts and their sources: docs/research/xteink-hardware.md.
 id = "x3"
 name = "Xteink X3"
+# The console `inkemu run` shows when --console is not given. CrossPoint, one image for the X3 and
+# the X4, writes its own log to USB-Serial-JTAG only (`ARDUINO_USB_CDC_ON_BOOT=1`,
+# docs/research/xteink-hardware.md, section 1.1, USB row, and section 6), and the ROM and the
+# bootloader mirror their lines there (docs/research/flash-writes-and-crosspoint-boot.md, section
+# K.2). The value rests on the firmware, not on the connector.
+# ASSUMPTION: whether the magnetic pogo pins of the X3 carry USB D+ and D- to the chip is not
+# established (docs/research/xteink-hardware.md, section 1.2, battery row, and section 7, item 3):
+# its product page shows no USB-C port, only a magnetic charging cable. A host that enumerates
+# 303A:1001 through the X3 cable settles it.
+console = "usb-serial-jtag"
 
 [soc]
 family = "esp32c3"
