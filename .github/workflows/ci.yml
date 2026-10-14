@@ -302,3 +302,24 @@ jobs:
           grep -q "^divergence after 4000000 compared instructions" "$RUNNER_TEMP/perturbed-after-reset.txt"
           grep -q "^x5/t0 .*<<" "$RUNNER_TEMP/perturbed-after-reset.txt"
           grep -q "^resets crossed: 1$" "$RUNNER_TEMP/perturbed-after-reset.txt"
+      # The rows still hold after the reset: the same fault in the SYSTIMER's model, put five
+      # million instructions in, in the second life, must be found near row 15 (measured on
+      # 2026-10-14: the counter read at instruction 5 700 683).
+      - name: The lockstep finds a fault put in the SYSTIMER's model after the reset
+        timeout-minutes: 15
+        run: |
+          source tools/conformance/versions.env
+          set +e
+          cargo run --release -p inkemu-lockstep -- --window hello \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --perturb-systimer-after 5000000 > "$RUNNER_TEMP/perturbed-systimer-after-reset.txt" 2>&1
+          code=$?
+          set -e
+          head -80 "$RUNNER_TEMP/perturbed-systimer-after-reset.txt"
+          test "$code" -eq 1 || { echo "exit $code where 1 (divergence) was expected"; exit 1; }
+          grep -q "^divergence after 5700683 compared instructions" "$RUNNER_TEMP/perturbed-systimer-after-reset.txt"
+          grep -q "^nearest row of docs/lockstep-differences.md: 15 " "$RUNNER_TEMP/perturbed-systimer-after-reset.txt"
+          grep -q "^resets crossed: 1$" "$RUNNER_TEMP/perturbed-systimer-after-reset.txt"
