@@ -22,9 +22,12 @@ const TRACE_DIR_IN_CONTAINER: &str = "/trace";
 /// How often the wait for QEMU to open its end of the pipe looks at the container and at Ctrl-C.
 const OPEN_POLL: Duration = Duration::from_millis(200);
 /// How long QEMU may take to open its trace: it does so while parsing its options, before the
-/// machine exists, a second at most on the CI's runners. Past this the container is stuck
-/// (a daemon that cannot share the pipe, a QEMU that hangs) and the run fails rather than wait.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(120);
+/// machine exists, a second at most on the CI's runners, but the daemon may take minutes to start
+/// the container on a loaded host (measured on 2026-10-14 on the development host: 99 s to 272 s
+/// from `docker run` to the first byte of the trace, and a run of `CrossPoint` that failed at the
+/// former bound of 120 s). Past this the container is stuck (a daemon that cannot share the pipe,
+/// a QEMU that hangs) and the run fails rather than wait.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long the end of the trace waits for the container to report how QEMU ended.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -313,11 +316,11 @@ fn check(status: ExitStatus) -> Result<(), QemuError> {
 }
 
 /// How many times [`clean_up`] removes the container and looks again before it gives up, and
-/// how long it waits between two tries: 120 s in all, as long as Docker is given to start QEMU.
+/// how long it waits between two tries: 300 s in all, as long as Docker is given to start QEMU.
 /// A daemon slow enough to miss the open timeout is slow to create the container too: measured
 /// on 2026-10-14 on a loaded host, it created one about two minutes after `docker run`, after a
 /// first version of this loop, bounded at 10 s, had killed the client and left.
-const REMOVE_TRIES: u32 = 600;
+const REMOVE_TRIES: u32 = 1500;
 const REMOVE_POLL: Duration = Duration::from_millis(200);
 /// After this many tries, 10 s, the user is told what the tool waits for.
 const REMOVE_NOTICE: u32 = 50;
