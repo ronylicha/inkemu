@@ -23,6 +23,8 @@ Date : 2026-10-14. Spec : `docs/superpowers/specs/2026-10-14-sp1b-3f-design.md` 
 
 ## Valeurs que seule la CI produit
 
+Deux valeurs viennent de la CI, les deux premières ci-dessous ; tant qu'elles ne sont pas épinglées, le job `reference-boot` est rouge par construction. Le README dit le sommeil profond fait sans citer aucun résultat de la CI (ni effectif, ni empreinte) : la branche n'est fusionnée qu'une fois la CI verte.
+
 - `tools/reference-firmware/SHA256SUMS.inputs-deep-sleep-timer` : absent. La première construction imprime les trois empreintes sous `unpinned SHA256SUMS.inputs-deep-sleep-timer:` et échoue avant de livrer quoi que ce soit ; les recopier dans ce fichier, pousser, et vérifier que la construction suivante (propre) donne les mêmes.
 - `DEEP_SLEEP_TIMER_TRACE` (`crates/emu-cli/tests/run_cli.rs`) vaut `trace-hash not pinned yet` : le test échoue alors sur cette seule valeur et imprime l'empreinte de l'exécution ; vérifier la console et le journal du message d'échec, puis l'épingler.
 - Les millisecondes de sommeil que l'application imprime ne sont pas épinglées : le test les lit dans `2000..3000` (2 s moins les 400 µs qu'ESP-IDF retranche, plus le démarrage de la vie suivante, que fixe le modèle de temps non calibré).
@@ -32,6 +34,8 @@ Date : 2026-10-14. Spec : `docs/superpowers/specs/2026-10-14-sp1b-3f-design.md` 
 `cargo fmt --all` ; `tools/ci/clippy.sh -p soc-esp32c3 -p emu-cli -p console-script --all-targets --all-features -- -D warnings` ; `cargo test -p soc-esp32c3 --lib` (623 passés) ; `cargo test -p soc-esp32c3 --test accepted_without_effect` (2, après `INKEMU_BLESS=1`) ; `cargo test -p emu-cli --lib` (173) ; `cargo test -p emu-cli --test run_cli -- readme help` (7) ; `cargo test -p console-script --lib` (30) ; `cargo test -p emu-cli --test run_cli -- --ignored --list` : 11 tests `reference_firmware`, 28 autres. Rien d'autre : ni suite complète, ni suites ignorées, ni couverture, ni Docker, ni ESP-IDF.
 
 Après les corrections de revue du modèle : `cargo fmt --all` ; `tools/ci/clippy.sh -p soc-esp32c3 -p emu-cli --all-targets --all-features -- -D warnings` ; `cargo test -p soc-esp32c3 --lib` filtré (`machine::tests`, `periph::`, `rtc_cntl`, `system::`, `deep_sleep`) ; `cargo test -p soc-esp32c3 --test accepted_without_effect` (2, après `INKEMU_BLESS=1`) ; `cargo test -p emu-cli --lib` (173) ; `cargo check --target wasm32-unknown-unknown -p soc-esp32c3`.
+
+Après les corrections de la revue des tests (stub de réveil compté, `ESP_ERROR_CHECK`, comptes exacts des lignes de réveil et de sommeil) : `cargo fmt --all` ; `tools/ci/clippy.sh -p emu-cli --all-targets --all-features -- -D warnings` ; `cargo test -p emu-cli --test run_cli readme` (1) ; `cargo test -p emu-cli --test run_cli -- --ignored --list` : 11 tests `reference_firmware`. L'application modifiée n'a pas été construite : ses empreintes restent à épingler par la CI.
 
 ## Hypothèses (`ASSUMPTION:`)
 
@@ -76,7 +80,7 @@ Le modèle et la CLI ont été commités ensemble (tâches 3 à 5 et 7 du plan) 
 
 ## Limites de preuve
 
-- `deep_sleep_timer` n'a été ni construit ni exécuté par l'architecte (ni Docker ni ESP-IDF sur son hôte) : écrit contre les en-têtes d'ESP-IDF v5.5.2 (`esp_sleep.h`, `esp_system.h`, `esp_attr.h`), il est vérifié par la première exécution de la CI. Le chemin réel (ROM au réveil, `rtc_boot_control`, stub de réveil exécuté depuis la mémoire RTC, bootloader livré qui ne recharge pas les segments RTC, démarrage de l'application de cause 5) n'est tenu que par ce test.
+- `deep_sleep_timer` n'a été ni construit ni exécuté par l'architecte (ni Docker ni ESP-IDF sur son hôte) : écrit contre les en-têtes d'ESP-IDF v5.5.2 (`esp_sleep.h`, `esp_system.h`, `esp_attr.h`, `esp_err.h`) et les règles du stub de réveil (`docs/en/api-guides/deep-sleep-stub.rst`), il est vérifié par la première exécution de la CI. Le chemin réel (ROM au réveil, `rtc_boot_control`, stub de réveil exécuté depuis la mémoire RTC, bootloader livré qui ne recharge pas les segments RTC, démarrage de l'application de cause 5) n'est tenu que par ce test. Le stub d'ESP-IDF est vide sur la C3 et la ROM, quand le CRC ne correspond pas, saute le stub sans rien dire et démarre depuis la flash : l'application porte donc son propre stub (`RTC_IRAM_ATTR esp_wake_deep_sleep`, qui appelle d'abord `esp_default_wake_deep_sleep` et n'incrémente qu'un compteur `RTC_DATA_ATTR`), chaque vie imprime ce compteur et le test exige `vie - 1` (correction de la revue des tests, M1) : sans lui, un CRC faux ou une exécution ratée depuis la mémoire RTC rapide passerait inaperçu.
 - Les registres que la séquence d'ESP-IDF touche ont été relevés dans le code source (DS §A.1) ; un registre oublié apparaîtrait comme avertissement dans ce test, qui n'en tolère aucun.
 - Le sommeil est tenu au niveau des registres (`rtc_cntl/sleep.rs`) et de la machine par un firmware écrit en instructions (`machine.rs`), dont le déterminisme est vérifié sur quatre découpages en cycles, quatre en temps d'appareil (limites dans les sommeils) et deux mixtes, console surveillée ou non.
 - QEMU ne modélise ni le sommeil ni le timer RTC : pas d'oracle au-delà de l'entrée en sommeil (DS partie B §5).
