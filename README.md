@@ -313,7 +313,7 @@ cargo run --release -p inkemu-lockstep -- --window hello \
   - `4`: inkemu stopped on its own;
   - `5`: a row, a register or a bit was never used, or a row was used outside what it declares;
   - `130`: Ctrl-C (the container is removed whatever ends the run).
-- The CI runs the command above and the windows `nvs` and `nvs-ota` in the `reference-boot` job, then three more times, each time with a fault put in inkemu on purpose, which must diverge: in a register of the CPU before the reset and after it, and in a read of the SYSTIMER's model. See [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md) (French).
+- The CI runs the command above and the windows `nvs` and `nvs-ota` in the `reference-boot` job, then four more times, each time with a fault put in inkemu on purpose, which must diverge: in a register of the CPU, and in a read of the SYSTIMER's model, each before the reset and after it. See [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md) (French).
 
 ## Why
 
@@ -455,7 +455,7 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
   - `4` : inkemu s'est arrêté de lui-même ;
   - `5` : une ligne, un registre ou un bit jamais utilisé, ou une ligne utilisée hors de ce qu'elle déclare ;
   - `130` : Ctrl-C (le conteneur est supprimé quoi qu'il arrive).
-- La CI l'exécute, avec les fenêtres `nvs` et `nvs-ota`, dans le job `reference-boot`, puis trois fois encore, chacune avec une faute mise exprès dans inkemu, qui doit diverger : dans un registre du CPU avant le reset et après, et dans une lecture du modèle du SYSTIMER. Voir l'[ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md).
+- La CI l'exécute, avec les fenêtres `nvs` et `nvs-ota`, dans le job `reference-boot`, puis quatre fois encore, chacune avec une faute mise exprès dans inkemu, qui doit diverger : dans un registre du CPU, et dans une lecture du modèle du SYSTIMER, chacune avant le reset et après. Voir l'[ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md).
 
 ### Pourquoi
 
