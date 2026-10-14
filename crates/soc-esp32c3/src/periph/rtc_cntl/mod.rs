@@ -149,28 +149,43 @@ const STORE: [u32; STORE_COUNT] = [
     addr("RTC_CNTL", "STORE7") - RTC_CNTL_BASE,
 ];
 /// Configuration the ROM, the bootloader and the application write and read back. Nothing acts on
-/// it: there is no analog part, no power domain and no sleep in this model.
-const ACCEPTED: [Accepted; 18] = [
+/// it: there is no analog part, no power model, no pad and no radio in this model, and the sleep
+/// it has takes no time to enter or leave (F6: each row names who gives it its effect).
+/// `rtc_sleep_init` writes `OPTIONS0`, `TIMER1`, `ANA_CONF`, `CLK_CONF`, `RTC_CNTL`, `BIAS_CONF`,
+/// `SDIO_CONF`, `DIG_ISO` and `SLP_REJECT_CONF` on the way to a deep sleep (DS §A.1.3); the
+/// startup of an application woken from one reads `GPIO_WAKEUP` (`esp_deep_sleep_wakeup_io_reset`,
+/// DS §A.3.4).
+const ACCEPTED: [Accepted; 22] = [
     Accepted::svd(
         "RTC_CNTL",
         "OPTIONS0",
-        "BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits act)",
-        "SP1b-3f",
+        "BBPLL, crystal and I2C power forcing: no effect to see without a power model; CPU stall, which ESP-IDF uses on dual-core chips only (the two software reset bits act)",
+        "SP4",
     ),
     Accepted::svd(
         "RTC_CNTL",
         "TIMER1",
-        "clock and PLL wake-up delays",
-        "SP1b-3f",
+        "clock and PLL wake-up delays: a wake from deep sleep takes no time",
+        "SP8",
     ),
-    Accepted::svd("RTC_CNTL", "TIMER3", "Wi-Fi/BT power-up timing", "SP1b-3f"),
-    Accepted::svd("RTC_CNTL", "TIMER4", "digital power-up timing", "SP1b-3f"),
-    Accepted::svd("RTC_CNTL", "TIMER5", "minimum sleep time", "SP1b-3f"),
+    Accepted::svd("RTC_CNTL", "TIMER3", "Wi-Fi/BT power-up timing", "SP5a"),
+    Accepted::svd(
+        "RTC_CNTL",
+        "TIMER4",
+        "digital power-up timing: a wake from deep sleep takes no time",
+        "SP8",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "TIMER5",
+        "minimum sleep time: a sleep of any length is entered",
+        "SP8",
+    ),
     Accepted::svd(
         "RTC_CNTL",
         "TIMER6",
-        "peripheral power-up timing",
-        "SP1b-3f",
+        "peripheral power-up timing: a wake from deep sleep takes no time",
+        "SP8",
     ),
     Accepted::svd(
         "RTC_CNTL",
@@ -193,9 +208,33 @@ const ACCEPTED: [Accepted; 18] = [
     ),
     Accepted::svd(
         "RTC_CNTL",
-        "DIG_PWC",
-        "digital power-domain control",
-        "SP1b-3f",
+        "SDIO_CONF",
+        "flash supply (VDD_SDIO) regulator and its power-down in sleep: no effect to see without a power model",
+        "SP4",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "BIAS_CONF",
+        "bias and regulator settings in sleep: no effect to see without a power model",
+        "SP4",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "EXT_WAKEUP_CONF",
+        "GPIO wake filter: the pins are not modelled",
+        "SP2",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "SLP_REJECT_CONF",
+        "sleep rejection: no reject source (GPIO, UART) is raised",
+        "SP2",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "GPIO_WAKEUP",
+        "GPIO wake of each pin and its status: the pins are not modelled (a GPIO wake source is refused by name at the entry into sleep)",
+        "SP2",
     ),
     Accepted::svd(
         "RTC_CNTL",
@@ -210,8 +249,18 @@ const ACCEPTED: [Accepted; 18] = [
         "SP2",
     ),
     Accepted::svd("RTC_CNTL", "SENSOR_CTRL", "SAR ADC power forcing", "SP2"),
-    Accepted::svd("RTC_CNTL", "PWC", "RTC power-domain control", "SP1b-3f"),
-    Accepted::svd("RTC_CNTL", "DIG_ISO", "digital pad isolation", "SP1b-3f"),
+    Accepted::svd(
+        "RTC_CNTL",
+        "PWC",
+        "RTC power-domain control: no effect to see without a power model",
+        "SP4",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "DIG_ISO",
+        "digital pad isolation and hold in sleep: the pins are not modelled",
+        "SP2",
+    ),
     Accepted::svd("RTC_CNTL", "PAD_HOLD", "pad hold", "SP2"),
     Accepted::svd("RTC_CNTL", "DIG_PAD_HOLD", "digital pad hold", "SP2"),
 ];
