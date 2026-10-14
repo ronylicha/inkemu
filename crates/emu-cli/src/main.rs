@@ -20,7 +20,7 @@ use emu_cli::run::{
 };
 use emu_cli::rvtest::{RunResult, TestMachine};
 use emu_cli::script_file;
-use emu_cli::session_file;
+use emu_cli::session_file::{self, Claimed};
 use emu_cli::term::sanitize;
 use firmware::BootloaderWarning;
 use session::{ConsoleDigests, Limits, ProfileText, Replay, ReplayError, RomIdentity};
@@ -483,7 +483,9 @@ fn run_device(
         Ok(script) => script,
         Err(e) => return fail(&e),
     };
-    let profile_text = match refuse_record_path(record, flash, console_script, device) {
+    let entry = rom_store::rom_entry_for(profile.chip_revision);
+    let rom = (rom_dir.as_deref(), entry);
+    let profile_text = match refuse_record_path(record, flash, console_script, rom, device) {
         Ok(text) => text,
         Err(code) => return code,
     };
@@ -508,7 +510,6 @@ fn run_device(
         write_line(io::stderr(), &format_args!("warning: {warning}"));
     }
     let flash_note = flash_note(flash.file, &run_flash, &fresh.note, flash_size);
-    let entry = rom_store::rom_entry_for(profile.chip_revision);
     let rom = match load_rom(rom_dir, entry) {
         Ok(rom) => rom,
         Err(code) => return code,
@@ -605,25 +606,59 @@ fn refuse_the_images_as_flash_file(flash: &FlashOptions<'_>) -> Result<(), ExitC
 }
 
 /// Refuses, before anything of the run, a `--record` path a session must not be written to: a
-/// file the run reads (a session is written over what is at its path). Gives the text of the
-/// profile of `device` that a session carries, when the run is recorded.
+/// path the run reads or writes, existing or not (a session is written over what is at its
+/// path): the files given to the run, the flash file and the files beside it, the ROM file of
+/// `rom_dir` or, without it, the ROM cache. Gives the text of the profile of `device` that a
+/// session carries, when the run is recorded.
 fn refuse_record_path(
     record: Option<&Path>,
     flash: &FlashOptions<'_>,
     console_script: Option<&Path>,
+    rom: (Option<&Path>, &RomEntry),
     device: &str,
 ) -> Result<Option<&'static str>, ExitCode> {
     let Some(path) = record else {
         return Ok(None);
     };
-    let inputs = [
+    let mut claimed = Vec::new();
+    for (option, input) in [
         ("--flash", flash.image),
         ("--firmware", flash.firmware),
         ("--bootloader", flash.bootloader),
-        ("--flash-file", flash.file),
         ("--console-script", console_script),
-    ];
-    session_file::refuse_record_path(path, &inputs).map_err(|e| fail(&e))?;
+    ] {
+        if let Some(input) = input {
+            claimed.push(Claimed::File {
+                path: input.to_path_buf(),
+                what: format!("the file of {option}, which the run reads"),
+            });
+        }
+    }
+    if let Some(file) = flash.file {
+        claimed.extend(flash_state::files_of_the_flash_file(file).into_iter().map(
+            |(path, what)| Claimed::File {
+                path,
+                what: what.to_owned(),
+            },
+        ));
+    }
+    let (rom_dir, entry) = rom;
+    match rom_dir {
+        Some(dir) => claimed.push(Claimed::File {
+            path: dir.join(entry.elf_name),
+            what: "the ROM file of --rom-dir, which the run reads".to_owned(),
+        }),
+        // Without a home directory there is no cache: loading the ROM says so.
+        None => {
+            if let Ok(dir) = rom_store::default_cache_dir() {
+                claimed.push(Claimed::Directory {
+                    path: dir,
+                    what: "in the ROM cache, whose files the run reads and downloads".to_owned(),
+                });
+            }
+        }
+    }
+    session_file::refuse_record_path(path, &claimed).map_err(|e| fail(&e))?;
     boards::builtin_toml(device).map(Some).map_err(|e| fail(&e))
 }
 

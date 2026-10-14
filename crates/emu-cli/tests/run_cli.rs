@@ -162,7 +162,7 @@ fn record_refuses_the_path_of_a_file_the_run_reads_before_any_rom_is_read() {
         .assert()
         .code(2)
         .stderr(contains(
-            "which is also the file of --flash: the run would replace it with its session; give --record another path",
+            "flash.bin, which is the file of --flash, which the run reads; give --record another path",
         ));
     assert_eq!(std::fs::read(&image).unwrap(), [0xFFu8; 16]);
     inkemu()
@@ -171,6 +171,49 @@ fn record_refuses_the_path_of_a_file_the_run_reads_before_any_rom_is_read() {
         .assert()
         .code(2)
         .stderr(contains("which is a directory or a link, not a file"));
+}
+
+/// The first run on a flash file finds no file at its path, and replaces it with the flash when
+/// it ends: a session written there would be lost, or would replace the flash. The flash file,
+/// its lock and its temporary file are refused, whether they exist or not, before anything is
+/// created; so are the ROM file the run reads, and a directory that does not exist.
+#[test]
+fn record_refuses_the_flash_file_its_own_files_and_the_rom_before_they_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = tempfile::tempdir().unwrap();
+    let flash = dir.path().join("x4.bin");
+    let record = |path: &std::path::Path| {
+        inkemu()
+            .args(["run", "--device", "x4", "--rom-dir"])
+            .arg(roms.path())
+            .arg("--flash-file")
+            .arg(&flash)
+            .arg("--record")
+            .arg(path)
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::starts_with("error: --record names "))
+    };
+    for (path, what) in [
+        (flash.clone(), "the flash file of --flash-file"),
+        (
+            dir.path().join("x4.bin.lock"),
+            "the lock file of --flash-file",
+        ),
+        (
+            dir.path().join(".x4.bin.tmp"),
+            "the temporary file of --flash-file",
+        ),
+        (roms.path().join(MISSING_ROM), "the ROM file of --rom-dir"),
+    ] {
+        record(&path).stderr(contains(format!(", which is {what}")));
+    }
+    record(&dir.path().join("runs").join("s.inkrec")).stderr(contains(
+        "s.inkrec, in a directory that does not exist; create it, or give --record a path in a directory that exists",
+    ));
+    assert_eq!(names_in(dir.path()), Vec::<String>::new());
+    assert_eq!(names_in(roms.path()), Vec::<String>::new());
 }
 
 #[test]

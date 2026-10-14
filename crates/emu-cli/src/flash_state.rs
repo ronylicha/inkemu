@@ -274,9 +274,33 @@ fn lock_path(path: &Path) -> Option<PathBuf> {
 }
 
 /// The name the content of the flash file at `path` is written to before it takes the name of
-/// the flash file. One name per flash file: the lock leaves a run alone with it.
-fn temporary_path(path: &Path) -> Option<PathBuf> {
+/// the flash file. One name per flash file: the lock leaves a run alone with it. A session is
+/// written the same way (`crate::session_file`), so that the two schemes stay one.
+pub(crate) fn temporary_path(path: &Path) -> Option<PathBuf> {
     sibling(path, ".", ".tmp")
+}
+
+/// The files a run writes or holds for the flash file at `path`, whether they exist yet or not,
+/// each with what the run does with it: the flash file, its temporary file and its lock file.
+#[must_use]
+pub fn files_of_the_flash_file(path: &Path) -> Vec<(PathBuf, &'static str)> {
+    [
+        (
+            Some(path.to_path_buf()),
+            "the flash file of --flash-file, which the run replaces when it ends",
+        ),
+        (
+            temporary_path(path),
+            "the temporary file of --flash-file, where the run writes the flash before it takes the name of the flash file",
+        ),
+        (
+            lock_path(path),
+            "the lock file of --flash-file, which the run holds locked to its end",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(file, what)| file.map(|file| (file, what)))
+    .collect()
 }
 
 /// Refuses `image`, the file given to `--flash`, as a file the run writes: the flash file, which

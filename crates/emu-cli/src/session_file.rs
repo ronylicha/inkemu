@@ -2,10 +2,9 @@
 //! its checks and the replay belong to the `session` crate, so that a front end gets the same
 //! answers; this module only reads the file, within the size a session may have, and writes it.
 use crate::flash_file::{ReadFailure, read_regular_file};
-use crate::flash_state::same_file;
+use crate::flash_state::{same_file, temporary_path};
 use crate::term::sanitize;
 use session::{MAX_SESSION_BYTES, ReadError, Session};
-use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -32,14 +31,26 @@ pub enum SessionFileError {
         #[source]
         source: ReadError,
     },
+    #[error("--record names {path}, which is {what}; give --record another path")]
+    Claimed { path: String, what: String },
     #[error(
-        "--record names {path}, which is also the file of {option}: the run would replace it with its session; give --record another path"
+        "--record names {path}, whose session is written first to {temporary}, which is {what}; give --record another path"
     )]
-    SameFile { path: String, option: &'static str },
+    TemporaryClaimed {
+        path: String,
+        temporary: String,
+        what: String,
+    },
     #[error(
         "--record names {path}, which is a directory or a link, not a file; give the path of the file to write"
     )]
     NotAFileToWrite { path: String },
+    #[error("--record names no file: `{path}`; give the path of the file to write")]
+    NoFileName { path: String },
+    #[error(
+        "--record names {path}, in a directory that does not exist; create it, or give --record a path in a directory that exists"
+    )]
+    NoDirectory { path: String },
     #[error(
         "cannot write the session {path}: {detail}; the run is not recorded: check that the directory exists and is writable"
     )]
@@ -77,42 +88,96 @@ pub fn read_session(path: &Path) -> Result<Session, SessionFileError> {
     })
 }
 
+/// A path the run reads or writes, which a session must not be written to: a file, or every file
+/// of a directory. `what` says which, and what the run does with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Claimed {
+    File { path: PathBuf, what: String },
+    Directory { path: PathBuf, what: String },
+}
+
+impl Claimed {
+    /// Whether `path` is this file or a file of this directory, whether it exists or not.
+    fn holds(&self, path: &Path) -> bool {
+        match self {
+            Claimed::File { path: file, .. } => same_place(path, file),
+            Claimed::Directory { path: dir, .. } => directory_of(path)
+                .zip(std::fs::canonicalize(dir).ok())
+                .is_some_and(|(one, other)| one == other),
+        }
+    }
+
+    fn what(&self) -> &str {
+        match self {
+            Claimed::File { what, .. } | Claimed::Directory { what, .. } => what,
+        }
+    }
+}
+
+/// The directory `path` is in, every link in it resolved; `None` when it does not exist.
+fn directory_of(path: &Path) -> Option<PathBuf> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::canonicalize(parent).ok()
+}
+
+/// Whether the two paths lead to one file, by whatever route, or would once it is created: the
+/// same name in the same directory, every link in the directories resolved. The flash file of a
+/// first run does not exist yet, and a session written at its path would replace it at the end.
+fn same_place(one: &Path, other: &Path) -> bool {
+    if same_file(one, other) {
+        return true;
+    }
+    let resolved = |path: &Path| Some(directory_of(path)?.join(path.file_name()?));
+    resolved(one)
+        .zip(resolved(other))
+        .is_some_and(|(one, other)| one == other)
+}
+
 /// Refuses, before a run, a `--record` path the run could not write a session to, or that names
-/// a file the run reads: `inputs`, each with its option. A path that leads to nothing yet is
-/// fine; the write at the end says what goes wrong then.
+/// a path the run reads or writes (`claimed`), the session or the temporary file it is written
+/// through: whether that path exists yet or not.
 ///
 /// # Errors
+/// [`SessionFileError::NoFileName`] when the path names no file,
 /// [`SessionFileError::NotAFileToWrite`] when a directory or a link is at the path,
-/// [`SessionFileError::SameFile`] when the path leads to one of the inputs.
-pub fn refuse_record_path(
-    path: &Path,
-    inputs: &[(&'static str, Option<&Path>)],
-) -> Result<(), SessionFileError> {
+/// [`SessionFileError::NoDirectory`] when its directory does not exist,
+/// [`SessionFileError::Claimed`] and [`SessionFileError::TemporaryClaimed`] when the path or its
+/// temporary file is one of `claimed`.
+pub fn refuse_record_path(path: &Path, claimed: &[Claimed]) -> Result<(), SessionFileError> {
+    let ends_in_a_separator = path
+        .as_os_str()
+        .to_string_lossy()
+        .ends_with(std::path::is_separator);
+    let Some(temporary) = temporary_path(path).filter(|_| !ends_in_a_separator) else {
+        return Err(SessionFileError::NoFileName { path: shown(path) });
+    };
     if let Ok(metadata) = std::fs::symlink_metadata(path)
         && !metadata.is_file()
     {
         return Err(SessionFileError::NotAFileToWrite { path: shown(path) });
     }
-    for (option, input) in inputs {
-        if let Some(input) = input
-            && same_file(path, input)
-        {
-            return Err(SessionFileError::SameFile {
+    if directory_of(path).is_none() {
+        return Err(SessionFileError::NoDirectory { path: shown(path) });
+    }
+    for claim in claimed {
+        if claim.holds(path) {
+            return Err(SessionFileError::Claimed {
                 path: shown(path),
-                option,
+                what: claim.what().to_owned(),
+            });
+        }
+        if claim.holds(&temporary) {
+            return Err(SessionFileError::TemporaryClaimed {
+                path: shown(path),
+                temporary: shown(&temporary),
+                what: claim.what().to_owned(),
             });
         }
     }
     Ok(())
-}
-
-/// The name the session is written to before it takes the name `path`: `.<name>.tmp` beside it.
-fn temporary_path(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?;
-    let mut temporary = OsString::from(".");
-    temporary.push(name);
-    temporary.push(".tmp");
-    Some(path.with_file_name(temporary))
 }
 
 /// Writes `bytes` to `path` through a temporary file beside it, flushed to the disk then renamed:
@@ -198,6 +263,13 @@ mod tests {
         );
     }
 
+    fn file(path: &Path, what: &str) -> Claimed {
+        Claimed::File {
+            path: path.to_path_buf(),
+            what: what.to_owned(),
+        }
+    }
+
     #[test]
     fn a_record_path_that_is_a_directory_or_an_input_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -207,15 +279,113 @@ mod tests {
         ));
         let image = dir.path().join("flash.bin");
         std::fs::write(&image, b"image").unwrap();
-        assert!(matches!(
-            refuse_record_path(&image, &[("--flash-file", None), ("--flash", Some(&image))]),
-            Err(SessionFileError::SameFile {
-                option: "--flash",
-                ..
-            })
-        ));
+        let error = refuse_record_path(&image, &[file(&image, "the file of --flash")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.ends_with("flash.bin, which is the file of --flash; give --record another path"),
+            "{error}"
+        );
         let new = dir.path().join("new.inkrec");
-        refuse_record_path(&new, &[("--flash", Some(&image))]).unwrap();
+        refuse_record_path(&new, &[file(&image, "the file of --flash")]).unwrap();
+    }
+
+    #[test]
+    fn a_record_path_is_refused_as_the_flash_file_and_its_own_files_before_they_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let flash = dir.path().join("x4.bin");
+        let claimed: Vec<Claimed> = crate::flash_state::files_of_the_flash_file(&flash)
+            .into_iter()
+            .map(|(path, what)| file(&path, what))
+            .collect();
+        // Another spelling of the same place: through `.` in the directory.
+        let spelled = dir.path().join(".").join("x4.bin");
+        for (path, what) in [
+            (spelled, "the flash file of --flash-file"),
+            (
+                dir.path().join("x4.bin.lock"),
+                "the lock file of --flash-file",
+            ),
+            (
+                dir.path().join(".x4.bin.tmp"),
+                "the temporary file of --flash-file",
+            ),
+        ] {
+            let error = refuse_record_path(&path, &claimed).unwrap_err().to_string();
+            assert!(error.contains(&format!(", which is {what}")), "{error}");
+        }
+        // Beside the flash file under another name, the session and its temporary file are its
+        // own.
+        refuse_record_path(&dir.path().join("x4.inkrec"), &claimed).unwrap();
+        assert!(names_in(dir.path()).is_empty(), "nothing is created");
+    }
+
+    #[test]
+    fn a_record_path_whose_temporary_file_is_an_input_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join(".run.inkrec.tmp");
+        std::fs::write(&script, b"script").unwrap();
+        let error = refuse_record_path(
+            &dir.path().join("run.inkrec"),
+            &[file(&script, "the file of --console-script")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("run.inkrec, whose session is written first to ")
+                && error.ends_with(
+                    ".run.inkrec.tmp, which is the file of --console-script; give --record another path"
+                ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_record_path_in_a_claimed_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Claimed::Directory {
+            path: dir.path().to_path_buf(),
+            what: "in the ROM cache".to_owned(),
+        };
+        assert!(matches!(
+            refuse_record_path(&dir.path().join("run.inkrec"), std::slice::from_ref(&cache)),
+            Err(SessionFileError::Claimed { .. })
+        ));
+        std::fs::create_dir(dir.path().join("sessions")).unwrap();
+        refuse_record_path(&dir.path().join("sessions").join("run.inkrec"), &[cache]).unwrap();
+    }
+
+    #[test]
+    fn a_record_path_that_names_no_file_or_no_directory_is_refused_before_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [PathBuf::new(), dir.path().join("run.inkrec/")] {
+            assert!(
+                matches!(
+                    refuse_record_path(&path, &[]),
+                    Err(SessionFileError::NoFileName { .. })
+                ),
+                "{}",
+                path.display()
+            );
+        }
+        let error = refuse_record_path(&dir.path().join("runs").join("s.inkrec"), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.ends_with(
+                "s.inkrec, in a directory that does not exist; create it, or give --record a path in a directory that exists"
+            ),
+            "{error}"
+        );
+        // A bare name is in the current directory, which exists.
+        refuse_record_path(Path::new("run.inkrec"), &[]).unwrap();
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
