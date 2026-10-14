@@ -1,6 +1,10 @@
 # Xteink X4. Hardware facts and their sources: docs/research/xteink-hardware.md.
 id = "x4"
 name = "Xteink X4"
+# The console `inkemu run` shows when --console is not given. The USB-C port of the X4 is the
+# USB-Serial-JTAG of the chip: the ROM and the bootloader mirror their lines there, and CrossPoint
+# writes its own log there only (docs/research/flash-writes-and-crosspoint-boot.md, section K.2).
+console = "usb-serial-jtag"
 
 [soc]
 family = "esp32c3"

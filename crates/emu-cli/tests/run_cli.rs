@@ -382,6 +382,8 @@ fn x4_boots_the_real_rom_to_its_banner() {
                 "run",
                 "--device",
                 "x4",
+                "--console",
+                "uart0",
                 "--max-cycles",
                 "5000000",
                 "--trace-hash",
@@ -439,6 +441,8 @@ fn the_usb_host_given_is_the_one_the_summary_says() {
             "run",
             "--device",
             "x4",
+            "--console",
+            "uart0",
             "--max-cycles",
             "1000000",
             "--rom-dir",
@@ -771,6 +775,8 @@ fn x4_boots_a_flash_image_through_the_real_rom() {
             "run",
             "--device",
             "x4",
+            "--console",
+            "uart0",
             "--strict-mmio",
             "--max-cycles",
             "5000000",
@@ -807,6 +813,8 @@ fn x4_without_a_flash_image_loops_on_the_invalid_header_of_an_erased_chip() {
             "run",
             "--device",
             "x4",
+            "--console",
+            "uart0",
             "--strict-mmio",
             "--max-cycles",
             "3000000",
@@ -896,6 +904,8 @@ fn a_device_time_limit_ends_the_run_of_a_blank_chip_after_its_first_watchdog_res
                 "run",
                 "--device",
                 "x4",
+                "--console",
+                "uart0",
                 "--strict-mmio",
                 "--max-time",
                 "1.5",
@@ -1048,6 +1058,8 @@ fn scripted_run(rom_dir: &str, body: &str) -> std::process::Output {
             "run",
             "--device",
             "x4",
+            "--console",
+            "uart0",
             "--max-time",
             SCRIPTED_RUN_SECONDS,
             "--rom-dir",
@@ -1106,6 +1118,8 @@ fn a_device_time_limit_ends_the_run_of_a_firmware_that_sleeps() {
             "run",
             "--device",
             "x4",
+            "--console",
+            "uart0",
             "--max-time",
             "2",
             "--rom-dir",
@@ -1147,6 +1161,8 @@ fn a_strict_stop_exits_3_and_names_the_register() {
             "run",
             "--device",
             "x4",
+            "--console",
+            "uart0",
             "--strict-mmio",
             "--rom-dir",
             &rom_dir,
@@ -1173,7 +1189,8 @@ fn a_wait_for_an_interrupt_nothing_can_raise_exits_4() {
     program.extend([wfi(), HANG]);
     let (_dir, flash) = flash_image_of(&program);
     inkemu()
-        .args(["run", "--device", "x4", "--rom-dir", &rom_dir, "--flash"])
+        .args(["run", "--device", "x4", "--console", "uart0"])
+        .args(["--rom-dir", &rom_dir, "--flash"])
         .arg(&flash)
         .timeout(HANG_LIMIT)
         .assert()
@@ -1334,6 +1351,14 @@ fn run_of(rom_dir: &str, flash: &std::path::Path) -> std::process::Command {
     command
 }
 
+/// `command` showing UART0, the console the test firmwares of this file write to and the ROM
+/// prints on: the profile of the X4 shows USB-Serial-JTAG by default.
+#[cfg(unix)]
+fn on_uart0(mut command: std::process::Command) -> std::process::Command {
+    command.args(["--console", "uart0"]);
+    command
+}
+
 /// Ctrl-C through the real command, with a real `SIGINT`: a blank chip prints and resets for ever,
 /// no limit is given, and the signal ends the run with its summary and exit code 0.
 #[cfg(unix)]
@@ -1342,7 +1367,15 @@ fn run_of(rom_dir: &str, flash: &std::path::Path) -> std::process::Command {
 fn ctrl_c_ends_a_run_without_a_limit_with_its_summary_and_exit_code_0() {
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_inkemu"));
-    command.args(["run", "--device", "x4", "--rom-dir", &rom_dir]);
+    command.args([
+        "run",
+        "--device",
+        "x4",
+        "--console",
+        "uart0",
+        "--rom-dir",
+        &rom_dir,
+    ]);
     // The reader stays to the end: the run must not end for having lost it.
     let run = live::start(command, |_| false);
     let limit = HANG_LIMIT;
@@ -1374,7 +1407,7 @@ fn a_run_that_prints_nothing_more_ends_when_the_reader_of_its_output_goes_away()
     let mut program = stop_watchdogs();
     program.push(HANG);
     let (_dir, flash) = flash_image_of(&program);
-    let run = live::start(run_of(&rom_dir, &flash), |line| {
+    let run = live::start(on_uart0(run_of(&rom_dir, &flash)), |line| {
         line.contains(LAST_ROM_LINE)
     });
     let limit = HANG_LIMIT;
@@ -1424,6 +1457,8 @@ fn x4_boots_the_reference_firmware_through_its_restart_into_a_second_boot() {
                 "run",
                 "--device",
                 "x4",
+                "--console",
+                "uart0",
                 "--strict-mmio",
                 "--max-cycles",
                 "40000000",
@@ -1501,6 +1536,8 @@ fn x4_boots_the_reference_firmware_and_a_device_time_limit_ends_its_countdown_as
             "run",
             "--device",
             "x4",
+            "--console",
+            "uart0",
             "--strict-mmio",
             "--max-time",
             "5",
@@ -1566,6 +1603,8 @@ fn x4_runs_the_reference_firmware_along_its_pinned_trace() {
             "run",
             "--device",
             "x4",
+            "--console",
+            "uart0",
             "--strict-mmio",
             "--max-cycles",
             "40000001",
@@ -2224,7 +2263,8 @@ const FLASH_AT_END: &str = "inkemu: flash at end: sha256 ";
 fn count_a_boot(more: &[&std::ffi::OsStr]) -> Counted {
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
     let output = inkemu()
-        .args(["run", "--device", "x4", "--strict-mmio", "--trace-hash"])
+        .args(["run", "--device", "x4", "--console", "uart0"])
+        .args(["--strict-mmio", "--trace-hash"])
         .args(["--max-cycles", "5000000", "--rom-dir", &rom_dir])
         .args(more)
         .timeout(HANG_LIMIT)
@@ -2461,7 +2501,7 @@ fn a_second_run_on_a_flash_file_is_refused_while_the_first_goes_on_and_ctrl_c_sa
     let (dir, image) = flash_image_of(&ready_then_busy());
     let file = dir.path().join("x4.bin");
     let limit = HANG_LIMIT;
-    let first = live::start(run_with_file(&rom_dir, &image, &file), |_| false);
+    let first = live::start(on_uart0(run_with_file(&rom_dir, &image, &file)), |_| false);
     first.wait_for_line("ready", limit);
     assert!(
         !file.exists(),
@@ -2501,6 +2541,8 @@ fn a_second_run_on_a_flash_file_is_refused_while_the_first_goes_on_and_ctrl_c_sa
                     "run",
                     "--device",
                     "x4",
+                    "--console",
+                    "uart0",
                     "--rom-dir",
                     &rom_dir,
                     "--flash-file",
@@ -2537,7 +2579,7 @@ fn a_second_ctrl_c_once_the_run_has_returned_leaves_the_save_and_the_summary_to_
     let (dir, image) = flash_image_of(&ready_then_busy());
     let file = dir.path().join("x4.bin");
     let limit = HANG_LIMIT;
-    let run = live::start(run_with_file(&rom_dir, &image, &file), |_| false);
+    let run = live::start(on_uart0(run_with_file(&rom_dir, &image, &file)), |_| false);
     run.wait_for_line("ready", limit);
     run.interrupt();
     run.wait_for_log_line("inkemu: flash at start: sha256 ", limit);
@@ -2569,7 +2611,7 @@ fn a_flash_file_whose_directory_vanished_during_the_run_exits_2_and_says_what_is
     std::fs::create_dir(&kept_in).unwrap();
     let limit = HANG_LIMIT;
     let run = live::start(
-        run_with_file(&rom_dir, &image, &kept_in.join("x4.bin")),
+        on_uart0(run_with_file(&rom_dir, &image, &kept_in.join("x4.bin"))),
         |_| false,
     );
     run.wait_for_line("ready", limit);
@@ -2611,7 +2653,7 @@ fn a_flash_file_whose_directory_became_read_only_exits_2_and_leaves_no_file() {
     );
     let limit = HANG_LIMIT;
     let run = live::start(
-        run_with_file(&rom_dir, &image, &kept_in.join("x4.bin")),
+        on_uart0(run_with_file(&rom_dir, &image, &kept_in.join("x4.bin"))),
         |_| false,
     );
     run.wait_for_line("ready", limit);
@@ -2673,7 +2715,15 @@ fn a_directory_at_the_temporary_name_refuses_the_run_before_its_first_instructio
 fn run_x4(more: &[&std::ffi::OsStr]) -> Counted {
     let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
     let output = inkemu()
-        .args(["run", "--device", "x4", "--rom-dir", &rom_dir])
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--console",
+            "uart0",
+            "--rom-dir",
+            &rom_dir,
+        ])
         .args(more)
         .timeout(HANG_LIMIT)
         .output()
@@ -2771,7 +2821,7 @@ fn a_reader_that_goes_away_ends_the_run_with_its_flash_file_saved() {
     then.push(HANG);
     let (dir, image) = flash_image_of(&counting_its_boots_then(&then));
     let file = dir.path().join("x4.bin");
-    let run = live::start(run_with_file(&rom_dir, &image, &file), |line| {
+    let run = live::start(on_uart0(run_with_file(&rom_dir, &image, &file)), |line| {
         line.contains("kept")
     });
     let limit = HANG_LIMIT;
@@ -2911,7 +2961,14 @@ fn a_save_killed_by_a_file_size_limit_leaves_the_flash_file_of_before_and_the_ne
     let killed = std::process::Command::new("sh")
         .args(["-c", r#"ulimit -c 0; ulimit -f 2048; exec "$0" "$@""#])
         .arg(env!("CARGO_BIN_EXE_inkemu"))
-        .args(["run", "--device", "x4", "--strict-mmio"])
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--console",
+            "uart0",
+            "--strict-mmio",
+        ])
         .args(["--max-cycles", "5000000", "--rom-dir", &rom_dir])
         .arg(flash_file)
         .arg(&file)
@@ -2979,7 +3036,8 @@ fn the_nvs_reference_firmware_goes_on_counting_in_a_second_run_on_the_same_flash
     let file = dir.path().join("x4.bin");
     let run = |seconds: &str, flash: &[&std::ffi::OsStr]| {
         let output = inkemu()
-            .args(["run", "--device", "x4", "--strict-mmio", "--trace-hash"])
+            .args(["run", "--device", "x4", "--console", "uart0"])
+            .args(["--strict-mmio", "--trace-hash"])
             .args(["--max-time", seconds, "--rom-dir", &rom_dir])
             .args(flash)
             .arg("--flash-file")
@@ -3071,11 +3129,11 @@ fn the_readme_shows_what_the_binary_prints_for_the_reference_firmware() {
     const EXAMPLES: [(&str, &[&str]); 3] = [
         (
             "With `--max-cycles 50000000`, standard error reads:\n\n",
-            &["run --device x4 --flash flash_hello.bin --max-cycles 50000000"],
+            &["run --device x4 --console uart0 --flash flash_hello.bin --max-cycles 50000000"],
         ),
         (
             "`Restarting in 6 seconds...` and standard error reads:\n\n",
-            &["run --device x4 --flash flash_hello.bin --max-time 5"],
+            &["run --device x4 --console uart0 --flash flash_hello.bin --max-time 5"],
         ),
         ("keeps a restart counter in NVS:\n\n", &[]),
     ];
@@ -3857,6 +3915,8 @@ fn x4_boots_the_reference_firmware_from_its_application_image_through_a_second_b
             "run",
             "--device",
             "x4",
+            "--console",
+            "uart0",
             "--strict-mmio",
             "--max-cycles",
             "44000000",
@@ -3931,6 +3991,8 @@ fn x4_runs_the_reference_firmware_from_its_application_image_along_its_pinned_tr
             "run",
             "--device",
             "x4",
+            "--console",
+            "uart0",
             "--strict-mmio",
             "--max-cycles",
             "40000001",
@@ -3974,8 +4036,8 @@ fn the_nvs_reference_firmware_counts_on_from_its_application_image_across_two_ru
     let file = dir.path().join("x4.bin");
     let run = |more: &[&std::ffi::OsStr]| {
         let output = inkemu()
-            .args(["run", "--device", "x4", "--strict-mmio", "--max-time", "5"])
-            .args(["--rom-dir", &rom_dir])
+            .args(["run", "--device", "x4", "--console", "uart0"])
+            .args(["--strict-mmio", "--max-time", "5", "--rom-dir", &rom_dir])
             .args(more)
             .arg("--flash-file")
             .arg(&file)

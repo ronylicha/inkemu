@@ -123,9 +123,11 @@ enum Command {
         /// (exit code 3).
         #[arg(long)]
         strict_mmio: bool,
-        /// Which console of the device goes to standard output.
-        #[arg(long, value_enum, default_value_t = ConsoleArg::Uart0)]
-        console: ConsoleArg,
+        /// Which console of the device goes to standard output. Without it, the console the device
+        /// profile names: usb-serial-jtag for the X3 and the X4, their USB-C port. The first line
+        /// on standard error says which console is shown and where the choice came from.
+        #[arg(long, value_enum)]
+        console: Option<ConsoleArg>,
         /// What the host sends to the consoles, and when: a text file whose first line is
         /// `inkemu-console-script 1`, then one step per line: `send CHANNEL "BYTES"`, `wait 250ms`,
         /// `wait-for CHANNEL "TEXT"` (the next steps are dated from the device time the text
@@ -259,10 +261,10 @@ fn main() -> ExitCode {
                 trace_hash,
                 usb_host: usb_host.into(),
             },
-            &RunOptions {
+            &RunRequest {
                 max_cycles,
                 max_device_nanos: max_time,
-                console: console.into(),
+                console: console.map(ConsoleChannel::from),
             },
         ),
         Command::Rom {
@@ -315,6 +317,7 @@ fn profile_for(id: &str) -> Result<DeviceProfile, boards::ProfileError> {
         },
         other @ (boards::ProfileError::Parse { .. }
         | boards::ProfileError::MissingFlash { .. }
+        | boards::ProfileError::MissingConsole { .. }
         | boards::ProfileError::IdMismatch { .. }
         | boards::ProfileError::Partitions { .. }
         | boards::ProfileError::NoBootloader { .. }) => other,
@@ -335,6 +338,61 @@ struct FlashOptions<'a> {
     reset: bool,
 }
 
+/// What `inkemu run` was told about how to run: its limits, and the console to show if one was
+/// named. The console becomes that of the device profile otherwise ([`shown_console`]).
+struct RunRequest {
+    max_cycles: Option<u64>,
+    max_device_nanos: Option<u64>,
+    /// `--console`, when it was given.
+    console: Option<ConsoleChannel>,
+}
+
+impl RunRequest {
+    /// The options of a run of `profile`, and the part of its first line that names the console
+    /// shown ([`console_note`]).
+    fn resolve(&self, profile: &DeviceProfile) -> (RunOptions, String) {
+        let (console, origin) = shown_console(profile, self.console);
+        let options = RunOptions {
+            max_cycles: self.max_cycles,
+            max_device_nanos: self.max_device_nanos,
+            console,
+        };
+        (options, console_note(console, origin))
+    }
+}
+
+/// Where the console a run shows comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleOrigin {
+    /// `--console` named it.
+    Option,
+    /// The device profile names it, and `--console` was not given.
+    Profile,
+}
+
+/// The console a run of `profile` shows: the one `--console` asked for, else the one the profile
+/// names, and where it came from.
+fn shown_console(
+    profile: &DeviceProfile,
+    asked: Option<ConsoleChannel>,
+) -> (ConsoleChannel, ConsoleOrigin) {
+    asked.map_or((profile.console, ConsoleOrigin::Profile), |channel| {
+        (channel, ConsoleOrigin::Option)
+    })
+}
+
+/// The part of the first line of a run that names the console shown and where the choice came
+/// from: a user who sees nothing knows which console to ask for instead.
+fn console_note(channel: ConsoleChannel, origin: ConsoleOrigin) -> String {
+    match origin {
+        ConsoleOrigin::Option => format!("console: {} (--console)", channel.name()),
+        ConsoleOrigin::Profile => format!(
+            "console: {} (the default of the device profile; --console shows another)",
+            channel.name()
+        ),
+    }
+}
+
 /// The last component of `path`, for a line that names a file the user gave: escaped, since it
 /// comes straight from the command line.
 fn file_name(path: &Path) -> String {
@@ -350,12 +408,13 @@ fn run_device(
     rom_dir: Option<PathBuf>,
     console_script: Option<&Path>,
     machine_options: MachineOptions,
-    run_options: &RunOptions,
+    request: &RunRequest,
 ) -> ExitCode {
     let profile = match profile_for(device) {
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
+    let (run_options, console_note) = request.resolve(&profile);
     // Read before anything else of the run: a refused script needs no flash and no ROM.
     let script = match console_script.map(script_file::read_script).transpose() {
         Ok(script) => script,
@@ -391,15 +450,7 @@ fn run_device(
     for warning in &fresh.warnings {
         write_line(io::stderr(), &format_args!("warning: {warning}"));
     }
-    let flash_note = match flash.file {
-        Some(path) if run_flash.starts_from_the_file() => format!(
-            "flash: {} (flash file, {} MiB)",
-            file_name(path),
-            flash_size >> 20
-        ),
-        Some(path) => format!("flash: {}, kept in {}", fresh.note, file_name(path)),
-        None => format!("flash: {}", fresh.note),
-    };
+    let flash_note = flash_note(flash.file, &run_flash, &fresh.note, flash_size);
     let entry = rom_store::rom_entry_for(profile.chip_revision);
     let rom = match load_rom(rom_dir, entry) {
         Ok(rom) => rom,
@@ -419,7 +470,10 @@ fn run_device(
     }
     write_line(
         io::stderr(),
-        &format_args!("{}; {flash_note}", header(&profile, entry, &machine)),
+        &format_args!(
+            "{}; {flash_note}",
+            header(&profile, entry, &machine, &console_note)
+        ),
     );
     // The steps before the first wait are dated now, at power-on.
     let mut script_run = match script
@@ -441,7 +495,7 @@ fn run_device(
     }
     let end = execute_with_script(
         &mut machine,
-        run_options,
+        &run_options,
         script_run.as_mut(),
         &interrupt,
         &stdout_reader_gone,
@@ -461,6 +515,20 @@ fn run_device(
         end.exit_code_without_its_flash()
     };
     ExitCode::from(code)
+}
+
+/// The part of the first line of a run that names its flash: the flash file it starts from, or
+/// the starting flash (`fresh`) and the flash file it is kept in, if any.
+fn flash_note(file: Option<&Path>, run_flash: &RunFlash, fresh: &str, flash_size: u32) -> String {
+    match file {
+        Some(path) if run_flash.starts_from_the_file() => format!(
+            "flash: {} (flash file, {} MiB)",
+            file_name(path),
+            flash_size >> 20
+        ),
+        Some(path) => format!("flash: {fresh}, kept in {}", file_name(path)),
+        None => format!("flash: {fresh}"),
+    }
 }
 
 /// The mask ROM of `entry`, from `rom_dir`, read only, or from the cache, which downloads it on
@@ -586,11 +654,17 @@ fn watch_ctrl_c(interrupt: &Arc<Interrupt>) -> Result<(), ctrlc::Error> {
     })
 }
 
-/// The one line that says what is being emulated and how much to trust its timing.
-fn header(profile: &DeviceProfile, entry: &RomEntry, machine: &soc_esp32c3::Esp32C3) -> String {
+/// The one line that says what is being emulated, how much to trust its timing and which console
+/// is shown (`console_note`).
+fn header(
+    profile: &DeviceProfile,
+    entry: &RomEntry,
+    machine: &soc_esp32c3::Esp32C3,
+    console_note: &str,
+) -> String {
     let timing = machine.timing_model();
     format!(
-        "inkemu: {} (ESP32-C3 {}, mask ROM rev{}); timing model {} ({})",
+        "inkemu: {} (ESP32-C3 {}, mask ROM rev{}); timing model {} ({}); {console_note}",
         profile.name,
         profile.chip_revision,
         entry.rom_revision,
@@ -791,6 +865,49 @@ mod tests {
                 "no value of --console selects {channel:?}"
             );
         }
+    }
+
+    /// Without `--console` a run shows the console of its profile, and says so; with it, the one
+    /// asked for, and says that instead.
+    #[test]
+    fn the_console_shown_is_the_profile_s_unless_one_is_asked_for() {
+        for id in ["x3", "x4"] {
+            let profile = profile_for(id).unwrap();
+            let (channel, origin) = shown_console(&profile, None);
+            assert_eq!(
+                (channel, origin),
+                (ConsoleChannel::UsbSerialJtag, ConsoleOrigin::Profile),
+                "{id}"
+            );
+            assert_eq!(
+                console_note(channel, origin),
+                "console: usb-serial-jtag (the default of the device profile; --console shows another)"
+            );
+            for asked in ConsoleChannel::ALL {
+                let (channel, origin) = shown_console(&profile, Some(asked));
+                assert_eq!((channel, origin), (asked, ConsoleOrigin::Option), "{id}");
+                assert_eq!(
+                    console_note(channel, origin),
+                    format!("console: {} (--console)", asked.name())
+                );
+            }
+        }
+    }
+
+    /// `--console` is optional, and nothing but the profile picks the console when it is absent.
+    #[test]
+    fn console_is_optional_on_the_command_line() {
+        let parsed = Cli::try_parse_from(["inkemu", "run", "--device", "x4"]).unwrap();
+        let Command::Run { console, .. } = parsed.command else {
+            panic!("`run` parses as the run command")
+        };
+        assert!(console.is_none());
+        let parsed =
+            Cli::try_parse_from(["inkemu", "run", "--device", "x4", "--console", "uart0"]).unwrap();
+        let Command::Run { console, .. } = parsed.command else {
+            panic!("`run` parses as the run command")
+        };
+        assert!(matches!(console, Some(ConsoleArg::Uart0)));
     }
 
     #[test]
