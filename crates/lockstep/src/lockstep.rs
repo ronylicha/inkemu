@@ -4,14 +4,17 @@
 use crate::report::{Adoption, Cause, HistoryEntry, Nearest, Report};
 use crate::state::{CpuState, Field};
 use crate::table::{
-    CPU_INT_THRESH, DIFFERENCES, Difference, Location, MEIP, MIP, Register, SPI1_CMD, SPI1_CMD_USR,
-    SPI1_USER2, Treatment, absent_in_qemu,
+    CPU_INT_THRESH, DIFFERENCES, Difference, Drift, Location, MEIP, MIP, Register, SPI1_CMD,
+    SPI1_CMD_USR, SPI1_USER2, Site, Treatment, absent_in_qemu,
 };
 use crate::trace::{QemuTrap, TraceEvent};
-use crate::usage::Usage;
+use crate::usage::{Check, Usage};
 use cpu_rv32::{CsrOp, Decoded, Instr, LoadOp, StoreOp};
 use soc_esp32c3::{CompatActs, Esp32C3, Executed, Stepped, StopReason};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// Nanoseconds in a second, for the slow clock's cycles at an instant of device time.
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 /// The instructions a report shows before the divergence, from both sides (spec §4.4).
 pub const HISTORY: usize = 64;
@@ -44,6 +47,8 @@ pub trait Target {
     fn external_interrupt_as_qemu(&self) -> bool;
     /// What the settings of `QemuCompat` did ([`Esp32C3::compat_acts`]).
     fn compat_acts(&self) -> CompatActs;
+    /// Device time since power-on ([`Esp32C3::device_time_nanos`]).
+    fn device_time_nanos(&self) -> u64;
 }
 
 impl Target for Esp32C3 {
@@ -70,6 +75,39 @@ impl Target for Esp32C3 {
     fn compat_acts(&self) -> CompatActs {
         Esp32C3::compat_acts(self)
     }
+
+    fn device_time_nanos(&self) -> u64 {
+        Esp32C3::device_time_nanos(self)
+    }
+}
+
+/// Where a counter of [`Treatment::Counter`] stands.
+#[derive(Clone, Copy, Debug, Default)]
+struct CounterState {
+    /// The gap (QEMU's value minus inkemu's) at the origin for [`Drift::Within`], at the last
+    /// read for [`Drift::Truncated`]; `None` until the first read after an origin.
+    gap: Option<i64>,
+    /// The updates QEMU may have made of its counter since the last read
+    /// ([`Drift::Truncated`]).
+    updates: u64,
+}
+
+/// How a read of a location is held, by the kind of row that names it.
+#[derive(Clone, Copy)]
+enum ReadRule {
+    Mip,
+    Counter {
+        row: u16,
+        drift: Drift,
+    },
+    SlowClock {
+        row: u16,
+        capture: u32,
+        hz: u64,
+        bound: u32,
+        qemu: u32,
+    },
+    Other,
 }
 
 /// Why the comparison ended without a divergence (decision H4).
@@ -153,6 +191,11 @@ pub struct Lockstep {
     /// `SPI1.USER2` as the last word store left it, and the opcode of the last user command.
     spi1_user2: u32,
     spi1_command: Option<u8>,
+    /// The counters of the table, by location: only those the rows name.
+    counters: BTreeMap<Location, CounterState>,
+    /// The device time of the last capture of each slow clock, by the address of its capture
+    /// register: only those the rows name.
+    captures: BTreeMap<u32, u64>,
 }
 
 impl Lockstep {
@@ -187,13 +230,42 @@ impl Lockstep {
             meip_lag: 0,
             spi1_user2: 0,
             spi1_command: None,
+            counters: BTreeMap::new(),
+            captures: BTreeMap::new(),
         }
+    }
+
+    /// Holds what the run did to the table (decision H3, [`Usage::check`]) for a window that
+    /// ended by `end`: a window cut at an instruction limit reports what it left unused without
+    /// failing on it.
+    #[must_use]
+    pub fn check_usage(&self, target: &impl Target, end: &WindowEnd) -> Check {
+        self.usage(target)
+            .check(self.rows, !matches!(end, WindowEnd::Limit))
     }
 
     /// The counts so far.
     #[must_use]
     pub fn counts(&self) -> &Counts {
         &self.counts
+    }
+
+    /// The word load the machine executed and the comparison has not yet compared: its
+    /// destination register and the address it read. For the test of the tool, which changes
+    /// what the load gave as a fault of a model would.
+    #[must_use]
+    pub fn pending_load(&self) -> Option<(u8, u32)> {
+        let executed = self.executed.as_ref()?.executed.as_ref()?;
+        if executed.trap.is_some() {
+            return None;
+        }
+        let decoded = executed.instruction?;
+        match decoded.instr {
+            Instr::Load {
+                op: LoadOp::W, rd, ..
+            } if rd != 0 => Some((rd, data_address(decoded, &self.before)?)),
+            _ => None,
+        }
     }
 
     /// What each row did so far, the rows of treatment (iv) with what their settings did in
@@ -297,6 +369,8 @@ impl Lockstep {
         }
         if interrupt.is_some() {
             self.counts.interrupts += 1;
+            // An alarm QEMU raised brought its counter up to date.
+            self.note_counter_update(|_| true);
         }
         let entry = HistoryEntry {
             index: self.counts.compared,
@@ -397,9 +471,24 @@ impl Lockstep {
         };
         // A load that copies bits records its use with them ([`Lockstep::adopt`]).
         if !Self::copies(executed) {
-            self.usage.record(row.number, Location::Mmio(word), 0, 0);
+            let site = self.site_of(word, row.registers_at(word));
+            self.usage.record(row.number, site, 0, 0);
         }
         None
+    }
+
+    /// The site at `address` among the register `entries` a row has there: the entry whose
+    /// condition holds now, or else the first.
+    fn site_of<'a>(&self, address: u32, entries: impl Iterator<Item = &'a Register>) -> Site {
+        let entries: Vec<&Register> = entries.collect();
+        let entry = entries
+            .iter()
+            .find(|register| self.condition_holds(register))
+            .or_else(|| entries.first());
+        Site {
+            location: Location::Mmio(address),
+            after_command: entry.and_then(|register| register.after_command),
+        }
     }
 
     /// Whether a word load of `executed` would be handled by [`Lockstep::adopt`].
@@ -444,22 +533,47 @@ impl Lockstep {
         }
         let mine = target.state().x(rd);
         let theirs = qemu.x(rd);
-        let (row, bits, gap) = if location == Location::Csr(MIP) {
-            self.admitted_mip_read(mine, theirs, previous)?
-        } else {
-            self.admitted_read(location, mine, theirs)?
-        };
-        if let Location::Mmio(address) = location {
-            // An admitted access to a register QEMU lacks is a use even when nothing differs.
-            if bits == 0 && absent_in_qemu(address) {
-                self.usage.record(row, location, 0, 0);
+        let differ = mine ^ theirs;
+        let (row, bits) = match self.read_rule(location) {
+            ReadRule::Mip => {
+                let (row, bits) = self.admitted_mip_read(mine, theirs, previous)?;
+                if bits != 0 {
+                    self.usage.record(row, Site::at(location), bits, 0);
+                }
+                (row, bits)
             }
-        }
+            // A counter and a clock are held at every read, equal or not: each read is a use.
+            ReadRule::Counter { row, drift } => {
+                let moved = self.counter_read(location, drift, mine, theirs)?;
+                self.usage.record(row, Site::at(location), differ, moved);
+                (row, differ)
+            }
+            ReadRule::SlowClock {
+                row,
+                capture,
+                hz,
+                bound,
+                qemu,
+            } => {
+                let moved = self.clock_read(capture, hz, bound, qemu, mine, theirs)?;
+                self.usage.record(row, Site::at(location), differ, moved);
+                (row, differ)
+            }
+            ReadRule::Other => {
+                let (row, site, bits) = self.admitted_read(location, mine, theirs)?;
+                // An admitted access to a register QEMU lacks is a use even when nothing
+                // differs.
+                let absent = matches!(location, Location::Mmio(address) if absent_in_qemu(address));
+                if bits != 0 || absent {
+                    self.usage.record(row, site, bits, 0);
+                }
+                (row, bits)
+            }
+        };
         if bits == 0 {
             return None;
         }
         target.set_x(rd, mine ^ bits);
-        self.usage.record(row, location, bits, gap);
         Some(Adoption {
             row,
             register: rd,
@@ -468,9 +582,149 @@ impl Lockstep {
         })
     }
 
+    /// How the rows hold a read of `location`.
+    fn read_rule(&self, location: Location) -> ReadRule {
+        if location == Location::Csr(MIP) {
+            return ReadRule::Mip;
+        }
+        for row in self.rows {
+            for treatment in row.treatments {
+                match *treatment {
+                    Treatment::Counter {
+                        location: l, drift, ..
+                    } if l == location => {
+                        return ReadRule::Counter {
+                            row: row.number,
+                            drift,
+                        };
+                    }
+                    Treatment::SlowClock {
+                        register,
+                        capture,
+                        hz,
+                        bound,
+                        qemu,
+                        ..
+                    } if Location::Mmio(register) == location => {
+                        return ReadRule::SlowClock {
+                            row: row.number,
+                            capture,
+                            hz,
+                            bound,
+                            qemu,
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ReadRule::Other
+    }
+
+    /// A read of a counter: the gap between the two values may move only as `drift` says from
+    /// where the counter's origin, or its last read, left it. Returns how far it moved, `None`
+    /// when that is past what the row admits.
+    fn counter_read(
+        &mut self,
+        location: Location,
+        drift: Drift,
+        mine: u32,
+        theirs: u32,
+    ) -> Option<u32> {
+        let gap = i64::from(theirs.wrapping_sub(mine).cast_signed());
+        let state = self.counters.entry(location).or_default();
+        let Some(held) = state.gap else {
+            // The first read after an origin fixes the gap.
+            *state = CounterState {
+                gap: Some(gap),
+                updates: 0,
+            };
+            return Some(0);
+        };
+        let moved = gap - held;
+        let within = match drift {
+            Drift::Within(bound) => moved.unsigned_abs() <= u64::from(bound),
+            Drift::Truncated { .. } => moved <= 0 && moved.unsigned_abs() <= state.updates,
+        };
+        if !within {
+            return None;
+        }
+        if matches!(drift, Drift::Truncated { .. }) {
+            *state = CounterState {
+                gap: Some(gap),
+                updates: 0,
+            };
+        }
+        Some(u32::try_from(moved.unsigned_abs()).unwrap_or(u32::MAX))
+    }
+
+    /// A read of a slow clock QEMU does not model: QEMU reads `qemu`, and inkemu the cycles of
+    /// `hz` at the device time of the last capture (0 before any), within `bound`. Returns how
+    /// far inkemu's value is from that, `None` when either side is off.
+    fn clock_read(
+        &self,
+        capture: u32,
+        hz: u64,
+        bound: u32,
+        qemu: u32,
+        mine: u32,
+        theirs: u32,
+    ) -> Option<u32> {
+        if theirs != qemu {
+            return None;
+        }
+        let expected = self.captures.get(&capture).map_or(0, |&nanos| {
+            let cycles = u128::from(nanos) * u128::from(hz) / NANOS_PER_SECOND;
+            // The register is the low word of the count.
+            u32::try_from(cycles & u128::from(u32::MAX)).unwrap_or(0)
+        });
+        let moved = mine.wrapping_sub(expected).cast_signed().unsigned_abs();
+        (moved <= bound).then_some(moved)
+    }
+
+    /// One update QEMU may have made of the counters of [`Drift::Truncated`] whose block
+    /// `touched` says the event reached.
+    fn note_counter_update(&mut self, touched: impl Fn((u32, u32)) -> bool) {
+        for row in self.rows {
+            for treatment in row.treatments {
+                if let Treatment::Counter {
+                    location,
+                    drift: Drift::Truncated { first, last },
+                    ..
+                } = *treatment
+                    && touched((first, last))
+                {
+                    self.counters.entry(location).or_default().updates += 1;
+                }
+            }
+        }
+    }
+
+    /// An origin of the counters that name `location`: their next read fixes the gap again.
+    fn note_counter_origin(&mut self, location: Location) {
+        for row in self.rows {
+            for treatment in row.treatments {
+                if let Treatment::Counter {
+                    location: counter,
+                    origins,
+                    ..
+                } = *treatment
+                    && origins.contains(&location)
+                {
+                    self.counters.entry(counter).or_default().gap = None;
+                }
+            }
+        }
+    }
+
     /// The row that admits the read of `location` giving `mine` in inkemu and `theirs` in QEMU,
-    /// with the bits to take from QEMU and, for a counter, the gap.
-    fn admitted_read(&self, location: Location, mine: u32, theirs: u32) -> Option<(u16, u32, u32)> {
+    /// with the site and the bits to take from QEMU.
+    fn admitted_read(
+        &self,
+        location: Location,
+        mine: u32,
+        theirs: u32,
+    ) -> Option<(u16, Site, u32)> {
         let differ = mine ^ theirs;
         for row in self.rows {
             for treatment in row.treatments {
@@ -482,14 +736,14 @@ impl Lockstep {
                         {
                             let qemu_ok = register.qemu.is_none_or(|value| value == theirs);
                             if differ & !register.mask == 0 && qemu_ok {
-                                return Some((row.number, differ, 0));
+                                let site = Site {
+                                    location,
+                                    after_command: register.after_command,
+                                };
+                                return Some((row.number, site, differ));
                             }
                             return None;
                         }
-                    }
-                    (Treatment::Counter { location: l, bound }, _) if l == location => {
-                        let gap = theirs.wrapping_sub(mine).cast_signed().unsigned_abs();
-                        return (gap <= bound).then_some((row.number, differ, gap));
                     }
                     (
                         Treatment::Pair {
@@ -505,7 +759,7 @@ impl Lockstep {
                     {
                         let held =
                             differ & !bits == 0 && theirs & bits == qemu && mine & bits == inkemu;
-                        return held.then_some((row.number, differ, 0));
+                        return held.then_some((row.number, Site::at(location), differ));
                     }
                     _ => {}
                 }
@@ -518,12 +772,7 @@ impl Lockstep {
     /// `MEIP` QEMU read is the one its state showed at the boundary the instruction started from
     /// (`previous`), which [`Lockstep::compare`] has already held to QEMU's matrix on inkemu's
     /// controller. Every other bit is compared.
-    fn admitted_mip_read(
-        &self,
-        mine: u32,
-        theirs: u32,
-        previous: &CpuState,
-    ) -> Option<(u16, u32, u32)> {
+    fn admitted_mip_read(&self, mine: u32, theirs: u32, previous: &CpuState) -> Option<(u16, u32)> {
         let row = self.rows.iter().find(|row| {
             row.treatments
                 .iter()
@@ -532,7 +781,7 @@ impl Lockstep {
         let differ = mine ^ theirs;
         let shown = previous.get(Field::Mip) & MEIP;
         (differ & !MEIP == 0 && mine & MEIP == 0 && theirs & MEIP == shown)
-            .then_some((row.number, differ, 0))
+            .then_some((row.number, differ))
     }
 
     /// Whether the condition a register entry carries holds now.
@@ -543,25 +792,32 @@ impl Lockstep {
     }
 
     /// What an executed instruction leaves for the rows that follow it: the CSRs it wrote, the
-    /// SPI1 command it started, a threshold store that QEMU's `MEIP` follows late. `previous` is
-    /// QEMU's state the instruction started from.
+    /// origins and updates of the counters, the capture of a slow clock, the SPI1 command it
+    /// started, a threshold store that QEMU's `MEIP` follows late. `previous` is QEMU's state
+    /// the instruction started from. An instruction that raised an exception wrote nothing.
     fn note_effects(&mut self, executed: &Executed, previous: &CpuState, target: &impl Target) {
         let Some(decoded) = executed.instruction else {
             return;
         };
+        if executed.trap.is_some() {
+            return;
+        }
         match decoded.instr {
             Instr::Csr { op, src, csr, .. } if op == CsrOp::Rw || src != 0 => {
                 self.written.insert(csr);
+                self.note_counter_origin(Location::Csr(csr));
             }
-            Instr::Store {
-                op: StoreOp::W,
-                rs2,
-                ..
-            } => {
+            Instr::Store { op, rs2, .. } => {
                 let Some(address) = data_address(decoded, &self.before) else {
                     return;
                 };
+                self.note_counter_update(|(first, last)| (first..=last).contains(&address));
+                self.note_counter_origin(Location::Mmio(address & !3));
+                if op != StoreOp::W {
+                    return;
+                }
                 let value = self.before.x(rs2);
+                self.note_capture(address, value, target);
                 match address {
                     SPI1_USER2 => self.spi1_user2 = value,
                     SPI1_CMD if value & SPI1_CMD_USR != 0 => {
@@ -586,6 +842,25 @@ impl Lockstep {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A word store of `value` to `address`: the capture of the slow clocks whose capture
+    /// register and trigger bit it is takes the device time after it. The capture is made at the
+    /// store and device time moves by that one instruction, 8 ns, far less than one cycle of a
+    /// slow clock.
+    fn note_capture(&mut self, address: u32, value: u32, target: &impl Target) {
+        for row in self.rows {
+            for treatment in row.treatments {
+                if let Treatment::SlowClock {
+                    capture, trigger, ..
+                } = *treatment
+                    && capture == address
+                    && value & trigger != 0
+                {
+                    self.captures.insert(capture, target.device_time_nanos());
+                }
+            }
         }
     }
 
@@ -633,8 +908,8 @@ impl Lockstep {
     /// A difference of a compared CSR that a pair admits, recorded; `None` when none does.
     fn admitted_pair(&mut self, field: Field, q: u32, i: u32) -> Option<u32> {
         let csr = field.csr()?;
-        let (row, bits, _) = self.admitted_read(Location::Csr(csr), i, q)?;
-        self.usage.record(row, Location::Csr(csr), bits, 0);
+        let (row, site, bits) = self.admitted_read(Location::Csr(csr), i, q)?;
+        self.usage.record(row, site, bits, 0);
         Some(bits)
     }
 
@@ -660,7 +935,8 @@ impl Lockstep {
             return None;
         }
         if shown {
-            self.usage.record(row.number, Location::Csr(MIP), MEIP, 0);
+            self.usage
+                .record(row.number, Site::at(Location::Csr(MIP)), MEIP, 0);
         }
         Some(q ^ i)
     }
@@ -711,11 +987,16 @@ impl Lockstep {
         let exact = address.and_then(|a| {
             self.rows.iter().find_map(|row| {
                 let masks: Vec<u32> = row.registers_at(a).map(|r| r.mask).collect();
-                let counter = row.bound(Location::Mmio(a));
-                if let Some(bound) = counter {
+                let held = row
+                    .sites()
+                    .any(|(site, _)| site.location == Location::Mmio(a));
+                if masks.is_empty() && held {
                     return Some(Nearest {
                         row: row.number,
-                        why: format!("admits a gap of {bound} at {a:#010x}, which the read passed"),
+                        why: format!(
+                            "holds the read of {a:#010x} as a counter or a clock, which the read \
+                             passed"
+                        ),
                     });
                 }
                 (!masks.is_empty()).then(|| Nearest {
@@ -731,7 +1012,7 @@ impl Lockstep {
         let held = || {
             self.rows.iter().find_map(|row| {
                 fields.iter().find_map(|&location| {
-                    row.declared(location).map(|bits| Nearest {
+                    row.declared(Site::at(location)).map(|bits| Nearest {
                         row: row.number,
                         why: format!(
                             "admits bits {bits:#010x} of {location}, which differ otherwise"

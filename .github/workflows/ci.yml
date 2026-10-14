@@ -190,10 +190,12 @@ jobs:
       # The lockstep (ADR 0008, docs/lockstep-differences.md): from the first instruction of the
       # ROM, through the bootloader, app_main and the first tick, to the reset that esp_restart
       # asks for at the end of the countdown, without a divergence outside the table. The number
-      # of compared instructions and the end of the window are pinned: a model change that adds or
-      # removes an instruction, or an admitted difference that grows into a divergence, fails here.
-      # The tool prints what each row of the table did, and fails (exit 5) if a row was not used or
-      # was used outside what it declares (decision H3). About 90 s of comparison.
+      # of compared instructions, the end of the window and the uses of every row are pinned: a
+      # model change that adds or removes an instruction, an admitted difference that grows into a
+      # divergence, or one that shows up more or less often, fails here (exit 3). The tool prints
+      # what each row of the table did, with the largest move of each counter, and fails (exit 5)
+      # if a row, a register of a row or a bit of its mask was not used, or a row was used outside
+      # what it declares (decision H3). About 90 s of comparison.
       - name: Compare flash_hello.bin with QEMU after every instruction
         timeout-minutes: 15
         run: |
@@ -203,11 +205,14 @@ jobs:
             --rom-dir "$RUNNER_TEMP/rom" \
             --image "espressif/idf:$ESP_IDF_VERSION" \
             --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
-            --expect-compared 3402169 --expect-end reset
-      # The same run with a fault put in inkemu on purpose (bit 0 of t0 changed once a million
-      # instructions are compared, a hook of the development binary only): the lockstep must find
-      # it against the real QEMU, exit 1 and name the instruction. A comparison that let a wrong
-      # model pass would pass this run too.
+            --expect-compared 3402169 --expect-end reset \
+            --expect-usage tools/ci/lockstep-hello.usage
+      # The same run with a fault put in the CPU's state on purpose (bit 0 of t0 changed once a
+      # million instructions are compared, a hook of the development binary only): the lockstep
+      # must find it against the real QEMU, exit 1 and name the instruction. This proves the path
+      # from a differing register to the report, nothing more: the next comparison sees the
+      # changed register whatever the rows say. The step after puts a fault in a peripheral's
+      # model, which only a row holds.
       - name: The lockstep finds a fault put in inkemu
         timeout-minutes: 10
         run: |
@@ -226,3 +231,25 @@ jobs:
           grep -q "^divergence after 1000000 compared instructions" "$RUNNER_TEMP/perturbed.txt"
           grep -q "^instruction .* at 0x" "$RUNNER_TEMP/perturbed.txt"
           grep -q "^x5/t0 .*<<" "$RUNNER_TEMP/perturbed.txt"
+      # A fault in a peripheral's model: once 2.5 million instructions are compared, the next read
+      # of a SYSTIMER counter gives one count more in inkemu (a hook of the development binary
+      # only). Row 15 admits that read, a gap moving down by one count, then holds the next read
+      # of the counter to the gap the faulty read left: the gap moves up, which QEMU's truncating
+      # counter never does, and the lockstep must report a divergence near row 15.
+      - name: The lockstep finds a fault put in the SYSTIMER's model
+        timeout-minutes: 10
+        run: |
+          source tools/conformance/versions.env
+          set +e
+          cargo run --release -p inkemu-lockstep -- \
+            --flash "$RUNNER_TEMP/reference-firmware/flash_hello.bin" \
+            --rom-dir "$RUNNER_TEMP/rom" \
+            --image "espressif/idf:$ESP_IDF_VERSION" \
+            --qemu "/opt/esp/tools/qemu-riscv32/$QEMU_ESP_BUILD/qemu/bin/qemu-system-riscv32" \
+            --perturb-systimer-after 2500000 > "$RUNNER_TEMP/perturbed-systimer.txt" 2>&1
+          code=$?
+          set -e
+          head -80 "$RUNNER_TEMP/perturbed-systimer.txt"
+          test "$code" -eq 1 || { echo "exit $code where 1 (divergence) was expected"; exit 1; }
+          grep -q "^divergence after 2500668 compared instructions" "$RUNNER_TEMP/perturbed-systimer.txt"
+          grep -q "^nearest row of docs/lockstep-differences.md: 15 " "$RUNNER_TEMP/perturbed-systimer.txt"

@@ -380,31 +380,67 @@ fn a_load_takes_qemus_bits_of_its_rows_mask_and_no_other() {
     );
 }
 
+/// Two reads of `SYSTIMER.UNIT0_VALUE_LO` into `t2`, each after a store of `UPDATE`; the
+/// numbers of instructions after which each read is done.
+fn two_systimer_reads() -> (Vec<u32>, [usize; 2]) {
+    let reg = |r| svd_regs::esp32c3::addr("SYSTIMER", r);
+    let mut program = Vec::new();
+    let mut reads = [0; 2];
+    for read in &mut reads {
+        program.extend(store_register(reg("UNIT0_OP"), 1 << 30));
+        program.extend([lui(T0, reg("CONF")), lw(T2, T0, 0x44)]);
+        *read = program.len();
+    }
+    program.extend([NOP, HANG]);
+    (program, reads)
+}
+
+/// The trace of [`two_systimer_reads`] where QEMU's first read is `offset` above inkemu's and
+/// its second `offset + moved`.
+fn systimer_trace(offset: u32, moved: i32) -> String {
+    let (program, reads) = two_systimer_reads();
+    let mut entries = record(&program, reads[1] + 1);
+    let read_at = |entries: &[Entry], at: usize| match entries[at] {
+        Entry::State(state) => state.x(T2),
+        Entry::Interrupt { .. } => panic!("no interrupt"),
+    };
+    let first = read_at(&entries, reads[0]).wrapping_add(offset);
+    let second = read_at(&entries, reads[1])
+        .wrapping_add(offset)
+        .wrapping_add_signed(moved);
+    for (n, entry) in entries.iter_mut().enumerate().skip(reads[0]) {
+        if let Entry::State(state) = entry {
+            state.set(Field::X(T2), if n < reads[1] { first } else { second });
+        }
+    }
+    text(&entries)
+}
+
 #[test]
-fn a_counter_takes_qemus_value_within_its_bound_and_no_further() {
-    // Row 15: `SYSTIMER.UNIT0_VALUE_LO`, two counts apart at most.
-    let program = load_from(0x6002_3000, 0x44);
-    let trace = with_register(&program, 3, 2, T1, |value| value.wrapping_sub(2));
+fn a_counter_takes_qemus_value_when_its_gap_moves_as_the_row_says() {
+    // Row 15: QEMU's SYSTIMER counter is further on (another origin) and drops what is left of
+    // a count at each update. The first read fixes the gap; between the two reads QEMU updated
+    // its counter once (the store of `UPDATE`), so the gap may go down by one count, not up.
+    let (program, _) = two_systimer_reads();
     let mut target = machine(&program);
-    let (end, lockstep) = compare(&trace, &mut target, None);
+    let (end, lockstep) = compare(&systimer_trace(300_000, -1), &mut target, None);
     assert_eq!(end, End::Window(WindowEnd::TraceEnd));
     let usage = lockstep.usage(&target);
-    assert_eq!(usage.uses(15), 1);
-    assert_eq!(
-        usage.rows()[&15]
-            .locations
-            .values()
-            .next()
-            .unwrap()
-            .largest_gap,
-        2
-    );
-    let trace = with_register(&program, 3, 2, T1, |value| value.wrapping_add(3));
-    let (end, _) = compare(&trace, &mut machine(&program), None);
-    let End::Divergence(report) = end else {
-        panic!("three counts is past the bound: {end:?}");
-    };
-    assert_eq!(report.nearest.map(|n| n.row), Some(15));
+    assert_eq!(usage.uses(15), 2, "both reads");
+    let site = lockstep::Site::at(lockstep::Location::Mmio(0x6002_3044));
+    assert_eq!(usage.rows()[&15].sites[&site].largest_move, 1);
+    for (moved, why) in [(1, "up"), (-2, "two counts for one update")] {
+        let (end, _) = compare(
+            &systimer_trace(300_000, moved),
+            &mut machine(&program),
+            None,
+        );
+        let End::Divergence(report) = end else {
+            panic!("a gap that moved {why} is a divergence: {end:?}");
+        };
+        assert_eq!(report.differing, vec![Field::X(T2)]);
+        assert_eq!(report.nearest.map(|n| n.row), Some(15));
+    }
 }
 
 #[test]
@@ -606,14 +642,66 @@ fn the_limit_ends_the_window_after_that_many_instructions() {
 fn a_row_of_treatment_iv_is_used_only_by_what_its_setting_did() {
     let config = lockstep::table::configure(SocConfig::default(), lockstep::DIFFERENCES);
     assert!(config.qemu_compat.systimer_no_alarm_on_stopped_counter);
-    assert!(config.qemu_compat.systimer_counts_as_qemu);
-    assert!(config.qemu_compat.cycle_counter_as_qemu);
+    assert!(config.qemu_compat.cycle_counter_on_time_base);
     assert_eq!(config.timing, soc_esp32c3::Timing::QemuIcount);
     // A machine built with the settings that never needed one: no use.
     let target = Esp32C3::new(flat_rom(&[HANG]), &config);
     let lockstep = Lockstep::new(&target, None);
     let usage = lockstep.usage(&target);
-    for row in [5, 15, 24] {
+    for row in [5, 24] {
         assert_eq!(usage.uses(row), 0, "row {row}");
     }
+}
+
+#[test]
+fn a_cycle_counter_is_held_within_one_count_of_the_gap_its_first_read_fixed() {
+    // Row 5: QEMU's counter starts at its first read, inkemu's at power-on; both count the
+    // time base. Two reads 25 instructions apart, QEMU's first read 0.
+    let mut program = vec![
+        csrrwi(0, 0x800, 1),
+        csrrwi(0, 0x801, 1),
+        csrrs(T2, 0x802, 0),
+    ];
+    let first = program.len();
+    program.extend([NOP; 24]);
+    program.extend([csrrs(T2, 0x802, 0), NOP, HANG]);
+    let second = program.len() - 2;
+    let config = lockstep::table::configure(SocConfig::default(), lockstep::DIFFERENCES);
+    let trace = |moved: i32| {
+        let mut m = Esp32C3::new(flat_rom(&program), &config);
+        let mut entries = vec![Entry::State(qemu_state(&m))];
+        for _ in 0..=second {
+            Target::step(&mut m);
+            entries.push(Entry::State(qemu_state(&m)));
+        }
+        let read_at = |at: usize| match entries[at] {
+            Entry::State(state) => state.x(T2),
+            Entry::Interrupt { .. } => panic!("no interrupt"),
+        };
+        let gap = 0u32.wrapping_sub(read_at(first));
+        let later = read_at(second).wrapping_add(gap).wrapping_add_signed(moved);
+        for (n, entry) in entries.iter_mut().enumerate().skip(first) {
+            if let Entry::State(state) = entry {
+                state.set(Field::X(T2), if n < second { 0 } else { later });
+            }
+        }
+        text(&entries)
+    };
+    let mut target = Esp32C3::new(flat_rom(&program), &config);
+    let (end, lockstep) = compare(&trace(1), &mut target, None);
+    assert_eq!(end, End::Window(WindowEnd::TraceEnd));
+    assert_eq!(
+        lockstep.usage(&target).uses(5),
+        2 + 2,
+        "two reads and two acts of the setting"
+    );
+    let (end, _) = compare(
+        &trace(-2),
+        &mut Esp32C3::new(flat_rom(&program), &config),
+        None,
+    );
+    assert!(
+        matches!(&end, End::Divergence(report) if report.nearest.as_ref().map(|n| n.row) == Some(5)),
+        "{end:?}"
+    );
 }

@@ -33,12 +33,42 @@ pub enum Treatment {
     /// to one of them is admitted (it does not end the window), and a word load from one takes
     /// in inkemu QEMU's bits of `mask`, every other bit being compared.
     Registers(&'static [Register]),
-    /// (ii) A counter QEMU and inkemu read apart by at most `bound` counts, a residue of the two
-    /// models of time: a read takes QEMU's value, a wider gap is a divergence.
-    Counter { location: Location, bound: u32 },
+    /// (ii) A counter both sides read, each its own model's, from origins that differ: the gap
+    /// between them (QEMU's value minus inkemu's) may only move as `drift` says, a residue of the
+    /// two models of time; a read within it takes QEMU's value, a wider move is a divergence. The
+    /// first read after any of `origins` (a CSR write to it, or a word store to that address),
+    /// and the first read of all, fix the gap the next reads are held to.
+    Counter {
+        location: Location,
+        drift: Drift,
+        origins: &'static [Location],
+    },
+    /// (ii) A register of the RTC timer, which QEMU does not model and reads `qemu`: inkemu's
+    /// value must be the slow-clock cycles of `hz` at the device time of the last store of bit
+    /// `trigger` to `capture`, within `bound`; a read within it takes QEMU's value.
+    SlowClock {
+        register: u32,
+        capture: u32,
+        trigger: u32,
+        hz: u64,
+        bound: u32,
+        qemu: u32,
+    },
     /// (iv) The machine takes on a behaviour of QEMU (`soc_esp32c3::QemuCompat`); the row is used
     /// as many times as the setting acted.
     Compat(Compat),
+}
+
+/// How far the gap of a [`Treatment::Counter`] may move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drift {
+    /// Within `n` counts of the gap at the origin, either way.
+    Within(u32),
+    /// From one read to the next, down by at most one count for every update QEMU may have made
+    /// of its counter in between, and never up: QEMU drops what is left of a count at every
+    /// update, which follows a store to the block `first..=last` (a flush, a load, a reprogram)
+    /// or an alarm (an interrupt taken).
+    Truncated { first: u32, last: u32 },
 }
 
 /// A register of a row of treatment (ii).
@@ -77,10 +107,8 @@ impl std::fmt::Display for Location {
 pub enum Compat {
     /// `QemuCompat::systimer_no_alarm_on_stopped_counter`.
     SystimerNoAlarmOnStoppedCounter,
-    /// `QemuCompat::systimer_counts_as_qemu`.
-    SystimerCountsAsQemu,
-    /// `QemuCompat::cycle_counter_as_qemu`.
-    CycleCounterAsQemu,
+    /// `QemuCompat::cycle_counter_on_time_base`.
+    CycleCounterOnTimeBase,
 }
 
 impl Compat {
@@ -90,8 +118,7 @@ impl Compat {
             Compat::SystimerNoAlarmOnStoppedCounter => {
                 compat.systimer_no_alarm_on_stopped_counter = true;
             }
-            Compat::SystimerCountsAsQemu => compat.systimer_counts_as_qemu = true,
-            Compat::CycleCounterAsQemu => compat.cycle_counter_as_qemu = true,
+            Compat::CycleCounterOnTimeBase => compat.cycle_counter_on_time_base = true,
         }
     }
 
@@ -100,10 +127,7 @@ impl Compat {
     pub const fn acts(self, acts: &CompatActs) -> u64 {
         match self {
             Compat::SystimerNoAlarmOnStoppedCounter => acts.systimer_alarms_withheld,
-            Compat::SystimerCountsAsQemu => {
-                acts.systimer_resets_ignored + acts.systimer_values_as_qemu
-            }
-            Compat::CycleCounterAsQemu => acts.cycle_counter_reads,
+            Compat::CycleCounterOnTimeBase => acts.cycle_counter_reads,
         }
     }
 }
@@ -114,7 +138,9 @@ impl Treatment {
     pub const fn kind(self) -> &'static str {
         match self {
             Treatment::Pair { .. } | Treatment::ExternalInterrupt { .. } => "i",
-            Treatment::Registers(_) | Treatment::Counter { .. } => "ii",
+            Treatment::Registers(_) | Treatment::Counter { .. } | Treatment::SlowClock { .. } => {
+                "ii"
+            }
             Treatment::Compat(_) => "iv",
         }
     }
@@ -160,43 +186,106 @@ impl Difference {
             .filter(move |register| register.address == address)
     }
 
-    /// The bits the row declares it may take from QEMU at `location`, `None` when it declares
-    /// nothing there. A counter declares every bit; a register admitted with no bit, 0.
-    #[must_use]
-    pub fn declared(&self, location: Location) -> Option<u32> {
-        let mut declared = None;
-        for treatment in self.treatments {
-            let bits = match (*treatment, location) {
-                (Treatment::Pair { field, bits, .. }, Location::Csr(csr))
-                    if field.csr() == Some(csr) =>
-                {
-                    Some(bits)
+    /// Every site the row declares, with the bits a run must take from QEMU there for the
+    /// declaration to be used whole (decision H3): a pair's bits, `MEIP`, a register's mask. A
+    /// register admitted with no bit, a counter and a clock are used by a read.
+    pub fn sites(&self) -> impl Iterator<Item = (Site, u32)> + '_ {
+        self.treatments
+            .iter()
+            .flat_map(|treatment| -> Box<dyn Iterator<Item = (Site, u32)>> {
+                match *treatment {
+                    Treatment::Pair { field, bits, .. } => Box::new(
+                        field
+                            .csr()
+                            .map(|csr| (Site::at(Location::Csr(csr)), bits))
+                            .into_iter(),
+                    ),
+                    Treatment::ExternalInterrupt { .. } => {
+                        Box::new(std::iter::once((Site::at(Location::Csr(MIP)), MEIP)))
+                    }
+                    Treatment::Registers(registers) => Box::new(registers.iter().map(|register| {
+                        (
+                            Site {
+                                location: Location::Mmio(register.address),
+                                after_command: register.after_command,
+                            },
+                            register.mask,
+                        )
+                    })),
+                    Treatment::Counter { location, .. } => {
+                        Box::new(std::iter::once((Site::at(location), 0)))
+                    }
+                    Treatment::SlowClock { register, .. } => {
+                        Box::new(std::iter::once((Site::at(Location::Mmio(register)), 0)))
+                    }
+                    Treatment::Compat(_) => Box::new(std::iter::empty()),
                 }
-                (Treatment::ExternalInterrupt { .. }, Location::Csr(MIP)) => Some(MEIP),
-                (Treatment::Counter { location: l, .. }, _) if l == location => Some(u32::MAX),
-                (Treatment::Registers(registers), Location::Mmio(address)) => registers
-                    .iter()
-                    .filter(|register| register.address == address)
-                    .map(|register| register.mask)
-                    .reduce(|a, b| a | b),
-                _ => None,
-            };
-            if let Some(bits) = bits {
-                declared = Some(declared.unwrap_or(0) | bits);
-            }
-        }
-        declared
+            })
     }
 
-    /// The largest gap the row admits at `location`, for a counter.
+    /// The bits the row allows a run to take from QEMU at `site`, `None` when it declares nothing
+    /// there. A counter and a clock allow every bit; a register admitted with no bit, none.
+    #[must_use]
+    pub fn declared(&self, site: Site) -> Option<u32> {
+        let allowed = |treatment: &Treatment| match *treatment {
+            Treatment::Counter { location, .. } => location == site.location,
+            Treatment::SlowClock { register, .. } => Location::Mmio(register) == site.location,
+            _ => false,
+        };
+        if self.treatments.iter().any(allowed) {
+            return Some(u32::MAX);
+        }
+        self.sites()
+            .filter(|(declared, _)| *declared == site)
+            .map(|(_, bits)| bits)
+            .reduce(|a, b| a | b)
+    }
+
+    /// The largest move of the gap the row admits at `location`, for a counter held within a
+    /// constant of its origin.
     #[must_use]
     pub fn bound(&self, location: Location) -> Option<u32> {
         self.treatments
             .iter()
             .find_map(|treatment| match *treatment {
-                Treatment::Counter { location: l, bound } if l == location => Some(bound),
+                Treatment::Counter {
+                    location: l,
+                    drift: Drift::Within(bound),
+                    ..
+                } if l == location => Some(bound),
+                Treatment::SlowClock {
+                    register, bound, ..
+                } if Location::Mmio(register) == location => Some(bound),
                 _ => None,
             })
+    }
+}
+
+/// A place a row acts at: a location and, for a register entry, the SPI1 command it waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Site {
+    pub location: Location,
+    pub after_command: Option<u8>,
+}
+
+impl Site {
+    /// A site without a condition.
+    #[must_use]
+    pub const fn at(location: Location) -> Site {
+        Site {
+            location,
+            after_command: None,
+        }
+    }
+}
+
+impl std::fmt::Display for Site {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.location)?;
+        if let Some(command) = self.after_command {
+            write!(f, " after {command:#04x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -210,6 +299,20 @@ pub const CPU_INT_THRESH: u32 = 0x600C_2194;
 pub const SPI1_CMD: u32 = 0x6000_2000;
 pub const SPI1_CMD_USR: u32 = 1 << 18;
 pub const SPI1_USER2: u32 = 0x6000_2020;
+/// The cycle counter at its machine and user addresses (`mpccr`, `upccr`).
+pub const MPCCR: u16 = 0x7E2;
+pub const UPCCR: u16 = 0x802;
+/// `RTC_CNTL.TIME_UPDATE`, whose bit 31 captures the RTC timer, and `TIME_LOW0`, the low word of
+/// the capture (the SVD; a test checks them).
+pub const RTC_TIME_UPDATE: u32 = 0x6000_800C;
+pub const RTC_TIME_LOW0: u32 = 0x6000_8010;
+/// The SYSTIMER block as QEMU maps it, its `CONF`, the low words of its two counters, and
+/// `SYSTEM.PERIP_RST_EN0`, whose bit 29 resets the block (the SVD; a test checks them).
+pub const SYSTIMER: (u32, u32) = (0x6002_3000, 0x6002_30FF);
+pub const SYSTIMER_CONF: u32 = 0x6002_3000;
+pub const SYSTIMER_UNIT0_VALUE_LO: u32 = 0x6002_3044;
+pub const SYSTIMER_UNIT1_VALUE_LO: u32 = 0x6002_304C;
+pub const SYSTEM_PERIP_RST_EN0: u32 = 0x600C_0018;
 
 /// A register admitted with `mask` taken from QEMU at a word load.
 const fn copy(address: u32, mask: u32) -> Register {
@@ -272,16 +375,18 @@ pub const DIFFERENCES: &[Difference] = &[
     },
     Difference {
         number: 5,
-        summary: "cycle counter: QEMU's counts 6.25 ns of its clock from the first read",
+        summary: "cycle counter: both count 6.25 ns of device time, QEMU's from its first read",
         treatments: &[
-            Treatment::Compat(Compat::CycleCounterAsQemu),
+            Treatment::Compat(Compat::CycleCounterOnTimeBase),
             Treatment::Counter {
-                location: Location::Csr(0x7E2),
-                bound: 1,
+                location: Location::Csr(MPCCR),
+                drift: Drift::Within(1),
+                origins: &[Location::Csr(MPCCR), Location::Csr(UPCCR)],
             },
             Treatment::Counter {
-                location: Location::Csr(0x802),
-                bound: 1,
+                location: Location::Csr(UPCCR),
+                drift: Drift::Within(1),
+                origins: &[Location::Csr(MPCCR), Location::Csr(UPCCR)],
             },
         ],
     },
@@ -339,33 +444,37 @@ pub const DIFFERENCES: &[Difference] = &[
     Difference {
         number: 9,
         summary: "RTC_CNTL: QEMU models OPTIONS0, RESET_STATE and STORE0-7 only",
-        treatments: &[Treatment::Registers(&[
-            copy(0x6000_8000, 0x1C00_A000),
-            Register {
-                address: 0x6000_8010,
-                mask: u32::MAX,
-                qemu: Some(0),
-                after_command: None,
+        treatments: &[
+            Treatment::SlowClock {
+                register: RTC_TIME_LOW0,
+                capture: RTC_TIME_UPDATE,
+                trigger: 1 << 31,
+                hz: 136_000,
+                bound: 1,
+                qemu: 0,
             },
-            copy(0x6000_801C, 0x3C14_0543),
-            copy(0x6000_8024, 0x0A08_0A09),
-            copy(0x6000_8028, 0x1220_0A09),
-            copy(0x6000_802C, 0x0000_8000),
-            copy(0x6000_8030, 0x0A08_0000),
-            copy(0x6000_8034, 0x00D4_0000),
-            copy(0x6000_8038, 0x0000_3000),
-            copy(0x6000_8040, 0x0000_0200),
-            copy(0x6000_8070, 0x31D8_3298),
-            copy(0x6000_8074, 0x0040_0000),
-            copy(0x6000_8080, 0xA03F_C000),
-            copy(0x6000_8088, 0x0057_5010),
-            copy(0x6000_808C, 0xBA80_5480),
-            copy(0x6000_8090, 0xF807_FA14),
-            copy(0x6000_80AC, 0x04B0_0000),
-            copy(0x6000_80D8, 0x7BFF_C030),
-            copy(0x6000_810C, 0x0000_0007),
-            copy(0x6000_811C, 0xC000_0000),
-        ])],
+            Treatment::Registers(&[
+                copy(0x6000_8000, 0x1C00_A000),
+                copy(0x6000_801C, 0x3C14_0543),
+                copy(0x6000_8024, 0x0A08_0A09),
+                copy(0x6000_8028, 0x1220_0A09),
+                copy(0x6000_802C, 0x0000_8000),
+                copy(0x6000_8030, 0x0A08_0000),
+                copy(0x6000_8034, 0x00D4_0000),
+                copy(0x6000_8038, 0x0000_3000),
+                copy(0x6000_8040, 0x0000_0200),
+                copy(0x6000_8070, 0x31D8_3298),
+                copy(0x6000_8074, 0x0040_0000),
+                copy(0x6000_8080, 0xA03F_C000),
+                copy(0x6000_8088, 0x0057_5010),
+                copy(0x6000_808C, 0xBA80_5480),
+                copy(0x6000_8090, 0xF807_FA14),
+                copy(0x6000_80AC, 0x04B0_0000),
+                copy(0x6000_80D8, 0x7BFF_C030),
+                copy(0x6000_810C, 0x0000_0007),
+                copy(0x6000_811C, 0xC000_0000),
+            ]),
+        ],
     },
     Difference {
         number: 10,
@@ -442,12 +551,33 @@ pub const DIFFERENCES: &[Difference] = &[
     },
     Difference {
         number: 15,
-        summary: "SYSTIMER: QEMU's counters, truncated at each update and never reset by SYSTEM",
+        summary: "SYSTIMER: QEMU's counters drop a fraction of a count at each update and always read valid",
         treatments: &[
-            Treatment::Compat(Compat::SystimerCountsAsQemu),
+            Treatment::Registers(&[
+                copy(0x6002_3004, 0x2000_0000),
+                copy(0x6002_3008, 0x2000_0000),
+            ]),
             Treatment::Counter {
-                location: Location::Mmio(0x6002_3044),
-                bound: 2,
+                location: Location::Mmio(SYSTIMER_UNIT0_VALUE_LO),
+                drift: Drift::Truncated {
+                    first: SYSTIMER.0,
+                    last: SYSTIMER.1,
+                },
+                origins: &[
+                    Location::Mmio(SYSTEM_PERIP_RST_EN0),
+                    Location::Mmio(SYSTIMER_CONF),
+                ],
+            },
+            Treatment::Counter {
+                location: Location::Mmio(SYSTIMER_UNIT1_VALUE_LO),
+                drift: Drift::Truncated {
+                    first: SYSTIMER.0,
+                    last: SYSTIMER.1,
+                },
+                origins: &[
+                    Location::Mmio(SYSTEM_PERIP_RST_EN0),
+                    Location::Mmio(SYSTIMER_CONF),
+                ],
             },
         ],
     },
@@ -633,6 +763,14 @@ mod tests {
         assert_eq!(CPU_INT_THRESH, addr("INTERRUPT_CORE0", "CPU_INT_THRESH"));
         assert_eq!(SPI1_CMD, addr("SPI1", "CMD"));
         assert_eq!(SPI1_USER2, addr("SPI1", "USER2"));
+        assert_eq!(RTC_TIME_UPDATE, addr("RTC_CNTL", "TIME_UPDATE"));
+        assert_eq!(RTC_TIME_LOW0, addr("RTC_CNTL", "TIME_LOW0"));
+        assert_eq!(SYSTIMER_CONF, addr("SYSTIMER", "CONF"));
+        assert_eq!(SYSTIMER_UNIT0_VALUE_LO, addr("SYSTIMER", "UNIT0_VALUE_LO"));
+        assert_eq!(SYSTIMER_UNIT1_VALUE_LO, addr("SYSTIMER", "UNIT1_VALUE_LO"));
+        assert_eq!(SYSTEM_PERIP_RST_EN0, addr("SYSTEM", "PERIP_RST_EN0"));
+        let systimer = QEMU_DEVICES.iter().find(|d| d.name == "SYSTIMER").unwrap();
+        assert_eq!(SYSTIMER, (systimer.first, systimer.last));
     }
 
     #[test]

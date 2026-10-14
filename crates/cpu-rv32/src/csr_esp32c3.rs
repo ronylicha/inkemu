@@ -55,44 +55,17 @@ pub(crate) struct Esp32C3Csrs {
     snapshot_instret: u64,
     pmpcfg: [u8; PMP_ENTRIES],
     pmpaddr: [u32; PMP_ENTRIES],
-    /// The counter as Espressif's QEMU has it, when the machine asked for it
-    /// ([`Esp32C3Csrs::count_as_qemu`]); `None` is the chip's counter.
-    qemu: Option<QemuCounters>,
+    /// The clock the counter counts, when the machine gave it one
+    /// ([`Esp32C3Csrs::count_on_time_base`]); `None` is the CPU cycles of the timing model.
+    time_base: Option<TimeBase>,
 }
 
-/// One counter as Espressif's QEMU keeps it (`target/riscv/esp_cpu.c`, `esp_cpu_get_cycles`,
-/// branch `esp-develop` of `espressif/qemu`): it counts cycles of 6.25 ns of its virtual clock,
-/// one cycle of the time base, from its first read, whatever the event and mode registers say;
-/// a write sets the value and leaves the instant counting goes on from where the last read put it.
+/// The time base the counter counts instead of the CPU cycles the timing model prices.
 #[derive(Clone, Copy, Debug, Default)]
-struct QemuCounter {
-    /// QEMU's `cycles`: the value at the last read, or the value last written.
-    value: u32,
-    /// QEMU's `former_time`: the instant of the last read, in cycles of the time base; `None`
-    /// before the first.
-    last_read: Option<u64>,
-}
-
-impl QemuCounter {
-    /// What a read at `now` returns. QEMU divides the nanoseconds by 6.25 and carries the
-    /// remainder: here they are whole cycles of the time base, and no remainder is left.
-    #[allow(clippy::cast_possible_truncation)] // deliberate: the CSR keeps the low 32 bits
-    fn at(self, now: u64) -> u32 {
-        match self.last_read {
-            Some(last) => self.value.wrapping_add(now.wrapping_sub(last) as u32),
-            None => self.value,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct QemuCounters {
-    /// The time base at the instruction executing, as the machine set it.
+struct TimeBase {
+    /// Cycles of the 160 MHz time base at the instruction executing, as the machine set them.
     now: u64,
-    /// `0x7E2` and `0x802` are two counters in QEMU (`cc_machine`, `cc_user`), one register here.
-    machine: QemuCounter,
-    user: QemuCounter,
-    /// Reads of either counter by an instruction: what the setting acted on.
+    /// Reads of the counter by an instruction: what the setting acted on.
     reads: u64,
 }
 
@@ -178,44 +151,41 @@ impl Esp32C3Csrs {
         true
     }
 
-    /// From here on the counter counts as Espressif's QEMU counts it, on the time base the
-    /// machine sets with [`Esp32C3Csrs::set_time_base`].
-    pub(crate) fn count_as_qemu(&mut self) {
-        self.qemu = Some(QemuCounters::default());
+    /// From here on the counter counts the time base the machine sets with
+    /// [`Esp32C3Csrs::set_time_base`] instead of the CPU cycles it is given: the same counter,
+    /// with its event and mode registers and its writes, on another clock.
+    pub(crate) fn count_on_time_base(&mut self) {
+        self.time_base = Some(TimeBase::default());
     }
 
     pub(crate) fn set_time_base(&mut self, now: u64) {
-        if let Some(qemu) = &mut self.qemu {
-            qemu.now = now;
+        if let Some(time_base) = &mut self.time_base {
+            time_base.now = now;
         }
     }
 
-    pub(crate) fn qemu_counter_reads(&self) -> u64 {
-        self.qemu.map_or(0, |qemu| qemu.reads)
+    pub(crate) fn time_base_reads(&self) -> u64 {
+        self.time_base.map_or(0, |time_base| time_base.reads)
     }
 
-    /// An instruction is about to read `addr`: QEMU's counter starts at its first read.
+    /// An instruction is about to read `addr`: a read of the counter on the time base is what
+    /// the setting acts on.
     pub(crate) fn note_read(&mut self, addr: u16) {
-        let Some(qemu) = &mut self.qemu else { return };
-        let now = qemu.now;
-        let counter = match addr {
-            PCCR_MACHINE => &mut qemu.machine,
-            PCCR_USER => &mut qemu.user,
-            _ => return,
-        };
-        counter.value = counter.at(now);
-        counter.last_read = Some(now);
-        qemu.reads += 1;
+        if let Some(time_base) = &mut self.time_base
+            && matches!(addr, PCCR_MACHINE | PCCR_USER)
+        {
+            time_base.reads += 1;
+        }
+    }
+
+    /// The clock the counter counts: the time base when it has one, else `cycles`.
+    fn clock(&self, cycles: Cycles) -> Cycles {
+        self.time_base
+            .map_or(cycles, |time_base| Cycles(time_base.now))
     }
 
     pub(crate) fn read(&self, addr: u16, cycles: Cycles, instret: u64) -> Option<u32> {
-        if let Some(qemu) = &self.qemu {
-            match addr {
-                PCCR_MACHINE => return Some(qemu.machine.at(qemu.now)),
-                PCCR_USER => return Some(qemu.user.at(qemu.now)),
-                _ => {}
-            }
-        }
+        let cycles = self.clock(cycles);
         Some(match addr {
             USTATUS => self.ustatus,
             PCER_MACHINE | PCER_USER => self.pcer,
@@ -226,19 +196,7 @@ impl Esp32C3Csrs {
     }
 
     pub(crate) fn write(&mut self, addr: u16, value: u32, cycles: Cycles, instret: u64) -> bool {
-        if let Some(qemu) = &mut self.qemu {
-            let counter = match addr {
-                PCCR_MACHINE => Some(&mut qemu.machine),
-                PCCR_USER => Some(&mut qemu.user),
-                _ => None,
-            };
-            if let Some(counter) = counter {
-                // QEMU sets the value and keeps the instant of the last read: what passed since
-                // that read is added to the value written at the next one.
-                counter.value = value;
-                return true;
-            }
-        }
+        let cycles = self.clock(cycles);
         match addr {
             USTATUS => self.ustatus = value & (USTATUS_UIE | USTATUS_UPIE),
             PCER_MACHINE | PCER_USER => {
@@ -336,27 +294,28 @@ mod tests {
     }
 
     #[test]
-    fn as_qemu_the_counter_starts_at_its_first_read_and_a_write_keeps_its_last_read() {
+    fn on_the_time_base_the_counter_counts_it_with_its_own_registers_and_writes() {
+        // The cycles given (the timing model's) are ignored; the time base is counted, gated by
+        // the event and mode registers, and a write sets the value counting goes on from.
         let mut c = Esp32C3Csrs::default();
-        c.count_as_qemu();
+        c.count_on_time_base();
         c.set_time_base(100);
+        c.write(PCER_USER, PCER_CYCLES, Cycles(7), 0);
         c.note_read(PCCR_USER);
-        assert_eq!(c.read(PCCR_USER, Cycles(0), 0), Some(0), "the first read");
+        assert_eq!(c.read(PCCR_USER, Cycles(9), 0), Some(0), "not yet enabled");
+        c.write(PCMR_USER, PCMR_ENABLE, Cycles(9), 0);
         c.set_time_base(150);
-        assert!(c.write(PCCR_USER, 1000, Cycles(0), 0));
-        c.set_time_base(160);
         c.note_read(PCCR_USER);
+        assert_eq!(c.read(PCCR_USER, Cycles(10), 0), Some(50));
+        assert!(c.write(PCCR_MACHINE, 1000, Cycles(11), 0));
+        c.set_time_base(160);
+        c.note_read(PCCR_MACHINE);
         assert_eq!(
-            c.read(PCCR_USER, Cycles(0), 0),
-            Some(1060),
-            "the value written, and the 60 cycles since the read before the write"
+            c.read(PCCR_USER, Cycles(12), 0),
+            Some(1010),
+            "one register at both addresses"
         );
-        assert_eq!(
-            c.read(PCCR_MACHINE, Cycles(0), 0),
-            Some(0),
-            "QEMU keeps a counter per address, never read here"
-        );
-        assert_eq!(c.qemu_counter_reads(), 2);
+        assert_eq!(c.time_base_reads(), 3);
     }
 
     #[test]

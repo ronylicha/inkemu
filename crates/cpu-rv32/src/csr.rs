@@ -92,32 +92,30 @@ impl CsrFile {
         }
     }
 
-    /// The ESP32-C3 cycle counter counts from here on as Espressif's QEMU counts it, on the time
-    /// base [`CsrFile::set_time_base`] gives; nothing on a hart without the ESP32-C3 CSRs.
-    pub fn count_cycles_as_qemu(&mut self) {
+    /// The ESP32-C3 cycle counter counts from here on the time base [`CsrFile::set_time_base`]
+    /// gives instead of the hart's cycles; nothing on a hart without the ESP32-C3 CSRs.
+    pub fn count_cycles_on_time_base(&mut self) {
         if let Some(vendor) = &mut self.vendor {
-            vendor.count_as_qemu();
+            vendor.count_on_time_base();
         }
     }
 
     /// The instant, in cycles of the 160 MHz time base, of the instruction about to execute: what
-    /// the counter of [`CsrFile::count_cycles_as_qemu`] counts.
+    /// the counter of [`CsrFile::count_cycles_on_time_base`] counts.
     pub fn set_time_base(&mut self, now: u64) {
         if let Some(vendor) = &mut self.vendor {
             vendor.set_time_base(now);
         }
     }
 
-    /// Reads of the cycle counter that [`CsrFile::count_cycles_as_qemu`] answered.
+    /// Reads of the cycle counter that [`CsrFile::count_cycles_on_time_base`] answered.
     #[must_use]
-    pub fn qemu_counter_reads(&self) -> u64 {
-        self.vendor
-            .as_ref()
-            .map_or(0, Esp32C3Csrs::qemu_counter_reads)
+    pub fn time_base_reads(&self) -> u64 {
+        self.vendor.as_ref().map_or(0, Esp32C3Csrs::time_base_reads)
     }
 
-    /// An instruction is about to read `addr`. A read has no effect on any CSR of the chip; the
-    /// counter of [`CsrFile::count_cycles_as_qemu`] starts at its first read, as QEMU's does.
+    /// An instruction is about to read `addr`. A read has no effect on any CSR of the chip: it is
+    /// counted for [`CsrFile::time_base_reads`].
     pub fn note_read(&mut self, addr: u16) {
         if let Some(vendor) = &mut self.vendor {
             vendor.note_read(addr);

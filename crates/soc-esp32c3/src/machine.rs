@@ -317,9 +317,9 @@ pub struct Esp32C3 {
     /// [`Esp32C3::step`] executed an instruction and stopped before reaching the boundary of the
     /// next one: the next call goes on to that boundary without executing anything.
     boundary_pending: bool,
-    /// [`crate::QemuCompat::cycle_counter_as_qemu`]: kept here because a reset builds the hart's CSRs
-    /// again, and the setting belongs to the machine.
-    cycle_counter_as_qemu: bool,
+    /// [`crate::QemuCompat::cycle_counter_on_time_base`]: kept here because a reset builds the
+    /// hart's CSRs again, and the setting belongs to the machine.
+    cycle_counter_on_time_base: bool,
     /// Reads of that counter by the CSR files a reset replaced.
     cycle_counter_reads: u64,
 }
@@ -371,8 +371,8 @@ impl Esp32C3 {
             clock::cpu_clock(sysclk_conf, cpu_per_conf).unwrap_or(clock::CpuClock::POWER_ON),
         );
         let mut hart = Hart::new(RESET_PC, hart_config);
-        if config.qemu_compat.cycle_counter_as_qemu {
-            hart.csr.count_cycles_as_qemu();
+        if config.qemu_compat.cycle_counter_on_time_base {
+            hart.csr.count_cycles_on_time_base();
         }
         Esp32C3 {
             hart,
@@ -389,7 +389,7 @@ impl Esp32C3 {
             powered_down: false,
             journal: InputJournal::new(config.usb_host),
             boundary_pending: false,
-            cycle_counter_as_qemu: config.qemu_compat.cycle_counter_as_qemu,
+            cycle_counter_on_time_base: config.qemu_compat.cycle_counter_on_time_base,
             cycle_counter_reads: 0,
         }
     }
@@ -399,7 +399,7 @@ impl Esp32C3 {
     pub fn compat_acts(&self) -> CompatActs {
         let systimer = self.bus.periph.systimer.compat_acts();
         CompatActs {
-            cycle_counter_reads: self.cycle_counter_reads + self.hart.csr.qemu_counter_reads(),
+            cycle_counter_reads: self.cycle_counter_reads + self.hart.csr.time_base_reads(),
             ..systimer
         }
     }
@@ -649,8 +649,8 @@ impl Esp32C3 {
         // business, not this loop's.
         let sp = self.hart.x[STACK_POINTER];
         let before = self.hart.cycles.get();
-        if self.cycle_counter_as_qemu {
-            // QEMU's virtual clock at an instruction is the time of the instructions before it.
+        if self.cycle_counter_on_time_base {
+            // The instant of an instruction is the time of the instructions before it.
             self.hart.csr.set_time_base(self.bus.ctx.now().get());
         }
         let outcome = self.hart.step(&mut self.bus, self.pricing.model());
@@ -888,10 +888,10 @@ impl Esp32C3 {
         // The flash-window page versions (`SocBus::page_version`) restart at 0 with the MMU and
         // the cache registers: a version can repeat with another mapping. That is safe only
         // because `Hart::reset` builds a new decode cache, at every level.
-        self.cycle_counter_reads += self.hart.csr.qemu_counter_reads();
+        self.cycle_counter_reads += self.hart.csr.time_base_reads();
         self.hart.reset(RESET_PC);
-        if self.cycle_counter_as_qemu {
-            self.hart.csr.count_cycles_as_qemu();
+        if self.cycle_counter_on_time_base {
+            self.hart.csr.count_cycles_on_time_base();
         }
         // A CPU reset is taken to leave the interrupt controller and the source levels as they
         // are (the assumption marked on `Peripherals::reset`, with what settles it), and the hart
@@ -4737,6 +4737,50 @@ mod tests {
     }
 
     #[test]
+    fn stepping_goes_through_deep_sleeps_and_their_wakes_as_a_run_does() {
+        // Three lives woken by the RTC timer from deep sleep, then a sleep nothing ends: steps
+        // over the whole of it leave the machine a run leaves, under both timing models.
+        const MAX_STEPS: u32 = 1_000_000;
+        let program = four_lives_waiting(true);
+        for timing in [Timing::Datasheet, Timing::QemuIcount] {
+            let traced = SocConfig {
+                trace_hash: true,
+                timing,
+                ..SocConfig::default()
+            };
+            let mut run = machine_with(&program, traced);
+            while run.run_within(Cycles(u64::MAX), Some(1_000_000_000)) != StopReason::DeepSleep {}
+            let mut stepped = machine_with(&program, traced);
+            let mut steps = 0;
+            loop {
+                match stepped.step().stop {
+                    None | Some(StopReason::Asleep) => {}
+                    Some(StopReason::DeepSleep) => break,
+                    Some(other) => panic!("{timing:?}: {other:?}"),
+                }
+                steps += 1;
+                assert!(
+                    steps < MAX_STEPS,
+                    "{timing:?}: the sleep without end was not reached"
+                );
+            }
+            let state = |m: &Esp32C3| {
+                (
+                    m.pc(),
+                    m.x(),
+                    m.cycles(),
+                    m.instructions(),
+                    m.device_time_nanos(),
+                    m.trace_hash(),
+                    m.resets(),
+                )
+            };
+            assert_eq!(state(&stepped), state(&run), "{timing:?}");
+            assert_eq!(stepped.resets(), 3, "three wakes");
+        }
+    }
+
+    #[test]
     fn a_step_cut_by_a_long_sleep_resumes_at_its_boundary() {
         // An alarm 1.5 s ahead: the sleep passes the second after which a call returns `Asleep`.
         let (program, at_wfi) = alarm_and_wfi_program(24_000_000);
@@ -4791,32 +4835,40 @@ mod tests {
     }
 
     #[test]
-    fn the_cycle_counter_counts_as_qemus_when_asked() {
-        // Two reads of `mpccr` (0x802) 25 instructions apart: QEMU's counter starts at its first
-        // read and counts the 6.25 ns cycles of device time, 32 for 25 instructions of 8 ns.
-        let mut program = vec![cpu_rv32::asm::csrrs(6, 0x802, 0)];
+    fn the_cycle_counter_counts_the_time_base_when_asked() {
+        // The counter enabled (event "cycles", mode "on"), then two reads of `mpccr` (0x802) 25
+        // instructions apart: on the time base it counts the 6.25 ns cycles of device time, 32
+        // for 25 instructions of 8 ns; without the setting, the timing model's CPU cycles.
+        let mut program = vec![
+            cpu_rv32::asm::csrrwi(0, 0x800, 1),
+            cpu_rv32::asm::csrrwi(0, 0x801, 1),
+            cpu_rv32::asm::csrrs(6, 0x802, 0),
+        ];
         program.extend([NOP; 24]);
         program.extend([cpu_rv32::asm::csrrs(7, 0x802, 0), HANG]);
-        let config = SocConfig {
+        let run = |config: SocConfig| {
+            let mut m = machine_with(&program, config);
+            for _ in 0..28 {
+                m.step();
+            }
+            (m.x()[7].wrapping_sub(m.x()[6]), m.compat_acts())
+        };
+        let on_time_base = SocConfig {
             qemu_compat: crate::QemuCompat {
-                cycle_counter_as_qemu: true,
+                cycle_counter_on_time_base: true,
                 ..crate::QemuCompat::default()
             },
             ..qemu_icount()
         };
-        let mut m = machine_with(&program, config);
-        for _ in 0..26 {
-            m.step();
-        }
-        assert_eq!((m.x()[6], m.x()[7]), (0, 32));
-        assert_eq!(m.compat_acts().cycle_counter_reads, 2);
-        // The chip's counter, never enabled, stands at 0.
-        let mut chip = machine_with(&program, qemu_icount());
-        for _ in 0..26 {
-            chip.step();
-        }
-        assert_eq!((chip.x()[6], chip.x()[7]), (0, 0));
-        assert_eq!(chip.compat_acts(), crate::CompatActs::default());
+        let (elapsed, acts) = run(on_time_base);
+        assert_eq!(elapsed, 32);
+        assert_eq!(acts.cycle_counter_reads, 2);
+        let (elapsed, acts) = run(qemu_icount());
+        assert_eq!(
+            elapsed, 25,
+            "one CPU cycle per instruction under qemu-icount"
+        );
+        assert_eq!(acts, crate::CompatActs::default());
     }
 
     #[test]

@@ -57,16 +57,13 @@ pub struct QemuCompat {
     /// A SYSTIMER comparator in target mode raises no alarm while its counter is stopped: the
     /// early tick interrupt of `vSystimerSetup` is not taken (report TW §A.4, §G row 10).
     pub systimer_no_alarm_on_stopped_counter: bool,
-    /// The SYSTIMER counters read as QEMU's read (`hw/timer/esp_systimer.c`, branch `esp-develop`
-    /// of `espressif/qemu`): a reset of the block through `SYSTEM.PERIP_RST_EN0` changes nothing,
-    /// and the value a firmware reads is QEMU's, which truncates to a whole count every time it
-    /// brings a counter up to date and brings a stopped counter up to date when it reprograms a
-    /// comparator. The alarms keep this machine's counters: they fire when QEMU's do.
-    pub systimer_counts_as_qemu: bool,
-    /// The cycle counter `mpccr` (`0x7E2`, `0x802`) counts as QEMU's (`target/riscv/esp_cpu.c`,
-    /// `esp_cpu_get_cycles`): cycles of 6.25 ns of device time from its first read, whatever the
-    /// event and mode registers say, a counter for each address.
-    pub cycle_counter_as_qemu: bool,
+    /// The cycle counter `mpccr` (`0x7E2`, `0x802`) counts cycles of the time base, 6.25 ns of
+    /// device time, instead of the CPU cycles the timing model prices: the chip's counter, its
+    /// event and mode registers and its writes, on QEMU's clock. QEMU's CPU never changes clock
+    /// and its counter counts 6.25 ns of its virtual clock (`target/riscv/esp_cpu.c`,
+    /// `esp_cpu_get_cycles`, branch `esp-develop` of `espressif/qemu`); under `qemu-icount` an
+    /// instruction lasts 8 ns whatever the CPU clock, so the time base is the clock both count.
+    pub cycle_counter_on_time_base: bool,
 }
 
 /// How often each setting of [`QemuCompat`] acted since power-on: the lockstep counts a row of
@@ -75,11 +72,7 @@ pub struct QemuCompat {
 pub struct CompatActs {
     /// Alarms not raised because their counter was stopped.
     pub systimer_alarms_withheld: u64,
-    /// Resets of the SYSTIMER through `SYSTEM.PERIP_RST_EN0` that changed nothing.
-    pub systimer_resets_ignored: u64,
-    /// Reads of a SYSTIMER counter whose value differed from this machine's own counter.
-    pub systimer_values_as_qemu: u64,
-    /// Reads of the cycle counter answered as QEMU answers them.
+    /// Reads of the cycle counter answered on the time base.
     pub cycle_counter_reads: u64,
 }
 

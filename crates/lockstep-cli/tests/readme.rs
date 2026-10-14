@@ -58,7 +58,7 @@ fn the_readme_runs_the_lockstep_with_flags_the_binary_takes_and_the_counts_of_th
         );
     }
     let ci = lockstep_arguments(&repository_file(".github/workflows/ci.yml"));
-    for flag in ["--expect-compared", "--expect-end"] {
+    for flag in ["--expect-compared", "--expect-end", "--expect-usage"] {
         assert_eq!(value_of(&arguments, flag), value_of(&ci, flag), "{flag}");
     }
 }
@@ -76,7 +76,7 @@ fn the_help_lists_every_exit_code() {
         "2 error",
         "3 the window ended otherwise",
         "4 inkemu stopped",
-        "5 a row of the table was never used",
+        "5 a row, a site or a bit of the table was never used",
         "130 interrupted",
     ] {
         assert!(help.contains(code), "{code}:\n{help}");

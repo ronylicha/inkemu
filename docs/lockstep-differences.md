@@ -9,11 +9,18 @@ une divergence (décision H3). Deux contrôles tiennent ce tableau :
   et ce document ont les mêmes lignes, les mêmes traitements et les mêmes paramètres, registre par
   registre et bit par bit : `crates/lockstep/tests/table.rs` compare chaque bloc « Paramètres »
   ci-dessous à la ligne de l'outil.
-- **Chaque ligne sert, et seulement dans ce qu'elle déclare.** L'outil enregistre ce que chaque ligne
-  a fait pendant la fenêtre (les registres, les bits pris à QEMU, l'écart d'un compteur, ce qu'un
-  réglage a changé) ; une ligne jamais utilisée, ou utilisée hors de ses registres ou de ses bits,
-  fait échouer l'exécution (code de sortie 5, `lockstep::Usage::check`). L'outil imprime cet usage
-  à chaque exécution, la CI aussi.
+- **Chaque ligne sert, partout où elle déclare quelque chose, et seulement là.** L'outil
+  enregistre ce que chaque ligne a fait pendant la fenêtre : les registres, les bits pris à QEMU, le
+  mouvement de l'écart d'un compteur, ce qu'un réglage a changé.
+  - L'exécution échoue (code de sortie 5, `lockstep::Usage::check`, que la bibliothèque offre par
+    `Lockstep::check_usage` et que l'outil appelle) dans trois cas : une ligne utilisée hors de ses
+    registres ou de ses bits, un compteur au-delà de sa borne, une partie de ligne jamais utilisée.
+    Une partie, c'est une ligne entière, un de ses registres (une entrée morte dans une ligne qui
+    sert ailleurs), ou un bit de son masque jamais pris à QEMU.
+  - Une fenêtre coupée par `--max-instructions` liste ce qu'elle laisse inutilisé sans échouer.
+  - L'outil imprime cet usage à chaque exécution, avec le plus grand mouvement de chaque compteur.
+    La CI épingle le nombre d'usages de chaque ligne (`--expect-usage
+    tools/ci/lockstep-hello.usage`, code 3 s'il change).
 
 QEMU : `esp_develop_9.2.2_20250817`, celui de l'image `espressif/idf:v5.5.2`
 (`tools/conformance/versions.env`). Les lignes ont été mesurées le 2026-10-14 sur
@@ -75,9 +82,11 @@ de `0x1FF`, SYSTEM au-delà de `0x9B`).
   destination d'inkemu prend les bits du masque tels que QEMU les a chargés, les autres bits devant
   être égaux. Un registre de masque 0 est un accès admis à un registre que QEMU n'a pas : rien n'est
   copié, la valeur est comparée. Une copie peut porter une condition (la commande SPI1 qui a précédé)
-  et une valeur que QEMU doit avoir lue. **(ii) écart borné** : un compteur que QEMU et inkemu lisent
-  à au plus quelques unités l'un de l'autre prend la valeur de QEMU ; un écart plus grand est une
-  divergence.
+  et une valeur que QEMU doit avoir lue. **(ii) compteur tenu** : la valeur d'inkemu est celle de
+  son propre modèle, et l'écart avec celle de QEMU (d'une autre origine) ne peut bouger que comme la
+  ligne le dit et le source. Une lecture dans la borne prend la valeur de QEMU ; au-delà, c'est une
+  divergence. **(ii) horloge lente** : un temporisateur que QEMU n'a pas doit valoir, dans inkemu,
+  les cycles de sa fréquence déclarée au temps de l'appareil de sa capture.
 - **(iii) resynchronisation** à un PC d'ancrage : aucune ligne n'en a eu besoin.
 - **(iv) réglage `QemuCompat`** de la machine, désactivé par défaut, que seul le lockstep allume,
   quand la différence change le flot de contrôle et qu'aucun des trois premiers ne suffit. La ligne
@@ -93,18 +102,18 @@ comparaison qu'une paire règle, une valeur copiée, un accès admis, une action
 | 1 | `mstatus.MPP` : QEMU lit 0, inkemu « machine » | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MSTATUS_MPP_M`) ; mesure | 2 781 658 |
 | 2 | `mie` au reset : QEMU `0x0EEE`, inkemu 0, jusqu'à ce que le firmware l'écrive | (i) paire | oracle §1c piège 6 ; `target/riscv/esp_cpu.c` | 3 402 170 |
 | 3 | `mtvec.MODE` au reset : QEMU direct, inkemu vectorisé, jusqu'à l'écriture de `mtvec` | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MTVEC_VECTORED`) ; oracle §1c | 15 |
-| 4 | `mip.MEIP` : la ligne de la matrice de QEMU, trois instructions en retard après un rangement du seuil | (i) paire | `hw/riscv/esp32c3_intmatrix.c` ; `target/riscv/esp_cpu.c` ; mesure | 94 494 |
-| 5 | Le compteur de cycles : celui de QEMU compte 6,25 ns de son horloge depuis la première lecture | (iv) réglage ; (ii) écart borné | `target/riscv/esp_cpu.c` (`esp_cpu_get_cycles`) ; mesure | 532 149 |
+| 4 | `mip.MEIP` : la ligne de la matrice de QEMU, trois instructions en retard après un rangement du seuil qui la fait tomber | (i) paire | `hw/riscv/esp32c3_intmatrix.c` ; `target/riscv/esp_cpu.c` ; mesure | 94 494 |
+| 5 | Le compteur de cycles : les deux comptent 6,25 ns du temps de l'appareil, celui de QEMU depuis sa première lecture | (iv) réglage ; (ii) compteur tenu | `target/riscv/esp_cpu.c` (`esp_cpu_get_cycles`) ; mesure | 566 442 |
 | 6 | UART0 : niveaux de ligne, compte de FIFO et valeurs de reset que QEMU ne modélise pas | (ii) copie | mesure ; `info mtree -f` (`esp_soc.uart`) | 3 165 |
 | 7 | SPI1 : la flash de QEMU ne répond pas à SFDP, laisse `W0` périmé et n'a pas les valeurs de reset | (ii) copie | oracle §1b (`Unknown cmd 5a`) ; mesure | 20 |
 | 8 | SPI0, absent de QEMU : la configuration flash du cache | (ii) copie | `info mtree -f` ; mesure | 81 |
-| 9 | RTC_CNTL : QEMU ne modélise que `OPTIONS0`, `RESET_STATE` et `STORE0`–`7` | (ii) copie | `hw/misc/esp32c3_rtc_cntl.c` ; mesure | 92 |
+| 9 | RTC_CNTL : QEMU ne modélise que `OPTIONS0`, `RESET_STATE` et `STORE0`–`7` | (ii) horloge lente ; (ii) copie | `hw/misc/esp32c3_rtc_cntl.c` ; `clk_tree_defs.h` ; mesure | 92 |
 | 10 | eFuse : les mots où les eFuses vierges de QEMU et ceux de la X4 diffèrent | (ii) copie | oracle §1d ; carryover SP1b-2 ligne 17 ; mesure | 67 |
 | 11 | IO_MUX, absent de QEMU : la configuration des broches GPIO0–21 | (ii) copie | `info mtree -f` ; SVD ; mesure | 284 |
 | 12 | Le maître I²C analogique, absent de QEMU : les accès regi2c de la ROM | (ii) copie | carryover SP1b-2 lignes 7 et 8 ; mesure | 147 |
 | 13 | La mise sous tension de la radio par `rtc_sleep_pu`, absente de QEMU : BB, NRX, FE, FE2 | (ii) copie | ESP-IDF v5.5.2 `rtc_sleep.c` ; `esp32c3-bootloader-accesses.md` lignes 31–33 | 14 |
 | 14 | TIMG0 et TIMG1 : valeurs de reset des chiens de garde, portes d'horloge, calibration RTC | (ii) copie | `timers-and-watchdogs` §G lignes 1, 5 et 8 ; mesure | 13 |
-| 15 | SYSTIMER : les compteurs de QEMU, tronqués à chaque mise à jour et jamais remis à zéro par SYSTEM | (iv) réglage ; (ii) écart borné | `hw/timer/esp_systimer.c` ; mesure | 2 228 |
+| 15 | SYSTIMER : les compteurs de QEMU perdent une fraction d'unité à chaque mise à jour et se lisent toujours valides | (ii) copie ; (ii) compteur tenu | `hw/timer/esp_systimer.c` ; SVD ; mesure | 2 220 |
 | 16 | APB_CTRL, absent de QEMU : horloges Wi-Fi et alimentation des mémoires | (ii) copie | `info mtree -f` ; mesure | 21 |
 | 17 | `RNG.DATA` : QEMU rend le `rand()` de l'hôte | (ii) copie | `hw/riscv/esp32c3.c` (`A_SYSCON_RND_DATA_REG`) | 1 604 |
 | 18 | APB_SARADC, absent de QEMU : les sept registres de la source d'entropie du bootloader | (ii) copie | ESP-IDF v5.5.2 `bootloader_random_esp32c3.c` ; `esp32c3-bootloader-accesses.md` lignes 79–85 | 48 |
@@ -123,8 +132,12 @@ chaque chargement, avec le PC (relevé décrit dans la note de passation de SP1b
 
 Chaque bloc « Paramètres » est la ligne de l'outil, dans la syntaxe que le test lit : `paire <CSR>
 bits <masque> qemu <valeur> inkemu <valeur> [jusqu'à écriture]`, `meip retard <instructions>`,
-`registre <adresse> masque <bits> [après <commande SPI1>] [qemu <valeur>]`, `compteur <adresse>
-écart <unités>` ou `compteur csr <numéro> écart <unités>`, `réglage <nom du champ de QemuCompat>`.
+`registre <adresse> masque <bits> [après <commande SPI1>] [qemu <valeur>]`, `compteur <adresse ou
+csr numéro> écart <unités> origines <…>` (l'écart tenu à ses unités de celui de l'origine) ou
+`compteur <adresse> recul par mise à jour <premier>-<dernier> origines <…>` (l'écart ne descend que
+d'une unité par mise à jour possible de QEMU entre deux lectures), `horloge lente <adresse> capture
+<adresse> bit <n> <fréquence> Hz écart <cycles> qemu <valeur>`, `réglage <nom du champ de
+QemuCompat>`. Une origine est un CSR écrit ou une adresse où un rangement est fait.
 
 ### Ligne 1 — `mstatus.MPP`
 
@@ -174,7 +187,12 @@ Le contrôleur d'inkemu ne montre pas les lignes au processeur par `mip`. Le cœ
 `MEIP` ; dans les 3 336 autres, exactement 3 × 1 112, QEMU garde `MEIP` les trois instructions qui
 suivent le rangement du seuil `CPU_INT_THRESH` par `_interrupt_handler` (pc `0x40380252`), quand
 le nouveau seuil a déjà fait tomber la ligne. Le mécanisme de ce retard dans QEMU n'est pas
-identifié ; la ligne l'admet pour trois instructions après un tel rangement, pas une de plus.
+identifié ; la ligne l'admet pour trois instructions après un tel rangement, pas une de plus, et
+seulement après un rangement qui fait tomber la ligne : QEMU montrait `MEIP` à la frontière d'où
+part le rangement, et sa matrice, calculée sur l'état du contrôleur d'inkemu, la donne basse après
+lui. Un rangement du seuil qui ne fait rien tomber n'ouvre aucun retard. Une lecture de `mip` dans
+un registre (`csrr`) est tenue de même : le registre d'inkemu prend le `MEIP` que l'état de QEMU
+montrait à la frontière d'où part la lecture, déjà comparé ; tout autre bit lu est comparé.
 
 Paramètres :
 
@@ -187,20 +205,43 @@ meip retard 3
 QEMU garde un compteur par adresse (`0x7E2`, `0x802`) qui compte des cycles de 6,25 ns de son horloge
 virtuelle à partir de sa première lecture, reporte le reste de la division, et ignore les registres
 d'événement et de mode ; une écriture fixe la valeur sans toucher l'instant de la dernière lecture,
-et `csrw` ne lit pas (`esp_cpu_get_cycles`, `esp_cpu_csr_write`). Le réglage
-`cycle_counter_as_qemu` fait compter ainsi le compteur d'inkemu, sur le temps de l'appareil. Reste
-un écart d'un cycle au plus : QEMU compte 8 ns exactement par instruction, inkemu en cycles entiers de
-la base de temps (`floor(n × 32 / 25)`). Mesure : `0x7E2` −1 (1 138 lectures), 0 (505), +1 (6) ;
-`0x802` −1 ou 0 sur 200 000 lectures. Avant le réglage, l'écart croissait sans borne (inkemu comptait
-ses propres cycles, pas le temps). Les usages comptent les 283 221 lectures que le réglage a servies
-et les 248 928 valeurs copiées dans la borne.
+et `csrw` ne lit pas (`esp_cpu_get_cycles`, `esp_cpu_csr_write`). Le CPU de QEMU ne change jamais
+d'horloge.
+
+La valeur qu'inkemu lit est celle de son propre compteur, celui de la puce : les registres
+d'événement et de mode, une écriture qui fixe la valeur, un registre aux deux adresses. Le réglage
+`cycle_counter_on_time_base` ne change que l'horloge qu'il compte : les cycles de la base de temps
+(6,25 ns de temps de l'appareil) au lieu des cycles CPU que le modèle de temps facture. Sous
+`qemu-icount` une instruction dure 8 ns quelle que soit l'horloge CPU, et la base de temps est
+l'horloge que les deux comptent. Sans lui, le compteur avance d'un cycle par instruction et l'écart
+croît sans borne.
+
+Le lockstep compare alors la valeur d'inkemu à celle de QEMU. Les origines diffèrent : QEMU part de
+sa première lecture, inkemu de la mise sous tension. La première lecture de chaque adresse fixe donc
+l'écart (valeur de QEMU moins valeur d'inkemu), et chaque lecture suivante doit rester à un cycle au
+plus de cet écart, dans un sens ou dans l'autre. Une écriture de l'une ou l'autre adresse fixe une
+nouvelle origine.
+
+Source de la borne : les deux comptent `floor(n × 8 / 6,25)` cycles pour n instructions de 8 ns,
+QEMU en reportant son reste depuis sa première lecture, inkemu en cycles entiers de la base de temps
+(`floor(n × 32 / 25)`) depuis la mise sous tension. Deux parties entières du même temps, comptées
+depuis deux origines, diffèrent au plus d'un.
+
+Mesure du 2026-10-14 :
+
+- `0x7E2` : 1 649 lectures, écart maximal 1 ;
+- `0x802` : 281 572 lectures, écart maximal 1.
+
+Une valeur dans la borne est copiée dans le registre d'inkemu : le firmware continue avec la valeur
+de QEMU. Les usages comptent ces 283 221 lectures, plus les 283 221 lectures que le réglage a
+servies.
 
 Paramètres :
 
 ```text
-réglage cycle_counter_as_qemu
-compteur csr 0x7E2 écart 1
-compteur csr 0x802 écart 1
+réglage cycle_counter_on_time_base
+compteur csr 0x7E2 écart 1 origines csr 0x7E2 csr 0x802
+compteur csr 0x802 écart 1 origines csr 0x7E2 csr 0x802
 ```
 
 ### Ligne 6 — UART0
@@ -272,16 +313,29 @@ Le RTC_CNTL de QEMU ne lit que `OPTIONS0` (la valeur écrite, partie de 0), `RES
 seule) et `STORE0`–`7` ; tout le reste lit 0. `OPTIONS0` et `RESET_STATE` sont donc comparés, sauf les
 bits mesurés différents : les bits de forçage d'alimentation du quartz et de la PLL de la valeur de
 reset d'`OPTIONS0` (`0x1C00A000` dans inkemu), et `STAT_VECTOR_SEL_APPCPU`/`PROCPU` (bits 12–13) de
-`RESET_STATE`, que QEMU ne met pas ; la cause du reset est comparée. `TIME_LOW0` : QEMU lit toujours
-0, ce que la ligne exige ; le temporisateur RTC d'inkemu n'est pas comparé. Les autres registres :
-valeurs de reset, minuteries d'alimentation, horloges et chien de garde RTC qu'inkemu tient et que
-QEMU lit 0.
+`RESET_STATE`, que QEMU ne met pas ; la cause du reset est comparée. Les autres registres : valeurs
+de reset, minuteries d'alimentation, horloges et chien de garde RTC qu'inkemu tient et que QEMU lit 0.
+
+**Le temporisateur RTC (`TIME_LOW0`)** : QEMU ne le modélise pas et lit 0. Ce registre est l'un des
+deux choix laissés par H4 corrigée, et la ligne prend le second (b) :
+
+- (a) Faire terminer la fenêtre à sa lecture. Écarté : ses cinq lectures tombent avant `app_main`,
+  et la fenêtre n'atteindrait ni `app_main` ni le premier tic de FreeRTOS.
+- (b) Retenu. QEMU doit lire 0. La valeur d'inkemu doit être les cycles de l'horloge lente déclarée
+  (136 kHz, `SOC_CLK_RC_SLOW_FREQ_APPROX`) au temps de l'appareil du dernier rangement du bit 31 de
+  `TIME_UPDATE`, qui capture le temporisateur, ou 0 avant toute capture. La tolérance est d'un
+  cycle de l'horloge lente : le lockstep relève le temps de l'appareil à la frontière qui suit le
+  rangement, une instruction (8 ns) après la capture, bien moins qu'un cycle de l'horloge lente
+  (7,35 µs). La valeur dans la tolérance prend celle de QEMU.
+
+Mesure du 2026-10-14 : cinq lectures, écart 0. Une copie du mot entier sous la condition « QEMU lit
+0 » ne vérifiait rien : elle a été retirée.
 
 Paramètres :
 
 ```text
+horloge lente 0x60008010 capture 0x6000800C bit 31 136000 Hz écart 1 qemu 0x00000000
 registre 0x60008000 masque 0x1C00A000
-registre 0x60008010 masque 0xFFFFFFFF qemu 0x00000000
 registre 0x6000801C masque 0x3C140543
 registre 0x60008024 masque 0x0A080A09
 registre 0x60008028 masque 0x12200A09
@@ -403,26 +457,60 @@ registre 0x600200FC masque 0x60000000
 
 ### Ligne 15 — les compteurs du SYSTIMER
 
-Le SYSTIMER de QEMU (`hw/timer/esp_systimer.c`) tronque un compte à l'unité chaque fois qu'il met un
-compteur à jour (lecture `UPDATE`, chargement, alarme, reprogrammation d'un comparateur) et reprend
-la base à l'instant présent, si bien qu'il perd en moyenne une demi-unité par mise à jour ; il met à
-jour un compteur arrêté quand il reprogramme un comparateur qui le suit ; `SYSTEM.PERIP_RST_EN0` ne le
-remet jamais à zéro ; `VALUE_VALID` se lit toujours 1. Le réglage `systimer_counts_as_qemu` fait lire à
-inkemu ces valeurs-là, ses alarmes restant celles de ses propres compteurs (elles tombent aux mêmes
-instructions que celles de QEMU dans toute la fenêtre). Reste, sur le compteur 0, un écart d'au plus
-deux unités : QEMU arrondit le délai d'une alarme à la microseconde (`TICKS_TO_NS`) et date ses mises
-à jour sur une grille de 8 ns, inkemu sur la base de temps de 6,25 ns. Mesure : compteur 1 égal sur
-2 200 lectures ; compteur 0 en avance d'une unité sur 12 lectures, de deux sur 2. Avant le réglage,
-QEMU avait 293 412 à 303 246 unités d'avance (19 ms : le reset de SYSTEM que QEMU ignore, la mise à
-jour d'un compteur arrêté) et l'écart dérivait d'une unité par période de tick. Les usages comptent
-les 2 214 actions du réglage (resets ignorés, lectures rendues autrement) et les 14 valeurs copiées
-dans la borne.
+La valeur qu'inkemu lit est celle de son propre SYSTIMER : ses compteurs à 16 MHz, sa capture
+`UPDATE`, son `VALUE_VALID`, le reset du bloc par `SYSTEM.PERIP_RST_EN0`. Aucun réglage ne la
+remplace.
+
+Le SYSTIMER de QEMU (`hw/timer/esp_systimer.c`) diffère de trois façons :
+
+- **Il tronque.** À chaque mise à jour d'un compteur (lecture `UPDATE`, chargement, alarme,
+  reprogrammation d'un comparateur), il ajoute les unités entières écoulées depuis la précédente et
+  perd le reste.
+- **Il ne repart pas de zéro.** `SYSTEM.PERIP_RST_EN0` ne le remet jamais à zéro, et il met à jour un
+  compteur arrêté quand il reprogramme un comparateur qui le suit.
+- **`VALUE_VALID` se lit toujours 1** (« always synchronized and valid »). Le registre `UNITn_OP`
+  d'inkemu lit sa valeur de reset du SVD, 0, jusqu'au premier `UPDATE`. ESP-IDF lit ce mot avant de
+  poser `UPDATE` (lecture-modification-écriture de `systimer_ll_counter_snapshot`) : le bit 29 de
+  `UNIT0_OP` et de `UNIT1_OP` est copié.
+
+Les origines des deux compteurs diffèrent donc d'environ 300 000 unités (19 ms). La ligne ne les
+compare pas : elle compare comment l'écart évolue. La première lecture d'un compteur après une
+origine fixe l'écart (valeur de QEMU moins valeur d'inkemu). Sont des origines la mise sous tension,
+un rangement dans `SYSTEM.PERIP_RST_EN0` (le reset du bloc qu'inkemu fait et que QEMU ignore) et un
+rangement dans `SYSTIMER.CONF` (QEMU arrête et lance un compteur sans le mettre à jour). D'une
+lecture à la suivante, l'écart ne peut que descendre, d'au plus une unité par mise à jour que QEMU a
+pu faire entre elles : un rangement dans le bloc SYSTIMER (vidage, chargement, reprogrammation) ou
+une interruption prise (une alarme).
+
+Source de la borne :
+
+- QEMU ajoute `floor(Δns × 16 / 1000)` à chaque mise à jour, inkemu compte `floor(cycles / 10)` de la
+  base de temps.
+- Les deux voient le même temps à la même instruction : n × 8 ns pour QEMU, `floor(n × 32 / 25)`
+  cycles de 6,25 ns pour inkemu, soit le même nombre d'unités entières.
+- Entre deux captures, l'avance d'inkemu est donc `floor(Δ)` ou `floor(Δ) + 1`. Celle de QEMU, une
+  somme de k parties entières, est entre `floor(Δ) − (k − 1)` et `floor(Δ)`.
+- L'écart bouge donc de 0 à −k. Il ne monte jamais.
+
+Mesure du 2026-10-14 :
+
+- compteur 0 : 18 lectures, mouvement maximal 1 ;
+- compteur 1 : 2 200 lectures, mouvement maximal 1.
+
+Limite de ce contrôle : un défaut d'inkemu qui décale le compteur d'une constante passe. Un défaut de
+cadence n'est vu que s'il dépasse, entre deux lectures, la marge que les troncatures de QEMU lui
+laissent.
+
+Une valeur dans la borne est copiée dans le registre d'inkemu. Les usages comptent les 2 218 lectures
+de compteur et les 2 copies de `VALUE_VALID`.
 
 Paramètres :
 
 ```text
-réglage systimer_counts_as_qemu
-compteur 0x60023044 écart 2
+registre 0x60023004 masque 0x20000000
+registre 0x60023008 masque 0x20000000
+compteur 0x60023044 recul par mise à jour 0x60023000-0x600230FF origines 0x600C0018 0x60023000
+compteur 0x6002304C recul par mise à jour 0x60023000-0x600230FF origines 0x600C0018 0x60023000
 ```
 
 ### Ligne 16 — APB_CTRL
@@ -442,10 +530,23 @@ registre 0x600260AC masque 0x0000003F
 
 ### Ligne 17 — `RNG.DATA`
 
-QEMU rend `rand()` de l'hôte, semé par `srand(time(NULL))` (`hw/riscv/esp32c3.c`) : aucune option de
-QEMU ne le rend reproductible, et ce n'est pas un compteur. Le mot entier est copié. Le flot du
-bootloader n'en dépend pas dans la fenêtre : deux exécutions vivantes comparent le même nombre
-d'instructions.
+QEMU rend `rand()` de l'hôte, semé par `srand(time(NULL))` (`hw/riscv/esp32c3.c`) : la graine est la
+seconde de l'horloge de l'hôte au lancement, et aucune option de QEMU ne la fixe. Ce n'est pas un
+compteur ; le mot entier est copié, et inkemu continue avec la valeur de QEMU.
+
+Ce qui rend la fenêtre indépendante de cette valeur :
+
+- **La comparaison, par construction.** Inkemu prend à chaque lecture la valeur que QEMU a lue, et
+  les deux côtés continuent avec le même mot. Ce qu'un firmware en fait ensuite (le ranger, le
+  relire, brancher dessus) est identique des deux côtés.
+- **La longueur de la fenêtre, par la mesure.** Seule cette longueur pourrait varier avec la
+  graine : un branchement sur la valeur ferait suivre aux deux côtés, ensemble, un chemin plus long
+  ou plus court. Trois captures de QEMU lancées à des secondes différentes le 2026-10-14 (deux
+  exécutions vivantes et une trace enregistrée) comparent toutes 3 402 169 instructions, avec le
+  même usage de chaque ligne. La CI épingle les deux.
+
+Si un firmware de référence futur faisait varier sa longueur avec la graine, l'épinglage échouerait
+(code 3) : il faudrait alors un firmware qui n'en dépend pas, pas une borne plus large.
 
 Paramètres :
 
@@ -604,8 +705,10 @@ seulement.
   `mpcmr`. Un rangement n'est comparé qu'à travers les chargements qui le relisent.
 - Un bloc qu'une interruption a préempté (ci-dessous) : l'état qu'il porte est comparé au premier
   bloc du gestionnaire, `mepc` et `mcause` compris.
-- Ce que les copies de valeurs et les réglages remplacent (temporisateur RTC, moniteur de pile,
-  changement d'horloge, interruption de tick précoce) : chaque section le dit.
+- Ce que les copies de valeurs et les réglages remplacent (moniteur de pile, changement d'horloge,
+  interruption de tick précoce) : chaque section le dit.
+- L'origine d'un compteur (lignes 5 et 15) : la première lecture après une origine fixe l'écart, et
+  seule son évolution est tenue. Un compteur d'inkemu décalé d'une constante n'est pas vu.
 
 ## Ce qui n'est pas une différence
 

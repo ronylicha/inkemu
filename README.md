@@ -281,14 +281,30 @@ tools/reference-firmware/build.sh                       # builds target/referenc
 inkemu rom fetch --all --rom-dir rom
 cargo run --release -p inkemu-lockstep -- \
     --flash target/reference-firmware/flash_hello.bin --rom-dir rom \
-    --expect-compared 3402169 --expect-end reset
+    --expect-compared 3402169 --expect-end reset \
+    --expect-usage tools/ci/lockstep-hello.usage
 ```
 
-- inkemu runs under the timing model `qemu-icount`: 8 ns per instruction, no interrupt latency, so that the timers of both sides fire on the same instruction. Every difference the comparison admits is a numbered row of [docs/lockstep-differences.md](docs/lockstep-differences.md), with its source and its exact parameters: a CSR whose bits hold a known pair of values, register bits copied from QEMU under a mask (every other bit compared), a counter admitted within a bound of a count or two, or a behaviour of QEMU the machine takes on for the lockstep only. Anything else is a divergence.
-- Every run prints what each row did (registers, bits taken from QEMU, gaps of counters, what a setting changed); a row the window never used, or used outside what it declares, fails the run.
-- The window ends at a reset of both sides, at an access to a register no QEMU peripheral covers (SPI2, I2C0, a measurement of the SAR ADC, the radio…) unless a row names that register, at `--max-instructions`, or at the end of the trace. A reset of one side only is a divergence. `--trace FILE` (or `-` for standard input) reads a captured `-d cpu,nochain,int` trace instead of running QEMU.
+- inkemu runs under the timing model `qemu-icount`: 8 ns per instruction, no interrupt latency, so that the timers of both sides fire on the same instruction. Every difference the comparison admits is a numbered row of [docs/lockstep-differences.md](docs/lockstep-differences.md), with its source and its exact parameters. A row is one of:
+  - a CSR whose bits hold a known pair of values;
+  - register bits copied from QEMU under a mask, every other bit compared;
+  - a counter both sides read from their own models, whose gap may move only as the row's sourced bound says;
+  - QEMU's missing RTC timer, held to the slow clock at device time;
+  - a behaviour of QEMU the machine takes on for the lockstep only.
+
+  Anything else is a divergence.
+- Every run prints what each row did: registers, bits taken from QEMU, the largest move of each counter, what a setting changed. The run fails if a row, a register of a row or a bit of its mask was never used, or if a row was used outside what it declares; a window cut by `--max-instructions` only lists what it left unused. `--expect-usage FILE` pins how often each row was used.
+- The window ends at a reset of both sides, at an access to a register no QEMU peripheral covers (SPI2, I2C0, a measurement of the SAR ADC, the radio…) unless a row names that register, or at `--max-instructions`. A reset of one side only is a divergence, and a trace that ends before the window does is an error. `--trace FILE` (or `-` for standard input) reads a captured `-d cpu,nochain,int` trace instead of running QEMU.
 - A divergence prints the instruction, the state before it and both states after it with the differences marked, the 64 instructions before it with every value taken from QEMU on the way, and the row that comes nearest to applying.
-- **Exit codes**: `0` the window ended without a divergence, every row used within its declaration, as `--expect-compared` and `--expect-end` said; `1` divergence, a reset of one side included; `2` error (arguments, files, Docker, QEMU ending on its own, a trace that is not QEMU's or holds no block); `3` the window ended otherwise than expected; `4` inkemu stopped on its own; `5` a row was never used or was used outside what it declares; `130` Ctrl-C (the container is removed whatever ends the run). The CI runs the command above in the `reference-boot` job, then once more with a fault put in inkemu on purpose, which must diverge. See [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md) (French).
+- **Exit codes**:
+  - `0`: the window ended without a divergence, every row used at every register and bit it declares and within them, as the `--expect-*` options said;
+  - `1`: a divergence, a reset of one side included;
+  - `2`: an error (arguments, files, Docker, QEMU ending on its own, a trace that is not QEMU's, holds no block or ends early);
+  - `3`: the window ended otherwise than expected, or a row was used a different number of times;
+  - `4`: inkemu stopped on its own;
+  - `5`: a row, a register or a bit was never used, or a row was used outside what it declares;
+  - `130`: Ctrl-C (the container is removed whatever ends the run).
+- The CI runs the command above in the `reference-boot` job, then twice more, each time with a fault put in inkemu on purpose, which must diverge: once in a register of the CPU, once in a read of the SYSTIMER's model. See [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md) (French).
 
 ## Why
 
@@ -408,11 +424,26 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
 
 `inkemu-lockstep` est un outil de développement de l'espace de travail, absent de l'`inkemu` distribué (voir la commande de la partie anglaise). Il exécute une image flash dans le QEMU d'Espressif et dans inkemu et compare, après chaque instruction, le PC, `x1`–`x31` et les huit CSR machine que les deux ont (`mstatus`, `mie`, `mip`, `mtvec`, `mepc`, `mcause`, `mtval`, `mscratch`). QEMU ne tourne que dans l'image épinglée `espressif/idf:v5.5.2` (`tools/conformance/versions.env`), jamais sur l'hôte : il faut Docker et l'image déjà téléchargée (l'outil ne la télécharge pas), l'image flash, une flash entière de la taille du profil, est montée en lecture seule, et lancer QEMU demande un hôte Unix (`--trace` fonctionne partout).
 
-- inkemu tourne sous le modèle de temps `qemu-icount` : 8 ns par instruction, aucune latence d'interruption, pour que les timers des deux côtés se déclenchent à la même instruction. Chaque différence admise est une ligne numérotée de [docs/lockstep-differences.md](docs/lockstep-differences.md), avec sa source et ses paramètres exacts : un CSR dont des bits valent une paire de valeurs connue, des bits de registre copiés de QEMU sous un masque (les autres bits comparés), un compteur admis à une ou deux unités près, ou un comportement de QEMU que la machine adopte pour le lockstep seulement. Tout le reste est une divergence.
-- Chaque exécution imprime ce que chaque ligne a fait (registres, bits pris à QEMU, écarts des compteurs, ce qu'un réglage a changé) ; une ligne que la fenêtre n'a jamais utilisée, ou utilisée hors de ce qu'elle déclare, fait échouer l'exécution.
-- La fenêtre s'arrête au reset des deux côtés, au premier accès à un registre qu'aucun périphérique de QEMU ne couvre (SPI2, I2C0, une mesure de l'ADC SAR, la radio…) sauf si une ligne nomme ce registre, à `--max-instructions`, ou à la fin de la trace. Un reset d'un seul côté est une divergence. `--trace FICHIER` (ou `-`) lit une trace `-d cpu,nochain,int` capturée au lieu de lancer QEMU.
+- inkemu tourne sous le modèle de temps `qemu-icount` : 8 ns par instruction, aucune latence d'interruption, pour que les timers des deux côtés se déclenchent à la même instruction. Chaque différence admise est une ligne numérotée de [docs/lockstep-differences.md](docs/lockstep-differences.md), avec sa source et ses paramètres exacts. Une ligne est l'une de ces formes :
+  - un CSR dont des bits valent une paire de valeurs connue ;
+  - des bits de registre copiés de QEMU sous un masque, les autres bits comparés ;
+  - un compteur que chaque côté lit dans son propre modèle, dont l'écart ne bouge que comme la borne sourcée de la ligne le dit ;
+  - le temporisateur RTC absent de QEMU, tenu à l'horloge lente au temps de l'appareil ;
+  - un comportement de QEMU que la machine adopte pour le lockstep seulement.
+
+  Tout le reste est une divergence.
+- Chaque exécution imprime ce que chaque ligne a fait : registres, bits pris à QEMU, plus grand mouvement de chaque compteur, ce qu'un réglage a changé. L'exécution échoue si une ligne, un registre d'une ligne ou un bit de son masque n'a jamais servi, ou si une ligne a servi hors de ce qu'elle déclare. Une fenêtre coupée par `--max-instructions` liste seulement ce qu'elle a laissé inutilisé. `--expect-usage FICHIER` épingle le nombre d'usages de chaque ligne.
+- La fenêtre s'arrête au reset des deux côtés, au premier accès à un registre qu'aucun périphérique de QEMU ne couvre (SPI2, I2C0, une mesure de l'ADC SAR, la radio…) sauf si une ligne nomme ce registre, ou à `--max-instructions`. Un reset d'un seul côté est une divergence, et une trace qui finit avant la fenêtre est une erreur. `--trace FICHIER` (ou `-`) lit une trace `-d cpu,nochain,int` capturée au lieu de lancer QEMU.
 - Une divergence affiche l'instruction, l'état d'avant et les deux états d'après avec les différences marquées, les 64 instructions précédentes avec chaque valeur prise à QEMU en chemin, et la ligne du tableau la plus proche.
-- **Codes de sortie** : `0` fenêtre terminée sans divergence, chaque ligne utilisée dans ce qu'elle déclare, comme `--expect-compared` et `--expect-end` l'annonçaient ; `1` divergence, reset d'un seul côté compris ; `2` erreur (arguments, fichiers, Docker, QEMU qui s'arrête de lui-même, trace qui n'est pas celle de QEMU ou ne contient aucun bloc) ; `3` fenêtre terminée autrement qu'annoncé ; `4` inkemu s'est arrêté de lui-même ; `5` une ligne jamais utilisée, ou utilisée hors de ce qu'elle déclare ; `130` Ctrl-C (le conteneur est supprimé quoi qu'il arrive). La CI l'exécute dans le job `reference-boot`, puis une seconde fois avec une faute mise exprès dans inkemu, qui doit diverger. Voir l'[ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md).
+- **Codes de sortie** :
+  - `0` : fenêtre terminée sans divergence, chaque ligne utilisée à chaque registre et chaque bit qu'elle déclare, et dans ces limites, comme les options `--expect-*` l'annonçaient ;
+  - `1` : divergence, reset d'un seul côté compris ;
+  - `2` : erreur (arguments, fichiers, Docker, QEMU qui s'arrête de lui-même, trace qui n'est pas celle de QEMU, ne contient aucun bloc ou finit trop tôt) ;
+  - `3` : fenêtre terminée autrement qu'annoncé, ou ligne utilisée un autre nombre de fois ;
+  - `4` : inkemu s'est arrêté de lui-même ;
+  - `5` : une ligne, un registre ou un bit jamais utilisé, ou une ligne utilisée hors de ce qu'elle déclare ;
+  - `130` : Ctrl-C (le conteneur est supprimé quoi qu'il arrive).
+- La CI l'exécute dans le job `reference-boot`, puis deux fois encore, chacune avec une faute mise exprès dans inkemu, qui doit diverger : une fois dans un registre du CPU, une fois dans une lecture du modèle du SYSTIMER. Voir l'[ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md).
 
 ### Pourquoi
 

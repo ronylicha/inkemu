@@ -6,7 +6,7 @@
 
 use lockstep::state::CSRS;
 use lockstep::table::Compat;
-use lockstep::{Location, Treatment};
+use lockstep::{Drift, Location, Treatment};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -109,18 +109,52 @@ fn lines_of(treatment: &Treatment) -> Vec<String> {
                 line
             })
             .collect(),
-        Treatment::Counter { location, bound } => vec![match location {
-            Location::Mmio(address) => format!("compteur 0x{address:08X} écart {bound}"),
-            Location::Csr(csr) => format!("compteur csr 0x{csr:03X} écart {bound}"),
-        }],
+        Treatment::Counter {
+            location,
+            drift,
+            origins,
+        } => {
+            let mut line = format!("compteur {}", location_text(location));
+            match drift {
+                Drift::Within(bound) => {
+                    let _ = write!(line, " écart {bound}");
+                }
+                Drift::Truncated { first, last } => {
+                    let _ = write!(line, " recul par mise à jour 0x{first:08X}-0x{last:08X}");
+                }
+            }
+            line.push_str(" origines");
+            for origin in origins {
+                let _ = write!(line, " {}", location_text(*origin));
+            }
+            vec![line]
+        }
+        Treatment::SlowClock {
+            register,
+            capture,
+            trigger,
+            hz,
+            bound,
+            qemu,
+        } => vec![format!(
+            "horloge lente 0x{register:08X} capture 0x{capture:08X} bit {} {hz} Hz écart {bound} \
+             qemu 0x{qemu:08X}",
+            trigger.trailing_zeros()
+        )],
         Treatment::Compat(setting) => vec![format!(
             "réglage {}",
             match setting {
                 Compat::SystimerNoAlarmOnStoppedCounter => "systimer_no_alarm_on_stopped_counter",
-                Compat::SystimerCountsAsQemu => "systimer_counts_as_qemu",
-                Compat::CycleCounterAsQemu => "cycle_counter_as_qemu",
+                Compat::CycleCounterOnTimeBase => "cycle_counter_on_time_base",
             }
         )],
+    }
+}
+
+fn location_text(location: Location) -> String {
+    match location {
+        Location::Mmio(address) => format!("0x{address:08X}"),
+        Location::Csr(csr) => format!("csr 0x{csr:03X}"),
     }
 }
 

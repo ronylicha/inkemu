@@ -37,12 +37,14 @@ const EXIT_TABLE: u8 = 5;
 const EXIT_INTERRUPTED: u8 = 130;
 
 const EXIT_CODES_HELP: &str = "Exit codes: 0 the window ended without a divergence outside \
-docs/lockstep-differences.md, every row of it used within what it declares (and as --expect-* \
-said); 1 divergence, a reset of one side included (the report is printed); 2 error (arguments, \
-files, Docker, QEMU ending on its own, a trace that is not QEMU's or holds no block); 3 the \
-window ended otherwise than --expect-compared or --expect-end said; 4 inkemu stopped on its own \
-before QEMU's trace ended; 5 a row of the table was never used, or was used outside what it \
-declares; 130 interrupted by Ctrl-C.";
+docs/lockstep-differences.md, every row of it used at every site and bit it declares and \
+within them (and as --expect-* said); 1 divergence, a reset of one side included (the report \
+is printed); 2 error (arguments, files, Docker, QEMU ending on its own, a trace that is not \
+QEMU's, holds no block or ends before the window does); 3 the window ended otherwise than \
+--expect-compared, --expect-end or --expect-usage said; 4 inkemu stopped on its own before \
+QEMU's trace ended; 5 a row, a site or a bit of the table was never used (unless \
+--max-instructions cut the window), or a row was used outside what it declares; 130 \
+interrupted by Ctrl-C.";
 
 /// How the window is expected to end, for `--expect-end`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -52,16 +54,16 @@ enum EndKind {
     /// An access to a register QEMU does not have that no row names.
     Absent,
     Limit,
-    TraceEnd,
 }
 
 impl EndKind {
-    fn of(end: &WindowEnd) -> EndKind {
+    /// The kind of a window end the run reports; `None` for the end of the trace, an error.
+    fn of(end: &WindowEnd) -> Option<EndKind> {
         match end {
-            WindowEnd::Reset => EndKind::Reset,
-            WindowEnd::Absent { .. } => EndKind::Absent,
-            WindowEnd::Limit => EndKind::Limit,
-            WindowEnd::TraceEnd => EndKind::TraceEnd,
+            WindowEnd::Reset => Some(EndKind::Reset),
+            WindowEnd::Absent { .. } => Some(EndKind::Absent),
+            WindowEnd::Limit => Some(EndKind::Limit),
+            WindowEnd::TraceEnd => None,
         }
     }
 }
@@ -91,7 +93,8 @@ struct Cli {
     /// QEMU inside the image.
     #[arg(long, default_value = DEFAULT_QEMU)]
     qemu: String,
-    /// End the window after this many compared instructions.
+    /// End the window after this many compared instructions. The rows, sites and bits of the
+    /// table such a partial window leaves unused are listed, not failed on.
     #[arg(long)]
     max_instructions: Option<u64>,
     /// Fail (exit 3) unless exactly this many instructions are compared.
@@ -100,10 +103,20 @@ struct Cli {
     /// Fail (exit 3) unless the window ends this way.
     #[arg(long, value_enum)]
     expect_end: Option<EndKind>,
+    /// Fail (exit 3) unless every row was used exactly as often as this file says, one line
+    /// `row N: uses` per row (a row it does not name, never).
+    #[arg(long)]
+    expect_usage: Option<PathBuf>,
     /// For the test of the tool only: once this many instructions are compared, change bit 0 of
-    /// t0 in inkemu, as a fault of the model would; the run must then diverge (exit 1).
+    /// t0 in inkemu, as a fault of the CPU's model would; the run must then diverge (exit 1).
     #[arg(long, hide = true)]
     perturb_after: Option<u64>,
+    /// For the test of the tool only: once this many instructions are compared, the next read of
+    /// the low word of a SYSTIMER counter gives one count more in inkemu, as a fault of the
+    /// SYSTIMER's model would; row 15 holds the next read of that counter to the gap the
+    /// faulty one left, and the run must then diverge (exit 1).
+    #[arg(long, hide = true)]
+    perturb_systimer_after: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -142,6 +155,13 @@ enum Error {
         "QEMU's trace held no block ({0} lines skipped): it is not a trace of `-d cpu,nochain,int`"
     )]
     EmptyTrace(u64),
+    #[error(
+        "QEMU's trace ended after {0} instructions compared, before the window did: a capture \
+         stopped early (QEMU crashed or was cut) ends no window"
+    )]
+    TraceEnded(u64),
+    #[error("{path}: `{line}` is not a line `row N: uses`")]
+    Usage { path: PathBuf, line: String },
 }
 
 fn machine(cli: &Cli) -> Result<Esp32C3, Error> {
@@ -195,7 +215,14 @@ enum Outcome {
 struct Options<'a> {
     interrupted: &'a AtomicBool,
     perturb_after: Option<u64>,
+    perturb_systimer_after: Option<u64>,
 }
+
+/// The low words of the two SYSTIMER counters, which `--perturb-systimer-after` changes.
+const SYSTIMER_VALUE_LO: [u32; 2] = [
+    lockstep::table::SYSTIMER_UNIT0_VALUE_LO,
+    lockstep::table::SYSTIMER_UNIT1_VALUE_LO,
+];
 
 fn compare(
     reader: &mut TraceReader<impl BufRead>,
@@ -205,6 +232,7 @@ fn compare(
 ) -> Result<Outcome, Error> {
     let mut events: u64 = 0;
     let mut perturbed = false;
+    let mut systimer_perturbed = false;
     loop {
         events += 1;
         if events.is_multiple_of(INTERRUPT_CHECK_EVENTS)
@@ -237,6 +265,16 @@ fn compare(
             let t0 = machine.x()[usize::from(PERTURBED_REGISTER)];
             Target::set_x(machine, PERTURBED_REGISTER, t0 ^ 1);
             perturbed = true;
+        }
+        if let Some(after) = options.perturb_systimer_after
+            && !systimer_perturbed
+            && lockstep.counts().compared >= after
+            && let Some((rd, address)) = lockstep.pending_load()
+            && SYSTIMER_VALUE_LO.contains(&address)
+        {
+            let value = machine.x()[usize::from(rd)];
+            Target::set_x(machine, rd, value.wrapping_add(1));
+            systimer_perturbed = true;
         }
         if matches!(event, TraceEvent::State { .. }) && events.is_multiple_of(PROGRESS_EVENTS) {
             eprintln!(
@@ -318,12 +356,53 @@ fn run_qemu(
     Err(Error::NotUnix)
 }
 
+/// Whether every row was used exactly as often as `path` says, one line `row N: X uses` each
+/// (as the run prints them; `#` starts a comment), the rows it does not name never. Prints every
+/// row that differs.
+fn usage_as_expected(path: &std::path::Path, usage: &lockstep::Usage) -> Result<bool, Error> {
+    let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut expected = std::collections::BTreeMap::new();
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let parsed = line
+            .strip_prefix("row ")
+            .and_then(|rest| rest.split_once(':'))
+            .and_then(|(row, uses)| {
+                let uses = uses.trim().strip_suffix("uses").unwrap_or(uses).trim();
+                Some((row.trim().parse::<u16>().ok()?, uses.parse::<u64>().ok()?))
+            });
+        let Some((row, uses)) = parsed else {
+            return Err(Error::Usage {
+                path: path.to_owned(),
+                line: line.to_owned(),
+            });
+        };
+        expected.insert(row, uses);
+    }
+    let mut as_expected = true;
+    for row in lockstep::DIFFERENCES.iter().map(|row| row.number) {
+        let (want, got) = (expected.get(&row).copied().unwrap_or(0), usage.uses(row));
+        if want != got {
+            eprintln!("inkemu-lockstep: row {row} was used {got} times where {want} were expected");
+            as_expected = false;
+        }
+    }
+    Ok(as_expected)
+}
+
 fn run(cli: &Cli, interrupted: &AtomicBool) -> Result<u8, Error> {
     let mut machine = machine(cli)?;
     let mut lockstep = Lockstep::new(&machine, cli.max_instructions);
     let options = Options {
         interrupted,
         perturb_after: cli.perturb_after,
+        perturb_systimer_after: cli.perturb_systimer_after,
     };
     let (outcome, skipped) = comparison(cli, &mut machine, &mut lockstep, &options)?;
     let counts = lockstep.counts();
@@ -340,6 +419,12 @@ fn run(cli: &Cli, interrupted: &AtomicBool) -> Result<u8, Error> {
         }
     };
     match end {
+        // A firmware's run never ends QEMU: a trace that stops before the window has ended is a
+        // capture cut short, whether it is a file or QEMU's own pipe.
+        End::Window(WindowEnd::TraceEnd) => {
+            println!("{summary}");
+            Err(Error::TraceEnded(counts.compared))
+        }
         End::Window(end) => {
             println!("{summary}window end: {end}");
             let mut code = 0;
@@ -353,22 +438,31 @@ fn run(cli: &Cli, interrupted: &AtomicBool) -> Result<u8, Error> {
                 code = EXIT_EXPECTATION;
             }
             if let Some(expected) = cli.expect_end
-                && expected != EndKind::of(&end)
+                && Some(expected) != EndKind::of(&end)
             {
                 eprintln!(
                     "inkemu-lockstep: the window ended by {end} where {expected:?} was expected"
                 );
                 code = EXIT_EXPECTATION;
             }
+            if let Some(path) = &cli.expect_usage
+                && !usage_as_expected(path, &usage)?
+                && code == 0
+            {
+                code = EXIT_EXPECTATION;
+            }
             // Decision H3: a row the window did not need, or used outside its declaration, is a
-            // table that no longer says what the comparison does.
-            if let Err(misuses) = usage.check(lockstep::DIFFERENCES) {
-                for misuse in misuses {
-                    eprintln!("inkemu-lockstep: {misuse}");
-                }
-                if code == 0 {
-                    code = EXIT_TABLE;
-                }
+            // table that no longer says what the comparison does. A window cut at
+            // --max-instructions reports what it left unused without failing on it.
+            let check = lockstep.check_usage(&machine, &end);
+            for unused in &check.unused_in_partial_window {
+                println!("unused in this partial window: {unused}");
+            }
+            for misuse in &check.failures {
+                eprintln!("inkemu-lockstep: {misuse}");
+            }
+            if !check.passes() && code == 0 {
+                code = EXIT_TABLE;
             }
             Ok(code)
         }
