@@ -286,6 +286,13 @@ cargo run --release -p inkemu-lockstep -- --window hello \
 ```
 
 - `--window` names what is compared and under which rows: `hello` (`flash_hello.bin`), `nvs` (`flash_nvs.bin`) and `nvs-ota` (`flash_nvs_ota.bin`) go through the reset `esp_restart` asks for and end at the next one. The windows, their rows and their pinned counts are listed in [docs/lockstep-differences.md](docs/lockstep-differences.md). `--firmware FILE` gives an application image instead of `--flash`: the flash both sides boot is composed as `inkemu run --firmware` composes it, behind the bootloader inkemu ships.
+- The window `crosspoint` compares CrossPoint 1.6.5 (`crosspoint-1.6.5-x3-x4.bin`), which cannot be distributed: only in local, never in the CI, by an ignored test that refuses any file but the pinned one. Measured on 2026-10-14: 31 088 420 instructions compared, the ROM, the bootloader and the start of the application, up to its read of the temperature sensor, which QEMU does not have.
+
+  ```sh
+  export INKEMU_ROM_ELF_DIR=/path/to/rom
+  export INKEMU_CROSSPOINT_X3_X4=/path/to/crosspoint-1.6.5-x3-x4.bin
+  cargo test --release -p inkemu-lockstep --test crosspoint -- --ignored
+  ```
 - inkemu runs under the timing model `qemu-icount`: 8 ns per instruction, no interrupt latency, so that the timers of both sides fire on the same instruction. Every difference the comparison admits is a numbered row of [docs/lockstep-differences.md](docs/lockstep-differences.md), with its source and its exact parameters. A row is one of:
   - a CSR whose bits hold a known pair of values;
   - a register or a CSR QEMU keeps through its reset where the chip's CPU reset clears it, held until written;
@@ -334,7 +341,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 
 ## Roadmap
 
-1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3a, interrupts, timers, watchdogs and reset, done; 1b-3b, flash writes and the device's flash file, done; 1b-3c, a firmware given on its own (`--firmware`), done; 1b-3d, the serial consoles in both directions, done; 1b-3e, two real firmwares of the X4 start, done; 1b-3f, deep sleep and the wake by the RTC timer, done; 1b-4a, the documentation without a warning, done; 1b-4b, recording and replaying a run, done; 1b-4c, the lockstep against QEMU over the first life of the reference image, done; the lockstep through a reset and on CrossPoint is next.*
+1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3a, interrupts, timers, watchdogs and reset, done; 1b-3b, flash writes and the device's flash file, done; 1b-3c, a firmware given on its own (`--firmware`), done; 1b-3d, the serial consoles in both directions, done; 1b-3e, two real firmwares of the X4 start, done; 1b-3f, deep sleep and the wake by the RTC timer, done; 1b-4a, the documentation without a warning, done; 1b-4b, recording and replaying a run, done; 1b-4c, the lockstep against QEMU over the first life of the reference image, done; 1b-4d, the lockstep through a reset, on two more reference firmwares, and on CrossPoint in local, done; CoreMark is next.*
 2. X4 peripherals, desktop UI, e-ink rendering: **first visual milestone**
 3. X3 support (UC8253 panel, I2C sensors)
 4. Debugging, resource monitor, headless test runner
@@ -427,6 +434,7 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
 `inkemu-lockstep` est un outil de développement de l'espace de travail, absent de l'`inkemu` distribué (voir la commande de la partie anglaise). Il exécute une image flash dans le QEMU d'Espressif et dans inkemu et compare, après chaque instruction, le PC, `x1`–`x31` et les huit CSR machine que les deux ont (`mstatus`, `mie`, `mip`, `mtvec`, `mepc`, `mcause`, `mtval`, `mscratch`). QEMU ne tourne que dans l'image épinglée `espressif/idf:v5.5.2` (`tools/conformance/versions.env`), jamais sur l'hôte : il faut Docker et l'image déjà téléchargée (l'outil ne la télécharge pas), l'image flash, une flash entière de la taille du profil, est montée en lecture seule, et lancer QEMU demande un hôte Unix (`--trace` fonctionne partout).
 
 - `--window` dit ce qui est comparé et sous quelles lignes : `hello` (`flash_hello.bin`), `nvs` (`flash_nvs.bin`) et `nvs-ota` (`flash_nvs_ota.bin`) traversent le reset que demande `esp_restart` et finissent au suivant. Les fenêtres, leurs lignes et leurs comptes épinglés sont dans [docs/lockstep-differences.md](docs/lockstep-differences.md). `--firmware FICHIER` donne une image d'application au lieu de `--flash` : la flash que les deux côtés démarrent est composée comme `inkemu run --firmware` la compose, derrière le bootloader livré.
+- La fenêtre `crosspoint` compare CrossPoint 1.6.5 (`crosspoint-1.6.5-x3-x4.bin`), qui ne peut pas être distribué : en local seulement, jamais dans la CI, par un test ignoré qui refuse tout autre fichier que celui épinglé (voir la commande de la partie anglaise). Mesure du 2026-10-14 : 31 088 420 instructions comparées, la ROM, le bootloader et le début de l'application, jusqu'à sa lecture du capteur de température, que QEMU n'a pas.
 - inkemu tourne sous le modèle de temps `qemu-icount` : 8 ns par instruction, aucune latence d'interruption, pour que les timers des deux côtés se déclenchent à la même instruction. Chaque différence admise est une ligne numérotée de [docs/lockstep-differences.md](docs/lockstep-differences.md), avec sa source et ses paramètres exacts. Une ligne est l'une de ces formes :
   - un CSR dont des bits valent une paire de valeurs connue ;
   - un registre ou un CSR que QEMU garde à son reset là où le reset du CPU de la puce le remet à zéro, tenu jusqu'à son écriture ;
@@ -463,7 +471,7 @@ Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtens
 
 ### Feuille de route
 
-1. Cœur RV32IMC, ESP32-C3 minimal, chargeur de firmware, CLI : démarrer un firmware jusqu'à ses journaux de console. *1a fait ; 1b-1, squelette du SoC et démarrage de la ROM, fait ; 1b-2, flash et bootloader, fait ; 1b-3a, interruptions, timers, watchdogs et reset, fait ; 1b-3b, écritures en flash et fichier de flash de l'appareil, fait ; 1b-3c, firmware fourni seul (`--firmware`), fait ; 1b-3d, consoles série dans les deux sens, fait ; 1b-3e, démarrage de deux firmwares réels du X4, fait ; 1b-3f, sommeil profond et réveil par le timer RTC, fait ; 1b-4a, documentation sans avertissement, fait ; 1b-4b, enregistrement et rejeu d'une exécution, fait ; 1b-4c, lockstep avec QEMU sur la première vie de l'image de référence, fait ; le lockstep à travers un reset et sur CrossPoint est le suivant.*
+1. Cœur RV32IMC, ESP32-C3 minimal, chargeur de firmware, CLI : démarrer un firmware jusqu'à ses journaux de console. *1a fait ; 1b-1, squelette du SoC et démarrage de la ROM, fait ; 1b-2, flash et bootloader, fait ; 1b-3a, interruptions, timers, watchdogs et reset, fait ; 1b-3b, écritures en flash et fichier de flash de l'appareil, fait ; 1b-3c, firmware fourni seul (`--firmware`), fait ; 1b-3d, consoles série dans les deux sens, fait ; 1b-3e, démarrage de deux firmwares réels du X4, fait ; 1b-3f, sommeil profond et réveil par le timer RTC, fait ; 1b-4a, documentation sans avertissement, fait ; 1b-4b, enregistrement et rejeu d'une exécution, fait ; 1b-4c, lockstep avec QEMU sur la première vie de l'image de référence, fait ; 1b-4d, lockstep à travers un reset, sur deux autres firmwares de référence et sur CrossPoint en local, fait ; CoreMark est le suivant.*
 2. Périphériques du X4, interface de bureau, rendu e-ink : **premier jalon visuel**
 3. Prise en charge du X3 (dalle UC8253, capteurs I2C)
 4. Débogage, moniteur de ressources, exécution de tests sans écran

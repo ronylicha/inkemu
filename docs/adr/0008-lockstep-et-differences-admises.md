@@ -1,7 +1,7 @@
 # ADR 0008 — Lockstep et différences admises
 
-- Date : 2026-10-14 (révisée le même jour après les revues de la politique et de la machine, puis après la seconde revue : section « Révision du 2026-10-14, seconde revue »)
-- Statut : accepté (plan SP1b-4c)
+- Date : 2026-10-14 (révisée le même jour après les revues de la politique et de la machine, puis après la seconde revue : section « Révision du 2026-10-14, seconde revue » ; étendue par SP1b-4d : section « Révision du 2026-10-14, SP1b-4d »)
+- Statut : accepté (plan SP1b-4c ; plan SP1b-4d pour la traversée du reset, les fenêtres et CrossPoint)
 - Spec : `docs/superpowers/specs/2026-10-14-sp1b-4c-design.md` (décisions H1–H11, et sa correction du 2026-10-14) ; spec globale §4.4, §10.2 point 10, §10.3 critère 3
 
 ## Contexte
@@ -99,3 +99,64 @@ Une seconde revue a trouvé que le lockstep passait encore avec un inkemu faux �
 - **Le retard de `MEIP` (ligne 4)** ne s'ouvre plus qu'après un rangement du seuil qui fait tomber la ligne. Une lecture de `mip` dans un registre prend le `MEIP` que QEMU montrait.
 - **L'outil.** Une trace qui finit avant la fenêtre est une erreur. La bibliothèque offre la vérification de l'usage (`Lockstep::check_usage`). Une seconde faute exprès, dans le modèle du SYSTIMER, doit diverger dans la CI.
 - **Tests ajoutés.** Le reset d'inkemu seul (divergence), un programme de sommeil profond dans l'équivalence de `step` et `run_within`, la lecture de `mip`, un compteur dont l'écart monte ou descend de deux pour une mise à jour (divergence).
+
+## Révision du 2026-10-14, SP1b-4d
+
+Spec : `docs/superpowers/specs/2026-10-14-sp1b-4d-design.md` (décisions J1–J9) ; plan :
+`docs/superpowers/plans/2026-10-14-sp1b-4d-lockstep-application.md` (décisions R30–R41). Le
+lockstep traverse désormais le reset qu'`esp_restart` demande, compare la seconde vie, couvre deux
+autres firmwares de référence en CI et CrossPoint 1.6.5 en local.
+
+- **La référence du reset est la puce (J1, R30).** `esp_restart` finit par
+  `esp_rom_software_reset_cpu(0)` (lu dans l'image épinglée) : `SW_PROCPU_RST`, cause
+  `RTC_SW_CPU_RST` (0x0C), un reset du seul CPU (TRM §6.1). C'est ce qu'inkemu modélise depuis
+  SP1b-3a ; rien n'y change. QEMU réinitialise toute sa machine et donne la même cause.
+- **La traversée ne resynchronise rien (J2, R31).** Au reset des deux côtés après la même
+  instruction, la comparaison continue ; rien de la machine n'est touché, et ce que le lockstep
+  savait de QEMU (CSR écrits, écart des compteurs, commande SPI1, retard de `MEIP`) repart comme à la
+  mise sous tension. Ce que les deux resets laissent différent est une ligne mesurée, de trois
+  traitements nouveaux :
+  - **(i) gardé au reset** (lignes 25 et 31, R32) : QEMU garde ses registres entiers, `mtvec`,
+    `mepc` et `mstatus.MPIE`, inkemu prend ses valeurs de reset (`Hart::reset` ; pour les registres
+    entiers, une hypothèse sur la puce, que seul un appareil tranchera). Chaque grandeur différente
+    est tenue à ces deux valeurs exactes jusqu'à ce qu'une instruction l'écrive ; toute lecture
+    diverge (`Cause::ReadKeptAtReset`), sauf un rangement d'un mot, qui porte la paire en mémoire, et
+    le chargement qui la rend exactement. Mesure : aucune instruction des deux fenêtres ne calcule
+    avec une telle valeur. Une copie de la valeur de QEMU aurait caché tout usage.
+  - **(ii) CSR gardé au reset** (ligne 26, R33) : la PMP de QEMU garde les bits R, W, X de chaque
+    entrée, la spécification privilégiée n'exige que A et L effacés. Une lecture doit rendre chez
+    QEMU la valeur d'inkemu plus les bits qu'inkemu avait avant le reset, dans le masque mesuré.
+  - **(ii) copie après reset** (lignes 27, 28 et 32, R34) : registres que les deux resets laissent
+    différents, copiés seulement après le reset ; dans la première vie, ces bits restent comparés.
+- **Fenêtres nommées (J3, R35, R36).** `lockstep::WINDOWS` : un firmware, les resets traversés,
+  une borne éventuelle (aucune fenêtre n'en a besoin) et ses lignes, chacune utilisée entièrement à
+  chaque exécution. Un firmware qui montre d'autres registres ou d'autres bits reçoit ses lignes.
+- **Fenêtres mesurées le 2026-10-14** (QEMU `esp_develop_9.2.2_20250817`) :
+
+  | Fenêtre | Comparées | Fin | Interruptions | Plus grands mouvements |
+  |---|---|---|---|---|
+  | hello (CI) | 6 813 949 | reset, 1 traversé | 2 224 | 1 (lignes 5 et 15) |
+  | nvs (CI) | 7 680 555 | reset, 1 traversé | 2 224 | 1 (lignes 5 et 15) |
+  | nvs-ota (CI) | 7 701 890 | reset, 1 traversé | 2 224 | 1 (lignes 5 et 15) |
+  | crosspoint (local) | 31 088 420 | `APB_SARADC.APB_TSENS_CTRL` (`0x60040058`) à `0x4214917C` | 0 | 1 (lignes 5 et 39) |
+
+  La CI épingle le compte, la fin et l'usage de chaque ligne des trois premières, et vérifie qu'une
+  faute mise dans `t0` après le reset (`--perturb-after 4000000`) est trouvée à l'instruction où elle
+  est mise, un reset traversé.
+- **CrossPoint en local (J6, R39, R41).** `crates/lockstep-cli/tests/crosspoint.rs`, ignoré, lit
+  `INKEMU_CROSSPOINT_X3_X4`, vérifie l'empreinte épinglée (`8eccf614…0385764`), compose la flash
+  comme `inkemu run --firmware` et compare la fenêtre `crosspoint`. Exécuté une fois le 2026-10-14 :
+  la ROM, le bootloader, l'écriture d'`otadata` et le début de l'application, jusqu'à la lecture du
+  capteur de température, que QEMU n'a pas. Les lignes 34 à 41 y sont mesurées. C'est le critère 3
+  sur un vrai firmware de la X4, jusqu'au premier périphérique que QEMU n'émule pas.
+- **Les applications composées n'ont pas de fenêtre (J5, R37).** `adc_wait_panic`, `uart_select`,
+  `usb_serial_jtag_console` et `deep_sleep_timer` s'arrêtent dans leur démarrage (3,8 à 4,0 millions
+  d'instructions) au premier tick de FreeRTOS, qui tombe pendant que le CPU exécute : QEMU le prend
+  deux instructions après inkemu (dans `hello` et `nvs`, chaque tick tombe dans un `wfi`).
+  `usb_serial_jtag_echo` s'arrête à 2 525 511 : QEMU montre `MEIP` alors que sa matrice, calculée sur
+  le contrôleur d'inkemu, ne lève pas la ligne ; la cause n'est pas identifiée. Ni l'un ni l'autre
+  n'est admis : ce serait une ligne sur l'instant d'une interruption, ce que le lockstep doit prouver.
+- **Pas de changement de QEMU (J7, R38).** `20260417` corrige des interruptions perdues quand `MIE`
+  vaut 0 ; aucune fenêtre ne l'a rencontré, et les deux artefacts ci-dessus sont d'une autre nature.
+- **Rien ne change par défaut (J8).** `soc-esp32c3` et `cpu-rv32` ne changent pas ; l'empreinte de
+  12 s de `flash_hello.bin` reste `a0d221296337b295`.
