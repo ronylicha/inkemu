@@ -17,8 +17,9 @@ use std::io::{BufRead, Read};
 /// The longest line the reader accepts. QEMU's longest lines are those of the integer registers
 /// (77 bytes) and of `-d int` (about 110).
 pub const MAX_LINE_BYTES: usize = 512;
-/// The most lines a `-d cpu` block may have. QEMU 9.2's RISC-V dump has 40 for the ESP32-C3.
-pub const MAX_BLOCK_LINES: usize = 64;
+/// The most lines a `-d cpu` block may have after its first. QEMU 9.2's RISC-V dump has 39 for
+/// the ESP32-C3 (40 with the first): a longer block is two blocks merged, or not QEMU's.
+pub const MAX_BLOCK_LINES: usize = 39;
 
 /// The first line of a `-d cpu` block: the virtualisation mode, which the ESP32-C3 never enters.
 const BLOCK_START: &[u8] = b" V      =   0";
@@ -74,6 +75,8 @@ pub struct TraceReader<R> {
     lines: u64,
     /// Lines that are neither part of a block nor a trap.
     skipped: u64,
+    /// Blocks read whole.
+    blocks: u64,
 }
 
 /// The FNV-1a hash of a 64-bit seed: the fingerprint of a block is the hash of its lines.
@@ -95,6 +98,7 @@ impl<R: BufRead> TraceReader<R> {
             line: Vec::with_capacity(MAX_LINE_BYTES + 1),
             lines: 0,
             skipped: 0,
+            blocks: 0,
         }
     }
 
@@ -102,6 +106,13 @@ impl<R: BufRead> TraceReader<R> {
     #[must_use]
     pub const fn skipped_lines(&self) -> u64 {
         self.skipped
+    }
+
+    /// `-d cpu` blocks read whole so far: none at the end of the input is a trace that is not
+    /// QEMU's, or a QEMU that ended before its first instruction.
+    #[must_use]
+    pub const fn blocks_read(&self) -> u64 {
+        self.blocks
     }
 
     /// Reads one line into `self.line`, without its end; `false` at the end of the input.
@@ -186,6 +197,10 @@ impl<R: BufRead> TraceReader<R> {
             if !self.read_line()? {
                 return Err(TraceError::Truncated { line: start });
             }
+            // A block starting inside another is two blocks merged: the one cut is not QEMU's.
+            if self.line.as_slice() == BLOCK_START {
+                return Err(self.malformed());
+            }
             fingerprint = fnv(fingerprint, &self.line);
             fingerprint = fnv(fingerprint, b"\n");
             let text = std::str::from_utf8(&self.line).map_err(|_| self.malformed())?;
@@ -207,6 +222,10 @@ impl<R: BufRead> TraceReader<R> {
                         .ok_or_else(|| self.malformed())?;
                     let value = u32::from_str_radix(value, 16).map_err(|_| self.malformed())?;
                     if number > 0 {
+                        // A quantity given twice is not what QEMU writes.
+                        if seen[usize::from(number)] {
+                            return Err(self.malformed());
+                        }
                         state.set(Field::X(number), value);
                         seen[usize::from(number)] = true;
                     }
@@ -215,7 +234,10 @@ impl<R: BufRead> TraceReader<R> {
                 }
                 if last_register {
                     return match Field::all().find(|field| !seen[field.index()]) {
-                        None => Ok(TraceEvent::State { state, fingerprint }),
+                        None => {
+                            self.blocks += 1;
+                            Ok(TraceEvent::State { state, fingerprint })
+                        }
                         Some(missing) => Err(TraceError::Missing {
                             line: start,
                             what: missing.to_string(),
@@ -236,6 +258,9 @@ impl<R: BufRead> TraceReader<R> {
             if let Some(field) = field {
                 let value = words.next().ok_or_else(|| self.malformed())?;
                 let value = u32::from_str_radix(value, 16).map_err(|_| self.malformed())?;
+                if seen[field.index()] {
+                    return Err(self.malformed());
+                }
                 state.set(field, value);
                 seen[field.index()] = true;
             }

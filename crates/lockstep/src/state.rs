@@ -73,6 +73,22 @@ impl Field {
     pub fn all() -> impl Iterator<Item = Field> {
         (0..FIELDS).filter_map(Field::at)
     }
+
+    /// The address of the CSR the quantity is, `None` for the PC and the integer registers.
+    #[must_use]
+    pub fn csr(self) -> Option<u16> {
+        CSRS.iter()
+            .find(|(field, _, _)| *field == self)
+            .map(|(_, address, _)| *address)
+    }
+
+    /// The quantity a CSR address is, when it is one of those compared.
+    #[must_use]
+    pub fn of_csr(csr: u16) -> Option<Field> {
+        CSRS.iter()
+            .find(|(_, address, _)| *address == csr)
+            .map(|(field, _, _)| *field)
+    }
 }
 
 impl fmt::Display for Field {

@@ -76,6 +76,7 @@ fn the_help_lists_every_exit_code() {
         "2 error",
         "3 the window ended otherwise",
         "4 inkemu stopped",
+        "5 a row of the table was never used",
         "130 interrupted",
     ] {
         assert!(help.contains(code), "{code}:\n{help}");

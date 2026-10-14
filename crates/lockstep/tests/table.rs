@@ -1,18 +1,24 @@
 //! `docs/lockstep-differences.md` and `lockstep::DIFFERENCES` are one table (decision H3): every
-//! row of the documentation is a row of the tool with the same treatments, and the tool has no
-//! other row.
+//! row of the documentation is a row of the tool with the same treatments and the same
+//! parameters, register by register and bit by bit, and the tool has no other row.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test: a panic is a test failure
 #![allow(clippy::disallowed_methods)] // reads the documentation: it is a test of the repository
 
-use std::collections::BTreeSet;
+use lockstep::state::CSRS;
+use lockstep::table::Compat;
+use lockstep::{Location, Treatment};
+use std::collections::{BTreeMap, BTreeSet};
 
-/// The rows of the documentation: number, and the treatments the third column names.
-fn documented() -> Vec<(u16, BTreeSet<String>)> {
+fn documentation() -> String {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/lockstep-differences.md"
     );
-    let text = std::fs::read_to_string(path).expect("docs/lockstep-differences.md");
+    std::fs::read_to_string(path).expect("docs/lockstep-differences.md")
+}
+
+/// The rows of the summary table: number, and the treatments its third column names.
+fn summary(text: &str) -> Vec<(u16, BTreeSet<String>)> {
     let mut rows = Vec::new();
     for line in text.lines() {
         let cells: Vec<&str> = line.split('|').map(str::trim).collect();
@@ -31,9 +37,95 @@ fn documented() -> Vec<(u16, BTreeSet<String>)> {
     rows
 }
 
+/// The parameters each row declares: the lines of the `text` block under `### Ligne N`.
+fn parameters(text: &str) -> BTreeMap<u16, Vec<String>> {
+    let mut rows = BTreeMap::new();
+    let mut current: Option<(u16, Vec<String>, bool)> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("### Ligne ") {
+            let number = rest
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("a row heading without a number: {line}"));
+            current = Some((number, Vec::new(), false));
+            continue;
+        }
+        let Some((number, lines, open)) = &mut current else {
+            continue;
+        };
+        if line.trim() == "```text" && !*open {
+            *open = true;
+        } else if line.trim() == "```" && *open {
+            rows.insert(*number, std::mem::take(lines));
+            current = None;
+        } else if *open {
+            lines.push(line.trim().to_owned());
+        }
+    }
+    rows
+}
+
+fn csr_name(csr: u16) -> &'static str {
+    CSRS.iter()
+        .find(|(_, address, _)| *address == csr)
+        .map(|(_, _, name)| *name)
+        .unwrap()
+}
+
+/// The lines the documentation gives for a treatment of the tool.
+fn lines_of(treatment: &Treatment) -> Vec<String> {
+    match *treatment {
+        Treatment::Pair {
+            field,
+            bits,
+            qemu,
+            inkemu,
+            until_written,
+        } => vec![format!(
+            "paire {} bits 0x{bits:08X} qemu 0x{qemu:08X} inkemu 0x{inkemu:08X}{}",
+            csr_name(field.csr().unwrap()),
+            if until_written {
+                " jusqu'à écriture"
+            } else {
+                ""
+            }
+        )],
+        Treatment::ExternalInterrupt { lag } => vec![format!("meip retard {lag}")],
+        Treatment::Registers(registers) => registers
+            .iter()
+            .map(|register| {
+                let mut line = format!(
+                    "registre 0x{:08X} masque 0x{:08X}",
+                    register.address, register.mask
+                );
+                if let Some(command) = register.after_command {
+                    line.push_str(&format!(" après 0x{command:02X}"));
+                }
+                if let Some(value) = register.qemu {
+                    line.push_str(&format!(" qemu 0x{value:08X}"));
+                }
+                line
+            })
+            .collect(),
+        Treatment::Counter { location, bound } => vec![match location {
+            Location::Mmio(address) => format!("compteur 0x{address:08X} écart {bound}"),
+            Location::Csr(csr) => format!("compteur csr 0x{csr:03X} écart {bound}"),
+        }],
+        Treatment::Compat(setting) => vec![format!(
+            "réglage {}",
+            match setting {
+                Compat::SystimerNoAlarmOnStoppedCounter => "systimer_no_alarm_on_stopped_counter",
+                Compat::SystimerCountsAsQemu => "systimer_counts_as_qemu",
+                Compat::CycleCounterAsQemu => "cycle_counter_as_qemu",
+            }
+        )],
+    }
+}
+
 #[test]
 fn the_table_of_the_documentation_is_the_table_of_the_tool() {
-    let documented = documented();
+    let text = documentation();
     let tool: Vec<(u16, BTreeSet<String>)> = lockstep::DIFFERENCES
         .iter()
         .map(|row| {
@@ -46,7 +138,28 @@ fn the_table_of_the_documentation_is_the_table_of_the_tool() {
             )
         })
         .collect();
-    assert_eq!(documented, tool);
+    assert_eq!(summary(&text), tool);
+}
+
+#[test]
+fn every_row_of_the_documentation_declares_the_parameters_of_the_tool() {
+    let documented = parameters(&documentation());
+    let tool: BTreeMap<u16, Vec<String>> = lockstep::DIFFERENCES
+        .iter()
+        .map(|row| (row.number, row.treatments.iter().flat_map(lines_of).collect()))
+        .collect();
+    for (number, lines) in &tool {
+        assert_eq!(
+            documented.get(number),
+            Some(lines),
+            "row {number} of docs/lockstep-differences.md"
+        );
+    }
+    assert_eq!(
+        documented.keys().collect::<Vec<_>>(),
+        tool.keys().collect::<Vec<_>>(),
+        "the rows of the documentation are those of the tool"
+    );
 }
 
 #[test]
