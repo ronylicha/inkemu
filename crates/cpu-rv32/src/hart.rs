@@ -293,6 +293,7 @@ impl Hart {
         if mie_was_set {
             csr.mstatus |= MSTATUS_MPIE;
         }
+        csr.save_privilege_on_trap();
         let base = csr.mtvec & !MTVEC_MODE_MASK;
         let vectored =
             csr.mtvec & MTVEC_MODE_MASK == MTVEC_VECTORED && mcause & MCAUSE_INTERRUPT != 0;
@@ -303,7 +304,8 @@ impl Hart {
         };
     }
 
-    /// `mret`: restores `MIE` from `MPIE`, sets `MPIE`, and returns the address to resume at.
+    /// `mret`: restores `MIE` from `MPIE`, sets `MPIE`, sets `MPP` to the least privileged mode
+    /// of the core, and returns the address to resume at.
     ///
     /// ASSUMPTION: `mret` sets `MPIE`, the rule of the RISC-V privileged specification (and what
     /// QEMU does). The ESP32-C3 TRM says `MPIE` is cleared (report IR §2.3, §7 question 6). The
@@ -314,6 +316,7 @@ impl Hart {
         let mpie = csr.mstatus & MSTATUS_MPIE != 0;
         csr.mstatus =
             (csr.mstatus & !MSTATUS_MIE) | MSTATUS_MPIE | if mpie { MSTATUS_MIE } else { 0 };
+        csr.return_privilege();
         csr.mepc
     }
 }
@@ -1081,6 +1084,37 @@ mod tests {
         ]);
         run(&mut hart, &mut ram, 5);
         assert_eq!(hart.x[6] - hart.x[5], 2);
+    }
+
+    #[test]
+    fn esp32c3_mpp_is_user_at_reset_machine_in_a_trap_and_user_after_mret() {
+        // TRM §1.4.2: `mstatus` resets to 0; register 1.5: `MPP` is 0 (user) or 3 (machine).
+        let mut program = vec![csrrs(5, MSTATUS, 0), ecall(), csrrs(8, MSTATUS, 0)];
+        program.resize(0x100 / 4, addi(0, 0, 0));
+        program.extend([
+            csrrs(6, MSTATUS, 0),
+            csrrs(7, MEPC, 0),
+            addi(7, 7, 4),
+            csrrw(0, MEPC, 7),
+            mret(),
+        ]);
+        let (mut hart, mut ram) = c3_machine(&program);
+        assert!(hart.csr.write(MTVEC, 0x100));
+        run(&mut hart, &mut ram, 8);
+        assert_eq!(hart.x[5], 0, "mstatus at reset");
+        assert_eq!(hart.x[6] & MSTATUS_MPP_M, MSTATUS_MPP_M, "in the trap");
+        assert_eq!(hart.x[8] & MSTATUS_MPP_M, 0, "after mret");
+        assert_eq!(hart.pc, 12);
+    }
+
+    #[test]
+    fn a_plain_hart_keeps_mpp_at_machine_after_mret() {
+        let mut program = vec![ecall(), csrrs(8, MSTATUS, 0)];
+        program.resize((TRAP_VECTOR / 4) as usize, addi(0, 0, 0));
+        program.extend([csrrs(7, MEPC, 0), addi(7, 7, 4), csrrw(0, MEPC, 7), mret()]);
+        let (mut hart, mut ram) = machine(&program, MisalignedPolicy::Trap);
+        run(&mut hart, &mut ram, 6);
+        assert_eq!(hart.x[8] & MSTATUS_MPP_M, MSTATUS_MPP_M);
     }
 
     /// A hart whose interrupts come from an outside controller, as on the ESP32-C3.
