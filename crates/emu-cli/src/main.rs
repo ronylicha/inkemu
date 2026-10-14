@@ -124,8 +124,8 @@ enum Command {
         #[arg(long)]
         strict_mmio: bool,
         /// Which console of the device goes to standard output. Without it, the console the device
-        /// profile names: usb-serial-jtag for the X3 and the X4, their USB-C port. The first line
-        /// on standard error says which console is shown and where the choice came from.
+        /// profile names; the first line on standard error says which console is shown and where
+        /// the choice came from.
         #[arg(long, value_enum)]
         console: Option<ConsoleArg>,
         /// What the host sends to the consoles, and when: a text file whose first line is

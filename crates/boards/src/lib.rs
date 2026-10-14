@@ -65,7 +65,8 @@ pub struct DeviceProfile {
     pub soc: SocFamily,
     pub chip_revision: ChipRevision,
     /// The console a front end shows when its user names none: the serial output a user of the
-    /// device reads its firmware on (for the X3 and the X4, USB-Serial-JTAG, the USB-C port).
+    /// device reads its firmware on (for the X3 and the X4, USB-Serial-JTAG, where `CrossPoint`
+    /// writes its log; each profile says where its value comes from).
     pub console: ConsoleChannel,
     pub flash: FlashConfig,
     /// The partition table an application is booted with, checked when the profile is loaded:
@@ -1029,9 +1030,11 @@ mod tests {
         assert_eq!(profile.console, ConsoleChannel::Uart0);
     }
 
-    /// The X3 and the X4 are read on their USB-C port, which is USB-Serial-JTAG: the ROM and the
-    /// bootloader mirror their lines there, and `CrossPoint` writes its own there only
-    /// (`docs/research/flash-writes-and-crosspoint-boot.md`, §K.2).
+    /// The X3 and the X4 are read on USB-Serial-JTAG: `CrossPoint`, one image for both, writes
+    /// its log there only (`ARDUINO_USB_CDC_ON_BOOT=1`, `docs/research/xteink-hardware.md`, §1.1),
+    /// and the ROM and the bootloader mirror their lines there
+    /// (`docs/research/flash-writes-and-crosspoint-boot.md`, §K.2). The value rests on the
+    /// firmware: whether the X3's connector carries USB data is an assumption of its profile.
     #[test]
     fn the_xteink_devices_are_read_on_usb_serial_jtag() {
         for id in ["x3", "x4"] {
