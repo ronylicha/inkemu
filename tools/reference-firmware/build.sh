@@ -7,7 +7,8 @@
 #                      (tests/fixtures/partitions/x4-stock.bin), whose bootloader writes otadata;
 # and four applications alone, which the tests boot behind the bootloader inkemu ships:
 # uart_select.bin, usb_serial_jtag_echo.bin and usb_serial_jtag_console.bin (the serial consoles),
-# and adc_wait_panic.bin (the wait for the SAR ADC that stops CrossPoint, its panic and core dump).
+# adc_wait_panic.bin (the wait for the SAR ADC that stops CrossPoint, its panic and core dump), and
+# deep_sleep_timer.bin (three deep sleeps woken by the RTC timer, then one with no wake source).
 # Everything third-party runs inside Docker, in one container run. One artefact of this build is
 # committed: its bootloader, the one inkemu ships (third_party/esp-idf-bootloader/, the same bytes);
 # nothing else built here is.
@@ -39,3 +40,4 @@ echo "$out/uart_select.bin"
 echo "$out/usb_serial_jtag_echo.bin"
 echo "$out/usb_serial_jtag_console.bin"
 echo "$out/adc_wait_panic.bin"
+echo "$out/deep_sleep_timer.bin"

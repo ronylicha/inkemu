@@ -4201,3 +4201,97 @@ fn x4_runs_the_adc_wait_panic_reference_firmware_through_its_panic_into_a_second
         "the trace hash of this run is {measured:?}: when the run above is the one intended, pin it in ADC_WAIT_PANIC_TRACE\n{log}"
     );
 }
+
+/// The trace of the run of `deep_sleep_timer` below, as the CI prints it. Not known before the
+/// first run of the pinned image in the job `reference-boot`: the test then fails on this value
+/// alone and prints the hash of the run, which is pinned here.
+const DEEP_SLEEP_TIMER_TRACE: &str = "trace-hash not pinned yet";
+
+/// The milliseconds a life of `deep_sleep_timer` says it slept: the 2 s of the RTC timer, less
+/// the 400 us ESP-IDF takes off for the entry and the exit (DS §A.1.2 item 6), plus the boot of
+/// the next life, which the uncalibrated timing model sets. A range, not a value: below 2 000 the
+/// sleep was cut short, from 3 000 the boot or the sleep is far too long.
+const SLEPT_MS: std::ops::Range<u64> = 2_000..3_000;
+
+/// Deep sleep and the wake by the RTC timer (F1, F2, F11), with an application this repository
+/// builds: `deep_sleep_timer` counts its lives in RTC memory and sleeps 2 s on the RTC timer three
+/// times; each wake is a core reset of cause 5, which the ROM prints as `rst:0x5 (DSLEEP)`, the
+/// count survives it, and ESP-IDF reads the wake cause "timer". Life 4 sleeps with no wake source:
+/// the run ends there, the device asleep, with exit code 0.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_DEEP_SLEEP_TIMER_APP"]
+fn x4_runs_the_deep_sleep_timer_reference_firmware_through_three_wakes_into_a_sleep_without_end() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let application = std::env::var("INKEMU_DEEP_SLEEP_TIMER_APP").expect(
+        "set INKEMU_DEEP_SLEEP_TIMER_APP to the deep_sleep_timer.bin of tools/reference-firmware/build.sh",
+    );
+    assert_eq!(
+        sha256_of(std::path::Path::new(&application)),
+        pinned_in_sums("SHA256SUMS.inputs-deep-sleep-timer", "deep_sleep_timer.bin"),
+        "{application} is not the pinned deep_sleep_timer.bin; rebuild it with tools/reference-firmware/build.sh"
+    );
+    let output = inkemu()
+        .args(["run", "--device", "x4", "--console", "uart0"])
+        .args(["--max-time", "30", "--trace-hash", "--rom-dir", &rom_dir])
+        .arg("--firmware")
+        .arg(&application)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    let wake = "rst:0x5 (DSLEEP),boot:0x8 (SPI_FAST_FLASH_BOOT)\n";
+    let mut expected = vec![
+        "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n".to_owned(),
+        "deep_sleep_timer: life 1, reset by power-on (1), woken by nothing (0)\n".to_owned(),
+        "deep_sleep_timer: sleeping 2000 ms on the RTC timer\n".to_owned(),
+    ];
+    for life in 2..=4 {
+        expected.push(wake.to_owned());
+        expected.push(format!(
+            "deep_sleep_timer: life {life}, reset by deep sleep (8), woken by the RTC timer (4)\n"
+        ));
+        expected.push("deep_sleep_timer: slept ".to_owned());
+        expected.push(if life < 4 {
+            "deep_sleep_timer: sleeping 2000 ms on the RTC timer\n".to_owned()
+        } else {
+            "deep_sleep_timer: sleeping with no wake source\n".to_owned()
+        });
+    }
+    let mut from = 0;
+    for expected in &expected {
+        let at = console[from..].find(expected.as_str()).unwrap_or_else(|| {
+            panic!("`{expected}` is missing, or out of order:\n{console}\n{log}")
+        });
+        from += at + expected.len();
+    }
+    assert_eq!(console.matches("rst:").count(), 4, "{console}");
+    for slept in console.lines().filter_map(|line| {
+        line.strip_prefix("deep_sleep_timer: slept ")
+            .and_then(|rest| rest.strip_suffix(" ms"))
+    }) {
+        let slept: u64 = slept
+            .parse()
+            .unwrap_or_else(|e| panic!("`{slept}`: {e}\n{console}"));
+        assert!(SLEPT_MS.contains(&slept), "slept {slept} ms:\n{console}");
+    }
+    for line in [
+        "inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset; the CPU had stopped at pc ",
+        "\ninkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here\n",
+        " us of device time; it waits for nothing: the firmware enabled no wake source\n",
+    ] {
+        assert!(log.contains(line), "`{line}` is missing:\n{log}");
+    }
+    // Every register of the path into deep sleep and out of it is modelled or accepted by name.
+    assert!(!log.contains("warning:"), "{log}");
+    let measured = trace_hash_line(&log);
+    assert_eq!(
+        measured,
+        Some(DEEP_SLEEP_TIMER_TRACE),
+        "the trace hash of this run is {measured:?}: when the run above is the one intended, pin it in DEEP_SLEEP_TIMER_TRACE\n{log}"
+    );
+}

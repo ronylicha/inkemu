@@ -111,7 +111,9 @@ jobs:
     # (USB-Serial-JTAG, the last one written for inkemu); they are applications, run behind the
     # bootloader inkemu ships. One more, adc_wait_panic, also written for inkemu, takes the path
     # that stops CrossPoint: a wait for the SAR ADC with interrupts masked, the panic of the
-    # interrupt watchdog, a core dump in flash and a second life. The firmware is built here,
+    # interrupt watchdog, a core dump in flash and a second life. The last one, deep_sleep_timer,
+    # ours too, sleeps three times on the RTC timer and wakes as the chip does (rst:0x5), counting
+    # its lives in RTC memory, then sleeps with no wake source. The firmware is built here,
     # inside the pinned ESP-IDF image, and checked against pinned SHA-256 values. The bootloader
     # is the one artefact of this build that is committed, under third_party/esp-idf-bootloader/;
     # the applications and the merged images are never stored in this repository. The cache
@@ -162,11 +164,12 @@ jobs:
           INKEMU_USJ_ECHO_APP: ${{ runner.temp }}/reference-firmware/usb_serial_jtag_echo.bin
           INKEMU_USJ_CONSOLE_APP: ${{ runner.temp }}/reference-firmware/usb_serial_jtag_console.bin
           INKEMU_ADC_WAIT_PANIC_APP: ${{ runner.temp }}/reference-firmware/adc_wait_panic.bin
+          INKEMU_DEEP_SLEEP_TIMER_APP: ${{ runner.temp }}/reference-firmware/deep_sleep_timer.bin
         # Exact test counts, and every suite run whatever the one before it did, as in rom-boot:
         # see tools/ci/run-ignored-tests.sh.
         run: |
           failed=0
           tools/ci/run-ignored-tests.sh 13 --release -p soc-esp32c3 --test reference_boot -- --ignored || failed=1
-          tools/ci/run-ignored-tests.sh 10 --release -p emu-cli --test run_cli reference_firmware -- --ignored || failed=1
+          tools/ci/run-ignored-tests.sh 11 --release -p emu-cli --test run_cli reference_firmware -- --ignored || failed=1
           tools/ci/run-ignored-tests.sh 5 --release -p console-script --test reference_firmware -- --ignored || failed=1
           exit "$failed"
