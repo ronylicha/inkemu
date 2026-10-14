@@ -33,7 +33,7 @@ pub enum Unsupported {
     /// An SPI flash command whose opcode the flash model does not implement.
     FlashCommand { opcode: u8 },
     /// A flash command the model knows, in a frame it does not: see
-    /// [`FlashRefusal::Form`](crate::flash::FlashRefusal::Form).
+    /// [`FlashRefusal::Form`].
     FlashCommandForm {
         opcode: u8,
         address_bits: u32,

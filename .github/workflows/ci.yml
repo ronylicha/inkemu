@@ -21,6 +21,12 @@ jobs:
       - run: cargo fmt --all --check
       # Also fails when a path a clippy.toml bans names nothing: see tools/ci/clippy.sh.
       - run: tools/ci/clippy.sh --workspace --all-targets --all-features -- -D warnings
+      # A doc comment that rustdoc reads wrongly (a bit range such as `[9:0]` taken for a link, a
+      # link to an item the public documentation cannot reach) is a warning here: it fails the job.
+      - name: Documentation without a warning
+        run: cargo doc --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: "-D warnings"
       - run: cargo test --workspace
       - run: cargo run -p svd-gen -- --check
       # The model crates, and the crates a front end composes a flash with, must go on building for

@@ -40,7 +40,7 @@ const CMD_BE: u32 = 1 << 23;
 /// `spi_flash_defs.h`; `0xB9` deep power-down is the JEDEC opcode). `FLASH_BE` is the 64 KiB
 /// erase `D8`, whatever the header's "32KB" says: the ROM and ESP-IDF both use it for 64 KiB.
 ///
-/// `CMD` [7:0] are two read-only state fields (`SPI1_MST_ST`, `MSPI_ST`): no command lives
+/// `CMD` `[7:0]` are two read-only state fields (`SPI1_MST_ST`, `MSPI_ST`): no command lives
 /// there. Suspend and resume are bits 1 and 0 of `FLASH_SUS_CTRL`.
 ///
 /// ASSUMPTION: `FLASH_CE` (bit 22) sends `C7`. FW §A.1 gives `60` for it, as QEMU's controller
@@ -88,7 +88,7 @@ const STATUS_BYTE_MASK: u32 = 0xFF;
 /// SP1b-4 lockstep, settles it.
 const HARD_WIRED_ADDRESS_BITS: u32 = 24;
 const HARD_WIRED_ADDRESS_MASK: u32 = 0x00FF_FFFF;
-/// `ADDR` [31:24] of a hard-wired page program: the number of bytes (`0x20009000` is 32 bytes at
+/// `ADDR` `[31:24]` of a hard-wired page program: the number of bytes (`0x20009000` is 32 bytes at
 /// `0x9000`; reports FW key result 1, SF §B.2).
 const PP_LENGTH_SHIFT: u32 = 24;
 /// `CTRL` bit 22, `WRSR_2B`: the status write sends two bytes instead of one
@@ -108,19 +108,19 @@ const USR_ADDR: u32 = 1 << 30;
 const USR_DUMMY: u32 = 1 << 29;
 const USR_MISO: u32 = 1 << 28;
 const USR_MOSI: u32 = 1 << 27;
-/// `USER1` [31:26]: address length in bits, minus one. [5:0]: dummy cycles, minus one.
+/// `USER1` `[31:26]`: address length in bits, minus one. `[5:0]`: dummy cycles, minus one.
 const ADDR_BITLEN_SHIFT: u32 = 26;
 const ADDR_BITLEN_MASK: u32 = 0x3F;
 const DUMMY_CYCLES_MASK: u32 = 0x3F;
-/// `USER2` [15:0]: the command; its low byte is the opcode of every 8-bit command.
+/// `USER2` `[15:0]`: the command; its low byte is the opcode of every 8-bit command.
 const OPCODE_MASK: u32 = 0xFF;
-/// `USER2` [31:28]: command length in bits, minus one.
+/// `USER2` `[31:28]`: command length in bits, minus one.
 const COMMAND_BITLEN_SHIFT: u32 = 28;
 const COMMAND_BITLEN_MASK: u32 = 0xF;
-/// The only command length the model runs: every measured transfer has it (`USER2` [31:28] = 7,
+/// The only command length the model runs: every measured transfer has it (`USER2` `[31:28]` = 7,
 /// FB §B.2).
 const MODELED_COMMAND_BITS: u32 = 8;
-/// `MOSI_DLEN` / `MISO_DLEN` [9:0]: data length in bits, minus one.
+/// `MOSI_DLEN` / `MISO_DLEN` `[9:0]`: data length in bits, minus one.
 const DLEN_MASK: u32 = 0x3FF;
 
 /// Configuration of SPI1 that nothing acts on here: what shapes the electrical transfer, which
@@ -188,15 +188,15 @@ const SPI0_FSM: u32 = addr("SPI0", "FSM") - SPI0_BASE;
 /// SPI1 `+0x54`: `SPI_MEM_FSM_REG`, at the offset of SPI0 `FSM`. The model makes it an alias whose
 /// lock delay is stored apart from SPI0's: whether the silicon holds one field for both views is
 /// not measured. The SVD lists it for SPI0 only; ESP-IDF's `spi_mem_reg.h` (v4.4.7 `include/soc/`, v5.5.2
-/// `register/soc/`) defines `SPI_MEM_FSM_REG(i)` at `+0x054` of both controllers: `CSPI_ST` [3:0]
-/// and `EM_ST` [6:4] read-only, the state of the SPI0 machines; `CSPI_LOCK_DELAY_TIME` [11:7]
+/// `register/soc/`) defines `SPI_MEM_FSM_REG(i)` at `+0x054` of both controllers: `CSPI_ST` `[3:0]`
+/// and `EM_ST` `[6:4]` read-only, the state of the SPI0 machines; `CSPI_LOCK_DELAY_TIME` `[11:7]`
 /// read-write, reset 4 (report `docs/research/spi1-fsm-and-usj-reset.md`, §A.1). ESP-IDF v4.4.7
 /// reads it through SPI1 to learn whether the controller is idle (`spimem_flash_ll_host_idle`,
 /// `fsm.spi0_mst_st == 0`, polled by `spi_flash_chip_generic_wait_idle`, §A.2); v5.5.2 reads
-/// `CMD` [3:0] instead. Through SPI0 a write of `FSM` stays refused: its lock delay is a field the
+/// `CMD` `[3:0]` instead. Through SPI0 a write of `FSM` stays refused: its lock delay is a field the
 /// SPI0 view does not model, so the write is reported by name (`SPI0.FSM`) rather than stored.
 const SPI1_FSM: u32 = SPI0_FSM;
-/// `FSM` [11:7], `CSPI_LOCK_DELAY_TIME`: the one field a write changes.
+/// `FSM` `[11:7]`, `CSPI_LOCK_DELAY_TIME`: the one field a write changes.
 const FSM_LOCK_DELAY: u32 = 0x1F << 7;
 const WHY_SPI0: &str =
     "cache-fill transfer (read command, dummy cycles, clock): the bus reads the flash directly";
@@ -353,7 +353,7 @@ pub struct Spi1 {
     /// does not depend on what the firmware sends.
     sent: [u64; OPCODES],
     /// `FSM` read through SPI1 ([`SPI1_FSM`]): the lock delay last written through SPI1 in
-    /// [11:7], every other bit 0. SPI0's view does not share it.
+    /// `[11:7]`, every other bit 0. SPI0's view does not share it.
     fsm: u32,
 }
 

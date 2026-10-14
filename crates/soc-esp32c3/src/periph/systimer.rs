@@ -57,7 +57,7 @@ const TARGET0_WORK_EN: u32 = 1 << 24;
 const OP_UPDATE: u32 = 1 << 30;
 const OP_VALUE_VALID: u32 = 1 << 29;
 /// `TARGETx_CONF`: bit 31 the counter compared (`systimer_ll_connect_alarm_counter`, line 132),
-/// bit 30 `PERIOD_MODE` (`systimer_ll_enable_alarm_period`, line 142), bits [25:0] the period
+/// bit 30 `PERIOD_MODE` (`systimer_ll_enable_alarm_period`, line 142), bits `[25:0]` the period
 /// (`systimer_ll_set_alarm_period`, line 147).
 const TARGET_CONF_WRITABLE: u32 = 0xC3FF_FFFF;
 const TARGET_UNIT_SEL: u32 = 1 << 31;

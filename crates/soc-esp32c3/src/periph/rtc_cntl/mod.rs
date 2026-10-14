@@ -68,7 +68,7 @@ const INT_SLP_WAKEUP: u32 = 1 << 0;
 const INT_SLP_REJECT: u32 = 1 << 1;
 const INT_TIMER_ALARM: u32 = 1 << 10;
 const CLK_CONF: u32 = reg("CLK_CONF");
-/// `CLK_CONF` bits [31:30] `ANA_CLK_RTC_SEL`: the slow clock, 0 = the RC oscillator
+/// `CLK_CONF` bits `[31:30]` `ANA_CLK_RTC_SEL`: the slow clock, 0 = the RC oscillator
 /// (`rtc_cntl_reg.h:971`; `clk_ll_rtc_slow_set_src`).
 const ANA_CLK_RTC_SEL_SHIFT: u32 = 30;
 const WDTCONFIG0: u32 = reg("WDTCONFIG0");
@@ -108,7 +108,7 @@ const WDT_KEY: u32 = 0x50D8_3AA1;
 /// `EFUSE_WDT_DELAY_SEL` is two bits wide.
 const WDT_DELAY_SEL_MASK: u32 = 0b11;
 /// `WDTCONFIG0`: bit 31 `EN` (`rwdt_ll_enable`, `rwdt_ll.h:66`), three bits per stage from
-/// [30:28] for stage 0 to [21:19] for stage 3 (`rwdt_ll_config_stage`, line 113), bit 12
+/// `[30:28]` for stage 0 to `[21:19]` for stage 3 (`rwdt_ll_config_stage`, line 113), bit 12
 /// `FLASHBOOT_MOD_EN` (`rwdt_ll_set_flashboot_en`, line 196). The rest is stored.
 const WDT_EN: u32 = 1 << 31;
 /// `WDTCONFIG0` bit 9 `PAUSE_IN_SLP` (reset 1, `rtc_cntl_reg.h:1640`): the watchdog stops counting
@@ -116,7 +116,7 @@ const WDT_EN: u32 = 1 << 31;
 const WDT_PAUSE_IN_SLP: u32 = 1 << 9;
 
 /// `SWD_CONF` (reset `0x04B00000`): bit 31 `AUTO_FEED_EN`, bit 30 `DISABLE`, bit 29 `FEED` and bit
-/// 28 `RST_FLAG_CLR` (write-only), bits [27:18] `SIGNAL_WIDTH`, bit 17 `BYPASS_RST`, bit 1
+/// 28 `RST_FLAG_CLR` (write-only), bits `[27:18]` `SIGNAL_WIDTH`, bit 17 `BYPASS_RST`, bit 1
 /// `FEED_INT` and bit 0 `RESET_FLAG` (read-only) (`rtc_cntl_reg.h:1706-1757`). The bootloader
 /// clears `BYPASS_RST` and sets `AUTO_FEED_EN` (`IDF:bootloader_support/src/esp32c3/bootloader_soc.c:10-19`,
 /// `bootloader_esp32c3.c:79-84`); the ROM reads `RESET_FLAG` and clears it with `RST_FLAG_CLR`
@@ -276,7 +276,7 @@ pub(crate) fn accepted() -> Vec<Accepted> {
     ACCEPTED.to_vec()
 }
 
-/// `RESET_CAUSE_PROCPU`, bits [5:0] of `RESET_STATE` (`soc/reset_reasons.h`).
+/// `RESET_CAUSE_PROCPU`, bits `[5:0]` of `RESET_STATE` (`soc/reset_reasons.h`).
 const RESET_CAUSE_MASK: u32 = 0x3F;
 
 #[derive(Debug)]
@@ -320,7 +320,7 @@ impl RtcCntl {
     /// The block after a power-on. `flash_boot` says whether the chip was strapped to boot from
     /// flash, `wdt_delay_sel` is the eFuse field of that name.
     ///
-    /// The owner calls [`RtcCntl::wake`] once afterwards: the reset values arm the flash-boot
+    /// The owner calls `RtcCntl::wake` once afterwards: the reset values arm the flash-boot
     /// protection of the RTC watchdog, which needs its first deadline.
     #[must_use]
     pub fn new(flash_boot: bool, wdt_delay_sel: u32, now: Cycles) -> RtcCntl {

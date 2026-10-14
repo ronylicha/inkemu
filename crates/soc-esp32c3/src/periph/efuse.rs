@@ -19,7 +19,7 @@ const fn reg(name: &str) -> u32 {
 /// First and last register of the read mirror: `RD_WR_DIS` to `RD_RS_ERR1`.
 const RD_FIRST: u32 = reg("RD_WR_DIS");
 const RD_LAST: u32 = reg("RD_RS_ERR1");
-/// `RD_REPEAT_DATA1` bits [17:16]: `WDT_DELAY_SEL`.
+/// `RD_REPEAT_DATA1` bits `[17:16]`: `WDT_DELAY_SEL`.
 const RD_REPEAT_DATA1: u32 = reg("RD_REPEAT_DATA1");
 const WDT_DELAY_SEL_SHIFT: u32 = 16;
 const WDT_DELAY_SEL_MASK: u32 = 0b11;
@@ -31,17 +31,17 @@ const WDT_DELAY_SEL_MASK: u32 = 0b11;
 /// ASSUMPTION: it reads 0, like the error registers around it on a chip without eFuse errors. A
 /// read on a real chip settles it.
 const RD_REPEAT_ERR_GAP: u32 = reg("RD_REPEAT_ERR3") + svd_regs::REGISTER_BYTES;
-/// `RD_MAC_SPI_SYS_3` bits [20:18]: `WAFER_VERSION_MINOR_LO`.
+/// `RD_MAC_SPI_SYS_3` bits `[20:18]`: `WAFER_VERSION_MINOR_LO`.
 const RD_MAC_SPI_SYS_3: u32 = reg("RD_MAC_SPI_SYS_3");
 const WAFER_MINOR_LO_SHIFT: u32 = 18;
 const WAFER_MINOR_LO_MASK: u32 = 0x7;
-/// `RD_MAC_SPI_SYS_5` bit 23: `WAFER_VERSION_MINOR_HI`; bits [25:24]: `WAFER_VERSION_MAJOR`.
+/// `RD_MAC_SPI_SYS_5` bit 23: `WAFER_VERSION_MINOR_HI`; bits `[25:24]`: `WAFER_VERSION_MAJOR`.
 const RD_MAC_SPI_SYS_5: u32 = reg("RD_MAC_SPI_SYS_5");
 const WAFER_MINOR_HI_SHIFT: u32 = 23;
 /// The minor revision is 4 bits: its top bit lives in `RD_MAC_SPI_SYS_5`, the low three in `_3`.
 const WAFER_MINOR_LO_BITS: u32 = 3;
 const WAFER_MAJOR_SHIFT: u32 = 24;
-/// `RD_MAC_SPI_SYS_3` bits [26:24]: `BLK_VERSION_MINOR`; `RD_SYS_PART1_DATA4` bits [1:0]:
+/// `RD_MAC_SPI_SYS_3` bits `[26:24]`: `BLK_VERSION_MINOR`; `RD_SYS_PART1_DATA4` bits `[1:0]`:
 /// `BLK_VERSION_MAJOR` (ESP-IDF v5.5.2 `hal/esp32c3/include/hal/efuse_ll.h`,
 /// `efuse_ll_get_blk_version_minor`/`_major`).
 const BLK_MINOR_SHIFT: u32 = 24;
@@ -100,7 +100,7 @@ fn documented_offsets() -> Vec<u32> {
 }
 
 impl Efuse {
-    /// The production chip of [`PRODUCTION_V0_3`], with its wafer version replaced by `revision`.
+    /// The production chip of `PRODUCTION_V0_3`, with its wafer version replaced by `revision`.
     #[must_use]
     pub fn new(revision: ChipRevision) -> Efuse {
         let (major, minor) = (u32::from(revision.major()), u32::from(revision.minor()));

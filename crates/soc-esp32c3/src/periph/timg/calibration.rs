@@ -4,7 +4,7 @@
 use crate::clock::XTAL_PERIOD;
 use emu_core::Cycles;
 
-/// `RTCCALICFG`: bit 31 `START`, bits [30:16] `MAX`, bit 15 `RDY` (read-only), bits [14:13]
+/// `RTCCALICFG`: bit 31 `START`, bits `[30:16]` `MAX`, bit 15 `RDY` (read-only), bits `[14:13]`
 /// `CLK_SEL`, bit 12 `START_CYCLING`. `rtc_clk_cal_internal` writes each of them
 /// (`IDF:esp_hw_support/port/esp32c3/rtc_time.c:36-128`; TW §B.4).
 pub(super) const CALI_START: u32 = 1 << 31;
@@ -15,9 +15,9 @@ pub(super) const CALI_CLK_SEL_SHIFT: u32 = 13;
 const CALI_CLK_SEL_MASK: u32 = 0b11;
 const CALI_START_CYCLING: u32 = 1 << 12;
 const RTCCALICFG_STORED: u32 = 0xFFFF_7000;
-/// `RTCCALICFG1` bits [31:7] `VALUE`: the crystal cycles counted.
+/// `RTCCALICFG1` bits `[31:7]` `VALUE`: the crystal cycles counted.
 pub(super) const CALI_VALUE_SHIFT: u32 = 7;
-/// `RTCCALICFG2`: bits [31:7] `TIMEOUT_THRES`, bits [6:3] `TIMEOUT_RST_CNT`, bit 0 `TIMEOUT`
+/// `RTCCALICFG2`: bits `[31:7]` `TIMEOUT_THRES`, bits `[6:3]` `TIMEOUT_RST_CNT`, bit 0 `TIMEOUT`
 /// (read-only).
 pub(super) const CALI_THRES_SHIFT: u32 = 7;
 pub(super) const CALI_TIMEOUT: u32 = 1;

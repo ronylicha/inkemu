@@ -20,12 +20,12 @@ fn sext(value: u32, bits: u32) -> i32 {
     ((value << (32 - bits)) as i32) >> (32 - bits)
 }
 
-/// 6-bit immediate of CI-format instructions: imm[5] = bit 12, imm[4:0] = bits 6:2.
+/// 6-bit immediate of CI-format instructions: `imm[5]` = bit 12, `imm[4:0]` = bits 6:2.
 fn ci_imm(h: u16) -> i32 {
     let h = u32::from(h);
     sext(((h >> 7) & 0x20) | ((h >> 2) & 0x1f), 6)
 }
-/// Shift amount of c.slli/c.srli/c.srai; `None` when shamt[5] is set (reserved on RV32).
+/// Shift amount of c.slli/c.srli/c.srai; `None` when `shamt[5]` is set (reserved on RV32).
 fn ci_shamt(h: u16) -> Option<i32> {
     if h & 0x1000 != 0 {
         None

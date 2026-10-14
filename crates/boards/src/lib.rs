@@ -106,7 +106,7 @@ pub struct MachineOptions {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProfileError {
-    /// `detail` ends with a remedy: its own, or the general one ([`parse_detail`]).
+    /// `detail` ends with a remedy: its own, or the general one (`parse_detail`).
     #[error("{origin}: {detail}")]
     Parse { origin: String, detail: String },
     #[error(

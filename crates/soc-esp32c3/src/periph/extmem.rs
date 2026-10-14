@@ -7,8 +7,8 @@
 //!
 //! One thing a cache does is still followed, because it is where reading the flash live can differ
 //! from a device: a line filled from the flash keeps its bytes when SPI1 programs or erases them,
-//! until software invalidates it (CM §3, "Stale data"). [`Extmem::window_read`],
-//! [`Extmem::flash_written`] and [`Extmem::invalidate`] keep, per 64 KiB flash page, whether a
+//! until software invalidates it (CM §3, "Stale data"). `Extmem::window_read`,
+//! `Extmem::flash_written` and `Extmem::invalidate` keep, per 64 KiB flash page, whether a
 //! window read may now return other bytes than a device would. The bus reports such a read; it
 //! still returns the bytes of the flash.
 use super::mmu::{MMU_ENTRIES, MMU_PAGE_BYTES, MmuTable};
@@ -48,7 +48,7 @@ const SYNC_DONE: u32 = 1 << 1;
 /// `ICACHE_SYNC_ADDR` and `ICACHE_SYNC_SIZE` (`ROM3:Cache_Invalidate_ICache_Items@0x40050f28`:
 /// `SYNC_ADDR = addr`, `SYNC_SIZE[22:0] = n`, `SYNC_CTRL |= 1`; CM §4.1).
 const SYNC_INVALIDATE: u32 = 1 << 0;
-/// `ICACHE_SYNC_SIZE` [22:0]: the number of cache lines, not of bytes. `Cache_Invalidate_Addr`
+/// `ICACHE_SYNC_SIZE` `[22:0]`: the number of cache lines, not of bytes. `Cache_Invalidate_Addr`
 /// called for `0x10000` bytes writes `0x800` (CM §4.1, measured).
 const SYNC_LINES_MASK: u32 = 0x7F_FFFF;
 /// A cache line (`ROM3:Cache_Get_ICache_Line_Size@0x40050e4c` returns 32; CM §3).
@@ -107,11 +107,11 @@ const AUTOLOAD_CONFIG: u32 = 0x77;
 const FREEZE_ENA: u32 = 1 << 0;
 const FREEZE_MODE: u32 = 1 << 1;
 const FREEZE_DONE: u32 = 1 << 2;
-/// `CACHE_STATE` [11:0]: 1 is idle, the only value `Cache_Disable_ICache` accepts.
+/// `CACHE_STATE` `[11:0]`: 1 is idle, the only value `Cache_Disable_ICache` accepts.
 const CACHE_IDLE: u32 = 1;
 /// `CACHE_ILG_INT_ST` bit 5: an access went through an invalid MMU entry.
 const MMU_ENTRY_FAULT: u32 = 1 << 5;
-/// `CACHE_MMU_FAULT_CONTENT`: [9:0] the entry, [13:10] the operation; 1 is a CPU access.
+/// `CACHE_MMU_FAULT_CONTENT`: `[9:0]` the entry, `[13:10]` the operation; 1 is a CPU access.
 const FAULT_CONTENT_MASK: u32 = 0x3FF;
 const FAULT_CODE_CPU: u32 = 1 << 10;
 /// `CORE0_ACS_CACHE_INT_ST`: bit 1 a store through the instruction bus, bit 5 through the data bus.
@@ -252,7 +252,7 @@ impl Extmem {
     /// decides it. It changes when the cache or one of its buses is switched on or off (decision
     /// D6), and when an invalidation takes a page out of the cache: the code of that page is
     /// then fetched again the next time it runs, as a device fetches it from the flash again,
-    /// and the fetch is a window read like any other ([`Extmem::window_read`]).
+    /// and the fetch is a window read like any other (`Extmem::window_read`).
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation

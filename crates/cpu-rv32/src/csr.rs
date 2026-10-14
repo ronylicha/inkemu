@@ -35,7 +35,7 @@ const MTVEC_VECTORED: u32 = 1;
 const MTVEC_C3_LOW: u32 = 0xFF;
 /// MXL=1 (32-bit) | C | I | M.
 const MISA_RV32IMC: u32 = (1 << 30) | (1 << 2) | (1 << 8) | (1 << 12);
-/// CSR addresses whose bits [11:10] are 0b11 are read-only (Privileged spec §2.1).
+/// CSR addresses whose bits `[11:10]` are 0b11 are read-only (Privileged spec §2.1).
 const READ_ONLY_MASK: u16 = 0xC00;
 
 /// CSRs that only one vendor's core implements.

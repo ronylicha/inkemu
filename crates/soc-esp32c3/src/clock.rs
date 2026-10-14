@@ -17,13 +17,13 @@ const fn megahertz(mhz: u32) -> Frequency {
 pub const XTAL_MHZ: u32 = 40;
 pub const XTAL: Frequency = megahertz(XTAL_MHZ);
 
-/// `SYSCLK_CONF` [9:0] `PRE_DIV_CNT`, [11:10] `SOC_CLK_SEL`.
+/// `SYSCLK_CONF` `[9:0]` `PRE_DIV_CNT`, `[11:10]` `SOC_CLK_SEL`.
 const PRE_DIV_MASK: u32 = 0x3FF;
 const SOC_CLK_SEL_SHIFT: u32 = 10;
 const SOC_CLK_SEL_MASK: u32 = 0x3;
 const SOC_CLK_XTAL: u32 = 0;
 const SOC_CLK_PLL: u32 = 1;
-/// `CPU_PER_CONF` [1:0] `CPUPERIOD_SEL`: 0 is 80 MHz, 1 is 160 MHz, whichever PLL frequency is selected.
+/// `CPU_PER_CONF` `[1:0]` `CPUPERIOD_SEL`: 0 is 80 MHz, 1 is 160 MHz, whichever PLL frequency is selected.
 const CPUPERIOD_SEL_MASK: u32 = 0x3;
 
 /// The time base of the machine: device time is counted in cycles of this clock (ADR 0003).

@@ -73,7 +73,7 @@ const REGCLK_RESET: u32 = 0x6000_0000;
 
 /// `T0CONFIG`: bit 31 `EN` (`timer_ll_enable_counter`, `IDF:hal/esp32c3/include/hal/timer_ll.h:175`),
 /// bit 30 `INCREASE` (`timer_ll_set_count_direction`, line 161), bit 29 `AUTORELOAD`
-/// (`timer_ll_enable_auto_reload`, line 149), bits [28:13] `DIVIDER` and bit 12 `DIVCNT_RST`, a
+/// (`timer_ll_enable_auto_reload`, line 149), bits `[28:13]` `DIVIDER` and bit 12 `DIVCNT_RST`, a
 /// write-1 trigger (`timer_ll_set_clock_prescale`, lines 130-137), bit 10 `ALARM_EN`
 /// (`timer_ll_enable_alarm`, line 118), bit 9 `USE_XTAL` (`timer_ll_set_clock_source`, line 79).
 const T0_EN: u32 = 1 << 31;
@@ -92,7 +92,7 @@ const T0_HI_MASK: u32 = 0x003F_FFFF;
 const T0_PASSED_WINDOW: u64 = 1 << 53;
 
 /// `WDTCONFIG0`: bit 31 `EN` (`mwdt_ll_enable`, `IDF:hal/esp32c3/include/hal/mwdt_ll.h:65`), two
-/// bits per stage from [30:29] for stage 0 to [24:23] for stage 3 (`mwdt_ll_config_stage`, line
+/// bits per stage from `[30:29]` for stage 0 to `[24:23]` for stage 3 (`mwdt_ll_config_stage`, line
 /// 102), bit 22 `CONF_UPDATE_EN`, a write-1 trigger that reads 0 (same function), bit 21 `USE_XTAL`
 /// (`mwdt_ll_set_clock_source`, line 277), bit 14 `FLASHBOOT_MOD_EN` (`mwdt_ll_set_flashboot_en`,
 /// line 194). The reset lengths and the two CPU reset enables are stored.
@@ -104,7 +104,7 @@ const WDT_CONF_UPDATE_EN: u32 = 1 << 22;
 const WDT_USE_XTAL: u32 = 1 << 21;
 const WDT_FLASHBOOT_MOD_EN: u32 = 1 << 14;
 const WDTCONFIG0_STORED: u32 = 0xFFBF_F000;
-/// `WDTCONFIG1` bits [31:16] `CLK_PRESCALE` (`mwdt_ll_set_prescaler`, line 207); bit 0 is a
+/// `WDTCONFIG1` bits `[31:16]` `CLK_PRESCALE` (`mwdt_ll_set_prescaler`, line 207); bit 0 is a
 /// write-1 trigger that restarts the prescaler.
 const WDT_PRESCALE_SHIFT: u32 = 16;
 const WDTCONFIG1_STORED: u32 = 0xFFFF_0000;
@@ -179,7 +179,7 @@ impl Timg {
     /// The group after a power-on, a core reset or a peripheral reset. `flash_boot` says whether
     /// the chip was strapped to boot from flash.
     ///
-    /// The owner calls [`Timg::wake`] once afterwards: the reset values arm the flash-boot
+    /// The owner calls `Timg::wake` once afterwards: the reset values arm the flash-boot
     /// protection of group 0, which needs its first deadline.
     #[must_use]
     pub fn new(group: Group, flash_boot: bool, ctx: &Ctx) -> Timg {
