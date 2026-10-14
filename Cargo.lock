@@ -834,6 +834,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "session"
+version = "0.1.0"
+dependencies = [
+ "boards",
+ "cpu-rv32",
+ "emu-core",
+ "flate2",
+ "sha2",
+ "soc-esp32c3",
+ "svd-regs",
+ "thiserror",
+]
+
+[[package]]
 name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

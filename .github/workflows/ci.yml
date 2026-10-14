@@ -29,13 +29,13 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
       - run: cargo test --workspace
       - run: cargo run -p svd-gen -- --check
-      # The model crates, and the crates a front end composes a flash with, must go on building for
-      # `wasm32-unknown-unknown`, the target of the web version: this step notices a crate that does
-      # not build there. It cannot notice host I/O, which std compiles there and fails at run time:
-      # the clippy step above refuses it in firmware, boards, soc-esp32c3 and console-script (their
-      # clippy.toml).
+      # The model crates, the crates a front end composes a flash with, and the one it replays a
+      # session with, must go on building for `wasm32-unknown-unknown`, the target of the web
+      # version: this step notices a crate that does not build there. It cannot notice host I/O,
+      # which std compiles there and fails at run time: the clippy step above refuses it in
+      # firmware, boards, soc-esp32c3, console-script and session (their clippy.toml).
       - name: Build the model for WebAssembly
-        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3 -p firmware -p boards -p console-script
+        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3 -p firmware -p boards -p console-script -p session
       - uses: EmbarkStudios/cargo-deny-action@v2
   coverage:
     runs-on: ubuntu-24.04
