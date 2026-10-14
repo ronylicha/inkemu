@@ -319,9 +319,10 @@ fn check(status: ExitStatus) -> Result<(), QemuError> {
 /// time, Docker's own answers included: as long as Docker is given to start QEMU. A daemon slow
 /// enough to miss the open timeout is slow to create the container too: measured on 2026-10-14
 /// on a loaded host, it created one about two minutes after `docker run`, after a first version
-/// of this loop, bounded at 10 s, had killed the client and left. With [`OPEN_TIMEOUT`] and the
-/// last removal, a run that cannot start QEMU ends within 11 minutes; the CI's lockstep steps
-/// give it more.
+/// of this loop, bounded at 10 s, had killed the client and left. Every `docker` call, the last
+/// removal and look included, ends within it (each one is killed after [`DOCKER_CALL_TIMEOUT`],
+/// and none starts too late to end in time: [`LAST_CALL_START`]). With [`OPEN_TIMEOUT`], a run
+/// that cannot start QEMU ends within about 10 minutes; the CI's lockstep steps give it more.
 const REMOVE_BOUND: Duration = Duration::from_secs(300);
 /// How long [`clean_up`] waits between two tries.
 const REMOVE_POLL: Duration = Duration::from_millis(200);
@@ -330,6 +331,11 @@ const REMOVE_NOTICE: Duration = Duration::from_secs(10);
 /// How long one `docker rm` or `docker inspect` may take before it is killed and counted as no
 /// answer: a daemon that hangs must not hold the run past [`REMOVE_BOUND`].
 const DOCKER_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// The latest time on the clean-up's clock a `docker` call of its loop may start, or a wait of
+/// it end: that call, then the last removal and look after the loop, three calls at most, still
+/// end within [`REMOVE_BOUND`].
+const LAST_CALL_START: Duration =
+    REMOVE_BOUND.saturating_sub(DOCKER_CALL_TIMEOUT.saturating_mul(3));
 /// How often a bounded `docker` call is looked at.
 const DOCKER_CALL_POLL: Duration = Duration::from_millis(50);
 
@@ -385,9 +391,10 @@ enum Cleanup {
 /// Removes the container `name` without a race with a slow daemon. The client is not killed
 /// while the daemon may still create the container: it exits by itself once the daemon answers,
 /// since a container removed while it is being created cannot be started. The removal is
-/// repeated until the client has exited and Docker says the container does not exist, for
-/// [`REMOVE_BOUND`] at most on `clock`, [`REMOVE_POLL`] apart; `notice` is called once after
-/// [`REMOVE_NOTICE`]. Past the bound the client is killed and one more removal made.
+/// repeated until the client has exited and Docker says the container does not exist,
+/// [`REMOVE_POLL`] apart; `notice` is called once after [`REMOVE_NOTICE`]. No call starts after
+/// [`LAST_CALL_START`] on `clock`; then the client is killed and one more removal made, so that
+/// the whole clean-up ends within [`REMOVE_BOUND`].
 fn clean_up(
     docker: &mut impl Docker,
     client: &mut impl Client,
@@ -396,15 +403,23 @@ fn clean_up(
     notice: impl FnOnce(),
 ) -> Cleanup {
     let mut notice = Some(notice);
-    while clock.elapsed() < REMOVE_BOUND {
+    while clock.elapsed() <= LAST_CALL_START {
         docker.remove(name);
-        if client.exited() && docker.exists(name) == Some(false) {
-            return Cleanup::Removed;
+        if client.exited() {
+            if clock.elapsed() > LAST_CALL_START {
+                break;
+            }
+            if docker.exists(name) == Some(false) {
+                return Cleanup::Removed;
+            }
         }
         if clock.elapsed() >= REMOVE_NOTICE
             && let Some(notice) = notice.take()
         {
             notice();
+        }
+        if clock.elapsed() + REMOVE_POLL > LAST_CALL_START {
+            break;
         }
         clock.sleep(REMOVE_POLL);
     }
@@ -728,14 +743,95 @@ mod tests {
         }
     }
 
-    /// The tries [`clean_up`] makes within its bound when each takes `poll`.
+    /// The tries [`clean_up`] makes in its loop when Docker answers at once: one at every poll
+    /// from 0 to [`LAST_CALL_START`].
     fn tries_within_bound() -> u32 {
-        u32::try_from(REMOVE_BOUND.as_millis() / REMOVE_POLL.as_millis()).unwrap()
+        u32::try_from(LAST_CALL_START.as_millis() / REMOVE_POLL.as_millis()).unwrap() + 1
+    }
+
+    /// Time shared by a clock and a slow Docker ([`SlowDocker`]).
+    struct SharedClock<'a> {
+        now: &'a std::cell::Cell<Duration>,
+    }
+
+    impl Clock for SharedClock<'_> {
+        fn elapsed(&self) -> Duration {
+            self.now.get()
+        }
+
+        fn sleep(&mut self, poll: Duration) {
+            self.now.set(self.now.get() + poll);
+        }
+    }
+
+    /// A Docker whose every call takes `took` (at most [`DOCKER_CALL_TIMEOUT`], where it is
+    /// killed) and never says whether the container exists.
+    struct SlowDocker<'a> {
+        now: &'a std::cell::Cell<Duration>,
+        took: Duration,
+        /// When each call started.
+        calls: Vec<Duration>,
+    }
+
+    impl SlowDocker<'_> {
+        fn call(&mut self) {
+            self.calls.push(self.now.get());
+            self.now.set(self.now.get() + self.took);
+        }
+    }
+
+    impl Docker for SlowDocker<'_> {
+        fn remove(&mut self, _name: &str) {
+            self.call();
+        }
+
+        fn exists(&mut self, _name: &str) -> Option<bool> {
+            self.call();
+            None
+        }
+    }
+
+    #[test]
+    fn no_docker_call_ends_past_the_bound_however_slow_each_call_is() {
+        // The client has exited, so every try is a removal and a look. Checked once per try,
+        // the bound let a removal started just before it, the look after it and the final
+        // removal and look end up to 80 s past it (about 305 s for calls of 19 s).
+        for seconds in 1..=20 {
+            let now = std::cell::Cell::new(Duration::ZERO);
+            let mut docker = SlowDocker {
+                now: &now,
+                took: Duration::from_secs(seconds),
+                calls: Vec::new(),
+            };
+            let done = std::cell::Cell::new(true);
+            let mut client = FakeClient {
+                gone: &done,
+                stuck: false,
+                killed: false,
+            };
+            let cleanup = clean_up(
+                &mut docker,
+                &mut client,
+                &mut SharedClock { now: &now },
+                &container_name(42, 7),
+                || {},
+            );
+            assert_eq!(cleanup, Cleanup::Left);
+            assert!(now.get() <= REMOVE_BOUND, "{seconds} s: {:?}", now.get());
+            // Every call of the loop, all but the final removal and look, started in time.
+            let (in_loop, last) = docker.calls.split_at(docker.calls.len() - 2);
+            assert!(in_loop.len() > 1 && last.len() == 2, "{seconds} s");
+            assert!(
+                in_loop.iter().all(|start| *start <= LAST_CALL_START),
+                "{seconds} s: {in_loop:?}"
+            );
+        }
     }
 
     #[test]
     fn the_clean_up_is_bounded_in_time_whatever_docker_takes() {
-        // Every try takes the poll and 10 s of Docker: the bound is reached in far fewer tries.
+        // Every try takes the poll and 10 s of Docker: the bound is reached in far fewer tries,
+        // and the last wait ends no later than the last call may start.
         let mut docker = FakeDocker::new(Some(1), false);
         let done = std::cell::Cell::new(false);
         let mut client = FakeClient {
@@ -755,8 +851,15 @@ mod tests {
             || {},
         );
         assert_eq!(cleanup, Cleanup::Left);
-        assert!(clock.now >= REMOVE_BOUND && clock.now < REMOVE_BOUND + Duration::from_secs(11));
-        assert_eq!(docker.removals, 30 + 1);
+        // Here Docker's time is spent in the waits: the last one (234.6 s to 244.8 s) is the
+        // only one that may end past the last start, by its 10 s of Docker.
+        assert!(
+            clock.now > LAST_CALL_START && clock.now <= REMOVE_BOUND,
+            "{:?}",
+            clock.now
+        );
+        // A try at 0 s, 10.2 s, … 234.6 s, then the last removal.
+        assert_eq!(docker.removals, 24 + 1);
     }
 
     #[test]
