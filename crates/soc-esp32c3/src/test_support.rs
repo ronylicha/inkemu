@@ -371,6 +371,39 @@ pub fn stop_watchdogs() -> Vec<u32> {
     program
 }
 
+/// `t2` and `t3`, two more registers a test program may use: the helpers above use only [`T0`]
+/// and [`T1`], and [`sleep_on_the_rtc_timer`] only those and [`T3`].
+pub const T2: u8 = 7;
+pub const T3: u8 = 28;
+
+/// `RTC_CNTL.WAKEUP_STATE` with the RTC timer as the only wake source (`WAKEUP_ENA` bit 3).
+pub const TIMER_WAKE_STATE: u32 = (1 << 3) << 15;
+
+fn rtc_cntl(name: &str) -> u32 {
+    svd_regs::esp32c3::addr("RTC_CNTL", name)
+}
+
+/// Code that sets the alarm of the RTC timer `counts` slow-clock counts after a capture of the
+/// timer (what `timer_wakeup_prepare` does: DS §A.1.4), then `DIG_PWC.DG_WRAP_PD_EN` and
+/// `SLEEP_EN` (`rtc_deep_sleep_start` without its CRC: DS §A.1.5), and parks. `wake_state` goes
+/// to `WAKEUP_STATE` in between: [`TIMER_WAKE_STATE`] wakes the chip at the alarm, 0 lets it
+/// sleep for ever. `counts` is a multiple of 0x1000 below 2^31 (one `lui`).
+#[must_use]
+pub fn sleep_on_the_rtc_timer(counts: u32, wake_state: u32) -> Vec<u32> {
+    let mut program = store_register(rtc_cntl("TIME_UPDATE"), 1 << 31).to_vec();
+    // T0 holds the page of the RTC_CNTL registers, T1 the low word of the capture.
+    program.extend(load_register(rtc_cntl("TIME_LOW0")));
+    program.extend([asm::lui(T3, counts), asm::add(T1, T1, T3)]);
+    let slp_timer0 = rtc_cntl("SLP_TIMER0") - rtc_cntl("OPTIONS0");
+    program.push(asm::sw(T1, T0, slp_timer0.cast_signed()));
+    program.extend(store_register(rtc_cntl("SLP_TIMER1"), 1 << 16));
+    program.extend(store_register(rtc_cntl("WAKEUP_STATE"), wake_state));
+    program.extend(store_register(rtc_cntl("DIG_PWC"), 1 << 31));
+    program.extend(store_register(rtc_cntl("STATE0"), 1 << 31));
+    program.push(HANG);
+    program
+}
+
 /// `SPI1.CMD` bits of the hard-wired commands the two helpers below use (report FW §A.1).
 const SPI1_CMD_WREN: u32 = 1 << 30;
 const SPI1_CMD_PP: u32 = 1 << 25;
