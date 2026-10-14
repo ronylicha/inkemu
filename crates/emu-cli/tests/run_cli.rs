@@ -4623,6 +4623,141 @@ fn x4_records_the_deep_sleep_timer_reference_firmware_through_its_wakes_and_repl
     assert_eq!(trace_hash_line(&log), trace, "{log}");
 }
 
+/// The `CoreMark` score Espressif publishes for the ESP32-C3, one core at 160 MHz: "483.27
+/// `CoreMark`; 3.02 `CoreMark`/MHz" (ESP32-C3 Series Datasheet v2.4, 2026-05-06, page 3; spec §4.2 and §10.3
+/// criterion 5; ADR 0009). The datasheet names neither compiler nor flags; the other published
+/// figure, 409.25 (the `espressif/coremark` example, GCC 12.2), is reported beside it, not tested.
+const PUBLISHED_COREMARK: f64 = 483.27;
+/// Criterion 5: the score within 15 % of the published one, either way. Never widened to make a
+/// run pass: a score outside it is a fault of the timing model, found and fixed there (ADR 0009).
+const COREMARK_TOLERANCE: f64 = 0.15;
+/// The second published figure, for the message only (see [`PUBLISHED_COREMARK`]).
+const EXAMPLE_COREMARK: f64 = 409.25;
+
+/// The trace of the run of `coremark_example` below, measured on 2026-10-15 on the development
+/// host (the run is the same on every host: the CI prints it too).
+const COREMARK_TRACE: &str = "trace-hash bfb20978732b673f";
+
+/// The value `CoreMark` prints after `label` (its padded name and the colon): the rest of the
+/// first line that starts with it.
+fn coremark_field<'a>(console: &'a str, label: &str) -> &'a str {
+    console
+        .lines()
+        .find_map(|line| line.strip_prefix(label))
+        .unwrap_or_else(|| panic!("no line `{label}`:\n{console}"))
+        .trim()
+}
+
+/// Criterion 5 (spec §10.3): `CoreMark` on the emulated ESP32-C3 scores within 15 % of the score
+/// Espressif publishes. The firmware is Espressif's `CoreMark` example and component (1.1.0~2, its
+/// files unmodified, built by `tools/reference-firmware/build.sh` with GCC 14.2.0, `-O3`, code in
+/// IRAM), behind the bootloader inkemu ships. It times itself with `esp_timer`, that is the SYSTIMER
+/// of inkemu, which counts device time: the score is the one inkemu's device time gives, with the
+/// timing model inkemu runs by default. The run also has to be one `CoreMark` accepts: the CRCs of
+/// the 2K performance run, "Correct operation validated" (which `CoreMark` prints only when they
+/// match and the run lasted 10 s or more), and a score consistent with its own counts.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_COREMARK_APP"]
+fn x4_runs_the_coremark_reference_firmware_within_15_percent_of_the_published_score() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let application = std::env::var("INKEMU_COREMARK_APP").expect(
+        "set INKEMU_COREMARK_APP to the coremark_example.bin of tools/reference-firmware/build.sh",
+    );
+    assert_eq!(
+        sha256_of(std::path::Path::new(&application)),
+        pinned_in_sums("SHA256SUMS.inputs-coremark", "coremark_example.bin"),
+        "{application} is not the pinned coremark_example.bin; rebuild it with tools/reference-firmware/build.sh"
+    );
+    // CoreMark returns from app_main at about 17.5 s of device time; 20 s leaves it room.
+    let output = inkemu()
+        .args(["run", "--device", "x4", "--console", "uart0"])
+        .args(["--max-time", "20", "--trace-hash", "--rom-dir", &rom_dir])
+        .arg("--firmware")
+        .arg(&application)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&output.stdout).replace('\r', "");
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    // The CRCs that do not depend on the number of iterations: those of the seeds of the 2K
+    // performance run, the ones CoreMark checks itself (`core_main.c`, `known_id` 3).
+    let mut from = 0;
+    for expected in [
+        "Running coremark...\n",
+        "2K performance run parameters for coremark.\n",
+        "CoreMark Size    : 666\n",
+        "Memory location  : IRAM\n",
+        "seedcrc          : 0xe9f5\n",
+        "[0]crclist       : 0xe714\n",
+        "[0]crcmatrix     : 0x1fd7\n",
+        "[0]crcstate      : 0x8e3a\n",
+        "Correct operation validated. See README.md for run and reporting rules.\n",
+        "CPU frequency: 160 MHz\n",
+        "main_task: Returned from app_main()",
+    ] {
+        let at = console[from..].find(expected).unwrap_or_else(|| {
+            panic!("`{expected}` is missing, or out of order:\n{console}\n{log}")
+        });
+        from += at + expected.len();
+    }
+    assert!(!console.contains("ERROR!"), "{console}");
+    let iterations: u32 = coremark_field(&console, "Iterations       :")
+        .parse()
+        .unwrap_or_else(|e| panic!("iterations: {e}\n{console}"));
+    // The final CRC depends on the number of iterations, which CoreMark chooses from its own
+    // timing; 6000 is what the chip runs, and its CRC is the one Espressif's example prints.
+    if iterations == 6000 {
+        assert!(console.contains("[0]crcfinal      : 0xa14c\n"), "{console}");
+    }
+    let ticks: f64 = coremark_field(&console, "Total ticks      :")
+        .parse()
+        .unwrap_or_else(|e| panic!("ticks: {e}\n{console}"));
+    let seconds: f64 = coremark_field(&console, "Total time (secs):")
+        .parse()
+        .unwrap_or_else(|e| panic!("seconds: {e}\n{console}"));
+    assert!(
+        seconds >= 10.0,
+        "CoreMark ran {seconds} s; its results need 10 s:\n{console}"
+    );
+    let per_second = coremark_field(&console, "Iterations/Sec   :");
+    let (reported, _) = console
+        .lines()
+        .find_map(|line| line.strip_prefix("CoreMark 1.0 : "))
+        .and_then(|rest| rest.split_once(" / "))
+        .unwrap_or_else(|| panic!("no line `CoreMark 1.0 : <score> / ...`:\n{console}"));
+    assert_eq!(reported, per_second, "{console}");
+    let score: f64 = reported
+        .parse()
+        .unwrap_or_else(|e| panic!("score `{reported}`: {e}\n{console}"));
+    // The port counts milliseconds of `esp_timer` (`EE_TICKS_PER_SEC` 1000).
+    let from_counts = f64::from(iterations) * 1000.0 / ticks;
+    assert!(
+        (score - from_counts).abs() <= 1e-6 * from_counts,
+        "{score} is not {iterations} iterations in {ticks} ms:\n{console}"
+    );
+    let low = PUBLISHED_COREMARK * (1.0 - COREMARK_TOLERANCE);
+    let high = PUBLISHED_COREMARK * (1.0 + COREMARK_TOLERANCE);
+    let gap = |published: f64| (score / published - 1.0) * 100.0;
+    assert!(
+        (low..=high).contains(&score),
+        "CoreMark scores {score} on inkemu, {:+.1} % from the published {PUBLISHED_COREMARK} (outside {low:.2}..={high:.2}) and {:+.1} % from the example's {EXAMPLE_COREMARK}: the timing model is out of criterion 5; find the cause in it, never widen the band\n{log}",
+        gap(PUBLISHED_COREMARK),
+        gap(EXAMPLE_COREMARK),
+    );
+    // Every register CoreMark's run touches is modelled or accepted by name.
+    assert!(!log.contains("warning:"), "{log}");
+    let measured = trace_hash_line(&log);
+    assert_eq!(
+        measured,
+        Some(COREMARK_TRACE),
+        "the trace hash of this run is {measured:?} (score {score}): when the run above is the one intended, pin it in COREMARK_TRACE\n{log}"
+    );
+}
+
 /// The script the console-script reference test types into `uart_select`
 /// (`crates/console-script/tests/reference_firmware.rs`): through by 10.6 s of device time.
 const UART_SELECT_SCRIPT: &str = "\
