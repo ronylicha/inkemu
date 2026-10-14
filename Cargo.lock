@@ -508,6 +508,7 @@ dependencies = [
  "ctrlc",
  "lockstep",
  "nix",
+ "sha2",
  "soc-esp32c3",
  "thiserror",
 ]

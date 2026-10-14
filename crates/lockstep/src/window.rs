@@ -47,6 +47,13 @@ pub const WINDOWS: &[Window] = &[
         bound: None,
         rows: table::NVS_OTA,
     },
+    Window {
+        name: "crosspoint",
+        firmware: "crosspoint-1.6.5-x3-x4.bin",
+        resets: 0,
+        bound: None,
+        rows: table::CROSSPOINT,
+    },
 ];
 
 /// The window called `name`.

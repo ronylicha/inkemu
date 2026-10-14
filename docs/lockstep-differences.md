@@ -47,6 +47,7 @@ des deux côtés que la comparaison traverse ; le suivant termine la fenêtre.
 | hello | `flash_hello.bin` | 1 | — | 1–28 | 6 813 949 | reset |
 | nvs | `flash_nvs.bin` | 1 | — | 1–6, 8–24, 26, 27, 29–32 | 7 680 555 | reset |
 | nvs-ota | `flash_nvs_ota.bin` | 1 | — | 1–6, 8–24, 26, 27, 29–33 | 7 701 890 | reset |
+| crosspoint | `crosspoint-1.6.5-x3-x4.bin` | 0 | — | 1–3, 5, 6, 8, 10, 12, 13, 16–19, 21, 22, 33–41 | 31 088 420 | registre absent de QEMU |
 
 - **hello** : la ROM, le bootloader, `app_main` et le compte à rebours, le reset que demande
   `esp_restart`, puis une seconde vie entière, jusqu'au second reset. 2 224 interruptions prises par
@@ -57,6 +58,20 @@ des deux côtés que la comparaison traverse ; le suivant termine la fenêtre.
 - **nvs-ota** : la même application sous la table de partitions d'origine de la X4, dont le
   bootloader écrit `otadata` à chaque démarrage ; les lignes de `nvs` et la ligne 33. 2 224
   interruptions, 118 blocs réimprimés, 20 préemptés.
+- **crosspoint** : CrossPoint 1.6.5 pour la X3 et la X4 (`crosspoint-1.6.5-x3-x4.bin`, SHA-256
+  `8eccf614…0385764`) derrière le bootloader qu'inkemu livre, composés comme le fait
+  `inkemu run --firmware`, sous la table de partitions de la X4. Ce fichier n'est pas dans le dépôt
+  et ne tourne jamais dans la CI : `crates/lockstep-cli/tests/crosspoint.rs`, ignoré, lit le fichier
+  de l'utilisateur (`INKEMU_CROSSPOINT_X3_X4`), refuse tout autre fichier, et épingle le compte, la
+  fin et les usages (`crates/lockstep-cli/tests/crosspoint.usage`). Mesure locale du 2026-10-14 :
+  la ROM, le bootloader (environ 30,7 millions d'instructions, dont l'écriture d'`otadata`) et le
+  début de l'application ; la fenêtre se termine au premier accès à un registre que QEMU n'a pas et
+  qu'aucune ligne ne nomme, la lecture d'`APB_SARADC.APB_TSENS_CTRL` (`0x60040058`, le capteur de
+  température) au PC `0x4214917C`, avant le démarrage de l'ordonnanceur. Aucune interruption, 657
+  blocs réimprimés, aucun préempté. Le compte n'est pas l'objectif d'environ 32 millions de la
+  spécification de SP1b-4d : c'est la fin de la fenêtre, à cet accès, et non une borne (décision
+  R41 du plan). Aucune ligne n'admet ce registre : QEMU n'a pas de capteur de température, et une
+  copie donnerait à CrossPoint une valeur qu'aucun des deux côtés n'a mesurée.
 
 Les autres firmwares de référence n'ont pas de fenêtre (SP1b-4d, décision J5) : chacun s'arrête,
 mesuré le 2026-10-14, dans le démarrage de son application, à un artefact de la livraison des
@@ -172,28 +187,28 @@ usages de SP1b-4c (première vie de `flash_hello.bin` seule) sont dans l'ADR 000
 
 | N° | Différence | Traitement | Source | Usages |
 |---|---|---|---|---|
-| 1 | `mstatus.MPP` : QEMU lit 0, inkemu « machine » | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MSTATUS_MPP_M`) ; mesure | hello 5 572 920 ; nvs 6 441 342 ; nvs-ota 6 462 597 |
-| 2 | `mie` au reset : QEMU `0x0EEE`, inkemu 0, jusqu'à ce que le firmware l'écrive | (i) paire | oracle §1c piège 6 ; `target/riscv/esp_cpu.c` | hello 6 813 950 ; nvs 7 680 556 ; nvs-ota 7 701 891 |
-| 3 | `mtvec.MODE` au reset : QEMU direct, inkemu vectorisé, jusqu'à l'écriture de `mtvec` | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MTVEC_VECTORED`) ; oracle §1c | hello 15 ; nvs 15 ; nvs-ota 15 |
+| 1 | `mstatus.MPP` : QEMU lit 0, inkemu « machine » | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MSTATUS_MPP_M`) ; mesure | hello 5 572 920 ; nvs 6 441 342 ; nvs-ota 6 462 597 ; crosspoint 31 088 721 |
+| 2 | `mie` au reset : QEMU `0x0EEE`, inkemu 0, jusqu'à ce que le firmware l'écrive | (i) paire | oracle §1c piège 6 ; `target/riscv/esp_cpu.c` | hello 6 813 950 ; nvs 7 680 556 ; nvs-ota 7 701 891 ; crosspoint 31 088 421 |
+| 3 | `mtvec.MODE` au reset : QEMU direct, inkemu vectorisé, jusqu'à l'écriture de `mtvec` | (i) paire | `crates/cpu-rv32/src/csr.rs` (`MTVEC_VECTORED`) ; oracle §1c | hello 15 ; nvs 15 ; nvs-ota 15 ; crosspoint 15 |
 | 4 | `mip.MEIP` : la ligne de la matrice de QEMU, trois instructions en retard après un rangement du seuil qui la fait tomber | (i) paire | `hw/riscv/esp32c3_intmatrix.c` ; `target/riscv/esp_cpu.c` ; mesure | hello 188 988 ; nvs 188 988 ; nvs-ota 188 988 |
-| 5 | Le compteur de cycles : les deux comptent 6,25 ns du temps de l'appareil, celui de QEMU depuis sa première lecture | (iv) réglage ; (ii) compteur tenu | `target/riscv/esp_cpu.c` (`esp_cpu_get_cycles`) ; mesure | hello 1 118 166 ; nvs 1 118 170 ; nvs-ota 1 118 182 |
-| 6 | UART0 : niveaux de ligne, compte de FIFO et valeurs de reset que QEMU ne modélise pas | (ii) copie | mesure ; `info mtree -f` (`esp_soc.uart`) | hello 6 483 ; nvs 6 601 ; nvs-ota 7 150 |
+| 5 | Le compteur de cycles : les deux comptent 6,25 ns du temps de l'appareil, celui de QEMU depuis sa première lecture | (iv) réglage ; (ii) compteur tenu | `target/riscv/esp_cpu.c` (`esp_cpu_get_cycles`) ; mesure | hello 1 118 166 ; nvs 1 118 170 ; nvs-ota 1 118 182 ; crosspoint 429 162 |
+| 6 | UART0 : niveaux de ligne, compte de FIFO et valeurs de reset que QEMU ne modélise pas | (ii) copie | mesure ; `info mtree -f` (`esp_soc.uart`) | hello 6 483 ; nvs 6 601 ; nvs-ota 7 150 ; crosspoint 1 955 |
 | 7 | SPI1 : la flash de QEMU ne répond pas à SFDP, laisse `W0` périmé et n'a pas les valeurs de reset | (ii) copie | oracle §1b (`Unknown cmd 5a`) ; mesure | hello 40 |
-| 8 | SPI0, absent de QEMU : la configuration flash du cache | (ii) copie | `info mtree -f` ; mesure | hello 162 ; nvs 162 ; nvs-ota 169 |
+| 8 | SPI0, absent de QEMU : la configuration flash du cache | (ii) copie | `info mtree -f` ; mesure | hello 162 ; nvs 162 ; nvs-ota 169 ; crosspoint 88 |
 | 9 | RTC_CNTL : QEMU ne modélise que `OPTIONS0`, `RESET_STATE` et `STORE0`–`7` | (ii) horloge lente ; (ii) copie | `hw/misc/esp32c3_rtc_cntl.c` ; `clk_tree_defs.h` ; mesure | hello 162 ; nvs 162 ; nvs-ota 162 |
-| 10 | eFuse : les mots où les eFuses vierges de QEMU et ceux de la X4 diffèrent | (ii) copie | oracle §1d ; carryover SP1b-2 ligne 17 ; mesure | hello 132 ; nvs 126 ; nvs-ota 126 |
+| 10 | eFuse : les mots où les eFuses vierges de QEMU et ceux de la X4 diffèrent | (ii) copie | oracle §1d ; carryover SP1b-2 ligne 17 ; mesure | hello 132 ; nvs 126 ; nvs-ota 126 ; crosspoint 42 |
 | 11 | IO_MUX, absent de QEMU : la configuration des broches GPIO0–21 | (ii) copie | `info mtree -f` ; SVD ; mesure | hello 549 ; nvs 549 ; nvs-ota 549 |
-| 12 | Le maître I²C analogique, absent de QEMU : les accès regi2c de la ROM | (ii) copie | carryover SP1b-2 lignes 7 et 8 ; mesure | hello 268 ; nvs 268 ; nvs-ota 268 |
-| 13 | La mise sous tension de la radio par `rtc_sleep_pu`, absente de QEMU : BB, NRX, FE, FE2 | (ii) copie | ESP-IDF v5.5.2 `rtc_sleep.c` ; `esp32c3-bootloader-accesses.md` lignes 31–33 | hello 28 ; nvs 28 ; nvs-ota 28 |
+| 12 | Le maître I²C analogique, absent de QEMU : les accès regi2c de la ROM | (ii) copie | carryover SP1b-2 lignes 7 et 8 ; mesure | hello 268 ; nvs 268 ; nvs-ota 268 ; crosspoint 180 |
+| 13 | La mise sous tension de la radio par `rtc_sleep_pu`, absente de QEMU : BB, NRX, FE, FE2 | (ii) copie | ESP-IDF v5.5.2 `rtc_sleep.c` ; `esp32c3-bootloader-accesses.md` lignes 31–33 | hello 28 ; nvs 28 ; nvs-ota 28 ; crosspoint 14 |
 | 14 | TIMG0 et TIMG1 : valeurs de reset des chiens de garde, portes d'horloge, calibration RTC | (ii) copie | `timers-and-watchdogs` §G lignes 1, 5 et 8 ; mesure | hello 24 ; nvs 24 ; nvs-ota 24 |
 | 15 | SYSTIMER : les compteurs de QEMU perdent une fraction d'unité à chaque mise à jour et se lisent toujours valides | (ii) copie ; (ii) compteur tenu | `hw/timer/esp_systimer.c` ; SVD ; mesure | hello 4 442 ; nvs 4 714 ; nvs-ota 4 678 |
-| 16 | APB_CTRL, absent de QEMU : horloges Wi-Fi et alimentation des mémoires | (ii) copie | `info mtree -f` ; mesure | hello 43 ; nvs 43 ; nvs-ota 43 |
-| 17 | `RNG.DATA` : QEMU rend le `rand()` de l'hôte | (ii) copie | `hw/riscv/esp32c3.c` (`A_SYSCON_RND_DATA_REG`) | hello 3 208 ; nvs 3 208 ; nvs-ota 3 208 |
-| 18 | APB_SARADC, absent de QEMU : les sept registres de la source d'entropie du bootloader | (ii) copie | ESP-IDF v5.5.2 `bootloader_random_esp32c3.c` ; `esp32c3-bootloader-accesses.md` lignes 79–85 | hello 96 ; nvs 96 ; nvs-ota 96 |
-| 19 | USB-Serial-JTAG : `SERIAL_IN_EP_DATA_FREE`, que QEMU lit 0 | (ii) copie | carryover SP1b-2 ligne 22 ; mesure | hello 14 218 ; nvs 14 231 ; nvs-ota 14 384 |
+| 16 | APB_CTRL, absent de QEMU : horloges Wi-Fi et alimentation des mémoires | (ii) copie | `info mtree -f` ; mesure | hello 43 ; nvs 43 ; nvs-ota 43 ; crosspoint 18 |
+| 17 | `RNG.DATA` : QEMU rend le `rand()` de l'hôte | (ii) copie | `hw/riscv/esp32c3.c` (`A_SYSCON_RND_DATA_REG`) | hello 3 208 ; nvs 3 208 ; nvs-ota 3 208 ; crosspoint 1 604 |
+| 18 | APB_SARADC, absent de QEMU : les sept registres de la source d'entropie du bootloader | (ii) copie | ESP-IDF v5.5.2 `bootloader_random_esp32c3.c` ; `esp32c3-bootloader-accesses.md` lignes 79–85 | hello 96 ; nvs 96 ; nvs-ota 96 ; crosspoint 48 |
+| 19 | USB-Serial-JTAG : `SERIAL_IN_EP_DATA_FREE`, que QEMU lit 0 | (ii) copie | carryover SP1b-2 ligne 22 ; mesure | hello 14 218 ; nvs 14 231 ; nvs-ota 14 384 ; crosspoint 6 079 |
 | 20 | SYSTEM : portes d'horloge, resets et choix d'horloge que le modèle d'horloge de QEMU tient autrement | (ii) copie | `timers-and-watchdogs` §G ligne 12 ; mesure | hello 83 ; nvs 83 ; nvs-ota 83 |
-| 21 | SENSITIVE, absent de QEMU : la protection mémoire qu'ESP-IDF installe | (ii) copie | `info mtree -f` ; mesure | hello 154 ; nvs 154 ; nvs-ota 154 |
-| 22 | EXTMEM : bits d'alimentation, de gel et de synchronisation que le cache de QEMU ne tient pas | (ii) copie | carryover SP1b-2 ligne 3 ; mesure | hello 46 ; nvs 442 ; nvs-ota 388 |
+| 21 | SENSITIVE, absent de QEMU : la protection mémoire qu'ESP-IDF installe | (ii) copie | `info mtree -f` ; mesure | hello 154 ; nvs 154 ; nvs-ota 154 ; crosspoint 77 |
+| 22 | EXTMEM : bits d'alimentation, de gel et de synchronisation que le cache de QEMU ne tient pas | (ii) copie | carryover SP1b-2 ligne 3 ; mesure | hello 46 ; nvs 442 ; nvs-ota 388 ; crosspoint 24 |
 | 23 | ASSIST_DEBUG, absent de QEMU : le moniteur de pile de FreeRTOS | (ii) copie | `timers-and-watchdogs` §G ligne 13 ; mesure | hello 28 892 ; nvs 28 892 ; nvs-ota 28 892 |
 | 24 | SYSTIMER : pas d'alarme tant que le compteur est arrêté | (iv) réglage | `timers-and-watchdogs` §A.4 et §G ligne 10 ; `hw/timer/esp_systimer.c` | hello 2 ; nvs 2 ; nvs-ota 2 |
 | 25 | `flash_hello.bin`, à son reset : QEMU garde des registres et des CSR que le reset du CPU de la puce remet à leur valeur de reset | (i) gardé au reset | `cpu_rv32::Hart::reset` ; TRM §6.1 ; mesure | hello 4 789 611 |
@@ -204,7 +219,15 @@ usages de SP1b-4c (première vie de `flash_hello.bin` seule) sont dans l'ADR 000
 | 30 | `flash_nvs.bin`, EXTMEM : la synchronisation du cache autour des écritures de la flash | (ii) copie | mesure | nvs 2 ; nvs-ota 2 |
 | 31 | `flash_nvs.bin`, à son reset : comme la ligne 25, avec d'autres registres | (i) gardé au reset | `cpu_rv32::Hart::reset` ; TRM §6.1 ; mesure | nvs 5 108 772 ; nvs-ota 5 176 490 |
 | 32 | `flash_nvs.bin`, après son reset : les registres de SPI1 que le bootloader relit | (ii) copie après reset | mesure | nvs 4 ; nvs-ota 4 |
-| 33 | `flash_nvs_ota.bin`, SPI1 : `RD_STATUS`, où la ROM lit le `WEL` que la flash de QEMU garde | (ii) copie | `esp-idf-storage-flash-traffic.md` (résultat clé 5) ; mesure | nvs-ota 10 |
+| 33 | `flash_nvs_ota.bin`, SPI1 : `RD_STATUS`, où la ROM lit le `WEL` que la flash de QEMU garde | (ii) copie | `esp-idf-storage-flash-traffic.md` (résultat clé 5) ; mesure | nvs-ota 10 ; crosspoint 9 |
+| 34 | CrossPoint, SPI1 : la ligne 7, et le `WEL` que la flash de QEMU garde dans `W0` après `RDSR` | (ii) copie | `esp-idf-storage-flash-traffic.md` (résultat clé 5) ; mesure locale | crosspoint 21 |
+| 35 | CrossPoint, eFuse : un mot du bloc 2 où les eFuses vierges de QEMU et ceux de la X4 diffèrent | (ii) copie | oracle §1d ; mesure locale | crosspoint 1 |
+| 36 | CrossPoint, TIMG0 : les registres de la ligne 14 qu'il lit, et d'autres bits de la calibration RTC | (ii) copie | `timers-and-watchdogs` §G lignes 1 et 8 ; mesure locale | crosspoint 7 |
+| 37 | CrossPoint, RTC_CNTL : la ligne 9, avec moins de bits de la configuration du chien de garde RTC | (ii) horloge lente ; (ii) copie | `hw/misc/esp32c3_rtc_cntl.c` ; `clk_tree_defs.h` ; mesure locale | crosspoint 86 |
+| 38 | CrossPoint, IO_MUX : les broches de la flash (GPIO12–17) et de l'UART0 (GPIO20–21) | (ii) copie | `info mtree -f` ; SVD ; mesure locale | crosspoint 64 |
+| 39 | CrossPoint, SYSTIMER : la ligne 15 pour le compteur 0, le seul lu avant l'ordonnanceur | (ii) copie ; (ii) compteur tenu | `hw/timer/esp_systimer.c` ; SVD ; mesure locale | crosspoint 13 |
+| 40 | CrossPoint, SYSTEM : la ligne 20, un bit de moins dans `PERIP_RST_EN0` | (ii) copie | `timers-and-watchdogs` §G ligne 12 ; mesure locale | crosspoint 35 |
+| 41 | CrossPoint, ASSIST_DEBUG : les trois registres que le bootloader et le démarrage touchent | (ii) copie | `timers-and-watchdogs` §G ligne 13 ; mesure locale | crosspoint 7 |
 
 Les sources de QEMU sont celles de la branche `esp-develop` d'`espressif/qemu`. « Mesure » renvoie à
 la mesure du 2026-10-14 : chaque registre de la fenêtre lu ou écrit, les valeurs des deux côtés à
@@ -1001,6 +1024,158 @@ Paramètres :
 registre 0x6000202C masque 0x00000002
 ```
 
+### Lignes 34 à 41 — CrossPoint 1.6.5
+
+Mesurées en local le 2026-10-14 sur la fenêtre `crosspoint` (QEMU `esp_develop_9.2.2_20250817`,
+trace capturée, chaque chargement différent relevé par registre). La fenêtre s'arrête avant
+l'ordonnanceur : CrossPoint touche moins de registres et de bits que `hello` dans les lignes 7, 9,
+11, 14, 15, 20 et 23, et une fenêtre utilise entièrement chaque ligne qu'elle prend (décision R35
+du plan). Il a donc ses propres lignes, aux registres et aux bits mesurés sur lui ; les lignes de
+`hello` qu'il utilise entièrement, et la ligne 33, restent les mêmes.
+
+### Ligne 34 — CrossPoint : SPI1
+
+La ligne 7 ; après `RDSR` (`0x05`), `W0` diffère par les octets hauts que QEMU laisse périmés (bits
+13–14 et 19–20 de la mesure) et par `WEL` (bit 1), que la flash de QEMU garde après l'écriture
+d'`otadata` par le bootloader, comme dans la ligne 29. Mesure : 21 copies.
+
+Paramètres :
+
+```text
+registre 0x60002034 masque 0x00000002
+registre 0x60002058 masque 0x001860FF après 0x5A
+registre 0x60002058 masque 0x00186002 après 0x05
+registre 0x60002098 masque 0x00000014
+registre 0x6000209C masque 0x0A002000
+registre 0x600020DC masque 0x00000001
+```
+
+### Ligne 35 — CrossPoint : eFuse
+
+`RD_SYS_PART1_DATA5` (`0x60008870`, mot 5 du bloc 2, données système), lu ici et absent de la
+ligne 10 : les eFuses vierges de QEMU et ceux du profil X4 y diffèrent, comme dans la ligne 10.
+Mesure : une lecture.
+
+Paramètres :
+
+```text
+registre 0x60008870 masque 0x5ABA3A86
+```
+
+### Ligne 36 — CrossPoint : TIMG0
+
+Les registres de la ligne 14 où la fenêtre lit une différence : le chien de garde et la calibration
+de l'horloge RTC de TIMG0 ; les autres registres de la ligne 14 n'y diffèrent pas. La calibration
+(`RTCCALICFG1`, `0x6001F06C`) y rend d'autres valeurs, donc d'autres bits différents, que dans
+`hello`. Mesure : 7 copies.
+
+Paramètres :
+
+```text
+registre 0x6001F048 masque 0x0004C000
+registre 0x6001F068 masque 0x00008000
+registre 0x6001F06C masque 0x014AE180
+registre 0x6001F080 masque 0xFFFFFF99
+```
+
+### Ligne 37 — CrossPoint : RTC_CNTL
+
+La ligne 9, l'horloge lente comprise ; dans `WDTCONFIG0` (`0x60008090`), les bits 27–29 ne
+diffèrent pas dans cette fenêtre et ne sont pas pris. Mesure : 86 usages.
+
+Paramètres :
+
+```text
+horloge lente 0x60008010 capture 0x6000800C bit 31 136000 Hz écart 1 qemu 0x00000000
+registre 0x60008000 masque 0x1C00A000
+registre 0x6000801C masque 0x3C140543
+registre 0x60008024 masque 0x0A080A09
+registre 0x60008028 masque 0x12200A09
+registre 0x6000802C masque 0x00008000
+registre 0x60008030 masque 0x0A080000
+registre 0x60008034 masque 0x00D40000
+registre 0x60008038 masque 0x00003000
+registre 0x60008040 masque 0x00000200
+registre 0x60008070 masque 0x31D83298
+registre 0x60008074 masque 0x00400000
+registre 0x60008080 masque 0xA03FC000
+registre 0x60008088 masque 0x00575010
+registre 0x6000808C masque 0xBA805480
+registre 0x60008090 masque 0xC007FA14
+registre 0x600080AC masque 0x04B00000
+registre 0x600080D8 masque 0x7BFFC030
+registre 0x6000810C masque 0x00000007
+registre 0x6000811C masque 0xC0000000
+```
+
+### Ligne 38 — CrossPoint : IO_MUX
+
+Comme la ligne 11, sur les seules broches que la fenêtre lit : celles de la flash (GPIO12–17) et de
+l'UART0 (GPIO20–21). Le bit 10 (`FUN_DRV`) que la ligne 11 prend sur GPIO12–17 ne diffère pas
+ici. Mesure : 64 copies.
+
+Paramètres :
+
+```text
+registre 0x60009034 masque 0x00001B00
+registre 0x60009038 masque 0x00001B00
+registre 0x6000903C masque 0x00000B00
+registre 0x60009040 masque 0x00000B00
+registre 0x60009044 masque 0x00000B00
+registre 0x60009048 masque 0x00000B00
+registre 0x60009054 masque 0x00000B00
+registre 0x60009058 masque 0x00000B00
+```
+
+### Ligne 39 — CrossPoint : le compteur 0 du SYSTIMER
+
+La ligne 15 pour le seul compteur que la fenêtre lit, le compteur 0 (le compteur 1 sert au tick de
+FreeRTOS, qui ne démarre pas avant la fin de la fenêtre), et le bit `VALUE_VALID` de `UNIT0_OP`.
+Mesure : 13 usages, mouvement maximal de l'écart 1.
+
+Paramètres :
+
+```text
+registre 0x60023004 masque 0x20000000
+compteur 0x60023044 recul par mise à jour 0x60023000-0x600230FF origines 0x600C0018 0x60023000
+```
+
+### Ligne 40 — CrossPoint : SYSTEM
+
+La ligne 20, sans le bit 13 de `PERIP_RST_EN0` (`TIMERGROUP_RST`), égal des deux côtés dans cette
+fenêtre. Mesure : 35 copies.
+
+Paramètres :
+
+```text
+registre 0x600C0000 masque 0x00000040
+registre 0x600C0004 masque 0x000000C0
+registre 0x600C0008 masque 0x0000000C
+registre 0x600C000C masque 0x00000001
+registre 0x600C0010 masque 0xF9C1E06F
+registre 0x600C0014 masque 0x00000204
+registre 0x600C0018 masque 0xA86D9BEE
+registre 0x600C001C masque 0x000001FE
+registre 0x600C0020 masque 0x000000FF
+registre 0x600C0024 masque 0x02001001
+registre 0x600C0040 masque 0x00000007
+registre 0x600C0058 masque 0x00080401
+```
+
+### Ligne 41 — CrossPoint : ASSIST_DEBUG
+
+Trois registres de la ligne 23, que le bootloader et le démarrage de l'application touchent avec la
+même valeur des deux côtés : ils sont admis, rien n'est copié. Les autres registres de la ligne 23
+n'y diffèrent pas ou n'y sont pas touchés. Mesure : 7 accès.
+
+Paramètres :
+
+```text
+registre 0x600CE044 masque 0x00000000
+registre 0x600CE048 masque 0x00000000
+registre 0x600CE098 masque 0x00000000
+```
+
 ## Pourquoi la ligne 24 n'est pas une resynchronisation
 
 Aucune lecture de registre n'explique l'interruption précoce, donc rien à copier ; faire exécuter à
@@ -1025,7 +1200,8 @@ seulement.
 
 Deux sortes de blocs de la trace de QEMU ne sont pas des états d'instruction et sont écartés (ADR
 0008) : un bloc réimprimé à l'identique quand le budget d'instructions de QEMU se recharge (100 dans
-`hello`, 114 dans `nvs`, jamais deux de suite ; un deuxième à l'identique est comparé comme une
+`hello`, 114 dans `nvs`, 657 dans `crosspoint`, jamais deux de suite ; un deuxième à l'identique est comparé comme une
 instruction exécutée, sauf un saut sur lui-même reconnu sur ses bits et l'état de QEMU), et un bloc
-dont QEMU prend l'interruption avant d'exécuter l'instruction (20 dans chacune). Le temps est aligné par le modèle
+dont QEMU prend l'interruption avant d'exécuter l'instruction (20 dans chacune des fenêtres de la
+CI, aucun dans `crosspoint`). Le temps est aligné par le modèle
 `qemu-icount` (décision H2), pas par une ligne.

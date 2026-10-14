@@ -1013,6 +1013,155 @@ pub const ROW_NVS_OTA_SPI1_STATUS: Difference = Difference {
     treatments: &[Treatment::Registers(&[copy(0x6000_202C, 0x0000_0002)])],
 };
 
+/// Row 34. Rows 34 to 41 were measured on `CrossPoint` 1.6.5 in local (SP1b-4d): its window ends
+/// before the scheduler starts, and uses fewer registers and bits of rows 7, 9, 11, 14, 15, 20 and
+/// 23 than `hello`, a few others more.
+pub const ROW_CROSSPOINT_SPI1: Difference = Difference {
+    number: 34,
+    summary: "CrossPoint, SPI1: row 7, and the WEL QEMU's flash keeps in W0 after RDSR",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6000_2034, 0x0000_0002),
+        Register {
+            address: 0x6000_2058,
+            mask: 0x0018_60FF,
+            qemu: None,
+            after_command: Some(0x5A),
+        },
+        Register {
+            address: 0x6000_2058,
+            mask: 0x0018_6002,
+            qemu: None,
+            after_command: Some(0x05),
+        },
+        copy(0x6000_2098, 0x0000_0014),
+        copy(0x6000_209C, 0x0A00_2000),
+        copy(0x6000_20DC, 0x0000_0001),
+    ])],
+};
+
+/// Row 35.
+pub const ROW_CROSSPOINT_EFUSE: Difference = Difference {
+    number: 35,
+    summary: "CrossPoint, eFuse: a word of BLOCK_SYS_DATA1 where QEMU's blank eFuses and the X4's differ",
+    treatments: &[Treatment::Registers(&[copy(0x6000_8870, 0x5ABA_3A86)])],
+};
+
+/// Row 36.
+pub const ROW_CROSSPOINT_TIMG0: Difference = Difference {
+    number: 36,
+    summary: "CrossPoint, TIMG0: row 14's registers it reads, and more bits of the RTC calibration",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6001_F048, 0x0004_C000),
+        copy(0x6001_F068, 0x0000_8000),
+        copy(0x6001_F06C, 0x014A_E180),
+        copy(0x6001_F080, 0xFFFF_FF99),
+    ])],
+};
+
+/// Row 37.
+pub const ROW_CROSSPOINT_RTC_CNTL: Difference = Difference {
+    number: 37,
+    summary: "CrossPoint, RTC_CNTL: row 9, fewer bits of the RTC watchdog's configuration",
+    treatments: &[
+        Treatment::SlowClock {
+            register: RTC_TIME_LOW0,
+            capture: RTC_TIME_UPDATE,
+            trigger: 1 << 31,
+            hz: 136_000,
+            bound: 1,
+            qemu: 0,
+        },
+        Treatment::Registers(&[
+            copy(0x6000_8000, 0x1C00_A000),
+            copy(0x6000_801C, 0x3C14_0543),
+            copy(0x6000_8024, 0x0A08_0A09),
+            copy(0x6000_8028, 0x1220_0A09),
+            copy(0x6000_802C, 0x0000_8000),
+            copy(0x6000_8030, 0x0A08_0000),
+            copy(0x6000_8034, 0x00D4_0000),
+            copy(0x6000_8038, 0x0000_3000),
+            copy(0x6000_8040, 0x0000_0200),
+            copy(0x6000_8070, 0x31D8_3298),
+            copy(0x6000_8074, 0x0040_0000),
+            copy(0x6000_8080, 0xA03F_C000),
+            copy(0x6000_8088, 0x0057_5010),
+            copy(0x6000_808C, 0xBA80_5480),
+            copy(0x6000_8090, 0xC007_FA14),
+            copy(0x6000_80AC, 0x04B0_0000),
+            copy(0x6000_80D8, 0x7BFF_C030),
+            copy(0x6000_810C, 0x0000_0007),
+            copy(0x6000_811C, 0xC000_0000),
+        ]),
+    ],
+};
+
+/// Row 38.
+pub const ROW_CROSSPOINT_IO_MUX: Difference = Difference {
+    number: 38,
+    summary: "CrossPoint, IO_MUX: the pads of the flash (GPIO12-17) and of UART0 (GPIO20-21)",
+    treatments: &[Treatment::Registers(&[
+        copy(0x6000_9034, 0x0000_1B00),
+        copy(0x6000_9038, 0x0000_1B00),
+        copy(0x6000_903C, 0x0000_0B00),
+        copy(0x6000_9040, 0x0000_0B00),
+        copy(0x6000_9044, 0x0000_0B00),
+        copy(0x6000_9048, 0x0000_0B00),
+        copy(0x6000_9054, 0x0000_0B00),
+        copy(0x6000_9058, 0x0000_0B00),
+    ])],
+};
+
+/// Row 39.
+pub const ROW_CROSSPOINT_SYSTIMER: Difference = Difference {
+    number: 39,
+    summary: "CrossPoint, SYSTIMER: row 15 for counter 0, the one read before the scheduler starts",
+    treatments: &[
+        Treatment::Registers(&[copy(0x6002_3004, 0x2000_0000)]),
+        Treatment::Counter {
+            location: Location::Mmio(SYSTIMER_UNIT0_VALUE_LO),
+            drift: Drift::Truncated {
+                first: SYSTIMER.0,
+                last: SYSTIMER.1,
+            },
+            origins: &[
+                Location::Mmio(SYSTEM_PERIP_RST_EN0),
+                Location::Mmio(SYSTIMER_CONF),
+            ],
+        },
+    ],
+};
+
+/// Row 40.
+pub const ROW_CROSSPOINT_SYSTEM: Difference = Difference {
+    number: 40,
+    summary: "CrossPoint, SYSTEM: row 20, one bit fewer of PERIP_RST_EN0",
+    treatments: &[Treatment::Registers(&[
+        copy(0x600C_0000, 0x0000_0040),
+        copy(0x600C_0004, 0x0000_00C0),
+        copy(0x600C_0008, 0x0000_000C),
+        copy(0x600C_000C, 0x0000_0001),
+        copy(0x600C_0010, 0xF9C1_E06F),
+        copy(0x600C_0014, 0x0000_0204),
+        copy(0x600C_0018, 0xA86D_9BEE),
+        copy(0x600C_001C, 0x0000_01FE),
+        copy(0x600C_0020, 0x0000_00FF),
+        copy(0x600C_0024, 0x0200_1001),
+        copy(0x600C_0040, 0x0000_0007),
+        copy(0x600C_0058, 0x0008_0401),
+    ])],
+};
+
+/// Row 41.
+pub const ROW_CROSSPOINT_ASSIST_DEBUG: Difference = Difference {
+    number: 41,
+    summary: "CrossPoint, ASSIST_DEBUG: the three registers the bootloader and the start-up touch",
+    treatments: &[Treatment::Registers(&[
+        admit(0x600C_E044),
+        admit(0x600C_E048),
+        admit(0x600C_E098),
+    ])],
+};
+
 /// The rows of the window `hello` ([`crate::window::WINDOWS`]).
 pub const HELLO: &[Difference] = &[
     ROW_MSTATUS_MPP,
@@ -1147,6 +1296,43 @@ pub const DIFFERENCES: &[Difference] = &[
     ROW_NVS_KEPT_AT_RESET,
     ROW_NVS_SPI1_AFTER_RESET,
     ROW_NVS_OTA_SPI1_STATUS,
+    ROW_CROSSPOINT_SPI1,
+    ROW_CROSSPOINT_EFUSE,
+    ROW_CROSSPOINT_TIMG0,
+    ROW_CROSSPOINT_RTC_CNTL,
+    ROW_CROSSPOINT_IO_MUX,
+    ROW_CROSSPOINT_SYSTIMER,
+    ROW_CROSSPOINT_SYSTEM,
+    ROW_CROSSPOINT_ASSIST_DEBUG,
+];
+
+/// The rows of the window `crosspoint`, compared in local only (`CrossPoint` 1.6.5 cannot be
+/// distributed): rows of the first life of `hello` it uses whole, row 33, and its own.
+pub const CROSSPOINT: &[Difference] = &[
+    ROW_MSTATUS_MPP,
+    ROW_MIE_AT_POWER_ON,
+    ROW_MTVEC_MODE_AT_POWER_ON,
+    ROW_CYCLE_COUNTER,
+    ROW_UART0,
+    ROW_SPI0,
+    ROW_EFUSE,
+    ROW_REGI2C,
+    ROW_RADIO,
+    ROW_APB_CTRL,
+    ROW_RNG,
+    ROW_APB_SARADC,
+    ROW_USB_SERIAL_JTAG,
+    ROW_SENSITIVE,
+    ROW_EXTMEM,
+    ROW_NVS_OTA_SPI1_STATUS,
+    ROW_CROSSPOINT_SPI1,
+    ROW_CROSSPOINT_EFUSE,
+    ROW_CROSSPOINT_TIMG0,
+    ROW_CROSSPOINT_RTC_CNTL,
+    ROW_CROSSPOINT_IO_MUX,
+    ROW_CROSSPOINT_SYSTIMER,
+    ROW_CROSSPOINT_SYSTEM,
+    ROW_CROSSPOINT_ASSIST_DEBUG,
 ];
 
 /// A peripheral QEMU instantiates, by its first and last byte: the flattened memory tree of
