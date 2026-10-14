@@ -1,0 +1,11 @@
+dependencies:
+  idf: '>=5.0'
+description: CoreMark Benchmark
+documentation: https://www.eembc.org/coremark/
+issues: https://github.com/espressif/idf-extra-components/issues
+repository: git://github.com/espressif/idf-extra-components.git
+repository_info:
+  commit_sha: 746e83ddbea0db9c3d24993a87c4c737a60337ae
+  path: coremark
+url: https://github.com/espressif/idf-extra-components/tree/master/coremark
+version: 1.1.0~2

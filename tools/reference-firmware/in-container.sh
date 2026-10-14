@@ -110,14 +110,22 @@ symbols nvs_rw_value_cxx
 # this directory's too: adc_wait_panic waits for the SAR ADC with interrupts masked, as CrossPoint
 # does, until the interrupt watchdog panics, and its next life finds the core dump the panic wrote;
 # deep_sleep_timer counts its lives in RTC memory through three deep sleeps on the RTC timer and a
-# fourth with no wake source.
+# fourth with no wake source. The last one, coremark_example, is Espressif's CoreMark example and
+# component, copied unmodified into this directory (coremark_example/PROVENANCE.md): the build has no
+# network and no component manager. Its copied files are checked first, against their pinned hashes;
+# the CoreMark run rules ask for the benchmark's files unmodified.
+if ! (cd /ref/coremark_example && sha256sum --quiet -c /ref/SHA256SUMS.coremark-sources); then
+  echo "error: a file of coremark_example is not the copy of espressif/coremark 1.1.0~2 its hash pins (see above); restore it from the release (coremark_example/PROVENANCE.md), never edit the sums" >&2
+  exit 1
+fi
 applications=()
 for project in \
   "$IDF_PATH/examples/peripherals/uart/uart_select:SHA256SUMS.inputs-uart-select" \
   "$IDF_PATH/examples/peripherals/usb_serial_jtag/usb_serial_jtag_echo:SHA256SUMS.inputs-usj-echo" \
   "/ref/usb_serial_jtag_console:SHA256SUMS.inputs-usj-console" \
   "/ref/adc_wait_panic:SHA256SUMS.inputs-adc-wait-panic" \
-  "/ref/deep_sleep_timer:SHA256SUMS.inputs-deep-sleep-timer"; do
+  "/ref/deep_sleep_timer:SHA256SUMS.inputs-deep-sleep-timer" \
+  "/ref/coremark_example:SHA256SUMS.inputs-coremark"; do
   source="${project%%:*}"
   name="$(basename "$source")"
   build_example "$source" "/ref/${project##*:}"
