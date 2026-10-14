@@ -249,18 +249,39 @@ fn reset_value(offset: u32) -> u32 {
     svd_regs::esp32c3::lookup(SYSTEM_BASE + offset).map_or(0, |r| r.reset_value)
 }
 
-/// CRC-32/ISO-HDLC, bit by bit: the CRC unit reads at most 8 KiB, twice per sleep, so a table
-/// would buy nothing.
-fn crc32_iso_hdlc(bytes: &[u8]) -> u32 {
-    const POLYNOMIAL: u32 = 0xEDB8_8320;
-    !bytes.iter().fold(u32::MAX, |crc, &byte| {
-        (0..8).fold(crc ^ u32::from(byte), |crc, _| {
-            if crc & 1 == 0 {
+/// The reflected polynomial of CRC-32/ISO-HDLC.
+const CRC32_POLYNOMIAL: u32 = 0xEDB8_8320;
+
+/// The CRC-32/ISO-HDLC remainder of each byte value, built at compile time.
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0; 256];
+    // The byte value, as an index and as the start of its remainder: two counters, no cast.
+    let mut index = 0;
+    let mut byte: u32 = 0;
+    while index < 256 {
+        let mut crc = byte;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 == 0 {
                 crc >> 1
             } else {
-                (crc >> 1) ^ POLYNOMIAL
-            }
-        })
+                (crc >> 1) ^ CRC32_POLYNOMIAL
+            };
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+        byte += 1;
+    }
+    table
+};
+
+/// CRC-32/ISO-HDLC, a byte per step through [`CRC32_TABLE`]. The firmware chooses how often the
+/// CRC unit runs (each rising edge of `START`), over at most the 8 KiB of the RTC fast memory:
+/// one table lookup per byte keeps the cost of a run of the unit at 8 192 steps.
+fn crc32_iso_hdlc(bytes: &[u8]) -> u32 {
+    !bytes.iter().fold(u32::MAX, |crc, &byte| {
+        (crc >> 8) ^ CRC32_TABLE[usize::from(crc.to_le_bytes()[0] ^ byte)]
     })
 }
 
