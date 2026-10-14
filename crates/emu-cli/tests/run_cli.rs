@@ -111,6 +111,170 @@ fn run_help_lists_every_exit_code() {
 }
 
 #[test]
+fn replay_help_lists_every_exit_code_of_a_replay() {
+    let help = inkemu().args(["replay", "--help"]).assert().success();
+    let out = String::from_utf8_lossy(&help.get_output().stdout).into_owned();
+    for code in [0, 2, 6, 130] {
+        assert!(
+            out.contains(&format!("\n{code:>3}  ")),
+            "exit code {code} missing from:\n{out}"
+        );
+    }
+    assert!(
+        out.contains("Usage: inkemu replay [OPTIONS] <SESSION>"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_file_that_is_no_session_exits_2_before_any_rom_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.inkrec");
+    inkemu()
+        .arg("replay")
+        .arg(&missing)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(contains("error: cannot read the session ").and(contains("; check the path")));
+    let garbage = dir.path().join("garbage.inkrec");
+    std::fs::write(&garbage, b"inkemu-session 9\nwhatever").unwrap();
+    inkemu()
+        .arg("replay")
+        .arg(&garbage)
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "is refused: the file is a session of format `inkemu-session 9`, and this inkemu reads `inkemu-session 1` only",
+        ));
+}
+
+/// A session comes from anywhere: one whose profile text holds an escape sequence, which TOML
+/// refuses and whose line the refusal quotes, reaches the terminal escaped.
+#[test]
+fn a_session_whose_profile_would_drive_the_terminal_is_refused_with_its_text_escaped() {
+    use sha2::{Digest as _, Sha256};
+    let text = boards::builtin_toml("x4").unwrap().to_owned();
+    let session = session::Session {
+        rom: session::RomIdentity {
+            revision: 3,
+            sha256: [0; 32],
+        },
+        profile: session::ProfileText {
+            id: "x4".to_owned(),
+            text: text.clone(),
+        },
+        flash: vec![0xFF; 16 << 20],
+        limits: session::Limits::default(),
+        usb_host: soc_esp32c3::UsbHost::Open,
+        inputs: Vec::new(),
+        outcome: session::Outcome {
+            end: session::End::Idle,
+            device_time: emu_core::Cycles(0),
+            cycles: 0,
+            instructions: 0,
+            trace_hash: 0,
+            flash_sha256: [0; 32],
+            consoles: [[0; 32]; 3],
+        },
+    };
+    let mut bytes = session.to_bytes().unwrap();
+    // The writer refuses such a text: the file is changed afterwards, its SHA-256 redone.
+    let hostile = text.replacen("name = \"Xteink X4\"", "name = \"\u{1b}[2Jnk X4\"", 1);
+    for (from, to) in [
+        (text.as_bytes().to_vec(), hostile.as_bytes().to_vec()),
+        (
+            Sha256::digest(text.as_bytes()).to_vec(),
+            Sha256::digest(hostile.as_bytes()).to_vec(),
+        ),
+    ] {
+        let at = bytes
+            .windows(from.len())
+            .position(|window| window == from.as_slice())
+            .unwrap();
+        bytes[at..at + to.len()].copy_from_slice(&to);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hostile.inkrec");
+    std::fs::write(&path, &bytes).unwrap();
+    inkemu()
+        .arg("replay")
+        .arg(&path)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::function(|err: &[u8]| !err.contains(&0x1b)))
+        .stderr(contains("is refused: ").and(contains("\\u{1b}[2Jnk X4")));
+}
+
+#[test]
+fn record_refuses_the_path_of_a_file_the_run_reads_before_any_rom_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("flash.bin");
+    std::fs::write(&image, [0xFFu8; 16]).unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--flash"])
+        .arg(&image)
+        .arg("--record")
+        .arg(&image)
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "flash.bin, which is the file of --flash, which the run reads; give --record another path",
+        ));
+    assert_eq!(std::fs::read(&image).unwrap(), [0xFFu8; 16]);
+    inkemu()
+        .args(["run", "--device", "x4", "--record"])
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stderr(contains("which is a directory or a link, not a file"));
+}
+
+/// The first run on a flash file finds no file at its path, and replaces it with the flash when
+/// it ends: a session written there would be lost, or would replace the flash. The flash file,
+/// its lock and its temporary file are refused, whether they exist or not, before anything is
+/// created; so are the ROM file the run reads, and a directory that does not exist.
+#[test]
+fn record_refuses_the_flash_file_its_own_files_and_the_rom_before_they_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let roms = tempfile::tempdir().unwrap();
+    let flash = dir.path().join("x4.bin");
+    let record = |path: &std::path::Path| {
+        inkemu()
+            .args(["run", "--device", "x4", "--rom-dir"])
+            .arg(roms.path())
+            .arg("--flash-file")
+            .arg(&flash)
+            .arg("--record")
+            .arg(path)
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::starts_with("error: --record names "))
+    };
+    for (path, what) in [
+        (flash.clone(), "the flash file of --flash-file"),
+        (
+            dir.path().join("x4.bin.lock"),
+            "the lock file of --flash-file",
+        ),
+        (
+            dir.path().join(".x4.bin.tmp"),
+            "the temporary file of --flash-file",
+        ),
+        (roms.path().join(MISSING_ROM), "the ROM file of --rom-dir"),
+    ] {
+        record(&path).stderr(contains(format!(", which is {what}")));
+    }
+    record(&dir.path().join("runs").join("s.inkrec")).stderr(contains(
+        "s.inkrec, in a directory that does not exist; create it, or give --record a path in a directory that exists",
+    ));
+    assert_eq!(names_in(dir.path()), Vec::<String>::new());
+    assert_eq!(names_in(roms.path()), Vec::<String>::new());
+}
+
+#[test]
 fn a_time_limit_that_is_not_a_number_of_seconds_exits_2_and_says_what_to_write() {
     // A negative number included: it is a value of the option, refused for what it is, and not
     // an unknown flag.
@@ -3806,6 +3970,40 @@ fn the_readme_shows_run_help_as_the_binary_prints_it() {
     assert_eq!(words(block), help);
 }
 
+/// The commands the README shows for recording and replaying a run are commands this inkemu
+/// takes: each one, given `--help` after its arguments, parses (a renamed option or subcommand
+/// would be refused with exit code 2) and prints the help of its subcommand.
+#[test]
+fn the_readme_records_and_replays_with_commands_the_binary_takes() {
+    let readme = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+    )
+    .unwrap();
+    let block = readme
+        .split_once("### Recording and replaying a run\n\n```sh\n")
+        .unwrap_or_else(|| panic!("no example of recording in the README"))
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    let commands: Vec<Vec<&str>> = block
+        .lines()
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(commands.len(), 2, "{block}");
+    for words in commands {
+        let (program, args) = words.split_first().unwrap();
+        assert_eq!(*program, "inkemu", "{words:?}");
+        let subcommand = args[0];
+        inkemu()
+            .args(args)
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(contains(format!("Usage: inkemu {subcommand} ")));
+    }
+}
+
 /// `hello_world.bin` and `nvs_rw_value_cxx.bin`, the application images the reference build
 /// merges at 0x10000 (`tools/reference-firmware/SHA256SUMS.inputs`, `SHA256SUMS.inputs-nvs`).
 const HELLO_APPLICATION_SHA256: &str =
@@ -4324,5 +4522,216 @@ fn x4_runs_the_deep_sleep_timer_reference_firmware_through_three_wakes_into_a_sl
         measured,
         Some(DEEP_SLEEP_TIMER_TRACE),
         "the trace hash of this run is {measured:?}: when the run above is the one intended, pin it in DEEP_SLEEP_TIMER_TRACE\n{log}"
+    );
+}
+
+/// What the host sends to `deep_sleep_timer`, which reads nothing: bytes on UART0 at power-on,
+/// then, a second into its first deep sleep, bytes dated in the sleep and a change of the USB
+/// host, then bytes once the second life has said it woke.
+const DEEP_SLEEP_TIMER_SCRIPT: &str = "\
+send uart0 \"before\"
+wait-for uart0 \"sleeping 2000 ms on the RTC timer\"
+wait 1s
+send uart0 \"asleep\"
+usb-host attached
+wait-for uart0 \"life 2, reset by deep sleep\"
+send uart0 \"after\"
+";
+
+/// Recording and replaying a session through resets and deep sleeps (spec §5 criterion 1):
+/// `deep_sleep_timer`, driven by a console script that sends before a deep sleep, during it and
+/// after the wake, is recorded with `--record` through its three wakes into its sleep without
+/// end, then replayed by `inkemu replay`: exit 0, the same console, the same trace hash.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_DEEP_SLEEP_TIMER_APP"]
+fn x4_records_the_deep_sleep_timer_reference_firmware_through_its_wakes_and_replays_it_identically()
+{
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let application = std::env::var("INKEMU_DEEP_SLEEP_TIMER_APP").expect(
+        "set INKEMU_DEEP_SLEEP_TIMER_APP to the deep_sleep_timer.bin of tools/reference-firmware/build.sh",
+    );
+    assert_eq!(
+        sha256_of(std::path::Path::new(&application)),
+        pinned_in_sums("SHA256SUMS.inputs-deep-sleep-timer", "deep_sleep_timer.bin"),
+        "{application} is not the pinned deep_sleep_timer.bin; rebuild it with tools/reference-firmware/build.sh"
+    );
+    let (_script_dir, script) = console_script(DEEP_SLEEP_TIMER_SCRIPT);
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("deep_sleep_timer.inkrec");
+    let run = inkemu()
+        .args(["run", "--device", "x4", "--console", "uart0"])
+        .args(["--max-time", "30", "--rom-dir", &rom_dir])
+        .arg("--firmware")
+        .arg(&application)
+        .arg("--console-script")
+        .arg(&script)
+        .arg("--record")
+        .arg(&session)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let run_log = String::from_utf8_lossy(&run.stderr).into_owned();
+    let console = String::from_utf8_lossy(&run.stdout).into_owned();
+    for expected in [
+        "inkemu: console script through (7 steps)\n",
+        "\ninkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here\n",
+        "inkemu: session recorded in deep_sleep_timer.inkrec (4 inputs); `inkemu replay` replays it\n",
+    ] {
+        assert!(
+            run_log.contains(expected),
+            "`{expected}` is missing:\n{run_log}"
+        );
+    }
+    let wakes = run_log
+        .matches("inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset at ")
+        .count();
+    assert_eq!(wakes, 3, "{run_log}");
+    assert_eq!(console.matches("rst:").count(), 4, "{console}");
+    let replayed = inkemu()
+        .arg("replay")
+        .arg(&session)
+        .args(["--console", "uart0", "--rom-dir", &rom_dir])
+        .timeout(HANG_LIMIT)
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&replayed.stderr).into_owned();
+    assert_eq!(replayed.status.code(), Some(0), "{log}");
+    assert_eq!(
+        String::from_utf8_lossy(&replayed.stdout),
+        console,
+        "the replay shows the console of the run"
+    );
+    assert!(
+        log.contains("inkemu: the replay gives what the session recorded: "),
+        "{log}"
+    );
+    assert_eq!(
+        log.matches("inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset at ")
+            .count(),
+        3,
+        "{log}"
+    );
+    let trace = trace_hash_line(&run_log);
+    assert!(
+        trace.is_some(),
+        "a recorded run prints its trace hash:\n{run_log}"
+    );
+    assert_eq!(trace_hash_line(&log), trace, "{log}");
+}
+
+/// The script the console-script reference test types into `uart_select`
+/// (`crates/console-script/tests/reference_firmware.rs`): through by 10.6 s of device time.
+const UART_SELECT_SCRIPT: &str = "\
+wait-for uart0 \"Timeout has been reached and nothing has been received\\r\\n\"
+send uart0 \"a\"
+wait-for uart0 \"Received: a\\r\\n\"
+wait 500ms
+send uart0 \"bc\\r\\n\"
+wait-for uart0 \"Timeout has been reached and nothing has been received\\r\\n\"
+";
+
+/// Recording and replaying a session (G9): `uart_select`, an application of ESP-IDF, typed into
+/// by a console script whose dates come from what it reads, is recorded with `--record`, then
+/// replayed by `inkemu replay`: exit 0, the same console, the same trace hash. A copy of the
+/// session whose first console input is changed replays, and diverges: exit 6.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_UART_SELECT_APP"]
+fn x4_records_the_uart_select_reference_firmware_typed_into_and_replays_it_identically() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let application = std::env::var("INKEMU_UART_SELECT_APP").expect(
+        "set INKEMU_UART_SELECT_APP to the uart_select.bin of tools/reference-firmware/build.sh",
+    );
+    assert_eq!(
+        sha256_of(std::path::Path::new(&application)),
+        pinned_in_sums("SHA256SUMS.inputs-uart-select", "uart_select.bin"),
+        "{application} is not the pinned uart_select.bin; rebuild it with tools/reference-firmware/build.sh"
+    );
+    let (_script_dir, script) = console_script(UART_SELECT_SCRIPT);
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("uart_select.inkrec");
+    let run = inkemu()
+        .args(["run", "--device", "x4", "--console", "uart0"])
+        .args(["--max-time", "12", "--rom-dir", &rom_dir])
+        .arg("--firmware")
+        .arg(&application)
+        .arg("--console-script")
+        .arg(&script)
+        .arg("--record")
+        .arg(&session)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let run_log = String::from_utf8_lossy(&run.stderr).into_owned();
+    let console = String::from_utf8_lossy(&run.stdout).into_owned();
+    for expected in [
+        "inkemu: console script through (6 steps)\n",
+        "inkemu: session recorded in uart_select.inkrec (",
+    ] {
+        assert!(
+            run_log.contains(expected),
+            "`{expected}` is missing:\n{run_log}"
+        );
+    }
+    assert!(
+        console.contains("uart_select_example: Received: a"),
+        "{console}"
+    );
+    let replay = |path: &std::path::Path| {
+        inkemu()
+            .arg("replay")
+            .arg(path)
+            .args(["--console", "uart0", "--rom-dir", &rom_dir])
+            .timeout(HANG_LIMIT)
+            .output()
+            .unwrap()
+    };
+    let replayed = replay(&session);
+    let log = String::from_utf8_lossy(&replayed.stderr).into_owned();
+    assert_eq!(replayed.status.code(), Some(0), "{log}");
+    assert_eq!(
+        String::from_utf8_lossy(&replayed.stdout),
+        console,
+        "the replay shows the console of the run"
+    );
+    assert!(
+        log.contains("inkemu: the replay gives what the session recorded: "),
+        "{log}"
+    );
+    let trace = trace_hash_line(&run_log);
+    assert!(
+        trace.is_some(),
+        "a recorded run prints its trace hash:\n{run_log}"
+    );
+    assert_eq!(trace_hash_line(&log), trace, "{log}");
+    // The same session with its first byte typed changed: a replay of another run.
+    let mut changed = session::Session::from_bytes(&std::fs::read(&session).unwrap()).unwrap();
+    let Some(soc_esp32c3::AcceptedInput::Console { bytes, .. }) = changed
+        .inputs
+        .iter_mut()
+        .find(|input| matches!(input, soc_esp32c3::AcceptedInput::Console { .. }))
+    else {
+        panic!("the script typed into the run")
+    };
+    bytes[0] = b'z';
+    let changed_path = dir.path().join("changed.inkrec");
+    std::fs::write(&changed_path, changed.to_bytes().unwrap()).unwrap();
+    let diverged = replay(&changed_path);
+    let log = String::from_utf8_lossy(&diverged.stderr).into_owned();
+    assert_eq!(diverged.status.code(), Some(6), "{log}");
+    assert!(
+        log.contains("inkemu: the replay diverges from the session: "),
+        "{log}"
+    );
+    assert!(
+        String::from_utf8_lossy(&diverged.stdout).contains("uart_select_example: Received: z"),
+        "the replay ran the changed input"
     );
 }

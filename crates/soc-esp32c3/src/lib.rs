@@ -4,8 +4,9 @@
 //! ([`clock`]) and run-time configuration ([`config`]), the flash chip ([`flash`]), the mask-ROM
 //! image built from an Espressif ROM ELF ([`rom`]), the address space that routes each access to
 //! the ROM, the RAMs, the flash windows or a peripheral ([`bus`]), the modelled peripherals
-//! ([`periph`]), the diagnostics that report what is not modelled ([`diag`]) and the machine that
-//! runs one hart on all of it ([`machine`]).
+//! ([`periph`]), the diagnostics that report what is not modelled ([`diag`]), the machine that
+//! runs one hart on all of it ([`machine`]) and the journal of the inputs it accepted
+//! ([`inputs`]).
 //!
 //! This crate performs no host I/O (no file, network or clock): callers hand it bytes.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -17,6 +18,7 @@ pub mod config;
 pub mod ctx;
 pub mod diag;
 pub mod flash;
+pub mod inputs;
 pub mod machine;
 pub mod memmap;
 pub mod periph;
@@ -30,6 +32,10 @@ pub use config::SocConfig;
 pub use diag::Diagnostic;
 pub use flash::{
     FlashConfig, FlashConfigError, FlashDevice, FlashImageError, FlashWrite, JedecId, NorFlash,
+};
+pub use inputs::{
+    AcceptedInput, InputJournal, MAX_JOURNAL_CONSOLE_BYTES, MAX_JOURNAL_CONSOLE_CHUNKS,
+    MAX_JOURNAL_HOST_CHANGES, MAX_JOURNAL_INPUTS,
 };
 pub use machine::{
     ConsoleChannel, DeepSleep, Esp32C3, InputError, MAX_PENDING_HOST_BYTES,

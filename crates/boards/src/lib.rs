@@ -455,14 +455,24 @@ pub fn builtin_ids() -> &'static [&'static str] {
 /// # Errors
 /// [`ProfileError::UnknownDevice`] when no built-in profile has this id.
 pub fn builtin(id: &str) -> Result<DeviceProfile, ProfileError> {
-    let (_, text) = BUILTIN
+    let text = builtin_toml(id)?;
+    DeviceProfile::from_named_toml(id, &format!("built-in profile {id}"), text)
+}
+
+/// The text of the built-in profile `id`, as [`builtin`] reads it: what a session carries, so
+/// that its replay rebuilds the device it was recorded on whatever the profile becomes later.
+///
+/// # Errors
+/// [`ProfileError::UnknownDevice`] when no built-in profile has this id.
+pub fn builtin_toml(id: &str) -> Result<&'static str, ProfileError> {
+    BUILTIN
         .iter()
         .find(|(known, _)| *known == id)
+        .map(|(_, text)| *text)
         .ok_or_else(|| ProfileError::UnknownDevice {
             id: id.to_owned(),
             known: BUILTIN_IDS.join(", "),
-        })?;
-    DeviceProfile::from_named_toml(id, &format!("built-in profile {id}"), text)
+        })
 }
 
 impl DeviceProfile {
@@ -681,6 +691,21 @@ mod tests {
                 "decision D2"
             );
         }
+    }
+
+    #[test]
+    fn the_text_of_a_builtin_profile_is_the_one_it_is_loaded_from() {
+        for id in builtin_ids() {
+            let text = builtin_toml(id).unwrap();
+            assert_eq!(
+                DeviceProfile::from_named_toml(id, "text", text).unwrap(),
+                builtin(id).unwrap()
+            );
+        }
+        assert!(matches!(
+            builtin_toml("x9"),
+            Err(ProfileError::UnknownDevice { .. })
+        ));
     }
 
     #[test]

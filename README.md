@@ -196,6 +196,7 @@ Options:
       --usb-host <USB_HOST>      The USB host on the USB-Serial-JTAG port when the device starts: absent (no cable), attached (the port closed: frames, nothing read) or open (a program reads and writes the port) [default: open] [possible values: absent, attached, open]
       --rom-dir <ROM_DIR>        Use the ROM ELF files of this directory and never download
       --trace-hash               Print the execution trace hash at the end (determinism checks)
+      --record <FILE>            Record the run in this file, a session that `inkemu replay` replays: the identity of the ROM (not the ROM), the device profile, the whole flash the run starts from, the limits, the USB host at power-on, every input the consoles and the USB host received with its device time, and what the run came to (its end, device time, cycles, instructions, trace hash, final flash and consoles). The file is written when the run ends, however it ends but at a second Ctrl-C: a run cut by Ctrl-C or by its reader is recorded with the device time it stopped at. The path may not be a file the run reads or writes, even one that does not exist yet (the flash file, its lock and temporary files, a ROM file), and its directory must exist. A session holds the whole flash: on Unix the file is readable and writable by its owner only. Recording turns the trace hash on
   -h, --help                     Print help
 
 Exit codes:
@@ -204,7 +205,8 @@ Exit codes:
      nothing inkemu models can wake it from
   2  error: unknown device, missing or invalid ROM, refused flash image or flash file, standard
      output cannot be written, or the flash file could not be written when the run ended (what
-     the firmware wrote to the flash is then lost)
+     the firmware wrote to the flash is then lost), or the session of --record could not be
+     written
   3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
      emulator cannot perform faithfully, flash that is not mapped, or a read through a flash
      window that may differ from the device)
@@ -259,6 +261,17 @@ inkemu run --device x4 --firmware app.bin --console-script steps.txt --max-time 
 - **Refusals**: a script is read whole before the run starts, and every refusal names its line and its column, then what to write instead. The limits are those of `crates/console-script/src/parse.rs` (1 MiB of script, 10,000 steps, 1,024 bytes a send, 256 bytes a text to wait for).
 - **The end**: the summary says how far the script got. A run that would exit 0 exits 5 when its script was not through: it was still waiting for a text, or one of its steps is dated after the end of the run.
 
+### Recording and replaying a run
+
+```sh
+inkemu run --device x4 --firmware app.bin --console-script steps.txt --max-time 30 --record run.inkrec
+inkemu replay run.inkrec
+```
+
+- **`--record FILE`** writes a session when the run ends, however it ends: the identity of the mask ROM (its revision and SHA-256, never the ROM itself), the device profile as text, the whole flash the run started from, `--strict-mmio`, `--max-cycles` and `--max-time`, the USB host at power-on, every input the machine accepted on its consoles and from the USB host, dated in device time, and what the run came to: its end, device time, cycles, instructions, trace hash, the SHA-256 of the final flash and of each console. No path, no time of the host. A run that Ctrl-C or its reader cut is recorded with the device time it stopped at, which makes it replayable; a second Ctrl-C ends the process at once (exit code 130), and nothing is recorded. A session holds at most 1 MiB of input and 16,384 chunks of input (each `send` of a script is one) per console, and 16,384 changes of the USB host over the run; a run that sends more says so as soon as it happens, and is not recorded (exit code 2, 3 after a `--strict-mmio` stop). The file holds the whole flash: it is written through a temporary file (`.FILE.tmp`) renamed when complete, readable and writable by its owner only on Unix. `--record` may not name a file the run reads or writes, even one that does not exist yet: the files given to the run, the flash file, its lock and its temporary file, the ROM file of `--rom-dir` or the ROM cache; and its directory must exist. All of this is checked before the run starts. Recording turns the trace hash on.
+- **`inkemu replay FILE`** checks that the ROM is the one recorded (`--rom-dir` as for `run`), rebuilds the device from the session alone, hands it the recorded inputs, runs it to the same limits, showing the console as `run` does (`--console` chooses it), then compares what it gives with what was recorded. It reads no path of the recording and writes nothing of the run, not even the flash; without `--rom-dir`, the ROM is downloaded into the cache on first use, as for `run`. What the session says reaches the terminal with its control characters escaped. A replay gives the same outcome whatever the host and however it is cut into slices.
+- **Exit codes**: `0` when everything is identical; `6` when the replay diverges, with the first quantity that differs and its two values; `2` for a file that is refused (another version, cut short, a length past its bound, a SHA-256 that does not match, each refusal naming the field), a missing or different ROM, and a replay that Ctrl-C or its reader cut before the end of its session (nothing was compared); `130` for a second Ctrl-C before the replay begins its summary. The format is described in [ADR 0007](docs/adr/0007-format-des-sessions.md) (French).
+
 ## Why
 
 Existing simulators for small e-ink devices recompile the firmware sources against a fake display driver. That only works when you have the sources, and it hides the bugs that live in the real hardware path. inkemu takes the opposite approach. It emulates the SoC, the bus and every chip on the board, then boots the vendor's binary through its real boot chain.
@@ -285,7 +298,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 
 ## Roadmap
 
-1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3a, interrupts, timers, watchdogs and reset, done; 1b-3b, flash writes and the device's flash file, done; 1b-3c, a firmware given on its own (`--firmware`), done; 1b-3d, the serial consoles in both directions, done; 1b-3e, two real firmwares of the X4 start, done; 1b-3f, deep sleep and the wake by the RTC timer, done; 1b-4, the lockstep against QEMU, is next.*
+1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3a, interrupts, timers, watchdogs and reset, done; 1b-3b, flash writes and the device's flash file, done; 1b-3c, a firmware given on its own (`--firmware`), done; 1b-3d, the serial consoles in both directions, done; 1b-3e, two real firmwares of the X4 start, done; 1b-3f, deep sleep and the wake by the RTC timer, done; 1b-4a, the documentation without a warning, done; 1b-4b, recording and replaying a run, done; the lockstep against QEMU is next.*
 2. X4 peripherals, desktop UI, e-ink rendering: **first visual milestone**
 3. X3 support (UC8253 panel, I2C sensors)
 4. Debugging, resource monitor, headless test runner
@@ -305,6 +318,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 - [ADR 0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md): what an input of a run is, and the life of the flash file (French)
 - [ADR 0005](docs/adr/0005-bootloader-embarque.md): the 2nd-stage bootloader inkemu ships, chosen by the device profile and replaceable (French)
 - [ADR 0006](docs/adr/0006-entrees-des-consoles.md): what the host sends to the consoles and the USB host, inputs of a run dated in device time (French)
+- [ADR 0007](docs/adr/0007-format-des-sessions.md): the format of a recorded session, how it is read and how it is replayed (French)
 
 ## Français
 
@@ -363,6 +377,14 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
 - **Les refus** : un script est lu en entier avant le départ, et chaque refus donne sa ligne et sa colonne, puis ce qu'il faut écrire. Les limites sont celles de `crates/console-script/src/parse.rs` (1 Mio de script, 10 000 étapes, 1 024 octets par envoi, 256 octets par texte attendu).
 - **La fin** : le résumé dit jusqu'où le script est allé. Une exécution qui sortirait avec 0 sort avec 5 quand son script n'est pas allé au bout : il attendait encore un texte, ou l'une de ses étapes est datée après la fin de l'exécution.
 
+### Enregistrer et rejouer une exécution
+
+`inkemu run … --record session.inkrec` enregistre l'exécution, puis `inkemu replay session.inkrec` la rejoue (voir l'exemple de la partie anglaise).
+
+- **`--record FICHIER`** écrit une session à la fin de l'exécution, quelle qu'en soit la fin : l'identité de la ROM masquée (sa révision et son SHA-256, jamais la ROM), le profil de l'appareil sous forme de texte, la flash entière du départ, `--strict-mmio`, `--max-cycles` et `--max-time`, l'hôte USB à la mise sous tension, chaque entrée que la machine a acceptée sur ses consoles et de l'hôte USB, datée en temps d'appareil, et ce à quoi l'exécution est arrivée : sa fin, le temps d'appareil, les cycles, les instructions, l'empreinte de trace, le SHA-256 de la flash finale et de chaque console. Aucun chemin, aucune heure de l'hôte. Une exécution coupée par Ctrl-C ou par le départ de son lecteur est enregistrée avec l'instant d'appareil où elle s'est arrêtée, ce qui la rend rejouable ; un second Ctrl-C termine le processus sur-le-champ (code 130), et rien n'est enregistré. Une session porte au plus 1 Mio d'entrée et 16 384 morceaux d'entrée (chaque `send` d'un script en est un) par console, et 16 384 changements d'hôte USB sur toute l'exécution ; une exécution qui envoie davantage le dit dès que cela arrive, et n'est pas enregistrée (code 2, 3 après un arrêt de `--strict-mmio`). Le fichier contient la flash entière : il est écrit par un fichier temporaire (`.FICHIER.tmp`) renommé une fois complet, lisible et modifiable par son seul propriétaire sous Unix. `--record` ne peut pas désigner un fichier que l'exécution lit ou écrit, même s'il n'existe pas encore : les fichiers donnés à l'exécution, le fichier de flash, son verrou et son fichier temporaire, le fichier de ROM de `--rom-dir` ou le cache des ROM ; et son répertoire doit exister. Tout cela est vérifié avant le départ. Enregistrer active l'empreinte de trace.
+- **`inkemu replay FICHIER`** vérifie que la ROM est celle de l'enregistrement (`--rom-dir` comme pour `run`), reconstruit l'appareil depuis la seule session, lui remet les entrées enregistrées, l'exécute jusqu'aux mêmes limites en affichant la console comme `run` (`--console` la choisit), puis compare ce qu'il obtient à ce qui a été enregistré. Il ne lit aucun chemin de l'enregistrement et n'écrit rien de l'exécution, pas même la flash ; sans `--rom-dir`, la ROM est téléchargée dans le cache à la première utilisation, comme pour `run`. Ce que dit la session parvient au terminal avec ses caractères de contrôle échappés. Un rejeu donne le même résultat quel que soit l'hôte et quel que soit son découpage.
+- **Codes de sortie** : `0` quand tout est identique ; `6` quand le rejeu diverge, avec la première grandeur qui diffère et ses deux valeurs ; `2` pour un fichier refusé (autre version, tronqué, longueur au-delà de sa borne, SHA-256 qui ne correspond pas, chaque refus nommant le champ), une ROM absente ou différente, et un rejeu coupé par Ctrl-C ou par son lecteur avant la fin de sa session (rien n'a été comparé) ; `130` pour un second Ctrl-C avant le résumé du rejeu. Le format est décrit dans l'[ADR 0007](docs/adr/0007-format-des-sessions.md).
+
 ### Pourquoi
 
 Les simulateurs existants pour petits appareils e-ink recompilent les sources du firmware contre un faux pilote d'écran : cela ne marche qu'avec les sources, et cache les bogues du vrai chemin matériel. inkemu fait l'inverse : il émule le SoC, le bus et chaque puce de la carte, puis démarre le binaire du fabricant par sa vraie chaîne de démarrage.
@@ -377,7 +399,7 @@ Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtens
 
 ### Feuille de route
 
-1. Cœur RV32IMC, ESP32-C3 minimal, chargeur de firmware, CLI : démarrer un firmware jusqu'à ses journaux de console. *1a fait ; 1b-1, squelette du SoC et démarrage de la ROM, fait ; 1b-2, flash et bootloader, fait ; 1b-3a, interruptions, timers, watchdogs et reset, fait ; 1b-3b, écritures en flash et fichier de flash de l'appareil, fait ; 1b-3c, firmware fourni seul (`--firmware`), fait ; 1b-3d, consoles série dans les deux sens, fait ; 1b-3e, démarrage de deux firmwares réels du X4, fait ; 1b-3f, sommeil profond et réveil par le timer RTC, fait ; 1b-4, lockstep avec QEMU, est le suivant.*
+1. Cœur RV32IMC, ESP32-C3 minimal, chargeur de firmware, CLI : démarrer un firmware jusqu'à ses journaux de console. *1a fait ; 1b-1, squelette du SoC et démarrage de la ROM, fait ; 1b-2, flash et bootloader, fait ; 1b-3a, interruptions, timers, watchdogs et reset, fait ; 1b-3b, écritures en flash et fichier de flash de l'appareil, fait ; 1b-3c, firmware fourni seul (`--firmware`), fait ; 1b-3d, consoles série dans les deux sens, fait ; 1b-3e, démarrage de deux firmwares réels du X4, fait ; 1b-3f, sommeil profond et réveil par le timer RTC, fait ; 1b-4a, documentation sans avertissement, fait ; 1b-4b, enregistrement et rejeu d'une exécution, fait ; le lockstep avec QEMU est le suivant.*
 2. Périphériques du X4, interface de bureau, rendu e-ink : **premier jalon visuel**
 3. Prise en charge du X3 (dalle UC8253, capteurs I2C)
 4. Débogage, moniteur de ressources, exécution de tests sans écran
@@ -389,7 +411,7 @@ Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtens
 
 ### Documentation
 
-La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) [0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash), [0005](docs/adr/0005-bootloader-embarque.md) (bootloader embarqué) et [0006](docs/adr/0006-entrees-des-consoles.md) (entrées des consoles et hôte USB) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
+La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) [0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash), [0005](docs/adr/0005-bootloader-embarque.md) (bootloader embarqué), [0006](docs/adr/0006-entrees-des-consoles.md) (entrées des consoles et hôte USB) et [0007](docs/adr/0007-format-des-sessions.md) (format des sessions) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
 
 ### Matériel tiers et licence
 

@@ -5,6 +5,7 @@ use crate::config::SocConfig;
 use crate::ctx::Event;
 use crate::diag::{Diagnostic, Unsupported};
 use crate::flash::{FlashDevice, FlashImageError, FlashWrite, NorFlash};
+use crate::inputs::InputJournal;
 use crate::memmap::RESET_PC;
 use crate::periph::UsbHost;
 use crate::reset::ResetCause;
@@ -222,6 +223,8 @@ pub struct Esp32C3 {
     watched: [bool; 3],
     /// The chip is in deep sleep: the CPU executes nothing until a reset (F1).
     powered_down: bool,
+    /// The inputs the machine accepted since power-on (G1).
+    journal: InputJournal,
 }
 
 impl Esp32C3 {
@@ -279,6 +282,7 @@ impl Esp32C3 {
             resets: 0,
             watched: [false; 3],
             powered_down: false,
+            journal: InputJournal::new(config.usb_host),
         }
     }
 
@@ -749,7 +753,26 @@ impl Esp32C3 {
             ConsoleChannel::UsbSerialJtag => periph.usb_serial_jtag.receive(ctx, at, bytes),
             ConsoleChannel::Uart1 => periph.uart1.receive(ctx, at, bytes),
         }
+        // Journaled once accepted, never before a check: a refused input is no part of the run.
+        self.journal.record_console(channel, at, bytes);
         Ok(())
+    }
+
+    /// The inputs the machine accepted since power-on, in the order it accepted them, and the
+    /// state of the USB host at power-on (G1): what a session records
+    /// ([`InputJournal::is_complete`] says whether it holds them all).
+    #[must_use]
+    pub const fn input_journal(&self) -> &InputJournal {
+        &self.journal
+    }
+
+    /// The machine keeps no journal of its inputs from now on, and lets go of what it holds: for
+    /// a machine whose run will not be recorded, such as the replay of a session, which hands
+    /// over inputs the session holds already and would otherwise hold them twice. The journal
+    /// says so ([`InputJournal::is_forgone`]) and holds nothing; the inputs are accepted as
+    /// before.
+    pub fn forgo_input_journal(&mut self) {
+        self.journal.forgo();
     }
 
     /// The bytes of the host on `channel` that have not reached the device yet, the same count on
@@ -781,6 +804,7 @@ impl Esp32C3 {
             return Err(InputError::TooManyHostChanges);
         }
         usb.set_host(&mut self.bus.ctx, at, state);
+        self.journal.record_usb_host(at, state);
         Ok(())
     }
 
@@ -954,10 +978,11 @@ mod tests {
     use crate::memmap::ROM_BASE;
     use crate::memmap::SRAM_DBUS_BASE;
     use crate::test_support::{
-        HANG, T0, T1, flash_erase_sector, flash_program, flat_rom, load_register,
-        print_program as print, stop_watchdogs, store_register, unmodeled_register, within,
+        HANG, T0, T1, T2, T3, TIMER_WAKE_STATE, flash_erase_sector, flash_program, flat_rom,
+        load_register, print_program as print, sleep_on_the_rtc_timer, stop_watchdogs,
+        store_register, unmodeled_register, within,
     };
-    use cpu_rv32::asm::{add, addi, beq, bne, csrrs, csrrwi, jal, lbu, lui, lw, sw, wfi};
+    use cpu_rv32::asm::{addi, beq, bne, csrrs, csrrwi, jal, lbu, lui, lw, sw, wfi};
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
     use emu_core::{AccessKind, AccessSize, Bus};
 
@@ -1789,29 +1814,6 @@ mod tests {
 
     fn rtc_cntl(name: &str) -> u32 {
         svd_regs::esp32c3::addr("RTC_CNTL", name)
-    }
-    /// `WAKEUP_STATE` with the RTC timer as the only wake source (`WAKEUP_ENA` bit 3).
-    const TIMER_WAKE_STATE: u32 = (1 << 3) << 15;
-    const T2: u8 = 7;
-    const T3: u8 = 28;
-
-    /// Code that sets the alarm of the RTC timer `counts` slow-clock counts after a capture of
-    /// the timer (what `timer_wakeup_prepare` does: DS §A.1.4), then `DIG_PWC.DG_WRAP_PD_EN` and
-    /// `SLEEP_EN` (`rtc_deep_sleep_start` without its CRC: DS §A.1.5). `wake_state` goes to
-    /// `WAKEUP_STATE` in between. `counts` is a multiple of 0x1000 below 2^31 (one `lui`).
-    fn sleep_on_the_rtc_timer(counts: u32, wake_state: u32) -> Vec<u32> {
-        let mut program = store_register(rtc_cntl("TIME_UPDATE"), 1 << 31).to_vec();
-        // T0 holds the page of the RTC_CNTL registers, T1 the low word of the capture.
-        program.extend(load_register(rtc_cntl("TIME_LOW0")));
-        program.extend([lui(T3, counts), add(T1, T1, T3)]);
-        let slp_timer0 = rtc_cntl("SLP_TIMER0") - rtc_cntl("OPTIONS0");
-        program.push(sw(T1, T0, slp_timer0.cast_signed()));
-        program.extend(store_register(rtc_cntl("SLP_TIMER1"), 1 << 16));
-        program.extend(store_register(rtc_cntl("WAKEUP_STATE"), wake_state));
-        program.extend(store_register(rtc_cntl("DIG_PWC"), 1 << 31));
-        program.extend(store_register(rtc_cntl("STATE0"), 1 << 31));
-        program.push(HANG);
-        program
     }
 
     /// A firmware of four lives: each counts itself in `STORE0` (in the RTC domain), prints the
@@ -4229,5 +4231,64 @@ mod tests {
             Cycles(u64::MAX),
             "the CPU ran on to the end of device time, where it saturates"
         );
+    }
+
+    #[test]
+    fn the_machine_journals_the_inputs_it_accepts_and_not_those_it_refuses() {
+        use crate::inputs::AcceptedInput;
+        let config = SocConfig {
+            usb_host: UsbHost::Attached,
+            ..SocConfig::default()
+        };
+        let mut m = machine_with(&[HANG], config);
+        assert_eq!(m.input_journal().usb_host_at_power_on(), UsbHost::Attached);
+        m.send_console(ConsoleChannel::Uart1, Cycles(40), b"hi")
+            .unwrap();
+        m.set_usb_host(Cycles(80), UsbHost::Open).unwrap();
+        m.run_until(Cycles(100));
+        let now = m.device_time();
+        assert!(now > Cycles(80));
+        // In the past, beyond the line of a UART, too much pending: refused, and not journaled.
+        assert!(
+            m.send_console(ConsoleChannel::Uart0, Cycles(0), b"x")
+                .is_err()
+        );
+        assert!(m.set_usb_host(Cycles(0), UsbHost::Absent).is_err());
+        let beyond = Cycles(crate::periph::uart::LAST_INPUT_DATE.get() + 1);
+        assert!(m.send_console(ConsoleChannel::Uart0, beyond, b"x").is_err());
+        let too_much = vec![0u8; MAX_PENDING_HOST_BYTES + 1];
+        assert!(
+            m.send_console(ConsoleChannel::UsbSerialJtag, now, &too_much)
+                .is_err()
+        );
+        m.send_console(ConsoleChannel::UsbSerialJtag, now, b"")
+            .unwrap();
+        assert_eq!(
+            m.input_journal().inputs(),
+            [
+                AcceptedInput::Console {
+                    channel: ConsoleChannel::Uart1,
+                    at: Cycles(40),
+                    bytes: b"hi".to_vec()
+                },
+                AcceptedInput::UsbHost {
+                    at: Cycles(80),
+                    state: UsbHost::Open
+                },
+                AcceptedInput::Console {
+                    channel: ConsoleChannel::UsbSerialJtag,
+                    at: now,
+                    bytes: Vec::new()
+                },
+            ]
+        );
+        assert!(m.input_journal().is_complete());
+        // A machine told to keep no journal lets it go and still takes its inputs.
+        m.forgo_input_journal();
+        let pending = m.input_pending(ConsoleChannel::Uart1);
+        m.send_console(ConsoleChannel::Uart1, now, b"!").unwrap();
+        assert_eq!(m.input_pending(ConsoleChannel::Uart1), pending + 1);
+        assert!(m.input_journal().is_forgone());
+        assert_eq!(m.input_journal().inputs(), []);
     }
 }

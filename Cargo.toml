@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/emu-core", "crates/cpu-rv32", "crates/firmware", "crates/emu-cli", "crates/svd-gen", "crates/svd-regs", "crates/soc-esp32c3", "crates/boards", "crates/console-script"]
+members = ["crates/emu-core", "crates/cpu-rv32", "crates/firmware", "crates/emu-cli", "crates/svd-gen", "crates/svd-regs", "crates/soc-esp32c3", "crates/boards", "crates/console-script", "crates/session"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,7 @@ svd-regs = { path = "crates/svd-regs", version = "0.1.0" }
 soc-esp32c3 = { path = "crates/soc-esp32c3", version = "0.1.0" }
 boards = { path = "crates/boards", version = "0.1.0" }
 console-script = { path = "crates/console-script", version = "0.1.0" }
+session = { path = "crates/session", version = "0.1.0" }
 thiserror = "2"
 sha2 = "0.11"
 sha1 = "0.11"
