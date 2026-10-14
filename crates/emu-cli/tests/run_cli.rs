@@ -111,6 +111,69 @@ fn run_help_lists_every_exit_code() {
 }
 
 #[test]
+fn replay_help_lists_every_exit_code_of_a_replay() {
+    let help = inkemu().args(["replay", "--help"]).assert().success();
+    let out = String::from_utf8_lossy(&help.get_output().stdout).into_owned();
+    for code in [0, 2, 6, 130] {
+        assert!(
+            out.contains(&format!("\n{code:>3}  ")),
+            "exit code {code} missing from:\n{out}"
+        );
+    }
+    assert!(
+        out.contains("Usage: inkemu replay [OPTIONS] <SESSION>"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_file_that_is_no_session_exits_2_before_any_rom_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.inkrec");
+    inkemu()
+        .arg("replay")
+        .arg(&missing)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(contains("error: cannot read the session ").and(contains("; check the path")));
+    let garbage = dir.path().join("garbage.inkrec");
+    std::fs::write(&garbage, b"inkemu-session 9\nwhatever").unwrap();
+    inkemu()
+        .arg("replay")
+        .arg(&garbage)
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "is refused: the file is a session of format `inkemu-session 9`, and this inkemu reads `inkemu-session 1` only",
+        ));
+}
+
+#[test]
+fn record_refuses_the_path_of_a_file_the_run_reads_before_any_rom_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("flash.bin");
+    std::fs::write(&image, [0xFFu8; 16]).unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--flash"])
+        .arg(&image)
+        .arg("--record")
+        .arg(&image)
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "which is also the file of --flash: the run would replace it with its session; give --record another path",
+        ));
+    assert_eq!(std::fs::read(&image).unwrap(), [0xFFu8; 16]);
+    inkemu()
+        .args(["run", "--device", "x4", "--record"])
+        .arg(dir.path())
+        .assert()
+        .code(2)
+        .stderr(contains("which is a directory or a link, not a file"));
+}
+
+#[test]
 fn a_time_limit_that_is_not_a_number_of_seconds_exits_2_and_says_what_to_write() {
     // A negative number included: it is a value of the option, refused for what it is, and not
     // an unknown flag.

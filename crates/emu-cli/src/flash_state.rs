@@ -334,7 +334,7 @@ pub fn refuse_the_image_as_flash_file(
 /// path that leads to nothing is one file with no other: what is wrong with it is said by
 /// whoever opens it.
 #[cfg(unix)]
-fn same_file(one: &Path, other: &Path) -> bool {
+pub(crate) fn same_file(one: &Path, other: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     match (std::fs::metadata(one), std::fs::metadata(other)) {
         (Ok(one), Ok(other)) => one.dev() == other.dev() && one.ino() == other.ino(),
@@ -346,7 +346,7 @@ fn same_file(one: &Path, other: &Path) -> bool {
 /// link in them is resolved. A hard link is then not seen; replacing the flash file leaves the
 /// other name of the image with its content.
 #[cfg(not(unix))]
-fn same_file(one: &Path, other: &Path) -> bool {
+pub(crate) fn same_file(one: &Path, other: &Path) -> bool {
     matches!(
         (std::fs::canonicalize(one), std::fs::canonicalize(other)),
         (Ok(one), Ok(other)) if one == other

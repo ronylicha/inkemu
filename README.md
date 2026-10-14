@@ -196,6 +196,7 @@ Options:
       --usb-host <USB_HOST>      The USB host on the USB-Serial-JTAG port when the device starts: absent (no cable), attached (the port closed: frames, nothing read) or open (a program reads and writes the port) [default: open] [possible values: absent, attached, open]
       --rom-dir <ROM_DIR>        Use the ROM ELF files of this directory and never download
       --trace-hash               Print the execution trace hash at the end (determinism checks)
+      --record <FILE>            Record the run in this file, a session that `inkemu replay` replays: the identity of the ROM (not the ROM), the device profile, the whole flash the run starts from, the limits, the USB host at power-on, every input the consoles received with its device time, and what the run came to (its end, device time, cycles, instructions, trace hash, final flash and consoles). The file is written when the run ends, however it ends: a run cut by Ctrl-C or by its reader is recorded with the device time it stopped at. A session holds the whole flash: on Unix the file is readable and writable by its owner only. Recording turns the trace hash on
   -h, --help                     Print help
 
 Exit codes:
@@ -204,7 +205,8 @@ Exit codes:
      nothing inkemu models can wake it from
   2  error: unknown device, missing or invalid ROM, refused flash image or flash file, standard
      output cannot be written, or the flash file could not be written when the run ended (what
-     the firmware wrote to the flash is then lost)
+     the firmware wrote to the flash is then lost), or the session of --record could not be
+     written
   3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
      emulator cannot perform faithfully, flash that is not mapped, or a read through a flash
      window that may differ from the device)

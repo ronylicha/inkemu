@@ -325,6 +325,7 @@ dependencies = [
  "goblin",
  "nix",
  "predicates",
+ "session",
  "sha2",
  "soc-esp32c3",
  "svd-regs",

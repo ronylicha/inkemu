@@ -2,6 +2,7 @@
 use crate::exit::{EXIT_ERROR, EXIT_IDLE, EXIT_OK, EXIT_SCRIPT_INCOMPLETE, EXIT_STRICT_MMIO};
 use console_script::{ScriptRun, ScriptStatus};
 use emu_core::Cycles;
+use session::{ConsoleDigests, CutReason, Reached};
 use soc_esp32c3::diag::{MAX_DISTINCT_DIAGNOSTICS, MAX_LISTED_RESETS};
 use soc_esp32c3::{ConsoleChannel, DeepSleep, Diagnostic, Esp32C3, StopReason};
 use std::io::{self, Write};
@@ -482,24 +483,66 @@ pub fn execute(
     console: &mut dyn Write,
     log: &mut dyn Write,
 ) -> RunEnd {
-    execute_with_script(machine, options, None, interrupt, reader_gone, console, log)
+    execute_with_script(
+        machine,
+        options,
+        RunExtras::default(),
+        interrupt,
+        reader_gone,
+        console,
+        log,
+    )
 }
 
-/// [`execute`], with a console script that started on `machine` ([`ScriptRun::start`]): after
-/// each call of the machine the bytes of every console are shown to it, so that its steps are
-/// handed to the machine at their dates; the summary says how far it got. A step the machine
-/// refuses is said in `log` and ends the script there, its channels no longer watched
-/// ([`ScriptRun::stop`]); from a file, only a `send` on a UART dated after about 114 years of
-/// device time is (`InputError::BeyondTheLine`).
+/// What a run of [`execute_with_script`] does beside showing its console: a console script to
+/// hand to the machine, and the digests a session takes of every console (G3).
+#[derive(Debug, Default)]
+pub struct RunExtras<'a> {
+    pub script: Option<&'a mut ScriptRun>,
+    /// Every byte of every console goes into these, those the end of the run flushes included:
+    /// the console a session compares.
+    pub digests: Option<&'a mut ConsoleDigests>,
+}
+
+/// How a run that ended as `end` ends a session: a stop of the machine's own, or a cut of the
+/// host (Ctrl-C, a reader that went away, a console that could not be written), which a session
+/// records with its instant (G5).
+///
+/// # Errors
+/// The [`CutReason`] of an end the host made.
+pub const fn session_end(end: RunEnd) -> Result<Reached, CutReason> {
+    match end {
+        RunEnd::Budget => Ok(Reached::CycleLimit),
+        RunEnd::TimeLimit => Ok(Reached::TimeLimit),
+        RunEnd::Idle => Ok(Reached::Idle),
+        RunEnd::DeepSleep => Ok(Reached::DeepSleep),
+        RunEnd::StrictMmio => Ok(Reached::StrictMmio),
+        RunEnd::Interrupted => Err(CutReason::Interrupted),
+        RunEnd::ConsoleClosed => Err(CutReason::ReaderGone),
+        RunEnd::ConsoleError => Err(CutReason::ConsoleError),
+    }
+}
+
+/// [`execute`], with `extras`: a console script that started on `machine`
+/// ([`ScriptRun::start`]), whose steps are handed to the machine at their dates as it reads the
+/// bytes of every console after each call, the summary saying how far it got; and the digests of
+/// a session, which take every byte of every console. A step the machine refuses is said in
+/// `log` and ends the script there, its channels no longer watched ([`ScriptRun::stop`]); from a
+/// file, only a `send` on a UART dated after about 114 years of device time is
+/// (`InputError::BeyondTheLine`).
 pub fn execute_with_script(
     machine: &mut Esp32C3,
     options: &RunOptions,
-    mut script: Option<&mut ScriptRun>,
+    extras: RunExtras<'_>,
     interrupt: &Interrupt,
     reader_gone: &dyn Fn() -> bool,
     console: &mut dyn Write,
     log: &mut dyn Write,
 ) -> RunEnd {
+    let RunExtras {
+        mut script,
+        mut digests,
+    } = extras;
     // Whether the script still reads the consoles: not after a step the machine refused.
     let mut observing = true;
     // Whether the console has taken everything it was given. A console that failed, or whose
@@ -521,6 +564,11 @@ pub fn execute_with_script(
         let stop = machine.run_within(Cycles(limit), options.max_device_nanos);
         let (console_open, taken) =
             relay_selected_console(machine, options.console, console, &mut reader, reader_gone);
+        if let Some(digests) = digests.as_deref_mut() {
+            for (channel, bytes) in &taken {
+                digests.add(*channel, bytes);
+            }
+        }
         if observing
             && let Some(run) = script.as_deref_mut()
             && let Err(e) = run.observe(machine, &taken)
@@ -556,21 +604,19 @@ pub fn execute_with_script(
         say_why(log, end, Some(&stop));
         break end;
     };
-    // What the firmware had written and the device had not sent yet: without it the console
-    // would end before the place the run stopped at.
     if console_usable {
-        let flushed = relay(console, &machine.flush_console(options.console));
-        log_console_error(log, &flushed);
-        end = match (end, flushed) {
-            // As in the loop: a `--strict-mmio` stop keeps its exit code whatever the console did.
-            (RunEnd::StrictMmio, _) => RunEnd::StrictMmio,
-            (_, Err(_)) => RunEnd::ConsoleError,
-            (_, Ok(false)) => {
-                log_reader_gone(log);
-                RunEnd::ConsoleClosed
-            }
-            (other, Ok(true)) => other,
-        };
+        end = flush_shown_console(
+            machine,
+            options.console,
+            end,
+            digests.as_deref_mut(),
+            console,
+            log,
+        );
+    }
+    if let Some(digests) = digests {
+        let flushed = console_usable.then_some(options.console);
+        flush_the_other_consoles(machine, flushed, digests);
     }
     let _ = writeln!(
         log,
@@ -604,6 +650,50 @@ pub fn execute_with_script(
         let _ = writeln!(log, "trace-hash {hash:016x}");
     }
     end
+}
+
+/// Relays what the firmware had written on `shown` and the device had not sent yet: without it
+/// the console would end before the place the run stopped at. The bytes go into the digests of
+/// a session too. Gives the end of the run, which a console that fails here changes.
+fn flush_shown_console(
+    machine: &mut Esp32C3,
+    shown: ConsoleChannel,
+    end: RunEnd,
+    digests: Option<&mut ConsoleDigests>,
+    console: &mut dyn Write,
+    log: &mut dyn Write,
+) -> RunEnd {
+    let bytes = machine.flush_console(shown);
+    if let Some(digests) = digests {
+        digests.add(shown, &bytes);
+    }
+    let flushed = relay(console, &bytes);
+    log_console_error(log, &flushed);
+    match (end, flushed) {
+        // As in the loop: a `--strict-mmio` stop keeps its exit code whatever the console did.
+        (RunEnd::StrictMmio, _) => RunEnd::StrictMmio,
+        (_, Err(_)) => RunEnd::ConsoleError,
+        (_, Ok(false)) => {
+            log_reader_gone(log);
+            RunEnd::ConsoleClosed
+        }
+        (other, Ok(true)) => other,
+    }
+}
+
+/// A session compares every console to its last byte: the ones not shown, and the one shown when
+/// it could not be written, are flushed into its digests only. `flushed` is the console the run
+/// flushed already.
+fn flush_the_other_consoles(
+    machine: &mut Esp32C3,
+    flushed: Option<ConsoleChannel>,
+    digests: &mut ConsoleDigests,
+) {
+    for channel in ConsoleChannel::ALL {
+        if flushed != Some(channel) {
+            digests.add(channel, &machine.flush_console(channel));
+        }
+    }
 }
 
 /// The line of the summary of a run that ends with the device in deep sleep (F5, F9): since when
@@ -805,7 +895,10 @@ mod tests {
         let end = execute_with_script(
             &mut m,
             &options,
-            Some(&mut run),
+            RunExtras {
+                script: Some(&mut run),
+                digests: None,
+            },
             &NOT_INTERRUPTED,
             &reader_stays,
             &mut console,
@@ -871,7 +964,10 @@ mod tests {
         execute_with_script(
             &mut m,
             &options,
-            Some(&mut run),
+            RunExtras {
+                script: Some(&mut run),
+                digests: None,
+            },
             &NOT_INTERRUPTED,
             &reader_stays,
             &mut console,
