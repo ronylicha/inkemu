@@ -766,6 +766,15 @@ impl Esp32C3 {
         &self.journal
     }
 
+    /// The machine keeps no journal of its inputs from now on, and lets go of what it holds: for
+    /// a machine whose run will not be recorded, such as the replay of a session, which hands
+    /// over inputs the session holds already and would otherwise hold them twice. The journal
+    /// says so ([`InputJournal::is_forgone`]) and holds nothing; the inputs are accepted as
+    /// before.
+    pub fn forgo_input_journal(&mut self) {
+        self.journal.forgo();
+    }
+
     /// The bytes of the host on `channel` that have not reached the device yet, the same count on
     /// every channel: on a UART those still to start and the one on the line, on
     /// USB-Serial-JTAG the packets not yet in the OUT FIFO, a zero-length one counting as one
@@ -4274,5 +4283,12 @@ mod tests {
             ]
         );
         assert!(m.input_journal().is_complete());
+        // A machine told to keep no journal lets it go and still takes its inputs.
+        m.forgo_input_journal();
+        let pending = m.input_pending(ConsoleChannel::Uart1);
+        m.send_console(ConsoleChannel::Uart1, now, b"!").unwrap();
+        assert_eq!(m.input_pending(ConsoleChannel::Uart1), pending + 1);
+        assert!(m.input_journal().is_forgone());
+        assert_eq!(m.input_journal().inputs(), []);
     }
 }

@@ -34,7 +34,8 @@ pub use flash::{
     FlashConfig, FlashConfigError, FlashDevice, FlashImageError, FlashWrite, JedecId, NorFlash,
 };
 pub use inputs::{
-    AcceptedInput, InputJournal, MAX_JOURNAL_CONSOLE_BYTES, MAX_JOURNAL_HOST_CHANGES,
+    AcceptedInput, InputJournal, MAX_JOURNAL_CONSOLE_BYTES, MAX_JOURNAL_CONSOLE_CHUNKS,
+    MAX_JOURNAL_HOST_CHANGES, MAX_JOURNAL_INPUTS,
 };
 pub use machine::{
     ConsoleChannel, DeepSleep, Esp32C3, InputError, MAX_PENDING_HOST_BYTES,
