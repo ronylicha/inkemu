@@ -504,7 +504,9 @@ impl Peripherals {
             Event::Systimer => self.systimer.wake(ctx),
             Event::Timg(Group::Timg0) => self.timg0.wake(ctx),
             Event::Timg(Group::Timg1) => self.timg1.wake(ctx),
-            Event::RtcWatchdog => self.rtc_cntl.wake(ctx),
+            Event::RtcCntl => self.rtc_cntl.wake(ctx),
+            // The bus answers it (`settle_signals`): it holds the RTC memory the CRC is taken of.
+            Event::RtcMemoryCrc => {}
             Event::ClockChanged => {
                 self.timg0.clock_changed(ctx);
                 self.timg1.clock_changed(ctx);
@@ -550,6 +552,28 @@ impl Peripherals {
     ///   analog registers behind regi2c and the console bytes that already left are no digital
     ///   register: they stay.
     /// - A system reset also returns `RTC_CNTL` to its reset values and clears the recorded PC.
+    /// - The wake from deep sleep is a core reset that clears the recorded PC too.
+    /// - Any reset that ends a deep sleep rebuilds the digital domain at least as a core reset
+    ///   does, and clears the recorded PC: the domain had no power. The cause keeps its code in
+    ///   `RESET_STATE` and `RTC_CNTL` keeps its level.
+    ///
+    /// ASSUMPTION: a CPU-level reset that ends a deep sleep (the RTC watchdog left running in the
+    /// sleep with a stage action of 2, `RTC_WDT_STG_SEL_RESET_CPU`) finds every digital
+    /// peripheral at its reset value, as the wake does, where a CPU reset of an awake chip keeps
+    /// them. The digital domain is powered down in deep sleep (TRM §9.4.1, table 9.4-1), so
+    /// nothing of it can have kept its state; whether the CPU-level reset then powers it up
+    /// before the ROM runs is not documented. A chip whose RTC watchdog ends a deep sleep with a
+    /// CPU reset, a UART register written before the sleep read again after it, settles it.
+    ///
+    /// ASSUMPTION: a deep sleep powers the debug assistant down with the rest of the digital
+    /// domain (TRM §9.4.1, table 9.4-1: only the RTC domain stays on), so the PC it recorded is
+    /// lost and the ROM prints no `Saved PC:` after `rst:0x5` (report DS §A.3.2, open question 3).
+    /// A real chip's boot log after a wake from deep sleep settles it.
+    ///
+    /// ASSUMPTION: internal SRAM keeps its bytes through a deep sleep, where the powered-down chip
+    /// loses them (DS §A.3.1, open question 6). The bootloader and ESP-IDF load or clear everything
+    /// they use, so a firmware that relies on SRAM across a deep sleep is the only one to see the
+    /// difference. A `.noinit` SRAM word read after a wake on a real chip settles what it holds.
     ///
     /// What the cache model keeps of the flash pages read through a window and written since
     /// follows `EXTMEM`: a CPU reset keeps it, a core reset empties it. The sources and the one
@@ -568,16 +592,27 @@ impl Peripherals {
     /// settles it.
     pub(crate) fn reset(&mut self, ctx: &mut Ctx, cause: ResetCause, pc: u32, sp: u32) {
         let level = cause.level();
+        let ends_a_deep_sleep = self.rtc_cntl.is_in_deep_sleep();
         self.assist_debug.cpu_reset(pc, sp);
         self.sensitive = Sensitive::new();
-        if level >= ResetLevel::Core {
+        if level >= ResetLevel::Core || ends_a_deep_sleep {
             self.core_reset(ctx);
         }
-        if level == ResetLevel::System {
+        if level == ResetLevel::System || ends_a_deep_sleep {
             self.assist_debug.system_reset();
         }
         // Last: it drives the RTC interrupt source again, after a core reset cleared them all.
         self.rtc_cntl.reset(ctx, cause, level == ResetLevel::System);
+    }
+
+    /// The chip went into deep sleep at the present time. The devices a front end reaches while
+    /// the CPU is off (the console channels) go no further than this instant until the reset
+    /// that ends the sleep rebuilds them; the others are reached only by the CPU and their
+    /// wake-ups, which a sleeping chip does not deliver (`Esp32C3::sleep_deeply`).
+    pub(crate) fn power_down(&mut self, ctx: &Ctx) {
+        self.uart0.power_down(ctx);
+        self.uart1.power_down(ctx);
+        self.usb_serial_jtag.power_down(ctx);
     }
 
     fn core_reset(&mut self, ctx: &mut Ctx) {

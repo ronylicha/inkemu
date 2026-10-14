@@ -219,6 +219,9 @@ pub struct Uart {
     /// timeout. A start bit it heard ends the idle period, which the firmware sees, even when the
     /// byte is lost afterwards. Refused at that look ([`Uart::report_mistimed_reception`]).
     rx_mistimed: Option<u32>,
+    /// The instant, in thirty-seconds, the chip went into deep sleep while it sleeps: the UART
+    /// has no power and goes no further than it ([`Uart::power_down`]).
+    powered_down_at: Option<u64>,
 }
 
 /// A byte of the host on the receive line.
@@ -258,7 +261,17 @@ impl Uart {
             wake: Deadline::default(),
             watched: false,
             rx_mistimed: None,
+            powered_down_at: None,
         }
+    }
+
+    /// The chip went into deep sleep at the present time: the digital domain has no power until
+    /// the reset that ends the sleep (TRM §9.4.1, table 9.4-1). Whatever a front end calls in
+    /// between (take the console, send bytes, watch), the UART goes no further than this instant:
+    /// a byte still on its way out leaves at that reset, as in a run that no call cut inside the
+    /// sleep, and a byte of the host lands then (the assumption on `RtcCntl::enter_sleep`).
+    pub(crate) fn power_down(&mut self, ctx: &Ctx) {
+        self.powered_down_at = Some(ctx.now().get().saturating_mul(SUBCYCLES));
     }
 
     /// While `watched`, each byte asks for a call at the instant its last bit has gone, not only
@@ -281,6 +294,8 @@ impl Uart {
     /// Those that left stay for the console. The host is no part of the chip: the bytes it is
     /// sending go on arriving, and land in the FIFO of the reset UART.
     pub fn reset(&mut self, ctx: &mut Ctx) {
+        // A reset that ends a deep sleep powers the UART up: it comes to the instant of the reset.
+        self.powered_down_at = None;
         self.settle(ctx);
         self.config = Storage::for_offsets(self.base, &CONFIG);
         self.in_flight.clear();
@@ -476,9 +491,14 @@ impl Uart {
 
     /// Brings the device to now: the bytes whose last bit has gone move to the console, the bytes
     /// of the host whose frame has ended land, and the receive timeout comes, in the order of
-    /// their instants; the interrupt source follows.
+    /// their instants; the interrupt source follows. A UART without power comes no further than
+    /// the instant it lost it.
     fn settle(&mut self, ctx: &mut Ctx) {
-        let now = ctx.now().get().saturating_mul(SUBCYCLES);
+        let now = ctx
+            .now()
+            .get()
+            .saturating_mul(SUBCYCLES)
+            .min(self.powered_down_at.unwrap_or(u64::MAX));
         let was_sending = !self.in_flight.is_empty();
         while let Some(&(gone_at, byte)) = self.in_flight.front() {
             if gone_at > now {

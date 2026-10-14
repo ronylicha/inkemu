@@ -111,8 +111,12 @@ pub enum Event {
     UsbSerialJtag,
     /// Wake-up of a timer group: its timer or its watchdog may have reached a deadline.
     Timg(Group),
-    /// Wake-up of `RTC_CNTL`: the RTC watchdog may have reached a stage timeout.
-    RtcWatchdog,
+    /// Wake-up of `RTC_CNTL`: its watchdog may have reached a stage timeout, its super watchdog
+    /// asked to be fed or reset the chip, or the RTC timer reached the target of its alarm.
+    RtcCntl,
+    /// To the bus, from `SYSTEM`: `RTC_FASTMEM_CONFIG.START` was set, and the CRC of the RTC fast
+    /// memory is computed now. The bus answers it, because it holds that memory.
+    RtcMemoryCrc,
     /// To every device that counts APB clock cycles: the clock selection changed.
     ClockChanged,
     /// To the named module: `SYSTEM.PERIP_RST_EN0/1` put it in reset.
@@ -159,6 +163,12 @@ impl Deadline {
         }
     }
 
+    /// The instant of the wake-up, if one is armed.
+    #[must_use]
+    pub fn due(&self) -> Option<Cycles> {
+        self.armed.map(|(due, _)| due)
+    }
+
     /// Forgets a wake-up whose instant has come: the device is being called for it.
     pub fn called(&mut self, now: Cycles) {
         if self.armed.is_some_and(|(due, _)| due <= now) {
@@ -195,6 +205,8 @@ pub struct Ctx {
     interrupts_changed: bool,
     /// The reset a device asked for, if any: see [`Ctx::request_reset`] for which request is kept.
     reset: Option<ResetCause>,
+    /// `RTC_CNTL` put the chip in deep sleep since the machine last looked.
+    deep_sleep_entered: bool,
     /// Every refusal in the order it was reported, for the tests of the device models: the
     /// diagnostics list a repeated refusal once, and a device test wants to see each one.
     #[cfg(test)]
@@ -216,6 +228,7 @@ impl Ctx {
             sources: 0,
             interrupts_changed: false,
             reset: None,
+            deep_sleep_entered: false,
             #[cfg(test)]
             refused: VecDeque::new(),
         }
@@ -363,10 +376,10 @@ impl Ctx {
     /// The rule for a device author: a signal is delivered before the instruction that posted it
     /// ends, and the delivery of signals is not bounded by a pass. So a device must not post a
     /// signal from the delivery of a signal or of a wake-up: a chain of signals each posting the
-    /// next would never let the instruction end. Today three register writes post one, and no
-    /// delivery writes any of the three registers: `SYSTEM.PERIP_RST_EN0/1` (module resets),
-    /// `SPI1.CMD` (a program or an erase changed the flash) and `EXTMEM.ICACHE_SYNC_CTRL` (a
-    /// cache invalidation).
+    /// next would never let the instruction end. Today four register writes post one, and no
+    /// delivery writes any of the four registers: `SYSTEM.PERIP_RST_EN0/1` (module resets),
+    /// `SPI1.CMD` (a program or an erase changed the flash), `EXTMEM.ICACHE_SYNC_CTRL` (a
+    /// cache invalidation) and `SYSTEM.RTC_FASTMEM_CONFIG` (the CRC of the RTC memory).
     pub fn signal(&mut self, event: Event) {
         self.signals.push_back(event);
     }
@@ -413,11 +426,25 @@ impl Ctx {
         std::mem::take(&mut self.interrupts_changed)
     }
 
-    /// Whether a device left something for the machine: a reset request, a clock selection write
-    /// or a change of the interrupt lines.
+    /// Whether a device left something for the machine: a reset request, a clock selection write,
+    /// a change of the interrupt lines or the entry into deep sleep.
     #[must_use]
     pub const fn is_flagged(&self) -> bool {
-        self.clock_written || self.interrupts_changed || self.reset.is_some()
+        self.clock_written
+            || self.interrupts_changed
+            || self.reset.is_some()
+            || self.deep_sleep_entered
+    }
+
+    /// `RTC_CNTL` tells that the chip went into deep sleep (F1): the CPU executes nothing from the
+    /// end of the current instruction until a reset.
+    pub fn enter_deep_sleep(&mut self) {
+        self.deep_sleep_entered = true;
+    }
+
+    /// Whether the chip went into deep sleep since the last call.
+    pub(crate) fn take_deep_sleep_entered(&mut self) -> bool {
+        std::mem::take(&mut self.deep_sleep_entered)
     }
 
     /// Every source is released at once: what a reset of the digital peripherals does.

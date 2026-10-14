@@ -147,17 +147,26 @@ impl SocBus {
     /// One delivery pass of the wake-ups that are due (see [`Ctx::deliver_due`]), each followed by
     /// the events its call had something to tell.
     pub(crate) fn deliver_due(&mut self) {
-        let SocBus { periph, ctx, .. } = self;
+        let SocBus {
+            periph, ctx, rtc, ..
+        } = self;
         ctx.deliver_due(|ctx, event| {
             periph.deliver(ctx, event);
-            settle_signals(periph, ctx);
+            settle_signals(periph, ctx, rtc);
         });
+    }
+
+    /// Calls `RTC_CNTL` alone, for its wake-up, while the chip is in deep sleep: the digital
+    /// devices have no power and are not called (F1).
+    pub(crate) fn wake_rtc_domain(&mut self) {
+        self.periph.rtc_cntl.wake(&mut self.ctx);
+        self.settle();
     }
 
     /// Delivers what the devices posted for each other during a register access or a call: such
     /// an event reaches its device before the instruction ends.
     fn settle(&mut self) {
-        settle_signals(&mut self.periph, &mut self.ctx);
+        settle_signals(&mut self.periph, &mut self.ctx, &self.rtc);
     }
 
     /// Tells the bus which instruction is running, so diagnostics can name it.
@@ -330,10 +339,22 @@ impl SocBus {
 /// or clears flash pages in the cache state: none writes one of those registers or posts a
 /// signal. So the signals there are to deliver are those one register access posted (at most one
 /// per module; for a flash command one per run of pages it changed, 128 at most among the 256
-/// pages; one for an invalidation), and delivering them posts none.
-fn settle_signals(periph: &mut Peripherals, ctx: &mut Ctx) {
+/// pages; one for an invalidation), and delivering them posts none. A write to
+/// `SYSTEM.RTC_FASTMEM_CONFIG` that sets `START` posts one more, which the bus answers itself:
+/// the CRC unit reads the RTC fast memory, and the bus holds that memory, no peripheral. Its answer
+/// posts nothing.
+fn settle_signals(periph: &mut Peripherals, ctx: &mut Ctx, rtc: &Ram) {
     while let Some(event) = ctx.take_signal() {
-        periph.deliver(ctx, event);
+        if event == Event::RtcMemoryCrc {
+            // INVARIANT: the RTC memory is `RTC_RAM_SIZE` bytes from `RTC_RAM_BASE`, so the slice
+            // is always there; an empty one would only give a CRC of no bytes.
+            let memory = rtc
+                .bytes(RTC_RAM_BASE, RTC_RAM_SIZE as usize)
+                .unwrap_or_default();
+            periph.system.finish_rtc_memory_crc(memory);
+        } else {
+            periph.deliver(ctx, event);
+        }
     }
 }
 

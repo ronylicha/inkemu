@@ -11,6 +11,16 @@ use std::fmt;
 /// but no longer listed: a runaway program must not grow the log without bound.
 pub const MAX_DISTINCT_DIAGNOSTICS: usize = 4096;
 
+/// Past this many resets, further ones are counted (see [`Diagnostics::unlisted_resets`]) but no
+/// longer listed. Resets have a bound of their own: each one is an entry of the journal, so they
+/// would fill the table of [`MAX_DISTINCT_DIAGNOSTICS`] in a reset loop and hide every later
+/// diagnostic, and that table would hide the later resets.
+pub const MAX_LISTED_RESETS: usize = 4096;
+
+/// `WAKEUP_STATE.WAKEUP_ENA` bit 2, the GPIO wake (`RTC_GPIO_TRIG_EN`,
+/// `IDF:esp_hw_support/port/esp32c3/include/soc/rtc.h:664`; report DS §A.5).
+const GPIO_WAKE: u32 = 1 << 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Direction {
     Read,
@@ -63,6 +73,20 @@ pub enum Unsupported {
     ClockSource { sysclk_conf: u32, cpu_per_conf: u32 },
     /// `RTC_CNTL.CLK_CONF` selects a slow clock other than the RC oscillator, the only one modelled.
     SlowClock { clk_conf: u32 },
+    /// `RTC_CNTL.STATE0.SLEEP_EN` was set with `DIG_PWC.DG_WRAP_PD_EN` clear: a light sleep, which
+    /// the model refuses (F4). The request is rejected as the chip rejects one: `INT_RAW` bit 1.
+    LightSleep { dig_pwc: u32 },
+    /// The chip went into deep sleep with wake sources other than the RTC timer enabled in
+    /// `WAKEUP_STATE.WAKEUP_ENA` (F5): `wakeup_ena` is that field.
+    SleepWakeSource { wakeup_ena: u32 },
+    /// `RTC_CNTL.STATE0` written with `SW_CPU_INT`, `SLP_WAKEUP` or `SLP_REJECT` set
+    /// (`rtc_cntl_reg.h:229-261`): the RTC software interrupt and the software wake and reject of
+    /// a sleep are not modelled. `state0` is the value written.
+    SleepSignal { state0: u32 },
+    /// `RTC_CNTL.TIME_UPDATE` written with `TIMER_SYS_STALL`, `TIMER_XTL_OFF` or `TIMER_SYS_RST`
+    /// set (bits 27 to 29, `rtc_cntl_reg.h:187-204`): the captures of the RTC timer they ask for
+    /// are not modelled (F7). `time_update` is the value written.
+    RtcTimerTrigger { time_update: u32 },
     /// A byte written to a UART whose transmit FIFO was full.
     /// ASSUMPTION: the byte is dropped. No source says what the silicon does with such a write;
     /// writing 129 bytes or more without waiting on `TXFIFO_CNT` on a real chip and reading what
@@ -306,10 +330,11 @@ impl Unsupported {
                 f,
                 "the clock registers select a CPU clock inkemu cannot model (SYSCLK_CONF {sysclk_conf:#010x}, CPU_PER_CONF {cpu_per_conf:#010x}, pc {pc:#010x}), so emulated time keeps the previous frequency; select the crystal or the PLL at 80 or 160 MHz"
             ),
-            Unsupported::SlowClock { clk_conf } => write!(
-                f,
-                "RTC_CNTL.CLK_CONF selects an RTC slow clock inkemu does not model (value {clk_conf:#010x}, pc {pc:#010x}), so the RTC timer and the RTC watchdog keep counting the 136 kHz RC oscillator; select the RC oscillator (ANA_CLK_RTC_SEL = 0) or expect their durations to differ from the device"
-            ),
+            Unsupported::SlowClock { .. }
+            | Unsupported::LightSleep { .. }
+            | Unsupported::SleepWakeSource { .. }
+            | Unsupported::SleepSignal { .. }
+            | Unsupported::RtcTimerTrigger { .. } => self.describe_rtc(pc, f),
             Unsupported::UartOverflow { .. }
             | Unsupported::UartClock { .. }
             | Unsupported::UartReceiveClock { .. }
@@ -318,6 +343,42 @@ impl Unsupported {
             | Unsupported::UartEmptyRead { .. }
             | Unsupported::UsbEmptyRead
             | Unsupported::UsbInFull => self.describe_serial(pc, f),
+        }
+    }
+
+    /// The messages of the refusals of `RTC_CNTL`: its slow clock, the sleep of the chip and its
+    /// RTC timer, for [`Unsupported::describe`].
+    fn describe_rtc(self, pc: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unsupported::SlowClock { clk_conf } => write!(
+                f,
+                "RTC_CNTL.CLK_CONF selects an RTC slow clock inkemu does not model (value {clk_conf:#010x}, pc {pc:#010x}), so the RTC timer and the RTC watchdog keep counting the 136 kHz RC oscillator; select the RC oscillator (ANA_CLK_RTC_SEL = 0) or expect their durations to differ from the device"
+            ),
+            Unsupported::LightSleep { dig_pwc } => write!(
+                f,
+                "RTC_CNTL.STATE0.SLEEP_EN asks for a light sleep (DIG_PWC {dig_pwc:#010x} keeps the digital domain powered, pc {pc:#010x}), which inkemu does not model, so the request was rejected as the chip rejects one (INT_RAW.SLP_REJECT) and the firmware goes on; use deep sleep (esp_deep_sleep_start) or keep the CPU awake"
+            ),
+            Unsupported::SleepWakeSource { wakeup_ena } => {
+                let gpio = if wakeup_ena & GPIO_WAKE != 0 {
+                    "; the GPIO wake (bit 2) belongs to sub-project 2, which models the pins"
+                } else {
+                    ""
+                };
+                write!(
+                    f,
+                    "the chip went into deep sleep with wake sources inkemu does not model (WAKEUP_ENA {wakeup_ena:#07x}, pc {pc:#010x}){gpio}, so only the RTC timer (bit 3) can wake it; wake it with the RTC timer (esp_sleep_enable_timer_wakeup) or expect it to sleep for the rest of the run"
+                )
+            }
+            Unsupported::SleepSignal { state0 } => write!(
+                f,
+                "RTC_CNTL.STATE0 was written with SW_CPU_INT, SLP_WAKEUP or SLP_REJECT set (value {state0:#010x}, pc {pc:#010x}), signals inkemu does not model, so nothing was raised; leave bits 0, 29 and 30 clear"
+            ),
+            Unsupported::RtcTimerTrigger { time_update } => write!(
+                f,
+                "RTC_CNTL.TIME_UPDATE enables a capture of the RTC timer inkemu does not model (value {time_update:#010x}: TIMER_SYS_STALL, TIMER_XTL_OFF or TIMER_SYS_RST, pc {pc:#010x}), so TIME_LOW1/HIGH1 hold only the captures TIME_UPDATE bit 31 asks for; leave bits 27 to 29 clear"
+            ),
+            // INVARIANT: `describe` hands only the five refusals above to this function.
+            _ => Ok(()),
         }
     }
 
@@ -417,26 +478,36 @@ pub enum Diagnostic {
     /// the journal spec §7 asks for, with the program counter and the stack. It is no fault of
     /// the emulator and none it can judge of the firmware (`esp_restart` ends with one): it never
     /// stops a strict run, and a front end lists it as an event of the run, not as a warning.
+    ///
+    /// Every reset is an entry of its own, up to [`MAX_LISTED_RESETS`]: two resets of one cause
+    /// at one PC (a boot loop, three wakes from deep sleep) are two events, told apart by their
+    /// device time. They are never merged as a register polled in a loop is.
     Reset {
         cause: ResetCause,
         /// The instruction the reset kept from executing: where a watchdog caught the program,
         /// or the instruction after the store that asked for the reset.
         pc: u32,
-        /// The stack pointer at that instant. A reset is listed once per cause and PC: when the
-        /// same one comes again with another stack pointer (a boot loop), the entry that is shown
-        /// keeps the stack pointer of the first occurrence.
+        /// The stack pointer at that instant.
         sp: u32,
+        /// When the reset took place: microseconds of device time since power-on, as the summary
+        /// of a run counts them.
+        at_us: u64,
     },
     /// Emitted once when [`MAX_DISTINCT_DIAGNOSTICS`] is reached.
     Suppressed,
+    /// Emitted once when [`MAX_LISTED_RESETS`] resets have been listed: the later ones are
+    /// counted ([`Diagnostics::unlisted_resets`]) and no longer listed.
+    UnlistedResets,
 }
 
 /// Deduplication key: what the diagnostic is about, not where it was first seen.
 type Key = (u8, u32, u32);
 
 impl Diagnostic {
-    fn key(&self) -> Key {
-        match *self {
+    /// `None` for a reset: each one is listed (see [`Diagnostic::Reset`]).
+    fn key(&self) -> Option<Key> {
+        let key = match *self {
+            Diagnostic::Reset { .. } => return None,
             Diagnostic::UnmodeledMmio {
                 addr,
                 direction: Direction::Read,
@@ -459,6 +530,12 @@ impl Diagnostic {
                     cpu_per_conf,
                 } => (8, sysclk_conf, cpu_per_conf),
                 Unsupported::SlowClock { .. } => (9, 0, 0),
+                // One line each for a run: the values vary with what the firmware leaves in the
+                // other bits, and the refusal is the same whatever they are.
+                Unsupported::LightSleep { .. } => (29, 0, 0),
+                Unsupported::SleepWakeSource { .. } => (30, 0, 0),
+                Unsupported::SleepSignal { .. } => (31, 0, 0),
+                Unsupported::RtcTimerTrigger { .. } => (32, 0, 0),
                 Unsupported::UartOverflow { uart } => (12, u32::from(uart), 0),
                 Unsupported::UartClock { uart, sclk_sel } => (13, u32::from(uart), sclk_sel),
                 Unsupported::UartReceiveClock { uart, sclk_sel } => (28, u32::from(uart), sclk_sel),
@@ -490,8 +567,9 @@ impl Diagnostic {
             Diagnostic::FlashMapping { entry, fault, .. } => (10, entry, fault as u32),
             // One line per flash page: the firmware reads the page again at many addresses.
             Diagnostic::StaleFlashWindow { page, .. } => (21, page, 0),
-            Diagnostic::Reset { cause, pc, .. } => (14, pc, cause.code()),
-        }
+            Diagnostic::UnlistedResets => (14, 0, 0),
+        };
+        Some(key)
     }
 
     /// Whether `--strict-mmio` stops the run on this diagnostic. A CPU exception and a reset do
@@ -582,16 +660,37 @@ impl fmt::Display for Diagnostic {
                 f,
                 "CPU exception: {cause} at pc {pc:#010x} (tval {tval:#010x}, sp {sp:#010x}); the firmware's trap handler takes it, as on the device"
             ),
+            // The CPU had stopped at the write of `SLEEP_EN`: the PC is where it stood, not where a
+            // watchdog caught it (F2).
+            Diagnostic::Reset {
+                cause: ResetCause::DeepSleep,
+                pc,
+                sp,
+                at_us,
+            } => write!(
+                f,
+                "woken from deep sleep by the RTC timer (rst:{code:#x}), a core reset at {at_us} us of device time; the CPU had stopped at pc {pc:#010x}, sp {sp:#010x}",
+                code = ResetCause::DeepSleep.code()
+            ),
             // The code as the ROM prints it at the next boot (`rst:0x7`), so that the two lines
             // of one reset can be matched by eye.
-            Diagnostic::Reset { cause, pc, sp } => write!(
+            Diagnostic::Reset {
+                cause,
+                pc,
+                sp,
+                at_us,
+            } => write!(
                 f,
-                "reset by {cause} (rst:{code:#x}) at pc {pc:#010x}, sp {sp:#010x}",
+                "reset by {cause} (rst:{code:#x}) at pc {pc:#010x}, sp {sp:#010x}, at {at_us} us of device time",
                 code = cause.code()
             ),
             Diagnostic::Suppressed => write!(
                 f,
                 "more than {MAX_DISTINCT_DIAGNOSTICS} distinct diagnostics; further new ones are counted but not listed"
+            ),
+            Diagnostic::UnlistedResets => write!(
+                f,
+                "more than {MAX_LISTED_RESETS} resets; further ones are counted but not listed"
             ),
         }
     }
@@ -608,6 +707,10 @@ pub struct Diagnostics {
     capped: bool,
     /// Occurrences dropped because [`MAX_DISTINCT_DIAGNOSTICS`] distinct ones were already known.
     suppressed: u64,
+    /// Resets listed so far: at most [`MAX_LISTED_RESETS`].
+    listed_resets: usize,
+    /// Resets that came once [`MAX_LISTED_RESETS`] had been listed.
+    unlisted_resets: u64,
 }
 
 impl Diagnostics {
@@ -620,6 +723,8 @@ impl Diagnostics {
             violation: None,
             capped: false,
             suppressed: 0,
+            listed_resets: 0,
+            unlisted_resets: 0,
         }
     }
 
@@ -627,7 +732,10 @@ impl Diagnostics {
         if self.strict && self.violation.is_none() && diagnostic.stops_a_strict_run() {
             self.violation = Some(diagnostic.clone());
         }
-        let key = diagnostic.key();
+        let Some(key) = diagnostic.key() else {
+            self.record_reset(diagnostic);
+            return;
+        };
         if let Some((_, count)) = self.seen.get_mut(&key) {
             *count += 1;
             return;
@@ -643,6 +751,20 @@ impl Diagnostics {
         self.pending.push(diagnostic);
     }
 
+    /// Lists `reset` as an entry of its own, within its own bound: the table of distinct
+    /// diagnostics neither holds nor hides it.
+    fn record_reset(&mut self, reset: Diagnostic) {
+        if self.listed_resets < MAX_LISTED_RESETS {
+            self.listed_resets += 1;
+            self.pending.push(reset);
+            return;
+        }
+        if self.unlisted_resets == 0 {
+            self.pending.push(Diagnostic::UnlistedResets);
+        }
+        self.unlisted_resets += 1;
+    }
+
     /// Diagnostics seen for the first time since the last call, in order of first occurrence.
     pub fn drain(&mut self) -> Vec<Diagnostic> {
         std::mem::take(&mut self.pending)
@@ -655,10 +777,13 @@ impl Diagnostics {
         self.violation.take()
     }
 
+    /// How many times a diagnostic that is listed once was recorded; 0 for a reset, which is
+    /// listed at each occurrence.
     #[must_use]
     pub fn occurrences(&self, diagnostic: &Diagnostic) -> u64 {
-        self.seen
-            .get(&diagnostic.key())
+        diagnostic
+            .key()
+            .and_then(|key| self.seen.get(&key))
             .map_or(0, |&(_, count)| count)
     }
 
@@ -667,6 +792,13 @@ impl Diagnostics {
     #[must_use]
     pub const fn suppressed(&self) -> u64 {
         self.suppressed
+    }
+
+    /// How many resets came once [`MAX_LISTED_RESETS`] had been listed: none of them is listed,
+    /// and each is counted here.
+    #[must_use]
+    pub const fn unlisted_resets(&self) -> u64 {
+        self.unlisted_resets
     }
 
     /// At most `limit` diagnostics that occurred more than once, the most frequent first (ties in key
@@ -913,6 +1045,14 @@ mod tests {
             unsupported(Unsupported::SlowClock {
                 clk_conf: 0x4000_0000,
             }),
+            unsupported(Unsupported::LightSleep {
+                dig_pwc: 0x0055_5010,
+            }),
+            unsupported(Unsupported::SleepWakeSource { wakeup_ena: 0xC }),
+            unsupported(Unsupported::SleepSignal { state0: 1 }),
+            unsupported(Unsupported::RtcTimerTrigger {
+                time_update: 1 << 29,
+            }),
             unsupported(Unsupported::UartOverflow { uart: 0 }),
             unsupported(Unsupported::UartClock {
                 uart: 1,
@@ -971,7 +1111,16 @@ mod tests {
     }
 
     fn reset_at(cause: ResetCause, pc: u32, sp: u32) -> Diagnostic {
-        Diagnostic::Reset { cause, pc, sp }
+        reset_at_time(cause, pc, sp, 1_300_000)
+    }
+
+    fn reset_at_time(cause: ResetCause, pc: u32, sp: u32, at_us: u64) -> Diagnostic {
+        Diagnostic::Reset {
+            cause,
+            pc,
+            sp,
+            at_us,
+        }
     }
 
     #[test]
@@ -994,19 +1143,26 @@ mod tests {
                 ResetCause::Mwdt0Core,
                 0x4004_c0d4,
                 0x3FCD_E710,
-                "reset by main watchdog 0, a core reset (rst:0x7) at pc 0x4004c0d4, sp 0x3fcde710",
+                "reset by main watchdog 0, a core reset (rst:0x7) at pc 0x4004c0d4, sp 0x3fcde710, at 1300000 us of device time",
             ),
             (
                 ResetCause::SoftwareCpu,
                 0x4004_8b92,
                 0x3FC9_0000,
-                "reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x3fc90000",
+                "reset by the firmware, a CPU reset (rst:0xc) at pc 0x40048b92, sp 0x3fc90000, at 1300000 us of device time",
             ),
             (
                 ResetCause::RtcWatchdogSystem,
                 0x10,
                 0,
-                "reset by the RTC watchdog, a system reset (rst:0x10) at pc 0x00000010, sp 0x00000000",
+                "reset by the RTC watchdog, a system reset (rst:0x10) at pc 0x00000010, sp 0x00000000, at 1300000 us of device time",
+            ),
+            // F2: the wake from deep sleep says where the CPU had stopped, not where it was caught.
+            (
+                ResetCause::DeepSleep,
+                0x4038_0f2c,
+                0x3FC9_8000,
+                "woken from deep sleep by the RTC timer (rst:0x5), a core reset at 1300000 us of device time; the CPU had stopped at pc 0x40380f2c, sp 0x3fc98000",
             ),
         ] {
             assert_eq!(reset_at(cause, pc, sp).to_string(), text);
@@ -1014,27 +1170,53 @@ mod tests {
     }
 
     #[test]
-    fn resets_are_listed_once_per_cause_and_pc_and_counted() {
+    fn each_reset_is_listed_with_its_device_time_and_never_merged_with_another() {
         let mut d = Diagnostics::new(false);
-        let first = reset_at(ResetCause::Mwdt0Core, 0x4004_c0d4, 0x3FCD_E710);
-        d.record(first.clone());
-        // The loop of a blank chip: the same watchdog at the same instruction, another stack.
-        d.record(reset_at(ResetCause::Mwdt0Core, 0x4004_c0d4, 0x3FCD_E700));
-        // Another cause at the same instruction, and the same cause at another one.
-        d.record(reset_at(
-            ResetCause::RtcWatchdogSystem,
-            0x4004_c0d4,
-            0x3FCD_E710,
-        ));
-        d.record(reset_at(ResetCause::Mwdt0Core, 0x4004_c0d8, 0x3FCD_E710));
-        let listed = d.drain();
-        assert_eq!(listed.len(), 3, "{listed:?}");
+        // Three wakes from deep sleep at the same instruction, as the lives of one firmware
+        // stop there: three events, which only their device time tells apart.
+        let wakes: Vec<Diagnostic> = [2_000_000, 4_000_000, 6_000_000]
+            .into_iter()
+            .map(|at_us| reset_at_time(ResetCause::DeepSleep, 0x4038_0f2c, 0x3FC9_8000, at_us))
+            .collect();
+        for wake in &wakes {
+            d.record(wake.clone());
+        }
+        assert_eq!(d.drain(), wakes);
+        assert_eq!(d.most_repeated(4), Vec::new(), "no reset is a repetition");
+        assert_eq!(d.occurrences(&wakes[0]), 0, "a reset is not counted as one");
         assert_eq!(
-            listed[0], first,
-            "the entry shown is the first occurrence, with its stack pointer"
+            d.distinct(),
+            0,
+            "nor kept in the table of distinct diagnostics"
         );
-        assert_eq!(d.occurrences(&first), 2, "the second one is counted");
-        assert_eq!(d.most_repeated(4), vec![(first, 2)]);
+    }
+
+    #[test]
+    fn resets_past_their_bound_are_counted_and_said_once_and_never_hide_other_diagnostics() {
+        let mut d = Diagnostics::new(false);
+        let total = MAX_LISTED_RESETS as u64 + 10;
+        for at_us in 0..total {
+            d.record(reset_at_time(ResetCause::Mwdt0Core, 0x4004_c0d4, 0, at_us));
+        }
+        let listed = d.drain();
+        assert_eq!(
+            listed.len(),
+            MAX_LISTED_RESETS + 1,
+            "the resets, then the note"
+        );
+        assert_eq!(listed.last(), Some(&Diagnostic::UnlistedResets));
+        assert_eq!(d.unlisted_resets(), 10);
+        assert_eq!(
+            d.suppressed(),
+            0,
+            "the table of distinct diagnostics is untouched"
+        );
+        d.record(read_at(0x6001_9000, 0));
+        assert_eq!(
+            d.drain(),
+            vec![read_at(0x6001_9000, 0)],
+            "a reset loop does not hide what comes next"
+        );
     }
 
     #[test]
@@ -1277,6 +1459,30 @@ mod tests {
                     clk_conf: 0x4000_0000,
                 }),
                 "RTC slow clock",
+            ),
+            (
+                unsupported(Unsupported::LightSleep {
+                    dig_pwc: 0x0055_5010,
+                }),
+                "asks for a light sleep (DIG_PWC 0x00555010 keeps the digital domain powered",
+            ),
+            (
+                unsupported(Unsupported::SleepWakeSource { wakeup_ena: 0xC }),
+                "(WAKEUP_ENA 0x0000c, pc 0x40381000); the GPIO wake (bit 2) belongs to sub-project 2",
+            ),
+            (
+                unsupported(Unsupported::SleepWakeSource { wakeup_ena: 0x48 }),
+                "(WAKEUP_ENA 0x00048, pc 0x40381000), so only the RTC timer (bit 3) can wake it",
+            ),
+            (
+                unsupported(Unsupported::SleepSignal { state0: 1 }),
+                "SW_CPU_INT, SLP_WAKEUP or SLP_REJECT set (value 0x00000001",
+            ),
+            (
+                unsupported(Unsupported::RtcTimerTrigger {
+                    time_update: 1 << 29,
+                }),
+                "capture of the RTC timer inkemu does not model (value 0x20000000",
             ),
             (
                 unsupported(Unsupported::UartClock {

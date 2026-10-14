@@ -20,7 +20,7 @@ they are stored with their lock rules and **never enforced** — no access is re
 (decision D18 of plan SP1b-2). Plan SP1b-4 enforces them (decision E31 of plan SP1b-3a).
 
 The table is generated: the lists live next to each peripheral model (`accepted()` in
-`crates/soc-esp32c3/src/periph/*.rs`). A model that is plain storage is built from its list; a model
+`crates/soc-esp32c3/src/periph/`). A model that is plain storage is built from its list; a model
 that keeps its registers in fields has its list beside it. In both cases the test
 `every_row_of_the_table_is_routed_to_a_model_that_accepts_a_write_there`
 (`crates/soc-esp32c3/src/periph/mod.rs`) writes the first and the last register of every row through
@@ -31,8 +31,13 @@ then rewrites the table below, and nothing else; review the diff before committi
 
 "Count" is 1 for a single register, or the number of consecutive registers the row stands for.
 "Made real by" names the plan that gives the register its effect. Each plan inherits the rows that
-name it. The table has six heirs: SP1b-3f (deep sleep), SP1b-4, SP2, SP5a, SP5b and SP8. The
-UART rows SP1b-3d inherited left the table when it gave them their effect. The carry-over note
+name it. The table has six heirs: SP1b-4, SP2, SP4 (the resource monitor, which needs a power
+model), SP5a, SP5b and SP8. The UART rows SP1b-3d inherited left the table when it gave them their
+effect; the rows SP1b-3f inherited went to SP2, SP4, SP5a and SP8, with the registers the
+deep-sleep path of ESP-IDF writes that the model did not know before. A row whose register has one
+bit that acts names that bit in its description, the rest of the register being stored without
+effect: `RTC_CNTL.DIG_PWC` (`DG_WRAP_PD_EN`, which makes a sleep deep), like `RTC_CNTL.OPTIONS0`,
+`RTC_CNTL.FIB_SEL` and `RTC_CNTL.CLK_CONF`. The carry-over note
 `docs/superpowers/notes/2026-10-11-sp1b-3a-carryover.md` names the rows one by one, as the table
 stood at the end of plan SP1b-3a, when one plan, "SP1b-3b", was to take what five plans now share;
 its first section says which plan takes what.
@@ -71,23 +76,28 @@ its first section says which plan takes what.
 | `0x60004168` | `GPIO.FUNC5_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x600050f0` | `FE2.FE2_TX_INTERP_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60006090` | `FE.FE_GEN_CTRL` | 1 | radio memory power: there is no radio | SP5a |
-| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing, CPU stall (the two software reset bits act) | SP1b-3f |
-| `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays | SP1b-3f |
-| `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP1b-3f |
-| `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing | SP1b-3f |
-| `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time | SP1b-3f |
-| `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing | SP1b-3f |
+| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing: no effect to see without a power model; CPU stall, which ESP-IDF uses on dual-core chips only (the two software reset bits act) | SP4 |
+| `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays: a wake from deep sleep takes no time | SP8 |
+| `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP5a |
+| `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing: a wake from deep sleep takes no time | SP8 |
+| `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time: a sleep of any length is entered | SP8 |
+| `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing: a wake from deep sleep takes no time | SP8 |
 | `0x60008034` | `RTC_CNTL.ANA_CONF` | 1 | analog configuration, glitch reset | SP8 |
+| `0x60008064` | `RTC_CNTL.EXT_WAKEUP_CONF` | 1 | GPIO wake filter: the pins are not modelled | SP2 |
+| `0x60008068` | `RTC_CNTL.SLP_REJECT_CONF` | 1 | sleep rejection: no reject source (GPIO, UART) is raised | SP2 |
 | `0x60008070` | `RTC_CNTL.CLK_CONF` | 1 | RTC fast clock source and dividers (a slow clock other than the RC oscillator is refused) | SP8 |
 | `0x60008074` | `RTC_CNTL.SLOW_CLK_CONF` | 1 | RTC slow clock divider | SP8 |
+| `0x60008078` | `RTC_CNTL.SDIO_CONF` | 1 | flash supply (VDD_SDIO) regulator and its power-down in sleep: no effect to see without a power model | SP4 |
+| `0x6000807c` | `RTC_CNTL.BIAS_CONF` | 1 | bias and regulator settings in sleep: no effect to see without a power model | SP4 |
 | `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP8 |
-| `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control | SP1b-3f |
-| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power-domain control | SP1b-3f |
-| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation | SP1b-3f |
+| `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control: no effect to see without a power model | SP4 |
+| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power domains in sleep (Wi-Fi, BT, CPU, peripherals) and their forced power-up: no effect to see without a power model (DG_WRAP_PD_EN acts: read at the write of SLEEP_EN, set it makes the sleep deep, clear a light sleep, which is refused) | SP4 |
+| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation and hold in sleep: the pins are not modelled | SP2 |
 | `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | pad hold | SP2 |
 | `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | digital pad hold | SP2 |
 | `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector: the supply is always good | SP2 |
 | `0x6000810c` | `RTC_CNTL.FIB_SEL` | 1 | brown-out and glitch reset selection (the super watchdog bit acts) | SP2 |
+| `0x60008110` | `RTC_CNTL.GPIO_WAKEUP` | 1 | GPIO wake of each pin and its status: the pins are not modelled (a GPIO wake source is refused by name at the entry into sleep) | SP2 |
 | `0x6000811c` | `RTC_CNTL.SENSOR_CTRL` | 1 | SAR ADC power forcing | SP2 |
 | `0x60009000` | `IO_MUX.PIN_CTRL` | 23 | pad function, pulls, drive strength, input enable | SP2 |
 | `0x600090fc` | `IO_MUX.DATE` | 1 | none: the version date of the block, stored as written | SP2 |
@@ -112,7 +122,7 @@ its first section says which plan takes what.
 | `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals: a gated module keeps answering | SP8 |
 | `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals (the debug assistant) | SP1b-4 |
 | `0x600c0008` | `SYSTEM.CPU_PER_CONF` | 1 | PLL_FREQ_SEL and the CPU wait-mode bits (CPUPERIOD_SEL is used by the clock model) | SP8 |
-| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep | SP1b-3f |
+| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep, which is refused by name: no effect to see without a power model | SP4 |
 | `0x600c0010` | `SYSTEM.PERIP_CLK_EN0` | 1 | peripheral clock gates: a gated module keeps answering | SP8 |
 | `0x600c0014` | `SYSTEM.PERIP_CLK_EN1` | 1 | peripheral clock gates: a gated module keeps answering | SP8 |
 | `0x600c0020` | `SYSTEM.BT_LPCK_DIV_INT` | 1 | Bluetooth low-power clock divider: there is no radio | SP5b |

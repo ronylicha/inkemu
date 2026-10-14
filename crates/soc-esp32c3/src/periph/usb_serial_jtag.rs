@@ -164,6 +164,9 @@ pub struct UsbSerialJtag {
     int_ena: u32,
     /// The call at the next instant the block has something to do.
     wake: Deadline,
+    /// The device time the chip went into deep sleep, while it sleeps: the block has no power
+    /// and goes no further than it ([`UsbSerialJtag::power_down`]).
+    powered_down_at: Option<u64>,
 }
 
 impl Default for UsbSerialJtag {
@@ -203,7 +206,17 @@ impl UsbSerialJtag {
             int_raw: SERIAL_IN_EMPTY,
             int_ena: 0,
             wake: Deadline::default(),
+            powered_down_at: None,
         }
+    }
+
+    /// The chip went into deep sleep at the present time: the digital domain has no power until
+    /// the reset that ends the sleep (TRM §9.4.1, table 9.4-1). Whatever a front end calls in
+    /// between (take the console, send packets, change or read the host), the block goes no
+    /// further than this instant: the host takes a committed packet, sends its own and changes
+    /// as the block sees it at that reset, as in a run that no call cut inside the sleep.
+    pub(crate) fn power_down(&mut self, ctx: &Ctx) {
+        self.powered_down_at = Some(ctx.now().get());
     }
 
     /// A core reset, or `SYSTEM.PERIP_RST_EN0` bit 23 (`USB_DEVICE_RST`), returns the block to
@@ -231,6 +244,9 @@ impl UsbSerialJtag {
     /// held bytes leave with the banner, committed by its first `\n`, §B.2 and §B.3); the banner
     /// alone means it was reset.
     pub(crate) fn reset(&mut self, ctx: &mut Ctx) {
+        // A reset that ends a deep sleep powers the block up: it comes to the instant of the
+        // reset.
+        self.powered_down_at = None;
         self.settle(ctx);
         self.stored = UsbSerialJtag::new(self.host).stored;
         self.in_fifo.clear();
@@ -292,10 +308,17 @@ impl UsbSerialJtag {
         self.arm(ctx);
     }
 
-    /// The state of the host now, the changes due by now applied.
+    /// The state of the host now, the changes due by now applied. While the block has no power
+    /// (a deep sleep), the changes due wait for the reset that ends the sleep: the host is what
+    /// the last of them says, and the block does not see it yet.
     pub fn host(&mut self, ctx: &mut Ctx) -> UsbHost {
         self.settle(ctx);
-        self.host
+        let now = ctx.now().get();
+        self.host_changes
+            .iter()
+            .take_while(|&&(at, _)| at <= now)
+            .last()
+            .map_or(self.host, |&(_, state)| state)
     }
 
     /// How many bytes the host has sent that have not reached the OUT FIFO, its packets counted
@@ -313,7 +336,9 @@ impl UsbSerialJtag {
         !self.tx.is_empty()
     }
 
-    /// How many changes of the host are still to come, those due by now applied first.
+    /// How many changes of the host the block has not applied, those due by now applied first.
+    /// While the block has no power (a deep sleep), the changes due wait for the reset that ends
+    /// the sleep and count: the bound of the caller holds whatever a front end sends meanwhile.
     pub fn host_changes_pending(&mut self, ctx: &mut Ctx) -> usize {
         self.settle(ctx);
         self.host_changes.len()
@@ -397,9 +422,13 @@ impl UsbSerialJtag {
 
     /// Brings the block to now: the host changes, takes the committed packet and sends its own,
     /// in the order of their instants (a change of the host first at an instant they share); the
-    /// frames started raise `SOF`; the interrupt source follows.
+    /// frames started raise `SOF`; the interrupt source follows. A block without power comes no
+    /// further than the instant it lost it.
     fn settle(&mut self, ctx: &mut Ctx) {
-        let now = ctx.now().get();
+        let now = ctx
+            .now()
+            .get()
+            .min(self.powered_down_at.unwrap_or(u64::MAX));
         // INVARIANT: each pass applies a change, takes the committed packet or takes a packet of
         // the host, all of them bounded by the caller (`host_pending`, `host_changes_pending`).
         loop {
@@ -886,6 +915,34 @@ mod tests {
         assert_eq!(usb.take_written(), [], "the packet being filled is lost");
         run_to(ctx, &mut usb, Cycles(11 * HOST_LATENCY));
         assert_eq!(read_packet(ctx, &mut usb), b"later");
+        assert_eq!(usb.host(ctx), UsbHost::Open);
+    }
+
+    #[test]
+    fn a_block_without_power_goes_no_further_than_its_power_down_whatever_a_front_end_calls() {
+        // A deep sleep: the host takes the committed packet and changes as the block sees it at
+        // the reset that ends the sleep, not at the calls of a front end in between.
+        let ctx = &mut Ctx::default();
+        let mut usb = UsbSerialJtag::new(UsbHost::Attached);
+        send(ctx, &mut usb, b"sent\n");
+        usb.write(ctx, EP1_CONF, WR_DONE);
+        usb.power_down(ctx);
+        usb.set_host(ctx, Cycles(HOST_LATENCY), UsbHost::Open);
+        ctx.sleep_until(Cycles(10 * HOST_LATENCY));
+        assert_eq!(usb.take_tx(ctx), [], "not taken during the sleep");
+        assert_eq!(
+            usb.host(ctx),
+            UsbHost::Open,
+            "the host is open all the same"
+        );
+        assert_eq!(
+            usb.host_changes_pending(ctx),
+            1,
+            "the change waits for the wake"
+        );
+        usb.reset(ctx);
+        assert_eq!(usb.take_tx(ctx), b"sent\n", "taken at the reset");
+        assert_eq!(usb.host_changes_pending(ctx), 0);
         assert_eq!(usb.host(ctx), UsbHost::Open);
     }
 
