@@ -529,6 +529,7 @@ impl Lockstep {
         self.resets = target.resets();
         self.counts.resets_crossed += 1;
         self.written.clear();
+        self.csrs_before_reset = self.csrs_kept_through_resets();
         self.bits_written.clear();
         self.meip_lag = 0;
         self.spi1_user2 = 0;
@@ -539,7 +540,6 @@ impl Lockstep {
         self.kept.clear();
         self.kept_memory.clear();
         self.stored_since_reset.clear();
-        self.csrs_before_reset = self.csrs_before_step.clone();
         let written = executed
             .filter(|executed| executed.trap.is_none())
             .and_then(|executed| executed.instruction)
@@ -963,7 +963,8 @@ impl Lockstep {
 
     /// A read of a CSR of [`Treatment::CsrKeptAtReset`] giving `mine` in inkemu and `theirs` in
     /// QEMU: equal, or, after a reset of both sides, QEMU's is inkemu's with the bits of `kept`
-    /// that inkemu held just before the reset set again, the difference within `mask`. Returns
+    /// that QEMU held at the reset set again ([`Lockstep::csrs_kept_through_resets`]: inkemu's
+    /// value before it, with what earlier resets kept), the difference within `mask`. Returns
     /// the bits to take.
     ///
     /// A bit an instruction has written since the reset holds what the life after it wrote, the
@@ -981,6 +982,31 @@ impl Lockstep {
         let before = *self.csrs_before_reset.get(&csr)?;
         let still_kept = before & kept & !written;
         (theirs == mine | still_kept && differ & !mask == 0).then_some(differ)
+    }
+
+    /// What QEMU's CSRs of [`Treatment::CsrKeptAtReset`] hold at the reset being crossed, as the
+    /// value the life after it is compared from: inkemu's value before the reset, with the kept
+    /// bits QEMU still held from the resets before (the value they started this life from) that
+    /// this life did not write. QEMU keeps those bits through every reset, so a third life reads
+    /// what the first set when the second wrote none of it.
+    fn csrs_kept_through_resets(&self) -> BTreeMap<u16, u32> {
+        let mut kept_through = BTreeMap::new();
+        for row in self.rows {
+            for treatment in row.treatments {
+                let Treatment::CsrKeptAtReset(csrs) = treatment else {
+                    continue;
+                };
+                for kept in *csrs {
+                    let Some(&now) = self.csrs_before_step.get(&kept.csr) else {
+                        continue;
+                    };
+                    let earlier = self.csrs_before_reset.get(&kept.csr).copied().unwrap_or(0);
+                    let written = self.bits_written.get(&kept.csr).copied().unwrap_or(0);
+                    kept_through.insert(kept.csr, now | (earlier & kept.kept & !written));
+                }
+            }
+        }
+        kept_through
     }
 
     /// Whether the entries of [`Treatment::RegistersAfterReset`] at the word `address` hold: a

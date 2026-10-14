@@ -39,10 +39,13 @@ pub enum Treatment {
     KeptAtReset(&'static [Kept]),
     /// (ii) CSRs QEMU does not print, some bits of which its reset keeps where inkemu's CPU reset
     /// clears them: after a reset of both sides, a read into a register gives in QEMU inkemu's
-    /// value with those of the kept bits inkemu held before the reset set again ([`KeptCsr`]),
-    /// or inkemu's value itself; the register takes QEMU's bits, within the mask. A bit an
-    /// instruction has written since the reset is no longer kept (every bit for `csrrw` and
-    /// `csrrwi`, the operand for `csrrs`, `csrrc` and their immediate forms): it is compared.
+    /// value with those of the kept bits QEMU held at the reset set again ([`KeptCsr`]), or
+    /// inkemu's value itself; the register takes QEMU's bits, within the mask. QEMU holds at a
+    /// reset inkemu's value before it, with the kept bits of earlier resets the life it ends did
+    /// not write: QEMU keeps them through every reset. A bit an instruction has written since
+    /// the reset is no longer kept (every bit for `csrrw` and `csrrwi`, the operand for `csrrs`,
+    /// `csrrc` and their immediate forms; nothing for an instruction that raised an exception):
+    /// it is compared.
     CsrKeptAtReset(&'static [KeptCsr]),
     /// (ii) Registers the two resets leave in different states: the same copy as
     /// [`Treatment::Registers`], made only after a reset that left the register in two states

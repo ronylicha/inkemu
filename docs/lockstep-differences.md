@@ -202,11 +202,14 @@ ce que les deux resets laissent différent est une ligne mesurée sur la fenêtr
   (ii) à la même adresse (un bit va à la première ligne qui le déclare). **(ii) CSR gardé au
   reset** (SP1b-4d) : un CSR que QEMU n'imprime pas, dont son reset garde certains bits ; après un
   reset, une lecture doit donner dans QEMU la valeur d'inkemu avec, en plus, ceux de ces bits
-  qu'inkemu avait juste avant le reset et qu'aucune instruction n'a écrits depuis, et la
-  destination prend les bits de QEMU, dans le masque mesuré. Les bits écrits sont suivis par CSR :
-  tous pour `csrrw` et `csrrwi`, l'opérande pour `csrrs`, `csrrc` et leurs formes immédiates (un
-  opérande nul n'écrit rien). Un bit écrit tient ce que la seconde vie a écrit, le même des deux
-  côtés : il est comparé.
+  que QEMU avait au reset et qu'aucune instruction n'a écrits depuis, et la destination prend les
+  bits de QEMU, dans le masque mesuré. QEMU a au reset la valeur qu'inkemu avait juste avant, plus
+  les bits gardés des resets précédents que la vie qui finit n'a pas écrits : il les garde à
+  travers chaque reset (une troisième vie lit ce que la première a posé quand la deuxième n'y a
+  rien écrit). Les bits écrits sont suivis par CSR : tous pour `csrrw` et `csrrwi`, l'opérande
+  pour `csrrs`, `csrrc` et leurs formes immédiates (un opérande nul n'écrit rien, une instruction
+  qui lève une exception non plus). Un bit écrit tient ce que la seconde vie a écrit, le même des
+  deux côtés : il est comparé.
 - **(iii) resynchronisation** à un PC d'ancrage : aucune ligne n'en a eu besoin.
 - **(iv) réglage `QemuCompat`** de la machine, désactivé par défaut, que seul le lockstep allume,
   quand la différence change le flot de contrôle et qu'aucun des trois premiers ne suffit. La ligne
