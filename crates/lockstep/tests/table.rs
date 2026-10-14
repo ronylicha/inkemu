@@ -8,6 +8,7 @@ use lockstep::state::CSRS;
 use lockstep::table::Compat;
 use lockstep::{Location, Treatment};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 fn documentation() -> String {
     let path = concat!(
@@ -100,10 +101,10 @@ fn lines_of(treatment: &Treatment) -> Vec<String> {
                     register.address, register.mask
                 );
                 if let Some(command) = register.after_command {
-                    line.push_str(&format!(" après 0x{command:02X}"));
+                    let _ = write!(line, " après 0x{command:02X}");
                 }
                 if let Some(value) = register.qemu {
-                    line.push_str(&format!(" qemu 0x{value:08X}"));
+                    let _ = write!(line, " qemu 0x{value:08X}");
                 }
                 line
             })

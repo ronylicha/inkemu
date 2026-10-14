@@ -5,7 +5,7 @@
 //! row of the table admits the difference, within what the row declares.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test: a panic is a test failure
 
-use cpu_rv32::asm::{addi, csrrw, csrrwi, lui, lw};
+use cpu_rv32::asm::{addi, csrrs, csrrw, csrrwi, lui, lw};
 use lockstep::{
     Cause, CpuState, End, Field, Lockstep, Target, TraceReader, WindowEnd, render_block,
 };
@@ -15,6 +15,7 @@ use soc_esp32c3::{Esp32C3, SocConfig};
 
 const T0: u8 = 5;
 const T1: u8 = 6;
+const T2: u8 = 7;
 const NOP: u32 = 0x0000_0013;
 const MEIP: u32 = 1 << 11;
 
@@ -247,6 +248,39 @@ fn a_reset_of_both_sides_ends_the_window_and_of_one_side_is_a_divergence() {
     assert_eq!(lockstep.counts().compared, 4);
 }
 
+#[test]
+fn a_reset_of_inkemu_alone_is_a_divergence() {
+    // `RTC_CNTL.OPTIONS0.SW_SYS_RST` resets the machine after the store; QEMU's trace goes on
+    // to the next instruction as if nothing happened.
+    let options0 = svd_regs::esp32c3::addr("RTC_CNTL", "OPTIONS0");
+    let mut program = store_register(options0, 1 << 31).to_vec();
+    let store = program.len();
+    program.extend([NOP; 4]);
+    program.push(HANG);
+    let mut entries = record(&program, store);
+    let Some(Entry::State(last)) = entries.last().copied() else {
+        panic!("the trace ends with a state");
+    };
+    assert_eq!(last.pc(), ROM_BASE, "the machine reset after the store");
+    // QEMU's state after the store: the next instruction, the registers the store left.
+    let Entry::State(before_store) = entries[store - 1] else {
+        panic!("a state");
+    };
+    let mut not_reset = before_store;
+    not_reset.set(Field::Pc, ROM_BASE + 4 * u32::try_from(store).unwrap());
+    *entries.last_mut().unwrap() = Entry::State(not_reset);
+    let (end, lockstep) = compare(&text(&entries), &mut machine(&program), None);
+    let End::Divergence(report) = end else {
+        panic!("inkemu reset alone: {end:?}");
+    };
+    assert_eq!(report.cause, Cause::OneSidedReset { qemu: false });
+    assert!(report.to_string().contains("inkemu reset"), "{}", report);
+    assert_eq!(
+        lockstep.counts().compared,
+        u64::try_from(store - 1).unwrap()
+    );
+}
+
 /// `lw t1, offset(t0)` with `t0` = `base`, then a halt.
 fn load_from(base: u32, offset: i32) -> Vec<u32> {
     vec![lui(T0, base), lw(T1, T0, offset), NOP, HANG]
@@ -421,33 +455,138 @@ fn a_pair_admits_its_values_until_the_csr_is_written() {
     );
 }
 
-#[test]
-fn qemus_meip_follows_its_matrix_and_lags_three_instructions_after_a_threshold_store() {
-    let thresh = svd_regs::esp32c3::addr("INTERRUPT_CORE0", "CPU_INT_THRESH");
-    let mut program = store_register(thresh, 2).to_vec();
+/// Software interrupt 0 pending on line 3 at priority 1, its line enabled but `mstatus.MIE`
+/// clear: QEMU's matrix raises `MEIP` and the CPU takes nothing. Then `csrr t1, mip` when
+/// `read_mip`, the threshold store of `threshold` (2 brings the line down), and NOPs.
+fn pending_then_threshold(read_mip: bool, threshold: u32) -> (Vec<u32>, usize, usize) {
+    let reg = |p, r| svd_regs::esp32c3::addr(p, r);
+    let mut program = Vec::new();
+    program.extend(store_register(
+        reg("INTERRUPT_CORE0", "CPU_INTR_FROM_CPU_0_MAP"),
+        3,
+    ));
+    program.extend(store_register(
+        reg("INTERRUPT_CORE0", "CPU_INT_PRI_0") + 12,
+        1,
+    ));
+    program.extend(store_register(
+        reg("INTERRUPT_CORE0", "CPU_INT_ENABLE"),
+        1 << 3,
+    ));
+    program.extend(store_register(reg("SYSTEM", "CPU_INTR_FROM_CPU_0"), 1));
+    let read = program.len();
+    if read_mip {
+        program.push(csrrs(T2, 0x344, 0));
+    }
+    program.extend(store_register(
+        reg("INTERRUPT_CORE0", "CPU_INT_THRESH"),
+        threshold,
+    ));
     let store = program.len();
     program.extend([NOP; 6]);
     program.push(HANG);
+    (program, read, store)
+}
+
+/// The trace of `program` for `steps` instructions with QEMU's `MEIP` kept up in the `blocks`
+/// states after the `store`-th instruction (`entries[n]` is the state after `n` instructions).
+fn lagging(program: &[u32], steps: usize, store: usize, blocks: usize) -> Vec<Entry> {
+    let mut entries = record(program, steps);
+    for entry in entries.iter_mut().skip(store).take(blocks) {
+        if let Entry::State(state) = entry {
+            state.set(Field::Mip, state.get(Field::Mip) | MEIP);
+        }
+    }
+    entries
+}
+
+#[test]
+fn qemus_meip_lags_three_instructions_after_a_threshold_store_that_brings_its_line_down() {
+    let (program, _, store) = pending_then_threshold(false, 2);
     let steps = store + 6;
-    // QEMU keeps MEIP up for the three blocks after the store, as it does in the window.
-    let lagging = |blocks: usize| {
-        let mut entries = record(&program, steps);
-        // `entries[n]` is the state after `n` instructions: the store is the `store`-th.
-        for entry in entries.iter_mut().skip(store).take(blocks) {
+    let mut target = machine(&program);
+    assert!(
+        !target.external_interrupt_as_qemu(),
+        "nothing is pending at power-on"
+    );
+    let (end, lockstep) = compare(
+        &text(&lagging(&program, steps, store, 3)),
+        &mut target,
+        None,
+    );
+    assert_eq!(end, End::Window(WindowEnd::TraceEnd));
+    assert!(
+        lockstep.usage(&target).uses(4) >= 3,
+        "the line while pending, then the three late blocks"
+    );
+    let (end, _) = compare(
+        &text(&lagging(&program, steps, store, 4)),
+        &mut machine(&program),
+        None,
+    );
+    assert!(
+        matches!(&end, End::Divergence(report) if report.differing == [Field::Mip]),
+        "a fourth block is past the lag: {end:?}"
+    );
+    // A threshold store that brings no line down (nothing pending) arms no lag: QEMU's MEIP in
+    // the block after it is a divergence.
+    let thresh = svd_regs::esp32c3::addr("INTERRUPT_CORE0", "CPU_INT_THRESH");
+    let mut program = store_register(thresh, 2).to_vec();
+    let store = program.len();
+    program.extend([NOP; 4]);
+    program.push(HANG);
+    let (end, _) = compare(
+        &text(&lagging(&program, store + 4, store, 1)),
+        &mut machine(&program),
+        None,
+    );
+    assert!(
+        matches!(&end, End::Divergence(report) if report.differing == [Field::Mip]),
+        "no line came down: {end:?}"
+    );
+}
+
+#[test]
+fn a_read_of_mip_takes_the_meip_qemu_showed_and_no_other_bit() {
+    // QEMU's `csrr t1, mip` reads the MEIP its matrix raised; inkemu's controller shows none.
+    let (program, read, store) = pending_then_threshold(true, 2);
+    let steps = store + 6;
+    let with_t1 = |change: u32| {
+        let mut entries = lagging(&program, steps, store, 3);
+        for entry in entries.iter_mut().skip(read + 1) {
             if let Entry::State(state) = entry {
-                state.set(Field::Mip, state.get(Field::Mip) | MEIP);
+                state.set(Field::X(T2), state.x(T2) | change);
             }
         }
         text(&entries)
     };
     let mut target = machine(&program);
-    let (end, lockstep) = compare(&lagging(3), &mut target, None);
+    let (end, _) = compare(&with_t1(MEIP), &mut target, None);
     assert_eq!(end, End::Window(WindowEnd::TraceEnd));
-    assert_eq!(lockstep.usage(&target).uses(4), 3);
-    let (end, _) = compare(&lagging(4), &mut machine(&program), None);
+    assert_eq!(
+        target.x()[usize::from(T2)] & MEIP,
+        MEIP,
+        "the machine holds QEMU's read"
+    );
+    // Another bit of the read is compared.
+    let (end, _) = compare(&with_t1(MEIP | 1 << 7), &mut machine(&program), None);
     assert!(
-        matches!(&end, End::Divergence(report) if report.differing == [Field::Mip]),
-        "a fourth block is past the lag: {end:?}"
+        matches!(&end, End::Divergence(report) if report.differing == [Field::X(T2)]),
+        "{end:?}"
+    );
+    // A read of MEIP where QEMU's state did not show it is a divergence.
+    let (mut program, _, store) = pending_then_threshold(false, 2);
+    program.insert(store, csrrs(T2, 0x344, 0));
+    let mut entries = lagging(&program, store + 7, store + 1, 0);
+    for entry in entries.iter_mut().skip(store + 1) {
+        if let Entry::State(state) = entry {
+            state.set(Field::X(T2), state.x(T2) | MEIP);
+        }
+    }
+    let (end, _) = compare(&text(&entries), &mut machine(&program), None);
+    assert!(
+        matches!(&end, End::Divergence(report) if report.differing.contains(&Field::X(T2))),
+        "{end:?}"
     );
 }
 

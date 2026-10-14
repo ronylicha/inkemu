@@ -292,8 +292,8 @@ impl Lockstep {
             if let Some(end) = self.access(executed) {
                 return Some(end);
             }
-            adopted = self.adopt(executed, &qemu, target);
-            self.note_effects(executed);
+            adopted = self.adopt(executed, &last, &qemu, target);
+            self.note_effects(executed, &last, target);
         }
         if interrupt.is_some() {
             self.counts.interrupts += 1;
@@ -417,10 +417,12 @@ impl Lockstep {
 
     /// Treatments (i) and (ii) at a read: the register an instruction loaded from a row's
     /// register, a counter, or a CSR held to a pair takes QEMU's bits in the machine, within what
-    /// the row declares. Returns what was taken.
+    /// the row declares. `previous` is QEMU's state the instruction started from. Returns what
+    /// was taken.
     fn adopt(
         &mut self,
         executed: &Executed,
+        previous: &CpuState,
         qemu: &CpuState,
         target: &mut impl Target,
     ) -> Option<Adoption> {
@@ -442,7 +444,11 @@ impl Lockstep {
         }
         let mine = target.state().x(rd);
         let theirs = qemu.x(rd);
-        let (row, bits, gap) = self.admitted_read(location, mine, theirs)?;
+        let (row, bits, gap) = if location == Location::Csr(MIP) {
+            self.admitted_mip_read(mine, theirs, previous)?
+        } else {
+            self.admitted_read(location, mine, theirs)?
+        };
         if let Location::Mmio(address) = location {
             // An admitted access to a register QEMU lacks is a use even when nothing differs.
             if bits == 0 && absent_in_qemu(address) {
@@ -508,6 +514,27 @@ impl Lockstep {
         None
     }
 
+    /// A read of `mip` into a register, under the row of `MEIP`: inkemu reads no `MEIP`, and the
+    /// `MEIP` QEMU read is the one its state showed at the boundary the instruction started from
+    /// (`previous`), which [`Lockstep::compare`] has already held to QEMU's matrix on inkemu's
+    /// controller. Every other bit is compared.
+    fn admitted_mip_read(
+        &self,
+        mine: u32,
+        theirs: u32,
+        previous: &CpuState,
+    ) -> Option<(u16, u32, u32)> {
+        let row = self.rows.iter().find(|row| {
+            row.treatments
+                .iter()
+                .any(|t| matches!(t, Treatment::ExternalInterrupt { .. }))
+        })?;
+        let differ = mine ^ theirs;
+        let shown = previous.get(Field::Mip) & MEIP;
+        (differ & !MEIP == 0 && mine & MEIP == 0 && theirs & MEIP == shown)
+            .then_some((row.number, differ, 0))
+    }
+
     /// Whether the condition a register entry carries holds now.
     fn condition_holds(&self, register: &Register) -> bool {
         register
@@ -516,8 +543,9 @@ impl Lockstep {
     }
 
     /// What an executed instruction leaves for the rows that follow it: the CSRs it wrote, the
-    /// SPI1 command it started, a threshold store that QEMU's `MEIP` follows late.
-    fn note_effects(&mut self, executed: &Executed) {
+    /// SPI1 command it started, a threshold store that QEMU's `MEIP` follows late. `previous` is
+    /// QEMU's state the instruction started from.
+    fn note_effects(&mut self, executed: &Executed, previous: &CpuState, target: &impl Target) {
         let Some(decoded) = executed.instruction else {
             return;
         };
@@ -539,7 +567,13 @@ impl Lockstep {
                     SPI1_CMD if value & SPI1_CMD_USR != 0 => {
                         self.spi1_command = Some(self.spi1_user2.to_le_bytes()[0]);
                     }
-                    CPU_INT_THRESH => {
+                    // Only a store that brings QEMU's line down: `MEIP` was up at the boundary
+                    // the store started from, and QEMU's matrix computes it down after it. The
+                    // window shows QEMU's `MEIP` late after exactly those stores.
+                    CPU_INT_THRESH
+                        if previous.get(Field::Mip) & MEIP != 0
+                            && !target.external_interrupt_as_qemu() =>
+                    {
                         for row in self.rows {
                             for treatment in row.treatments {
                                 if let Treatment::ExternalInterrupt { lag } = *treatment {
