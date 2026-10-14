@@ -661,6 +661,44 @@ fn the_bits_qemu_keeps_through_a_life_that_writes_none_are_still_kept_at_the_nex
     );
 }
 
+#[test]
+fn a_kept_bit_the_life_between_two_resets_clears_is_no_longer_kept_at_the_second() {
+    // The first life sets R, W, X; the second reads them, kept, then clears W; the third reads
+    // pmpcfg0. QEMU keeps R and X through the second reset, not W.
+    let program = lives(&[
+        lui(T2, SRAM_DBUS_BASE),
+        lw(A1, T2, 0),
+        addi(A1, A1, 1),
+        sw(A1, T2, 0),
+        csrrs(A0, PMPCFG0, 0),
+        addi(S1, 0, 1),
+        bne(A1, S1, 12),
+        addi(A1, 0, 0x07),
+        csrrs(0, PMPCFG0, A1),
+        addi(S1, 0, 2),
+        bne(A1, S1, 12),
+        addi(A1, 0, 0x02),
+        csrrc(0, PMPCFG0, A1),
+    ]);
+    let states = record(&program, 100);
+    let at = resets(&states);
+    let read = |value: u32| {
+        let mut qemu = states.clone();
+        read_in_qemu(&mut qemu, at[0] + 5, at[1], 0x07);
+        read_in_qemu(&mut qemu, at[1] + 5, at[2], value);
+        compare(&text(&qemu[..=at[2]]), &program, &window(PMP, 2))
+    };
+    let (end, lockstep, target) = read(0x05);
+    assert_eq!(end, End::Window(WindowEnd::Reset), "{end:?}");
+    assert_eq!(lockstep.usage(&target).uses(1), 2);
+    // A model that lost the clear of W reads it kept: a divergence.
+    let (end, _, _) = read(0x07);
+    assert!(
+        matches!(&end, End::Divergence(report) if report.index == u64::try_from(at[1] + 4).unwrap()),
+        "{end:?}"
+    );
+}
+
 /// `UART0.CLKDIV` after the machine reset UART0 and then a reset of both sides: inkemu, whose
 /// CPU reset keeps the module, must show its reset value, whatever QEMU's reset gave.
 const AFTER_PULSE_THEN_RESET: &[Difference] = &[Difference {
