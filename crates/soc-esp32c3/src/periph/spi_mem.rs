@@ -127,8 +127,10 @@ const DLEN_MASK: u32 = 0x3FF;
 /// is instantaneous, and the automatic wait, suspend and resume around a program or an erase.
 /// A flash operation completes at once (report FW §A.5: every measured poll ends on its first
 /// read), so there is nothing to wait for and nothing to suspend: these three rows wait for the
-/// plan that gives a flash operation its duration.
-const SPI1_ACCEPTED: [Accepted; 9] = [
+/// plan that gives a flash operation its duration. The last row, `FSM`, is a register the SVD
+/// omits for SPI1: its read is modelled ([`SPI1_FSM`]), its one writable field stored without
+/// effect.
+const SPI1_ACCEPTED: [Accepted; 10] = [
     Accepted::svd(
         "SPI1",
         "CTRL",
@@ -169,6 +171,13 @@ const SPI1_ACCEPTED: [Accepted; 9] = [
         "program/erase suspend and resume: an operation completes at once (a suspend or resume request is refused by name)",
         "SP8",
     ),
+    Accepted::at(
+        "SPI1",
+        "FSM",
+        SPI1_BASE + SPI1_FSM,
+        "CSPI_LOCK_DELAY_TIME, the arbiter lock delay after a resume: nothing is ever suspended",
+        "SP8",
+    ),
 ];
 
 /// SPI0 `+0x24` and `+0x28`: `MOSI_DLEN` and `MISO_DLEN`. The SVD omits them for SPI0; ESP-IDF
@@ -176,14 +185,16 @@ const SPI1_ACCEPTED: [Accepted; 9] = [
 const SPI0_MOSI_DLEN: u32 = SPI0_BASE + 0x24;
 const SPI0_MISO_DLEN: u32 = SPI0_BASE + 0x28;
 const SPI0_FSM: u32 = addr("SPI0", "FSM") - SPI0_BASE;
-/// SPI1 `+0x54`: `SPI_MEM_FSM_REG`, the same register as SPI0 `FSM`, whose offset it shares. The SVD
-/// lists it for SPI0 only; ESP-IDF's `spi_mem_reg.h` (v4.4.7 `include/soc/`, v5.5.2
+/// SPI1 `+0x54`: `SPI_MEM_FSM_REG`, at the offset of SPI0 `FSM`. The model makes it an alias whose
+/// lock delay is stored apart from SPI0's: whether the silicon holds one field for both views is
+/// not measured. The SVD lists it for SPI0 only; ESP-IDF's `spi_mem_reg.h` (v4.4.7 `include/soc/`, v5.5.2
 /// `register/soc/`) defines `SPI_MEM_FSM_REG(i)` at `+0x054` of both controllers: `CSPI_ST` [3:0]
 /// and `EM_ST` [6:4] read-only, the state of the SPI0 machines; `CSPI_LOCK_DELAY_TIME` [11:7]
 /// read-write, reset 4 (report `docs/research/spi1-fsm-and-usj-reset.md`, §A.1). ESP-IDF v4.4.7
 /// reads it through SPI1 to learn whether the controller is idle (`spimem_flash_ll_host_idle`,
 /// `fsm.spi0_mst_st == 0`, polled by `spi_flash_chip_generic_wait_idle`, §A.2); v5.5.2 reads
-/// `CMD` [3:0] instead.
+/// `CMD` [3:0] instead. Through SPI0 a write of `FSM` stays refused: its lock delay is a field the
+/// SPI0 view does not model, so the write is reported by name (`SPI0.FSM`) rather than stored.
 const SPI1_FSM: u32 = SPI0_FSM;
 /// `FSM` [11:7], `CSPI_LOCK_DELAY_TIME`: the one field a write changes.
 const FSM_LOCK_DELAY: u32 = 0x1F << 7;
@@ -341,8 +352,8 @@ pub struct Spi1 {
     /// Like the journal it belongs to the run. One counter per opcode a byte can hold: its size
     /// does not depend on what the firmware sends.
     sent: [u64; OPCODES],
-    /// `FSM` read through SPI1 ([`SPI1_FSM`]): the lock delay last written in [11:7], every other
-    /// bit 0.
+    /// `FSM` read through SPI1 ([`SPI1_FSM`]): the lock delay last written through SPI1 in
+    /// [11:7], every other bit 0. SPI0's view does not share it.
     fsm: u32,
 }
 
@@ -368,7 +379,12 @@ impl Spi1 {
     }
 
     fn reset_registers() -> Storage {
-        let mut offsets: Vec<u32> = SPI1_ACCEPTED.iter().map(|a| a.addr - SPI1_BASE).collect();
+        // `FSM` is held by its own field, which `read` and `write` serve before the storage.
+        let mut offsets: Vec<u32> = SPI1_ACCEPTED
+            .iter()
+            .map(|a| a.addr - SPI1_BASE)
+            .filter(|&offset| offset != SPI1_FSM)
+            .collect();
         offsets.extend([ADDR, USER, USER1, USER2, MOSI_DLEN, MISO_DLEN, RD_STATUS]);
         offsets.extend((0..DATA_WORDS).map(|word| W0 + 4 * word));
         Storage::for_offsets(SPI1_BASE, &offsets)
@@ -743,9 +759,12 @@ impl Peripheral<Ctx> for Spi1 {
             // modelled: no state machine is ever seen busy, so both state fields read 0, idle
             // (report `docs/research/spi1-fsm-and-usj-reset.md`, §A.3). A busy value would
             // contradict `CMD` reading 0 and could hold `wait_idle` for ever.
-            // ASSUMPTION: SPI1 `+0x54` reads the register SPI0 `FSM` holds, as the ESP-IDF headers
-            // define one register for both controllers; the value read through SPI1 on a chip is
-            // not measured. A read of `0x60002054` on a chip at rest settles it (`0x200` expected).
+            // ASSUMPTION: SPI1 `+0x54` reads at rest what SPI0 `FSM` reads, as the ESP-IDF headers
+            // define the same register at both controllers, and its lock delay is held apart from
+            // SPI0's: neither the value read through SPI1 on a chip nor whether a lock delay
+            // written through one controller reads back through the other is measured. A read of
+            // `0x60002054` on a chip at rest settles the first (`0x200` expected); a write of
+            // `9 << 7` to `0x60002054` followed by a read of `0x60003054` settles the second.
             return Some(self.fsm);
         }
         self.registers.read(offset)
@@ -2368,7 +2387,10 @@ mod tests {
             Some(0),
             "Wait_SPI_Idle: bits 6:4 (FB §C row 10)"
         );
-        assert!(!spi0.write(ctx, fsm, 0), "FSM is read-only");
+        assert!(
+            !spi0.write(ctx, fsm, 0),
+            "the lock delay of SPI0 FSM is not modelled: a write is reported by name"
+        );
         for offset in [SPI0_MOSI_DLEN - SPI0_BASE, SPI0_MISO_DLEN - SPI0_BASE] {
             assert_eq!(spi0.read(ctx, offset), Some(0));
             assert!(
