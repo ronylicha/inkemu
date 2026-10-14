@@ -139,7 +139,8 @@ crates/emu-cli/tests/run_cli.rs                        deep_sleep_timer (Task 8)
 - [ ] **Step 1: Write the failing tests** (`machine.rs`): a program that counts its lives in `STORE0`, prints the count, and sleeps on the RTC timer three times then with no source; `a_deep_sleep_run_is_the_same_whatever_its_calls` (one call, then slices of 1, 7, 997, 7 919 cycles: consoles, trace hash, device time, cycles); `a_deep_sleep_nothing_can_end_stops_the_run` (`StopReason::DeepSleep`, device time not moved); `a_deep_sleep_cut_by_the_time_limit_is_still_asleep` (`TimeBudget`, `deep_sleep()` gives the instant of the wake); `a_running_main_watchdog_does_not_reset_a_chip_in_deep_sleep`; `light_sleep_stops_a_strict_run`; `the_rtc_memory_crc_unit_answers_at_once_over_the_words_asked`.
 - [ ] **Step 2: Code.** `powered_down` in the machine; `sleep_deeply`; `reset` of cause 5 clears `ASSIST_DEBUG`'s record; `Esp32C3::deep_sleep() -> Option<DeepSleep>`; `StopReason::DeepSleep` in `drive` and in the run loop of `console-script`.
 - [ ] **Step 3: Run** `cargo test -p soc-esp32c3 --lib -- machine::tests::a_deep machine::tests::light machine::tests::the_rtc_memory`, `cargo test -p console-script --lib` → pass.
-- [ ] **Step 4: Commit** Tasks 3–5: `feat(soc-esp32c3): deep sleep: SLEEP_EN with the digital domain powered down stops the CPU and device time jumps to the RTC timer's alarm, the chip wakes as a core reset of cause 5 with the RTC domain kept, the RTC memory CRC unit answers, light sleep and wake sources other than the timer are refused by name`.
+- [ ] **Step 4: Commit** Tasks 3–5 with Task 7, in one commit: the new stop reason makes the `match` of `emu-cli` non-exhaustive, so the workspace builds only with both (`feat(soc-esp32c3,emu-cli): deep sleep: …`).
+  - *Note of 2026-10-14:* done so; a clippy finding in a test of `machine.rs` (`assert_is_empty`) was fixed in a commit of its own after Task 6.
 
 ## Task 6: The table of registers accepted without effect (F6; P7, P8)
 
@@ -155,7 +156,7 @@ crates/emu-cli/tests/run_cli.rs                        deep_sleep_timer (Task 8)
 
 - [ ] **Step 1: Write the failing tests:** `RunEnd::DeepSleep` exit 0 and in `ALL`; the end line of a run stopped asleep names the sources it waits for; a run that ends on its limit while asleep says when the timer wakes the chip.
 - [ ] **Step 2: Code** and **Run** `cargo test -p emu-cli --lib run` → pass.
-- [ ] **Step 3: Commit:** `feat(emu-cli): a run that ends with the device in deep sleep says since when and what it waits for, and one nothing can wake ends with exit code 0`.
+- [ ] **Step 3: Commit** with Tasks 3–5 (Task 5, Step 4). The help of `inkemu run` lists the new end under exit code 0, so the README's help block and `run_help_tells_the_two_limits_apart` change in the same commit.
 
 ## Task 8: `deep_sleep_timer`, the proof in the CI (F11; P12)
 
