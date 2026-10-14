@@ -193,9 +193,14 @@ fn crosspoint_1_6_5_x3_x4_starts_and_names_what_the_model_lacks() {
         "ESP-ROM:esp32c3-api1-20210207\n",
         "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
         ") boot: ESP-IDF v5.5.2 2nd stage bootloader\n",
-        "[INF] [MAIN] Hardware detect: X4\n",
+        // The first life probes the board over I2C, finds nothing, which means X4, and stores the
+        // verdict in NVS before the wait for the ADC.
+        "[INF] [HW] Xteink probe scores: pass1=0 pass2=0 verdict=0\n",
         INTERRUPT_WATCHDOG_PANIC,
         "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        // The second life reads the verdict back: the NVS write survived the CPU reset.
+        "[INF] [HW] Using cached device type: X4\n",
+        "[INF] [MAIN] Hardware detect: X4\n",
         "[SD] SD card not detected (",
         "Wait complete:  CMD_SOFT_RESET (0 ms)\n",
     ]);
