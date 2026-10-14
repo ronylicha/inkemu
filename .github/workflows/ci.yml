@@ -111,11 +111,11 @@ jobs:
     # (USB-Serial-JTAG, the last one written for inkemu); they are applications, run behind the
     # bootloader inkemu ships. One more, adc_wait_panic, also written for inkemu, takes the path
     # that stops CrossPoint: a wait for the SAR ADC with interrupts masked, the panic of the
-    # interrupt watchdog, a core dump in flash and a second life. The firmware is built here, inside the pinned ESP-IDF image, and
-    # checked against pinned SHA-256 values. The bootloader is the one
-    # artefact of this build that is committed, under third_party/esp-idf-bootloader/; the
-    # applications and the merged images are never stored in this repository. The cache saves
-    # the build and replaces no check: the images are re-hashed on every run.
+    # interrupt watchdog, a core dump in flash and a second life. The firmware is built here,
+    # inside the pinned ESP-IDF image, and checked against pinned SHA-256 values. The bootloader
+    # is the one artefact of this build that is committed, under third_party/esp-idf-bootloader/;
+    # the applications and the merged images are never stored in this repository. The cache
+    # saves the build and replaces no check: the images are re-hashed on every run.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
