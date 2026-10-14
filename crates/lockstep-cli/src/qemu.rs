@@ -315,15 +315,44 @@ fn check(status: ExitStatus) -> Result<(), QemuError> {
     }
 }
 
-/// How many times [`clean_up`] removes the container and looks again before it gives up, and
-/// how long it waits between two tries: 300 s in all, as long as Docker is given to start QEMU.
-/// A daemon slow enough to miss the open timeout is slow to create the container too: measured
-/// on 2026-10-14 on a loaded host, it created one about two minutes after `docker run`, after a
-/// first version of this loop, bounded at 10 s, had killed the client and left.
-const REMOVE_TRIES: u32 = 1500;
+/// How long [`clean_up`] removes the container and looks again before it gives up, in real
+/// time, Docker's own answers included: as long as Docker is given to start QEMU. A daemon slow
+/// enough to miss the open timeout is slow to create the container too: measured on 2026-10-14
+/// on a loaded host, it created one about two minutes after `docker run`, after a first version
+/// of this loop, bounded at 10 s, had killed the client and left. With [`OPEN_TIMEOUT`] and the
+/// last removal, a run that cannot start QEMU ends within 11 minutes; the CI's lockstep steps
+/// give it more.
+const REMOVE_BOUND: Duration = Duration::from_secs(300);
+/// How long [`clean_up`] waits between two tries.
 const REMOVE_POLL: Duration = Duration::from_millis(200);
-/// After this many tries, 10 s, the user is told what the tool waits for.
-const REMOVE_NOTICE: u32 = 50;
+/// After this long, the user is told what the tool waits for.
+const REMOVE_NOTICE: Duration = Duration::from_secs(10);
+/// How long one `docker rm` or `docker inspect` may take before it is killed and counted as no
+/// answer: a daemon that hangs must not hold the run past [`REMOVE_BOUND`].
+const DOCKER_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// How often a bounded `docker` call is looked at.
+const DOCKER_CALL_POLL: Duration = Duration::from_millis(50);
+
+/// The time [`clean_up`] measures, behind a trait so that its bounds are tested without waiting.
+trait Clock {
+    /// The time since the clean-up started.
+    fn elapsed(&self) -> Duration;
+    /// Waits `poll`.
+    fn sleep(&mut self, poll: Duration);
+}
+
+/// Real time.
+struct RealClock(Instant);
+
+impl Clock for RealClock {
+    fn elapsed(&self) -> Duration {
+        self.0.elapsed()
+    }
+
+    fn sleep(&mut self, poll: Duration) {
+        std::thread::sleep(poll);
+    }
+}
 
 /// What [`clean_up`] needs of Docker, behind a trait so that its logic is tested without one.
 trait Docker {
@@ -356,28 +385,28 @@ enum Cleanup {
 /// Removes the container `name` without a race with a slow daemon. The client is not killed
 /// while the daemon may still create the container: it exits by itself once the daemon answers,
 /// since a container removed while it is being created cannot be started. The removal is
-/// repeated until the client has exited and Docker says the container does not exist,
-/// [`REMOVE_TRIES`] times at most, `poll` apart; `notice` is called once after
-/// [`REMOVE_NOTICE`] tries. Past the bound the client is killed and one more removal made.
+/// repeated until the client has exited and Docker says the container does not exist, for
+/// [`REMOVE_BOUND`] at most on `clock`, [`REMOVE_POLL`] apart; `notice` is called once after
+/// [`REMOVE_NOTICE`]. Past the bound the client is killed and one more removal made.
 fn clean_up(
     docker: &mut impl Docker,
     client: &mut impl Client,
+    clock: &mut impl Clock,
     name: &str,
-    poll: Duration,
     notice: impl FnOnce(),
 ) -> Cleanup {
     let mut notice = Some(notice);
-    for tries in 0..REMOVE_TRIES {
+    while clock.elapsed() < REMOVE_BOUND {
         docker.remove(name);
         if client.exited() && docker.exists(name) == Some(false) {
             return Cleanup::Removed;
         }
-        if tries + 1 == REMOVE_NOTICE
+        if clock.elapsed() >= REMOVE_NOTICE
             && let Some(notice) = notice.take()
         {
             notice();
         }
-        std::thread::sleep(poll);
+        clock.sleep(REMOVE_POLL);
     }
     let exited = client.exited();
     client.kill();
@@ -409,26 +438,18 @@ struct HostDocker;
 
 impl Docker for HostDocker {
     fn remove(&mut self, name: &str) {
-        let _ = Command::new("docker")
-            .args(["rm", "--force", name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = docker_within(&["rm", "--force", name]);
     }
 
     fn exists(&mut self, name: &str) -> Option<bool> {
-        let output = Command::new("docker")
-            .args([
-                "inspect",
-                "--type",
-                "container",
-                "--format",
-                "{{.Id}}",
-                name,
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .ok()?;
+        let output = docker_within(&[
+            "inspect",
+            "--type",
+            "container",
+            "--format",
+            "{{.Id}}",
+            name,
+        ])?;
         if output.status.success() {
             return Some(true);
         }
@@ -436,6 +457,32 @@ impl Docker for HostDocker {
             .to_ascii_lowercase()
             .contains("no such")
             .then_some(false)
+    }
+}
+
+/// Runs `docker` with `args`, its output captured; `None` when it cannot start, or does not end
+/// within [`DOCKER_CALL_TIMEOUT`] (it is then killed).
+fn docker_within(args: &[&str]) -> Option<std::process::Output> {
+    let mut child = Command::new("docker")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if started.elapsed() < DOCKER_CALL_TIMEOUT => {
+                std::thread::sleep(DOCKER_CALL_POLL);
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
 }
 
@@ -456,13 +503,13 @@ impl Drop for Qemu {
         let cleanup = clean_up(
             &mut HostDocker,
             &mut self.child,
+            &mut RealClock(Instant::now()),
             &self.name,
-            REMOVE_POLL,
             || {
                 eprintln!(
                     "inkemu-lockstep: waiting for Docker to release the container {name} \
                      (up to {} s)",
-                    REMOVE_POLL.as_millis() * u128::from(REMOVE_TRIES) / 1000
+                    REMOVE_BOUND.as_secs()
                 );
             },
         );
@@ -649,15 +696,67 @@ mod tests {
             done: &done,
         };
         let told = std::cell::Cell::new(0);
+        let mut clock = FakeClock {
+            now: Duration::ZERO,
+            per_call: Duration::ZERO,
+        };
         let cleanup = clean_up(
             &mut linked,
             &mut client,
+            &mut clock,
             &container_name(42, 7),
-            Duration::ZERO,
             || told.set(told.get() + 1),
         );
         assert!(told.get() <= 1, "told once at most");
         (cleanup, client.killed, told.get() == 1)
+    }
+
+    /// Time that moves only when the clean-up waits.
+    struct FakeClock {
+        now: Duration,
+        /// What every wait adds beyond the poll: a slow Docker.
+        per_call: Duration,
+    }
+
+    impl Clock for FakeClock {
+        fn elapsed(&self) -> Duration {
+            self.now
+        }
+
+        fn sleep(&mut self, poll: Duration) {
+            self.now += poll + self.per_call;
+        }
+    }
+
+    /// The tries [`clean_up`] makes within its bound when each takes `poll`.
+    fn tries_within_bound() -> u32 {
+        u32::try_from(REMOVE_BOUND.as_millis() / REMOVE_POLL.as_millis()).unwrap()
+    }
+
+    #[test]
+    fn the_clean_up_is_bounded_in_time_whatever_docker_takes() {
+        // Every try takes the poll and 10 s of Docker: the bound is reached in far fewer tries.
+        let mut docker = FakeDocker::new(Some(1), false);
+        let done = std::cell::Cell::new(false);
+        let mut client = FakeClient {
+            gone: &done,
+            stuck: false,
+            killed: false,
+        };
+        let mut clock = FakeClock {
+            now: Duration::ZERO,
+            per_call: Duration::from_secs(10),
+        };
+        let cleanup = clean_up(
+            &mut docker,
+            &mut client,
+            &mut clock,
+            &container_name(42, 7),
+            || {},
+        );
+        assert_eq!(cleanup, Cleanup::Left);
+        assert!(clock.now >= REMOVE_BOUND && clock.now < REMOVE_BOUND + Duration::from_secs(11));
+        assert_eq!(docker.removals, 30 + 1);
     }
 
     #[test]
@@ -679,7 +778,9 @@ mod tests {
         assert_eq!(cleanup_warning(cleanup, "inkemu-lockstep-42-7"), None);
         // As measured: the daemon creates it minutes later, long after a 10 s bound. The client
         // is not killed meanwhile, the user is told of the wait, and the container is removed.
-        let mut docker = FakeDocker::new(Some(4 * REMOVE_NOTICE), true);
+        let notice_tries =
+            u32::try_from(REMOVE_NOTICE.as_millis() / REMOVE_POLL.as_millis()).unwrap();
+        let mut docker = FakeDocker::new(Some(4 * notice_tries), true);
         let (cleanup, killed, told) = run(&mut docker, false);
         assert_eq!(cleanup, Cleanup::Removed);
         assert!(docker.removed && !killed && told);
@@ -693,7 +794,7 @@ mod tests {
         let (cleanup, killed, _) = run(&mut docker, false);
         assert_eq!(cleanup, Cleanup::Left);
         assert!(killed, "the client is killed past the bound");
-        assert_eq!(docker.removals, REMOVE_TRIES + 1);
+        assert_eq!(docker.removals, tries_within_bound() + 1);
         let warning = cleanup_warning(cleanup, &name).unwrap();
         assert!(
             warning.contains(&format!("docker rm -f {name}")),

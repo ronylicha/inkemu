@@ -243,7 +243,9 @@ jobs:
       # changed register whatever the rows say. The step after puts a fault in a peripheral's
       # model, which only a row holds.
       - name: The lockstep finds a fault put in inkemu
-        timeout-minutes: 10
+        # The tool gives Docker 300 s to start QEMU and 300 s to remove its container (about
+        # 11 minutes when Docker never answers); each step leaves room for that and its run.
+        timeout-minutes: 15
         run: |
           source tools/conformance/versions.env
           set +e
@@ -266,7 +268,7 @@ jobs:
       # of the counter to the gap the faulty read left: the gap moves up, which QEMU's truncating
       # counter never does, and the lockstep must report a divergence near row 15.
       - name: The lockstep finds a fault put in the SYSTIMER's model
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           source tools/conformance/versions.env
           set +e
@@ -285,7 +287,7 @@ jobs:
       # The second life is compared, not only reached: the same fault as above, put four million
       # instructions in, after the reset (instruction 3 402 169), must be found there.
       - name: The lockstep finds a fault put in inkemu after the reset
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
           source tools/conformance/versions.env
           set +e
@@ -306,7 +308,7 @@ jobs:
       # million instructions in, in the second life, must be found near row 15 (measured on
       # 2026-10-14: the counter read at instruction 5 700 683).
       - name: The lockstep finds a fault put in the SYSTIMER's model after the reset
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
           source tools/conformance/versions.env
           set +e
