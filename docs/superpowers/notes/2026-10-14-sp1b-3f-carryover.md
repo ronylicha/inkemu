@@ -89,3 +89,7 @@ Le modèle et la CLI ont été commités ensemble (tâches 3 à 5 et 7 du plan) 
 - Les registres que la séquence d'ESP-IDF touche ont été relevés dans le code source (DS §A.1) ; un registre oublié apparaîtrait comme avertissement dans ce test, qui n'en tolère aucun.
 - Le sommeil est tenu au niveau des registres (`rtc_cntl/sleep.rs`) et de la machine par un firmware écrit en instructions (`machine.rs`), dont le déterminisme est vérifié sur quatre découpages en cycles, quatre en temps d'appareil (limites dans les sommeils) et deux mixtes, console surveillée ou non.
 - QEMU ne modélise ni le sommeil ni le timer RTC : pas d'oracle au-delà de l'entrée en sommeil (DS partie B §5).
+
+## CI et exécutions locales finales (2026-10-14)
+
+CI de la tête `5a75785` (exécution 38518622309) verte sur ses cinq jobs : suites ignorées 19, 28, 13, 11 et 5 ; `check` 1 284 tests passés, 79 ignorés ; couverture 98,32 % des lignes. Les deux tests locaux des firmwares réels (SP1b-3e) passent sur la même branche, 367 s.
