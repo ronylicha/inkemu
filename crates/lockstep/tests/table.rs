@@ -146,7 +146,12 @@ fn every_row_of_the_documentation_declares_the_parameters_of_the_tool() {
     let documented = parameters(&documentation());
     let tool: BTreeMap<u16, Vec<String>> = lockstep::DIFFERENCES
         .iter()
-        .map(|row| (row.number, row.treatments.iter().flat_map(lines_of).collect()))
+        .map(|row| {
+            (
+                row.number,
+                row.treatments.iter().flat_map(lines_of).collect(),
+            )
+        })
         .collect();
     for (number, lines) in &tool {
         assert_eq!(
