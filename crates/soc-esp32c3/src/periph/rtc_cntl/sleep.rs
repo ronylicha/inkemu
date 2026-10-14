@@ -118,9 +118,14 @@ impl Sleep {
         self.asleep.is_some()
     }
 
-    /// Any reset ends the sleep: the chip is awake when the reset is over.
+    /// Any reset ends the sleep: the chip is awake when the reset is over, and `SLEEP_EN` reads 0
+    /// whatever ended the sleep (the alarm, or the RTC watchdog left running in it). A
+    /// read-modify-write of `STATE0` after the wake, which `rtc_deep_sleep_start` does with
+    /// `SLP_REJECT_CAUSE_CLR` before it computes the CRC (DS §A.1.5), would otherwise write the bit
+    /// back and put the chip to sleep where the firmware never asked for it.
     pub(super) fn wake_up(&mut self) {
         self.asleep = None;
+        self.state0 &= !SLEEP_EN;
     }
 }
 
@@ -475,6 +480,7 @@ mod tests {
         for (config0, reset) in [
             (WDT_EN | 3 << 28 | 1 << 9, None),
             (WDT_EN | 3 << 28, Some(ResetCause::RtcWatchdogCore)),
+            (WDT_EN | 2 << 28, Some(ResetCause::RtcWatchdogCpu)),
         ] {
             let ctx = &mut Ctx::default();
             let mut rtc = rtc(ctx);
@@ -483,8 +489,22 @@ mod tests {
             rtc.write(ctx, DIG_PWC, DEEP);
             rtc.write(ctx, WAKEUP_STATE, 0);
             rtc.write(ctx, STATE0, SLEEP_EN);
+            assert!(ctx.take_deep_sleep_entered());
             after(ctx, &mut rtc, 10 * SECOND);
             assert_eq!(ctx.take_reset(), reset, "{config0:#x}");
+            let Some(cause) = reset else {
+                continue;
+            };
+            // The watchdog ended the sleep: `SLEEP_EN` reads 0 after the reset, so the
+            // read-modify-write of `STATE0` that sets `SLP_REJECT_CAUSE_CLR` on the way to the
+            // next sleep (DS §A.1.5) does not put the chip back to sleep.
+            rtc.reset(ctx, cause, false);
+            assert!(!rtc.is_in_deep_sleep(), "{cause:?}");
+            assert_eq!(rtc.read(ctx, STATE0), Some(0), "{cause:?}");
+            let state0 = rtc.read(ctx, STATE0).unwrap();
+            assert!(rtc.write(ctx, STATE0, state0 | 1 << 1));
+            assert!(!ctx.take_deep_sleep_entered(), "{cause:?}");
+            assert!(!rtc.is_in_deep_sleep(), "{cause:?}");
         }
     }
 
