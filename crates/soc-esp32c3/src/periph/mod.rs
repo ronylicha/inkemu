@@ -466,8 +466,7 @@ impl Peripherals {
             ana_i2c: AnaI2c::new(),
             timg0: Timg::new(Group::Timg0, flash_boot, ctx),
             timg1: Timg::new(Group::Timg1, flash_boot, ctx),
-            systimer: Systimer::new(ctx.now())
-                .with_qemu_compat(config.qemu_compat.systimer_no_alarm_on_stopped_counter),
+            systimer: Systimer::new(ctx.now()).with_qemu_compat(config.qemu_compat, ctx.now()),
             apb_saradc: AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED),
             radio_power: AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED),
             uart0: Uart::new(0, UART0_BASE),
@@ -538,7 +537,7 @@ impl Peripherals {
             Module::Uart1 => self.uart1.reset(ctx),
             Module::Timg0 => self.timg0.reset(ctx),
             Module::Timg1 => self.timg1.reset(ctx),
-            Module::Systimer => self.systimer.reset(ctx),
+            Module::Systimer => self.systimer.peripheral_reset(ctx),
             Module::Sha => self.sha = Sha::new(),
             Module::UsbDevice => self.usb_serial_jtag.reset(ctx),
         }

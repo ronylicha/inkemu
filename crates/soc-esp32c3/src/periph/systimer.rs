@@ -8,6 +8,7 @@
 use super::SYSTIMER_BASE;
 use super::counter::{Counter, Rate};
 use super::{consecutive, half_of, index_in, replace_half};
+use crate::config::{CompatActs, QemuCompat};
 use crate::ctx::{Ctx, Deadline, Event, Source};
 use emu_core::{Cycles, Peripheral};
 use svd_regs::esp32c3::addr;
@@ -129,6 +130,56 @@ pub struct Systimer {
     /// `QemuCompat::systimer_no_alarm_on_stopped_counter`: a comparator compares only a counter
     /// that runs. Kept across a reset of the block: it is a property of the machine.
     no_alarm_on_stopped_counter: bool,
+    /// `QemuCompat::systimer_counts_as_qemu`: the counters as QEMU reports them, `None` without
+    /// the setting. Kept across a reset of the block.
+    qemu: Option<[QemuUnit; UNITS]>,
+    /// What the settings did, kept across a reset of the block.
+    acts: CompatActs,
+}
+
+/// Cycles of the time base QEMU takes for one count: it multiplies the nanoseconds elapsed by
+/// 16 and divides by 1 000 (`esp_systimer_update_counter`), 6.25 ns × 16 / 1 000 a tenth of a
+/// count for each cycle of the time base, the remainder dropped.
+const QEMU_CYCLES_PER_COUNT: u64 = 10;
+
+/// A counter as Espressif's QEMU keeps it (`hw/timer/esp_systimer.c`, branch `esp-develop` of
+/// `espressif/qemu`): `value` was brought up to date at `base`, and is brought up to date again
+/// only when QEMU calls `esp_systimer_update_counter`, which adds the whole counts elapsed since
+/// `base` and drops what is left of a count. Software reads `flushed`, the value the last
+/// `UPDATE` took.
+#[derive(Clone, Copy, Debug, Default)]
+struct QemuUnit {
+    value: u64,
+    base: u64,
+    flushed: u64,
+    enabled: bool,
+}
+
+impl QemuUnit {
+    fn new(now: Cycles, enabled: bool) -> QemuUnit {
+        QemuUnit {
+            value: 0,
+            base: now.get(),
+            flushed: 0,
+            enabled,
+        }
+    }
+
+    /// `esp_systimer_update_counter`, which QEMU calls whether the counter works or not when it
+    /// reprograms a comparator.
+    fn update(&mut self, now: Cycles) {
+        let counts = now.get().saturating_sub(self.base) / QEMU_CYCLES_PER_COUNT;
+        self.value = self.value.wrapping_add(counts) & COUNT_MASK;
+        self.base = now.get();
+    }
+
+    /// An update QEMU makes only for a counter that works (`esp_systimer_flush_counter`,
+    /// `esp_systimer_load_counter`, `esp_systimer_notify`).
+    fn update_if_enabled(&mut self, now: Cycles) {
+        if self.enabled {
+            self.update(now);
+        }
+    }
 }
 
 /// Splits a register offset inside a block of `pairs` `(HI, LO)` pairs whose first register is at
@@ -193,25 +244,64 @@ impl Systimer {
             int_raw: 0,
             wake: Deadline::default(),
             no_alarm_on_stopped_counter: false,
+            qemu: None,
+            acts: CompatActs::default(),
         }
     }
 
     /// The block as Espressif's QEMU has it, for the lockstep (`QemuCompat`): a comparator raises
-    /// no alarm while its counter is stopped.
+    /// no alarm while its counter is stopped, and the counters read as QEMU's read.
     #[must_use]
-    pub fn with_qemu_compat(mut self, no_alarm_on_stopped_counter: bool) -> Systimer {
-        self.no_alarm_on_stopped_counter = no_alarm_on_stopped_counter;
+    pub fn with_qemu_compat(mut self, compat: QemuCompat, now: Cycles) -> Systimer {
+        self.no_alarm_on_stopped_counter = compat.systimer_no_alarm_on_stopped_counter;
+        // QEMU's counter 0 works from power-on and counter 1 does not (`esp_systimer_default_conf`).
+        self.qemu = compat
+            .systimer_counts_as_qemu
+            .then(|| [QemuUnit::new(now, true), QemuUnit::new(now, false)]);
         self
     }
 
-    /// The block is reset (`SYSTEM.PERIP_RST_EN0` bit 29, or a core reset): it is built again at
-    /// the present time. Its wake-up is withdrawn first, so that a firmware resetting the block over
-    /// and over leaves no call behind in the scheduler.
+    /// What the settings of [`QemuCompat`] did since power-on.
+    #[must_use]
+    pub fn compat_acts(&self) -> CompatActs {
+        self.acts
+    }
+
+    /// The block is reset by a core reset: it is built again at the present time. Its wake-up is
+    /// withdrawn first, so that a firmware resetting the block over and over leaves no call behind
+    /// in the scheduler.
     pub(crate) fn reset(&mut self, ctx: &mut Ctx) {
         self.wake.cancel(ctx);
-        *self = Systimer::new(ctx.now()).with_qemu_compat(self.no_alarm_on_stopped_counter);
+        let compat = QemuCompat {
+            systimer_no_alarm_on_stopped_counter: self.no_alarm_on_stopped_counter,
+            systimer_counts_as_qemu: self.qemu.is_some(),
+            ..QemuCompat::default()
+        };
+        let acts = self.acts;
+        *self = Systimer::new(ctx.now()).with_qemu_compat(compat, ctx.now());
+        self.acts = acts;
         // The rebuilt block drives its interrupt sources low.
         self.wake(ctx);
+    }
+
+    /// The block is reset through `SYSTEM.PERIP_RST_EN0` bit 29: as [`Systimer::reset`], except
+    /// that with `QemuCompat::systimer_counts_as_qemu` nothing happens. QEMU's `SYSTEM` registers
+    /// reset no device, and its SYSTIMER is reset with the machine only (`esp_systimer_reset_hold`).
+    pub(crate) fn peripheral_reset(&mut self, ctx: &mut Ctx) {
+        if self.qemu.is_some() {
+            self.acts.systimer_resets_ignored += 1;
+        } else {
+            self.reset(ctx);
+        }
+    }
+
+    /// QEMU reprograms a comparator: it brings the comparator's counter up to date, working or not
+    /// (`esp_systimer_comparator_reprogram`).
+    fn qemu_reprogram(&mut self, comparator: usize, now: Cycles) {
+        let unit = self.unit_of(comparator);
+        if let Some(units) = &mut self.qemu {
+            units[unit].update(now);
+        }
     }
 
     const fn comparator_works(&self, comparator: usize) -> bool {
@@ -272,10 +362,17 @@ impl Systimer {
             let compares =
                 !self.no_alarm_on_stopped_counter || self.units[unit].counter.is_running();
             let comparator = &mut self.comparators[index];
-            if compares && let Some(next) = comparator.next {
+            if let Some(next) = comparator.next {
                 let late = count.wrapping_sub(next) & COUNT_MASK;
-                if late < PASSED_WINDOW {
+                if late < PASSED_WINDOW && !compares {
+                    // The setting holds back an alarm the chip would raise: what it acts on.
+                    self.acts.systimer_alarms_withheld += 1;
+                } else if late < PASSED_WINDOW {
                     self.int_raw |= 1 << index;
+                    // QEMU brings the counter of an alarm up to date (`esp_systimer_notify`).
+                    if let Some(units) = &mut self.qemu {
+                        units[unit].update_if_enabled(now);
+                    }
                     // In period mode the alarms that were missed are one level, not a queue: the
                     // next one is the first multiple of the period after the present count.
                     comparator.next = (comparator.conf & TARGET_PERIOD_MODE != 0
@@ -322,6 +419,7 @@ impl Systimer {
         for (unit, work_en) in (0..UNITS).zip([UNIT0_WORK_EN, UNIT0_WORK_EN >> 1]) {
             self.units[unit].counter.run(self.conf & work_en != 0, now);
         }
+        self.qemu_write_conf(previous, now);
         for comparator in 0..COMPARATORS {
             let bit = TARGET0_WORK_EN >> comparator;
             if self.conf & bit != 0 && previous & bit == 0 {
@@ -329,6 +427,49 @@ impl Systimer {
             }
         }
         self.evaluate(ctx);
+    }
+
+    /// `esp_systimer_conf_set` on QEMU's counters: the counters take their new state without being
+    /// brought up to date, then a comparator that worked and whose counter changed state is
+    /// reprogrammed, and so is a comparator that starts to work.
+    fn qemu_write_conf(&mut self, previous: u32, now: Cycles) {
+        let conf = self.conf;
+        let Some(units) = &mut self.qemu else { return };
+        let mut changed = [false; UNITS];
+        for (unit, work_en) in (0..UNITS).zip([UNIT0_WORK_EN, UNIT0_WORK_EN >> 1]) {
+            let enabled = conf & work_en != 0;
+            changed[unit] = units[unit].enabled != enabled;
+            units[unit].enabled = enabled;
+        }
+        for comparator in 0..COMPARATORS {
+            let bit = TARGET0_WORK_EN >> comparator;
+            let unit = self.unit_of(comparator);
+            let worked = previous & bit != 0;
+            let works = self.conf & bit != 0;
+            if (worked && changed[unit]) || (works && !worked) {
+                self.qemu_reprogram(comparator, now);
+            }
+        }
+    }
+
+    /// What a read of `UNITn_VALUE_HI/LO` or `UNITn_OP` gives with
+    /// `QemuCompat::systimer_counts_as_qemu`, counted when it is not what this machine gives.
+    fn qemu_read(&mut self, offset: u32, chip: u32) -> u32 {
+        let Some(units) = &self.qemu else {
+            return chip;
+        };
+        let value = if let Some((unit, hi)) = pair_in(offset, UNIT0_VALUE_HI, UNITS) {
+            half_of(units[unit].flushed, hi)
+        } else if index_in(offset, UNIT0_OP, UNITS).is_some() {
+            // "Value is always synchronized and valid" (`esp_systimer_read`).
+            OP_VALUE_VALID
+        } else {
+            return chip;
+        };
+        if value != chip {
+            self.acts.systimer_values_as_qemu += 1;
+        }
+        value
     }
 }
 
@@ -341,17 +482,19 @@ impl Peripheral<Ctx> for Systimer {
             return Some(half_of(self.comparators[comparator].target, hi));
         }
         if let Some((unit, hi)) = pair_in(offset, UNIT0_VALUE_HI, UNITS) {
-            return Some(half_of(self.units[unit].latch, hi));
+            let chip = half_of(self.units[unit].latch, hi);
+            return Some(self.qemu_read(offset, chip));
         }
         if let Some(comparator) = index_in(offset, TARGET0_CONF, COMPARATORS) {
             return Some(self.comparators[comparator].conf);
         }
         if let Some(unit) = index_in(offset, UNIT0_OP, UNITS) {
-            return Some(if self.units[unit].valid {
+            let chip = if self.units[unit].valid {
                 OP_VALUE_VALID
             } else {
                 0
-            });
+            };
+            return Some(self.qemu_read(offset, chip));
         }
         // Write-only triggers read 0.
         if index_in(offset, COMP0_LOAD, COMPARATORS).is_some()
@@ -390,6 +533,11 @@ impl Peripheral<Ctx> for Systimer {
             if (previous ^ value) & (TARGET_PERIOD_MODE | TARGET_UNIT_SEL) != 0 {
                 self.start(comparator, now);
             }
+            // QEMU reprograms a working comparator whose counter changed
+            // (`esp_systimer_comparator_conf`).
+            if (previous ^ value) & TARGET_UNIT_SEL != 0 && self.comparator_works(comparator) {
+                self.qemu_reprogram(comparator, now);
+            }
             self.evaluate(ctx);
             return true;
         }
@@ -399,12 +547,21 @@ impl Peripheral<Ctx> for Systimer {
                 c.loaded_target = c.target;
                 c.loaded_period = u64::from(c.conf & TARGET_PERIOD_MASK);
                 self.start(comparator, now);
+                // `esp_systimer_comparator_reload` reprograms a working comparator.
+                if self.comparator_works(comparator) {
+                    self.qemu_reprogram(comparator, now);
+                }
                 self.evaluate(ctx);
             }
             return true;
         }
         if let Some(unit) = index_in(offset, UNIT0_OP, UNITS) {
             if value & OP_UPDATE != 0 {
+                // `esp_systimer_flush_counter`.
+                if let Some(units) = &mut self.qemu {
+                    units[unit].update_if_enabled(now);
+                    units[unit].flushed = units[unit].value;
+                }
                 // ASSUMPTION: the latch is valid at once, so `VALUE_VALID` reads 1 from the write
                 // of `UPDATE` on. The TRM gives no latency for it (TW §A.3, §I question 6), and
                 // ESP-IDF polls the bit without a timeout, so a late one would only cost time.
@@ -420,6 +577,20 @@ impl Peripheral<Ctx> for Systimer {
                 // "The current count value will be changed immediately" (TRM §10.5).
                 let load = self.units[unit].load;
                 self.units[unit].counter.set(load, now);
+                // `esp_systimer_load_counter`: the counter, brought up to date when it works,
+                // takes the value, then every working comparator on it is reprogrammed.
+                if let Some(units) = &mut self.qemu {
+                    units[unit].update_if_enabled(now);
+                    units[unit].value = load;
+                    for comparator in 0..COMPARATORS {
+                        if self.conf & (TARGET0_WORK_EN >> comparator) != 0
+                            && usize::from(self.comparators[comparator].conf & TARGET_UNIT_SEL != 0)
+                                == unit
+                        {
+                            units[unit].update(now);
+                        }
+                    }
+                }
                 self.evaluate(ctx);
             }
             return true;
@@ -619,10 +790,18 @@ mod tests {
         // `QemuCompat::systimer_no_alarm_on_stopped_counter`: the target-mode comparator enabled
         // on the stopped counter 1 compares nothing; the period alarms come as on the chip.
         let ctx = &mut Ctx::default();
-        let mut timer = Systimer::new(ctx.now()).with_qemu_compat(true);
+        let compat = QemuCompat {
+            systimer_no_alarm_on_stopped_counter: true,
+            ..QemuCompat::default()
+        };
+        let mut timer = Systimer::new(ctx.now()).with_qemu_compat(compat, ctx.now());
         after(ctx, 12_345);
         program_the_tick(ctx, &mut timer);
         assert_eq!(timer.read(ctx, INT_RAW), Some(0), "no early alarm");
+        assert!(
+            timer.compat_acts().systimer_alarms_withheld > 0,
+            "the setting acted: it held back the alarm the chip raises"
+        );
         assert_eq!(ctx.sources(), 0);
         let start = ctx.now();
         assert_eq!(ctx.next_wake(), Some(start + TICK));
@@ -633,6 +812,66 @@ mod tests {
         // A reset of the block keeps the setting: it belongs to the machine.
         timer.reset(ctx);
         assert!(timer.no_alarm_on_stopped_counter);
+    }
+
+    /// Latches counter `unit` (`UPDATE`) and reads its low word, as `systimer_ll` does.
+    fn latched(ctx: &mut Ctx, timer: &mut Systimer, unit: u32) -> Option<u32> {
+        timer.write(ctx, UNIT0_OP + 4 * unit, OP_UPDATE);
+        timer.read(ctx, UNIT0_VALUE_LO + 8 * unit)
+    }
+
+    fn counting_as_qemu(ctx: &Ctx) -> Systimer {
+        let compat = QemuCompat {
+            systimer_counts_as_qemu: true,
+            ..QemuCompat::default()
+        };
+        Systimer::new(ctx.now()).with_qemu_compat(compat, ctx.now())
+    }
+
+    #[test]
+    fn as_qemu_a_count_truncates_at_each_update_and_a_peripheral_reset_changes_nothing() {
+        let ctx = &mut Ctx::default();
+        let mut timer = counting_as_qemu(ctx);
+        after(ctx, 1_005);
+        assert_eq!(latched(ctx, &mut timer, 0), Some(100));
+        after(ctx, 1_005);
+        // The chip counts 201 counts in 2 010 cycles; QEMU dropped half a count at the first
+        // update (`esp_systimer_update_counter`).
+        assert_eq!(latched(ctx, &mut timer, 0), Some(200));
+        assert_eq!(timer.compat_acts().systimer_values_as_qemu, 1);
+        assert_eq!(
+            timer.read(ctx, UNIT1_OP),
+            Some(OP_VALUE_VALID),
+            "always valid"
+        );
+        timer.peripheral_reset(ctx);
+        assert_eq!(timer.compat_acts().systimer_resets_ignored, 1);
+        after(ctx, 10);
+        assert_eq!(latched(ctx, &mut timer, 0), Some(201), "not reset");
+        // Without the setting, the same reset starts the counter from 0 again.
+        let mut chip = Systimer::new(ctx.now());
+        after(ctx, 1_000);
+        chip.peripheral_reset(ctx);
+        after(ctx, 10);
+        assert_eq!(latched(ctx, &mut chip, 0), Some(1));
+        assert_eq!(chip.compat_acts(), CompatActs::default());
+    }
+
+    #[test]
+    fn as_qemu_a_stopped_counter_is_brought_up_to_date_when_a_comparator_on_it_starts() {
+        // `esp_systimer_comparator_reprogram` updates the counter of the comparator whether it
+        // works or not: counter 1, stopped since power-on, takes the 500 counts of 5 000 cycles.
+        let ctx = &mut Ctx::default();
+        let mut timer = counting_as_qemu(ctx);
+        after(ctx, 5_000);
+        timer.write(ctx, TARGET0_CONF, TARGET_UNIT_SEL);
+        timer.write(ctx, CONF, CONF_RESET | TARGET0_WORK_EN);
+        assert_eq!(latched(ctx, &mut timer, 1), Some(500));
+        assert_eq!(
+            counter(ctx, &mut Systimer::new(ctx.now()), 1),
+            0,
+            "the chip's"
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub mod rom;
 pub mod test_support;
 
 pub use chip::ChipRevision;
-pub use config::{SocConfig, Timing};
+pub use config::{CompatActs, QemuCompat, SocConfig, Timing};
 pub use diag::Diagnostic;
 pub use flash::{
     FlashConfig, FlashConfigError, FlashDevice, FlashImageError, FlashWrite, JedecId, NorFlash,

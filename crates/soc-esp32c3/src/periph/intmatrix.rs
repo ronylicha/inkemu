@@ -184,6 +184,20 @@ impl IntMatrix {
         best.map(|(line, _)| line)
     }
 
+    /// Whether Espressif's QEMU would raise the CPU's external interrupt (`mip.MEIP`) given the
+    /// level of every source: some line is enabled, has a source up and a priority at least the
+    /// threshold, every line being a level line and priority 0 counting like any other
+    /// (`hw/riscv/esp32c3_intmatrix.c`, `esp32c3_intmatrix_line_should_assert`, branch
+    /// `esp-develop` of `espressif/qemu`). Reading it changes nothing: the lockstep against QEMU
+    /// compares it with the `mip` QEMU prints, a bit this controller does not show the CPU.
+    #[must_use]
+    pub fn asserted_as_qemu(&self, sources: u64) -> bool {
+        let levels = self.line_levels(sources) & self.enable & !1;
+        (0u32..)
+            .zip(self.priority)
+            .any(|(line, priority)| levels & (1 << line) != 0 && priority >= self.threshold)
+    }
+
     /// The CPU took `line`: an edge latched on it can now be acknowledged (TRM §1.5.2: the
     /// acknowledge clears "the pending state of claimed edge-type interrupts only").
     pub fn claim(&mut self, line: u32) {
@@ -438,6 +452,24 @@ mod tests {
         m.write(ctx, priority(4), 0);
         m.write(ctx, CPU_INT_THRESH, 0);
         assert_eq!(m.resolve(ctx.sources()), None);
+    }
+
+    #[test]
+    fn qemus_external_interrupt_follows_its_matrix_priority_zero_included() {
+        let ctx = &mut Ctx::default();
+        let mut m = application_setup(ctx);
+        assert!(!m.asserted_as_qemu(ctx.sources()), "no source up");
+        ctx.irq(TICK, true);
+        assert!(m.asserted_as_qemu(ctx.sources()));
+        m.write(ctx, CPU_INT_THRESH, 2);
+        assert!(!m.asserted_as_qemu(ctx.sources()), "below the threshold");
+        // QEMU compares priority 0 with the threshold like any other; the chip never passes it.
+        m.write(ctx, priority(4), 0);
+        m.write(ctx, CPU_INT_THRESH, 0);
+        assert!(m.asserted_as_qemu(ctx.sources()));
+        assert_eq!(m.resolve(ctx.sources()), None);
+        m.write(ctx, CPU_INT_ENABLE, 0);
+        assert!(!m.asserted_as_qemu(ctx.sources()), "a disabled line");
     }
 
     #[test]
