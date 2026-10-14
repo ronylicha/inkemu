@@ -136,3 +136,30 @@ crates/lockstep-cli/tests/readme.rs                         the README's command
 - [x] **Step 2:** README (EN, then FR): the developer section on `inkemu-lockstep`.
 - [x] **Step 3:** The hand-over note (French): results, rulings R1–R14, what is left to SP1b-4d and later, limits of proof.
 - [x] **Step 4: Commit:** `docs: ADR 0008, the lockstep and its admitted differences, the README of inkemu-lockstep, and the hand-over of SP1b-4c`.
+
+## Fix round (2026-10-14)
+
+Two reviews (policy: 3 blocking, 11 important, 8 minor; machine: 5 medium, 7 low) found that the lockstep
+could pass with a wrong model. The controller's rulings and how they are implemented:
+
+| # | Ruling | Implementation |
+|---|---|---|
+| R15 | A copy row never replaces a value blindly: exact registers and bits, equality outside the mask, every adoption counted; rows 7, 9, 10 and 18 narrowed. | `Treatment::Registers` of `Register { address, mask, qemu, after_command }`; masks are the bits measured to differ; `W0` conditioned on the SPI1 opcode at the store of `CMD.USR`; `TIME_LOW0` requires QEMU's 0. |
+| R16 | Rows 2 and 4 narrowed to their bits and, where possible, their window. | `Treatment::Pair` with `until_written`; `Treatment::ExternalInterrupt { lag: 3 }` against `Esp32C3::external_interrupt_as_qemu`. |
+| R17 | SYSTIMER (and any timer): exact equality under `qemu-icount`, else a bounded, sourced, counted delta; never a full copy. | `QemuCompat::systimer_counts_as_qemu` and `cycle_counter_as_qemu` (QEMU's models ported from its source); `Treatment::Counter` bounds 2 and 1, measured. |
+| R18 | Accesses to undocumented addresses end the window or are an explicit row; a one-sided reset is a divergence. | `absent_in_qemu` from QEMU's `info mtree -f` to the byte; `WindowEnd::Absent`; `Cause::OneSidedReset`. |
+| R19 | Per-row usage recorded and checked; unused or out-of-declaration rows fail the run; row 24 counts only when it acts; CI prints it. | `lockstep::Usage`, `Usage::check`, exit 5; `CompatActs` from the machine. |
+| R20 | Duplicates bounded and cross-checked against the trace. | `MAX_REPRINTS` = 1; `loops_on_itself` on raw bits and QEMU's state. |
+| R21 | Machine and tool: Ctrl-C, Drop, empty trace, long sleeps, Windows, image tag, CI timeouts, faulting accesses, wider equivalence test, negative test against QEMU. | See the commits below and the hand-over note. |
+
+- [x] **Step 1:** `fix(cpu-rv32)`: the QEMU cycle counter, off by default.
+- [x] **Step 2:** `fix(soc-esp32c3)`: `step` resumes at its boundary, `qemu-icount` refunds faulting accesses, the
+  SYSTIMER and cycle-counter settings with their act counters, `external_interrupt_as_qemu`; tests.
+- [x] **Step 3:** `fix(lockstep)`: the table of exact registers, pairs and bounded counters; `Usage`; the window
+  by QEMU's devices; one-sided reset; reprints; reader bounds; `inkemu-lockstep` (Drop, process group, timeouts,
+  exit codes 2/5/130, `--perturb-after`, Unix-only QEMU mode, `versions.env`); `docs/lockstep-differences.md`.
+- [x] **Step 4:** `ci`: timeouts, `--qemu` from `versions.env`, the run with a fault that must diverge.
+- [x] **Step 5:** `docs`: ADR 0008, the correction of the spec, the README, this section, the hand-over note.
+
+Measured after the fixes: 3 402 169 instructions compared (unchanged), window end at the reset of both sides, all
+24 rows used within their declarations, the same usage live and on the captured trace.
