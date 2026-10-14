@@ -5,11 +5,11 @@
 //! where QEMU's reset of its whole machine leaves another state than the chip's CPU reset.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test: a panic is a test failure
 
-use cpu_rv32::asm::{addi, csrrs, csrrw, lui, lw, sw};
+use cpu_rv32::asm::{addi, csrrc, csrrs, csrrw, lui, lw, sw};
 use lockstep::table::PMP_RWX;
 use lockstep::{
-    Cause, CpuState, Difference, End, Field, Kept, KeptCsr, Location, Lockstep, Register, Site,
-    Target, TraceReader, Treatment, Window, WindowEnd, kept, render_block,
+    AfterReset, Cause, CpuState, Difference, End, Field, Kept, KeptCsr, Location, Lockstep,
+    Register, Site, Target, TraceReader, Treatment, Window, WindowEnd, kept, render_block,
 };
 use soc_esp32c3::memmap::{ROM_BASE, SRAM_DBUS_BASE};
 use soc_esp32c3::test_support::{HANG, flat_rom, store_register};
@@ -231,16 +231,114 @@ fn a_held_register_stored_to_memory_holds_the_register_it_is_loaded_back_into() 
     );
 }
 
+const CLKDIV: Register = Register {
+    address: 0x6000_0014,
+    mask: 0x0000_00FF,
+    qemu: None,
+    after_command: None,
+};
+
+/// `UART0.CLKDIV` after a reset of both sides: QEMU must read `0xB9` in the low byte, its reset
+/// value in these traces (inkemu's is `0x2B6`, kept through the CPU reset).
 const AFTER_RESET: &[Difference] = &[Difference {
     number: 1,
     summary: "UART0.CLKDIV, after a reset",
-    treatments: &[Treatment::RegistersAfterReset(&[Register {
-        address: 0x6000_0014,
-        mask: 0x0000_00FF,
-        qemu: None,
-        after_command: None,
+    treatments: &[Treatment::RegistersAfterReset(&[AfterReset {
+        register: CLKDIV,
+        inkemu: None,
+        qemu: Some(0xB9),
     }])],
 }];
+
+/// The same row declaring another value for QEMU.
+const AFTER_RESET_OTHER_VALUE: &[Difference] = &[Difference {
+    number: 1,
+    summary: "UART0.CLKDIV, after a reset, another value",
+    treatments: &[Treatment::RegistersAfterReset(&[AfterReset {
+        register: CLKDIV,
+        inkemu: None,
+        qemu: Some(0xB6),
+    }])],
+}];
+
+/// `UART0.CLKDIV` after the machine resets UART0 (bit 2 of `PERIP_RST_EN0`), which QEMU
+/// ignores: inkemu must read its reset value, `0x2B6`.
+const AFTER_PULSE: &[Difference] = &[Difference {
+    number: 1,
+    summary: "UART0.CLKDIV, after a reset of UART0",
+    treatments: &[Treatment::RegistersAfterReset(&[AfterReset {
+        register: Register {
+            mask: 0x0000_03FF,
+            ..CLKDIV
+        },
+        inkemu: Some(0x2B6),
+        qemu: None,
+    }])],
+}];
+
+const AFTER_PULSE_OTHER_VALUE: &[Difference] = &[Difference {
+    number: 1,
+    summary: "UART0.CLKDIV, after a reset of UART0, another value",
+    treatments: &[Treatment::RegistersAfterReset(&[AfterReset {
+        register: Register {
+            mask: 0x0000_03FF,
+            ..CLKDIV
+        },
+        inkemu: Some(0x123),
+        qemu: None,
+    }])],
+}];
+
+#[test]
+fn a_copy_after_a_reset_of_a_module_qemu_ignores_holds_only_from_inkemus_reset_value() {
+    // The life sets CLKDIV, then pulses UART0's reset, then reads CLKDIV: inkemu reads its
+    // reset value, QEMU, which ignores the pulse, the value the life set.
+    let perip_rst_en0 = svd_regs::esp32c3::addr("SYSTEM", "PERIP_RST_EN0");
+    let mut body = Vec::new();
+    body.extend(store_register(0x6000_0014, 0x123));
+    body.extend(store_register(perip_rst_en0, 1 << 2));
+    body.extend(store_register(perip_rst_en0, 0));
+    body.extend([lui(5, 0x6000_0000), lw(A1, 5, 0x14)]);
+    let program = lives(&body);
+    let states = record(&program, 60);
+    let at = resets(&states);
+    let load = body.len() - 1;
+    let mut qemu = states;
+    for state in &mut qemu[load + 1..at[0]] {
+        state.set(Field::X(A1), 0x123);
+    }
+    let trace = text(&qemu[..at[0]]);
+    let (end, lockstep, target) = compare(&trace, &program, &window(AFTER_PULSE, 0));
+    assert_eq!(end, End::Window(WindowEnd::TraceEnd), "{end:?}");
+    assert_eq!(lockstep.usage(&target).uses(1), 1);
+    // A row that declares another value for inkemu does not admit it.
+    let (end, _, _) = compare(&trace, &program, &window(AFTER_PULSE_OTHER_VALUE, 0));
+    assert!(
+        matches!(&end, End::Divergence(report) if report.index == u64::try_from(load).unwrap()),
+        "{end:?}"
+    );
+}
+
+#[test]
+fn a_copy_after_a_reset_of_both_sides_holds_only_from_the_value_qemu_must_show() {
+    let program = lives(&[lui(5, 0x6000_0000), lw(A1, 5, 0x14)]);
+    let states = record(&program, 30);
+    let at = resets(&states);
+    let mut second = states;
+    for state in &mut second[at[0] + 2..=at[1]] {
+        let read = state.x(A1);
+        state.set(Field::X(A1), read ^ 0x0F);
+    }
+    let (end, _, _) = compare(
+        &text(&second[..=at[1]]),
+        &program,
+        &window(AFTER_RESET_OTHER_VALUE, 1),
+    );
+    assert!(
+        matches!(&end, End::Divergence(report) if report.index == u64::try_from(at[0] + 1).unwrap()),
+        "{end:?}"
+    );
+}
 
 #[test]
 fn a_register_of_the_rows_after_a_reset_is_copied_only_after_one() {
@@ -328,6 +426,52 @@ fn a_csr_qemu_partly_keeps_is_compared_once_the_life_after_the_reset_writes_it()
         matches!(&end, End::Divergence(report) if report.index == u64::try_from(at[0] + 1).unwrap()),
         "{end:?}"
     );
+}
+
+#[test]
+fn the_bits_a_csrrs_or_csrrc_writes_after_the_reset_are_compared_and_the_others_still_kept() {
+    // As ESP-IDF does (PMP_ENTRY_CFG_RESET, then PMP_ENTRY_CFG_SET): the second life clears the
+    // R, W, X bits of entry 0 and sets R and X, then reads pmpcfg0; each life ends with R, W, X
+    // set, which QEMU keeps through its reset.
+    let program = lives(&[
+        addi(A1, 0, 0x07),
+        csrrc(0, PMPCFG0, A1),
+        addi(A1, 0, 0x05),
+        csrrs(0, PMPCFG0, A1),
+        csrrs(A0, PMPCFG0, 0),
+        addi(A1, 0, 0x07),
+        csrrs(0, PMPCFG0, A1),
+    ]);
+    let states = record(&program, 40);
+    let at = resets(&states);
+    let mut qemu = states.clone();
+    // A model that lost the clear of W reads 0x07: the cleared bit is written, so compared.
+    for state in &mut qemu[at[0] + 5..=at[1]] {
+        state.set(Field::X(A0), 0x07);
+    }
+    let (end, _, _) = compare(&text(&qemu[..=at[1]]), &program, &window(PMP, 1));
+    assert!(
+        matches!(&end, End::Divergence(report) if report.index == u64::try_from(at[0] + 4).unwrap()),
+        "{end:?}"
+    );
+
+    // A csrrs of entry 1 leaves entry 0's kept bits as the reset left them: still admitted.
+    let program = lives(&[
+        addi(A1, 0, 0x700),
+        csrrs(0, PMPCFG0, A1),
+        csrrs(A0, PMPCFG0, 0),
+        addi(A1, 0, 0x07),
+        csrrs(0, PMPCFG0, A1),
+    ]);
+    let states = record(&program, 40);
+    let at = resets(&states);
+    let mut qemu = states;
+    for state in &mut qemu[at[0] + 3..=at[1]] {
+        state.set(Field::X(A0), 0x707);
+    }
+    let (end, lockstep, target) = compare(&text(&qemu[..=at[1]]), &program, &window(PMP, 1));
+    assert_eq!(end, End::Window(WindowEnd::Reset));
+    assert_eq!(lockstep.usage(&target).uses(1), 1);
 }
 
 #[test]

@@ -116,25 +116,8 @@ fn lines_of(treatment: &Treatment) -> Vec<String> {
                 )
             })
             .collect(),
-        Treatment::Registers(registers) | Treatment::RegistersAfterReset(registers) => registers
-            .iter()
-            .map(|register| {
-                let after_reset = matches!(treatment, Treatment::RegistersAfterReset(_));
-                let mut line = format!(
-                    "{}registre 0x{:08X} masque 0x{:08X}",
-                    if after_reset { "après reset " } else { "" },
-                    register.address,
-                    register.mask
-                );
-                if let Some(command) = register.after_command {
-                    let _ = write!(line, " après 0x{command:02X}");
-                }
-                if let Some(value) = register.qemu {
-                    let _ = write!(line, " qemu 0x{value:08X}");
-                }
-                line
-            })
-            .collect(),
+        Treatment::Registers(registers) => registers.iter().map(register_line).collect(),
+        Treatment::RegistersAfterReset(entries) => entries.iter().map(after_reset_line).collect(),
         Treatment::Counter {
             location,
             drift,
@@ -175,6 +158,34 @@ fn lines_of(treatment: &Treatment) -> Vec<String> {
             }
         )],
     }
+}
+
+fn register_line(register: &lockstep::Register) -> String {
+    let mut line = format!(
+        "registre 0x{:08X} masque 0x{:08X}",
+        register.address, register.mask
+    );
+    if let Some(command) = register.after_command {
+        let _ = write!(line, " après 0x{command:02X}");
+    }
+    if let Some(value) = register.qemu {
+        let _ = write!(line, " qemu 0x{value:08X}");
+    }
+    line
+}
+
+fn after_reset_line(entry: &lockstep::AfterReset) -> String {
+    let mut line = format!(
+        "après reset registre 0x{:08X} masque 0x{:08X}",
+        entry.register.address, entry.register.mask
+    );
+    if let Some(value) = entry.inkemu {
+        let _ = write!(line, " inkemu 0x{value:08X}");
+    }
+    if let Some(value) = entry.qemu {
+        let _ = write!(line, " qemu 0x{value:08X}");
+    }
+    line
 }
 
 fn location_text(location: Location) -> String {

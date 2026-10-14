@@ -23,8 +23,8 @@ pub use lockstep::{
 pub use report::{Adoption, Cause, HistoryEntry, Nearest, Report};
 pub use state::{CpuState, Field};
 pub use table::{
-    DIFFERENCES, Difference, Drift, Kept, KeptCsr, Location, QEMU_DEVICES, RETIRED, Register,
-    Retired, Site, Treatment, kept,
+    AfterReset, DIFFERENCES, Difference, Drift, Kept, KeptCsr, Location, QEMU_DEVICES, RETIRED,
+    Register, Retired, Site, Treatment, kept,
 };
 pub use trace::{QemuTrap, TraceError, TraceEvent, TraceReader, render_block};
 pub use usage::{Check, Misuse, RowUse, SiteUse, Usage};

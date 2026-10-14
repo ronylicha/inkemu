@@ -38,16 +38,19 @@ pub enum Treatment {
     /// different values.
     KeptAtReset(&'static [Kept]),
     /// (ii) CSRs QEMU does not print, some bits of which its reset keeps where inkemu's CPU reset
-    /// clears them: after a reset of both sides, and until an instruction writes the CSR whole
-    /// (`csrrw`, `csrrwi`; a `csrrs` or `csrrc` writes back the value it read, and carries the
-    /// difference), a read into a register gives in QEMU inkemu's value with those of the kept
-    /// bits inkemu held before the reset set again ([`KeptCsr`]), or inkemu's value itself; the
-    /// register takes QEMU's bits, within the mask.
+    /// clears them: after a reset of both sides, a read into a register gives in QEMU inkemu's
+    /// value with those of the kept bits inkemu held before the reset set again ([`KeptCsr`]),
+    /// or inkemu's value itself; the register takes QEMU's bits, within the mask. A bit an
+    /// instruction has written since the reset is no longer kept (every bit for `csrrw` and
+    /// `csrrwi`, the operand for `csrrs`, `csrrc` and their immediate forms): it is compared.
     CsrKeptAtReset(&'static [KeptCsr]),
     /// (ii) Registers the two resets leave in different states: the same copy as
-    /// [`Treatment::Registers`], made only after a reset of both sides and until the first store
-    /// to the register since, on top of what the entries of `Registers` at the same address take.
-    RegistersAfterReset(&'static [Register]),
+    /// [`Treatment::Registers`], made only after a reset that left the register in two states
+    /// (a reset of both sides, or one of its module the machine made at a pulse QEMU ignores) and
+    /// until the first store to it since, on top of what the entries of `Registers` at the same
+    /// address take. The copy is made only when the side that reset shows the value the entry
+    /// declares ([`AfterReset`]); any other value is a divergence.
+    RegistersAfterReset(&'static [AfterReset]),
     /// (ii) Registers of a peripheral the two model differently, or of one QEMU lacks: an access
     /// to one of them is admitted (it does not end the window), and a word load from one takes
     /// in inkemu QEMU's bits of `mask`, every other bit being compared.
@@ -103,6 +106,33 @@ pub struct Register {
     /// The copy is made only after an SPI1 user command with this opcode (`USR_COMMAND_VALUE`
     /// at the store of `CMD.USR`): the register holds that command's answer.
     pub after_command: Option<u8>,
+}
+
+/// A register of [`Treatment::RegistersAfterReset`], with the values the side that reset it must
+/// show, within the mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AfterReset {
+    pub register: Register,
+    /// inkemu's value when the machine reset the register's module since the last store to it
+    /// (`esp_restart`'s pulses, or the firmware's): its reset value in the SVD.
+    pub inkemu: Option<u32>,
+    /// QEMU's value otherwise, when the reset of both sides left inkemu's register as the life
+    /// before set it: the value QEMU's reset gives it, as measured.
+    pub qemu: Option<u32>,
+}
+
+/// An entry of [`Treatment::RegistersAfterReset`] at `address`, copying `mask`.
+const fn after_reset(
+    address: u32,
+    mask: u32,
+    inkemu: Option<u32>,
+    qemu: Option<u32>,
+) -> AfterReset {
+    AfterReset {
+        register: copy(address, mask),
+        inkemu,
+        qemu,
+    }
 }
 
 /// A quantity of [`Treatment::KeptAtReset`].
@@ -212,6 +242,17 @@ impl Compat {
 }
 
 impl Treatment {
+    /// The registers a treatment of registers names, after a reset or not; none for another.
+    pub fn registers(&self) -> Box<dyn Iterator<Item = &'static Register>> {
+        match *self {
+            Treatment::Registers(registers) => Box::new(registers.iter()),
+            Treatment::RegistersAfterReset(entries) => {
+                Box::new(entries.iter().map(|entry| &entry.register))
+            }
+            _ => Box::new(std::iter::empty()),
+        }
+    }
+
     /// The roman numeral of H3 the treatment is.
     #[must_use]
     pub const fn kind(self) -> &'static str {
@@ -266,26 +307,34 @@ impl Difference {
     ) -> impl Iterator<Item = &'static Register> + '_ {
         self.treatments
             .iter()
-            .filter_map(move |treatment| match treatment {
-                Treatment::Registers(registers) => Some(registers.iter()),
-                Treatment::RegistersAfterReset(registers) if after_reset => Some(registers.iter()),
-                _ => None,
-            })
-            .flatten()
+            .flat_map(
+                move |treatment| -> Box<dyn Iterator<Item = &'static Register>> {
+                    match *treatment {
+                        Treatment::Registers(registers) => Box::new(registers.iter()),
+                        Treatment::RegistersAfterReset(entries) if after_reset => {
+                            Box::new(entries.iter().map(|entry| &entry.register))
+                        }
+                        _ => Box::new(std::iter::empty()),
+                    }
+                },
+            )
             .filter(move |register| register.address == address)
+    }
+
+    /// The entries of [`Treatment::RegistersAfterReset`] of the row at `address`.
+    pub fn after_reset_at(&self, address: u32) -> impl Iterator<Item = &'static AfterReset> + '_ {
+        self.treatments
+            .iter()
+            .flat_map(|treatment| match *treatment {
+                Treatment::RegistersAfterReset(entries) => entries,
+                _ => &[],
+            })
+            .filter(move |entry| entry.register.address == address)
     }
 
     /// Every register entry of the row, before a reset and after one.
     pub fn registers_at_all(&self) -> impl Iterator<Item = &'static Register> + '_ {
-        self.treatments
-            .iter()
-            .filter_map(|treatment| match treatment {
-                Treatment::Registers(registers) | Treatment::RegistersAfterReset(registers) => {
-                    Some(registers.iter())
-                }
-                _ => None,
-            })
-            .flatten()
+        self.treatments.iter().flat_map(Treatment::registers)
     }
 
     /// Every site the row declares, with the bits a run must take from QEMU there for the
@@ -310,8 +359,8 @@ impl Difference {
                             .filter_map(|kept| Location::of(kept.field))
                             .map(|location| (Site::at(location), 0)),
                     ),
-                    Treatment::Registers(registers) | Treatment::RegistersAfterReset(registers) => {
-                        Box::new(registers.iter().map(|register| {
+                    Treatment::Registers(_) | Treatment::RegistersAfterReset(_) => {
+                        Box::new(treatment.registers().map(|register| {
                             (
                                 Site {
                                     location: Location::Mmio(register.address),
@@ -951,49 +1000,52 @@ pub const ROW_AFTER_RESET: Difference = Difference {
     number: 27,
     summary: "after esp_restart: registers the chip's reset and QEMU's leave in different states",
     treatments: &[Treatment::RegistersAfterReset(&[
-        copy(0x6000_0014, 0x0030_03ED),
-        copy(0x6000_0078, 0x0000_1000),
-        copy(0x6000_2010, 0x0000_03E0),
-        copy(0x6000_2028, 0x0000_0017),
-        copy(0x6000_4154, 0x0000_0030),
-        copy(0x6000_4158, 0x0000_0030),
-        copy(0x6000_8024, 0x0001_0000),
-        copy(0x6000_8028, 0x0001_0000),
-        copy(0x6000_802C, 0x0000_0200),
-        copy(0x6000_8030, 0x0001_0000),
-        copy(0x6000_8080, 0x1000_0000),
-        copy(0x6000_8088, 0x0000_0800),
-        copy(0x6000_808C, 0x0040_0000),
-        copy(0x6000_9004, 0x0000_0002),
-        copy(0x6000_9008, 0x0000_0002),
-        copy(0x6000_900C, 0x0000_0002),
-        copy(0x6000_9010, 0x0000_0002),
-        copy(0x6000_9014, 0x0000_0002),
-        copy(0x6000_9018, 0x0000_0002),
-        copy(0x6000_901C, 0x0000_0002),
-        copy(0x6000_9020, 0x0000_0002),
-        copy(0x6000_9024, 0x0000_0002),
-        copy(0x6000_9028, 0x0000_0002),
-        copy(0x6000_902C, 0x0000_0002),
-        copy(0x6000_9030, 0x0000_0002),
-        copy(0x6000_9034, 0x0000_0002),
-        copy(0x6000_9038, 0x0000_0002),
-        copy(0x6000_9040, 0x0000_0002),
-        copy(0x6000_9044, 0x0000_0002),
-        copy(0x6000_9048, 0x0000_0002),
-        copy(0x6000_904C, 0x0000_0002),
-        copy(0x6000_9050, 0x0000_0002),
-        copy(0x6001_F048, 0x383B_0000),
-        copy(0x6001_F04C, 0x4E20_0000),
-        copy(0x6001_F068, 0x0401_3000),
-        copy(0x6002_004C, 0x4E20_0000),
-        copy(0x6004_0018, 0x0063_0000),
-        copy(0x600C_0008, 0x0000_0001),
-        copy(0x600C_0024, 0x0100_0000),
-        copy(0x600C_4078, 0x0000_0023),
-        copy(0x600C_4084, 0x0000_003F),
-        copy(0x600C_E008, 0x0000_0300),
-        copy(0x600C_E048, 0x4004_8B92),
+        // Modules the machine resets (UART0, SPI0/1, TIMG0/1): inkemu shows its SVD reset value
+        // in the mask (CLKDIV 0x2B6, CLK_CONF 0x3701000, WDTCONFIG0 0x4C000, WDTCONFIG1
+        // 0x10000, RTCCALICFG 0x13000, the SPI1 registers 0); the others: QEMU reads 0.
+        after_reset(0x6000_0014, 0x0030_03ED, Some(0x0000_02A4), None),
+        after_reset(0x6000_0078, 0x0000_1000, Some(0x0000_1000), None),
+        after_reset(0x6000_2010, 0x0000_03E0, Some(0), None),
+        after_reset(0x6000_2028, 0x0000_0017, Some(0), None),
+        after_reset(0x6000_4154, 0x0000_0030, None, Some(0)),
+        after_reset(0x6000_4158, 0x0000_0030, None, Some(0)),
+        after_reset(0x6000_8024, 0x0001_0000, None, Some(0)),
+        after_reset(0x6000_8028, 0x0001_0000, None, Some(0)),
+        after_reset(0x6000_802C, 0x0000_0200, None, Some(0)),
+        after_reset(0x6000_8030, 0x0001_0000, None, Some(0)),
+        after_reset(0x6000_8080, 0x1000_0000, None, Some(0)),
+        after_reset(0x6000_8088, 0x0000_0800, None, Some(0)),
+        after_reset(0x6000_808C, 0x0040_0000, None, Some(0)),
+        after_reset(0x6000_9004, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9008, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_900C, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9010, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9014, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9018, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_901C, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9020, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9024, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9028, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_902C, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9030, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9034, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9038, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9040, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9044, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9048, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_904C, 0x0000_0002, None, Some(0)),
+        after_reset(0x6000_9050, 0x0000_0002, None, Some(0)),
+        after_reset(0x6001_F048, 0x383B_0000, Some(0), Some(0)),
+        after_reset(0x6001_F04C, 0x4E20_0000, Some(0), None),
+        after_reset(0x6001_F068, 0x0401_3000, Some(0x0001_3000), None),
+        after_reset(0x6002_004C, 0x4E20_0000, Some(0), None),
+        after_reset(0x6004_0018, 0x0063_0000, None, Some(0)),
+        after_reset(0x600C_0008, 0x0000_0001, None, Some(0)),
+        after_reset(0x600C_0024, 0x0100_0000, None, Some(0)),
+        after_reset(0x600C_4078, 0x0000_0023, None, Some(0)),
+        after_reset(0x600C_4084, 0x0000_003F, None, Some(0)),
+        after_reset(0x600C_E008, 0x0000_0300, None, Some(0)),
+        after_reset(0x600C_E048, 0x4004_8B92, None, Some(0)),
     ])],
 };
 
@@ -1002,8 +1054,8 @@ pub const ROW_HELLO_SPI1_AFTER_RESET: Difference = Difference {
     number: 28,
     summary: "flash_hello.bin, after its reset: the SPI1 registers the bootloader reads back",
     treatments: &[Treatment::RegistersAfterReset(&[
-        copy(0x6000_2018, 0x0000_0080),
-        copy(0x6000_2020, 0x0000_009F),
+        after_reset(0x6000_2018, 0x0000_0080, Some(0), None),
+        after_reset(0x6000_2020, 0x0000_009F, Some(0), None),
     ])],
 };
 
@@ -1073,8 +1125,8 @@ pub const ROW_NVS_SPI1_AFTER_RESET: Difference = Difference {
     number: 32,
     summary: "flash_nvs.bin, after its reset: the SPI1 registers the bootloader reads back",
     treatments: &[Treatment::RegistersAfterReset(&[
-        copy(0x6000_2018, 0x1000_0080),
-        copy(0x6000_2020, 0x0000_0005),
+        after_reset(0x6000_2018, 0x1000_0080, Some(0), None),
+        after_reset(0x6000_2020, 0x0000_0005, Some(0), None),
     ])],
 };
 
@@ -1544,8 +1596,8 @@ mod tests {
             }
             for row in window.rows {
                 for treatment in row.treatments {
-                    if let Treatment::RegistersAfterReset(registers) = treatment {
-                        for register in *registers {
+                    if let Treatment::RegistersAfterReset(entries) = treatment {
+                        for register in entries.iter().map(|entry| entry.register) {
                             let earlier = before.get(&register.address).copied().unwrap_or(0);
                             assert_eq!(
                                 register.mask & earlier,

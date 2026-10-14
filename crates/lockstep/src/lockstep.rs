@@ -4,7 +4,7 @@
 use crate::report::{Adoption, Cause, HistoryEntry, Nearest, Report};
 use crate::state::{CpuState, Field};
 use crate::table::{
-    CPU_INT_THRESH, Difference, Drift, Location, MEIP, MIP, MODULE_RESETS,
+    AfterReset, CPU_INT_THRESH, Difference, Drift, Location, MEIP, MIP, MODULE_RESETS,
     PERIP_RST_EN_AT_POWER_ON, Register, SPI1_CMD, SPI1_CMD_USR, SPI1_USER2, SYSTEM_PERIP_RST_EN0,
     SYSTEM_PERIP_RST_EN1, Site, Treatment, absent_in_qemu,
 };
@@ -239,6 +239,9 @@ pub struct Lockstep {
     /// The words of peripherals stored to since the last reset that reached them: an entry of
     /// [`Treatment::RegistersAfterReset`] holds only until its register is stored to.
     stored_since_reset: BTreeSet<u32>,
+    /// The words of peripherals stored to since the last pulse of their module, which a reset of
+    /// both sides does not clear: what the machine's module reset left is gone at such a store.
+    stored_since_pulse: BTreeSet<u32>,
     /// What the last word stores left in `SYSTEM.PERIP_RST_EN0` and `PERIP_RST_EN1`, which a CPU
     /// reset keeps, to see the bits a store sets.
     perip_rst_en: [u32; 2],
@@ -251,9 +254,10 @@ pub struct Lockstep {
     history: VecDeque<HistoryEntry>,
     /// The CSRs an instruction has written since power-on, for the pairs that hold until then.
     written: BTreeSet<u16>,
-    /// The CSRs an instruction has written whole (`csrrw`, `csrrwi`) since power-on or the last
-    /// reset crossed.
-    replaced: BTreeSet<u16>,
+    /// The bits of each CSR instructions have written since power-on or the last reset crossed:
+    /// every bit for `csrrw` and `csrrwi`, the operand for `csrrs`, `csrrc` and their immediate
+    /// forms (an operand of 0 writes nothing).
+    bits_written: BTreeMap<u16, u32>,
     /// Compared blocks left in which QEMU may still show `MEIP` after a threshold store.
     meip_lag: u8,
     /// `SPI1.USER2` as the last word store left it, and the opcode of the last user command.
@@ -294,13 +298,14 @@ impl Lockstep {
             kept: BTreeMap::new(),
             kept_memory: BTreeMap::new(),
             stored_since_reset: BTreeSet::new(),
+            stored_since_pulse: BTreeSet::new(),
             perip_rst_en: PERIP_RST_EN_AT_POWER_ON,
             modules_reset: BTreeSet::new(),
             csrs_before_step: BTreeMap::new(),
             csrs_before_reset: BTreeMap::new(),
             history: VecDeque::with_capacity(HISTORY),
             written: BTreeSet::new(),
-            replaced: BTreeSet::new(),
+            bits_written: BTreeMap::new(),
             meip_lag: 0,
             spi1_user2: 0,
             spi1_command: None,
@@ -524,7 +529,7 @@ impl Lockstep {
         self.resets = target.resets();
         self.counts.resets_crossed += 1;
         self.written.clear();
-        self.replaced.clear();
+        self.bits_written.clear();
         self.meip_lag = 0;
         self.spi1_user2 = 0;
         self.spi1_command = None;
@@ -960,21 +965,22 @@ impl Lockstep {
     /// QEMU: equal, or, after a reset of both sides, QEMU's is inkemu's with the bits of `kept`
     /// that inkemu held just before the reset set again, the difference within `mask`. Returns
     /// the bits to take.
+    ///
+    /// A bit an instruction has written since the reset holds what the life after it wrote, the
+    /// same on both sides: it is compared. `csrrw` writes every bit; `csrrs` and `csrrc` write
+    /// their operand, and leave the other bits as the read the row admitted gave them. ESP-IDF
+    /// sets and clears `pmpcfg` entries this way (`RV_SET_CSR` is a `csrrs`, `RV_CLEAR_CSR` a
+    /// `csrrc`: `components/riscv/include/riscv/csr.h` of v5.5.2, `PMP_ENTRY_CFG_SET` and
+    /// `PMP_ENTRY_CFG_RESET`).
     fn kept_csr_read(&self, csr: u16, kept: u32, mask: u32, mine: u32, theirs: u32) -> Option<u32> {
         let differ = mine ^ theirs;
         if differ == 0 {
             return Some(0);
         }
-        // From the first instruction since the reset that writes the CSR whole (`csrrw`,
-        // `csrrwi`), it holds what the life after the reset wrote: the kept bits explain nothing
-        // any more, and it is compared. A `csrrs` or `csrrc` writes back the value it read, which
-        // the row admitted, with some bits set or cleared: the difference it carries is the
-        // reset's, and the row goes on holding it.
-        if self.replaced.contains(&csr) {
-            return None;
-        }
+        let written = self.bits_written.get(&csr).copied().unwrap_or(0);
         let before = *self.csrs_before_reset.get(&csr)?;
-        (theirs == mine | (before & kept) && differ & !mask == 0).then_some(differ)
+        let still_kept = before & kept & !written;
+        (theirs == mine | still_kept && differ & !mask == 0).then_some(differ)
     }
 
     /// Whether the entries of [`Treatment::RegistersAfterReset`] at the word `address` hold: a
@@ -990,6 +996,35 @@ impl Lockstep {
         reset && !self.stored_since_reset.contains(&address)
     }
 
+    /// Whether the side that reset the register at `address` shows the value `entry` declares,
+    /// within its mask: inkemu its reset value when the machine reset the register's module
+    /// since the last store to it, QEMU its reset value otherwise (a reset of both sides left
+    /// inkemu's register as the life before set it). No declared value admits nothing.
+    fn after_reset_value_holds(
+        &self,
+        address: u32,
+        entry: &AfterReset,
+        mine: u32,
+        theirs: u32,
+    ) -> bool {
+        let mask = entry.register.mask;
+        if self.module_reset_since_store(address) {
+            entry.inkemu.is_some_and(|value| mine & mask == value)
+        } else {
+            entry.qemu.is_some_and(|value| theirs & mask == value)
+        }
+    }
+
+    /// Whether the machine reset the module of the register at `address` (a pulse of its bit,
+    /// [`MODULE_RESETS`]) since the last store to the register.
+    fn module_reset_since_store(&self, address: u32) -> bool {
+        !self.stored_since_pulse.contains(&address)
+            && self
+                .modules_reset
+                .iter()
+                .any(|&m| (MODULE_RESETS[m].first..=MODULE_RESETS[m].last).contains(&address))
+    }
+
     /// A word store of `value` to `SYSTEM.PERIP_RST_EN0` or `PERIP_RST_EN1`: the modules whose
     /// bit it sets are reset in the machine (`soc_esp32c3::periph::system`, a reset at the bit
     /// going from 0 to 1) and not in QEMU, whose `SYSTEM` ignores the store; the copies after a
@@ -1001,8 +1036,9 @@ impl Lockstep {
         for (m, module) in MODULE_RESETS.iter().enumerate() {
             if module.register == address && rising & module.bit != 0 {
                 self.modules_reset.insert(m);
-                self.stored_since_reset
-                    .retain(|word| !(module.first..=module.last).contains(word));
+                let outside = |word: &u32| !(module.first..=module.last).contains(word);
+                self.stored_since_reset.retain(outside);
+                self.stored_since_pulse.retain(outside);
             }
         }
     }
@@ -1106,26 +1142,38 @@ impl Lockstep {
 
     /// The rows that admit a word load from `address` whose two values differ by `differ`, QEMU's
     /// being `theirs`, each with the site and the bits it takes: the register entries there whose
-    /// condition holds, those of [`Treatment::RegistersAfterReset`] once a reset of both sides
-    /// was crossed and until a store to the register. Together they must cover every differing
-    /// bit and agree with QEMU's value; a bit goes to the first entry that declares it, in the
-    /// order of the table. `None` when no entry is there, or they do not cover the read.
+    /// condition holds, those of [`Treatment::RegistersAfterReset`] while a reset holds them
+    /// ([`Lockstep::after_reset_at`]) and only with the value the entry declares for the side
+    /// that reset ([`Lockstep::after_reset_value_holds`]). Together they must cover every
+    /// differing bit and agree with QEMU's value; a bit goes to the first entry that declares it,
+    /// in the order of the table. `None` when no entry is there, or they do not cover the read.
     fn admitted_register_read(
         &self,
         address: u32,
         differ: u32,
         theirs: u32,
     ) -> Option<Vec<(u16, Site, u32)>> {
+        let mine = theirs ^ differ;
         let after_reset = self.after_reset_at(address);
-        let entries: Vec<(u16, &Register)> = self
-            .rows
-            .iter()
-            .flat_map(|row| {
-                row.registers_at(address, after_reset)
+        let mut entries: Vec<(u16, &Register)> = Vec::new();
+        for row in self.rows {
+            entries.extend(
+                row.registers_at(address, false)
                     .filter(|register| self.condition_holds(register))
-                    .map(move |register| (row.number, register))
-            })
-            .collect();
+                    .map(|register| (row.number, register)),
+            );
+            if !after_reset {
+                continue;
+            }
+            for entry in row.after_reset_at(address) {
+                if self.after_reset_value_holds(address, entry, mine, theirs) {
+                    entries.push((row.number, &entry.register));
+                } else if differ & entry.register.mask != 0 {
+                    // The side that reset shows another value than the row declares.
+                    return None;
+                }
+            }
+        }
         if entries.is_empty() {
             return None;
         }
@@ -1187,11 +1235,16 @@ impl Lockstep {
             return;
         }
         match decoded.instr {
-            Instr::Csr { op, src, csr, .. } if op == CsrOp::Rw || src != 0 => {
+            Instr::Csr {
+                op, src, uimm, csr, ..
+            } if op == CsrOp::Rw || src != 0 => {
                 self.written.insert(csr);
-                if op == CsrOp::Rw {
-                    self.replaced.insert(csr);
-                }
+                let bits = match (op, uimm) {
+                    (CsrOp::Rw, _) => u32::MAX,
+                    (_, true) => u32::from(src),
+                    (_, false) => self.before.x(src),
+                };
+                *self.bits_written.entry(csr).or_default() |= bits;
                 self.note_counter_origin(Location::Csr(csr));
             }
             Instr::Store { op, rs2, .. } => {
@@ -1202,6 +1255,7 @@ impl Lockstep {
                 self.note_counter_origin(Location::Mmio(address & !3));
                 if PERIPHERALS.contains(&address) {
                     self.stored_since_reset.insert(address & !3);
+                    self.stored_since_pulse.insert(address & !3);
                 }
                 if op != StoreOp::W {
                     return;

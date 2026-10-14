@@ -107,9 +107,9 @@ mod tests {
                 .iter()
                 .map(|register| (false, Location::Mmio(register.address)))
                 .collect(),
-            Treatment::RegistersAfterReset(registers) => registers
+            Treatment::RegistersAfterReset(entries) => entries
                 .iter()
-                .map(|register| (true, Location::Mmio(register.address)))
+                .map(|entry| (true, Location::Mmio(entry.register.address)))
                 .collect(),
             Treatment::Counter { location, .. } => vec![(false, location)],
             Treatment::SlowClock { register, .. } => vec![(false, Location::Mmio(register))],

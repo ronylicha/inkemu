@@ -193,14 +193,19 @@ ce que les deux resets laissent différent est une ligne mesurée sur la fenêtr
   du CPU garde les périphériques), et celui d'un module qu'inkemu fait à une impulsion de son bit de
   `SYSTEM.PERIP_RST_EN0/1`, que QEMU ignore (`hw/riscv/esp32c3_clk.c` : `PERIP_RST_EN0/1` y lisent 0
   et les écritures n'y font rien). Les modules sont ceux qu'inkemu remet à zéro (SPI0/1, UART0, UART1,
-  TIMG0, TIMG1, USB-Serial-JTAG, SYSTIMER, SHA ; `lockstep::table::MODULE_RESETS`). La copie s'ajoute
-  à ce que prennent les registres des lignes (ii) à la même adresse (un bit va à la première ligne qui
-  le déclare). **(ii) CSR gardé au reset** (SP1b-4d) : un CSR que QEMU n'imprime pas, dont son reset
-  garde certains bits ; après un reset, et jusqu'à ce qu'une instruction écrive le CSR en entier
-  (`csrrw`, `csrrwi`), une lecture doit donner dans QEMU la valeur d'inkemu avec, en plus, ceux de
-  ces bits qu'inkemu avait juste avant le reset, et la destination prend les bits de QEMU, dans le
-  masque mesuré. Un `csrrs` ou un `csrrc` réécrit la valeur qu'il vient de lire, que la ligne a
-  admise, avec des bits posés ou effacés : la différence qu'il porte reste celle du reset.
+  TIMG0, TIMG1, USB-Serial-JTAG, SYSTIMER, SHA ; `lockstep::table::MODULE_RESETS`). La copie n'est
+  faite que si le côté qui a remis le registre montre la valeur que la ligne déclare, dans le
+  masque : inkemu sa valeur de reset du SVD (`inkemu …`) quand il a remis le module depuis le
+  dernier rangement dans le registre, QEMU la valeur que son reset lui donne (`qemu …`) sinon.
+  Une autre valeur est une divergence. La copie s'ajoute à ce que prennent les registres des lignes
+  (ii) à la même adresse (un bit va à la première ligne qui le déclare). **(ii) CSR gardé au
+  reset** (SP1b-4d) : un CSR que QEMU n'imprime pas, dont son reset garde certains bits ; après un
+  reset, une lecture doit donner dans QEMU la valeur d'inkemu avec, en plus, ceux de ces bits
+  qu'inkemu avait juste avant le reset et qu'aucune instruction n'a écrits depuis, et la
+  destination prend les bits de QEMU, dans le masque mesuré. Les bits écrits sont suivis par CSR :
+  tous pour `csrrw` et `csrrwi`, l'opérande pour `csrrs`, `csrrc` et leurs formes immédiates (un
+  opérande nul n'écrit rien). Un bit écrit tient ce que la seconde vie a écrit, le même des deux
+  côtés : il est comparé.
 - **(iii) resynchronisation** à un PC d'ancrage : aucune ligne n'en a eu besoin.
 - **(iv) réglage `QemuCompat`** de la machine, désactivé par défaut, que seul le lockstep allume,
   quand la différence change le flot de contrôle et qu'aucun des trois premiers ne suffit. La ligne
@@ -269,8 +274,10 @@ csr numéro> écart <unités> origines <…>` (l'écart tenu à ses unités de c
 `compteur <adresse> recul par mise à jour <premier>-<dernier> origines <…>` (l'écart ne descend que
 d'une unité par mise à jour possible de QEMU entre deux lectures), `horloge lente <adresse> capture
 <adresse> bit <n> <fréquence> Hz écart <cycles> qemu <valeur>`, `réglage <nom du champ de
-QemuCompat>`, et depuis SP1b-4d `gardé au reset <registre ou CSR>`, `csr gardé au reset <adresse>
-bits gardés <bits> masque <bits>`, `après reset registre <adresse> masque <bits>`. Une origine est un CSR écrit ou une adresse où un rangement est fait.
+QemuCompat>`, et depuis SP1b-4d `gardé au reset <registre ou CSR> [bits <bits>] reset <valeur>`,
+`csr gardé au reset <adresse> bits gardés <bits> masque <bits>`, `après reset registre <adresse>
+masque <bits> [inkemu <valeur>] [qemu <valeur>]` (les valeurs que montre, dans le masque, le côté
+qui a remis le registre). Une origine est un CSR écrit ou une adresse où un rangement est fait.
 
 ### Ligne 1 — `mstatus.MPP` (retirée le 2026-10-14)
 
@@ -886,9 +893,12 @@ PMP est 0 ; que le reset efface aussi les bits L est une hypothèse du même rap
 la spécification privilégiée RISC-V (§3.7.1) n'exige d'un reset que d'effacer A et L, et QEMU garde
 le reste. Mesure : à chaque lecture, la valeur de QEMU est celle d'inkemu plus les bits R, W, X
 qu'inkemu avait juste avant le reset (`0x89888F88` avant le reset pour `pmpcfg0`, `0x01000700` lu
-par QEMU). La ligne tient jusqu'à ce qu'une instruction écrive le CSR en entier (`csrrw`) ; un
-`csrrs` porte la différence qu'il a lue. inkemu ne fait pas respecter la PMP (SP1b-4f) : la copie ne
-change que le registre destination. Mêmes masques dans `hello` et `nvs`.
+par QEMU). ESP-IDF pose et efface les entrées par `csrrs` et `csrrc` (`RV_SET_CSR` et
+`RV_CLEAR_CSR`, dans `PMP_ENTRY_CFG_SET` et `PMP_ENTRY_CFG_RESET` :
+`components/riscv/include/riscv/csr.h` de la v5.5.2) : un bit qu'une de ces instructions écrit
+n'est plus tenu, il est comparé ; les autres bits gardés le restent. inkemu ne fait pas respecter
+la PMP (SP1b-4f) : la copie ne change que le registre destination. Mêmes masques dans `hello` et
+`nvs`.
 
 Paramètres :
 
@@ -933,52 +943,63 @@ toujours une impulsion du module de son registre (UART0 : `CLKDIV`, `0x60000078`
 bit 31 de `0x600080AC` (RTC_CNTL, désormais à la ligne 9) et `PERIP_RST_EN0/1` (désormais à la
 ligne 20). Mêmes registres et mêmes masques dans `hello`, `nvs` et `nvs-ota`.
 
+Chaque copie vérifie la valeur du côté qui a remis le registre (seconde relecture, 2026-10-14).
+Les registres des modules qu'inkemu remet à zéro (UART0, SPI0/1, TIMG0, TIMG1) déclarent sa valeur
+de reset du SVD dans le masque : `CLKDIV` `0x2B6`, `CLK_CONF` `0x3701000`, `WDTCONFIG0` `0x4C000`,
+`WDTCONFIG1` `0x10000`, `RTCCALICFG` `0x13000`, les registres de SPI1 0 (`USER` `0x80000000`,
+`USER2` `0x70000000` hors masque). Les autres (GPIO, RTC_CNTL, IO_MUX, APB_SARADC, SYSTEM, EXTMEM,
+ASSIST_DEBUG), que QEMU remet à son reset ou ne modélise pas, déclarent ce que QEMU y lit : 0.
+`WDTCONFIG0` de TIMG0 déclare les deux : sa première lecture suit le reset des deux côtés sans
+impulsion de TIMG0 depuis son dernier rangement (QEMU 0), les suivantes une impulsion du module
+par l'application (inkemu 0 dans le masque). Relevé du 2026-10-14 sur les trois fenêtres : chaque
+lecture admise montre la valeur déclarée.
+
 Paramètres :
 
 ```text
-après reset registre 0x60000014 masque 0x003003ED
-après reset registre 0x60000078 masque 0x00001000
-après reset registre 0x60002010 masque 0x000003E0
-après reset registre 0x60002028 masque 0x00000017
-après reset registre 0x60004154 masque 0x00000030
-après reset registre 0x60004158 masque 0x00000030
-après reset registre 0x60008024 masque 0x00010000
-après reset registre 0x60008028 masque 0x00010000
-après reset registre 0x6000802C masque 0x00000200
-après reset registre 0x60008030 masque 0x00010000
-après reset registre 0x60008080 masque 0x10000000
-après reset registre 0x60008088 masque 0x00000800
-après reset registre 0x6000808C masque 0x00400000
-après reset registre 0x60009004 masque 0x00000002
-après reset registre 0x60009008 masque 0x00000002
-après reset registre 0x6000900C masque 0x00000002
-après reset registre 0x60009010 masque 0x00000002
-après reset registre 0x60009014 masque 0x00000002
-après reset registre 0x60009018 masque 0x00000002
-après reset registre 0x6000901C masque 0x00000002
-après reset registre 0x60009020 masque 0x00000002
-après reset registre 0x60009024 masque 0x00000002
-après reset registre 0x60009028 masque 0x00000002
-après reset registre 0x6000902C masque 0x00000002
-après reset registre 0x60009030 masque 0x00000002
-après reset registre 0x60009034 masque 0x00000002
-après reset registre 0x60009038 masque 0x00000002
-après reset registre 0x60009040 masque 0x00000002
-après reset registre 0x60009044 masque 0x00000002
-après reset registre 0x60009048 masque 0x00000002
-après reset registre 0x6000904C masque 0x00000002
-après reset registre 0x60009050 masque 0x00000002
-après reset registre 0x6001F048 masque 0x383B0000
-après reset registre 0x6001F04C masque 0x4E200000
-après reset registre 0x6001F068 masque 0x04013000
-après reset registre 0x6002004C masque 0x4E200000
-après reset registre 0x60040018 masque 0x00630000
-après reset registre 0x600C0008 masque 0x00000001
-après reset registre 0x600C0024 masque 0x01000000
-après reset registre 0x600C4078 masque 0x00000023
-après reset registre 0x600C4084 masque 0x0000003F
-après reset registre 0x600CE008 masque 0x00000300
-après reset registre 0x600CE048 masque 0x40048B92
+après reset registre 0x60000014 masque 0x003003ED inkemu 0x000002A4
+après reset registre 0x60000078 masque 0x00001000 inkemu 0x00001000
+après reset registre 0x60002010 masque 0x000003E0 inkemu 0x00000000
+après reset registre 0x60002028 masque 0x00000017 inkemu 0x00000000
+après reset registre 0x60004154 masque 0x00000030 qemu 0x00000000
+après reset registre 0x60004158 masque 0x00000030 qemu 0x00000000
+après reset registre 0x60008024 masque 0x00010000 qemu 0x00000000
+après reset registre 0x60008028 masque 0x00010000 qemu 0x00000000
+après reset registre 0x6000802C masque 0x00000200 qemu 0x00000000
+après reset registre 0x60008030 masque 0x00010000 qemu 0x00000000
+après reset registre 0x60008080 masque 0x10000000 qemu 0x00000000
+après reset registre 0x60008088 masque 0x00000800 qemu 0x00000000
+après reset registre 0x6000808C masque 0x00400000 qemu 0x00000000
+après reset registre 0x60009004 masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009008 masque 0x00000002 qemu 0x00000000
+après reset registre 0x6000900C masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009010 masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009014 masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009018 masque 0x00000002 qemu 0x00000000
+après reset registre 0x6000901C masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009020 masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009024 masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009028 masque 0x00000002 qemu 0x00000000
+après reset registre 0x6000902C masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009030 masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009034 masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009038 masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009040 masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009044 masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009048 masque 0x00000002 qemu 0x00000000
+après reset registre 0x6000904C masque 0x00000002 qemu 0x00000000
+après reset registre 0x60009050 masque 0x00000002 qemu 0x00000000
+après reset registre 0x6001F048 masque 0x383B0000 inkemu 0x00000000 qemu 0x00000000
+après reset registre 0x6001F04C masque 0x4E200000 inkemu 0x00000000
+après reset registre 0x6001F068 masque 0x04013000 inkemu 0x00013000
+après reset registre 0x6002004C masque 0x4E200000 inkemu 0x00000000
+après reset registre 0x60040018 masque 0x00630000 qemu 0x00000000
+après reset registre 0x600C0008 masque 0x00000001 qemu 0x00000000
+après reset registre 0x600C0024 masque 0x01000000 qemu 0x00000000
+après reset registre 0x600C4078 masque 0x00000023 qemu 0x00000000
+après reset registre 0x600C4084 masque 0x0000003F qemu 0x00000000
+après reset registre 0x600CE008 masque 0x00000300 qemu 0x00000000
+après reset registre 0x600CE048 masque 0x40048B92 qemu 0x00000000
 ```
 
 ### Ligne 28 — `flash_hello.bin` : SPI1 après le reset
@@ -993,13 +1014,14 @@ SPI0/1. Le reset de QEMU, lui, ne remet que des champs : `esp32c3_spi_reset_hold
 première vie avait rangés : la commande et les phases de la dernière opération sur la flash. Ils ne
 sont pas les mêmes dans `hello` et dans `nvs` (ligne 32), qui n'ont pas fini sur la même commande ;
 `CTRL2` et `MISO_DLEN` sont à la ligne 27. La copie vaut jusqu'au premier rangement, ou de nouveau
-après une impulsion de SPI0/1, qu'inkemu fait et que QEMU ignore.
+après une impulsion de SPI0/1, qu'inkemu fait et que QEMU ignore, et seulement si inkemu montre sa
+valeur de reset dans le masque (0) : `esp_restart` a pulsé SPI0/1 avant le reset.
 
 Paramètres :
 
 ```text
-après reset registre 0x60002018 masque 0x00000080
-après reset registre 0x60002020 masque 0x0000009F
+après reset registre 0x60002018 masque 0x00000080 inkemu 0x00000000
+après reset registre 0x60002020 masque 0x0000009F inkemu 0x00000000
 ```
 
 ### Ligne 29 — `flash_nvs.bin` : SPI1
@@ -1080,8 +1102,8 @@ première vie (`USER2` bas, `0x05`, `RDSR`) et un bit de phase de `USER` (bit 28
 Paramètres :
 
 ```text
-après reset registre 0x60002018 masque 0x10000080
-après reset registre 0x60002020 masque 0x00000005
+après reset registre 0x60002018 masque 0x10000080 inkemu 0x00000000
+après reset registre 0x60002020 masque 0x00000005 inkemu 0x00000000
 ```
 
 ### Ligne 33 — `flash_nvs_ota.bin` : `SPI1.RD_STATUS`
