@@ -226,8 +226,10 @@ impl UsbSerialJtag {
     /// only (report `docs/research/spi1-fsm-and-usj-reset.md`, §B: undecidable without a chip).
     /// If silicon keeps the block across `SW_SYS_RST`, this is too aggressive. A capture of
     /// USB-Serial-JTAG across a panic of a 4.4 image on a board settles it, or an image that
-    /// writes `abc` to `EP1` without `WR_DONE`, sets `RTC_CNTL_SW_SYS_RST` and reads the host
-    /// side after the ROM's banner: `abc` there means the block survives a core reset.
+    /// writes `abc` to `EP1` without `WR_DONE`, sets `RTC_CNTL_SW_SYS_RST` and reads what the host
+    /// received: `abc` immediately before `ESP-ROM:` means the block survives a core reset (the
+    /// held bytes leave with the banner, committed by its first `\n`, §B.2 and §B.3); the banner
+    /// alone means it was reset.
     pub(crate) fn reset(&mut self, ctx: &mut Ctx) {
         self.settle(ctx);
         self.stored = UsbSerialJtag::new(self.host).stored;
