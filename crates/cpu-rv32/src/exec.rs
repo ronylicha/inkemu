@@ -221,6 +221,11 @@ impl Hart {
             tval: d.raw,
         };
         let operand = if uimm { u32::from(src) } else { self.r(src) };
+        // `csrrw` to x0 only writes (the specification: "shall not read the CSR"); every other
+        // form reads.
+        if op != CsrOp::Rw || rd != 0 {
+            self.csr.note_read(csr);
+        }
         let old = self
             .csr
             .read(csr, self.cycles, self.instret)
