@@ -334,6 +334,14 @@ impl Systimer {
         self.evaluate(ctx);
     }
 
+    /// ASSUMPTION: a store to `CONF` takes effect at the device time the store starts
+    /// (`ctx.now()` is read during the instruction, and time moves only after it): a counter it
+    /// starts, and a periodic alarm it enables, are anchored there. On the chip the store crosses
+    /// the APB and the 16 MHz clock domain of the timer, which can only delay it. Under
+    /// `qemu-icount` the first `FreeRTOS` tick of an application whose tick falls while the CPU
+    /// runs comes two instructions earlier than QEMU's (SP1b-4d hand-over note); an anchor at the
+    /// end of the store explains one of the two, the cause of the other is not established. A
+    /// chip measurement of the first tick's latency after enabling the comparator settles it.
     fn write_conf(&mut self, ctx: &mut Ctx, value: u32) {
         let now = ctx.now();
         let previous = self.conf;
