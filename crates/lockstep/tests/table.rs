@@ -219,8 +219,11 @@ fn every_row_of_the_documentation_declares_the_parameters_of_the_tool() {
     );
 }
 
-/// The rows of the section « Les fenêtres »: name, firmware, resets, bound, row numbers.
-fn windows(text: &str) -> Vec<(String, String, u32, Option<u64>, Vec<u16>)> {
+/// A window as the documentation and the test compare it: name, firmware, resets, bound, rows.
+type WindowLine = (String, String, u32, Option<u64>, Vec<u16>);
+
+/// The rows of the section « Les fenêtres ».
+fn windows(text: &str) -> Vec<WindowLine> {
     let section = text
         .split("## Les fenêtres")
         .nth(1)
@@ -255,7 +258,7 @@ fn windows(text: &str) -> Vec<(String, String, u32, Option<u64>, Vec<u16>)> {
 
 #[test]
 fn the_windows_of_the_documentation_are_the_windows_of_the_tool() {
-    let tool: Vec<(String, String, u32, Option<u64>, Vec<u16>)> = lockstep::WINDOWS
+    let tool: Vec<WindowLine> = lockstep::WINDOWS
         .iter()
         .map(|window| {
             (

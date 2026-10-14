@@ -118,8 +118,8 @@ struct Cli {
     #[arg(long)]
     max_instructions: Option<u64>,
     /// The window: which rows of docs/lockstep-differences.md hold, how many resets of both
-    /// sides the comparison goes on through, and its bound (hello, the first one, compares
-    /// flash_hello.bin).
+    /// sides the comparison goes on through, and its bound (`hello`, the first one, compares
+    /// `flash_hello.bin`).
     #[arg(long, value_parser = window_name)]
     window: &'static lockstep::Window,
     /// Fail (exit 3) unless exactly this many instructions are compared.

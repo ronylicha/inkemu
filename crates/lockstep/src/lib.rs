@@ -4,7 +4,7 @@
 //! The crate reads QEMU's trace from any source ([`trace`]), drives a machine through its stepping
 //! API and compares ([`lockstep`]), holds the table and the peripherals QEMU instantiates
 //! ([`table`]), the windows that each compare one firmware under their own rows of it
-//! ([`window`]), records what each row did and checks it against the table ([`usage`]) and writes
+//! ([`mod@window`]), records what each row did and checks it against the table ([`usage`]) and writes
 //! the report of a divergence ([`report`]). It performs no host I/O: the development binary
 //! `inkemu-lockstep` starts QEMU and hands the trace over.
 
