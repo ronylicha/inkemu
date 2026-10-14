@@ -609,15 +609,26 @@ fn deep_sleep_line(sleep: &DeepSleep) -> String {
             "it waits for nothing: the firmware enabled no wake source".to_owned()
         }
         None => {
-            let gpio = if sleep.wake_sources & DeepSleep::GPIO != 0 {
-                " (GPIO, bit 2, belongs to sub-project 2)"
+            // The RTC timer is modelled: enabled as a source without its alarm, it wakes
+            // nothing, which is not the same as a source inkemu lacks.
+            let unmodelled = sleep.wake_sources & !DeepSleep::TIMER;
+            let waits = if unmodelled == 0 {
+                "it waits for nothing".to_owned()
+            } else {
+                let gpio = if unmodelled & DeepSleep::GPIO != 0 {
+                    " (GPIO, bit 2, belongs to sub-project 2)"
+                } else {
+                    ""
+                };
+                format!("it waits for a wake source inkemu does not model{gpio}")
+            };
+            let timer = if sleep.wake_sources & DeepSleep::TIMER != 0 {
+                "; the RTC timer is a wake source but its alarm is not enabled \
+                 (SLP_TIMER1.MAIN_TIMER_ALARM_EN)"
             } else {
                 ""
             };
-            format!(
-                "it waits for a wake source inkemu does not model{gpio}: WAKEUP_ENA {:#07x}",
-                sleep.wake_sources
-            )
+            format!("{waits}: WAKEUP_ENA {:#07x}{timer}", sleep.wake_sources)
         }
     };
     format!("inkemu: the device is in deep sleep since {since} us of device time; {waits}")
@@ -1432,6 +1443,15 @@ mod tests {
         assert_eq!(
             line(None, 0x40),
             "inkemu: the device is in deep sleep since 1500 us of device time; it waits for a wake source inkemu does not model: WAKEUP_ENA 0x00040"
+        );
+        // The timer enabled as a source, its alarm not: a modelled source that wakes nothing.
+        assert_eq!(
+            line(None, DeepSleep::TIMER),
+            "inkemu: the device is in deep sleep since 1500 us of device time; it waits for nothing: WAKEUP_ENA 0x00008; the RTC timer is a wake source but its alarm is not enabled (SLP_TIMER1.MAIN_TIMER_ALARM_EN)"
+        );
+        assert_eq!(
+            line(None, DeepSleep::TIMER | DeepSleep::GPIO),
+            "inkemu: the device is in deep sleep since 1500 us of device time; it waits for a wake source inkemu does not model (GPIO, bit 2, belongs to sub-project 2): WAKEUP_ENA 0x0000c; the RTC timer is a wake source but its alarm is not enabled (SLP_TIMER1.MAIN_TIMER_ALARM_EN)"
         );
     }
 
