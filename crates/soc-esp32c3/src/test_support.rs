@@ -526,8 +526,8 @@ pub struct Bounds {
 pub enum Driven {
     /// The caller's check accepted what the machine did.
     Done,
-    /// The machine stopped for this reason, which no further call changes: a strict stop, or a
-    /// CPU that waits for ever.
+    /// The machine stopped for this reason, which no further call changes: a strict stop, a
+    /// CPU that waits for ever, or a chip in a deep sleep nothing can end.
     Stopped(StopReason),
     /// The cycles or the device time of [`Bounds`] ran out first.
     OutOfBounds,
@@ -567,7 +567,9 @@ pub fn drive(
             | StopReason::TimeBudget
             | StopReason::Asleep
             | StopReason::ConsoleOutput => {}
-            StopReason::StrictMmio(_) | StopReason::Idle => return Driven::Stopped(stop),
+            StopReason::StrictMmio(_) | StopReason::Idle | StopReason::DeepSleep => {
+                return Driven::Stopped(stop);
+            }
         }
     }
 }

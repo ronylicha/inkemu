@@ -504,7 +504,9 @@ impl Peripherals {
             Event::Systimer => self.systimer.wake(ctx),
             Event::Timg(Group::Timg0) => self.timg0.wake(ctx),
             Event::Timg(Group::Timg1) => self.timg1.wake(ctx),
-            Event::RtcWatchdog => self.rtc_cntl.wake(ctx),
+            Event::RtcCntl => self.rtc_cntl.wake(ctx),
+            // The bus answers it (`settle_signals`): it holds the RTC memory the CRC is taken of.
+            Event::RtcMemoryCrc => {}
             Event::ClockChanged => {
                 self.timg0.clock_changed(ctx);
                 self.timg1.clock_changed(ctx);
@@ -550,6 +552,17 @@ impl Peripherals {
     ///   analog registers behind regi2c and the console bytes that already left are no digital
     ///   register: they stay.
     /// - A system reset also returns `RTC_CNTL` to its reset values and clears the recorded PC.
+    /// - The wake from deep sleep is a core reset that clears the recorded PC too.
+    ///
+    /// ASSUMPTION: a deep sleep powers the debug assistant down with the rest of the digital
+    /// domain (TRM §9.4.1, table 9.4-1: only the RTC domain stays on), so the PC it recorded is
+    /// lost and the ROM prints no `Saved PC:` after `rst:0x5` (report DS §A.3.2, open question 3).
+    /// A real chip's boot log after a wake from deep sleep settles it.
+    ///
+    /// ASSUMPTION: internal SRAM keeps its bytes through a deep sleep, where the powered-down chip
+    /// loses them (DS §A.3.1, open question 6). The bootloader and ESP-IDF load or clear everything
+    /// they use, so a firmware that relies on SRAM across a deep sleep is the only one to see the
+    /// difference. A `.noinit` SRAM word read after a wake on a real chip settles what it holds.
     ///
     /// What the cache model keeps of the flash pages read through a window and written since
     /// follows `EXTMEM`: a CPU reset keeps it, a core reset empties it. The sources and the one
@@ -573,7 +586,7 @@ impl Peripherals {
         if level >= ResetLevel::Core {
             self.core_reset(ctx);
         }
-        if level == ResetLevel::System {
+        if level == ResetLevel::System || cause == ResetCause::DeepSleep {
             self.assist_debug.system_reset();
         }
         // Last: it drives the RTC interrupt source again, after a core reset cleared them all.

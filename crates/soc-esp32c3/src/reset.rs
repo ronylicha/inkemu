@@ -53,6 +53,10 @@ pub enum ResetCause {
     RtcWatchdogSystem,
     /// Main watchdog 1, stage action 2: `TG1WDT_CPU_RST`.
     Mwdt1Cpu,
+    /// The chip woke from deep sleep: `DSLEEP` (`ROM3:boot_prepare`, the name table at
+    /// `0x3ff19da8`; report DS §A.3.2). The wake is a core reset: "the whole digital system except
+    /// RTC" (TRM table 6.1-1). The RTC timer is the only wake source the model raises (F2, F5).
+    DeepSleep,
     /// The super watchdog was not fed: `SUPER_WDT_RST`.
     SuperWatchdog,
 }
@@ -66,6 +70,7 @@ impl ResetCause {
     pub const fn code(self) -> u32 {
         match self {
             ResetCause::SoftwareSystem => 0x03,
+            ResetCause::DeepSleep => 0x05,
             ResetCause::Mwdt0Core => 0x07,
             ResetCause::Mwdt1Core => 0x08,
             ResetCause::RtcWatchdogCore => 0x09,
@@ -87,6 +92,7 @@ impl ResetCause {
             | ResetCause::RtcWatchdogCpu
             | ResetCause::Mwdt1Cpu => ResetLevel::Cpu,
             ResetCause::SoftwareSystem
+            | ResetCause::DeepSleep
             | ResetCause::Mwdt0Core
             | ResetCause::Mwdt1Core
             | ResetCause::RtcWatchdogCore => ResetLevel::Core,
@@ -104,6 +110,7 @@ impl ResetCause {
             | ResetCause::RtcWatchdogCpu
             | ResetCause::RtcWatchdogSystem => "the RTC watchdog",
             ResetCause::SuperWatchdog => "the super watchdog",
+            ResetCause::DeepSleep => "the RTC timer, waking the chip from deep sleep",
         }
     }
 }
@@ -126,6 +133,7 @@ mod tests {
         // TRM table 6.1-1, as tabulated in TW §D.3.
         for (cause, code, level) in [
             (ResetCause::SoftwareSystem, 0x03, ResetLevel::Core),
+            (ResetCause::DeepSleep, 0x05, ResetLevel::Core),
             (ResetCause::Mwdt0Core, 0x07, ResetLevel::Core),
             (ResetCause::Mwdt1Core, 0x08, ResetLevel::Core),
             (ResetCause::RtcWatchdogCore, 0x09, ResetLevel::Core),
@@ -154,6 +162,7 @@ mod tests {
             ResetCause::RtcWatchdogSystem,
             ResetCause::Mwdt1Cpu,
             ResetCause::SuperWatchdog,
+            ResetCause::DeepSleep,
         ]
         .iter()
         .map(ToString::to_string)
@@ -171,6 +180,7 @@ mod tests {
                 "the RTC watchdog, a system reset",
                 "main watchdog 1, a CPU reset",
                 "the super watchdog, a system reset",
+                "the RTC timer, waking the chip from deep sleep, a core reset",
             ]
         );
     }

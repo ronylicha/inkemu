@@ -11,6 +11,10 @@ use std::fmt;
 /// but no longer listed: a runaway program must not grow the log without bound.
 pub const MAX_DISTINCT_DIAGNOSTICS: usize = 4096;
 
+/// `WAKEUP_STATE.WAKEUP_ENA` bit 2, the GPIO wake (`RTC_GPIO_TRIG_EN`,
+/// `IDF:esp_hw_support/port/esp32c3/include/soc/rtc.h:664`; report DS §A.5).
+const GPIO_WAKE: u32 = 1 << 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Direction {
     Read,
@@ -63,6 +67,20 @@ pub enum Unsupported {
     ClockSource { sysclk_conf: u32, cpu_per_conf: u32 },
     /// `RTC_CNTL.CLK_CONF` selects a slow clock other than the RC oscillator, the only one modelled.
     SlowClock { clk_conf: u32 },
+    /// `RTC_CNTL.STATE0.SLEEP_EN` was set with `DIG_PWC.DG_WRAP_PD_EN` clear: a light sleep, which
+    /// the model refuses (F4). The request is rejected as the chip rejects one: `INT_RAW` bit 1.
+    LightSleep { dig_pwc: u32 },
+    /// The chip went into deep sleep with wake sources other than the RTC timer enabled in
+    /// `WAKEUP_STATE.WAKEUP_ENA` (F5): `wakeup_ena` is that field.
+    SleepWakeSource { wakeup_ena: u32 },
+    /// `RTC_CNTL.STATE0` written with `SW_CPU_INT`, `SLP_WAKEUP` or `SLP_REJECT` set
+    /// (`rtc_cntl_reg.h:229-261`): the RTC software interrupt and the software wake and reject of
+    /// a sleep are not modelled. `state0` is the value written.
+    SleepSignal { state0: u32 },
+    /// `RTC_CNTL.TIME_UPDATE` written with `TIMER_SYS_STALL`, `TIMER_XTL_OFF` or `TIMER_SYS_RST`
+    /// set (bits 27 to 29, `rtc_cntl_reg.h:187-204`): the captures of the RTC timer they ask for
+    /// are not modelled (F7). `time_update` is the value written.
+    RtcTimerTrigger { time_update: u32 },
     /// A byte written to a UART whose transmit FIFO was full.
     /// ASSUMPTION: the byte is dropped. No source says what the silicon does with such a write;
     /// writing 129 bytes or more without waiting on `TXFIFO_CNT` on a real chip and reading what
@@ -306,10 +324,11 @@ impl Unsupported {
                 f,
                 "the clock registers select a CPU clock inkemu cannot model (SYSCLK_CONF {sysclk_conf:#010x}, CPU_PER_CONF {cpu_per_conf:#010x}, pc {pc:#010x}), so emulated time keeps the previous frequency; select the crystal or the PLL at 80 or 160 MHz"
             ),
-            Unsupported::SlowClock { clk_conf } => write!(
-                f,
-                "RTC_CNTL.CLK_CONF selects an RTC slow clock inkemu does not model (value {clk_conf:#010x}, pc {pc:#010x}), so the RTC timer and the RTC watchdog keep counting the 136 kHz RC oscillator; select the RC oscillator (ANA_CLK_RTC_SEL = 0) or expect their durations to differ from the device"
-            ),
+            Unsupported::SlowClock { .. }
+            | Unsupported::LightSleep { .. }
+            | Unsupported::SleepWakeSource { .. }
+            | Unsupported::SleepSignal { .. }
+            | Unsupported::RtcTimerTrigger { .. } => self.describe_rtc(pc, f),
             Unsupported::UartOverflow { .. }
             | Unsupported::UartClock { .. }
             | Unsupported::UartReceiveClock { .. }
@@ -318,6 +337,42 @@ impl Unsupported {
             | Unsupported::UartEmptyRead { .. }
             | Unsupported::UsbEmptyRead
             | Unsupported::UsbInFull => self.describe_serial(pc, f),
+        }
+    }
+
+    /// The messages of the refusals of `RTC_CNTL`: its slow clock, the sleep of the chip and its
+    /// RTC timer, for [`Unsupported::describe`].
+    fn describe_rtc(self, pc: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unsupported::SlowClock { clk_conf } => write!(
+                f,
+                "RTC_CNTL.CLK_CONF selects an RTC slow clock inkemu does not model (value {clk_conf:#010x}, pc {pc:#010x}), so the RTC timer and the RTC watchdog keep counting the 136 kHz RC oscillator; select the RC oscillator (ANA_CLK_RTC_SEL = 0) or expect their durations to differ from the device"
+            ),
+            Unsupported::LightSleep { dig_pwc } => write!(
+                f,
+                "RTC_CNTL.STATE0.SLEEP_EN asks for a light sleep (DIG_PWC {dig_pwc:#010x} keeps the digital domain powered, pc {pc:#010x}), which inkemu does not model, so the request was rejected as the chip rejects one (INT_RAW.SLP_REJECT) and the firmware goes on; use deep sleep (esp_deep_sleep_start) or keep the CPU awake"
+            ),
+            Unsupported::SleepWakeSource { wakeup_ena } => {
+                let gpio = if wakeup_ena & GPIO_WAKE != 0 {
+                    "; the GPIO wake (bit 2) belongs to sub-project 2, which models the pins"
+                } else {
+                    ""
+                };
+                write!(
+                    f,
+                    "the chip went into deep sleep with wake sources inkemu does not model (WAKEUP_ENA {wakeup_ena:#07x}, pc {pc:#010x}){gpio}, so only the RTC timer (bit 3) can wake it; wake it with the RTC timer (esp_sleep_enable_timer_wakeup) or expect it to sleep for the rest of the run"
+                )
+            }
+            Unsupported::SleepSignal { state0 } => write!(
+                f,
+                "RTC_CNTL.STATE0 was written with SW_CPU_INT, SLP_WAKEUP or SLP_REJECT set (value {state0:#010x}, pc {pc:#010x}), signals inkemu does not model, so nothing was raised; leave bits 0, 29 and 30 clear"
+            ),
+            Unsupported::RtcTimerTrigger { time_update } => write!(
+                f,
+                "RTC_CNTL.TIME_UPDATE enables a capture of the RTC timer inkemu does not model (value {time_update:#010x}: TIMER_SYS_STALL, TIMER_XTL_OFF or TIMER_SYS_RST, pc {pc:#010x}), so TIME_LOW1/HIGH1 hold only the captures TIME_UPDATE bit 31 asks for; leave bits 27 to 29 clear"
+            ),
+            // INVARIANT: `describe` hands only the five refusals above to this function.
+            _ => Ok(()),
         }
     }
 
@@ -459,6 +514,12 @@ impl Diagnostic {
                     cpu_per_conf,
                 } => (8, sysclk_conf, cpu_per_conf),
                 Unsupported::SlowClock { .. } => (9, 0, 0),
+                // One line each for a run: the values vary with what the firmware leaves in the
+                // other bits, and the refusal is the same whatever they are.
+                Unsupported::LightSleep { .. } => (29, 0, 0),
+                Unsupported::SleepWakeSource { .. } => (30, 0, 0),
+                Unsupported::SleepSignal { .. } => (31, 0, 0),
+                Unsupported::RtcTimerTrigger { .. } => (32, 0, 0),
                 Unsupported::UartOverflow { uart } => (12, u32::from(uart), 0),
                 Unsupported::UartClock { uart, sclk_sel } => (13, u32::from(uart), sclk_sel),
                 Unsupported::UartReceiveClock { uart, sclk_sel } => (28, u32::from(uart), sclk_sel),
@@ -581,6 +642,17 @@ impl fmt::Display for Diagnostic {
             } => write!(
                 f,
                 "CPU exception: {cause} at pc {pc:#010x} (tval {tval:#010x}, sp {sp:#010x}); the firmware's trap handler takes it, as on the device"
+            ),
+            // The CPU had stopped at the write of `SLEEP_EN`: the PC is where it stood, not where a
+            // watchdog caught it (F2).
+            Diagnostic::Reset {
+                cause: ResetCause::DeepSleep,
+                pc,
+                sp,
+            } => write!(
+                f,
+                "woken from deep sleep by the RTC timer (rst:{code:#x}), a core reset; the CPU had stopped at pc {pc:#010x}, sp {sp:#010x}",
+                code = ResetCause::DeepSleep.code()
             ),
             // The code as the ROM prints it at the next boot (`rst:0x7`), so that the two lines
             // of one reset can be matched by eye.
@@ -913,6 +985,14 @@ mod tests {
             unsupported(Unsupported::SlowClock {
                 clk_conf: 0x4000_0000,
             }),
+            unsupported(Unsupported::LightSleep {
+                dig_pwc: 0x0055_5010,
+            }),
+            unsupported(Unsupported::SleepWakeSource { wakeup_ena: 0xC }),
+            unsupported(Unsupported::SleepSignal { state0: 1 }),
+            unsupported(Unsupported::RtcTimerTrigger {
+                time_update: 1 << 29,
+            }),
             unsupported(Unsupported::UartOverflow { uart: 0 }),
             unsupported(Unsupported::UartClock {
                 uart: 1,
@@ -1007,6 +1087,13 @@ mod tests {
                 0x10,
                 0,
                 "reset by the RTC watchdog, a system reset (rst:0x10) at pc 0x00000010, sp 0x00000000",
+            ),
+            // F2: the wake from deep sleep says where the CPU had stopped, not where it was caught.
+            (
+                ResetCause::DeepSleep,
+                0x4038_0f2c,
+                0x3FC9_8000,
+                "woken from deep sleep by the RTC timer (rst:0x5), a core reset; the CPU had stopped at pc 0x40380f2c, sp 0x3fc98000",
             ),
         ] {
             assert_eq!(reset_at(cause, pc, sp).to_string(), text);
@@ -1277,6 +1364,30 @@ mod tests {
                     clk_conf: 0x4000_0000,
                 }),
                 "RTC slow clock",
+            ),
+            (
+                unsupported(Unsupported::LightSleep {
+                    dig_pwc: 0x0055_5010,
+                }),
+                "asks for a light sleep (DIG_PWC 0x00555010 keeps the digital domain powered",
+            ),
+            (
+                unsupported(Unsupported::SleepWakeSource { wakeup_ena: 0xC }),
+                "(WAKEUP_ENA 0x0000c, pc 0x40381000); the GPIO wake (bit 2) belongs to sub-project 2",
+            ),
+            (
+                unsupported(Unsupported::SleepWakeSource { wakeup_ena: 0x48 }),
+                "(WAKEUP_ENA 0x00048, pc 0x40381000), so only the RTC timer (bit 3) can wake it",
+            ),
+            (
+                unsupported(Unsupported::SleepSignal { state0: 1 }),
+                "SW_CPU_INT, SLP_WAKEUP or SLP_REJECT set (value 0x00000001",
+            ),
+            (
+                unsupported(Unsupported::RtcTimerTrigger {
+                    time_update: 1 << 29,
+                }),
+                "capture of the RTC timer inkemu does not model (value 0x20000000",
             ),
             (
                 unsupported(Unsupported::UartClock {

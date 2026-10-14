@@ -192,7 +192,8 @@ Options:
 
 Exit codes:
   0  the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was
-     pressed, or the reader of standard output went away
+     pressed, the reader of standard output went away, or the device went into a deep sleep
+     nothing inkemu models can wake it from
   2  error: unknown device, missing or invalid ROM, refused flash image or flash file, standard
      output cannot be written, or the flash file could not be written when the run ended (what
      the firmware wrote to the flash is then lost)

@@ -131,6 +131,31 @@ pub enum StopReason {
     /// caller takes them with [`Esp32C3::take_console`] and calls again; bytes of a watched
     /// channel it leaves untaken end the next calls too ([`Esp32C3::watch_console`]).
     ConsoleOutput,
+    /// The chip is in deep sleep and nothing the model has can wake it: no wake source it can
+    /// raise is enabled (the RTC timer, with its alarm) and nothing else of the RTC domain is due
+    /// (F5). As with [`StopReason::Idle`], device time stands still from here on and is not moved
+    /// to a limit; [`Esp32C3::deep_sleep`] says since when and on which sources it waits.
+    DeepSleep,
+}
+
+/// A chip in deep sleep, as a front end shows it (F9): read with [`Esp32C3::deep_sleep`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeepSleep {
+    /// Device time of the entry, in nanoseconds since power-on: the write of `SLEEP_EN`.
+    pub since_nanos: u64,
+    /// Device time at which the RTC timer wakes the chip, when the timer is a wake source and
+    /// its alarm is enabled; `None` when nothing the model has can wake it.
+    pub timer_wake_nanos: Option<u64>,
+    /// `RTC_CNTL.WAKEUP_STATE.WAKEUP_ENA` at the entry: bit 3 the RTC timer, bit 2 GPIO, the
+    /// others sources the model does not raise either (`rtc.h:664-672`).
+    pub wake_sources: u32,
+}
+
+impl DeepSleep {
+    /// `WAKEUP_ENA` bit 3: the RTC timer.
+    pub const TIMER: u32 = 1 << 3;
+    /// `WAKEUP_ENA` bit 2: GPIO, a function of sub-project 2.
+    pub const GPIO: u32 = 1 << 2;
 }
 
 /// Device time one call to [`Esp32C3::run_within`] sleeps through, all its sleeps added, before
@@ -195,6 +220,8 @@ pub struct Esp32C3 {
     resets: u64,
     /// The channels [`Esp32C3::watch_console`] watches, by their place in [`ConsoleChannel::ALL`].
     watched: [bool; 3],
+    /// The chip is in deep sleep: the CPU executes nothing until a reset (F1).
+    powered_down: bool,
 }
 
 impl Esp32C3 {
@@ -251,6 +278,7 @@ impl Esp32C3 {
             selected: None,
             resets: 0,
             watched: [false; 3],
+            powered_down: false,
         }
     }
 
@@ -290,6 +318,27 @@ impl Esp32C3 {
         while self.hart.cycles.get() < cycles.get() {
             if deadline.is_some_and(|deadline| self.bus.ctx.now() >= deadline) {
                 return StopReason::TimeBudget;
+            }
+            if self.powered_down {
+                // Deep sleep: device time jumps to the next call of the RTC domain, the one part
+                // of the chip with power, without an instruction (F1).
+                let duration = match self.sleep_deeply(deadline) {
+                    Sleep::Until(duration) => duration,
+                    Sleep::NothingDue => return StopReason::DeepSleep,
+                    Sleep::CutAtDeadline => return StopReason::TimeBudget,
+                };
+                slept = slept.saturating_add(duration);
+                sleeps += 1;
+                if let Some(violation) = self.bus.ctx.diag.take_violation() {
+                    return StopReason::StrictMmio(violation);
+                }
+                if self.watched_output() {
+                    return StopReason::ConsoleOutput;
+                }
+                if slept >= SLEEP_SLICE || sleeps >= MAX_FRUITLESS_WAKES {
+                    return StopReason::Asleep;
+                }
+                continue;
             }
             let pc = self.hart.pc;
             self.bus.set_pc(pc);
@@ -396,6 +445,10 @@ impl Esp32C3 {
         if let Some(cause) = self.bus.ctx.take_reset() {
             self.reset(cause);
         }
+        // After the reset: a reset asked for by the same instruction ends the sleep at once.
+        if self.bus.ctx.take_deep_sleep_entered() {
+            self.powered_down = self.bus.periph.rtc_cntl.is_in_deep_sleep();
+        }
         if self.bus.ctx.take_clock_written() {
             self.retune(pc);
         }
@@ -458,6 +511,38 @@ impl Esp32C3 {
         Sleep::Until(target.get() - now.get())
     }
 
+    /// One step of a deep sleep: device time moves to the next call of `RTC_CNTL`, which is
+    /// called alone, or to `deadline` when that call comes after it. Nothing is due when the block
+    /// asked for no call: nothing the model has can wake the chip (F5).
+    ///
+    /// The digital devices have no power while the chip sleeps (TRM §9.4.1, table 9.4-1), so none
+    /// of them is called: a main watchdog left running does not reset a chip that sleeps, and a
+    /// timer does not fire. Their wake-ups that fall due meanwhile stay in the scheduler and are
+    /// delivered after the core reset of the wake, to devices that reset rebuilt, which find
+    /// nothing to do (the contract of [`Event`]). A reset `RTC_CNTL` asks for (the wake, or its
+    /// watchdog when it is left running in sleep) ends the sleep; anything else it raises (an
+    /// interrupt) waits, with the CPU, for a reset.
+    fn sleep_deeply(&mut self, deadline: Option<Cycles>) -> Sleep {
+        let now = self.bus.ctx.now();
+        let Some(call) = self.bus.periph.rtc_cntl.next_call() else {
+            return Sleep::NothingDue;
+        };
+        let target = call.max(now);
+        if let Some(deadline) = deadline.filter(|deadline| target > *deadline) {
+            self.bus.ctx.sleep_until(deadline);
+            return Sleep::CutAtDeadline;
+        }
+        self.bus.ctx.sleep_until(target);
+        self.bus.wake_rtc_domain();
+        if let Some(cause) = self.bus.ctx.take_reset() {
+            let pc = self.hart.pc;
+            self.reset(cause);
+            // Awake: the clock of the reset, the interrupt lines, the stale wake-ups.
+            self.service(pc);
+        }
+        Sleep::Until(target.get() - now.get())
+    }
+
     /// Applies a reset (TRM §6.1): the peripherals of its level return to their reset state, the
     /// CPU restarts in the ROM. The memories keep their content and device time goes on.
     ///
@@ -484,6 +569,8 @@ impl Esp32C3 {
         self.selected = None;
         self.bus.ctx.interrupts_changed();
         self.resets += 1;
+        // Every reset ends a deep sleep: `RTC_CNTL` ended it with the reset.
+        self.powered_down = false;
     }
 
     /// Applies a write to the clock registers: from the end of the instruction that wrote them,
@@ -550,6 +637,23 @@ impl Esp32C3 {
     #[must_use]
     pub const fn is_asleep(&self) -> bool {
         self.hart.is_waiting()
+    }
+
+    /// The deep sleep the chip is in, if any (F9): since when, until when the RTC timer lets it
+    /// sleep, and the wake sources the firmware enabled. A front end shows it; the wake comes as
+    /// a reset of cause 5 in the diagnostics ([`Diagnostic::Reset`]).
+    #[must_use]
+    pub fn deep_sleep(&self) -> Option<DeepSleep> {
+        let nanos = |instant: Cycles| clock::TIME_BASE.cycles_to_nanos(instant);
+        self.bus
+            .periph
+            .rtc_cntl
+            .deep_sleep(self.bus.ctx.now())
+            .map(|state| DeepSleep {
+                since_nanos: nanos(state.since),
+                timer_wake_nanos: state.timer_wake.map(nanos),
+                wake_sources: state.wake_sources,
+            })
     }
 
     /// The bytes that left the device on `channel` since the last call: a UART byte counts once
@@ -832,7 +936,7 @@ mod tests {
         HANG, T0, T1, flash_erase_sector, flash_program, flat_rom, load_register,
         print_program as print, stop_watchdogs, store_register, unmodeled_register, within,
     };
-    use cpu_rv32::asm::{addi, beq, bne, csrrs, csrrwi, jal, lbu, lui, lw, sw, wfi};
+    use cpu_rv32::asm::{add, addi, beq, bne, csrrs, csrrwi, jal, lbu, lui, lw, sw, wfi};
     use cpu_rv32::csr_esp32c3::{PCCR_USER, PCER_USER, PCMR_USER};
     use emu_core::{AccessKind, AccessSize, Bus};
 
@@ -1660,6 +1764,266 @@ mod tests {
                 "slice {slice}, watched {watched}"
             );
         }
+    }
+
+    fn rtc_cntl(name: &str) -> u32 {
+        svd_regs::esp32c3::addr("RTC_CNTL", name)
+    }
+    /// `WAKEUP_STATE` with the RTC timer as the only wake source (`WAKEUP_ENA` bit 3).
+    const TIMER_WAKE_STATE: u32 = (1 << 3) << 15;
+    const T2: u8 = 7;
+    const T3: u8 = 28;
+
+    /// Code that sets the alarm of the RTC timer `counts` slow-clock counts after a capture of
+    /// the timer (what `timer_wakeup_prepare` does: DS §A.1.4), then `DIG_PWC.DG_WRAP_PD_EN` and
+    /// `SLEEP_EN` (`rtc_deep_sleep_start` without its CRC: DS §A.1.5). `wake_state` goes to
+    /// `WAKEUP_STATE` in between. `counts` is a multiple of 0x1000 below 2^31 (one `lui`).
+    fn sleep_on_the_rtc_timer(counts: u32, wake_state: u32) -> Vec<u32> {
+        let mut program = store_register(rtc_cntl("TIME_UPDATE"), 1 << 31).to_vec();
+        // T0 holds the page of the RTC_CNTL registers, T1 the low word of the capture.
+        program.extend(load_register(rtc_cntl("TIME_LOW0")));
+        program.extend([lui(T3, counts), add(T1, T1, T3)]);
+        let slp_timer0 = rtc_cntl("SLP_TIMER0") - rtc_cntl("OPTIONS0");
+        program.push(sw(T1, T0, slp_timer0.cast_signed()));
+        program.extend(store_register(rtc_cntl("SLP_TIMER1"), 1 << 16));
+        program.extend(store_register(rtc_cntl("WAKEUP_STATE"), wake_state));
+        program.extend(store_register(rtc_cntl("DIG_PWC"), 1 << 31));
+        program.extend(store_register(rtc_cntl("STATE0"), 1 << 31));
+        program.push(HANG);
+        program
+    }
+
+    /// A firmware of four lives: each counts itself in `STORE0` (in the RTC domain), prints the
+    /// count on UART0 and waits for the byte to leave; lives 1 to 3 sleep 0x2000 slow-clock counts
+    /// (60 ms) on the RTC timer, life 4 sleeps with no wake source.
+    fn four_lives() -> Vec<u32> {
+        let store0 = rtc_cntl("STORE0");
+        let mut program = stop_watchdogs();
+        program.extend(load_register(store0));
+        program.extend([
+            addi(T2, T1, 1),
+            sw(T2, T0, (store0 - rtc_cntl("OPTIONS0")).cast_signed()),
+            lui(T3, UART0),
+            addi(T1, T2, i32::from(b'0')),
+            sw(T1, T3, 0),
+            // 8 192 turns, more than the 347 us a byte takes at the reset clock: the byte has
+            // left before the chip sleeps, as `flush_uarts` sees to.
+            lui(T1, 0x2000),
+            addi(T1, T1, -1),
+            bne(T1, 0, -4),
+        ]);
+        // Life 4 skips over the timer to a sleep without a source.
+        let timed = sleep_on_the_rtc_timer(0x2000, TIMER_WAKE_STATE);
+        let skip = i32::try_from(4 * (timed.len() + 1)).unwrap();
+        program.extend([addi(T1, 0, 4), beq(T2, T1, skip)]);
+        program.extend(timed);
+        program.extend(store_register(rtc_cntl("WAKEUP_STATE"), 0));
+        program.extend(store_register(rtc_cntl("DIG_PWC"), 1 << 31));
+        program.extend(store_register(rtc_cntl("STATE0"), 1 << 31));
+        program.push(HANG);
+        program
+    }
+
+    type DeepSleepRun = (Vec<u8>, Option<u64>, Cycles, Cycles, u64);
+
+    /// [`four_lives`] in calls of `slice` cycles, to its sleep without end.
+    fn deep_sleep_run(slice: u64) -> DeepSleepRun {
+        let config = SocConfig {
+            trace_hash: true,
+            ..SocConfig::default()
+        };
+        let mut m = machine_with(&four_lives(), config);
+        let mut uart0 = Vec::new();
+        loop {
+            let stop = m.run_within(m.cycles() + slice, Some(1_000_000_000));
+            uart0.extend(m.take_console(ConsoleChannel::Uart0));
+            match stop {
+                StopReason::DeepSleep => break,
+                StopReason::CycleBudget | StopReason::Asleep | StopReason::ConsoleOutput => {}
+                other => panic!("slice {slice}: {other:?}"),
+            }
+        }
+        (
+            uart0,
+            m.trace_hash(),
+            m.device_time(),
+            m.cycles(),
+            m.resets(),
+        )
+    }
+
+    #[test]
+    fn a_deep_sleep_run_is_the_same_whatever_its_calls() {
+        // F10: the instant of each wake is that of the RTC timer reaching its target, whatever
+        // the calls the run is cut into.
+        let whole = deep_sleep_run(u64::MAX);
+        assert_eq!(whole.0, b"1234");
+        assert_eq!(whole.4, 3, "three wakes");
+        assert!(whole.1.is_some());
+        // Three sleeps of 0x2000 counts, 60.2 ms each, and a few instructions per life.
+        let three_sleeps = Cycles(3 * 8_192 * 20_000 / 17);
+        assert!(whole.2 > three_sleeps, "{:?}", whole.2);
+        assert!(whole.2.get() < three_sleeps.get() + clock::SECOND / 100);
+        for slice in [1, 7, 997, 7_919] {
+            assert_eq!(deep_sleep_run(slice), whole, "slice {slice}");
+        }
+    }
+
+    #[test]
+    fn each_wake_is_a_core_reset_of_cause_5_that_keeps_the_rtc_domain() {
+        let mut m = machine(&four_lives());
+        while m.run_within(Cycles(u64::MAX), Some(1_000_000_000)) != StopReason::DeepSleep {}
+        assert_eq!(m.resets(), 3);
+        let diagnostics = m.drain_diagnostics();
+        let wakes: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::Reset { .. }))
+            .collect();
+        assert!(
+            wakes.iter().all(|d| matches!(
+                d,
+                Diagnostic::Reset {
+                    cause: ResetCause::DeepSleep,
+                    ..
+                }
+            )),
+            "{wakes:?}"
+        );
+        assert_eq!(
+            bus_word(&mut m, rtc_cntl("STORE0")),
+            4,
+            "the count survived"
+        );
+        assert_eq!(bus_word(&mut m, rtc_cntl("RESET_STATE")) & 0x3F, 5);
+        assert_eq!(bus_word(&mut m, rtc_cntl("SLP_WAKEUP_CAUSE")), 1 << 3);
+    }
+
+    #[test]
+    fn a_deep_sleep_nothing_can_end_stops_the_run_and_says_so() {
+        let mut m = machine(&four_lives());
+        let mut stop = StopReason::CycleBudget;
+        for _ in 0..10 {
+            stop = m.run_within(Cycles(u64::MAX), Some(1_000_000_000));
+            if stop == StopReason::DeepSleep {
+                break;
+            }
+        }
+        assert_eq!(stop, StopReason::DeepSleep);
+        let state = m.deep_sleep().unwrap();
+        assert_eq!((state.timer_wake_nanos, state.wake_sources), (None, 0));
+        let now = m.device_time_nanos();
+        assert_eq!(
+            m.run_within(Cycles(u64::MAX), Some(1_000_000_000)),
+            StopReason::DeepSleep,
+            "again, without moving"
+        );
+        assert_eq!(
+            m.device_time_nanos(),
+            now,
+            "device time is not moved to the limit"
+        );
+        assert!(state.since_nanos <= now);
+    }
+
+    #[test]
+    fn a_deep_sleep_cut_by_the_time_limit_is_still_asleep_and_says_when_it_wakes() {
+        let mut m = machine(&four_lives());
+        assert_eq!(
+            m.run_within(Cycles(u64::MAX), Some(30_000_000)),
+            StopReason::TimeBudget
+        );
+        assert_eq!(m.device_time_nanos(), 30_000_000);
+        let state = m.deep_sleep().unwrap();
+        assert_eq!(state.wake_sources, DeepSleep::TIMER);
+        let wake = state.timer_wake_nanos.unwrap();
+        // 0x2000 counts (60.2 ms) after the capture, which life 1 takes after its 1.6 ms loop.
+        assert!((61_000_000..63_000_000).contains(&wake), "{wake}");
+        assert!(!m.is_asleep(), "no `wfi`: the CPU is off, not waiting");
+        assert_eq!(m.resets(), 0);
+        // The next call wakes it at that instant; life 2 prints and sleeps within 2 ms.
+        let _ = m.run_within(Cycles(u64::MAX), Some(wake + 2_000_000));
+        assert_eq!(m.resets(), 1);
+        assert_eq!(m.take_console(ConsoleChannel::Uart0), b"12");
+    }
+
+    #[test]
+    fn a_running_main_watchdog_does_not_reset_a_chip_in_deep_sleep() {
+        // The flash-boot protection of main watchdog 0 runs from every reset and is left on: the
+        // digital domain has no power in deep sleep, so the only resets are the wakes. 272 000
+        // counts are 2 s: 0x42000 + 0x680.
+        let mut program = store_register(rtc_cntl("WDTCONFIG0"), 0).to_vec();
+        let mut timed = sleep_on_the_rtc_timer(0x42000, TIMER_WAKE_STATE);
+        // `lui` then `add`: the 0x680 goes in as one more `addi` after the `add`.
+        timed.insert(8, addi(T1, T1, 0x680));
+        program.extend(timed);
+        let mut m = machine(&program);
+        let mut stop = StopReason::CycleBudget;
+        while m.device_time_nanos() < 5_000_000_000 && stop != StopReason::TimeBudget {
+            stop = m.run_within(Cycles(u64::MAX), Some(5_000_000_000));
+        }
+        assert_eq!(m.resets(), 2, "woken at 2 s and 4 s");
+        assert!(
+            m.drain_diagnostics().iter().all(|d| !matches!(
+                d,
+                Diagnostic::Reset { cause, .. } if *cause != ResetCause::DeepSleep
+            )),
+            "no watchdog reset"
+        );
+    }
+
+    #[test]
+    fn light_sleep_stops_a_strict_run() {
+        // F4: `SLEEP_EN` with the digital domain kept powered (the reset value of DIG_PWC).
+        let mut program = store_register(rtc_cntl("STATE0"), 1 << 31).to_vec();
+        program.push(HANG);
+        let config = SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        };
+        let mut m = machine_with(&program, config);
+        assert!(matches!(
+            m.run_until(Cycles(10_000)),
+            StopReason::StrictMmio(Diagnostic::Unsupported {
+                what: Unsupported::LightSleep { .. },
+                ..
+            })
+        ));
+        assert_eq!(m.deep_sleep(), None);
+        assert_eq!(
+            bus_word(&mut m, rtc_cntl("INT_RAW_RTC")),
+            1 << 1,
+            "rejected"
+        );
+    }
+
+    #[test]
+    fn the_rtc_memory_crc_unit_answers_at_once_over_the_words_asked() {
+        // F3, through the bus: the unit reads the RTC fast memory, which only the bus holds.
+        let config_register = svd_regs::esp32c3::addr("SYSTEM", "RTC_FASTMEM_CONFIG");
+        let result = svd_regs::esp32c3::addr("SYSTEM", "RTC_FASTMEM_CRC");
+        let mut m = machine(&[HANG]);
+        for (i, word) in [0x3433_3231u32, 0x3837_3635, 0x0000_0039]
+            .into_iter()
+            .enumerate()
+        {
+            let at = crate::memmap::RTC_RAM_BASE + 4 * u32::try_from(i).unwrap();
+            m.bus.write(at, AccessSize::Word, word).unwrap();
+        }
+        // ADDR 0, LEN 1: the two words "12345678".
+        m.bus
+            .write(config_register, AccessSize::Word, 1 << 20)
+            .unwrap();
+        m.bus
+            .write(config_register, AccessSize::Word, 1 << 20 | 1 << 8)
+            .unwrap();
+        assert_eq!(
+            bus_word(&mut m, config_register),
+            1 << 31 | 1 << 20 | 1 << 8,
+            "FINISH at once"
+        );
+        // CRC-32/ISO-HDLC of "12345678".
+        assert_eq!(bus_word(&mut m, result), 0x9AE0_DAAF);
+        assert!(m.drain_diagnostics().is_empty());
     }
 
     #[test]

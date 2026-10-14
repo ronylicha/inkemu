@@ -159,6 +159,26 @@ const SYSCLK_RESET: u32 = 1;
 const XTAL_FREQ_SHIFT: u32 = 12;
 const XTAL_FREQ_MHZ: u32 = crate::clock::XTAL_MHZ;
 
+/// The CRC unit of the RTC fast memory (F3): `RTC_FASTMEM_CONFIG` bit 31 `RTC_MEM_CRC_FINISH`
+/// (read-only), bits [30:20] `RTC_MEM_CRC_LEN`, bits [19:9] `RTC_MEM_CRC_ADDR`, bit 8
+/// `RTC_MEM_CRC_START`; `RTC_FASTMEM_CRC` holds the result (`system_reg.h:734-766`). ESP-IDF's
+/// `rtc_deep_sleep_start` writes `LEN` = 0x7FF and `ADDR` = 0, sets `START`, waits for `FINISH`,
+/// clears `START` and keeps the result in `RTC_CNTL.STORE7`; the ROM does the same at the wake to
+/// check the memory before it calls the wake stub (`ROM3:cacl_rtc_memory_crc@0x40048ab2`; report
+/// DS §A.1.5, §A.3.2).
+const RTC_FASTMEM_CONFIG: u32 =
+    svd_regs::esp32c3::addr("SYSTEM", "RTC_FASTMEM_CONFIG") - SYSTEM_BASE;
+const RTC_FASTMEM_CRC: u32 = svd_regs::esp32c3::addr("SYSTEM", "RTC_FASTMEM_CRC") - SYSTEM_BASE;
+const CRC_FINISH: u32 = 1 << 31;
+const CRC_LEN_SHIFT: u32 = 20;
+const CRC_ADDR_SHIFT: u32 = 9;
+const CRC_FIELD_MASK: u32 = 0x7FF;
+const CRC_START: u32 = 1 << 8;
+const CRC_CONFIG_STORED: u32 = 0x7FFF_FF00;
+/// The RTC fast memory holds this many 32-bit words (8 KiB, TRM §9.6): the range of a CRC never
+/// goes past it, whatever `ADDR` and `LEN` say.
+const RTC_MEMORY_WORDS: usize = crate::memmap::RTC_RAM_SIZE as usize / 4;
+
 #[derive(Clone, Debug)]
 pub struct System {
     sysclk_writable: u32,
@@ -167,6 +187,12 @@ pub struct System {
     resets: [u32; 2],
     /// `CPU_INTR_FROM_CPU_0..3`.
     software_interrupts: [u32; SOFTWARE_INTERRUPTS],
+    /// `RTC_FASTMEM_CONFIG` without its `FINISH` bit.
+    crc_config: u32,
+    /// Whether the CRC asked for by the last `START` is done.
+    crc_finished: bool,
+    /// `RTC_FASTMEM_CRC`.
+    crc_result: u32,
 }
 
 impl System {
@@ -177,7 +203,34 @@ impl System {
             registers: Storage::accepted(SYSTEM_BASE, &ACCEPTED),
             resets: [reset_value(PERIP_RST_EN0), reset_value(PERIP_RST_EN1)],
             software_interrupts: [0; SOFTWARE_INTERRUPTS],
+            crc_config: reset_value(RTC_FASTMEM_CONFIG) & CRC_CONFIG_STORED,
+            crc_finished: false,
+            crc_result: 0,
         }
+    }
+
+    /// The CRC unit computes the CRC `START` asked for, over `memory`, the RTC fast memory: the
+    /// bus calls it when the signal of the write that set `START` is delivered, so `FINISH` reads
+    /// 1 from the next instruction on.
+    ///
+    /// ASSUMPTION: the unit takes no time, counts `ADDR` and `LEN` in 32-bit words, covers the
+    /// words `ADDR` to `ADDR + LEN` (so the 0x7FF that ESP-IDF and the ROM write covers the 8 KiB),
+    /// and computes CRC-32/ISO-HDLC (the reflected polynomial 0xEDB88320, initial value and final
+    /// XOR 0xFFFFFFFF) over their bytes in memory order. No source gives the polynomial, the unit
+    /// of the fields or the duration (DS §A, open question 1); the ROM and ESP-IDF compare a result
+    /// of the unit with another result of the unit, so any function of the same bytes keeps the
+    /// wake-stub check of the ROM right (F3). Writing a known pattern to the RTC fast memory of a
+    /// real chip, running the unit over a few words and comparing `RTC_FASTMEM_CRC` with the
+    /// candidates settles it.
+    pub(crate) fn finish_rtc_memory_crc(&mut self, memory: &[u8]) {
+        let field = |shift: u32| (self.crc_config >> shift) & CRC_FIELD_MASK;
+        // Each field is 11 bits: the arithmetic stays far inside `usize`, and the range is
+        // clamped to the memory, so a firmware cannot make the unit read past it.
+        let first = (field(CRC_ADDR_SHIFT) as usize).min(RTC_MEMORY_WORDS);
+        let end = (first + field(CRC_LEN_SHIFT) as usize + 1).min(RTC_MEMORY_WORDS);
+        let bytes = memory.get(4 * first..4 * end).unwrap_or_default();
+        self.crc_result = crc32_iso_hdlc(bytes);
+        self.crc_finished = true;
     }
 
     /// `SYSCLK_CONF` and `CPU_PER_CONF` as software reads them: the inputs of [`crate::clock::cpu_frequency`].
@@ -194,6 +247,21 @@ impl System {
 
 fn reset_value(offset: u32) -> u32 {
     svd_regs::esp32c3::lookup(SYSTEM_BASE + offset).map_or(0, |r| r.reset_value)
+}
+
+/// CRC-32/ISO-HDLC, bit by bit: the CRC unit reads at most 8 KiB, twice per sleep, so a table
+/// would buy nothing.
+fn crc32_iso_hdlc(bytes: &[u8]) -> u32 {
+    const POLYNOMIAL: u32 = 0xEDB8_8320;
+    !bytes.iter().fold(u32::MAX, |crc, &byte| {
+        (0..8).fold(crc ^ u32::from(byte), |crc, _| {
+            if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ POLYNOMIAL
+            }
+        })
+    })
 }
 
 /// Index of `offset` among the four software interrupt registers.
@@ -216,6 +284,10 @@ impl Peripheral<Ctx> for System {
             SYSCLK_CONF => Some(self.clock_registers().0),
             PERIP_RST_EN0 => Some(self.resets[0]),
             PERIP_RST_EN1 => Some(self.resets[1]),
+            RTC_FASTMEM_CONFIG => {
+                Some(self.crc_config | if self.crc_finished { CRC_FINISH } else { 0 })
+            }
+            RTC_FASTMEM_CRC => Some(self.crc_result),
             _ => self.registers.read(offset),
         }
     }
@@ -255,6 +327,24 @@ impl Peripheral<Ctx> for System {
                 ctx.clock_written();
                 self.registers.write(offset, value)
             }
+            RTC_FASTMEM_CONFIG => {
+                // ASSUMPTION: `FINISH` reads 1 from the write that sets `START` (the CRC is done
+                // before the next instruction) until a write clears `START`: both programs wait
+                // for it after setting `START`, then clear `START` (DS §A.1.5, §A.3.2). A real
+                // chip read in a loop across the two writes settles it.
+                let starting = value & CRC_START != 0 && self.crc_config & CRC_START == 0;
+                self.crc_config = value & CRC_CONFIG_STORED;
+                if value & CRC_START == 0 {
+                    self.crc_finished = false;
+                }
+                if starting {
+                    self.crc_finished = false;
+                    ctx.signal(Event::RtcMemoryCrc);
+                }
+                true
+            }
+            // Read-only: the write is reported as unmodelled.
+            RTC_FASTMEM_CRC => false,
             _ => self.registers.write(offset, value),
         }
     }
@@ -264,6 +354,87 @@ impl Peripheral<Ctx> for System {
 mod tests {
     use super::*;
     use emu_core::Peripheral;
+
+    #[test]
+    fn the_crc_is_crc_32_iso_hdlc() {
+        // The check value of the catalogue of parametrised CRCs for CRC-32/ISO-HDLC.
+        assert_eq!(crc32_iso_hdlc(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_iso_hdlc(b""), 0);
+    }
+
+    #[test]
+    fn the_crc_unit_starts_on_the_rising_start_bit_and_finishes_over_the_words_asked() {
+        // What `rtc_deep_sleep_start` writes (DS §A.1.5): LEN 0x7FF, ADDR 0, then START.
+        let ctx = &mut Ctx::default();
+        let mut sys = System::new();
+        assert_eq!(
+            sys.read(ctx, RTC_FASTMEM_CONFIG),
+            Some(0x7FF0_0000),
+            "SVD reset"
+        );
+        assert!(sys.write(ctx, RTC_FASTMEM_CONFIG, 0x7FF << 20));
+        assert_eq!(ctx.take_signal(), None);
+        assert!(sys.write(ctx, RTC_FASTMEM_CONFIG, 0x7FF << 20 | CRC_START));
+        assert_eq!(ctx.take_signal(), Some(Event::RtcMemoryCrc));
+        assert_eq!(
+            sys.read(ctx, RTC_FASTMEM_CONFIG).map(|v| v & CRC_FINISH),
+            Some(0),
+            "until the bus answers"
+        );
+        let mut memory = vec![0u8; RTC_MEMORY_WORDS * 4];
+        memory[..9].copy_from_slice(b"123456789");
+        sys.finish_rtc_memory_crc(&memory);
+        assert_eq!(
+            sys.read(ctx, RTC_FASTMEM_CONFIG),
+            Some(0x7FF0_0000 | CRC_START | CRC_FINISH)
+        );
+        assert_eq!(
+            sys.read(ctx, RTC_FASTMEM_CRC),
+            Some(crc32_iso_hdlc(&memory))
+        );
+        // Setting START again while it is set starts nothing; clearing it clears FINISH and keeps
+        // the result.
+        assert!(sys.write(ctx, RTC_FASTMEM_CONFIG, 0x7FF << 20 | CRC_START));
+        assert_eq!(ctx.take_signal(), None);
+        assert!(sys.write(ctx, RTC_FASTMEM_CONFIG, 0x7FF << 20));
+        assert_eq!(sys.read(ctx, RTC_FASTMEM_CONFIG), Some(0x7FF0_0000));
+        assert_eq!(
+            sys.read(ctx, RTC_FASTMEM_CRC),
+            Some(crc32_iso_hdlc(&memory))
+        );
+        assert!(!sys.write(ctx, RTC_FASTMEM_CRC, 0), "read-only");
+    }
+
+    #[test]
+    fn the_crc_unit_covers_addr_to_addr_plus_len_and_never_reads_past_the_memory() {
+        let mut memory = vec![0u8; RTC_MEMORY_WORDS * 4];
+        memory[8..16].copy_from_slice(b"abcdefgh");
+        let ctx = &mut Ctx::default();
+        let mut sys = System::new();
+        // Words 2 and 3: ADDR 2, LEN 1.
+        sys.write(ctx, RTC_FASTMEM_CONFIG, 1 << 20 | 2 << 9 | CRC_START);
+        sys.finish_rtc_memory_crc(&memory);
+        assert_eq!(
+            sys.read(ctx, RTC_FASTMEM_CRC),
+            Some(crc32_iso_hdlc(b"abcdefgh"))
+        );
+        // ADDR 0x7FF and LEN 0x7FF ask for 2 048 words from the last one: only the last is read.
+        sys.write(ctx, RTC_FASTMEM_CONFIG, 0);
+        sys.write(
+            ctx,
+            RTC_FASTMEM_CONFIG,
+            0x7FF << 20 | 0x7FF << 9 | CRC_START,
+        );
+        memory[RTC_MEMORY_WORDS * 4 - 4..].copy_from_slice(b"last");
+        sys.finish_rtc_memory_crc(&memory);
+        assert_eq!(
+            sys.read(ctx, RTC_FASTMEM_CRC),
+            Some(crc32_iso_hdlc(b"last"))
+        );
+        // A memory shorter than the RTC memory (none is) gives the CRC of what there is.
+        sys.finish_rtc_memory_crc(&memory[..4]);
+        assert_eq!(sys.read(ctx, RTC_FASTMEM_CRC), Some(0));
+    }
 
     #[test]
     fn sysclk_conf_reports_a_40_mhz_crystal_selected_undivided() {

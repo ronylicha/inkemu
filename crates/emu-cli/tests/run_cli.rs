@@ -159,7 +159,7 @@ fn run_help_tells_the_two_limits_apart() {
     for expected in [
         "--max-cycles <MAX_CYCLES> Stop when the CPU has executed this many cycles of its clock. The limit counts executed cycles, not device time: a sleeping CPU executes none, so a firmware that sleeps reaches it late, and one whose sleep nothing interrupts never does; --max-time bounds both",
         "--max-time <SECONDS> Stop when this many seconds of device time have elapsed since power-on (a decimal number: 30, 2.5, 0.001). Device time goes on while the CPU sleeps and across resets",
-        "0 the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was pressed, or the reader of standard output went away",
+        "0 the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was pressed, the reader of standard output went away, or the device went into a deep sleep nothing inkemu models can wake it from",
     ] {
         assert!(
             out.contains(expected),

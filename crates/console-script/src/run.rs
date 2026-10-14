@@ -293,7 +293,7 @@ mod tests {
             uart0.extend(&taken[0].1);
             run.observe(machine, &taken).unwrap();
             match stop {
-                StopReason::TimeBudget | StopReason::Idle => break,
+                StopReason::TimeBudget | StopReason::Idle | StopReason::DeepSleep => break,
                 StopReason::CycleBudget | StopReason::Asleep | StopReason::ConsoleOutput => {}
                 StopReason::StrictMmio(diagnostic) => panic!("{diagnostic}"),
             }

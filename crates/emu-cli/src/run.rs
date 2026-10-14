@@ -3,7 +3,7 @@ use crate::exit::{EXIT_ERROR, EXIT_IDLE, EXIT_OK, EXIT_SCRIPT_INCOMPLETE, EXIT_S
 use console_script::{ScriptRun, ScriptStatus};
 use emu_core::Cycles;
 use soc_esp32c3::diag::MAX_DISTINCT_DIAGNOSTICS;
-use soc_esp32c3::{ConsoleChannel, Diagnostic, Esp32C3, StopReason};
+use soc_esp32c3::{ConsoleChannel, DeepSleep, Diagnostic, Esp32C3, StopReason};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -69,6 +69,7 @@ fn pass_end(
         (Ok(false), _) => Some(RunEnd::ConsoleClosed),
         (Err(_), _) => Some(RunEnd::ConsoleError),
         (Ok(true), StopReason::Idle) => Some(RunEnd::Idle),
+        (Ok(true), StopReason::DeepSleep) => Some(RunEnd::DeepSleep),
         (Ok(true), StopReason::CycleBudget) if cycle_limit_reached => Some(RunEnd::Budget),
         (Ok(true), StopReason::TimeBudget) => Some(RunEnd::TimeLimit),
         // The end of a slice, or a CPU that sleeps while device time goes on: the next pass
@@ -100,6 +101,11 @@ fn say_why(log: &mut dyn Write, end: RunEnd, stop: Option<&StopReason>) {
         RunEnd::Idle => writeln!(
             log,
             "inkemu: the CPU waits for an interrupt and none can come: no interrupt line is pending and no device has anything scheduled; check that the firmware enables the interrupt it waits for"
+        ),
+        // F5: the line after the device time says since when it sleeps and what it waits for.
+        RunEnd::DeepSleep => writeln!(
+            log,
+            "inkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here"
         ),
         RunEnd::Budget => writeln!(
             log,
@@ -244,6 +250,9 @@ pub enum RunEnd {
     StrictMmio,
     /// The CPU waits for an interrupt and nothing on the device can raise one.
     Idle,
+    /// The device went into deep sleep and nothing the model has can wake it (F5): what a
+    /// firmware does when it turns the device off, so the run ended normally.
+    DeepSleep,
     /// The user asked the run to stop (Ctrl-C). The request is read between two slices, at a
     /// place that depends on the host: the trace hash of such a run covers what ran up to the
     /// cut, and is not reproducible from one run to the next. The hash of a run ended by a limit
@@ -254,7 +263,7 @@ pub enum RunEnd {
 impl RunEnd {
     /// Every way a run can end, for what must hold for each of them: a variant added to the enum
     /// is added here.
-    pub const ALL: [RunEnd; 7] = [
+    pub const ALL: [RunEnd; 8] = [
         RunEnd::Budget,
         RunEnd::TimeLimit,
         RunEnd::ConsoleClosed,
@@ -262,15 +271,18 @@ impl RunEnd {
         RunEnd::StrictMmio,
         RunEnd::Idle,
         RunEnd::Interrupted,
+        RunEnd::DeepSleep,
     ];
 
     /// The process exit code of a run that ended this way.
     #[must_use]
     pub const fn exit_code(self) -> u8 {
         match self {
-            RunEnd::Budget | RunEnd::TimeLimit | RunEnd::ConsoleClosed | RunEnd::Interrupted => {
-                EXIT_OK
-            }
+            RunEnd::Budget
+            | RunEnd::TimeLimit
+            | RunEnd::ConsoleClosed
+            | RunEnd::Interrupted
+            | RunEnd::DeepSleep => EXIT_OK,
             RunEnd::ConsoleError => EXIT_ERROR,
             RunEnd::StrictMmio => EXIT_STRICT_MMIO,
             RunEnd::Idle => EXIT_IDLE,
@@ -292,7 +304,8 @@ impl RunEnd {
             | RunEnd::ConsoleClosed
             | RunEnd::ConsoleError
             | RunEnd::Idle
-            | RunEnd::Interrupted => EXIT_ERROR,
+            | RunEnd::Interrupted
+            | RunEnd::DeepSleep => EXIT_ERROR,
         }
     }
 }
@@ -572,6 +585,9 @@ pub fn execute_with_script(
         machine.device_time_nanos() / 1_000,
         frequency_text(machine.cpu_frequency().hz())
     );
+    if let Some(sleep) = machine.deep_sleep() {
+        let _ = writeln!(log, "{}", deep_sleep_line(&sleep));
+    }
     let _ = writeln!(log, "inkemu: USB host {}", machine.usb_host().name());
     if let Some(run) = script {
         say_script(log, &run.status(machine.device_time()), run.step_count());
@@ -581,6 +597,30 @@ pub fn execute_with_script(
         let _ = writeln!(log, "trace-hash {hash:016x}");
     }
     end
+}
+
+/// The line of the summary of a run that ends with the device in deep sleep (F5, F9): since when
+/// it sleeps, and when the RTC timer wakes it or what it waits for instead.
+fn deep_sleep_line(sleep: &DeepSleep) -> String {
+    let since = sleep.since_nanos / 1_000;
+    let waits = match sleep.timer_wake_nanos {
+        Some(wake) => format!("the RTC timer wakes it at {} us", wake / 1_000),
+        None if sleep.wake_sources == 0 => {
+            "it waits for nothing: the firmware enabled no wake source".to_owned()
+        }
+        None => {
+            let gpio = if sleep.wake_sources & DeepSleep::GPIO != 0 {
+                " (GPIO, bit 2, belongs to sub-project 2)"
+            } else {
+                ""
+            };
+            format!(
+                "it waits for a wake source inkemu does not model{gpio}: WAKEUP_ENA {:#07x}",
+                sleep.wake_sources
+            )
+        }
+    };
+    format!("inkemu: the device is in deep sleep since {since} us of device time; {waits}")
 }
 
 /// A frequency in the largest unit that states its number of hertz exactly: `80 MHz`, `625 kHz`,
@@ -1287,6 +1327,111 @@ mod tests {
             run.log.contains("waits for an interrupt and none can come"),
             "{}",
             run.log
+        );
+    }
+
+    /// A program that stops its watchdogs and goes into deep sleep (F1) with `wake_state` in
+    /// `RTC_CNTL.WAKEUP_STATE`, after setting the alarm of the RTC timer at `target` counts.
+    fn deep_sleeping(wake_state: u32, target: u32) -> Vec<u32> {
+        let rtc = |name| svd_regs::esp32c3::addr("RTC_CNTL", name);
+        let mut program = stop_watchdogs();
+        for (register, value) in [
+            ("SLP_TIMER0", target),
+            ("SLP_TIMER1", 1 << 16),
+            ("WAKEUP_STATE", wake_state),
+            ("DIG_PWC", 1 << 31),
+            ("STATE0", 1 << 31),
+        ] {
+            program.extend(store_register(rtc(register), value));
+        }
+        program.push(HANG);
+        program
+    }
+
+    #[test]
+    fn a_device_in_a_deep_sleep_nothing_can_end_ends_the_run_with_code_0_and_says_so() {
+        // F5: no wake source at all, the last sleep of `deep_sleep_timer`.
+        let run = run_bounded(deep_sleeping(0, 0), UNLIMITED);
+        assert_eq!((run.end, run.end.exit_code()), (RunEnd::DeepSleep, 0));
+        for line in [
+            "inkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here\n",
+            "\ninkemu: the device is in deep sleep since ",
+            " us of device time; it waits for nothing: the firmware enabled no wake source\n",
+        ] {
+            assert!(run.log.contains(line), "`{line}` is missing:\n{}", run.log);
+        }
+        assert!(!run.log.contains("warning"), "{}", run.log);
+    }
+
+    #[test]
+    fn a_gpio_wake_is_named_and_the_run_ends_asleep() {
+        // F5: what CrossPoint arms before it sleeps, GPIO alone.
+        let run = run_bounded(deep_sleeping(1 << 2 << 15, 0), UNLIMITED);
+        assert_eq!(run.end, RunEnd::DeepSleep);
+        for line in [
+            "warning: the chip went into deep sleep with wake sources inkemu does not model (WAKEUP_ENA 0x00004, pc ",
+            "it waits for a wake source inkemu does not model (GPIO, bit 2, belongs to sub-project 2): WAKEUP_ENA 0x00004\n",
+        ] {
+            assert!(run.log.contains(line), "`{line}` is missing:\n{}", run.log);
+        }
+    }
+
+    #[test]
+    fn a_run_that_ends_on_its_limit_while_the_device_sleeps_says_when_the_timer_wakes_it() {
+        // 272 000 counts of the 136 kHz slow clock: the alarm is at 2 s exactly.
+        let run = run_bounded(
+            deep_sleeping(1 << 3 << 15, 272_000),
+            RunOptions {
+                max_device_nanos: Some(SECOND_NS),
+                ..UNLIMITED
+            },
+        );
+        assert_eq!((run.end, run.device_nanos), (RunEnd::TimeLimit, SECOND_NS));
+        assert!(
+            run.log
+                .contains(" us of device time; the RTC timer wakes it at 2000000 us\n"),
+            "{}",
+            run.log
+        );
+        // Run to 3 s, it wakes, sleeps again on the alarm already passed, and wakes again at once,
+        // and so on: the journal says so once, as every reset of one place.
+        let run = run_bounded(
+            deep_sleeping(1 << 3 << 15, 272_000),
+            RunOptions {
+                max_device_nanos: Some(3 * SECOND_NS),
+                max_cycles: Some(2_000_000),
+                ..UNLIMITED
+            },
+        );
+        assert!(
+            run.log.starts_with(
+                "inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset; the CPU had stopped at pc "
+            ),
+            "{}",
+            run.log
+        );
+    }
+
+    #[test]
+    fn the_deep_sleep_line_says_what_the_device_waits_for() {
+        let line = |timer_wake_nanos, wake_sources| {
+            deep_sleep_line(&DeepSleep {
+                since_nanos: 1_500_000,
+                timer_wake_nanos,
+                wake_sources,
+            })
+        };
+        assert_eq!(
+            line(Some(3_500_000), DeepSleep::TIMER),
+            "inkemu: the device is in deep sleep since 1500 us of device time; the RTC timer wakes it at 3500 us"
+        );
+        assert_eq!(
+            line(None, 0),
+            "inkemu: the device is in deep sleep since 1500 us of device time; it waits for nothing: the firmware enabled no wake source"
+        );
+        assert_eq!(
+            line(None, 0x40),
+            "inkemu: the device is in deep sleep since 1500 us of device time; it waits for a wake source inkemu does not model: WAKEUP_ENA 0x00040"
         );
     }
 
