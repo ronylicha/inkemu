@@ -4491,6 +4491,104 @@ fn x4_runs_the_deep_sleep_timer_reference_firmware_through_three_wakes_into_a_sl
     );
 }
 
+/// What the host sends to `deep_sleep_timer`, which reads nothing: bytes on UART0 at power-on,
+/// then, a second into its first deep sleep, bytes dated in the sleep and a change of the USB
+/// host, then bytes once the second life has said it woke.
+const DEEP_SLEEP_TIMER_SCRIPT: &str = "\
+send uart0 \"before\"
+wait-for uart0 \"sleeping 2000 ms on the RTC timer\"
+wait 1s
+send uart0 \"asleep\"
+usb-host attached
+wait-for uart0 \"life 2, reset by deep sleep\"
+send uart0 \"after\"
+";
+
+/// Recording and replaying a session through resets and deep sleeps (spec §5 criterion 1):
+/// `deep_sleep_timer`, driven by a console script that sends before a deep sleep, during it and
+/// after the wake, is recorded with `--record` through its three wakes into its sleep without
+/// end, then replayed by `inkemu replay`: exit 0, the same console, the same trace hash.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_DEEP_SLEEP_TIMER_APP"]
+fn x4_records_the_deep_sleep_timer_reference_firmware_through_its_wakes_and_replays_it_identically()
+{
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let application = std::env::var("INKEMU_DEEP_SLEEP_TIMER_APP").expect(
+        "set INKEMU_DEEP_SLEEP_TIMER_APP to the deep_sleep_timer.bin of tools/reference-firmware/build.sh",
+    );
+    assert_eq!(
+        sha256_of(std::path::Path::new(&application)),
+        pinned_in_sums("SHA256SUMS.inputs-deep-sleep-timer", "deep_sleep_timer.bin"),
+        "{application} is not the pinned deep_sleep_timer.bin; rebuild it with tools/reference-firmware/build.sh"
+    );
+    let (_script_dir, script) = console_script(DEEP_SLEEP_TIMER_SCRIPT);
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("deep_sleep_timer.inkrec");
+    let run = inkemu()
+        .args(["run", "--device", "x4", "--console", "uart0"])
+        .args(["--max-time", "30", "--rom-dir", &rom_dir])
+        .arg("--firmware")
+        .arg(&application)
+        .arg("--console-script")
+        .arg(&script)
+        .arg("--record")
+        .arg(&session)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let run_log = String::from_utf8_lossy(&run.stderr).into_owned();
+    let console = String::from_utf8_lossy(&run.stdout).into_owned();
+    for expected in [
+        "inkemu: console script through (7 steps)\n",
+        "\ninkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here\n",
+        "inkemu: session recorded in deep_sleep_timer.inkrec (4 inputs); `inkemu replay` replays it\n",
+    ] {
+        assert!(
+            run_log.contains(expected),
+            "`{expected}` is missing:\n{run_log}"
+        );
+    }
+    let wakes = run_log
+        .matches("inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset at ")
+        .count();
+    assert_eq!(wakes, 3, "{run_log}");
+    assert_eq!(console.matches("rst:").count(), 4, "{console}");
+    let replayed = inkemu()
+        .arg("replay")
+        .arg(&session)
+        .args(["--console", "uart0", "--rom-dir", &rom_dir])
+        .timeout(HANG_LIMIT)
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&replayed.stderr).into_owned();
+    assert_eq!(replayed.status.code(), Some(0), "{log}");
+    assert_eq!(
+        String::from_utf8_lossy(&replayed.stdout),
+        console,
+        "the replay shows the console of the run"
+    );
+    assert!(
+        log.contains("inkemu: the replay gives what the session recorded: "),
+        "{log}"
+    );
+    assert_eq!(
+        log.matches("inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset at ")
+            .count(),
+        3,
+        "{log}"
+    );
+    let trace = trace_hash_line(&run_log);
+    assert!(
+        trace.is_some(),
+        "a recorded run prints its trace hash:\n{run_log}"
+    );
+    assert_eq!(trace_hash_line(&log), trace, "{log}");
+}
+
 /// The script the console-script reference test types into `uart_select`
 /// (`crates/console-script/tests/reference_firmware.rs`): through by 10.6 s of device time.
 const UART_SELECT_SCRIPT: &str = "\
