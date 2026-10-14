@@ -234,6 +234,7 @@ fn assert_only_the_restart_is_reported(diagnostics: &[Diagnostic]) {
             cause: ResetCause::SoftwareCpu,
             pc: RESTART_PC,
             sp,
+            ..
         },
     ] = diagnostics
     else {
@@ -865,27 +866,31 @@ fn assert_the_console_of_three_lives(console: &str, first_boot: &[&str]) {
     assert_lines_in_order(console, &lines);
 }
 
-/// What the journal of a strict run of the example may hold: the restart it asks for, and
-/// nothing else. No unmodelled register, no refused flash command, no window read that may
-/// differ from the device, and no CPU exception.
+/// What the journal of a strict run of `lives` lives of the example may hold: the restarts it
+/// asks for, and nothing else. No unmodelled register, no refused flash command, no window read
+/// that may differ from the device, and no CPU exception.
 ///
-/// The restart is one entry however many lives the run crossed: the journal lists a reset once
-/// per cause and PC. A run that ends on the last line of a life may or may not have reached the
-/// restart that follows it, a few milliseconds later: no entry at all is accepted too.
-fn assert_nothing_but_the_restart_is_reported(diagnostics: &[Diagnostic]) {
-    assert!(diagnostics.len() <= 1, "{diagnostics:#?}");
+/// Every restart is an entry of its own, at its own device time (spec §7). A run that ends on the
+/// last line of its last life may or may not have reached the restart that follows it, a few
+/// milliseconds later: one entry fewer than the lives is accepted too.
+fn assert_nothing_but_the_restarts_are_reported(diagnostics: &[Diagnostic], lives: usize) {
+    assert!(
+        (lives - 1..=lives).contains(&diagnostics.len()),
+        "{lives} lives: {diagnostics:#?}"
+    );
+    let mut previous = None;
     for diagnostic in diagnostics {
-        assert!(
-            matches!(
-                diagnostic,
-                Diagnostic::Reset {
-                    cause: ResetCause::SoftwareCpu,
-                    pc: RESTART_PC,
-                    ..
-                }
-            ),
-            "{diagnostic}"
-        );
+        let Diagnostic::Reset {
+            cause: ResetCause::SoftwareCpu,
+            pc: RESTART_PC,
+            at_us,
+            ..
+        } = diagnostic
+        else {
+            panic!("not the restart: {diagnostic}");
+        };
+        assert!(previous < Some(*at_us), "{diagnostics:#?}");
+        previous = Some(*at_us);
     }
 }
 
@@ -916,7 +921,7 @@ fn the_nvs_example_counts_its_restarts_over_three_lives_and_programs_the_measure
         "the last of the six values programmed there; the journal above holds no erase"
     );
     assert!(run.resets >= 2, "two restarts were crossed: {}", run.resets);
-    assert_nothing_but_the_restart_is_reported(&run.diagnostics);
+    assert_nothing_but_the_restarts_are_reported(&run.diagnostics, 3);
 }
 
 /// The same three lives behind the stock partition table of the X4: the bootloader writes
@@ -941,7 +946,7 @@ fn the_nvs_example_behind_the_stock_x4_table_writes_otadata_once_and_counts_its_
     assert_eq!(run.flash_writes, expected);
     assert_eq!(sha256(&run.flash), NVS_OTA_AFTER_LIFE_3);
     assert_eq!(run.flash_modified_sectors, 2, "NVS and otadata");
-    assert_nothing_but_the_restart_is_reported(&run.diagnostics);
+    assert_nothing_but_the_restarts_are_reported(&run.diagnostics, 3);
 }
 
 /// The flash a first life leaves is the measured one, and a machine built from it goes on
@@ -954,7 +959,7 @@ fn a_cold_start_from_the_flash_the_first_life_left_goes_on_counting() {
     let first = run_image(nvs_flash(), strict(), lives(1));
     assert_eq!(first.flash_writes, first_life);
     assert_eq!(sha256(&first.flash), NVS_AFTER_LIFE_1);
-    assert_nothing_but_the_restart_is_reported(&first.diagnostics);
+    assert_nothing_but_the_restarts_are_reported(&first.diagnostics, 1);
 
     let second = run_image(first.flash, strict(), lives(1));
     // The ROM lines of the reference image: the bootloader is the same binary.
@@ -974,7 +979,7 @@ fn a_cold_start_from_the_flash_the_first_life_left_goes_on_counting() {
     assert_eq!(count_lines(&second.console, COUNTER_NOT_INITIALIZED), 0);
     assert_eq!(second.flash_writes, second_life);
     assert_eq!(sha256(&second.flash), NVS_AFTER_LIFE_2);
-    assert_nothing_but_the_restart_is_reported(&second.diagnostics);
+    assert_nothing_but_the_restarts_are_reported(&second.diagnostics, 1);
 }
 
 /// Determinism with a flash that is written: two runs from the same content are the same run,

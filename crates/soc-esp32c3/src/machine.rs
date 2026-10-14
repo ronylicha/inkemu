@@ -558,11 +558,15 @@ impl Esp32C3 {
     /// reaches its cycle limit.
     fn reset(&mut self, cause: ResetCause) {
         let (pc, sp) = (self.hart.pc, self.hart.x[STACK_POINTER]);
-        // Spec §7: a reset leaves an entry in the journal, with the PC and the stack it found.
-        self.bus
-            .ctx
-            .diag
-            .record(Diagnostic::Reset { cause, pc, sp });
+        // Spec §7: a reset leaves an entry in the journal, with the PC and the stack it found,
+        // and the device time that sets it apart from the other resets at the same PC.
+        let at_us = self.device_time_nanos() / 1_000;
+        self.bus.ctx.diag.record(Diagnostic::Reset {
+            cause,
+            pc,
+            sp,
+            at_us,
+        });
         self.bus.reset(cause, pc, sp);
         // The flash-window page versions (`SocBus::page_version`) restart at 0 with the MMU and
         // the cache registers: a version can repeat with another mapping. That is safe only
@@ -922,6 +926,13 @@ impl Esp32C3 {
     #[must_use]
     pub const fn suppressed_diagnostics(&self) -> u64 {
         self.bus.ctx.diag.suppressed()
+    }
+
+    /// Resets that came once [`MAX_LISTED_RESETS`](crate::diag::MAX_LISTED_RESETS) had been
+    /// listed: they are counted but never listed. [`Esp32C3::resets`] counts them all.
+    #[must_use]
+    pub const fn unlisted_resets(&self) -> u64 {
+        self.bus.ctx.diag.unlisted_resets()
     }
 
     /// The model that prices each instruction, so a front end can say whether timing is calibrated.
@@ -1979,18 +1990,25 @@ mod tests {
         while m.run_within(Cycles(u64::MAX), Some(1_000_000_000)) != StopReason::DeepSleep {}
         assert_eq!(m.resets(), 3);
         let diagnostics = m.drain_diagnostics();
-        let wakes: Vec<&Diagnostic> = diagnostics
+        // One entry per wake (spec §7), each at its own device time.
+        let wakes: Vec<u64> = diagnostics
             .iter()
-            .filter(|d| matches!(d, Diagnostic::Reset { .. }))
-            .collect();
-        assert!(
-            wakes.iter().all(|d| matches!(
-                d,
+            .filter_map(|d| match d {
                 Diagnostic::Reset {
                     cause: ResetCause::DeepSleep,
+                    at_us,
                     ..
-                }
-            )),
+                } => Some(*at_us),
+                Diagnostic::Reset { .. } => panic!("not a wake: {d}"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(wakes.len(), 3, "{diagnostics:?}");
+        assert!(wakes.is_sorted() && wakes[0] < wakes[2], "{wakes:?}");
+        assert!(
+            wakes
+                .iter()
+                .all(|at_us| *at_us <= m.device_time_nanos() / 1_000),
             "{wakes:?}"
         );
         assert_eq!(
@@ -4066,33 +4084,38 @@ mod tests {
                 cause: ResetCause::SoftwareCpu,
                 pc: after_the_store,
                 sp: 0x3FC9_0000,
+                // The few dozen cycles of 20 MHz before the store: a microsecond, rounded down.
+                at_us: 1,
             }],
             "the reset is in the journal, with the PC and the stack it found, and nothing else is"
         );
     }
 
     #[test]
-    fn a_boot_loop_is_one_entry_of_the_journal_counted_once_per_reset() {
+    fn a_boot_loop_is_one_entry_of_the_journal_per_reset_each_at_its_device_time() {
         // `wfi` under the watchdogs of the reset values: main watchdog 0 at 1.3 s and at 2.6 s,
         // the RTC watchdog at 2.94 s, each time with the CPU asleep after the same `wfi`.
         let mut m = machine(&[wfi(), HANG]);
         run_to_the_time_limit(&mut m, 3 * SECOND_NS, |_| NO_CYCLE_LIMIT);
         assert_eq!(m.resets(), 3);
-        let by = |cause| Diagnostic::Reset {
+        let by = |cause, at_us| Diagnostic::Reset {
             cause,
             pc: ROM_BASE + 4,
             sp: 0,
+            at_us,
         };
+        // 2 941 176 us: 400 000 cycles of the 136 kHz slow clock, rounded down.
         assert_eq!(
             m.drain_diagnostics(),
-            [by(ResetCause::Mwdt0Core), by(ResetCause::RtcWatchdogSystem)],
-            "listed once per cause and PC, in the order they first came"
+            [
+                by(ResetCause::Mwdt0Core, 1_300_000),
+                by(ResetCause::Mwdt0Core, 2_600_000),
+                by(ResetCause::RtcWatchdogSystem, 2_941_176),
+            ],
+            "spec §7: every reset is an entry, in the order they came"
         );
-        assert_eq!(
-            m.most_repeated_diagnostics(4),
-            [(by(ResetCause::Mwdt0Core), 2)],
-            "and every reset is counted"
-        );
+        assert_eq!(m.most_repeated_diagnostics(4), [], "none is a repetition");
+        assert_eq!(m.unlisted_resets(), 0);
     }
 
     #[test]

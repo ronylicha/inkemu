@@ -4202,10 +4202,9 @@ fn x4_runs_the_adc_wait_panic_reference_firmware_through_its_panic_into_a_second
     );
 }
 
-/// The trace of the run of `deep_sleep_timer` below, as the CI prints it. Not known before the
-/// first run of the pinned image in the job `reference-boot`: the test then fails on this value
-/// alone and prints the hash of the run, which is pinned here.
-const DEEP_SLEEP_TIMER_TRACE: &str = "trace-hash not pinned yet";
+/// The trace of the run of `deep_sleep_timer` below, as the CI printed it (run 38515471946, job
+/// `reference-boot`, where every assertion on the console passed).
+const DEEP_SLEEP_TIMER_TRACE: &str = "trace-hash 80bd1c43d55b5467";
 
 /// The milliseconds a life of `deep_sleep_timer` says it slept: the 2 s of the RTC timer, less
 /// the 400 us ESP-IDF takes off for the entry and the exit (DS §A.1.2 item 6), plus the boot of
@@ -4298,12 +4297,20 @@ fn x4_runs_the_deep_sleep_timer_reference_firmware_through_three_wakes_into_a_sl
     for slept in slept {
         assert!(SLEPT_MS.contains(&slept), "slept {slept} ms:\n{console}");
     }
-    let woken = "inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset; the CPU had stopped at pc ";
-    assert_eq!(
-        log.matches(woken).count(),
-        3,
-        "one wake line per wake:\n{log}"
-    );
+    // Spec §7: one line per wake, each with its device time, although the three find the CPU
+    // stopped at the same instruction.
+    let woken = log
+        .lines()
+        .filter(|line| {
+            line.strip_prefix(
+                "inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset at ",
+            )
+            .and_then(|rest| rest.split_once(" us of device time; the CPU had stopped at pc "))
+            .is_some_and(|(micros, _)| micros.parse::<u64>().is_ok())
+        })
+        .count();
+    assert_eq!(woken, 3, "one wake line per wake:\n{log}");
+    assert!(!log.contains("inkemu: repeated "), "{log}");
     for line in [
         "\ninkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here\n",
         " us of device time; it waits for nothing: the firmware enabled no wake source\n",

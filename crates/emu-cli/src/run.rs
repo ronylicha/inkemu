@@ -2,7 +2,7 @@
 use crate::exit::{EXIT_ERROR, EXIT_IDLE, EXIT_OK, EXIT_SCRIPT_INCOMPLETE, EXIT_STRICT_MMIO};
 use console_script::{ScriptRun, ScriptStatus};
 use emu_core::Cycles;
-use soc_esp32c3::diag::MAX_DISTINCT_DIAGNOSTICS;
+use soc_esp32c3::diag::{MAX_DISTINCT_DIAGNOSTICS, MAX_LISTED_RESETS};
 use soc_esp32c3::{ConsoleChannel, DeepSleep, Diagnostic, Esp32C3, StopReason};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -417,7 +417,7 @@ fn log_reader_gone(log: &mut dyn Write) {
 /// emulation did not do as the device would, or a fault of the firmware: a warning.
 const fn journal_prefix(diagnostic: &Diagnostic) -> &'static str {
     match diagnostic {
-        Diagnostic::Reset { .. } => "inkemu",
+        Diagnostic::Reset { .. } | Diagnostic::UnlistedResets => "inkemu",
         Diagnostic::UnmodeledMmio { .. }
         | Diagnostic::SubWordWrite { .. }
         | Diagnostic::Unsupported { .. }
@@ -439,6 +439,13 @@ fn summarize_diagnostics(machine: &Esp32C3, log: &mut dyn Write) {
         let _ = writeln!(
             log,
             "inkemu: {suppressed} further diagnostics were not listed (more than {MAX_DISTINCT_DIAGNOSTICS} distinct)"
+        );
+    }
+    let unlisted_resets = machine.unlisted_resets();
+    if unlisted_resets > 0 {
+        let _ = writeln!(
+            log,
+            "inkemu: {unlisted_resets} further resets were not listed (more than {MAX_LISTED_RESETS})"
         );
     }
 }
@@ -1405,7 +1412,7 @@ mod tests {
             run.log
         );
         // Run to 3 s, it wakes, sleeps again on the alarm already passed, and wakes again at once,
-        // and so on: the journal says so once, as every reset of one place.
+        // and so on: the journal says so at each wake.
         let run = run_bounded(
             deep_sleeping(1 << 3 << 15, 272_000),
             RunOptions {
@@ -1416,8 +1423,17 @@ mod tests {
         );
         assert!(
             run.log.starts_with(
-                "inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset; the CPU had stopped at pc "
+                "inkemu: woken from deep sleep by the RTC timer (rst:0x5), a core reset at 2000000 us of device time; the CPU had stopped at pc "
             ),
+            "{}",
+            run.log
+        );
+        assert!(
+            run.log
+                .matches("inkemu: woken from deep sleep by the RTC timer")
+                .count()
+                > 1
+                && !run.log.contains("inkemu: repeated "),
             "{}",
             run.log
         );
@@ -1779,9 +1795,9 @@ mod tests {
     #[test]
     fn a_reset_is_reported_as_an_event_of_the_run_and_not_as_a_warning() {
         // The same firmware, under `--strict-mmio`: a watchdog reset is neither a fault of the
-        // emulation nor a violation. Each (cause, PC) pair is one line of the journal, the
-        // repeats are counted in the summary, and the run goes on to its cycle limit, with the
-        // same device-time limit behind it for a run whose resets would stop.
+        // emulation nor a violation. Each reset is one line of the journal (spec §7), with its
+        // device time, none is a repeat of another, and the run goes on to its cycle limit, with
+        // the same device-time limit behind it for a run whose resets would stop.
         let mut m = machine(&printing(UART0, b"a", &[wfi(), HANG]), STRICT);
         let (mut console, mut log) = (Vec::new(), Vec::new());
         let end = execute(
@@ -1797,21 +1813,25 @@ mod tests {
         );
         assert_eq!((end, end.exit_code()), (RunEnd::Budget, 0));
         let log = text(&log);
-        let by_the_main_watchdog =
-            "reset by main watchdog 0, a core reset (rst:0x7) at pc 0x40000010, sp 0x";
+        let resets: Vec<&str> = log
+            .lines()
+            .filter(|line| line.starts_with("inkemu: reset by "))
+            .collect();
         assert_eq!(
-            log.lines()
-                .filter(|line| line.starts_with(&format!("inkemu: {by_the_main_watchdog}")))
-                .count(),
-            1,
-            "{log}"
+            u64::try_from(resets.len()).unwrap(),
+            m.resets(),
+            "one line per reset: {log}"
         );
-        assert!(
-            log.lines()
-                .any(|line| line.starts_with("inkemu: repeated ")
-                    && line.contains(by_the_main_watchdog)),
-            "the resets after the first are counted: {log}"
-        );
+        // Main watchdog 0 resets the first lives, each 1.3 s after the reset before it.
+        for (life, line) in (1..).zip(resets.iter().take(2)) {
+            assert!(
+                line.starts_with(
+                    "inkemu: reset by main watchdog 0, a core reset (rst:0x7) at pc 0x40000010, sp 0x"
+                ) && line.ends_with(&format!(", at {} us of device time", 1_300_000 * life)),
+                "{log}"
+            );
+        }
+        assert!(!log.contains("inkemu: repeated "), "{log}");
         assert!(!log.contains("warning:"), "{log}");
         assert!(m.resets() > 1);
     }

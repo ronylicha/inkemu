@@ -627,26 +627,10 @@ fn a_blank_flash_is_reset_by_the_main_watchdog_then_by_the_rtc_watchdog() {
             .nth(1)
             .is_some_and(|rest| rest.contains(INVALID_HEADER_BLANK))
     });
-    // Strict mode: nothing unmodelled. The journal holds the resets and nothing else, each cause
-    // and PC once, at its first occurrence; a reset that found the ROM at the same instruction
-    // as an earlier one of its cause is counted with it. Taken back in the order they came, the
-    // three resets are those of main watchdog 0 twice, then of the RTC watchdog, each in the
-    // loop where the ROM waits for room in the UART FIFO.
-    let repeated: Vec<((ResetCause, u32), u64)> = run
-        .repeated
-        .iter()
-        .map(|(diagnostic, count)| (reset_entries(std::slice::from_ref(diagnostic))[0], *count))
-        .collect();
-    let resets: Vec<(ResetCause, u32)> = reset_entries(&run.diagnostics)
-        .into_iter()
-        .flat_map(|entry| {
-            let count = repeated
-                .iter()
-                .find(|(other, _)| *other == entry)
-                .map_or(1, |&(_, count)| count);
-            std::iter::repeat_n(entry, usize::try_from(count).unwrap())
-        })
-        .collect();
+    // Strict mode: nothing unmodelled. The journal holds the resets and nothing else, one entry
+    // each (spec §7), in the order they came: main watchdog 0 twice, then the RTC watchdog, each
+    // in the loop where the ROM waits for room in the UART FIFO.
+    let resets = reset_entries(&run.diagnostics);
     assert_eq!(
         resets.iter().map(|&(cause, _)| cause).collect::<Vec<_>>(),
         [
@@ -654,9 +638,10 @@ fn a_blank_flash_is_reset_by_the_main_watchdog_then_by_the_rtc_watchdog() {
             ResetCause::Mwdt0Core,
             ResetCause::RtcWatchdogSystem
         ],
-        "journal {:?}, repeated {repeated:?}",
+        "journal {:?}",
         run.diagnostics
     );
+    assert_eq!(run.repeated, Vec::new(), "no reset is a repeat of another");
     assert!(
         resets.iter().all(|(_, pc)| ROM_UART_WAIT_LOOP.contains(pc)),
         "every reset finds the ROM in its wait for room in the UART FIFO: {resets:?}"
