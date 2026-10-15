@@ -5,7 +5,7 @@ ARG SAIL_RISCV_RELEASE
 ARG RISCOF_VERSION
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf \
-      make git ca-certificates curl python3 python3-venv \
+      make git ca-certificates curl python3 python3-venv patch \
  && rm -rf /var/lib/apt/lists/*
 # setuptools provides the `distutils` shim that the arch-test Sail plugin imports (removed from Python 3.12).
 RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir setuptools "riscof==${RISCOF_VERSION}"

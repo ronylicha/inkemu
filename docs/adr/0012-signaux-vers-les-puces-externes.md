@@ -1,4 +1,4 @@
-# ADR 0010 — Signaux entre le SoC et les puces externes, et broches de l'ESP32-C3
+# ADR 0012 — Signaux entre le SoC et les puces externes, et broches de l'ESP32-C3
 
 - Date : 2026-10-15
 - Statut : accepté (plan SP2b)

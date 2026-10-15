@@ -8,7 +8,7 @@
 
 | Where | Owns | Why |
 |---|---|---|
-| `crates/emu-core/src/signals.rs` | `Level`, `Nanos`, `GpioInput`, `GpioOutput`, `SpiTarget`, `AnalogSource`, their `Rc<RefCell<_>>` impls | the contract neither side owns (ADR 0010) |
+| `crates/emu-core/src/signals.rs` | `Level`, `Nanos`, `GpioInput`, `GpioOutput`, `SpiTarget`, `AnalogSource`, their `Rc<RefCell<_>>` impls | the contract neither side owns (ADR 0012) |
 | `crates/soc-esp32c3/src/periph/io/` | `IoMatrix`: GPIO and IO MUX registers, pad resolution, peripheral signals, attachments, GPIO interrupts | one owner of the pads' state |
 | `crates/soc-esp32c3/src/periph/spi2.rs` | GP-SPI2 master, CPU mode | the display and the SD card |
 | `crates/soc-esp32c3/src/periph/i2c0.rs` | I2C0 master, no target | the X3/X4 probe |
@@ -19,7 +19,7 @@
 
 **Tech Stack:** Rust 1.99.0 (edition 2024). No new crate dependency (`boards` takes `emu-core` and `sha2`, both in the workspace, as dev-dependencies for its test). ESP-IDF v5.5.2 in `espressif/idf:v5.5.2`.
 
-**Spec:** `docs/superpowers/specs/2026-10-15-sp2b-soc-peripherals-design.md` (2b-D1 to 2b-D14, binding). Research: `docs/research/esp32c3-soc-peripherals-sp2b.md`. ADR 0010.
+**Spec:** `docs/superpowers/specs/2026-10-15-sp2b-soc-peripherals-design.md` (2b-D1 to 2b-D14, binding). Research: `docs/research/esp32c3-soc-peripherals-sp2b.md`. ADR 0012.
 
 ## Global Constraints
 
@@ -47,7 +47,7 @@
 ### Task 1: Research and design
 
 - [x] Run CrossPoint 1.6.5 and the reference firmwares at `194f286`; read the TRM, the SVD, ESP-IDF v5.5.2 and QEMU's tag (research P).
-- [x] Spec, ADR 0010, this plan.
+- [x] Spec, ADR 0012, this plan.
 
 ### Task 2: The signal traits (`emu-core`)
 

@@ -60,7 +60,7 @@ pub(crate) const FSPI_CS: std::ops::Range<Signal> = FSPICS0..FSPICS0 + 6;
 /// routed, and the levels at rest are those of an idle bus: UART TX high, I2C released (high, an
 /// open-drain pad then releasing the line), the SPI clock low (mode 0), MOSI low, HD and WP high,
 /// every CS high (inactive). FSPIQ is an input of a master: it never enables the pad. A pad's level
-/// while a transfer is under way is not modelled: a transfer is delivered whole (ADR 0010), and a
+/// while a transfer is under way is not modelled: a transfer is delivered whole (ADR 0012), and a
 /// chip watching an SPI clock or MOSI pin sees its rest level.
 #[must_use]
 pub(crate) fn rest(signal: Signal) -> Option<Drive> {

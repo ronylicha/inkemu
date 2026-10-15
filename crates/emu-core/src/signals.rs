@@ -1,4 +1,4 @@
-//! The signals between a system-on-chip and the chips around it (spec §3.2, ADR 0010).
+//! The signals between a system-on-chip and the chips around it (spec §3.2, ADR 0012).
 //!
 //! A chip outside the `SoC` (a display controller, a memory card, a button ladder) never sees the
 //! `SoC`: it sees lines. Four traits say what a chip does on them, and nothing here knows which `SoC`

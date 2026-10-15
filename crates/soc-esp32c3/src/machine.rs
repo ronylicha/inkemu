@@ -12,8 +12,8 @@ use crate::periph::{AttachError, SpiWires, UsbHost};
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
 use cpu_rv32::{
-    Boundary, DatasheetTiming, Decoded, Exception, Hart, HartConfig, InterruptModel,
-    MisalignedPolicy, QemuIcountTiming, StepOutcome, Trap, VendorCsrs,
+    Boundary, Core, DatasheetTiming, Decoded, Exception, Hart, HartConfig, InterruptModel,
+    MisalignedPolicy, QemuIcountTiming, StepOutcome, Trap,
 };
 use emu_core::{
     AnalogSource, Cycles, Frequency, GpioInput, GpioOutput, SpiTarget, TimingModel, TraceHash,
@@ -361,7 +361,7 @@ impl Esp32C3 {
         // silicon trace or the SP1b-4 lockstep settles it.
         let hart_config = HartConfig {
             misaligned: MisalignedPolicy::Allow,
-            vendor_csrs: VendorCsrs::Esp32C3,
+            core: Core::Esp32C3,
             interrupts: InterruptModel::Controller,
         };
         let mut bus = SocBus::new(rom, flash, config);
@@ -658,7 +658,7 @@ impl Esp32C3 {
         let outcome = self.hart.step(&mut self.bus, self.pricing.model());
         if let StepOutcome::Trapped { trap, .. } = outcome
             // An `ecall` is a request to the trap handler, not a fault worth reporting.
-            && trap.cause != Exception::EcallM
+            && !trap.cause.is_environment_call()
         {
             self.bus.ctx.diag.record(Diagnostic::Exception {
                 cause: trap.cause,
@@ -1133,7 +1133,7 @@ impl Esp32C3 {
     }
 
     /// Attaches a chip that drives pin `pin` (a button, a BUSY line, a detection line): wherever
-    /// the pad is an input, the `SoC` reads the level the chip gives (ADR 0010). A chip whose level
+    /// the pad is an input, the `SoC` reads the level the chip gives (ADR 0012). A chip whose level
     /// changes by itself says when (`GpioInput::next_change`); one changed from outside the run
     /// is read again by [`Esp32C3::inputs_changed`].
     /// # Errors
@@ -1182,7 +1182,7 @@ impl Esp32C3 {
 
     /// An attached chip changed what it drives from outside the run (a button the user pressed):
     /// the pins are read again at the present device time, and a GPIO interrupt it triggers is
-    /// raised. Recording such a change in a session is the caller's (ADR 0010).
+    /// raised. Recording such a change in a session is the caller's (ADR 0012).
     pub fn inputs_changed(&mut self) {
         self.bus.periph.io.settle(&mut self.bus.ctx);
     }

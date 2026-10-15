@@ -2,7 +2,7 @@
 
 Plan : `docs/superpowers/plans/2026-10-15-sp2b-soc-peripherals.md` (2b-R1 à 2b-R7). Spec :
 `docs/superpowers/specs/2026-10-15-sp2b-soc-peripherals-design.md` (2b-D1 à 2b-D14, D10, D13 et D14 précisées par
-2b-R2 à 2b-R4). Recherche : `docs/research/esp32c3-soc-peripherals-sp2b.md`. ADR 0010 (nouvel). Point de départ :
+2b-R2 à 2b-R4). Recherche : `docs/research/esp32c3-soc-peripherals-sp2b.md`. ADR 0012 (nouvel). Point de départ :
 `main` à `194f286`.
 
 ## Résultat
@@ -29,7 +29,7 @@ Mesures du 2026-10-15, construction release de cette branche, ROM rev3, poste de
 
 2b-D1 à 2b-D14 de la spec et 2b-R1 à 2b-R7 du plan. Les plus engageantes :
 
-- les quatre traits et le branchement par broches (ADR 0010) : SP2d ne fait que câbler ;
+- les quatre traits et le branchement par broches (ADR 0012) : SP2d ne fait que câbler ;
 - pas de GDMA, ni DMA de SPI2 (refusé par nom) : CrossPoint n'en use pas ;
 - le balayage minuté du bootloader d'ESP-IDF accepté sans effet (2b-R2) ;
 - le test de `soc_signals` dans `boards` (2b-R3) ;
@@ -86,7 +86,7 @@ Mesures du 2026-10-15, construction release de cette branche, ROM rev3, poste de
 
 Fichiers et types à reporter dans la cartographie du projet :
 
-- `architecture_overview.md` : nouveau contrat « signaux vers les puces externes » (ADR 0010) : `emu-core::signals`
+- `architecture_overview.md` : nouveau contrat « signaux vers les puces externes » (ADR 0012) : `emu-core::signals`
   (`Level`, `Nanos`, `GpioInput`, `GpioOutput`, `SpiTarget`, `AnalogSource`, impl. pour `Rc<RefCell<T>>`, pas de
   `Send`) ; le SoC résout ce que porte chaque broche ; `Esp32C3::attach_input/attach_output/attach_spi/attach_analog`
   et `inputs_changed` ; `AttachError`, `SpiWires` réexportés à la racine de `soc_esp32c3`.
@@ -107,7 +107,7 @@ Fichiers et types à reporter dans la cartographie du projet :
   `the_stock_x4_firmware_goes_back_to_deep_sleep_without_its_power_button`).
 - `integrations.md` : firmware de référence `soc_signals` (Apache-2.0, console USB-Serial-JTAG,
   `SHA256SUMS.inputs-soc-signals`) ; `adc_wait_panic` réépinglé ; variable `INKEMU_SOC_SIGNALS_APP` ; `boards`
-  dev-dépend d'`emu-core` et `sha2` ; ADR 0010.
+  dev-dépend d'`emu-core` et `sha2` ; ADR 0012.
 - `database_schema.md` : rien (aucun état persistant nouveau).
 - `frontend_spa.md` (SP2c) : les puces branchées et `inputs_changed` sont la porte des boutons de l'interface.
 - `tech_debt.md` : les héritiers ci-dessus (SP2d, SP2a, SP3) ; la fenêtre `crosspoint` du lockstep.

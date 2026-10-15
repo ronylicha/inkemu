@@ -1,7 +1,7 @@
 //! The peripherals of the ESP32-C3 through which the X4 reaches its chips (sub-project 2b), driven
 //! by the ESP-IDF drivers of `tools/reference-firmware/soc_signals`, booted from the real mask ROM
 //! behind the bootloader inkemu ships, with chips attached to the pins of the X4 through the signal
-//! traits of `emu-core` (ADR 0010): a panel on GP-SPI2 (hardware chip select GPIO21, data/command
+//! traits of `emu-core` (ADR 0012): a panel on GP-SPI2 (hardware chip select GPIO21, data/command
 //! GPIO4) whose reset (GPIO5) it hears and whose BUSY line (GPIO6) it drives, an SD card on the same
 //! bus (software chip select GPIO12), and a voltage on GPIO1 for the SAR ADC. No chip sits on I2C0.
 //!

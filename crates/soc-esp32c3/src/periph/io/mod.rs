@@ -1,4 +1,4 @@
-//! The GPIO matrix and the IO MUX: one model answers both blocks (ADR 0010, decision 2b-D3).
+//! The GPIO matrix and the IO MUX: one model answers both blocks (ADR 0012, decision 2b-D3).
 //!
 //! It owns everything that decides what a pad does: the registers of the two blocks, the levels of
 //! the output signals of the modelled peripherals (GP-SPI2's chip selects), and the chips the board

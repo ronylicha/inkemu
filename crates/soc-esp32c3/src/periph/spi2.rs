@@ -2,7 +2,7 @@
 //!
 //! A transaction starts at the write of `CMD.USR` and lasts its bits at the clock `CLOCK` sets. At
 //! its end the IO matrix delivers its bytes to the chips selected on the pins its signals reach
-//! (ADR 0010), the bytes heard land in `W0..W15`, `CMD.USR` falls and `DMA_INT_RAW.TRANS_DONE`
+//! (ADR 0012), the bytes heard land in `W0..W15`, `CMD.USR` falls and `DMA_INT_RAW.TRANS_DONE`
 //! rises. What the model does not carry out is refused by name, and the transaction then ends at
 //! once without sending anything, so that no firmware waits for ever.
 use crate::clock::XTAL_PERIOD;

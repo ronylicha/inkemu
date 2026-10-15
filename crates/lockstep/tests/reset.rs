@@ -20,6 +20,7 @@ const A0: u8 = 10;
 const A1: u8 = 11;
 const T2: u8 = 7;
 const SP: u8 = 2;
+const GP: u8 = 3;
 const NOP: u32 = 0x0000_0013;
 /// `RTC_CNTL.OPTIONS0` and its bit 5, `SW_PROCPU_RST`: the CPU reset `esp_restart` asks for.
 const SW_PROCPU_RST: u32 = 1 << 5;
@@ -485,12 +486,13 @@ fn read_in_qemu(states: &mut [CpuState], from: usize, until: usize, read: u32) {
 
 #[test]
 fn a_csrrsi_writes_only_its_immediate() {
-    // The second life sets W of entry 0 with an immediate, then reads pmpcfg0: R and X are still
-    // the kept bits. sp holds every bit, so that a reading of the immediate as a register (x2)
-    // would count them all written.
+    // The second life sets R and W of entry 0 with an immediate, then reads pmpcfg0: X is still
+    // the kept bit. gp holds every bit, so that a reading of the immediate as a register (x3)
+    // would count them all written. Not W alone: R = 0 with W = 1 is reserved, a write the PMP
+    // ignores (QEMU's `pmp_write_cfg`, and inkemu's since SP1b-4f).
     let program = lives(&[
-        addi(SP, 0, -1),
-        csrrsi(0, PMPCFG0, 0x02),
+        addi(GP, 0, -1),
+        csrrsi(0, PMPCFG0, 0x03),
         csrrs(A0, PMPCFG0, 0),
         addi(A1, 0, 0x07),
         csrrs(0, PMPCFG0, A1),

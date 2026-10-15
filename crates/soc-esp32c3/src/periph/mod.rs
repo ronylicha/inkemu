@@ -393,7 +393,7 @@ const RADIO_POWER_ACCEPTED: [Accepted; 4] = [
 
 #[derive(Debug)]
 pub struct Peripherals {
-    /// The GPIO matrix and the IO MUX, with the chips of the board (ADR 0010).
+    /// The GPIO matrix and the IO MUX, with the chips of the board (ADR 0012).
     pub io: IoMatrix,
     pub intmatrix: IntMatrix,
     pub rtc_cntl: RtcCntl,
@@ -517,7 +517,7 @@ impl Peripherals {
             Event::UsbSerialJtag => self.usb_serial_jtag.wake(ctx),
             Event::ModuleReset(module) => self.reset_module(ctx, module),
             Event::Pins => self.io.wake(ctx),
-            // GP-SPI2 and the SAR ADC reach the pads through the matrix (ADR 0010).
+            // GP-SPI2 and the SAR ADC reach the pads through the matrix (ADR 0012).
             Event::Spi2 => self.spi2.wake(ctx, &mut self.io),
             Event::I2c0 => self.i2c0.wake(ctx),
             Event::SarAdc => self.saradc.wake(ctx, &mut self.io),

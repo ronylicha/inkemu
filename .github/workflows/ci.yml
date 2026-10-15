@@ -34,9 +34,9 @@ jobs:
       # `wasm32-unknown-unknown`, the target of the web version: this step notices a crate that
       # does not build there. It cannot notice host I/O, which std compiles there and fails at run
       # time: the clippy step above refuses it in firmware, boards, soc-esp32c3, console-script,
-      # session and lockstep (their clippy.toml).
+      # session, lockstep and chips (their clippy.toml).
       - name: Build the model for WebAssembly
-        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3 -p firmware -p boards -p console-script -p session -p lockstep
+        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3 -p firmware -p boards -p console-script -p session -p lockstep -p chips
       - uses: EmbarkStudios/cargo-deny-action@v2
   coverage:
     runs-on: ubuntu-24.04

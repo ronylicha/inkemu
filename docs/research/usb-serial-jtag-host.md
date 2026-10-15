@@ -342,3 +342,11 @@ Side conditions that are not USJ: the monitor needs the 1 kHz SysTick and its in
 | 11 | The X4 wires GPIO18/19 to its USB-C connector and has a USB-presence GPIO that must agree with the host state | coherence of the board profile | X4 schematic or board probing (SP2) |
 | 12 | Core reset keeps the USJ block (IR §4) while inkemu's `UsbSerialJtag::reset` clears the packet being filled | output across `esp_restart` | the reset table of the TRM |
 | 13 | A line longer than a packet, sent while the `usb_serial_jtag_echo` task still prints the dump of the line before, reaches the driver's ring whole and is read in one call (seen in the emulator only; on a chip the dump, about 95 characters, fits in the 128-byte UART FIFO and may be done before the second OUT packet) | the script of milestone 2, which waits for that dump before it sends | an echo on a board, a line sent the moment the echo of the line before arrives |
+
+## Correction of 2026-10-15, to §0 (SP2a)
+
+The source `CP:` at `e54c00873189` (§0) declares `version = 1.6.5`, but it is not the release: the tag `1.6.5`
+of `crosspoint-reader/crosspoint-reader` is on `93e98bb78702e29868a16a13b80c40e6b36ccdff` (2026-09-27), whose
+FreeInk is `111fdcc7f0176c3ee38391a160ee296bf492dbd8`; `e54c0087` is a later commit of `main`, 56 commits after
+it. What §G reads in `CP:` is the source of that commit, not of the 1.6.5 sources. Checked through the GitHub
+API while reviewing SP2a (`docs/research/sp2a-external-chips.md` §0). The sections above are left as they were.

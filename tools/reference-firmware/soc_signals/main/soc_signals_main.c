@@ -4,7 +4,7 @@
  * A reference firmware of inkemu, written for its tests: the peripherals of the ESP32-C3 through
  * which the Xteink X4 reaches its chips, driven by the ESP-IDF drivers, on the pins of the X4
  * (FreeInk's board header, docs/research/esp32c3-soc-peripherals-sp2b.md). Its test attaches
- * chips to the emulated pins (ADR 0010) and checks what they saw and what the firmware prints.
+ * chips to the emulated pins (ADR 0012) and checks what they saw and what the firmware prints.
  *
  * 1. GPIO: the reset line of the panel (GPIO5) is an output, held low then released; its BUSY
  *    line (GPIO6) is an input with an interrupt on both edges, whose handler counts the edges.

@@ -1,7 +1,8 @@
-//! Runs every committed riscv-tests ELF; any failure outside the documented skip list fails CI.
+//! Runs every committed riscv-tests ELF; any failure outside the documented skip list fails CI, and
+//! so does a count of tests run or skipped other than the pins of `tools/conformance/versions.env`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use cpu_rv32::HartConfig;
-use emu_cli::rvtest::{RunResult, TestMachine};
+use cpu_rv32::{HartConfig, MisalignedPolicy};
+use emu_cli::rvtest::{RunResult, TestMachine, bench_hart};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
@@ -9,6 +10,11 @@ const MAX_STEPS: u64 = 5_000_000;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// The hart `inkemu rvtest` runs the suites on.
+fn bench() -> HartConfig {
+    bench_hart(MisalignedPolicy::Trap)
 }
 
 fn fixture_dir() -> PathBuf {
@@ -37,6 +43,17 @@ fn manifest() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The count `key` pins in `tools/conformance/versions.env`.
+fn pinned_count(key: &str) -> usize {
+    let text = std::fs::read_to_string(repo_root().join("tools/conformance/versions.env")).unwrap();
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("{key} is not in tools/conformance/versions.env"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("{key} in versions.env is not a count: {e}"))
+}
+
 fn fixtures() -> Vec<PathBuf> {
     manifest()
         .into_iter()
@@ -50,26 +67,47 @@ fn all_riscv_tests_pass_except_documented_skips() {
     let files = fixtures();
     let mut failures = Vec::new();
     let mut ran = 0_usize;
+    let mut skipped = 0_usize;
     for path in &files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         if skips.contains(&name) {
+            skipped += 1;
             continue;
         }
-        let mut m =
-            TestMachine::from_elf(&std::fs::read(path).unwrap(), HartConfig::default()).unwrap();
+        let mut m = TestMachine::from_elf(&std::fs::read(path).unwrap(), bench()).unwrap();
         ran += 1;
         match m.run(MAX_STEPS) {
             RunResult::Passed => {}
             other => failures.push(format!("{name}: {other:?}")),
         }
     }
-    println!("riscv-tests: {ran} ran, {} skipped", skips.len());
+    println!("riscv-tests: {ran} ran, {skipped} skipped");
     assert!(
         failures.is_empty(),
         "{} failing:\n{}",
         failures.len(),
         failures.join("\n")
     );
+    // A new skip-list entry or a lost ELF would otherwise leave this test green on fewer tests.
+    assert_eq!(
+        (ran, skipped),
+        (
+            pinned_count("RISCV_TESTS_RAN"),
+            pinned_count("RISCV_TESTS_SKIPPED")
+        ),
+        "riscv-tests ran and skipped differ from RISCV_TESTS_RAN / RISCV_TESTS_SKIPPED in \
+         tools/conformance/versions.env: re-count deliberately and update the pins with the change"
+    );
+}
+
+/// The bench declares no Zicntr, as Sail is configured (`"Zicntr": {"supported": false}`): the
+/// first read of `cycle` in `rv32mi-p-zicntr` must trap, and the test fail at its case 2. If it
+/// passed, the bench would claim an extension the reference model of arch-test does not have.
+#[test]
+fn the_skipped_zicntr_test_fails_at_its_first_read_of_cycle() {
+    let bytes = std::fs::read(fixture_dir().join("rv32mi-p-zicntr")).unwrap();
+    let mut m = TestMachine::from_elf(&bytes, bench()).unwrap();
+    assert_eq!(m.run(MAX_STEPS), RunResult::Failed { test_number: 2 });
 }
 
 #[test]
@@ -127,7 +165,7 @@ fn skip_list_entries_exist_and_have_reasons() {
 fn same_test_twice_gives_same_trace_hash() {
     let bytes = std::fs::read(fixture_dir().join("rv32ui-p-add")).unwrap();
     let run = || {
-        let mut m = TestMachine::from_elf(&bytes, HartConfig::default()).unwrap();
+        let mut m = TestMachine::from_elf(&bytes, bench()).unwrap();
         assert_eq!(m.run(MAX_STEPS), RunResult::Passed);
         m.trace_hash()
     };
@@ -141,7 +179,7 @@ const LW_SIGNATURE: [u32; 4] = [0x00ff_00ff, 0xff00_ff00, 0x0ff0_0ff0, 0xf00f_f0
 #[test]
 fn signature_returns_the_words_of_the_signature_region() {
     let bytes = std::fs::read(fixture_dir().join("rv32ui-p-lw")).unwrap();
-    let mut m = TestMachine::from_elf(&bytes, HartConfig::default()).unwrap();
+    let mut m = TestMachine::from_elf(&bytes, bench()).unwrap();
     assert_eq!(m.run(MAX_STEPS), RunResult::Passed);
     assert_eq!(m.signature().unwrap(), LW_SIGNATURE);
 }
@@ -150,7 +188,7 @@ fn signature_returns_the_words_of_the_signature_region() {
 fn signature_is_empty_when_the_region_is_empty() {
     // rv32ui-p-add has begin_signature == end_signature.
     let bytes = std::fs::read(fixture_dir().join("rv32ui-p-add")).unwrap();
-    let mut m = TestMachine::from_elf(&bytes, HartConfig::default()).unwrap();
+    let mut m = TestMachine::from_elf(&bytes, bench()).unwrap();
     assert_eq!(m.run(MAX_STEPS), RunResult::Passed);
     assert_eq!(m.signature().unwrap(), Vec::<u32>::new());
 }
