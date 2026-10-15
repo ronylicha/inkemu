@@ -72,6 +72,11 @@ jobs:
           pnpm typecheck
           pnpm test
           pnpm build
+      # The shell's dependency tree (Tauri, WebKitGTK, GTK 3) is checked as the root one is, against
+      # its own rules: app/src-tauri/deny.toml, which cargo-deny finds beside the manifest.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: app/src-tauri/Cargo.toml
       # The libraries the Tauri guide lists for Debian and Ubuntu (docs/research/sp2c-app-stack.md).
       - name: Install the system libraries of Tauri
         run: |
