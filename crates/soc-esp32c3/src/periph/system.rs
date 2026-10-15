@@ -144,8 +144,8 @@ const ACCEPTED: [Accepted; 9] = [
     Accepted::svd(
         "SYSTEM",
         "MEM_PD_MASK",
-        "memory power-down mask in light sleep, which is refused by name: no effect to see without a power model",
-        "SP4",
+        "memory power-down mask in light sleep, which is refused by name: no effect to see without a power model measured on the chip (the datasheet has no figure per domain)",
+        "SP8",
     ),
 ];
 
