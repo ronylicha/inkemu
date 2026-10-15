@@ -972,11 +972,17 @@ impl Esp32C3 {
         // Spec §7: a reset leaves an entry in the journal, with the PC and the stack it found,
         // and the device time that sets it apart from the other resets at the same PC.
         let at_us = self.device_time_nanos() / 1_000;
+        let woken_by = if cause == ResetCause::DeepSleep {
+            self.bus.periph.rtc_cntl.latched_wake()
+        } else {
+            None
+        };
         self.bus.ctx.diag.record(Diagnostic::Reset {
             cause,
             pc,
             sp,
             at_us,
+            woken_by,
         });
         self.bus.reset(cause, pc, sp);
         // A system reset clears the holds of `RTC_CNTL`; a core reset keeps them, and the held
@@ -4675,6 +4681,7 @@ mod tests {
                 sp: 0x3FC9_0000,
                 // The few dozen cycles of 20 MHz before the store: a microsecond, rounded down.
                 at_us: 1,
+                woken_by: None,
             }],
             "the reset is in the journal, with the PC and the stack it found, and nothing else is"
         );
@@ -4692,6 +4699,7 @@ mod tests {
             pc: ROM_BASE + 4,
             sp: 0,
             at_us,
+            woken_by: None,
         };
         // 2 941 176 us: 400 000 cycles of the 136 kHz slow clock, rounded down.
         assert_eq!(

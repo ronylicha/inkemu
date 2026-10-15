@@ -617,6 +617,35 @@ pub enum MappingFault {
     BeyondFlash,
 }
 
+/// What woke the chip from a deep sleep: the cause `RTC_CNTL` latches (`SLP_WAKEUP_CAUSE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wake {
+    /// The alarm of the RTC timer.
+    RtcTimer,
+    /// Pins at their wake level (ADR 0013): bit `n` for GPIO`n`, as `GPIO_WAKEUP_STATUS` holds
+    /// them.
+    Pins(u32),
+}
+
+impl fmt::Display for Wake {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Wake::RtcTimer => f.write_str("the RTC timer"),
+            Wake::Pins(pins) => {
+                let names: Vec<String> = (0..32)
+                    .filter(|pin| pins & (1 << pin) != 0)
+                    .map(|pin| format!("GPIO{pin}"))
+                    .collect();
+                if names.is_empty() {
+                    f.write_str("a pin")
+                } else {
+                    f.write_str(&names.join(" and "))
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Diagnostic {
     /// Spec §5.2: `value` is what the read returned, or what the ignored write carried.
@@ -674,6 +703,9 @@ pub enum Diagnostic {
         /// When the reset took place: microseconds of device time since power-on, as the summary
         /// of a run counts them.
         at_us: u64,
+        /// What woke the chip, for a wake from deep sleep ([`ResetCause::DeepSleep`]): the cause
+        /// `RTC_CNTL` latched for the firmware to read. `None` for every other reset.
+        woken_by: Option<Wake>,
     },
     /// A clocked chip of the board (ADR 0012) stayed due after each of
     /// [`STUCK_CLOCKED_INSTANTS`] advances in a row: its deadline does not move
@@ -899,9 +931,11 @@ impl fmt::Display for Diagnostic {
                 pc,
                 sp,
                 at_us,
+                woken_by,
             } => write!(
                 f,
-                "woken from deep sleep by the RTC timer (rst:{code:#x}), a core reset at {at_us} us of device time; the CPU had stopped at pc {pc:#010x}, sp {sp:#010x}",
+                "woken from deep sleep by {by} (rst:{code:#x}), a core reset at {at_us} us of device time; the CPU had stopped at pc {pc:#010x}, sp {sp:#010x}",
+                by = woken_by.unwrap_or(Wake::RtcTimer),
                 code = ResetCause::DeepSleep.code()
             ),
             // The code as the ROM prints it at the next boot (`rst:0x7`), so that the two lines
@@ -911,6 +945,7 @@ impl fmt::Display for Diagnostic {
                 pc,
                 sp,
                 at_us,
+                ..
             } => write!(
                 f,
                 "reset by {cause} (rst:{code:#x}) at pc {pc:#010x}, sp {sp:#010x}, at {at_us} us of device time",
@@ -1369,6 +1404,7 @@ mod tests {
             pc,
             sp,
             at_us,
+            woken_by: (cause == ResetCause::DeepSleep).then_some(Wake::RtcTimer),
         }
     }
 
@@ -1416,6 +1452,19 @@ mod tests {
         ] {
             assert_eq!(reset_at(cause, pc, sp).to_string(), text);
         }
+        // A wake by a pin names the pin, not the timer (ADR 0013).
+        let by_the_key = Diagnostic::Reset {
+            cause: ResetCause::DeepSleep,
+            pc: 0x4038_0f2c,
+            sp: 0x3FC9_8000,
+            at_us: 1_300_000,
+            woken_by: Some(Wake::Pins(1 << 3)),
+        };
+        assert_eq!(
+            by_the_key.to_string(),
+            "woken from deep sleep by GPIO3 (rst:0x5), a core reset at 1300000 us of device time; the CPU had stopped at pc 0x40380f2c, sp 0x3fc98000"
+        );
+        assert_eq!(Wake::Pins(0b101).to_string(), "GPIO0 and GPIO2");
     }
 
     #[test]

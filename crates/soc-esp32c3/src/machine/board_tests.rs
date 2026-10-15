@@ -471,14 +471,23 @@ fn a_key_pressed_during_a_deep_sleep_wakes_the_chip_at_its_instant() {
         .drain_diagnostics()
         .into_iter()
         .filter_map(|d| match d {
-            Diagnostic::Reset { cause, at_us, .. } => Some((cause, at_us)),
+            Diagnostic::Reset {
+                cause,
+                at_us,
+                woken_by,
+                ..
+            } => Some((cause, at_us, woken_by)),
             _ => None,
         })
         .collect();
     assert_eq!(
         resets,
-        [(ResetCause::DeepSleep, (press.get() + 1) * 25 / 4 / 1_000)],
-        "woken at the instant the key acted"
+        [(
+            ResetCause::DeepSleep,
+            (press.get() + 1) * 25 / 4 / 1_000,
+            Some(crate::Wake::Pins(1 << 3))
+        )],
+        "woken by GPIO3 at the instant the key acted, and the journal says so"
     );
     assert_eq!(
         bus_word(&mut m, rtc("GPIO_WAKEUP")) & 0x3F,

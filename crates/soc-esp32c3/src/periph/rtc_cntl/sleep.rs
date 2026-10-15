@@ -13,7 +13,7 @@
 //! this module reads `DG_WRAP_PD_EN` from it at the write of `SLEEP_EN`.
 use super::{INT_SLP_REJECT, INT_SLP_WAKEUP, INT_TIMER_ALARM, RtcCntl, reg};
 use crate::ctx::Ctx;
-use crate::diag::Unsupported;
+use crate::diag::{Unsupported, Wake};
 use crate::periph::RTC_CNTL_BASE;
 use crate::reset::ResetCause;
 use emu_core::{Cycles, Level};
@@ -310,6 +310,16 @@ impl RtcCntl {
         self.int_raw |= INT_SLP_WAKEUP;
         self.sleep.state0 &= !SLEEP_EN;
         ctx.request_reset(ResetCause::DeepSleep);
+    }
+
+    /// What the latched wake cause says woke the chip, the cause ESP-IDF reads after the reset of
+    /// cause 5: `None` when neither the timer nor a pin is latched.
+    pub(crate) fn latched_wake(&self) -> Option<Wake> {
+        match self.sleep.wakeup_cause {
+            TIMER_WAKE => Some(Wake::RtcTimer),
+            GPIO_WAKE => Some(Wake::Pins(self.sleep.gpio_status & GPIO_WAKEUP_STATUS)),
+            _ => None,
+        }
     }
 
     /// The sleep, for the machine and a front end: `None` while the chip is awake.

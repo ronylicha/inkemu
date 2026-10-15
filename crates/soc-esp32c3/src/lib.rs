@@ -29,7 +29,7 @@ pub mod test_support;
 
 pub use chip::ChipRevision;
 pub use config::{CompatActs, QemuCompat, SocConfig, Timing};
-pub use diag::Diagnostic;
+pub use diag::{Diagnostic, Wake};
 pub use flash::{
     FlashConfig, FlashConfigError, FlashDevice, FlashImageError, FlashWrite, JedecId, NorFlash,
 };
