@@ -1,7 +1,8 @@
 //! The SSD1677 driven as the X4's firmware drives it: the byte sequences of `FreeInk`'s
-//! `Ssd1677Driver` (the hardware layer of `CrossPoint` 1.6.5, `Free-Ink/freeink-sdk` at
-//! `7fcd3b34`, research `sp2a-external-chips.md` §4), through the public interface only, on the
-//! 800×480 panel of the X4 (`SP2a` design §5, criterion 2).
+//! `Ssd1677Driver` (the hardware layer of `CrossPoint`: `Free-Ink/freeink-sdk` at `111fdcc7` for
+//! the release 1.6.5, read at `7fcd3b34`, the submodule of `CrossPoint`'s `main`, whose X4 path
+//! sends the same bytes; research `sp2a-external-chips.md` §0 and §4), through the public interface
+//! only, on the 800×480 panel of the X4 (`SP2a` design §5, criterion 2).
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
 
 use chips::{DiagnosticKind, PanelImage, Plane, RefreshKind, Ssd1677, Ssd1677Config, Temperature};
@@ -254,6 +255,11 @@ fn a_half_refresh_uses_the_waveform_of_the_forced_ninety_degrees() {
 }
 
 /// `FreeInk`'s `lut_factory_quality`, the X4's absolute four-level LUT.
+///
+/// Copied from `FreeInk` (`Free-Ink/freeink-sdk`, `Ssd1677Luts.h`), Copyright (c) 2026 `FreeInk`,
+/// MIT licence, itself derived from the `OpenX4` E-Paper Community SDK, Copyright (c) 2025 Open X4
+/// E-Paper Contributors, MIT licence. The licence and the notice are in `third_party/freeink-sdk/`,
+/// with the provenance of this table.
 const FACTORY_GREY: [u8; 110] = [
     0x00, 0x4A, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x80, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
@@ -268,6 +274,17 @@ const FACTORY_GREY: [u8; 110] = [
     0x22, 0x22, 0x22, 0x22, 0x22, //
     0x17, 0x41, 0xA8, 0x32, 0x30,
 ];
+
+/// The MIT licence asks its notice to travel with the copy: the two files stay in the repository
+/// as long as the table does (removing them breaks this file's build), unmodified.
+#[test]
+fn the_copied_lut_keeps_freeink_s_licence_and_notice() {
+    let license = include_str!("../../../third_party/freeink-sdk/LICENSE");
+    let notice = include_str!("../../../third_party/freeink-sdk/NOTICE");
+    assert!(license.starts_with("MIT License\n\nCopyright (c) 2026 FreeInk\n"));
+    assert!(notice.contains("Copyright (c) 2025 Open X4 E-Paper Contributors"));
+    assert!(notice.contains("panel initialization sequences and waveform LUTs are derived"));
+}
 
 #[test]
 fn the_factory_grey_lut_gives_four_levels() {

@@ -876,6 +876,11 @@ fn update_control_1_reads_the_planes_normal_as_zero_or_inverted() {
 }
 
 /// The X4's factory four-level LUT (`FreeInk` `lut_factory_quality`, research §4), 110 bytes.
+///
+/// Copied from `FreeInk` (`Free-Ink/freeink-sdk`, `Ssd1677Luts.h`), Copyright (c) 2026 `FreeInk`,
+/// MIT licence, itself derived from the `OpenX4` E-Paper Community SDK, Copyright (c) 2025 Open X4
+/// E-Paper Contributors, MIT licence. The licence and the notice are in `third_party/freeink-sdk/`,
+/// with the provenance of this table.
 const FACTORY_GREY: [u8; 110] = [
     0x00, 0x4A, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
     0x80, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
