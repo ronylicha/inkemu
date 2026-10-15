@@ -297,6 +297,11 @@ impl Drop for ClosingGuard {
 pub struct ErrorDto {
     kind: String,
     message: String,
+    /// An address the refusal offers in place of the one refused (`0x40380100`), which the
+    /// interface says in its own language: the instruction-bus address of a breakpoint refused
+    /// on a data-bus alias. Absent from every other refusal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested: Option<String>,
 }
 
 impl ErrorDto {
@@ -304,6 +309,7 @@ impl ErrorDto {
         ErrorDto {
             kind: kind.to_owned(),
             message: message.to_string(),
+            suggested: None,
         }
     }
 }
@@ -316,7 +322,16 @@ impl From<LaunchError> for ErrorDto {
 
 impl From<CommandError> for ErrorDto {
     fn from(error: CommandError) -> ErrorDto {
-        ErrorDto::new(error.kind(), &error)
+        let suggested = match &error {
+            CommandError::Point(point) => {
+                point.suggested().map(|address| format!("{address:#010x}"))
+            }
+            _ => None,
+        };
+        ErrorDto {
+            suggested,
+            ..ErrorDto::new(error.kind(), &error)
+        }
     }
 }
 
@@ -1014,6 +1029,20 @@ mod tests {
         // 0x3fc80000, the data-bus view of the SRAM.
         let alias: PointsRequest = serde_json::from_str(r#"{"breakpoints":[1070071808]}"#).unwrap();
         assert_eq!(points_of(Some(alias)).unwrap_err().kind, "dataBusAlias");
+    }
+
+    /// A breakpoint refused on a data-bus alias carries, as a field the interface reads, the
+    /// instruction-bus address to give instead; no other refusal carries one.
+    #[test]
+    fn a_refused_data_bus_alias_carries_the_address_to_give_instead() {
+        // 0x3fc80100, the data-bus view of the SRAM.
+        let alias: PointsRequest = serde_json::from_str(r#"{"breakpoints":[1070072064]}"#).unwrap();
+        let refused = serde_json::to_value(points_of(Some(alias)).unwrap_err()).unwrap();
+        assert_eq!(refused["kind"], "dataBusAlias");
+        assert_eq!(refused["suggested"], "0x40380100");
+        let odd: PointsRequest = serde_json::from_str(r#"{"breakpoints":[1073741825]}"#).unwrap();
+        let other = serde_json::to_value(points_of(Some(odd)).unwrap_err()).unwrap();
+        assert_eq!(other.get("suggested"), None, "{other}");
     }
 
     /// The debugger reads the emulator of the start it names, stopped at the breakpoint it began

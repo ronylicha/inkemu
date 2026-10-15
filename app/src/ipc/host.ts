@@ -65,7 +65,9 @@ export interface HostApi {
 /** Turns what a rejected command gives into a `HostError`. */
 export function asHostError(reason: unknown): HostError {
   if (isHostError(reason)) {
-    return reason;
+    const { kind, message } = reason;
+    const suggested = (reason as { suggested?: unknown }).suggested;
+    return typeof suggested === "string" ? { kind, message, suggested } : { kind, message };
   }
   return { kind: "ipc", message: reason instanceof Error ? reason.message : String(reason) };
 }

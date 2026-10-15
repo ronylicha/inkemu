@@ -203,7 +203,7 @@ export const fr = {
   "error.notKept": "L’appareil a été éteint sans tout conserver.",
   "error.point": "Ce point du débogueur est refusé.",
   "error.dataBusAlias":
-    "Cette adresse est un alias du bus de données : le processeur n’y exécute jamais rien, un point d’arrêt n’y arrêterait pas. Posez-le à l’adresse du bus d’instructions ci-dessous.",
+    "Cette adresse est un alias du bus de données : le processeur n’y exécute jamais rien, un point d’arrêt n’y arrêterait pas. Posez-le à {suggested}, la même cellule vue par le bus d’instructions.",
   "said.captured": "Capture enregistrée : {name}",
   "said.recording": "L’appareil est rallumé, et cette vie est enregistrée dans {name}",
 

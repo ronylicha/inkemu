@@ -63,6 +63,18 @@ impl PointError {
             _ => "point",
         }
     }
+
+    /// The address the refusal offers in place of the one refused, for an interface to say in
+    /// its own words: the instruction-bus address of a [`PointError::DataBusAlias`].
+    #[must_use]
+    pub const fn suggested(&self) -> Option<u32> {
+        match self {
+            PointError::DataBusAlias {
+                instruction_bus, ..
+            } => Some(*instruction_bus),
+            _ => None,
+        }
+    }
 }
 
 /// The points a debugger set.
@@ -351,7 +363,9 @@ mod tests {
                     .contains(&format!("set it at {twin:#010x}")),
                 "{refused}"
             );
+            assert_eq!(refused.suggested(), Some(twin));
         }
+        assert_eq!(PointError::TooManyBreakpoints.suggested(), None);
         assert_eq!(points.breakpoints().count(), 0);
     }
 

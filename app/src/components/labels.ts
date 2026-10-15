@@ -8,10 +8,15 @@ function isKey(key: string): key is Key {
   return key in fr;
 }
 
-/** The translation of `prefix.name`, else `name` itself. */
-export function labelOf(t: Translate, prefix: string, name: string): string {
+/** The translation of `prefix.name`, with `params` in it, else `name` itself. */
+export function labelOf(
+  t: Translate,
+  prefix: string,
+  name: string,
+  params?: Record<string, string | number>,
+): string {
   const key = `${prefix}.${name}`;
-  return isKey(key) ? t(key) : name;
+  return isKey(key) ? t(key, params) : name;
 }
 
 /** Device time in nanoseconds as seconds with three decimals: `12.345 s`. */

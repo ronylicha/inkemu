@@ -294,6 +294,9 @@ export interface Started {
 export interface HostError {
   kind: string;
   message: string;
+  /** An address the host offers in place of the one refused (`0x40380100`), said in the
+   * interface's words: the instruction-bus address of a breakpoint refused on a data-bus alias. */
+  suggested?: string;
 }
 
 export function isHostError(value: unknown): value is HostError {
