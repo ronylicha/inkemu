@@ -229,14 +229,17 @@ jobs:
           INKEMU_ADC_WAIT_PANIC_APP: ${{ runner.temp }}/reference-firmware/adc_wait_panic.bin
           INKEMU_DEEP_SLEEP_TIMER_APP: ${{ runner.temp }}/reference-firmware/deep_sleep_timer.bin
           INKEMU_COREMARK_APP: ${{ runner.temp }}/reference-firmware/coremark_example.bin
+          INKEMU_SOC_SIGNALS_APP: ${{ runner.temp }}/reference-firmware/soc_signals.bin
         # Exact test counts, and every suite run whatever the one before it did, as in rom-boot:
         # see tools/ci/run-ignored-tests.sh. The CoreMark test runs about 2.2 billion instructions
-        # (68 s in this job on 2026-10-15).
+        # (68 s in this job on 2026-10-15). The last suite attaches chips to the pins of the X4
+        # (sub-project 2b): GPIO, GP-SPI2, the SAR ADC and I2C0 through the ESP-IDF drivers.
         run: |
           failed=0
           tools/ci/run-ignored-tests.sh 13 --release -p soc-esp32c3 --test reference_boot -- --ignored || failed=1
           tools/ci/run-ignored-tests.sh 14 --release -p emu-cli --test run_cli reference_firmware -- --ignored || failed=1
           tools/ci/run-ignored-tests.sh 5 --release -p console-script --test reference_firmware -- --ignored || failed=1
+          tools/ci/run-ignored-tests.sh 1 --release -p boards --test reference_signals -- --ignored || failed=1
           exit "$failed"
       # QEMU runs only inside the pinned image (decision H6), the same as the firmware's.
       - name: Pull the image QEMU runs in

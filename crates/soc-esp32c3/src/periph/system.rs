@@ -23,9 +23,10 @@ const PERIP_RST_EN1: u32 = svd_regs::esp32c3::addr("SYSTEM", "PERIP_RST_EN1") - 
 /// ASSUMPTION: bit 0, `SYSTEM_TIMERS_RST` (`system_reg.h:503`), resets nothing here.
 /// `esp_system_reset_modules_on_exit` pulses it, and what it resets is not documented: the timer
 /// groups have their own bits (IR §4.3, §7 question 1; TW §F.1). Bits 13 and 15 reset the timer
-/// groups (`SYSTEM_TIMERGROUP_RST`, `SYSTEM_TIMERGROUP1_RST`). A bit of no module listed here is
-/// stored and resets nothing; one of them belongs to a module the model has and is not acted on:
-/// bit 28, `SYSTEM_APB_SARADC_RST` (`system_reg.h:341`).
+/// groups (`SYSTEM_TIMERGROUP_RST`, `SYSTEM_TIMERGROUP1_RST`). Bits 6, 7 and 28 reset GP-SPI2, I2C0
+/// and the SAR ADC controller (`SYSTEM_SPI2_RST` line 473, `SYSTEM_I2C_EXT0_RST` 467,
+/// `SYSTEM_APB_SARADC_RST` 341; decision 2b-D11). A bit of no module listed here is stored and
+/// resets nothing.
 ///
 /// Bit 23, `SYSTEM_USB_DEVICE_RST` (`system_reg.h:371`), resets USB-Serial-JTAG
 /// (`usb_serial_jtag_ll_reset_register`, `ll.h:296-311`; report USJ §A), which the startup of
@@ -40,13 +41,16 @@ const PERIP_RST_EN1: u32 = svd_regs::esp32c3::addr("SYSTEM", "PERIP_RST_EN1") - 
 /// module whose bit is still set (the SHA accelerator at power-on, `PERIP_RST_EN1` resets to
 /// `0x1FE`) would not answer, and writes made during a hold would not stick. Writing a register of
 /// a module while its reset bit is 1, on a chip, settles it.
-const RESETS_0: [(u32, Module); 7] = [
+const RESETS_0: [(u32, Module); 10] = [
     (1 << 1, Module::Spi01),
     (1 << 2, Module::Uart0),
     (1 << 5, Module::Uart1),
+    (1 << 6, Module::Spi2),
+    (1 << 7, Module::I2c0),
     (1 << 13, Module::Timg0),
     (1 << 15, Module::Timg1),
     (1 << 23, Module::UsbDevice),
+    (1 << 28, Module::ApbSaradc),
     (1 << 29, Module::Systimer),
 ];
 /// `PERIP_RST_EN1` bit 2, `SYSTEM_CRYPTO_SHA_RST` (`system_reg.h:553`): the only crypto module

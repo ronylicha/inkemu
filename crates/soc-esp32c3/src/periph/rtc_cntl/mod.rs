@@ -222,34 +222,39 @@ const ACCEPTED: [Accepted; 23] = [
     Accepted::svd(
         "RTC_CNTL",
         "EXT_WAKEUP_CONF",
-        "GPIO wake filter: the pins are not modelled",
-        "SP2",
+        "GPIO wake filter: the wake from a pin is not modelled",
+        "SP2d",
     ),
     Accepted::svd(
         "RTC_CNTL",
         "SLP_REJECT_CONF",
         "sleep rejection: no reject source (GPIO, UART) is raised",
-        "SP2",
+        "SP2d",
     ),
     Accepted::svd(
         "RTC_CNTL",
         "GPIO_WAKEUP",
-        "GPIO wake of each pin and its status: the pins are not modelled (a GPIO wake source is refused by name at the entry into sleep)",
-        "SP2",
+        "GPIO wake of each pin and its status: the wake from a pin is not modelled (a GPIO wake source is refused by name at the entry into sleep)",
+        "SP2d",
     ),
     Accepted::svd(
         "RTC_CNTL",
         "BROWN_OUT",
         "brown-out detector: the supply is always good",
-        "SP2",
+        "SP2d",
     ),
     Accepted::svd(
         "RTC_CNTL",
         "FIB_SEL",
         "brown-out and glitch reset selection (the super watchdog bit acts)",
-        "SP2",
+        "SP2d",
     ),
-    Accepted::svd("RTC_CNTL", "SENSOR_CTRL", "SAR ADC power forcing", "SP2"),
+    Accepted::svd(
+        "RTC_CNTL",
+        "SENSOR_CTRL",
+        "SAR ADC power forcing: the ADC converts whatever it says",
+        "SP2d",
+    ),
     Accepted::svd(
         "RTC_CNTL",
         "PWC",
@@ -265,11 +270,21 @@ const ACCEPTED: [Accepted; 23] = [
     Accepted::svd(
         "RTC_CNTL",
         "DIG_ISO",
-        "digital pad isolation and hold in sleep: the pins are not modelled",
-        "SP2",
+        "digital pad isolation and hold in sleep: a pad keeps no level through a sleep or a reset",
+        "SP2d",
     ),
-    Accepted::svd("RTC_CNTL", "PAD_HOLD", "pad hold", "SP2"),
-    Accepted::svd("RTC_CNTL", "DIG_PAD_HOLD", "digital pad hold", "SP2"),
+    Accepted::svd(
+        "RTC_CNTL",
+        "PAD_HOLD",
+        "pad hold: a held pad follows its registers",
+        "SP2d",
+    ),
+    Accepted::svd(
+        "RTC_CNTL",
+        "DIG_PAD_HOLD",
+        "digital pad hold: a held pad follows its registers",
+        "SP2d",
+    ),
 ];
 
 pub(crate) fn accepted() -> Vec<Accepted> {

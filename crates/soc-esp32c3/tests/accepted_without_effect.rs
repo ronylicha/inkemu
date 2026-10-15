@@ -40,9 +40,11 @@ fn the_documented_table_is_the_one_the_code_builds() {
 /// The plans a row may hand its register to: the plans still to come that own at least one row
 /// of the table. A plan that is done cannot be an heir: what it did not do is handed on by name
 /// before it ends, and its name is removed from this list by its last task. A plan to come that
-/// owns no row (SP3 today) is not in the list: it is added with its first row.
+/// owns no row is not in the list: it is added with its first row. Sub-project 2 is split in four;
+/// its second part ended the rows of the GPIO matrix and the SAR ADC, and handed the rest to the
+/// fourth, `SP2d`, the wiring of the X4, and the I2C targets to `SP3`, the X3.
 /// The list holds the table only: a comment or a document that names an heir is not read here.
-const PLANS_TO_COME: [&str; 6] = ["SP1b-4", "SP2", "SP4", "SP5a", "SP5b", "SP8"];
+const PLANS_TO_COME: [&str; 7] = ["SP1b-4", "SP2d", "SP3", "SP4", "SP5a", "SP5b", "SP8"];
 
 #[test]
 fn every_row_hands_its_register_to_a_plan_that_is_still_to_come() {

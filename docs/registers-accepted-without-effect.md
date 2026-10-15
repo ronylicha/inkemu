@@ -67,13 +67,6 @@ its first section says which plan takes what.
 | `0x6000303c` | `SPI0.CACHE_FCTRL` | 1 | cache request enable | SP1b-4 |
 | `0x600030dc` | `SPI0.CLOCK_GATE` | 1 | register clock gate | SP8 |
 | `0x600030e0` | `SPI0.CORE_CLK_SEL` | 1 | MSPI core clock selection: a transfer takes no time | SP8 |
-| `0x60004020` | `GPIO.ENABLE` | 1 | pin output enable | SP2 |
-| `0x60004154` | `GPIO.FUNC0_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
-| `0x60004158` | `GPIO.FUNC1_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
-| `0x6000415c` | `GPIO.FUNC2_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
-| `0x60004160` | `GPIO.FUNC3_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
-| `0x60004164` | `GPIO.FUNC4_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
-| `0x60004168` | `GPIO.FUNC5_IN_SEL_CFG` | 1 | input signal routing (GPIO matrix) | SP2 |
 | `0x600050f0` | `FE2.FE2_TX_INTERP_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60006090` | `FE.FE_GEN_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing: no effect to see without a power model; CPU stall, which ESP-IDF uses on dual-core chips only (the two software reset bits act) | SP4 |
@@ -83,8 +76,8 @@ its first section says which plan takes what.
 | `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time: a sleep of any length is entered | SP8 |
 | `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing: a wake from deep sleep takes no time | SP8 |
 | `0x60008034` | `RTC_CNTL.ANA_CONF` | 1 | analog configuration, glitch reset | SP8 |
-| `0x60008064` | `RTC_CNTL.EXT_WAKEUP_CONF` | 1 | GPIO wake filter: the pins are not modelled | SP2 |
-| `0x60008068` | `RTC_CNTL.SLP_REJECT_CONF` | 1 | sleep rejection: no reject source (GPIO, UART) is raised | SP2 |
+| `0x60008064` | `RTC_CNTL.EXT_WAKEUP_CONF` | 1 | GPIO wake filter: the wake from a pin is not modelled | SP2d |
+| `0x60008068` | `RTC_CNTL.SLP_REJECT_CONF` | 1 | sleep rejection: no reject source (GPIO, UART) is raised | SP2d |
 | `0x60008070` | `RTC_CNTL.CLK_CONF` | 1 | RTC fast clock source and dividers (a slow clock other than the RC oscillator is refused) | SP8 |
 | `0x60008074` | `RTC_CNTL.SLOW_CLK_CONF` | 1 | RTC slow clock divider | SP8 |
 | `0x60008078` | `RTC_CNTL.SDIO_CONF` | 1 | flash supply (VDD_SDIO) regulator and its power-down in sleep: no effect to see without a power model | SP4 |
@@ -92,33 +85,56 @@ its first section says which plan takes what.
 | `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP8 |
 | `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control: no effect to see without a power model | SP4 |
 | `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power domains in sleep (Wi-Fi, BT, CPU, peripherals) and their forced power-up: no effect to see without a power model (DG_WRAP_PD_EN acts: read at the write of SLEEP_EN, set it makes the sleep deep, clear a light sleep, which is refused) | SP4 |
-| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation and hold in sleep: the pins are not modelled | SP2 |
-| `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | pad hold | SP2 |
-| `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | digital pad hold | SP2 |
-| `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector: the supply is always good | SP2 |
-| `0x6000810c` | `RTC_CNTL.FIB_SEL` | 1 | brown-out and glitch reset selection (the super watchdog bit acts) | SP2 |
-| `0x60008110` | `RTC_CNTL.GPIO_WAKEUP` | 1 | GPIO wake of each pin and its status: the pins are not modelled (a GPIO wake source is refused by name at the entry into sleep) | SP2 |
-| `0x6000811c` | `RTC_CNTL.SENSOR_CTRL` | 1 | SAR ADC power forcing | SP2 |
-| `0x60009000` | `IO_MUX.PIN_CTRL` | 23 | pad function, pulls, drive strength, input enable | SP2 |
-| `0x600090fc` | `IO_MUX.DATE` | 1 | none: the version date of the block, stored as written | SP2 |
-| `0x6000e000` | `ANA_I2C.HOST0_CMD` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
-| `0x6000e004` | `ANA_I2C.HOST1_CMD` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
-| `0x6000e040` | `ANA_I2C.I2C_MST_ANA_CONF0` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
-| `0x6000e044` | `ANA_I2C.ANA_CONFIG` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
-| `0x6000e048` | `ANA_I2C.ANA_CONFIG2` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP2 |
+| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation and hold in sleep: a pad keeps no level through a sleep or a reset | SP2d |
+| `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | pad hold: a held pad follows its registers | SP2d |
+| `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | digital pad hold: a held pad follows its registers | SP2d |
+| `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector: the supply is always good | SP2d |
+| `0x6000810c` | `RTC_CNTL.FIB_SEL` | 1 | brown-out and glitch reset selection (the super watchdog bit acts) | SP2d |
+| `0x60008110` | `RTC_CNTL.GPIO_WAKEUP` | 1 | GPIO wake of each pin and its status: the wake from a pin is not modelled (a GPIO wake source is refused by name at the entry into sleep) | SP2d |
+| `0x6000811c` | `RTC_CNTL.SENSOR_CTRL` | 1 | SAR ADC power forcing: the ADC converts whatever it says | SP2d |
+| `0x60009000` | `IO_MUX.PIN_CTRL` | 23 | clock outputs (PIN_CTRL); of each pad, the drive strength, the input filter and the sleep settings (the function, the pulls and the input enable act) | SP2d |
+| `0x600090fc` | `IO_MUX.DATE` | 1 | none: the version date of the block, stored as written | SP2d |
+| `0x6000e000` | `ANA_I2C.HOST0_CMD` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP8 |
+| `0x6000e004` | `ANA_I2C.HOST1_CMD` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP8 |
+| `0x6000e040` | `ANA_I2C.I2C_MST_ANA_CONF0` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP8 |
+| `0x6000e044` | `ANA_I2C.ANA_CONFIG` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP8 |
+| `0x6000e048` | `ANA_I2C.ANA_CONFIG2` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP8 |
+| `0x6001300c` | `I2C0.TO` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
+| `0x60013010` | `I2C0.SLAVE_ADDR` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
+| `0x60013030` | `I2C0.SDA_HOLD` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
+| `0x60013034` | `I2C0.SDA_SAMPLE` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
+| `0x60013050` | `I2C0.FILTER_CFG` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
+| `0x60013078` | `I2C0.SCL_ST_TIME_OUT` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
+| `0x6001307c` | `I2C0.SCL_MAIN_ST_TIME_OUT` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
+| `0x60013084` | `I2C0.SCL_STRETCH_CONF` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
+| `0x600130f8` | `I2C0.DATE` | 1 | none: the version date of the block, stored as written | SP3 |
 | `0x6001ccd4` | `NRX.NRXPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x6001d054` | `BB.BBPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
+| `0x60024024` | `SPI2.DIN_MODE` | 1 | line timing compensation: a transfer is delivered whole | SP8 |
+| `0x60024028` | `SPI2.DIN_NUM` | 1 | line timing compensation: a transfer is delivered whole | SP8 |
+| `0x6002402c` | `SPI2.DOUT_MODE` | 1 | line timing compensation: a transfer is delivered whole | SP8 |
+| `0x600240e4` | `SPI2.SLAVE1` | 1 | slave-mode lengths: a transaction in slave mode is refused | SP8 |
+| `0x600240f0` | `SPI2.DATE` | 1 | none: the version date of the block, stored as written | SP8 |
 | `0x60026014` | `APB_CTRL.WIFI_CLK_EN` | 1 | radio clock gates: there is no radio | SP5a |
 | `0x60026018` | `APB_CTRL.WIFI_RST_EN` | 1 | radio resets: there is no radio | SP5a |
 | `0x6002609c` | `APB_CTRL.FRONT_END_MEM_PD` | 1 | radio front-end memory power | SP5a |
 | `0x600260ac` | `APB_CTRL.MEM_POWER_UP` | 1 | radio memory power | SP5a |
-| `0x60040000` | `APB_SARADC.CTRL` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
-| `0x60040004` | `APB_SARADC.CTRL2` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
-| `0x6004000c` | `APB_SARADC.FSM_WAIT` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
-| `0x60040018` | `APB_SARADC.SAR_PATT_TAB1` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
-| `0x6004001c` | `APB_SARADC.SAR_PATT_TAB2` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
-| `0x60040050` | `APB_SARADC.DMA_CONF` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
-| `0x60040054` | `APB_SARADC.CLKM_CONF` | 1 | SAR ADC configuration: no conversion is performed | SP2 |
+| `0x60040008` | `APB_SARADC.FILTER_CTRL1` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x6004000c` | `APB_SARADC.FSM_WAIT` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040010` | `APB_SARADC.SAR1_STATUS` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040014` | `APB_SARADC.SAR2_STATUS` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040018` | `APB_SARADC.SAR_PATT_TAB1` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x6004001c` | `APB_SARADC.SAR_PATT_TAB2` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040024` | `APB_SARADC.ARB_CTRL` | 1 | ADC2 arbiter: no Wi-Fi contends for ADC2 | SP5a |
+| `0x60040028` | `APB_SARADC.FILTER_CTRL0` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040034` | `APB_SARADC.THRES0_CTRL` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040038` | `APB_SARADC.THRES1_CTRL` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x6004003c` | `APB_SARADC.THRES_CTRL` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040050` | `APB_SARADC.DMA_CONF` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040058` | `APB_SARADC.APB_TSENS_CTRL` | 1 | temperature sensor: no temperature is measured, TSENS_OUT reads what is stored | SP2d |
+| `0x6004005c` | `APB_SARADC.TSENS_CTRL2` | 1 | temperature sensor clock | SP2d |
+| `0x60040060` | `APB_SARADC.CALI` | 1 | analog self-calibration selection: a reading follows the eFuse calibration | SP2d |
+| `0x600403fc` | `APB_SARADC.CTRL_DATE` | 1 | none: the version date of the block, stored as written | SP2d |
 | `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals: a gated module keeps answering | SP8 |
 | `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals (the debug assistant) | SP1b-4 |
 | `0x600c0008` | `SYSTEM.CPU_PER_CONF` | 1 | PLL_FREQ_SEL and the CPU wait-mode bits (CPUPERIOD_SEL is used by the clock model) | SP8 |
