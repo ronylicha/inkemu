@@ -41,5 +41,5 @@ pub use machine::{
     ConsoleChannel, DeepSleep, Esp32C3, Executed, InputError, MAX_PENDING_HOST_BYTES,
     MAX_PENDING_HOST_CHANGES, Stepped, StopReason,
 };
-pub use periph::UsbHost;
+pub use periph::{AttachError, SpiWires, UsbHost};
 pub use rom::{RomError, RomImage};

@@ -136,6 +136,17 @@ Usage attendu dans SP2d :
    GPIO2 repos 3 300, up 1 369, down 3. Batterie : cellule 3 700 mV par défaut (hypothèse), diviseur 10 k/10 k.
    Power est un GPIO numérique (GPIO3, actif bas), pas une échelle.
 
+**Révision du 2026-10-15 (relecture de SP2b, PR #18).** Deux points de cet usage se précisent avec l'interface que
+SP2b livre (ADR 0012, note `docs/superpowers/notes/2026-10-15-sp2b-carryover.md`, « Pour SP2d ») :
+
+- point 1 : la lecture demi-duplex du panneau n'est pas une transaction de GP-SPI2. Le firmware la fait en bit-bang :
+  il repasse MOSI (GPIO10) en entrée et bat SCLK (GPIO8) par GPIO. L'adaptateur la voit donc par un `GpioOutput` sur
+  SCLK et MOSI (les fronts que pilote le SoC) et y répond par un `GpioInput` sur MOSI, qui donne le bit de `read_data`
+  au front d'horloge ; elle n'arrive jamais à `SpiTarget::transfer`. `None` laisse toujours la broche à son tirage ;
+- point 2 : l'échéance se planifie par le trait `Clocked` (`Esp32C3::attach_clocked`) : le SoC demande
+  `next_deadline` après chaque appel à la puce et appelle `advance` à l'échéance, en temps d'appareil, même pendant
+  un `WFI`, puis relit BUSY et lève l'interruption sur front.
+
 ## Décisions prises sans l'utilisateur
 
 - **Le DCVCOM ne pilote aucun pixel** (A10, 2a-R12) : décidé en écrivant les tests, quand la première version

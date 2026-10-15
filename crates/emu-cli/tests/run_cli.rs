@@ -4320,17 +4320,23 @@ fn pinned_in_sums(sums: &str, file: &str) -> String {
         .unwrap_or_else(|| panic!("{}: no line for {file}", path.display()))
 }
 
-/// The trace of the run of `adc_wait_panic` below, as the CI prints it: measured by the job
-/// `reference-boot` of run 38498719362 (2026-10-14), where every other assertion of the test
-/// passed and this one printed the hash of the run.
-const ADC_WAIT_PANIC_TRACE: &str = "trace-hash b217bc3b287080ae";
+/// The trace of the run of `adc_wait_panic` below, measured on 2026-10-15 (release build, every
+/// other assertion of the test passing). It was `b217bc3b287080ae` (CI run 38498719362,
+/// 2026-10-14) until sub-project 2b: the SAR ADC and I2C0 are modelled, so the first wait ends
+/// with a reading instead of the panic, and the firmware itself changed, waiting next for ADC2 to
+/// keep the panic and the core dump (decisions 2b-D14 and 2b-R4): `42e50c75581ae020`. Then the
+/// firmware clears ADC2's done bit before that second wait (review of PR #18, ruling 2b-R11): one
+/// more register write, other instructions and addresses, so another trace, `20e53f8cdf1823fc`.
+const ADC_WAIT_PANIC_TRACE: &str = "trace-hash 20e53f8cdf1823fc";
 
-/// The path `CrossPoint` 1.6.5 and the stock firmware of the X4 take under inkemu (they are tested
-/// on the machine of a user who has them, `tests/real_firmware.rs`), with an application this
-/// repository builds: `adc_wait_panic` reads a register of I2C0, starts a conversion of the SAR
-/// ADC and waits for it with interrupts masked; the interrupt watchdog panics, the panic writes a
-/// core dump to the `coredump` partition of the X4 and restarts the CPU, and the second life finds
-/// the core dump. The registers the model lacks are named in warnings, none is undocumented.
+/// The wait for the SAR ADC that stopped `CrossPoint` 1.6.5 and the stock firmware of the X4
+/// under inkemu until sub-project 2b modelled the ADC (they are tested on the machine of a user who
+/// has them, `tests/real_firmware.rs`), with an application this repository builds:
+/// `adc_wait_panic` reads a register of I2C0, starts a conversion of ADC1 and waits for it with
+/// interrupts masked, and the reading comes; then it waits the same way for ADC2, which converts
+/// nothing, the interrupt watchdog panics, the panic writes a core dump to the `coredump` partition
+/// of the X4 and restarts the CPU, and the second life finds the core dump. Nothing in the run is
+/// a register the model lacks.
 ///
 /// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
 #[test]
@@ -4361,9 +4367,13 @@ fn x4_runs_the_adc_wait_panic_reference_firmware_through_its_panic_into_a_second
     for expected in [
         "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
         "adc_wait_panic: no core dump in flash (",
-        // The documented reset value of `I2C0.SR`, which inkemu returns for a register it lacks.
+        // `I2C0.SR` of an idle controller: `STRETCH_CAUSE` 3, no stretch, as at reset.
         "adc_wait_panic: I2C0 SR 0x0000c000\n",
         "adc_wait_panic: waiting for the SAR ADC, interrupts masked\n",
+        // GPIO1 as at reset, its pull-up enabled and nothing attached: 3.3 V, the top of the range
+        // of attenuation 3.
+        "adc_wait_panic: the SAR ADC answered 0xfff\n",
+        "adc_wait_panic: waiting for ADC2, which converts nothing, interrupts masked\n",
         "Guru Meditation Error: Core  0 panic'ed (Interrupt wdt timeout on CPU0).",
         "Rebooting...\n",
         "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
@@ -4383,15 +4393,7 @@ fn x4_runs_the_adc_wait_panic_reference_firmware_through_its_panic_into_a_second
         log.contains("\ninkemu: reset by the firmware, a CPU reset (rst:0xc) at pc "),
         "{log}"
     );
-    for warning in [
-        "warning: unmodeled register read: I2C0.SR at 0x60013008 ",
-        "warning: unmodeled register write: APB_SARADC.INT_CLR at 0x6004004c ",
-        "warning: unmodeled register write: APB_SARADC.ONETIME_SAMPLE at 0x60040020 ",
-        "warning: unmodeled register read: APB_SARADC.INT_RAW at 0x60040044 ",
-    ] {
-        assert!(log.contains(warning), "`{warning}` is missing:\n{log}");
-    }
-    assert!(!log.contains("no register is documented there"), "{log}");
+    assert!(!log.contains("\nwarning: "), "{log}");
     let measured = trace_hash_line(&log);
     assert_eq!(
         measured,

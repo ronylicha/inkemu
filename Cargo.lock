@@ -128,8 +128,10 @@ dependencies = [
 name = "boards"
 version = "0.1.0"
 dependencies = [
+ "emu-core",
  "firmware",
  "serde",
+ "sha2",
  "soc-esp32c3",
  "thiserror",
  "toml",
