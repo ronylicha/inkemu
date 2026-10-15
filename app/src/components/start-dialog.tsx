@@ -13,9 +13,12 @@ const SD_KINDS: readonly SdKind[] = ["none", "existing", "new"];
 
 /** The size a new card is offered at: 1 GiB, as `inkemu sd create` makes by default. */
 export const DEFAULT_SD_MIB = "1024";
-/** The bounds of a blank card (`host::sd_format::{MIN_MEBIBYTES, MAX_MEBIBYTES}`). */
+/**
+ * The bounds of a blank card (`host::sd_format::{MIN_MEBIBYTES, MAX_MEBIBYTES}`): FAT32's least,
+ * and the largest capacity the CSD of the SPI mode can say, (C_SIZE + 1) × 512 KiB.
+ */
 const MIN_SD_MIB = 64;
-const MAX_SD_MIB = 2 * 1024 * 1024;
+const MAX_SD_MIB = 2_097_024;
 
 /**
  * The card the form describes: `null` for an empty slot, `undefined` while the form misses

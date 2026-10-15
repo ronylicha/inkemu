@@ -50,7 +50,7 @@ export const en: Catalog = {
   "start.sd.image": "Card image",
   "start.sd.newImage": "New card image",
   "start.sd.readOnly": "Write-protected (the image is never written)",
-  "start.sd.size": "Size in MiB (64 to 2097152)",
+  "start.sd.size": "Size in MiB (64 to 2097024)",
   "start.record": "Record the session into",
   "start.advanced": "Advanced options",
   "start.maxTime": "Device-time limit (seconds)",

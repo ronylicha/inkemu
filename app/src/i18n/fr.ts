@@ -49,7 +49,7 @@ export const fr = {
   "start.sd.image": "Image de la carte",
   "start.sd.newImage": "Nouvelle image de carte",
   "start.sd.readOnly": "Protégée en écriture (l’image n’est jamais écrite)",
-  "start.sd.size": "Taille en Mio (de 64 à 2097152)",
+  "start.sd.size": "Taille en Mio (de 64 à 2097024)",
   "start.record": "Enregistrer la session dans",
   "start.advanced": "Options avancées",
   "start.maxTime": "Limite de temps d’appareil (secondes)",

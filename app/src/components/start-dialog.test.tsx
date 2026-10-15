@@ -31,8 +31,8 @@ describe("sdCardOf", () => {
       createMib: 1024,
     });
     expect(sdCardOf("new", "/n.img", false, "64")?.createMib).toBe(64);
-    expect(sdCardOf("new", "/n.img", false, "2097152")?.createMib).toBe(2_097_152);
-    for (const size of ["63", "2097153", "1.5", "", "1e3", "-64"]) {
+    expect(sdCardOf("new", "/n.img", false, "2097024")?.createMib).toBe(2_097_024);
+    for (const size of ["63", "2097025", "1.5", "", "1e3", "-64"]) {
       expect(sdCardOf("new", "/n.img", false, size), size).toBeUndefined();
     }
   });
