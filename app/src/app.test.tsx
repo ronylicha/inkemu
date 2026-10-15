@@ -2,7 +2,7 @@ import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "./app";
-import { fakeHost, status } from "./test/fake-host";
+import { debugView, fakeHost, status } from "./test/fake-host";
 import { renderWith } from "./test/render";
 
 describe("App", () => {
@@ -30,6 +30,7 @@ describe("App", () => {
       }),
       "realTime",
       1,
+      { breakpoints: [], watchpoints: [] },
       expect.any(Function),
     );
     expect(await screen.findByText(/inkemu: Xteink X4/)).toBeInTheDocument();
@@ -144,6 +145,36 @@ describe("App", () => {
     const pause = await screen.findByRole("button", { name: "Pause" });
     await user.click(pause);
     expect(host.command).toHaveBeenLastCalledWith({ kind: "pause" }, 2);
+  });
+
+  it("opens the debugger, and starts the next run with the points it showed", async () => {
+    const host = fakeHost();
+    const user = userEvent.setup();
+    renderWith(<App />, { host });
+    await powerOn(user);
+    await screen.findByText(/inkemu: Xteink X4/);
+    act(() => {
+      host.send({
+        event: "status",
+        data: status({ run: "paused", stop: { kind: "breakpoint", pc: 0x4000_0004 } }),
+      });
+    });
+    const open = screen.getByRole("button", { name: "Debugger" });
+    await user.click(open);
+    expect(open).toHaveAttribute("aria-expanded", "true");
+    expect(open).toHaveAttribute("aria-controls", "debugger");
+    expect(await screen.findByRole("region", { name: "Debugger" })).toBeInTheDocument();
+    await screen.findByRole("table", { name: "Registers" });
+    expect(host.inspect).toHaveBeenCalledWith(expect.anything(), 1);
+    // The stop is said where the state of the run is announced.
+    expect(screen.getAllByRole("status").at(-1)).toHaveTextContent(
+      "Run: Paused Stopped at the breakpoint 0x40000004, before its instruction.",
+    );
+    await powerOn(user);
+    await waitFor(() => expect(host.powerOn).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(host.powerOn).mock.calls[1]?.[3]).toEqual(debugView().points);
+    await user.click(open);
+    expect(screen.queryByRole("region", { name: "Debugger" })).not.toBeInTheDocument();
   });
 
   it("says in the journal where a capture went, and why one was refused", async () => {

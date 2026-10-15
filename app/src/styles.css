@@ -443,9 +443,182 @@ main {
   font-size: 0.8em;
 }
 
+/* The debugger (design SP4a): a row of its own under the device and its status. */
+.debugger {
+  grid-column: 1 / -1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-width: 0;
+}
+
+.debugger h2 {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.debugger h3 {
+  margin: 10px 0 6px;
+  font-size: 1em;
+}
+
+.debugger-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.debugger-stop {
+  margin: 4px 0;
+  padding: 6px 10px;
+  border-left: 4px solid var(--accent);
+  background: var(--bg);
+}
+
+.debugger-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(280px, 1.3fr) minmax(320px, 1.6fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.debugger-grid > *,
+.debugger-stack > * {
+  min-width: 0;
+}
+
+.debugger-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.debugger-form input.mono {
+  width: 12ch;
+}
+
+.debug-cpu {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 12px;
+  margin: 0 0 8px;
+}
+
+.debug-cpu dt {
+  color: var(--muted);
+}
+
+.debug-cpu dd {
+  margin: 0;
+}
+
+.debug-table {
+  border-collapse: collapse;
+  font-size: 0.85em;
+  margin-bottom: 10px;
+}
+
+.debug-table caption {
+  text-align: left;
+  font-weight: 600;
+  padding-bottom: 4px;
+}
+
+.debug-table th,
+.debug-table td {
+  padding: 1px 8px 1px 0;
+  text-align: left;
+  font-weight: normal;
+  white-space: nowrap;
+}
+
+.debug-table thead th {
+  color: var(--muted);
+}
+
+.memory-table td,
+.memory-table thead th {
+  padding-right: 4px;
+}
+
+.memory-text {
+  white-space: pre;
+}
+
+.memory-hidden {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  font-size: 0.85em;
+}
+
+.debugger-stack,
+.memory-table {
+  overflow-x: auto;
+}
+
+.disassembly {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.85em;
+}
+
+.disassembly li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 1px 4px;
+  border-left: 3px solid transparent;
+}
+
+.disassembly-current {
+  border-left-color: var(--accent);
+  background: var(--bg);
+  font-weight: 600;
+}
+
+.disassembly-address {
+  color: var(--muted);
+}
+
+.breakpoint-toggle {
+  padding: 0 6px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.breakpoint-toggle[aria-pressed="true"] {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.point-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.9em;
+}
+
+.point-list li {
+  margin: 2px 0;
+}
+
+@media (max-width: 1200px) {
+  .debugger-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
 @media (max-width: 900px) {
   main,
   .bottom {
+    grid-template-columns: 1fr;
+  }
+
+  .debugger-grid {
     grid-template-columns: 1fr;
   }
 }

@@ -46,6 +46,7 @@ const ERROR_KINDS = [
   "sdCard",
   "notRecordable",
   "onItsThread",
+  "point",
   "powerOn",
   "profile",
   "recordPath",

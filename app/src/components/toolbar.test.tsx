@@ -7,7 +7,12 @@ import { status } from "../test/fake-host";
 import { renderWith } from "../test/render";
 import { Toolbar } from "./toolbar";
 
-function toolbar(phase: AppState["phase"], current: Status | null, starting = false) {
+function toolbar(
+  phase: AppState["phase"],
+  current: Status | null,
+  starting = false,
+  onDebugger = vi.fn(),
+) {
   const onCommand = vi.fn();
   renderWith(
     <Toolbar
@@ -17,6 +22,8 @@ function toolbar(phase: AppState["phase"], current: Status | null, starting = fa
       speed="realTime"
       hasImage={false}
       theme="system"
+      debuggerOpen={false}
+      onDebugger={onDebugger}
       onPowerOn={vi.fn()}
       onCommand={onCommand}
       onSpeed={vi.fn()}
@@ -73,5 +80,15 @@ describe("Toolbar", () => {
   it("does not record a replay", () => {
     toolbar("on", status({ replay: "run.inkrec" }));
     expect(screen.getByRole("button", { name: "Record…" })).toBeDisabled();
+  });
+
+  it("opens the debugger, which says whether it is open", async () => {
+    const user = userEvent.setup();
+    const onDebugger = vi.fn();
+    toolbar("off", null, false, onDebugger);
+    const button = screen.getByRole("button", { name: "Debugger" });
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    await user.click(button);
+    expect(onDebugger).toHaveBeenCalledTimes(1);
   });
 });

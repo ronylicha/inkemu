@@ -8,17 +8,19 @@
 // emulator is shown from the answer to its start: what it sent before is kept until then, after
 // the answer's lines.
 
-import type {
-  ConsoleChannel,
-  DeviceView,
-  HostError,
-  Look,
-  Notice,
-  RunEnd,
-  Started,
-  Status,
-  Update,
-  VerdictView,
+import {
+  type ConsoleChannel,
+  type DeviceView,
+  type HostError,
+  type Look,
+  NO_POINTS,
+  type Notice,
+  type Points,
+  type RunEnd,
+  type Started,
+  type Status,
+  type Update,
+  type VerdictView,
 } from "../ipc/types";
 import { appendConsole, holdOpenEscape } from "./console";
 
@@ -69,6 +71,11 @@ export interface AppState {
   error: HostError | null;
   /** The last line of the interface's own, which a screen reader announces. */
   told: string;
+  /**
+   * The points of the debugger, as the host last showed them: a new start begins with them
+   * (design SP4a, 4a-D8). They outlive the emulator that had them.
+   */
+  points: Points;
 }
 
 export type Action =
@@ -82,7 +89,9 @@ export type Action =
   /** A line of the interface's own, translated: what a capture or a recording became. */
   | { type: "said"; notice: Notice }
   | { type: "clearConsole"; channel: ConsoleChannel }
-  | { type: "dismissError" };
+  | { type: "dismissError" }
+  /** The points the host showed with a view of the debugger, of emulator `start`. */
+  | { type: "points"; start: number; points: Points };
 
 const EMPTY_CONSOLES: Record<ConsoleChannel, string> = {
   uart0: "",
@@ -110,6 +119,7 @@ export function initialState(): AppState {
     frame: null,
     error: null,
     told: "",
+    points: NO_POINTS,
   };
 }
 
@@ -242,5 +252,8 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     case "dismissError":
       return { ...state, error: null };
+    case "points":
+      // A view of an emulator a newer start replaced does not speak for the points any more.
+      return action.start === state.current ? { ...state, points: action.points } : state;
   }
 }

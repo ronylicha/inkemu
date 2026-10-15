@@ -12,6 +12,9 @@ interface Props {
   speed: Speed;
   hasImage: boolean;
   theme: ThemeChoice;
+  /** The debugger panel is open. */
+  debuggerOpen: boolean;
+  onDebugger(): void;
   onPowerOn(): void;
   onCommand(command: Command): void;
   onSpeed(speed: Speed): void;
@@ -79,6 +82,14 @@ export function Toolbar(props: Props) {
       </button>
       <button type="button" onClick={props.onCapture} disabled={!hasImage}>
         {t("toolbar.capture")}
+      </button>
+      <button
+        type="button"
+        onClick={props.onDebugger}
+        aria-expanded={props.debuggerOpen}
+        aria-controls={props.debuggerOpen ? "debugger" : undefined}
+      >
+        {t("toolbar.debugger")}
       </button>
       <span className="toolbar-spacer" />
       <label>

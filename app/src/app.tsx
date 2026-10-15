@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { AboutDialog } from "./components/about-dialog";
 import { ConsolePanel } from "./components/console-panel";
+import { DebugPanel } from "./components/debug-panel";
+import { stopText } from "./components/debug-views";
 import { DeviceView } from "./components/device-view";
 import { ErrorBanner } from "./components/error-banner";
 import { JournalPanel } from "./components/journal-panel";
@@ -32,6 +34,7 @@ export function App() {
   const [speed, setSpeed] = useState<Speed>("realTime");
   const [asking, setAsking] = useState(false);
   const [about, setAbout] = useState(false);
+  const [debuggerOpen, setDebuggerOpen] = useState(false);
   // Every start is numbered: the updates of an emulator carry its number (reducer.ts).
   const starts = useRef(0);
   const batcher = useMemo(
@@ -79,16 +82,19 @@ export function App() {
       );
   };
 
+  // A start begins with the debugger's points of the run before (design SP4a, 4a-D8).
   const powerOn = (setup: Setup) => {
     setAsking(false);
-    start((number, onUpdate) => host.powerOn(setup, speed, number, onUpdate));
+    start((number, onUpdate) => host.powerOn(setup, speed, number, state.points, onUpdate));
   };
 
   const replay = async () => {
     try {
       const path = await host.pickFile("session");
       if (path !== null) {
-        start((number, onUpdate) => host.openReplay(path, null, speed, number, onUpdate));
+        start((number, onUpdate) =>
+          host.openReplay(path, null, speed, number, state.points, onUpdate),
+        );
       }
     } catch (reason) {
       failed(reason);
@@ -137,7 +143,14 @@ export function App() {
   const status = state.status;
   const takesInput = state.phase === "on" && status !== null && status.replay === null;
   const announcement =
-    status === null ? "" : t("announce.run", { state: labelOf(t, "status.run", status.run) });
+    status === null
+      ? ""
+      : [
+          t("announce.run", { state: labelOf(t, "status.run", status.run) }),
+          status.stop === null ? "" : stopText(t, status.stop),
+        ]
+          .join(" ")
+          .trim();
 
   return (
     <div className="app">
@@ -153,6 +166,8 @@ export function App() {
           speed={status?.speed ?? speed}
           hasImage={state.frame !== null}
           theme={theme}
+          debuggerOpen={debuggerOpen}
+          onDebugger={() => setDebuggerOpen((open) => !open)}
           onPowerOn={() => setAsking(true)}
           onCommand={command}
           onSpeed={changeSpeed}
@@ -182,6 +197,14 @@ export function App() {
           )}
         </div>
         <StatusPanel status={status} lastEnd={state.lastEnd} />
+        {debuggerOpen ? (
+          <DebugPanel
+            start={state.current}
+            status={state.phase === "on" ? status : null}
+            onCommand={(next) => host.command(next, state.current)}
+            dispatch={dispatch}
+          />
+        ) : null}
       </main>
       <footer className="bottom">
         <ConsolePanel
