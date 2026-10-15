@@ -10,6 +10,7 @@ use crate::memmap::{
     SRAM_IBUS_BASE, SRAM_SIZE, SRAM0_BASE, SRAM0_SIZE,
 };
 use crate::periph::Peripherals;
+use crate::periph::extmem::{PageSet, written_pages};
 use crate::periph::mmu::{MMU_PAGE_BYTES, MmuMiss};
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
@@ -32,6 +33,13 @@ pub struct SocBus {
     watches: Vec<Watch>,
     /// The first access to watched bytes since a debugger last took one ([`debug`]).
     watch_hit: Option<WatchHit>,
+    /// The 64 KiB flash pages the CPU fetched an instruction from since the machine was built,
+    /// less those a program or an erase changed since: the only flash a debugger may read, as
+    /// code (ADR 0016 §6). A note on the fetch path that nothing reads back while the machine
+    /// runs: it changes nothing of the run. The CPU fetches from the bus only when its decode
+    /// cache misses, so the note costs one bit set per decoding, not per instruction executed.
+    /// Every reset keeps it: it is the history of the machine, not a state of the chip.
+    executed: PageSet,
 }
 
 mod debug;
@@ -148,6 +156,7 @@ impl SocBus {
             ctx,
             watches: Vec::new(),
             watch_hit: None,
+            executed: PageSet::default(),
         }
     }
 
@@ -171,11 +180,15 @@ impl SocBus {
     /// the events its call had something to tell.
     pub(crate) fn deliver_due(&mut self) {
         let SocBus {
-            periph, ctx, rtc, ..
+            periph,
+            ctx,
+            rtc,
+            executed,
+            ..
         } = self;
         ctx.deliver_due(|ctx, event| {
             periph.deliver(ctx, event);
-            settle_signals(periph, ctx, rtc);
+            settle_signals(periph, ctx, rtc, executed);
         });
     }
 
@@ -189,7 +202,12 @@ impl SocBus {
     /// Delivers what the devices posted for each other during a register access or a call: such
     /// an event reaches its device before the instruction ends.
     fn settle(&mut self) {
-        settle_signals(&mut self.periph, &mut self.ctx, &self.rtc);
+        settle_signals(
+            &mut self.periph,
+            &mut self.ctx,
+            &self.rtc,
+            &mut self.executed,
+        );
     }
 
     /// Tells the bus which instruction is running, so diagnostics can name it.
@@ -249,7 +267,16 @@ impl SocBus {
     /// of the flash, returns 0. What silicon returns is not documented (report CM §6.1: "wrong
     /// data"); 0 makes a fetch an illegal instruction, as ESP-IDF's panic handler expects. The fault
     /// registers are latched and the access is reported; the SP1b-4 lockstep may refine the value.
-    fn flash_read(&mut self, vaddr: u32, window_offset: u32, size: AccessSize) -> ReadOutcome {
+    ///
+    /// A fetch notes the flash pages it read in `executed`, which nothing reads while the machine
+    /// runs.
+    fn flash_read(
+        &mut self,
+        vaddr: u32,
+        window_offset: u32,
+        size: AccessSize,
+        kind: AccessKind,
+    ) -> ReadOutcome {
         let len = size.bytes();
         let mut bytes = [0u8; 4];
         // The fault of the previous byte. The bytes of one access that miss through the same entry
@@ -274,6 +301,9 @@ impl SocBus {
                         .flash()
                         .read(offset, std::slice::from_mut(byte));
                     let page = offset / MMU_PAGE_BYTES;
+                    if kind == AccessKind::Fetch {
+                        self.executed.insert(page);
+                    }
                     if read_page.replace(page) != Some(page) && self.periph.extmem.window_read(page)
                     {
                         self.ctx.diag.record(Diagnostic::StaleFlashWindow {
@@ -366,8 +396,21 @@ impl SocBus {
 /// `SYSTEM.RTC_FASTMEM_CONFIG` that sets `START` posts one more, which the bus answers itself:
 /// the CRC unit reads the RTC fast memory, and the bus holds that memory, no peripheral. Its answer
 /// posts nothing.
-fn settle_signals(periph: &mut Peripherals, ctx: &mut Ctx, rtc: &Ram) {
+///
+/// A program or an erase also takes the pages it changed out of `executed`: what they hold now
+/// is no longer what the CPU executed (ADR 0016 §6); the code that runs there again is fetched
+/// again, since the change moves the version of the decoded flash code (`page_version`).
+fn settle_signals(periph: &mut Peripherals, ctx: &mut Ctx, rtc: &Ram, executed: &mut PageSet) {
     while let Some(event) = ctx.take_signal() {
+        if let Event::FlashWritten {
+            first_page,
+            last_page,
+        } = event
+        {
+            for page in written_pages(first_page, last_page) {
+                executed.remove(page);
+            }
+        }
         if event == Event::RtcMemoryCrc {
             // INVARIANT: the RTC memory is `RTC_RAM_SIZE` bytes from `RTC_RAM_BASE`, so the slice
             // is always there; an empty one would only give a CRC of no bytes.
@@ -399,7 +442,7 @@ impl Bus for SocBus {
             Some(Region::Sram(dbus_addr)) => self.sram.read(dbus_addr, size, kind),
             Some(Region::Sram0) => self.sram0.read(addr, size, kind),
             Some(Region::Rtc) => self.rtc.read(addr, size, kind),
-            Some(Region::Flash { offset, .. }) => Ok(self.flash_read(addr, offset, size)),
+            Some(Region::Flash { offset, .. }) => Ok(self.flash_read(addr, offset, size, kind)),
             Some(Region::Periph) if kind != AccessKind::Fetch => self.mmio_read(addr, size),
             Some(Region::Periph) | None => Err(BusError::Unmapped { addr, kind }),
         }?;

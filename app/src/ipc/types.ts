@@ -186,6 +186,8 @@ export interface DisassemblyLine {
   length: number;
   /** `null` where no code can be read. */
   instruction: Instruction | null;
+  /** A page of the flash the CPU executed nothing from: not read (ADR 0016 §6). */
+  notExecuted: boolean;
   current: boolean;
   breakpoint: boolean;
 }

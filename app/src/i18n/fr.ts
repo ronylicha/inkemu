@@ -244,6 +244,8 @@ export const fr = {
   "debug.code.goTo": "Code à l’adresse",
   "debug.code.show": "Afficher",
   "debug.code.unreadable": "aucun code lisible ici",
+  "debug.code.notExecuted":
+    "page de la flash non exécutée : non lue (elle peut contenir des données personnelles)",
   "debug.code.compressed": "instruction compressée (16 bits)",
   "debug.code.current": "instruction courante",
   "debug.breakpoint.toggle": "Point d’arrêt à {address}",

@@ -38,9 +38,14 @@ flash n'est affiché.
 5. **Lecture sans effet** : ROM et RAM telles quelles ; fenêtre de flash par l'entrée de MMU, sans état de cache ni
    registre de faute ; un registre de périphérique n'est jamais lu ; rien n'est signalé.
 6. **La flash n'est pas montrée.** La vue mémoire ne donne aucun octet des deux fenêtres de flash (« contenu de la
-   flash, non montré ») ; un point de surveillance y est refusé ; le désassemblage lit la seule fenêtre
-   d'instructions, le code que le processeur exécute, et n'en donne que le texte décodé, sans encodage ni bits
-   (une instruction illégale s'écrit `illegal`). Rien de ce que lit le débogueur n'entre au journal, dans un
+   flash, non montré ») ; un point de surveillance y est refusé. Le désassemblage lit la seule fenêtre
+   d'instructions, et dans elle les seules pages de 64 Kio d'où le processeur a réellement chargé une instruction
+   pendant cette vie : le bus les note sur le chemin du fetch (un bit par page de flash, posé quand le cache de
+   décodage manque, jamais relu pendant l'exécution, gardé à travers les resets, retiré d'une page qu'une
+   programmation ou un effacement change) ; `peek` ne donne aucun octet d'une autre page (`Peeked::NotExecuted`),
+   que la vue dit « non exécutée ». Une page projetée pour des données reste ainsi illisible, même lue par l'alias
+   d'instructions. Du code exécuté, le désassemblage ne donne que le texte décodé, sans encodage ni bits (une
+   instruction illégale s'écrit `illegal`). Rien de ce que lit le débogueur n'entre au journal, dans un
    fichier, une session ou la sortie de la CLI ; la ligne du journal d'un arrêt de surveillance ne porte une valeur
    que d'une région permise.
 7. **Les points appartiennent à l'émulateur** et à l'interface qui les garde d'un lancement à l'autre ; ils

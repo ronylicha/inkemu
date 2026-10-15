@@ -96,8 +96,13 @@ pub enum RunStop {
 pub enum Peeked {
     /// A byte of the mask ROM or of a RAM.
     Byte(u8),
-    /// A byte of the flash, through a cache window and its MMU entry.
+    /// A byte of the flash, through a cache window and its MMU entry, in a 64 KiB flash page the
+    /// CPU fetched an instruction from since the machine was built (and no program nor erase
+    /// changed since): code the machine executed.
     Flash(u8),
+    /// A byte of the flash in a page the CPU fetched no instruction from (ADR 0016 §6): not
+    /// given, since such a page may hold data, personal ones included (the NVS of a device).
+    NotExecuted,
     /// A byte of a flash window that no flash byte backs: its MMU entry is invalid, or maps a
     /// page past the end of the chip.
     Unbacked,

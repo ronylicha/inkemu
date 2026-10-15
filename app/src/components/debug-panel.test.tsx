@@ -68,6 +68,9 @@ describe("DebugPanel", () => {
     );
     expect(lines[2]).toHaveTextContent("no code can be read here");
     expect(within(code).getByRole("button", { name: "Breakpoint at 0x40000006" })).toBeDisabled();
+    // A page of the flash not executed yet is not read, but may hold code that will run.
+    expect(lines[3]).toHaveTextContent("a page of the flash not executed: not read");
+    expect(within(code).getByRole("button", { name: "Breakpoint at 0x42010000" })).toBeEnabled();
   });
 
   it("sets and clears a breakpoint from the code, then reads the machine again", async () => {

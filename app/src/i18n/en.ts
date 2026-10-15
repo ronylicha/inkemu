@@ -244,6 +244,8 @@ export const en: Catalog = {
   "debug.code.goTo": "Code at the address",
   "debug.code.show": "Show",
   "debug.code.unreadable": "no code can be read here",
+  "debug.code.notExecuted":
+    "a page of the flash not executed: not read (it may hold personal data)",
   "debug.code.compressed": "compressed instruction (16 bits)",
   "debug.code.current": "current instruction",
   "debug.breakpoint.toggle": "Breakpoint at {address}",

@@ -97,8 +97,12 @@ pub struct Line {
     /// 2 or 4; 2 for a line that could not be read, which moves the next one by a parcel.
     pub length: u8,
     /// The instruction; `None` where no code can be read: registers, nothing, a flash page no MMU
-    /// entry backs, or the data window of the flash.
+    /// entry backs, the data window of the flash, or a page of its instruction window the CPU
+    /// fetched no instruction from ([`Line::not_executed`]).
     pub instruction: Option<Instruction>,
+    /// A page of the flash's instruction window the CPU fetched no instruction from in this life:
+    /// not read, since it may hold data (ADR 0016 §6). A breakpoint may still go there.
+    pub not_executed: bool,
     /// The PC is here.
     pub current: bool,
     pub breakpoint: bool,
@@ -273,8 +277,8 @@ pub fn cpu(machine: &Esp32C3) -> CpuView {
     }
 }
 
-/// A byte of code at `address`: a byte of memory, or of the flash's instruction window, which
-/// holds the code the CPU executes (4a-D6); `None` elsewhere.
+/// A byte of code at `address`: a byte of memory, or of the flash's instruction window in a page
+/// the CPU fetched an instruction from (4a-D6, ADR 0016 §6); `None` elsewhere.
 fn code_byte(machine: &Esp32C3, address: u32) -> Option<u8> {
     match machine.peek(address, 1).first().copied() {
         Some(Peeked::Byte(byte)) => Some(byte),
@@ -303,8 +307,12 @@ fn instruction_at(machine: &Esp32C3, address: u32) -> Option<Decoded> {
 /// One line at `address`.
 fn line(machine: &Esp32C3, points: &Points, address: u32) -> Line {
     let decoded = instruction_at(machine, address);
+    let not_executed = decoded.is_none()
+        && in_flash_code(address)
+        && machine.peek(address, 1).first() == Some(&Peeked::NotExecuted);
     Line {
         address,
+        not_executed,
         length: decoded.map_or(2, |decoded| decoded.len),
         instruction: decoded.map(|decoded| Instruction {
             text: disassemble(&decoded, address),
@@ -393,7 +401,7 @@ pub fn memory(machine: &Esp32C3, request: MemoryRequest) -> MemoryView {
         let address = request.address.wrapping_add(offset);
         let (byte, region) = match peeked {
             Peeked::Byte(byte) => (Some(byte), Region::of(address)),
-            Peeked::Flash(_) => (None, Region::Flash),
+            Peeked::Flash(_) | Peeked::NotExecuted => (None, Region::Flash),
             Peeked::Unbacked => (None, Region::Unbacked),
             Peeked::Register => (None, Region::Registers),
             Peeked::Unmapped => (None, Region::Unmapped),
@@ -429,10 +437,11 @@ pub fn inspect(machine: &Esp32C3, points: &Points, request: &ViewRequest) -> Deb
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cpu_rv32::asm::{addi, lui, sw};
+    use cpu_rv32::asm::{addi, jalr, lui, lw, sw};
     use emu_core::Cycles;
     use soc_esp32c3::memmap::{FLASH_DBUS_BASE, FLASH_IBUS_BASE, ROM_BASE, SRAM_DBUS_BASE};
-    use soc_esp32c3::test_support::{HANG, flat_rom, stop_watchdogs};
+    use soc_esp32c3::periph::mmu::MMU_TABLE_BASE;
+    use soc_esp32c3::test_support::{HANG, flat_rom, stop_watchdogs, store_register};
     use soc_esp32c3::{SocConfig, WatchHit};
 
     /// A program that stores `0x2a` at the start of the SRAM, then hangs; the index of the hang.
@@ -573,6 +582,60 @@ mod tests {
             disassembly(&machine, &Points::default(), &request)[0]
                 .instruction
                 .is_none()
+        );
+    }
+
+    /// ADR 0016 §6: of the flash, the disassembly reads the pages the CPU executed only. A program
+    /// maps flash page 1 for data and page 2 for code, reads a word of the first through the data
+    /// window, then runs the second from the instruction window.
+    #[test]
+    fn a_data_page_read_through_the_instruction_window_gives_no_line() {
+        let code_page = FLASH_IBUS_BASE + 0x2_0000;
+        let data_page = FLASH_IBUS_BASE + 0x1_0000;
+        let mut image = vec![0xffu8; 0x3_0000];
+        // `addi a0, a0, 1` in both pages: the data one would read as code if it were decoded.
+        for page in [0x1_0000, 0x2_0000] {
+            image[page..page + 4].copy_from_slice(&addi(10, 10, 1).to_le_bytes());
+            image[page + 4..page + 8].copy_from_slice(&HANG.to_le_bytes());
+        }
+        let mut program = stop_watchdogs();
+        program.extend(store_register(MMU_TABLE_BASE + 4, 1));
+        program.extend(store_register(MMU_TABLE_BASE + 8, 2));
+        program.extend([
+            lui(5, FLASH_DBUS_BASE + 0x1_0000),
+            lw(6, 5, 0),
+            lui(5, code_page),
+            jalr(0, 5, 0),
+        ]);
+        let mut machine =
+            Esp32C3::with_flash(flat_rom(&program), image, &SocConfig::default()).unwrap();
+        machine.run_within(Cycles(100_000), None);
+        assert_eq!(machine.pc(), code_page + 4, "the code page ran");
+        assert_eq!(machine.x()[6], addi(10, 10, 1), "the data page was read");
+        let points = Points::default();
+        let at = |address: u32| ViewRequest {
+            disassembly_at: Some(address),
+            disassembly_lines: Some(2),
+            memory: None,
+        };
+        let data = disassembly(&machine, &points, &at(data_page));
+        assert!(
+            data.iter()
+                .all(|line| line.instruction.is_none() && line.not_executed)
+        );
+        let code = disassembly(&machine, &points, &at(code_page));
+        assert_eq!(text(&code[0]), "addi a0, a0, 1");
+        assert!(!code[0].not_executed);
+        let code_bytes = memory(
+            &machine,
+            MemoryRequest {
+                address: code_page,
+                length: 4,
+            },
+        );
+        assert_eq!(
+            code_bytes.bytes, [None; 4],
+            "the memory view never shows the flash"
         );
     }
 

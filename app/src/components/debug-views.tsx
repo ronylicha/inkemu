@@ -126,14 +126,18 @@ export function Disassembly({ lines, onBreakpoint }: DisassemblyProps) {
             className="breakpoint-toggle"
             aria-pressed={line.breakpoint}
             aria-label={t("debug.breakpoint.toggle", { address: hex32(line.address) })}
-            disabled={line.instruction === null && !line.breakpoint}
+            // A page of the flash not executed yet may hold code that will run: a breakpoint
+            // may wait there.
+            disabled={line.instruction === null && !line.notExecuted && !line.breakpoint}
             onClick={() => onBreakpoint(line.address, !line.breakpoint)}
           >
             <span aria-hidden="true">{line.breakpoint ? "●" : "○"}</span>
           </button>
           <span className="mono disassembly-address">{hex32(line.address)}</span>
           {line.instruction === null ? (
-            <span className="note">{t("debug.code.unreadable")}</span>
+            <span className="note">
+              {t(line.notExecuted ? "debug.code.notExecuted" : "debug.code.unreadable")}
+            </span>
           ) : (
             <span className="mono">
               {line.instruction.text}

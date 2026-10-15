@@ -1,6 +1,6 @@
 //! The side of the bus a debugger sees (ADR 0016): the accesses of the CPU noted for its
 //! watchpoints, and a read of memory without the effects of a load.
-use super::{Region, SocBus, canonical, locate};
+use super::{MMU_PAGE_BYTES, Region, SocBus, canonical, locate};
 use crate::debug::{Access, Peeked, Watch, WatchHit};
 use emu_core::AccessSize;
 
@@ -77,11 +77,12 @@ impl SocBus {
             Some(Region::Sram0) => byte(self.sram0.bytes(addr, 1)),
             Some(Region::Rtc) => byte(self.rtc.bytes(addr, 1)),
             Some(Region::Flash { offset, .. }) => match self.flash_offset(offset) {
-                Ok(flash_offset) => {
+                Ok(flash_offset) if self.executed.contains(flash_offset / MMU_PAGE_BYTES) => {
                     let mut out = [0u8];
                     self.periph.spi1.flash().read(flash_offset, &mut out);
                     Peeked::Flash(out[0])
                 }
+                Ok(_) => Peeked::NotExecuted,
                 Err(_) => Peeked::Unbacked,
             },
             Some(Region::Periph) => Peeked::Register,
@@ -94,6 +95,7 @@ impl SocBus {
 mod tests {
     use super::*;
     use crate::config::SocConfig;
+    use crate::ctx::Event;
     use crate::debug::WatchOn;
     use crate::flash::NorFlash;
     use crate::memmap::{
@@ -254,11 +256,90 @@ mod tests {
         b.write(MMU_TABLE_BASE + 4, AccessSize::Word, 1).unwrap();
         b.write(MMU_TABLE_BASE + 8, AccessSize::Word, MMU_ENTRY_INVALID)
             .unwrap();
+        b.read(
+            FLASH_IBUS_BASE + 0x1_0000,
+            AccessSize::Half,
+            AccessKind::Fetch,
+        )
+        .unwrap();
         let generation = b.periph.extmem.generation();
         assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x1_0000), Peeked::Flash(0x13));
         assert_eq!(b.peek_byte(FLASH_DBUS_BASE + 0x1_0002), Peeked::Flash(0x15));
         assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x2_0000), Peeked::Unbacked);
         assert_eq!(b.ctx.diag.drain(), [], "no fault latched nor reported");
         assert_eq!(b.periph.extmem.generation(), generation, "no cache state");
+    }
+
+    /// A bus whose MMU entry 1 maps flash page 1, and entry 2 flash page 2.
+    fn mapped_bus() -> SocBus {
+        let config = SocConfig::default();
+        let mut image = vec![0xffu8; 0x3_0000];
+        image[0x1_0000..0x1_0004].copy_from_slice(&[0x13, 0x05, 0x15, 0x00]);
+        image[0x2_0000..0x2_0004].copy_from_slice(&[0x93, 0x05, 0x16, 0x00]);
+        let flash = Box::new(NorFlash::with_image(image, config.flash).unwrap());
+        let mut b = SocBus::new(flat_rom(&[]), flash, &config);
+        b.write(MMU_TABLE_BASE + 4, AccessSize::Word, 1).unwrap();
+        b.write(MMU_TABLE_BASE + 8, AccessSize::Word, 2).unwrap();
+        b
+    }
+
+    /// ADR 0016 §6: the flash a debugger may read is the code the CPU executed. A page read as
+    /// data, through either window, gives no byte; a fetch from a page opens it, and only it.
+    #[test]
+    fn a_peek_gives_a_flash_byte_only_from_a_page_the_cpu_fetched_from() {
+        let mut b = mapped_bus();
+        b.read(
+            FLASH_DBUS_BASE + 0x1_0000,
+            AccessSize::Word,
+            AccessKind::Load,
+        )
+        .unwrap();
+        assert_eq!(b.peek_byte(FLASH_DBUS_BASE + 0x1_0000), Peeked::NotExecuted);
+        assert_eq!(
+            b.peek_byte(FLASH_IBUS_BASE + 0x1_0000),
+            Peeked::NotExecuted,
+            "a page of data, read through the instruction-bus alias"
+        );
+        b.read(
+            FLASH_IBUS_BASE + 0x2_0000,
+            AccessSize::Half,
+            AccessKind::Fetch,
+        )
+        .unwrap();
+        assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x2_0000), Peeked::Flash(0x93));
+        assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x1_0000), Peeked::NotExecuted);
+    }
+
+    /// A program or an erase changes what a page holds: what the CPU executed there is gone, and
+    /// the page is closed again until the CPU fetches from it anew.
+    #[test]
+    fn a_page_the_flash_rewrote_is_not_executed_any_more() {
+        let mut b = mapped_bus();
+        b.read(
+            FLASH_IBUS_BASE + 0x1_0000,
+            AccessSize::Half,
+            AccessKind::Fetch,
+        )
+        .unwrap();
+        b.read(
+            FLASH_IBUS_BASE + 0x2_0000,
+            AccessSize::Half,
+            AccessKind::Fetch,
+        )
+        .unwrap();
+        b.ctx.signal(Event::FlashWritten {
+            first_page: 2,
+            last_page: 2,
+        });
+        b.settle();
+        assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x2_0000), Peeked::NotExecuted);
+        assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x1_0000), Peeked::Flash(0x13));
+        b.read(
+            FLASH_IBUS_BASE + 0x2_0000,
+            AccessSize::Half,
+            AccessKind::Fetch,
+        )
+        .unwrap();
+        assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x2_0000), Peeked::Flash(0x93));
     }
 }
