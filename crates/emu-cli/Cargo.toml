@@ -24,11 +24,8 @@ soc-esp32c3.workspace = true
 boards.workspace = true
 console-script.workspace = true
 session.workspace = true
+host.workspace = true
 sha2.workspace = true
-ureq.workspace = true
-flate2.workspace = true
-tar.workspace = true
-etcetera.workspace = true
 
 # `poll`, to learn that the reader of standard output went away while a run prints nothing.
 [target.'cfg(unix)'.dependencies]

@@ -1,0 +1,42 @@
+[package]
+name = "host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The host policy of inkemu's front ends: the files a run reads and writes, the ROM, the sessions, the
+# loop that runs a machine, and a machine on a thread of its own with its commands and its ports. The
+# command line and the desktop application both consume it (design SP2c, C1).
+[lints]
+workspace = true
+
+[dependencies]
+emu-core.workspace = true
+firmware.workspace = true
+soc-esp32c3.workspace = true
+boards.workspace = true
+console-script.workspace = true
+session.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+ureq.workspace = true
+flate2.workspace = true
+tar.workspace = true
+etcetera.workspace = true
+
+# `O_NOFOLLOW` and `O_NONBLOCK`, to open the flash file without following a link or blocking on a pipe.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+# `mkfifo`, for the tests of what an open does when a pipe sits at the name of a file.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+svd-regs.workspace = true
+cpu-rv32 = { workspace = true, features = ["test-support"] }
+soc-esp32c3 = { workspace = true, features = ["test-support"] }
+firmware = { workspace = true, features = ["test-support"] }
