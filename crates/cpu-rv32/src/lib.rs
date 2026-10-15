@@ -14,10 +14,11 @@ pub mod csr_esp32c3;
 mod dcache;
 mod exec;
 pub mod hart;
+pub mod pmp;
 pub mod timing;
 pub mod trap;
 
-pub use csr::VendorCsrs;
+pub use csr::{Core, Privilege};
 pub use hart::{Boundary, Hart, HartConfig, InterruptModel, MisalignedPolicy, StepOutcome};
 pub use timing::{DatasheetTiming, QemuIcountTiming};
 pub use trap::{Exception, Trap};

@@ -1,5 +1,8 @@
-//! Synchronous exceptions of a machine-mode-only RV32 hart.
+//! Synchronous exceptions of an RV32 hart, all taken in machine mode.
 
+/// An access fault is raised by the bus (nothing answers at the address) or by the physical
+/// memory protection (`crate::pmp`): the two have the same cause, as on the ESP32-C3 (TRM register
+/// 1.10: "PMP Load access fault").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exception {
     InstrAccessFault,
@@ -9,6 +12,9 @@ pub enum Exception {
     LoadAccessFault,
     StoreMisaligned,
     StoreAccessFault,
+    /// `ecall` executed in user mode.
+    EcallU,
+    /// `ecall` executed in machine mode.
     EcallM,
 }
 
@@ -24,8 +30,15 @@ impl Exception {
             Exception::LoadAccessFault => 5,
             Exception::StoreMisaligned => 6,
             Exception::StoreAccessFault => 7,
+            Exception::EcallU => 8,
             Exception::EcallM => 11,
         }
+    }
+
+    /// An `ecall`: a request to the trap handler, not a fault.
+    #[must_use]
+    pub const fn is_environment_call(self) -> bool {
+        matches!(self, Exception::EcallU | Exception::EcallM)
     }
 }
 
@@ -41,6 +54,7 @@ impl std::fmt::Display for Exception {
             Exception::LoadAccessFault => "load access fault",
             Exception::StoreMisaligned => "store address misaligned",
             Exception::StoreAccessFault => "store access fault",
+            Exception::EcallU => "environment call from user mode",
             Exception::EcallM => "environment call from machine mode",
         })
     }
@@ -66,10 +80,33 @@ mod tests {
             (Exception::LoadAccessFault, 5),
             (Exception::StoreMisaligned, 6),
             (Exception::StoreAccessFault, 7),
+            (Exception::EcallU, 8),
             (Exception::EcallM, 11),
         ];
         for (exception, code) in codes {
             assert_eq!(exception.code(), code);
+        }
+    }
+
+    #[test]
+    fn only_the_two_environment_calls_are_requests_to_the_handler() {
+        let calls = [Exception::EcallU, Exception::EcallM];
+        for exception in [
+            Exception::InstrAccessFault,
+            Exception::IllegalInstr,
+            Exception::Breakpoint,
+            Exception::LoadMisaligned,
+            Exception::LoadAccessFault,
+            Exception::StoreMisaligned,
+            Exception::StoreAccessFault,
+            Exception::EcallU,
+            Exception::EcallM,
+        ] {
+            assert_eq!(
+                exception.is_environment_call(),
+                calls.contains(&exception),
+                "{exception}"
+            );
         }
     }
 
@@ -83,6 +120,7 @@ mod tests {
             (Exception::LoadAccessFault, "load access fault"),
             (Exception::StoreMisaligned, "store address misaligned"),
             (Exception::StoreAccessFault, "store access fault"),
+            (Exception::EcallU, "environment call from user mode"),
             (Exception::EcallM, "environment call from machine mode"),
         ];
         for (exception, name) in names {

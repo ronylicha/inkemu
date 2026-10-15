@@ -1,11 +1,17 @@
 // Sail RISC-V configuration (applied over the --rv32 defaults) that makes the reference model the
-// same machine as inkemu: RV32IMC + Zicsr + Zifencei, M-mode only, fixed misa, and misaligned
-// loads/stores raising an address-misaligned exception (the ISA YAML declares no hardware support).
+// same machine as inkemu's conformance bench (cpu_rv32::Core::MachineUser): RV32IMC + Zicsr +
+// Zifencei, machine and user modes without supervisor mode, fixed misa, misaligned loads/stores
+// raising an address-misaligned exception (the ISA YAML declares no hardware support), and the
+// default PMP of 16 entries with a grain of 4 bytes. A pmpcfg write of R = 0 with W = 1 leaves the
+// entry as it was (PMP_Ignore), as inkemu and QEMU do; wfi in user mode waits unless mstatus.TW is
+// set, as on the ESP32-C3 (TRM register 1.5).
 {
   "base": {
     "hpmevent_width_bits": 32,
-    "mstatus": { "fs_legal_states": "ExtContext_Off", "vs_legal_states": "ExtContext_Off" }
+    "mstatus": { "fs_legal_states": "ExtContext_Off", "vs_legal_states": "ExtContext_Off" },
+    "reserved_behavior": { "pmpcfg_write_only": "PMP_Ignore" }
   },
+  "platform": { "wfi_available_to_user_mode": true },
   "memory": {
     "physaddr_bits": 32,
     "misaligned": {
@@ -38,7 +44,7 @@
       "mutable_misa": false
     },
     "U": {
-      "supported": false,
+      "supported": true,
       "mutable_misa": false
     },
     "H": {

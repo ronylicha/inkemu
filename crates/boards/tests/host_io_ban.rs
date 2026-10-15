@@ -1,6 +1,6 @@
-//! The ban on host I/O of `firmware`, `boards`, `soc-esp32c3`, `console-script`, `session` and
-//! `lockstep` lives in one `clippy.toml` per crate, because clippy reads the one nearest to a crate
-//! and no other. Copies can drift, and
+//! The ban on host I/O of `firmware`, `boards`, `soc-esp32c3`, `console-script`, `session`,
+//! `lockstep` and `chips` lives in one `clippy.toml` per crate, because clippy reads the one nearest
+//! to a crate and no other. Copies can drift, and
 //! an entry removed from all of them is silent: clippy then accepts the call. This test holds the
 //! copies equal, holds the workspace settings in each, and names every call the ban must refuse.
 #![allow(clippy::disallowed_methods)] // reads the clippy.toml files: it is a test of the build
@@ -8,13 +8,14 @@
 use std::path::PathBuf;
 
 /// The crates that do no host I/O: a graphical front end and the WebAssembly build use them.
-const CRATES: [&str; 6] = [
+const CRATES: [&str; 7] = [
     "firmware",
     "boards",
     "soc-esp32c3",
     "console-script",
     "session",
     "lockstep",
+    "chips",
 ];
 
 /// Every path the ban refuses, by kind. A path missing from a `clippy.toml` is a call that
