@@ -81,6 +81,12 @@ impl<S: BlockStorage> Bus<S> {
     }
 
     fn cmd_bytes(&mut self, bytes: [u8; 6]) -> u8 {
+        // As SdFat does: wait until the card is ready, but for CMD0 and CMD12.
+        if !matches!(bytes[0] & 0x3F, 0 | 12) {
+            while self.byte(0xFF) != 0xFF {
+                self.wait(US);
+            }
+        }
         let during = self.send(&bytes);
         assert!(
             during.iter().all(|&byte| byte == 0xFF),
@@ -1054,6 +1060,45 @@ fn a_command_while_a_write_waits_is_refused_but_cmd12_ends_it() {
 }
 
 #[test]
+fn the_stop_token_of_a_multiple_write_is_followed_by_busy() {
+    let mut bus = ready_sdhc();
+    assert_eq!(bus.cmd(25, 0), 0x00);
+    assert_eq!(
+        bus.write_block(START_MULTIPLE_WRITE, &[1; 512]),
+        DATA_ACCEPTED
+    );
+    bus.wait_ready();
+    assert_eq!(bus.byte(STOP_TRANSMISSION), 0xFF);
+    assert_eq!(
+        bus.byte(0xFF),
+        0x00,
+        "busy right after the stop token (PLS Figure 7-7)"
+    );
+    let busy = bus.wait_ready();
+    assert!((249 * US..=251 * US).contains(&busy), "busy {busy} ns");
+}
+
+#[test]
+fn cmd12_ending_a_write_is_followed_by_busy_and_ending_a_read_is_not() {
+    let mut bus = ready_sdhc();
+    assert_eq!(bus.cmd(25, 0), 0x00);
+    bus.send(&frame(12, 0));
+    assert_eq!(bus.receive(2), [0xFF, 0x00], "R1 on the second byte");
+    assert_eq!(bus.byte(0xFF), 0x00, "then busy: R1b");
+    let busy = bus.wait_ready();
+    assert!((249 * US..=251 * US).contains(&busy), "busy {busy} ns");
+    assert_eq!(bus.cmd(18, 0), 0x00);
+    assert_eq!(bus.data_block(512), numbered(0));
+    bus.send(&frame(12, 0));
+    assert_eq!(bus.receive(2), [0xFF, 0x00]);
+    assert_eq!(
+        bus.receive(3),
+        [0xFF; 3],
+        "a read leaves nothing to program: no busy (PLS §4.9.2)"
+    );
+}
+
+#[test]
 fn the_diagnostics_kept_are_bounded_and_the_rest_counted() {
     let mut bus = ready_sdhc();
     for _ in 0..MAX_DIAGNOSTICS + 76 {
@@ -1271,6 +1316,7 @@ fn no_stream_of_bytes_selections_and_instants_makes_the_card_panic() {
             read_access_ns: 0,
             program_ns: 0,
             erase_ns: 0,
+            stop_ns: 0,
         },
         ..SdCardConfig::default()
     };

@@ -179,7 +179,7 @@ its chip select is active, nothing else. Two consequences:
 
 | Open point | SP2e | Why |
 |---|---|---|
-| Access times (NCR, NAC, busy) — removed from the simplified edition | response on the second byte after a command; read access 250 µs; programming 1 ms per block; erase 2 ms; initialization 50 ms from the first ACMD41 — all parameters of the model [HYP] | within the host timeouts of PLS §4.6.2 and SdFat's; short enough for a fast emulation |
+| Access times (NCR, NAC, busy) — removed from the simplified edition | response on the second byte after a command; read access 250 µs; programming 1 ms per block; erase 2 ms; initialization 50 ms from the first ACMD41; busy 250 µs after the stop token of a multiple write (PLS Figure 7-7 draws busy after it) and after CMD12 ending a multiple write, none after CMD12 ending a read ("The card may become busy after receiving these commands based on its state prior to the command reception", PLS §4.9.2: a read leaves nothing to program) — all parameters of the model [HYP] | within the host timeouts of PLS §4.6.2 and SdFat's; short enough for a fast emulation |
 | What DO carries while selected with nothing to send | `FFh` [HYP] | SdFat waits for `FFh` as "ready" (`SF:SdSpiCard.cpp:613-621`) |
 | What a deselection does to a transfer in progress | a partial command or block is dropped and reported; a multiple-block read ends; programming goes on (PLS §7.2.4) [HYP for reads] | the spec says it for writes only |
 | Card identity (CID) | MID `00h`, OID `"IE"`, PNM `"INKEM"`, PRV 1.0, PSN 1, MDT 2026-10 [HYP] | no manufacturer to imitate; a fixed identity keeps runs deterministic |

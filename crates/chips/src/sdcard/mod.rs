@@ -89,6 +89,11 @@ pub struct SdTiming {
     pub program_ns: u64,
     /// An erase (CMD38): the card is busy that long after its response.
     pub erase_ns: u64,
+    /// The end of a multiple write, by the stop token or by CMD12: the card is busy that long
+    /// after it (PLS Figure 7-7 shows busy after the stop token; R1b "may become busy after
+    /// receiving these commands based on its state prior to the command reception", §4.9.2).
+    /// After a read, which leaves nothing to program, CMD12 is not followed by busy.
+    pub stop_ns: u64,
 }
 
 impl Default for SdTiming {
@@ -98,6 +103,7 @@ impl Default for SdTiming {
             read_access_ns: 250_000,
             program_ns: 1_000_000,
             erase_ns: 2_000_000,
+            stop_ns: 250_000,
         }
     }
 }
@@ -723,6 +729,7 @@ impl<S: BlockStorage> SdCard<S> {
             };
         }
         if multiple && byte == STOP_TRANSMISSION {
+            self.busy_until = Some(self.after(self.config.timing.stop_ns));
             return Phase::Idle;
         }
         self.report(SdDiagnosticKind::UnexpectedToken { token: byte });
@@ -795,6 +802,10 @@ impl<S: BlockStorage> SdCard<S> {
                     return self.crc_refusal(command);
                 }
                 self.respond(0, &[]);
+                // R1b: busy after the response when a write was in progress, never after a read.
+                if matches!(during, Phase::WriteWait { .. }) {
+                    self.busy_until = Some(self.after(self.config.timing.stop_ns));
+                }
                 Phase::Idle
             }
             index => {
