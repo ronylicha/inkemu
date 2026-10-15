@@ -19,9 +19,12 @@ use crate::run::{self, RunEnd, SLICE_CYCLES};
 use crate::sd_run::LifeCard;
 use crate::utf8::Utf8Stream;
 use boards::SdHandle;
+use debugger::Points;
 use emu_core::Cycles;
 use session::{ConsoleDigests, NoTraceHash, Session};
-use soc_esp32c3::{ConsoleChannel, DeepSleep, Esp32C3, InputError, StopReason, UsbHost};
+use soc_esp32c3::{
+    ConsoleChannel, DebugStop, DeepSleep, Esp32C3, InputError, RunStop, StopReason, UsbHost,
+};
 use std::sync::Arc;
 
 /// The limits of a run: what ends it on its own besides the firmware.
@@ -123,6 +126,9 @@ pub struct Output {
     pub frame: Option<Arc<PanelFrame>>,
     /// The pass stopped on its pace: the machine is where the host clock allows it to be.
     pub caught_up: bool,
+    /// A point of the debugger stopped the pass, or the step made an access to watched bytes
+    /// (design `SP4a`, 4a-D9). The life goes on: nothing of the run changed.
+    pub stop: Option<DebugStop>,
 }
 
 /// Why the engine did not do what it was asked.
@@ -489,7 +495,14 @@ impl Engine {
             (Some(pace), None) => (Some(pace), true),
             (_, max) => (max, false),
         };
-        let stop = self.machine.run_within(Cycles(limit), deadline);
+        let stop = match self.machine.run_stopping(Cycles(limit), deadline) {
+            RunStop::Machine(stop) => stop,
+            RunStop::Debug(point) => {
+                self.collect(&mut output, None);
+                output.stop = Some(point);
+                return output;
+            }
+        };
         let violation = match &stop {
             StopReason::StrictMmio(diagnostic) => Some(diagnostic.clone()),
             _ => None,
@@ -497,6 +510,19 @@ impl Engine {
         self.collect(&mut output, violation.as_ref());
         self.after(&stop, paced, &mut output);
         output
+    }
+
+    /// Gives the points of the debugger to the machine, in place of the ones it had: from now on
+    /// they stop a pass ([`Output::stop`]). They change nothing of the run (ADR 0016).
+    pub fn set_points(&mut self, points: &Points) {
+        points.apply(&mut self.machine);
+    }
+
+    /// The machine, once the life is done with it ([`Engine::finish`]): what a debugger reads of
+    /// the state the life ended in.
+    #[must_use]
+    pub fn into_machine(self) -> Esp32C3 {
+        self.machine
     }
 
     /// Executes one instruction and goes to the boundary of the next ([`Esp32C3::step`]).
@@ -512,6 +538,7 @@ impl Engine {
         }
         let mut output = Output::default();
         let stepped = self.machine.step();
+        output.stop = self.machine.take_watch_hit().map(DebugStop::Watchpoint);
         let violation = match &stepped.stop {
             Some(StopReason::StrictMmio(diagnostic)) => Some(diagnostic.clone()),
             _ => None,
@@ -803,7 +830,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{echo, idle, life, options, run_until, text};
+    use super::fixtures::{self, echo, idle, life, options, run_until, text};
     use super::*;
     use crate::ports::{PanelFrame, Recipe as _, RefreshKind};
     use crate::record::Recorder;
@@ -1008,6 +1035,68 @@ mod tests {
         assert_eq!(engine.status().instructions, 1);
         engine.step().unwrap();
         assert_eq!(engine.status().instructions, 2);
+    }
+
+    /// `echo` begins with `lui t0, UART0`, then an `addi` and a `sw` per letter of `ready`.
+    const ECHO_SECOND_STORE: u32 = 0x4000_0000 + 4 * 4;
+
+    /// A breakpoint stops a pass before its instruction; the life goes on, and the next pass
+    /// goes past it (design `SP4a`, 4a-D2).
+    #[test]
+    fn a_breakpoint_stops_a_pass_and_the_life_goes_on() {
+        let mut engine = Engine::new(
+            life(echo(), false),
+            Mode::Run { recorder: None },
+            Limits::default(),
+        );
+        engine.begin();
+        let mut points = Points::default();
+        points.set_breakpoint(ECHO_SECOND_STORE).unwrap();
+        engine.set_points(&points);
+        let stopped = engine.pass(None);
+        assert_eq!(
+            stopped.stop,
+            Some(DebugStop::Breakpoint {
+                pc: ECHO_SECOND_STORE
+            })
+        );
+        assert_eq!(engine.state(), State::Live);
+        assert_eq!(engine.status().pc, ECHO_SECOND_STORE);
+        assert_eq!(engine.status().instructions, 4);
+        let shown = text(&stopped, UART0) + &run_until(&mut engine, UART0, "ready", 50);
+        assert!(shown.contains("ready"), "{shown}");
+    }
+
+    /// A step that stores to watched bytes says so: what, where, and by which instruction.
+    #[test]
+    fn a_step_over_a_watched_store_says_it() {
+        let mut engine = Engine::new(
+            life(echo(), false),
+            Mode::Run { recorder: None },
+            Limits::default(),
+        );
+        engine.begin();
+        let mut points = Points::default();
+        points
+            .set_watchpoint(soc_esp32c3::Watch {
+                address: fixtures::UART0,
+                length: 4,
+                on: soc_esp32c3::WatchOn::Write,
+            })
+            .unwrap();
+        engine.set_points(&points);
+        assert_eq!(engine.step().unwrap().stop, None, "lui");
+        assert_eq!(engine.step().unwrap().stop, None, "addi");
+        assert_eq!(
+            engine.step().unwrap().stop,
+            Some(DebugStop::Watchpoint(soc_esp32c3::WatchHit {
+                address: fixtures::UART0,
+                size: 4,
+                access: soc_esp32c3::Access::Write,
+                value: u32::from(b'r'),
+                pc: 0x4000_0008,
+            }))
+        );
     }
 
     /// The buttons of the pattern reach the panel and not the firmware: a press is a refresh,

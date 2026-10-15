@@ -517,6 +517,7 @@ dependencies = [
  "chips",
  "console-script",
  "cpu-rv32",
+ "debugger",
  "emu-core",
  "etcetera",
  "fatfs",

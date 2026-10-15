@@ -44,6 +44,8 @@ pub enum PointError {
         "nothing is mapped at {address:#010x}: no access can reach it; watch the RAM or the registers"
     )]
     Unmapped { address: u32 },
+    #[error("a watchpoint stops on `read`, `write` or `access`, not `{name}`")]
+    UnknownAccess { name: String },
 }
 
 /// The points a debugger set.
@@ -53,7 +55,61 @@ pub struct Points {
     watchpoints: Vec<Watch>,
 }
 
+/// Points as an interface sends them, to start a run with them: an interface keeps the points
+/// of its user from one run to the next, and a run starts with them before its first
+/// instruction.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PointsRequest {
+    #[serde(default)]
+    pub breakpoints: Vec<u32>,
+    #[serde(default)]
+    pub watchpoints: Vec<WatchRequest>,
+}
+
+/// A watchpoint as an interface sends it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WatchRequest {
+    pub address: u32,
+    pub length: u32,
+    /// `read`, `write` or `access`.
+    pub on: String,
+}
+
+impl WatchRequest {
+    /// The watchpoint.
+    ///
+    /// # Errors
+    /// [`PointError::UnknownAccess`] for an `on` that names no access.
+    pub fn watch(&self) -> Result<Watch, PointError> {
+        let on = watch_on(&self.on).ok_or_else(|| PointError::UnknownAccess {
+            name: self.on.clone(),
+        })?;
+        Ok(Watch {
+            address: self.address,
+            length: self.length,
+            on,
+        })
+    }
+}
+
 impl Points {
+    /// The points `request` gives, each checked as when it is set alone.
+    ///
+    /// # Errors
+    /// The first refusal, as [`Points::set_breakpoint`] and [`Points::set_watchpoint`] give it.
+    pub fn from_request(request: &PointsRequest) -> Result<Points, PointError> {
+        let mut points = Points::default();
+        for &address in &request.breakpoints {
+            points.set_breakpoint(address)?;
+        }
+        for watch in &request.watchpoints {
+            points.set_watchpoint(watch.watch()?)?;
+        }
+        Ok(points)
+    }
+
     /// Sets a breakpoint before the instruction at `address`.
     ///
     /// # Errors
@@ -330,6 +386,51 @@ mod tests {
         assert_eq!(
             machine.run_stopping(emu_core::Cycles(1_000), None),
             soc_esp32c3::RunStop::Debug(soc_esp32c3::DebugStop::Breakpoint { pc: ROM_BASE })
+        );
+    }
+
+    #[test]
+    fn the_points_an_interface_sends_are_checked_as_when_set_alone() {
+        let request: PointsRequest = serde_json::from_value(serde_json::json!({
+            "breakpoints": [ROM_BASE, ROM_BASE + 4],
+            "watchpoints": [{ "address": SRAM_DBUS_BASE, "length": 4, "on": "access" }]
+        }))
+        .unwrap();
+        let points = Points::from_request(&request).unwrap();
+        assert_eq!(points.breakpoints().count(), 2);
+        assert_eq!(
+            points.watchpoints(),
+            [Watch {
+                address: SRAM_DBUS_BASE,
+                length: 4,
+                on: WatchOn::Access
+            }]
+        );
+        let odd = PointsRequest {
+            breakpoints: vec![ROM_BASE + 1],
+            watchpoints: Vec::new(),
+        };
+        assert!(matches!(
+            Points::from_request(&odd),
+            Err(PointError::OddAddress { .. })
+        ));
+        let unknown = PointsRequest {
+            breakpoints: Vec::new(),
+            watchpoints: vec![WatchRequest {
+                address: SRAM_DBUS_BASE,
+                length: 4,
+                on: "execute".to_owned(),
+            }],
+        };
+        assert_eq!(
+            Points::from_request(&unknown),
+            Err(PointError::UnknownAccess {
+                name: "execute".to_owned()
+            })
+        );
+        assert_eq!(
+            Points::from_request(&PointsRequest::default()),
+            Ok(Points::default())
         );
     }
 

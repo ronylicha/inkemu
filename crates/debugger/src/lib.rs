@@ -17,8 +17,8 @@ pub mod region;
 pub mod view;
 
 pub use points::{
-    MAX_BREAKPOINTS, MAX_WATCH_LENGTH, MAX_WATCHPOINTS, PointError, Points, PointsView, WatchView,
-    watch_on, watch_on_name,
+    MAX_BREAKPOINTS, MAX_WATCH_LENGTH, MAX_WATCHPOINTS, PointError, Points, PointsRequest,
+    PointsView, WatchRequest, WatchView, watch_on, watch_on_name,
 };
 pub use region::Region;
 pub use view::{

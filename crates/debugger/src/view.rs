@@ -174,12 +174,13 @@ impl From<DebugStop> for StopView {
 }
 
 impl StopView {
-    /// The line of the journal that says the stop.
+    /// The line of the journal that says the stop. It begins with `inkemu: breakpoint` or
+    /// `inkemu: watchpoint`, which no other line of a run begins with.
     #[must_use]
     pub fn describe(&self) -> String {
         match *self {
             StopView::Breakpoint { pc } => {
-                format!("inkemu: stopped at the breakpoint {pc:#010x}, before its instruction")
+                format!("inkemu: breakpoint at {pc:#010x}: the device stops before its instruction")
             }
             StopView::Watchpoint {
                 address,
@@ -190,7 +191,7 @@ impl StopView {
             } => {
                 let verb = if access == "read" { "read" } else { "wrote" };
                 format!(
-                    "inkemu: stopped by a watchpoint: the instruction at {pc:#010x} {verb} {size} byte{} at {address:#010x} (value {value:#x})",
+                    "inkemu: watchpoint: the instruction at {pc:#010x} {verb} {size} byte{} at {address:#010x} (value {value:#x}); the device stops after it",
                     if size == 1 { "" } else { "s" }
                 )
             }
@@ -640,7 +641,7 @@ mod tests {
         }));
         assert_eq!(
             stop.describe(),
-            "inkemu: stopped by a watchpoint: the instruction at 0x42000100 wrote 4 bytes at 0x3fc80010 (value 0x2a)"
+            "inkemu: watchpoint: the instruction at 0x42000100 wrote 4 bytes at 0x3fc80010 (value 0x2a); the device stops after it"
         );
         assert_eq!(
             serde_json::to_value(stop).unwrap(),

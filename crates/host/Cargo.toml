@@ -13,7 +13,8 @@ workspace = true
 
 [features]
 # `host::test_support`: a device for the tests of a front end (the Tauri shell). Never in a release.
-test-support = ["soc-esp32c3/test-support"]
+# The instruction encoders of `cpu-rv32` write the programs of its devices.
+test-support = ["soc-esp32c3/test-support", "dep:cpu-rv32", "cpu-rv32/test-support"]
 
 [dependencies]
 emu-core.workspace = true
@@ -23,6 +24,10 @@ soc-esp32c3.workspace = true
 boards.workspace = true
 console-script.workspace = true
 session.workspace = true
+# The debugger's points and views (design SP4a): the thread holds the points and serves inspection.
+debugger.workspace = true
+# Only with `test-support` (above).
+cpu-rv32 = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
