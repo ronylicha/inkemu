@@ -1,0 +1,26 @@
+[package]
+name = "debugger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The debugger of inkemu's front ends (design SP4a, ADR 0016): its points and their bounds, the
+# regions it shows, and the views of a machine it gives an interface. No host I/O: the desktop
+# application and the web version (sub-project 6) use it, and the GDB server of sub-project 4d
+# will drive the same points.
+[lints]
+workspace = true
+
+[dependencies]
+cpu-rv32.workspace = true
+soc-esp32c3.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+emu-core.workspace = true
+cpu-rv32 = { workspace = true, features = ["test-support"] }
+soc-esp32c3 = { workspace = true, features = ["test-support"] }
+# The shape the interface reads the views in.
+serde_json = "1"
