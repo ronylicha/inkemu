@@ -7,7 +7,18 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { createContext, useContext } from "react";
 import type { Language } from "../i18n/i18n";
 import { decodeFrame, type Frame } from "./frame";
-import type { Command, DeviceView, HostError, Setup, Speed, Started, Update } from "./types";
+import type {
+  Command,
+  DebugView,
+  DeviceView,
+  HostError,
+  Points,
+  Setup,
+  Speed,
+  Started,
+  Update,
+  ViewRequest,
+} from "./types";
 import { isHostError } from "./types";
 
 export type FileKind = "firmware" | "bootloader" | "flash" | "session" | "romDir" | "sdImage";
@@ -19,10 +30,12 @@ export type SaveKind = "flashFile" | "session" | "capture" | "sdImage";
  */
 export interface HostApi {
   devices(): Promise<DeviceView[]>;
+  /** `points`: the debugger's, which the run begins with before its first instruction. */
   powerOn(
     setup: Setup,
     speed: Speed,
     start: number,
+    points: Points,
     onUpdate: (update: Update) => void,
   ): Promise<Started>;
   openReplay(
@@ -30,9 +43,12 @@ export interface HostApi {
     romDir: string | null,
     speed: Speed,
     start: number,
+    points: Points,
     onUpdate: (update: Update) => void,
   ): Promise<Started>;
   command(command: Command, start: number): Promise<void>;
+  /** What the debugger shows of the emulator of `start`; refused when another runs. */
+  inspect(view: ViewRequest, start: number): Promise<DebugView>;
   /**
    * The image of the last refresh, `null` before the first; refused (`FrameError`) when it is not
    * an image of `panel`.
@@ -49,7 +65,9 @@ export interface HostApi {
 /** Turns what a rejected command gives into a `HostError`. */
 export function asHostError(reason: unknown): HostError {
   if (isHostError(reason)) {
-    return reason;
+    const { kind, message } = reason;
+    const suggested = (reason as { suggested?: unknown }).suggested;
+    return typeof suggested === "string" ? { kind, message, suggested } : { kind, message };
   }
   return { kind: "ipc", message: reason instanceof Error ? reason.message : String(reason) };
 }
@@ -117,11 +135,19 @@ const command = serialized(sendCommand);
 
 export const tauriHost: HostApi = {
   devices: () => call<DeviceView[]>("devices"),
-  powerOn: (setup, speed, start, onUpdate) =>
-    call<Started>("power_on", { setup, speed, start, onUpdate: channelOf(onUpdate) }),
-  openReplay: (path, romDir, speed, start, onUpdate) =>
-    call<Started>("open_replay", { path, romDir, speed, start, onUpdate: channelOf(onUpdate) }),
+  powerOn: (setup, speed, start, points, onUpdate) =>
+    call<Started>("power_on", { setup, speed, start, points, onUpdate: channelOf(onUpdate) }),
+  openReplay: (path, romDir, speed, start, points, onUpdate) =>
+    call<Started>("open_replay", {
+      path,
+      romDir,
+      speed,
+      start,
+      points,
+      onUpdate: channelOf(onUpdate),
+    }),
   command,
+  inspect: (view, start) => call<DebugView>("inspect", { start, view }),
   frame: async (start, panel) => {
     const buffer = await call<ArrayBuffer>("frame", { start });
     return buffer.byteLength === 0 ? null : decodeFrame(buffer, panel);

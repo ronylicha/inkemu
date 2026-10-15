@@ -3,7 +3,7 @@
 
 import { vi } from "vitest";
 import type { HostApi } from "../ipc/host";
-import type { DeviceView, Look, Started, Status, Update } from "../ipc/types";
+import type { DebugView, DeviceView, Look, Started, Status, Update } from "../ipc/types";
 
 export const LOOK: Look = {
   panel: {
@@ -63,6 +63,109 @@ export function status(overrides: Partial<Status> = {}): Status {
       journalComplete: true,
     },
     usbConsoleSilenced: false,
+    stop: null,
+    ...overrides,
+  };
+}
+
+/** What the debugger shows: a CPU stopped at a breakpoint in the ROM, two lines of code around
+ * it, a word of the SRAM followed by peripheral registers, and the points. */
+export function debugView(overrides: Partial<DebugView> = {}): DebugView {
+  const names = [
+    "zero",
+    "ra",
+    "sp",
+    "gp",
+    "tp",
+    "t0",
+    "t1",
+    "t2",
+    "s0",
+    "s1",
+    "a0",
+    "a1",
+    "a2",
+    "a3",
+    "a4",
+    "a5",
+    "a6",
+    "a7",
+    "s2",
+    "s3",
+    "s4",
+    "s5",
+    "s6",
+    "s7",
+    "s8",
+    "s9",
+    "s10",
+    "s11",
+    "t3",
+    "t4",
+    "t5",
+    "t6",
+  ];
+  return {
+    cpu: {
+      pc: 0x4000_0004,
+      privilege: "machine",
+      asleep: false,
+      registers: names.map((name, number) => ({
+        number,
+        name,
+        value: number === 2 ? 0x3fcd_fff0 : number,
+      })),
+      csrs: [
+        { address: 0x300, name: "mstatus", value: 0x1800 },
+        { address: 0x342, name: "mcause", value: 0 },
+      ],
+    },
+    disassembly: [
+      {
+        address: 0x4000_0000,
+        length: 4,
+        instruction: { text: "lui t0, 0x3fc80", compressed: false },
+        notExecuted: false,
+        current: false,
+        breakpoint: false,
+      },
+      {
+        address: 0x4000_0004,
+        length: 2,
+        instruction: { text: "addi t1, t1, 1", compressed: true },
+        notExecuted: false,
+        current: true,
+        breakpoint: true,
+      },
+      {
+        address: 0x4000_0006,
+        length: 2,
+        instruction: null,
+        notExecuted: false,
+        current: false,
+        breakpoint: false,
+      },
+      {
+        address: 0x4201_0000,
+        length: 2,
+        instruction: null,
+        notExecuted: true,
+        current: false,
+        breakpoint: false,
+      },
+    ],
+    memory: {
+      address: 0x3fc8_0000,
+      bytes: [0x2a, 0x00, 0x41, 0x7f, null, null],
+      regions: [
+        { start: 0x3fc8_0000, length: 4, region: "sram" },
+        { start: 0x3fc8_0004, length: 2, region: "flash" },
+      ],
+    },
+    points: {
+      breakpoints: [0x4000_0004],
+      watchpoints: [{ address: 0x3fc8_0000, length: 4, on: "write" }],
+    },
     ...overrides,
   };
 }
@@ -82,15 +185,16 @@ export function fakeHost(overrides: Partial<HostApi> = {}): FakeHost {
   };
   const host: HostApi = {
     devices: vi.fn(async () => [X4]),
-    powerOn: vi.fn(async (_setup, _speed, _start, onUpdate) => {
+    powerOn: vi.fn(async (_setup, _speed, _start, _points, onUpdate) => {
       listener = onUpdate;
       return started;
     }),
-    openReplay: vi.fn(async (_path, _romDir, _speed, _start, onUpdate) => {
+    openReplay: vi.fn(async (_path, _romDir, _speed, _start, _points, onUpdate) => {
       listener = onUpdate;
       return started;
     }),
     command: vi.fn(async () => undefined),
+    inspect: vi.fn(async () => debugView()),
     frame: vi.fn(async () => null),
     saveCapture: vi.fn(async () => undefined),
     notices: vi.fn(async () => "NOTICE"),

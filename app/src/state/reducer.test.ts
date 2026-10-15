@@ -25,6 +25,7 @@ const status: Status = {
   replay: null,
   machine: null,
   usbConsoleSilenced: false,
+  stop: null,
 };
 
 const answer: Started = {
@@ -48,6 +49,20 @@ const text = (channel: "uart0" | "usb-serial-jtag", value: string): Update => ({
 });
 
 describe("reducer", () => {
+  it("keeps the debugger's points of the emulator shown, for the next start", () => {
+    const points = { breakpoints: [0x4000_0004], watchpoints: [] };
+    const shown = reducer(started(), { type: "points", start: 1, points });
+    expect(shown.points).toEqual(points);
+    const replaced = reducer(shown, {
+      type: "points",
+      start: 0,
+      points: { breakpoints: [], watchpoints: [] },
+    });
+    expect(replaced.points).toEqual(points);
+    // A new start keeps them: it begins with them.
+    expect(started(shown, 2).points).toEqual(points);
+  });
+
   it("starts a run with what the host gave back", () => {
     const state = started();
     expect(state.phase).toBe("on");

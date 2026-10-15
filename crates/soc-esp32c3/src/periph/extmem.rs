@@ -58,9 +58,10 @@ const FLASH_PAGES: u32 = 256;
 const PAGE_SET_WORDS: usize = 4;
 const WORD_BITS: u32 = u64::BITS;
 
-/// A set of 64 KiB flash pages, one bit each: constant size whatever the firmware does.
+/// A set of 64 KiB flash pages, one bit each: constant size whatever the firmware does. The bus
+/// keeps one too, of the pages the CPU fetched an instruction from (`SocBus::executed`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct PageSet([u64; PAGE_SET_WORDS]);
+pub(crate) struct PageSet([u64; PAGE_SET_WORDS]);
 
 impl PageSet {
     /// The word that holds `page` and the bit of the page in it; `None` past the 256 pages an
@@ -70,21 +71,21 @@ impl PageSet {
         Some((word, 1 << (page % WORD_BITS)))
     }
 
-    fn contains(&self, page: u32) -> bool {
+    pub(crate) fn contains(&self, page: u32) -> bool {
         usize::try_from(page / WORD_BITS)
             .ok()
             .and_then(|word| self.0.get(word))
             .is_some_and(|word| word & (1 << (page % WORD_BITS)) != 0)
     }
 
-    fn insert(&mut self, page: u32) {
+    pub(crate) fn insert(&mut self, page: u32) {
         if let Some((word, bit)) = self.slot(page) {
             *word |= bit;
         }
     }
 
     /// Takes `page` out of the set; whether it was in it.
-    fn remove(&mut self, page: u32) -> bool {
+    pub(crate) fn remove(&mut self, page: u32) -> bool {
         self.slot(page).is_some_and(|(word, bit)| {
             let held = *word & bit != 0;
             *word &= !bit;
@@ -402,7 +403,7 @@ impl Extmem {
 
 /// The flash pages a write of pages `first_page` to `last_page` reaches: those an MMU entry can
 /// name, so at most the [`FLASH_PAGES`] of the largest flash, whatever the two numbers are.
-fn written_pages(first_page: u32, last_page: u32) -> std::ops::RangeInclusive<u32> {
+pub(crate) fn written_pages(first_page: u32, last_page: u32) -> std::ops::RangeInclusive<u32> {
     first_page..=last_page.min(FLASH_PAGES - 1)
 }
 

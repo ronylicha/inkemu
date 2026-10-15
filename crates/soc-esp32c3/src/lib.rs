@@ -16,6 +16,7 @@ pub mod chip;
 pub mod clock;
 pub mod config;
 pub mod ctx;
+pub mod debug;
 pub mod diag;
 pub mod flash;
 pub mod inputs;
@@ -29,6 +30,7 @@ pub mod test_support;
 
 pub use chip::ChipRevision;
 pub use config::{CompatActs, QemuCompat, SocConfig, Timing};
+pub use debug::{Access, DebugStop, Peeked, RunStop, Watch, WatchHit, WatchOn};
 pub use diag::{Diagnostic, Wake};
 pub use flash::{
     FlashConfig, FlashConfigError, FlashDevice, FlashImageError, FlashWrite, JedecId, NorFlash,

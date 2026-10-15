@@ -305,6 +305,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "debugger"
+version = "0.1.0"
+dependencies = [
+ "cpu-rv32",
+ "emu-core",
+ "serde",
+ "serde_json",
+ "soc-esp32c3",
+ "thiserror",
+]
+
+[[package]]
 name = "difflib"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -505,6 +517,7 @@ dependencies = [
  "chips",
  "console-script",
  "cpu-rv32",
+ "debugger",
  "emu-core",
  "etcetera",
  "fatfs",

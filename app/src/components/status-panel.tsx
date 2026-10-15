@@ -44,6 +44,16 @@ export function StatusPanel({ status, lastEnd }: Props) {
             <dd>{labelOf(t, "status.end", status.end)}</dd>
           </>
         )}
+        {status.stop === null ? null : (
+          <>
+            <dt>{t("status.stop")}</dt>
+            <dd className="mono">
+              {status.stop.kind === "breakpoint"
+                ? t("status.stop.breakpoint", { pc: hex32(status.stop.pc) })
+                : t("status.stop.watchpoint", { address: hex32(status.stop.address) })}
+            </dd>
+          </>
+        )}
         {machine === null ? null : (
           <>
             <dt>{t("status.deviceTime")}</dt>

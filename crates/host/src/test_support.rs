@@ -7,7 +7,9 @@ use crate::device::{FlashKeeper, Launch};
 use crate::engine::Limits;
 use crate::pattern;
 use crate::ports::{Life, PanelDescription, PanelFrame, PanelSource, PowerOnError, Recipe};
-use soc_esp32c3::test_support::{HANG, flat_rom, stop_watchdogs};
+use cpu_rv32::asm;
+use soc_esp32c3::memmap::SRAM_DBUS_BASE;
+use soc_esp32c3::test_support::{HANG, T0, T1, flat_rom, stop_watchdogs};
 use soc_esp32c3::{Esp32C3, SocConfig};
 use std::time::Duration;
 
@@ -39,6 +41,8 @@ impl Drop for SlowToEnd {
 
 struct LoopingDevice {
     slow_end: Duration,
+    /// What the machine executes, from the first byte of its ROM.
+    program: Vec<u32>,
 }
 
 impl Recipe for LoopingDevice {
@@ -48,12 +52,10 @@ impl Recipe for LoopingDevice {
         _: bool,
         _: Option<boards::SdStart>,
     ) -> Result<Life, PowerOnError> {
-        let mut program = stop_watchdogs();
-        program.push(HANG);
         let look = x4_pattern_look();
         let (panel, buttons) = pattern::ports(look.panel, &look.buttons);
         Ok(Life {
-            machine: Esp32C3::new(flat_rom(&program), &SocConfig::default()),
+            machine: Esp32C3::new(flat_rom(&self.program), &SocConfig::default()),
             panel: Box::new(SlowToEnd {
                 panel,
                 slow_end: self.slow_end,
@@ -107,8 +109,48 @@ pub fn looping_device_with_sd(path: &std::path::Path) -> Launch {
 /// `slow_end`.
 #[must_use]
 pub fn looping_device(slow_end: Duration) -> Launch {
+    let mut program = stop_watchdogs();
+    program.push(HANG);
+    run_of(LoopingDevice { slow_end, program })
+}
+
+/// A run of a device whose CPU counts for ever in the first word of the SRAM: it adds 1 to `t1`
+/// and stores it there, then starts again. [`counting_increment`] and [`counting_store`] are the
+/// addresses of the two instructions; for the tests of a debugger.
+#[must_use]
+pub fn counting_device() -> Launch {
+    let mut program = stop_watchdogs();
+    program.extend([
+        asm::lui(T0, SRAM_DBUS_BASE),
+        asm::addi(T1, 0, 0),
+        asm::addi(T1, T1, 1),
+        asm::sw(T1, T0, 0),
+        asm::jal(0, -8),
+    ]);
+    run_of(LoopingDevice {
+        slow_end: Duration::ZERO,
+        program,
+    })
+}
+
+/// The address of the increment of [`counting_device`]: after the words that stop the watchdogs
+/// and the two that set `t0` and `t1`.
+#[must_use]
+pub fn counting_increment() -> u32 {
+    let words = u32::try_from(stop_watchdogs().len() + 2).unwrap_or(0);
+    soc_esp32c3::memmap::ROM_BASE + 4 * words
+}
+
+/// The address of the store of [`counting_device`], which writes the count at the first word of
+/// the SRAM.
+#[must_use]
+pub fn counting_store() -> u32 {
+    counting_increment() + 4
+}
+
+fn run_of(device: LoopingDevice) -> Launch {
     Launch::new(
-        Box::new(LoopingDevice { slow_end }),
+        Box::new(device),
         FlashKeeper::without_file(None, 4 << 20),
         Limits::default(),
         x4_pattern_look(),

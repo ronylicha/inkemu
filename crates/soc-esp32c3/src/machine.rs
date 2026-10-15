@@ -350,7 +350,14 @@ pub struct Esp32C3 {
     cycle_counter_on_time_base: bool,
     /// Reads of that counter by the CSR files a reset replaced.
     cycle_counter_reads: u64,
+    /// The breakpoints of a debugger, sorted, without repetition ([`Esp32C3::set_breakpoints`]).
+    breakpoints: Vec<u32>,
+    /// The breakpoint the last call of [`Esp32C3::run_stopping`] stopped at, until the machine
+    /// leaves it: the next call goes on past it.
+    breakpoint_left: Option<u32>,
 }
+
+mod debug;
 
 impl Esp32C3 {
     /// A machine in its power-on reset state with an erased flash, about to execute the first ROM
@@ -419,6 +426,8 @@ impl Esp32C3 {
             boundary_pending: false,
             cycle_counter_on_time_base: config.qemu_compat.cycle_counter_on_time_base,
             cycle_counter_reads: 0,
+            breakpoints: Vec::new(),
+            breakpoint_left: None,
         }
     }
 
@@ -462,25 +471,42 @@ impl Esp32C3 {
     ///   without running anything. A caller goes on after `Asleep` and `CycleBudget` and passes
     ///   the same limit to every call.
     pub fn run_within(&mut self, cycles: Cycles, device_time_nanos: Option<u64>) -> StopReason {
+        match self.run_loop::<debug::NoStops>(cycles, device_time_nanos) {
+            Ok(reason) => reason,
+            Err(never) => match never {},
+        }
+    }
+
+    /// The loop of [`Esp32C3::run_within`], and of [`Esp32C3::run_stopping`] with the points of
+    /// a debugger: `S` may end the call at a boundary, before or after a turn, with its own
+    /// reason. It never changes what a turn does.
+    fn run_loop<S: debug::Stops>(
+        &mut self,
+        cycles: Cycles,
+        device_time_nanos: Option<u64>,
+    ) -> Result<StopReason, S::Hit> {
         let deadline = device_time_nanos.map(limit_instant);
         let mut slept = Slept::default();
         // A run goes through boundaries as it meets them: a boundary a step left pending is
         // reached by its first turns, as a step would reach it.
         self.boundary_pending = false;
+        S::begin(self)?;
         while self.hart.cycles.get() < cycles.get() {
             if deadline.is_some_and(|deadline| self.bus.ctx.now() >= deadline) {
-                return StopReason::TimeBudget;
+                return Ok(StopReason::TimeBudget);
             }
+            S::before(self)?;
             match self.turn(deadline, &mut slept, false) {
                 Turn::Stepped {
                     stop: Some(reason), ..
                 }
-                | Turn::DeepSlept { stop: Some(reason) } => return reason,
+                | Turn::DeepSlept { stop: Some(reason) } => return Ok(reason),
                 Turn::Ready | Turn::Stepped { stop: None, .. } | Turn::DeepSlept { stop: None } => {
                 }
             }
+            S::after(self)?;
         }
-        StopReason::CycleBudget
+        Ok(StopReason::CycleBudget)
     }
 
     /// Executes the next instruction as [`Esp32C3::run_within`] would, then brings the machine to
@@ -503,7 +529,19 @@ impl Esp32C3 {
     /// executes nothing, goes on to it, and reports the interrupt and the sleep met on the way
     /// with no [`Stepped::executed`]. A caller that adds the calls up until one returns no
     /// [`StopReason::Asleep`] gets what one call without the bound would have given.
+    ///
+    /// For a debugger: a step notes its own access to watched bytes only
+    /// ([`Esp32C3::take_watch_hit`]), and the run that follows it goes past a breakpoint at the
+    /// boundary it reached, as the run that follows a breakpoint stop does.
     pub fn step(&mut self) -> Stepped {
+        self.bus.take_watch_hit();
+        let stepped = self.step_to_boundary();
+        self.breakpoint_left = Some(self.hart.pc);
+        stepped
+    }
+
+    /// [`Esp32C3::step`], without what it does for a debugger.
+    fn step_to_boundary(&mut self) -> Stepped {
         let mut slept = Slept::default();
         let mut stepped = Stepped {
             executed: None,
@@ -582,6 +620,9 @@ impl Esp32C3 {
     /// next instruction ([`Hart::take_boundary`]) and the turn is [`Turn::Ready`] when nothing
     /// does.
     fn turn(&mut self, deadline: Option<Cycles>, slept: &mut Slept, boundary_only: bool) -> Turn {
+        // The machine leaves the boundary a breakpoint stopped it at: from the next boundary on,
+        // the breakpoints stop it again (`debug::DebugStops::before`).
+        self.breakpoint_left = None;
         // The board's supply failed: nothing runs any more (ADR 0013).
         if self.bus.periph.io.power_lost().is_some() {
             return Turn::DeepSlept {
