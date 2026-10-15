@@ -128,6 +128,7 @@ dependencies = [
 name = "boards"
 version = "0.1.0"
 dependencies = [
+ "chips",
  "emu-core",
  "firmware",
  "serde",
