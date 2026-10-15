@@ -7,17 +7,21 @@
 //! board inputs, which the journal keeps: a replay that gives the same inputs is the same run
 //! (2d-R2). A profile without `[wiring]` gives the bare machine of [`DeviceProfile::instantiate`]
 //! and no handle (2d-R4).
-use crate::wiring::{Button, ButtonSource, Rotation, USB_POWER, Wiring};
+use crate::wiring::{Button, ButtonSource, ControllerConfig, Rotation, USB_POWER, Wiring};
 use crate::{DeviceProfile, MachineOptions};
+use chips::lines::{LineFault, PanelController, PanelLines};
 use chips::sdcard::{BlockSource, CapacityError, Overlay, SdCard, SdCardConfig, SdSlot};
-use chips::{ButtonLadder, ConfigError, PushButton, SdLines, Ssd1677Lines};
+use chips::{
+    Bq27220, ButtonLadder, ConfigError, Ds3231, PanelImage, PushButton, Qmi8658, SdLines,
+    Ssd1677Lines, Uc8253Lines,
+};
 use emu_core::{
     BoardInput, BoardInputError, BoardInputs, Cycles, Frequency, GpioInput, GpioOutput, Level,
     Nanos, Supply,
 };
 use soc_esp32c3::clock::TIME_BASE;
 use soc_esp32c3::flash::FlashImageError;
-use soc_esp32c3::{AttachError, Esp32C3, InputError, RomImage, SpiWires};
+use soc_esp32c3::{AttachError, Esp32C3, I2cWires, InputError, RomImage, SpiWires};
 use std::cell::{Ref, RefCell, RefMut};
 use std::num::NonZeroU64;
 use std::rc::Rc;
@@ -65,6 +69,10 @@ pub enum WiredError {
     },
     #[error("the configuration of the display controller is refused: {0}")]
     Display(ConfigError),
+    #[error("the configuration of the display controller is refused: {0}")]
+    DisplayUc8253(chips::uc8253::ConfigError),
+    #[error("`{key}`: the chip refuses its configuration: {detail}")]
+    I2cChip { key: &'static str, detail: String },
     #[error("the SD card cannot be built: {0}")]
     SdCard(CapacityError),
     #[error(
@@ -240,30 +248,103 @@ impl GpioInput for UsbDetect {
     }
 }
 
+/// The display controller of a wired device on its lines, of its own type.
+#[derive(Clone, Debug)]
+pub enum PanelChip {
+    /// The X4's.
+    Ssd1677(Rc<RefCell<Ssd1677Lines>>),
+    /// The X3's.
+    Uc8253(Rc<RefCell<Uc8253Lines>>),
+}
+
 /// The display of a wired device: its controller on its lines.
 #[derive(Clone, Debug)]
 pub struct PanelHandle {
-    lines: Rc<RefCell<Ssd1677Lines>>,
+    chip: PanelChip,
     rotation: Rotation,
 }
 
 impl PanelHandle {
-    /// The controller and what its lines saw; borrow it between two runs of the machine.
+    /// The controller, of its own type, for what only it has (its RAM, its diagnostics); borrow it
+    /// between two runs of the machine.
     #[must_use]
-    pub fn lines(&self) -> Ref<'_, Ssd1677Lines> {
-        self.lines.borrow()
+    pub fn chip(&self) -> &PanelChip {
+        &self.chip
     }
 
-    /// The controller, for what a front end takes from it (its diagnostics, its faults).
+    /// What the glass shows since the last refresh, whatever the controller.
     #[must_use]
-    pub fn lines_mut(&self) -> RefMut<'_, Ssd1677Lines> {
-        self.lines.borrow_mut()
+    pub fn image(&self) -> Ref<'_, PanelImage> {
+        match &self.chip {
+            PanelChip::Ssd1677(lines) => {
+                Ref::map(lines.borrow(), |lines| lines.chip().panel_image())
+            }
+            PanelChip::Uc8253(lines) => {
+                Ref::map(lines.borrow(), |lines| lines.chip().panel_image())
+            }
+        }
+    }
+
+    /// The faults of the wiring the lines saw since the last call.
+    #[must_use]
+    pub fn take_faults(&self) -> Vec<LineFault> {
+        match &self.chip {
+            PanelChip::Ssd1677(lines) => lines.borrow_mut().take_faults(),
+            PanelChip::Uc8253(lines) => lines.borrow_mut().take_faults(),
+        }
+    }
+
+    /// The X4's controller; `None` on another device.
+    #[must_use]
+    pub fn ssd1677(&self) -> Option<RefMut<'_, Ssd1677Lines>> {
+        match &self.chip {
+            PanelChip::Ssd1677(lines) => Some(lines.borrow_mut()),
+            PanelChip::Uc8253(_) => None,
+        }
+    }
+
+    /// The X3's controller; `None` on another device.
+    #[must_use]
+    pub fn uc8253(&self) -> Option<RefMut<'_, Uc8253Lines>> {
+        match &self.chip {
+            PanelChip::Uc8253(lines) => Some(lines.borrow_mut()),
+            PanelChip::Ssd1677(_) => None,
+        }
     }
 
     /// How the panel is turned in the case.
     #[must_use]
     pub fn rotation(&self) -> Rotation {
         self.rotation
+    }
+}
+
+/// The chips of a wired device's I2C bus (ADR 0015), for what a front end or a test reads of them:
+/// what the firmware set, the time of the clock, the diagnostics.
+#[derive(Clone, Debug)]
+pub struct I2cHandle {
+    gauge: Option<Rc<RefCell<Bq27220>>>,
+    clock: Option<Rc<RefCell<Ds3231>>>,
+    motion: Option<Rc<RefCell<Qmi8658>>>,
+}
+
+impl I2cHandle {
+    /// The fuel gauge; `None` on a board without one.
+    #[must_use]
+    pub fn gauge(&self) -> Option<RefMut<'_, Bq27220>> {
+        self.gauge.as_ref().map(|chip| chip.borrow_mut())
+    }
+
+    /// The real-time clock; `None` on a board without one.
+    #[must_use]
+    pub fn clock(&self) -> Option<RefMut<'_, Ds3231>> {
+        self.clock.as_ref().map(|chip| chip.borrow_mut())
+    }
+
+    /// The motion sensor; `None` on a board without one.
+    #[must_use]
+    pub fn motion(&self) -> Option<RefMut<'_, Qmi8658>> {
+        self.motion.as_ref().map(|chip| chip.borrow_mut())
     }
 }
 
@@ -367,6 +448,8 @@ pub struct Wired {
     pub buttons: Option<ButtonsHandle>,
     /// The SD card slot; `None` for a device without one.
     pub sd: Option<SdHandle>,
+    /// The chips of the I2C bus; `None` for a device without one.
+    pub i2c: Option<I2cHandle>,
 }
 
 fn attached(key: &'static str, result: Result<(), AttachError>) -> Result<(), WiredError> {
@@ -407,10 +490,12 @@ impl Wired {
                 panel: None,
                 buttons: None,
                 sd: None,
+                i2c: None,
             });
         };
         let panel = attach_display(&mut machine, wiring)?;
         let sd = attach_sd(&mut machine, wiring, wired.sd)?;
+        let i2c = attach_i2c(&mut machine, wiring)?;
         let state = attach_board(&mut machine, wiring)?;
         let buttons = ButtonsHandle {
             buttons: state.borrow().buttons.clone(),
@@ -422,15 +507,42 @@ impl Wired {
             panel: Some(panel),
             buttons: Some(buttons),
             sd,
+            i2c,
         })
     }
 }
 
 fn attach_display(machine: &mut Esp32C3, wiring: &Wiring) -> Result<PanelHandle, WiredError> {
+    let chip = match wiring.display.config.controller() {
+        ControllerConfig::Ssd1677(config) => {
+            let lines = Rc::new(RefCell::new(
+                Ssd1677Lines::new(config).map_err(WiredError::Display)?,
+            ));
+            attach_controller(machine, wiring, &lines)?;
+            PanelChip::Ssd1677(lines)
+        }
+        ControllerConfig::Uc8253(config) => {
+            let lines = Rc::new(RefCell::new(
+                Uc8253Lines::new(config).map_err(WiredError::DisplayUc8253)?,
+            ));
+            attach_controller(machine, wiring, &lines)?;
+            PanelChip::Uc8253(lines)
+        }
+    };
+    Ok(PanelHandle {
+        chip,
+        rotation: wiring.display.rotation,
+    })
+}
+
+/// Attaches a display controller by its lines: the SPI bus with its D/C#, RES#, the bit-banged
+/// SCLK, MOSI and D/C#, BUSY and the MOSI it drives during a read, and its time.
+fn attach_controller<C: PanelController + 'static>(
+    machine: &mut Esp32C3,
+    wiring: &Wiring,
+    lines: &Rc<RefCell<PanelLines<C>>>,
+) -> Result<(), WiredError> {
     let display = wiring.display;
-    let lines = Rc::new(RefCell::new(
-        Ssd1677Lines::new(display.config.ssd1677()).map_err(WiredError::Display)?,
-    ));
     let wires = SpiWires {
         sclk: display.sclk,
         mosi: display.mosi,
@@ -440,9 +552,9 @@ fn attach_display(machine: &mut Esp32C3, wiring: &Wiring) -> Result<PanelHandle,
     };
     attached(
         "wiring.display",
-        machine.attach_spi(wires, Box::new(Rc::clone(&lines))),
+        machine.attach_spi(wires, Box::new(Rc::clone(lines))),
     )?;
-    let outputs = Ssd1677Lines::outputs(&lines);
+    let outputs = PanelLines::outputs(lines);
     attached(
         "wiring.display.rst",
         machine.attach_output(display.rst, Box::new(outputs.reset)),
@@ -459,7 +571,7 @@ fn attach_display(machine: &mut Esp32C3, wiring: &Wiring) -> Result<PanelHandle,
         "wiring.display.dc",
         machine.attach_output(display.dc, Box::new(outputs.data_command)),
     )?;
-    let inputs = Ssd1677Lines::inputs(&lines);
+    let inputs = PanelLines::inputs(lines);
     attached(
         "wiring.display.busy",
         machine.attach_input(display.busy, Box::new(inputs.busy)),
@@ -468,11 +580,14 @@ fn attach_display(machine: &mut Esp32C3, wiring: &Wiring) -> Result<PanelHandle,
         "wiring.display.mosi",
         machine.attach_input(display.mosi, Box::new(inputs.data)),
     )?;
-    machine.attach_clocked(Box::new(Rc::clone(&lines)));
-    Ok(PanelHandle {
-        lines,
-        rotation: display.rotation,
-    })
+    if display.mosi_pull_up {
+        attached(
+            "wiring.display.mosi_pull_up",
+            machine.pull_up_on_board(display.mosi),
+        )?;
+    }
+    machine.attach_clocked(Box::new(Rc::clone(lines)));
+    Ok(())
 }
 
 fn attach_sd(
@@ -490,7 +605,10 @@ fn attach_sd(
                 .map_err(WiredError::SdCard)?,
         ),
     };
-    let lines = Rc::new(RefCell::new(SdLines::new(slot)));
+    let lines = Rc::new(RefCell::new(match sd.power {
+        None => SdLines::new(slot),
+        Some(_) => SdLines::switched(slot),
+    }));
     let wires = SpiWires {
         sclk: wiring.display.sclk,
         mosi: wiring.display.mosi,
@@ -502,7 +620,76 @@ fn attach_sd(
         "wiring.sd",
         machine.attach_spi(wires, Box::new(Rc::clone(&lines))),
     )?;
+    if let Some(power) = sd.power {
+        attached(
+            "wiring.sd.power",
+            machine.attach_output(power, Box::new(SdLines::power(&lines, Level::High))),
+        )?;
+    }
     Ok(Some(SdHandle { lines }))
+}
+
+/// The chips of `[wiring.i2c]` on the bus, in the order of their addresses.
+fn attach_i2c(machine: &mut Esp32C3, wiring: &Wiring) -> Result<Option<I2cHandle>, WiredError> {
+    let Some(bus) = &wiring.i2c else {
+        return Ok(None);
+    };
+    let wires = I2cWires {
+        scl: bus.scl,
+        sda: bus.sda,
+    };
+    if bus.pull_up {
+        for pin in [bus.scl, bus.sda] {
+            attached("wiring.i2c.pull_up", machine.pull_up_on_board(pin))?;
+        }
+    }
+    // The checks of the profile built each chip once already: these refusals are those of a
+    // profile built by hand, past `DeviceProfile::from_toml`.
+    let refused = |key: &'static str, error: &dyn std::fmt::Display| WiredError::I2cChip {
+        key,
+        detail: error.to_string(),
+    };
+    let gauge = match bus.gauge.clone() {
+        None => None,
+        Some(config) => Some(Rc::new(RefCell::new(
+            Bq27220::new(config).map_err(|error| refused("wiring.i2c.bq27220", &error))?,
+        ))),
+    };
+    let clock = match bus.clock {
+        None => None,
+        Some(config) => Some(Rc::new(RefCell::new(
+            Ds3231::new(config).map_err(|error| refused("wiring.i2c.ds3231", &error))?,
+        ))),
+    };
+    let motion = match bus.motion {
+        None => None,
+        Some(config) => Some(Rc::new(RefCell::new(
+            Qmi8658::new(config).map_err(|error| refused("wiring.i2c.qmi8658", &error))?,
+        ))),
+    };
+    if let Some(chip) = &gauge {
+        attached(
+            "wiring.i2c.bq27220",
+            machine.attach_i2c(wires, Box::new(Rc::clone(chip))),
+        )?;
+    }
+    if let Some(chip) = &clock {
+        attached(
+            "wiring.i2c.ds3231",
+            machine.attach_i2c(wires, Box::new(Rc::clone(chip))),
+        )?;
+    }
+    if let Some(chip) = &motion {
+        attached(
+            "wiring.i2c.qmi8658",
+            machine.attach_i2c(wires, Box::new(Rc::clone(chip))),
+        )?;
+    }
+    Ok(Some(I2cHandle {
+        gauge,
+        clock,
+        motion,
+    }))
 }
 
 fn attach_board(

@@ -23,8 +23,8 @@ use crate::ctx::{Ctx, Deadline, Event, Source};
 use crate::diag::{Diagnostic, STUCK_CLOCKED_INSTANTS, Unsupported};
 use crate::periph::{Accepted, GPIO_BASE, IO_MUX_BASE, Storage, consecutive, index_in};
 use emu_core::{
-    AnalogSource, BoardInput, BoardInputs, Clocked, Cycles, GpioInput, GpioOutput, Level, Nanos,
-    Peripheral, SpiTarget, Supply,
+    AnalogSource, BoardInput, BoardInputs, Clocked, Cycles, GpioInput, GpioOutput, I2cTarget,
+    Level, Nanos, Peripheral, SpiTarget, Supply,
 };
 use pad::{Drive, FUN_IE, Function, InputSource, PAD_DRIVER, PAD_MASK};
 use thiserror::Error;
@@ -134,6 +134,15 @@ pub struct SpiWires {
     pub dc: Option<u8>,
 }
 
+/// What a chip on I2C0 is attached by: the pins of its clock and data lines (ADR 0015).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct I2cWires {
+    /// The clock: the pin the matrix sends I2C0's SCL to.
+    pub scl: u8,
+    /// The data line: the pin the matrix sends I2C0's SDA to, and reads it from.
+    pub sda: u8,
+}
+
 /// Why a chip could not be attached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum AttachError {
@@ -161,6 +170,37 @@ struct SpiChip {
     wires: SpiWires,
     target: Box<dyn SpiTarget>,
     selected: bool,
+}
+
+/// A chip on I2C0, with whether it acknowledged the last address on the bus.
+#[derive(Debug)]
+struct I2cChip {
+    wires: I2cWires,
+    target: Box<dyn I2cTarget>,
+    /// The chip acknowledged the last address, and no STOP came since: it sees the bytes.
+    addressed: bool,
+}
+
+/// I2C0's two lines as the matrix routes them now: the pads its SCL and SDA outputs drive, and
+/// where its SDA input is read from.
+#[derive(Clone, Copy, Debug)]
+struct I2cBus {
+    scl: u32,
+    sda: u32,
+    heard: InputSource,
+}
+
+impl I2cBus {
+    /// Whether a chip on `wires` is on the bus: its clock and data pins carry I2C0's outputs.
+    fn reaches(self, wires: I2cWires) -> bool {
+        self.scl & (1 << wires.scl) != 0 && self.sda & (1 << wires.sda) != 0
+    }
+
+    /// Whether the master reads its SDA input from the pad of `wires`: what a chip there drives
+    /// is what it hears.
+    fn hears(self, wires: I2cWires) -> bool {
+        matches!(self.heard, InputSource::Pad { pad, .. } if pad == usize::from(wires.sda))
+    }
 }
 
 /// A chip that lives in time, with the instant it was last advanced at.
@@ -208,6 +248,8 @@ struct Chips {
     outputs: Vec<(usize, Box<dyn GpioOutput>)>,
     spi: Vec<SpiChip>,
     analog: Vec<(usize, Box<dyn AnalogSource>)>,
+    /// The chips on I2C0, in the order they were attached.
+    i2c: Vec<I2cChip>,
     /// The chips advanced in device time, in the order they were attached.
     clocked: Vec<ClockedChip>,
 }
@@ -303,6 +345,10 @@ pub struct IoMatrix {
     held: u32,
     held_drive: [Option<Level>; PADS],
     held_pad: [u32; PADS],
+    /// The pads a resistor of the board pulls up, bit `n` for pad `n` (an I2C bus, a data line a
+    /// chip releases): read high when nothing drives them, whatever the pad's own pulls and through
+    /// any reset, since they are not the chip's.
+    board_pull_ups: u32,
     /// The wake-up at the instant an attached chip said its level may change, a clocked chip
     /// must be advanced, or an input of the board acts, whichever comes first.
     wake: Deadline,
@@ -323,12 +369,14 @@ impl IoMatrix {
                 outputs: Vec::new(),
                 spi: Vec::new(),
                 analog: Vec::new(),
+                i2c: Vec::new(),
                 clocked: Vec::new(),
             },
             board: board::Board::default(),
             held: 0,
             held_drive: [None; PADS],
             held_pad: [0; PADS],
+            board_pull_ups: 0,
             wake: Deadline::default(),
         };
         for pad in 0..PADS {
@@ -470,6 +518,31 @@ impl IoMatrix {
         }
     }
 
+    /// The pulls of pad `pad` as its level sees them: the pad's own, and a pull-up of the board.
+    ///
+    /// ASSUMPTION: a resistor of the board (a few kΩ) wins over the pad's internal pull-down (about
+    /// 45 kΩ in the DC characteristics of the ESP32-C3 datasheet): the line reads high. No source measures a board's resistor
+    /// against the pad's; an I2C bus at 400 kHz needs one strong enough to rise in a bit time.
+    fn pulls(&self, pad: usize) -> u32 {
+        let board = if self.board_pull_ups & (1 << pad) != 0 {
+            pad::FUN_WPU
+        } else {
+            0
+        };
+        self.pad_config(pad) | board
+    }
+
+    /// Pulls pin `pin` up on the board (a resistor to the supply): a line nobody drives reads high
+    /// from now on, through any reset. The pads are worked out again at once.
+    /// # Errors
+    /// [`AttachError::NoSuchPin`].
+    pub(crate) fn pull_up_on_board(&mut self, ctx: &mut Ctx, pin: u8) -> Result<(), AttachError> {
+        let pad = pad_of(pin)?;
+        self.board_pull_ups |= 1 << pad;
+        self.settle(ctx);
+        Ok(())
+    }
+
     /// Of the pins `wanted` names with a level (GPIO0 to GPIO5, a deep sleep's wake pins), those
     /// at that level now, bit `n` for GPIO`n`: what an attached chip drives, else the pad's own
     /// drive and pulls, which a deep sleep keeps. The pads are read without being worked out: the
@@ -482,7 +555,7 @@ impl IoMatrix {
             let external = self.chips.inputs[pad]
                 .as_mut()
                 .and_then(|chip| chip.level(at));
-            if pad::level(self.drive_of(pad), external, self.pad_config(pad)) == level {
+            if pad::level(self.drive_of(pad), external, self.pulls(pad)) == level {
                 hit |= 1 << pad;
             }
         }
@@ -692,6 +765,164 @@ impl IoMatrix {
         Ok(())
     }
 
+    /// Attaches a chip to I2C0 by the pins of its two lines (ADR 0015).
+    /// # Errors
+    /// [`AttachError::NoSuchPin`] for either pin.
+    pub(crate) fn attach_i2c(
+        &mut self,
+        wires: I2cWires,
+        target: Box<dyn I2cTarget>,
+    ) -> Result<(), AttachError> {
+        pad_of(wires.scl)?;
+        pad_of(wires.sda)?;
+        self.chips.i2c.push(I2cChip {
+            wires,
+            target,
+            addressed: false,
+        });
+        Ok(())
+    }
+
+    /// I2C0's lines as the registers route them now.
+    fn i2c_bus(&self) -> I2cBus {
+        let carrying = |signal: Signal| {
+            let enable = pad::rest(signal).is_some_and(|rest| rest.enable);
+            (0..PADS)
+                .filter(|&pad| {
+                    pad::carries(
+                        pad::function(pad, self.regs.pads[pad]),
+                        self.regs.out_sel[pad],
+                        (self.regs.enable >> pad) & 1 != 0,
+                        signal,
+                        enable,
+                    )
+                })
+                .fold(0, |mask, pad| mask | (1 << pad))
+        };
+        let index = usize::try_from(pad::I2C_SDA).unwrap_or(0);
+        I2cBus {
+            scl: carrying(pad::I2C_SCL),
+            sda: carrying(pad::I2C_SDA),
+            heard: pad::input_source(self.regs.in_sel[index], None),
+        }
+    }
+
+    /// The level I2C0 reads on its SDA input when the chips it hears pull it low (`pulled`) or
+    /// leave it: the pad's own level otherwise, or the constant the matrix gives.
+    fn i2c_heard(&self, bus: I2cBus, pulled: bool) -> Level {
+        match bus.heard {
+            InputSource::Pad { pad, inverted } => {
+                let level = if pulled {
+                    Level::Low
+                } else {
+                    Level::from_bool((self.levels >> pad) & 1 != 0)
+                };
+                if inverted { level.inverted() } else { level }
+            }
+            InputSource::Constant(level) => level,
+        }
+    }
+
+    /// The present instant, the clocked chips whose deadline has come advanced to it and the
+    /// inputs of the board due by now applied: what comes before any call to a chip.
+    fn before_a_chip(&mut self, ctx: &mut Ctx) -> Nanos {
+        let at = nanos(ctx);
+        self.advance_due(ctx, at);
+        self.board.apply_due(ctx.now());
+        at
+    }
+
+    /// A START then the address byte `byte` of I2C0, ending now: every chip on the bus sees it,
+    /// and those that acknowledge it see the bytes that follow. Whether I2C0 hears an ACK.
+    pub(crate) fn i2c_address(&mut self, ctx: &mut Ctx, byte: u8) -> bool {
+        let at = self.before_a_chip(ctx);
+        let bus = self.i2c_bus();
+        let (address, read) = (byte >> 1, byte & 1 != 0);
+        let mut pulled = false;
+        for chip in &mut self.chips.i2c {
+            chip.addressed = bus.reaches(chip.wires) && chip.target.address(address, read, at);
+            pulled |= chip.addressed && bus.hears(chip.wires);
+        }
+        self.arm(ctx, at);
+        self.i2c_heard(bus, pulled) == Level::Low
+    }
+
+    /// A byte I2C0 writes, ending now, to the chips that acknowledged their address. Whether
+    /// I2C0 hears an ACK.
+    pub(crate) fn i2c_write(&mut self, ctx: &mut Ctx, byte: u8) -> bool {
+        let at = self.before_a_chip(ctx);
+        let bus = self.i2c_bus();
+        let mut pulled = false;
+        for chip in &mut self.chips.i2c {
+            if chip.addressed && bus.reaches(chip.wires) {
+                let acknowledged = chip.target.write(byte, at);
+                pulled |= acknowledged && bus.hears(chip.wires);
+            }
+        }
+        self.arm(ctx, at);
+        self.i2c_heard(bus, pulled) == Level::Low
+    }
+
+    /// A byte I2C0 reads, ending now, which it answers with an ACK when `acknowledged`: what the
+    /// chips addressed for it drive, bit by bit low wherever one of them pulls it low, the line's
+    /// own level elsewhere.
+    pub(crate) fn i2c_read(&mut self, ctx: &mut Ctx, acknowledged: bool) -> u8 {
+        let at = self.before_a_chip(ctx);
+        let bus = self.i2c_bus();
+        let mut driven = 0xFF_u8;
+        for chip in &mut self.chips.i2c {
+            if chip.addressed && bus.reaches(chip.wires) {
+                let byte = chip.target.read(acknowledged, at);
+                if bus.hears(chip.wires) {
+                    driven &= byte;
+                }
+            }
+        }
+        self.arm(ctx, at);
+        (0..8).fold(0, |byte, bit| {
+            let pulled = driven & (0x80 >> bit) == 0;
+            let high = self.i2c_heard(bus, pulled).is_high();
+            byte | (u8::from(high) << (7 - bit))
+        })
+    }
+
+    /// Routes I2C0 to `wires` as ESP-IDF's `i2c_master` does (`i2c_common_set_pins`): each pad in
+    /// GPIO function, input enabled, open drain, pulled up when `pulled_up` (the driver's
+    /// `enable_internal_pullup`), the output signal through the matrix and the input signal read
+    /// from it.
+    #[cfg(test)]
+    pub(crate) fn route_i2c(&mut self, ctx: &mut Ctx, wires: I2cWires, pulled_up: bool) {
+        /// `GPIO_FUNCm_IN_SEL_CFG.SEL`: the signal comes through the matrix.
+        const SIG_IN_SEL: u32 = 1 << 6;
+        let pull = if pulled_up { pad::FUN_WPU } else { 0 };
+        for (pin, signal) in [(wires.scl, pad::I2C_SCL), (wires.sda, pad::I2C_SDA)] {
+            let n = u32::from(pin);
+            let gpio_function = 1 << 12;
+            let writes = [
+                (PAD0 + 4 * n, gpio_function | FUN_IE | pull),
+                (PIN0 + 4 * n, PAD_DRIVER),
+                (FUNC0_OUT_SEL_CFG + 4 * n, signal),
+                (FUNC0_IN_SEL_CFG + 4 * signal, SIG_IN_SEL | n),
+            ];
+            for (offset, value) in writes {
+                assert!(self.write(ctx, offset, value), "{offset:#x}");
+            }
+        }
+    }
+
+    /// A STOP of I2C0, ending now: every chip on the bus sees it, and none is addressed after it.
+    pub(crate) fn i2c_stop(&mut self, ctx: &mut Ctx) {
+        let at = self.before_a_chip(ctx);
+        let bus = self.i2c_bus();
+        for chip in &mut self.chips.i2c {
+            if bus.reaches(chip.wires) {
+                chip.target.stop(at);
+            }
+            chip.addressed = false;
+        }
+        self.arm(ctx, at);
+    }
+
     /// Works out every pad again at the present time: first the clocked chips whose deadline has
     /// come are advanced to it, then what the chip drives (the chips watching a pad hear a
     /// change), what each pad reads (the chips driving one are asked), which SPI chips are
@@ -715,7 +946,7 @@ impl IoMatrix {
             let external = self.chips.inputs[pad]
                 .as_mut()
                 .and_then(|chip| chip.level(at));
-            if pad::level(driven, external, self.pad_config(pad)).is_high() {
+            if pad::level(driven, external, self.pulls(pad)).is_high() {
                 levels |= 1 << pad;
             }
         }

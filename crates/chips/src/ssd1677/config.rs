@@ -4,6 +4,7 @@
 
 use super::reference;
 use super::waveform::{source_millivolts, vcom_millivolts, vsl_millivolts};
+pub use crate::glass::{Optics, Provenance};
 
 /// Sources of the controller: the width of each RAM plane, in pixels (datasheet §1).
 pub const RAM_SOURCES: u16 = 960;
@@ -66,42 +67,6 @@ impl PanelGeometry {
 impl Default for PanelGeometry {
     fn default() -> Self {
         PanelGeometry::gdeq0426t82()
-    }
-}
-
-/// Where a set of parameters comes from, for an interface to say whether it shows a measured
-/// panel (spec §1.3 point 4, §5.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Provenance {
-    /// Built for the model where no source gives the panel's own values: shown as "approximation".
-    Approximation,
-    /// Measured on a device, or read from its OTP.
-    Measured,
-}
-
-/// How the glass answers the waveform (spec §5.3, research §6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Optics {
-    /// The defaults are not measured: [`Provenance::Approximation`].
-    pub provenance: Provenance,
-    /// The drive a pixel needs to go from black to white, in millivolt-nanoseconds (the pixel's
-    /// voltage times the time it is applied). ASSUMPTION: 6 V·s by default; not measured.
-    pub full_swing: u64,
-    /// A positive pixel voltage (source above VCOM) darkens the pixel. True on the X4: its factory
-    /// grey LUT only ends on the right colours that way.
-    pub positive_drives_black: bool,
-    /// The grey level of every pixel and of the border at power-on, 0 black to 255 white.
-    pub initial_gray: u8,
-}
-
-impl Default for Optics {
-    fn default() -> Self {
-        Optics {
-            provenance: Provenance::Approximation,
-            full_swing: 6_000 * MILLISECOND * 1_000,
-            positive_drives_black: true,
-            initial_gray: 255,
-        }
     }
 }
 

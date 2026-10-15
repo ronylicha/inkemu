@@ -3343,15 +3343,15 @@ mod tests {
             }),
             ..Setup::default()
         };
-        for (setup, said) in [
-            (x3(true, false), "no SD card slot"),
-            (x3(false, true), "no USB detect line"),
-        ] {
-            let refused = power_on(&setup).unwrap_err();
-            assert_eq!(refused.kind(), "board", "{refused}");
-            assert!(refused.to_string().contains(said), "{refused}");
-        }
-        assert!(!card.exists());
+        // Since its wiring (ADR 0015) the X3 has a card slot and no cable line; every built-in
+        // device has a slot, and `boards` tests the refusal of a card on a device without one.
+        let refused = power_on(&x3(true, true)).unwrap_err();
+        assert_eq!(refused.kind(), "board", "{refused}");
+        assert!(
+            refused.to_string().contains("no USB detect line"),
+            "{refused}"
+        );
+        assert!(!card.exists(), "refused before the card is made");
     }
 
     /// A replay of a file that is no session is refused before any ROM is looked for.

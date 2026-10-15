@@ -86,12 +86,9 @@ fn the_x4_display_hears_its_reset_and_drives_busy_for_the_hardware_reset_time() 
     assert_eq!(wired.machine.x()[usize::from(A0)] >> 6 & 1, 0, "ready");
     let panel = wired.panel.unwrap();
     assert_eq!(panel.rotation(), Rotation::Deg90);
-    assert_eq!(panel.lines_mut().take_faults(), []);
-    assert_eq!(
-        panel.lines().chip().panel_image().generation,
-        0,
-        "no refresh yet"
-    );
+    assert_eq!(panel.take_faults(), []);
+    assert_eq!(panel.image().generation, 0, "no refresh yet");
+    assert!(panel.ssd1677().is_some() && panel.uc8253().is_none());
 }
 
 /// One-shot conversions of ADC1 at 12 dB on GPIO1 into `a0` and on GPIO2 into `a1`, for ever, as
@@ -372,23 +369,35 @@ fn the_x4_slot_holds_the_card_it_is_given_and_hands_it_back() {
     assert!(!empty.sd.unwrap().has_card(), "an empty slot");
 }
 
+/// A device described by its `SoC` alone: no `[wiring]`, no `[power]`.
+fn bare() -> crate::DeviceProfile {
+    crate::DeviceProfile::from_toml(
+        "bare.toml",
+        "id = \"bare\"\nname = \"Bare board\"\nconsole = \"uart0\"\n[soc]\nfamily = \"esp32c3\"\nrevision = \"v0.3\"\n[flash]\nsize_mib = 4\njedec_id = 0x9D6016\n[[partition]]\nname = \"app\"\ntype = \"app\"\nsubtype = \"factory\"\noffset = 0x10000\nsize = 0x10000\n",
+    )
+    .unwrap()
+}
+
 /// 2d-R4: a device without `[wiring]` is the bare machine, and refuses what it has no line for.
 #[test]
 fn a_request_of_the_board_is_checked_against_the_profile_without_a_machine() {
-    let x3 = builtin("x3").unwrap();
+    let bare = bare();
     let ask = |sd, usb_power, power_hold_ms| BoardRequest {
         sd,
         usb_power,
         power_hold_ms,
     };
-    assert_eq!(check_board_request(&x3, ask(false, false, None)), Ok(0));
-    assert_eq!(check_board_request(&x3, ask(false, false, Some(0))), Ok(0));
+    assert_eq!(check_board_request(&bare, ask(false, false, None)), Ok(0));
+    assert_eq!(
+        check_board_request(&bare, ask(false, false, Some(0))),
+        Ok(0)
+    );
     for request in [
         ask(true, false, None),
         ask(false, true, None),
         ask(false, false, Some(5)),
     ] {
-        assert!(check_board_request(&x3, request).is_err(), "{request:?}");
+        assert!(check_board_request(&bare, request).is_err(), "{request:?}");
     }
     let x4 = x4();
     assert_eq!(check_board_request(&x4, ask(true, true, None)), Ok(1_500));
@@ -396,17 +405,108 @@ fn a_request_of_the_board_is_checked_against_the_profile_without_a_machine() {
         check_board_request(&x4, ask(false, false, Some(80))),
         Ok(80)
     );
+    let x3 = builtin("x3").unwrap();
+    assert_eq!(check_board_request(&x3, ask(true, false, None)), Ok(1_500));
+    assert!(
+        check_board_request(&x3, ask(false, true, None)).is_err(),
+        "the X3 has no cable line"
+    );
+}
+
+/// Puts GPIO0, GPIO10 and GPIO20 in GPIO function, inputs without the pads' own pulls, nothing
+/// driving them, then copies `GPIO_IN` into `a0` for ever.
+fn read_released_lines() -> Vec<u32> {
+    let mut program = stop_watchdogs();
+    for pin in ["GPIO0", "GPIO10", "GPIO20"] {
+        program.extend(store_register(
+            register("IO_MUX", pin),
+            GPIO_FUNCTION | FUN_IE,
+        ));
+    }
+    let top = program.len();
+    program.extend(load_register(register("GPIO", "IN")));
+    program.push(asm::addi(A0, T1, 0));
+    let back = i32::try_from((program.len() - top) * 4).unwrap();
+    program.push(asm::jal(0, -back));
+    program
+}
+
+/// The X3's board pulls up SCL (GPIO0), SDA (GPIO20) and the display's data line (GPIO10): with
+/// the pads' own pulls off and nothing driving them, they read high (ADR 0015). The X4's data line
+/// has no such resistor: it reads low.
+#[test]
+fn the_x3_board_pulls_up_its_i2c_bus_and_its_display_data_line() {
+    let lines = (1 << 0) | (1 << 10) | (1 << 20);
+    let mut x3 = power_on(&builtin("x3").unwrap(), &read_released_lines(), no_hold());
+    run_to(&mut x3.machine, 100_000);
+    assert_eq!(x3.machine.x()[usize::from(A0)] & lines, lines);
+    let mut x4 = power_on(&x4(), &read_released_lines(), no_hold());
+    run_to(&mut x4.machine, 100_000);
+    assert_eq!(x4.machine.x()[usize::from(A0)] >> 10 & 1, 0);
+}
+
+/// ADR 0015: the X3 powers on with its UC8253, its keys, its switched card slot and the three
+/// chips of its I2C bus; it has no supply to cut, and no cable line.
+#[test]
+fn the_x3_powers_on_wired_with_its_i2c_chips() {
+    let x3 = builtin("x3").unwrap();
+    let wired = power_on(
+        &x3,
+        &[HANG],
+        WiredOptions {
+            sd: Some(SdStart {
+                source: Box::new(SparseBlocks::new(2048)),
+                config: SdCardConfig::default(),
+            }),
+            ..WiredOptions::default()
+        },
+    );
+    let panel = wired.panel.unwrap();
+    assert!(panel.uc8253().is_some() && panel.ssd1677().is_none());
+    assert_eq!(
+        (panel.image().width, panel.image().height),
+        (792, 528),
+        "the glass"
+    );
+    assert_eq!(
+        board_inputs(&wired.machine).len(),
+        2,
+        "the power-on gesture"
+    );
+    let sd = wired.sd.unwrap();
+    assert!(sd.has_card());
+    assert!(!sd.lines().is_powered(), "GPIO13 not driven yet");
+    let i2c = wired.i2c.unwrap();
+    assert!(i2c.gauge().is_some() && i2c.clock().is_some() && i2c.motion().is_some());
+    let cable = Wired::power_on(
+        &x3,
+        flat_rom(&[HANG]),
+        None,
+        MachineOptions::default(),
+        WiredOptions {
+            usb_power: true,
+            ..WiredOptions::default()
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(cable.contains("no USB detect line"), "{cable}");
 }
 
 #[test]
-fn the_x3_powers_on_bare_and_refuses_what_it_has_no_wiring_for() {
-    let x3 = builtin("x3").unwrap();
-    let wired = power_on(&x3, &[HANG], WiredOptions::default());
-    assert!(wired.panel.is_none() && wired.buttons.is_none() && wired.sd.is_none());
+fn a_bare_device_powers_on_bare_and_refuses_what_it_has_no_wiring_for() {
+    let bare = bare();
+    let wired = power_on(&bare, &[HANG], WiredOptions::default());
+    assert!(
+        wired.panel.is_none()
+            && wired.buttons.is_none()
+            && wired.sd.is_none()
+            && wired.i2c.is_none()
+    );
     assert_eq!(board_inputs(&wired.machine), []);
     let refused = |options| {
         Wired::power_on(
-            &x3,
+            &bare,
             flat_rom(&[HANG]),
             None,
             MachineOptions::default(),

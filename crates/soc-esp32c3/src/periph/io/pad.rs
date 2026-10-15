@@ -161,6 +161,36 @@ pub(crate) fn driven(
     (!(open_drain && level == Level::High)).then_some(level)
 }
 
+/// Whether a pad's output is the peripheral signal `signal`, enabled, whatever its level: an
+/// open-drain pad at its high level releases the line, yet the bus it belongs to still runs on it.
+/// `gpio_enable` is the pad's bit of `GPIO.ENABLE`, `signal_enable` whether the peripheral enables
+/// the signal (`OEN_SEL` chooses between them, `OEN_INV_SEL` inverts the choice, as in
+/// [`driven`]).
+#[must_use]
+pub(crate) fn carries(
+    function: Function,
+    out_sel: u32,
+    gpio_enable: bool,
+    signal: Signal,
+    signal_enable: bool,
+) -> bool {
+    match function {
+        Function::Matrix => {
+            if out_sel & OUT_SEL_MASK != signal {
+                return false;
+            }
+            let enable = if out_sel & OEN_SEL != 0 {
+                gpio_enable
+            } else {
+                signal_enable
+            };
+            enable ^ (out_sel & OEN_INV_SEL != 0)
+        }
+        Function::Fspi(direct) => direct == signal && signal_enable,
+        Function::U0Txd | Function::Other => false,
+    }
+}
+
 /// The level of a pad: what the ESP32-C3 drives, else what an external chip drives, else its pull
 /// resistor, else low.
 ///
@@ -357,6 +387,39 @@ mod tests {
             driven(Function::Other, 0, HIGH_ENABLED, false, no_signal),
             None
         );
+    }
+
+    /// ADR 0015: an open-drain pad routed to I2C0's SCL carries the bus at its high level too,
+    /// where it drives nothing.
+    #[test]
+    fn a_pad_carries_a_signal_routed_and_enabled_whatever_its_level() {
+        assert!(carries(Function::Matrix, I2C_SCL, false, I2C_SCL, true));
+        assert_eq!(
+            driven(Function::Matrix, I2C_SCL, LOW_DISABLED, true, rest),
+            None,
+            "released at the high level of an idle bus"
+        );
+        assert!(!carries(Function::Matrix, I2C_SDA, true, I2C_SCL, true));
+        assert!(
+            !carries(Function::Matrix, I2C_SCL | OEN_SEL, false, I2C_SCL, true),
+            "OEN_SEL: GPIO.ENABLE, clear here, decides"
+        );
+        assert!(carries(
+            Function::Matrix,
+            I2C_SCL | OEN_SEL,
+            true,
+            I2C_SCL,
+            false
+        ));
+        assert!(!carries(
+            Function::Matrix,
+            I2C_SCL | OEN_INV_SEL,
+            false,
+            I2C_SCL,
+            true
+        ));
+        assert!(carries(Function::Fspi(FSPICLK), 0, false, FSPICLK, true));
+        assert!(!carries(Function::Other, I2C_SCL, true, I2C_SCL, true));
     }
 
     #[test]

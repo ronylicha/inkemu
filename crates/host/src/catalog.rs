@@ -2,10 +2,9 @@
 //! sub-project 2c, §4; design of sub-project 2d, 2d-D15 and 2d-D16).
 //!
 //! This is the one place that decides which ports a device gets. A device whose profile has a
-//! `[wiring]` (the X4) shows the image its display controller published and presses its board:
-//! its look and its ports come from the wiring ([`crate::ports_wired`]). A device described by
-//! its `SoC` alone (the X3, until it is wired) gets the test pattern ([`crate::pattern`]) with the
-//! geometry of its panel and the list of its buttons.
+//! `[wiring]` (the X4, the X3 since sub-project 3) shows the image its display controller published
+//! and presses its board: its look and its ports come from the wiring ([`crate::ports_wired`]). A
+//! device described by its `SoC` alone gets the test pattern ([`crate::pattern`]).
 use crate::pattern;
 use crate::ports::{
     ButtonPort, ButtonSpec, Life, PanelDescription, PanelOrigin, PanelSource, PowerOnError, Recipe,
@@ -27,14 +26,9 @@ pub struct Look {
 
 /// The look of the device of `profile`.
 ///
-/// - A wired device (the X4): its controller's panel and the buttons of its board, from the
-///   profile ([`ports_wired::description`], [`ports_wired::button_specs`]).
-/// - The X3: 792 × 528, 4 grey levels, the keys of the X4, which uses the same ladders and power
-///   key (`docs/research/xteink-hardware.md`).
+/// - A wired device (the X4, the X3): its controller's panel and the buttons of its board, from
+///   the profile ([`ports_wired::description`], [`ports_wired::button_specs`]).
 /// - Any other device: 800 × 480, 2 levels, no button.
-///
-/// ASSUMPTION: the X3 is not wired yet; the rotation of its panel (90°, as the X4's) and the
-/// places of its keys (the X4's) are not established. Its wiring settles them.
 #[must_use]
 pub fn look(profile: &DeviceProfile) -> Look {
     if let Some(wiring) = &profile.wiring {
@@ -43,33 +37,17 @@ pub fn look(profile: &DeviceProfile) -> Look {
             buttons: ports_wired::button_specs(wiring),
         };
     }
-    let panel = |width, height, levels| PanelDescription {
-        width,
-        height,
-        shades: Shades::Levels(levels),
-        rotation: Rotation::Deg90,
-        origin: PanelOrigin::TestPattern,
-        approximate: false,
-    };
-    match profile.id.as_str() {
-        "x3" => Look {
-            panel: panel(792, 528, 4),
-            buttons: x4_buttons(),
+    Look {
+        panel: PanelDescription {
+            width: 800,
+            height: 480,
+            shades: Shades::Levels(2),
+            rotation: Rotation::Deg90,
+            origin: PanelOrigin::TestPattern,
+            approximate: false,
         },
-        _ => Look {
-            panel: panel(800, 480, 2),
-            buttons: Vec::new(),
-        },
+        buttons: Vec::<ButtonSpec>::new(),
     }
-}
-
-/// The buttons of the X4, as its profile places them; none if its profile does not load, which
-/// its tests forbid.
-fn x4_buttons() -> Vec<ButtonSpec> {
-    boards::builtin("x4")
-        .ok()
-        .and_then(|x4| x4.wiring.as_ref().map(ports_wired::button_specs))
-        .unwrap_or_default()
 }
 
 /// A built-in device, as an interface lists it before anything runs.
@@ -235,10 +213,10 @@ mod tests {
         boards::builtin(id).unwrap()
     }
 
-    /// 2d-D15, 2d-D16: the X4's look is its wiring; the X3, not wired, keeps the pattern with the
-    /// keys of the X4.
+    /// 2d-D15, 2d-D16, ADR 0015: the X4's look is its wiring, and so is the X3's: its UC8253's
+    /// glass, turned as the X4's, and the X4's keys with the side keys on either edge.
     #[test]
-    fn the_x4_looks_as_its_wiring_says_and_the_x3_as_its_pattern() {
+    fn the_x4_and_the_x3_look_as_their_wiring_says() {
         let x4 = look(&profile("x4"));
         assert_eq!(
             (x4.panel.width, x4.panel.height, x4.panel.shades),
@@ -258,13 +236,19 @@ mod tests {
         let x3 = look(&profile("x3"));
         assert_eq!(
             (x3.panel.width, x3.panel.height, x3.panel.shades),
-            (792, 528, Shades::Levels(4))
+            (792, 528, Shades::Continuous)
         );
         assert_eq!(
-            (x3.panel.origin, x3.panel.approximate),
-            (PanelOrigin::TestPattern, false)
+            (x3.panel.origin, x3.panel.rotation, x3.panel.approximate),
+            (PanelOrigin::Device, Rotation::Deg90, true)
         );
-        assert_eq!(x3.buttons, x4.buttons);
+        let ids: Vec<&str> = x3.buttons.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["power", "back", "confirm", "left", "right", "up", "down"]
+        );
+        let sides: Vec<(Edge, u8)> = x3.buttons[5..].iter().map(|b| (b.edge, b.order)).collect();
+        assert_eq!(sides, [(Edge::Left, 0), (Edge::Right, 0)]);
     }
 
     /// The list an interface shows: every built-in device, the X4 with its console, its flash,
@@ -296,7 +280,8 @@ mod tests {
             "one or the other"
         );
         let x3 = devices.iter().find(|d| d.id == "x3").unwrap();
-        assert!(x3.sd_slot.is_none() && !x3.usb_power);
+        assert_eq!(x3.sd_slot, Some(SdSlotView::OF_A_DEVICE));
+        assert!(!x3.usb_power, "the X3 has no cable line");
     }
 
     /// Every button sits at its own place along its edge.
@@ -316,7 +301,7 @@ mod tests {
     }
 
     /// A power-on gives the wired machine of the X4 with its ports, the gesture journaled, and
-    /// keeps the flash given; the X3 gets the pattern.
+    /// keeps the flash given; the X3 is wired too.
     #[test]
     fn the_recipe_of_a_profile_powers_it_on_wired_with_its_ports() {
         let mut recipe = ProfileRecipe {
@@ -355,7 +340,8 @@ mod tests {
             board: BoardStart::default(),
         };
         let life = x3.power_on(None, false, None).unwrap();
-        assert_eq!(life.panel.describe().origin, PanelOrigin::TestPattern);
-        assert!(!life.buttons.reaches_firmware());
+        assert_eq!(life.panel.describe(), look(&profile("x3")).panel);
+        assert!(life.buttons.reaches_firmware());
+        assert_eq!(life.machine.board_inputs_pending(), 2, "the gesture");
     }
 }

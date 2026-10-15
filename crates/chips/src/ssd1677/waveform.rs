@@ -6,6 +6,7 @@
 //! a sequence of them is again one ([`Transfer`]), so a whole waveform is one translation per LUT.
 
 use super::config::LUT_BYTES;
+pub(crate) use crate::glass::Transfer;
 
 /// Groups of the waveform, each of four phases.
 pub(crate) const GROUPS: usize = 10;
@@ -99,48 +100,6 @@ pub(crate) enum Drive {
     Lut(usize),
     /// One source level, a VS code, for every frame (the border's fixed level, `0x3C` = 01b).
     Fixed(u8),
-}
-
-/// `x ↦ min(max(x + add, lo), hi)`, with `lo ≤ hi`: what a run of phases does to an optical state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Transfer {
-    add: i64,
-    lo: i64,
-    hi: i64,
-}
-
-impl Transfer {
-    /// Leaves every state of `[0, swing]` where it is.
-    pub(crate) fn identity(swing: i64) -> Transfer {
-        Transfer {
-            add: 0,
-            lo: 0,
-            hi: swing,
-        }
-    }
-
-    /// `self`, then `next`. `clamp(clamp(z, A, B), C, D)` is `clamp(z, clamp(A, C, D), clamp(B, C,
-    /// D))` for `A ≤ B` and `C ≤ D`, so the composition keeps the form.
-    pub(crate) fn then(self, next: Transfer) -> Transfer {
-        Transfer {
-            add: self.add.saturating_add(next.add),
-            lo: self.lo.saturating_add(next.add).clamp(next.lo, next.hi),
-            hi: self.hi.saturating_add(next.add).clamp(next.lo, next.hi),
-        }
-    }
-
-    /// Moves every state by `delta`, stopping at 0 and `swing`.
-    fn shift(delta: i64, swing: i64) -> Transfer {
-        Transfer {
-            add: delta,
-            lo: 0,
-            hi: swing,
-        }
-    }
-
-    pub(crate) fn apply(self, state: i64) -> i64 {
-        state.saturating_add(self.add).clamp(self.lo, self.hi)
-    }
 }
 
 /// One group of the waveform: four phases, their source codes for each LUT, and its repeats.
@@ -306,22 +265,6 @@ mod tests {
             gate_code_is_listed(0x00) && gate_code_is_listed(0x07) && gate_code_is_listed(0x17)
         );
         assert!(!gate_code_is_listed(0x06) && !gate_code_is_listed(0x18));
-    }
-
-    #[test]
-    fn a_transfer_composes_and_clamps() {
-        let swing = 100;
-        let up = Transfer::shift(30, swing);
-        let down = Transfer::shift(-80, swing);
-        for start in [0, 10, 50, 90, 100] {
-            let step = down.apply(up.apply(start));
-            assert_eq!(up.then(down).apply(start), step, "{start}");
-        }
-        // Down to black from anywhere, then up 30: always 30.
-        let flash = Transfer::shift(-200, swing).then(Transfer::shift(30, swing));
-        assert_eq!(flash.apply(0), 30);
-        assert_eq!(flash.apply(100), 30);
-        assert_eq!(Transfer::identity(swing).apply(42), 42);
     }
 
     /// A setting with one phase in group 0: `frames` frames of `code` on LUT1, VCOM at DCVCOM.

@@ -9,7 +9,7 @@ use crate::flash::{FlashDevice, FlashImageError, FlashWrite, NorFlash};
 use crate::inputs::InputJournal;
 use crate::memmap::RESET_PC;
 use crate::periph::io::{BoardRefusal, MAX_PENDING_BOARD_INPUTS};
-use crate::periph::{AttachError, SpiWires, UsbHost};
+use crate::periph::{AttachError, I2cWires, SpiWires, UsbHost};
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
 use cpu_rv32::{
@@ -18,7 +18,7 @@ use cpu_rv32::{
 };
 use emu_core::{
     AnalogSource, BoardInput, BoardInputError, BoardInputs, Clocked, Cycles, Frequency, GpioInput,
-    GpioOutput, SpiTarget, Supply, TimingModel, TraceHash,
+    GpioOutput, I2cTarget, SpiTarget, Supply, TimingModel, TraceHash,
 };
 
 /// `x2`, the stack pointer of the RISC-V calling convention.
@@ -1324,6 +1324,31 @@ impl Esp32C3 {
         chip: Box<dyn AnalogSource>,
     ) -> Result<(), AttachError> {
         self.bus.periph.io.attach_analog(pin, chip)
+    }
+
+    /// Attaches a chip to I2C0 by the pins of its clock and data lines (ADR 0015): it sees each
+    /// START with its address, and the bytes and the STOP that follow while it acknowledged it,
+    /// each at the instant it ends on the bus, wherever the GPIO matrix routes I2C0's SCL and SDA
+    /// to its pins. Several chips share a bus by their addresses.
+    /// # Errors
+    /// [`AttachError`] when one of the pins does not exist.
+    pub fn attach_i2c(
+        &mut self,
+        wires: I2cWires,
+        chip: Box<dyn I2cTarget>,
+    ) -> Result<(), AttachError> {
+        self.bus.periph.io.attach_i2c(wires, chip)?;
+        self.bus.periph.i2c0.chips_attached();
+        Ok(())
+    }
+
+    /// Pulls pin `pin` up on the board, as a resistor to the supply does (the lines of an I2C bus,
+    /// a data line a chip releases): when nothing drives it, it reads high, whatever the pad's
+    /// own pulls and through any reset of the chip.
+    /// # Errors
+    /// [`AttachError::NoSuchPin`] when the pin does not exist.
+    pub fn pull_up_on_board(&mut self, pin: u8) -> Result<(), AttachError> {
+        self.bus.periph.io.pull_up_on_board(&mut self.bus.ctx, pin)
     }
 
     /// Attaches a chip that does work of its own over time (a display controller running a

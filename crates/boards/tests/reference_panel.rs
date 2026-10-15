@@ -242,8 +242,7 @@ fn assert_only_drawn_changed(before: &PanelImage, after: &PanelImage, drawn: Rec
 
 /// The image the glass showed last, checked to be of `generation` and `kind`.
 fn shown(panel: &PanelHandle, generation: u64, kind: RefreshKind) -> PanelImage {
-    let lines = panel.lines();
-    let image = lines.chip().panel_image().clone();
+    let image = panel.image().clone();
     assert_eq!(
         (image.generation, image.kind, image.interrupted),
         (generation, kind, false),
@@ -352,7 +351,7 @@ fn the_x4_shows_its_frame_and_a_square_per_press_then_turns_off_on_its_power_key
         "off when the key is released at {released} ns: {lost} ns"
     );
     assert_eq!(consoles.diagnostics, [], "{console}");
-    assert_eq!(panel.lines_mut().take_faults(), [], "{console}");
+    assert_eq!(panel.take_faults(), [], "{console}");
     assert_eq!(
         machine.trace_hash(),
         Some(TRACE_HASH),
@@ -439,5 +438,5 @@ fn with_the_cable_in_the_power_key_sends_the_x4_to_deep_sleep_and_wakes_it() {
         ),
         other => panic!("{other:?}\n{console}"),
     }
-    assert_eq!(panel.lines_mut().take_faults(), [], "{console}");
+    assert_eq!(panel.take_faults(), [], "{console}");
 }
