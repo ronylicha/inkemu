@@ -101,6 +101,7 @@ impl Replay {
                     machine.send_console(*channel, *at, bytes)
                 }
                 AcceptedInput::UsbHost { at, state } => machine.set_usb_host(*at, *state),
+                AcceptedInput::Board { at, input } => machine.send_board_input(*at, *input),
             };
             handed.map_err(|source| ReplayError::Input { index, source })?;
         }
@@ -170,6 +171,7 @@ impl Replay {
             StopReason::Idle => Some(Reached::Idle),
             StopReason::DeepSleep => Some(Reached::DeepSleep),
             StopReason::StrictMmio(_) => Some(Reached::StrictMmio),
+            StopReason::PowerOff => Some(Reached::PowerOff),
             StopReason::CycleBudget | StopReason::Asleep | StopReason::ConsoleOutput => None,
         };
         self.end = reached.map(|reached| self.limits.end_of(reached, self.machine.device_time()));

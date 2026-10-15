@@ -9,8 +9,9 @@
 //! changes nothing and is not journaled.
 use crate::machine::{ConsoleChannel, MAX_PENDING_HOST_BYTES, MAX_PENDING_HOST_CHANGES};
 use crate::periph::UsbHost;
+use crate::periph::io::MAX_PENDING_BOARD_INPUTS;
 use crate::periph::usb_serial_jtag::PACKET_BYTES;
-use emu_core::Cycles;
+use emu_core::{BoardInput, Cycles};
 
 /// The most input the journal holds for one console channel over the whole run, each chunk
 /// counting for its length and an empty chunk for one byte: the bound ADR 0006 puts on what a
@@ -33,10 +34,14 @@ pub const MAX_JOURNAL_CONSOLE_BYTES: usize = MAX_PENDING_HOST_BYTES;
 pub const MAX_JOURNAL_CONSOLE_CHUNKS: usize = MAX_PENDING_HOST_BYTES / PACKET_BYTES;
 /// The most changes of the USB host the journal holds over the whole run, for the same reason.
 pub const MAX_JOURNAL_HOST_CHANGES: usize = MAX_PENDING_HOST_CHANGES;
-/// The most entries the journal holds: the chunks of the three consoles and the changes of the
-/// USB host, 65 536.
-pub const MAX_JOURNAL_INPUTS: usize =
-    ConsoleChannel::ALL.len() * MAX_JOURNAL_CONSOLE_CHUNKS + MAX_JOURNAL_HOST_CHANGES;
+/// The most inputs of the board (keys, the power cable) the journal holds over the whole run: as
+/// many as may wait in the machine, so that a replay hands them all over at power-on (ADR 0013).
+pub const MAX_JOURNAL_BOARD_INPUTS: usize = MAX_PENDING_BOARD_INPUTS;
+/// The most entries the journal holds: the chunks of the three consoles, the changes of the USB
+/// host and the inputs of the board, 81 920.
+pub const MAX_JOURNAL_INPUTS: usize = ConsoleChannel::ALL.len() * MAX_JOURNAL_CONSOLE_CHUNKS
+    + MAX_JOURNAL_HOST_CHANGES
+    + MAX_JOURNAL_BOARD_INPUTS;
 
 /// An input the machine accepted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +56,9 @@ pub enum AcceptedInput {
     /// From device time `at` the USB host is `state`
     /// ([`Esp32C3::set_usb_host`](crate::Esp32C3::set_usb_host)).
     UsbHost { at: Cycles, state: UsbHost },
+    /// The user acted on the board at device time `at`: a key, the power cable
+    /// ([`Esp32C3::send_board_input`](crate::Esp32C3::send_board_input)).
+    Board { at: Cycles, input: BoardInput },
 }
 
 /// What the journal holds of the inputs the machine accepted.
@@ -67,7 +75,8 @@ enum Kept {
 /// The inputs a machine accepted since power-on, and the state of the USB host at power-on.
 ///
 /// Its memory is bounded by [`MAX_JOURNAL_CONSOLE_BYTES`] and [`MAX_JOURNAL_CONSOLE_CHUNKS`]
-/// per channel and by [`MAX_JOURNAL_HOST_CHANGES`]: at most [`MAX_JOURNAL_INPUTS`] entries of
+/// per channel, by [`MAX_JOURNAL_HOST_CHANGES`] and by [`MAX_JOURNAL_BOARD_INPUTS`]: at most
+/// [`MAX_JOURNAL_INPUTS`] entries of
 /// `size_of::<AcceptedInput>()` bytes and `3 * MAX_JOURNAL_CONSOLE_BYTES` bytes of the
 /// consoles, each chunk that holds bytes in an allocation of its own. An input past a bound is
 /// accepted by the machine all the same, but the journal stops there and says it is incomplete
@@ -83,6 +92,7 @@ pub struct InputJournal {
     /// The chunks journaled on each channel, by the same place.
     console_chunks: [usize; 3],
     host_changes: usize,
+    board_inputs: usize,
     kept: Kept,
 }
 
@@ -96,6 +106,7 @@ impl InputJournal {
             console_bytes: [0; 3],
             console_chunks: [0; 3],
             host_changes: 0,
+            board_inputs: 0,
             kept: Kept::All,
         }
     }
@@ -159,6 +170,19 @@ impl InputJournal {
         }
         self.host_changes += 1;
         self.inputs.push(AcceptedInput::UsbHost { at, state });
+    }
+
+    /// The machine accepted `input` of the board, dated `at`.
+    pub(crate) fn record_board(&mut self, at: Cycles, input: BoardInput) {
+        if !self.is_complete() {
+            return;
+        }
+        if self.board_inputs >= MAX_JOURNAL_BOARD_INPUTS {
+            self.let_go(Kept::PastABound);
+            return;
+        }
+        self.board_inputs += 1;
+        self.inputs.push(AcceptedInput::Board { at, input });
     }
 
     /// The machine keeps no journal from now on: what the journal holds is let go, and nothing
@@ -241,7 +265,7 @@ mod tests {
     #[test]
     fn past_its_bound_on_the_chunks_of_a_channel_the_journal_stops() {
         assert_eq!(MAX_JOURNAL_CONSOLE_CHUNKS, 16_384);
-        assert_eq!(MAX_JOURNAL_INPUTS, 65_536);
+        assert_eq!(MAX_JOURNAL_INPUTS, 81_920);
         let mut journal = InputJournal::new(UsbHost::Open);
         // One-byte and empty chunks, far under the bound on bytes: the chunks are what is bounded.
         for at in 0..MAX_JOURNAL_CONSOLE_CHUNKS as u64 {
@@ -274,6 +298,36 @@ mod tests {
         }
         past.forgo();
         assert!(!past.is_forgone());
+    }
+
+    #[test]
+    fn inputs_of_the_board_are_journaled_and_bounded() {
+        assert_eq!(MAX_JOURNAL_BOARD_INPUTS, 16_384);
+        assert_eq!(MAX_JOURNAL_INPUTS, 81_920);
+        let key = |value| BoardInput { target: 2, value };
+        let mut journal = InputJournal::new(UsbHost::Open);
+        journal.record_board(Cycles(4), key(1));
+        journal.record_usb_host(Cycles(5), UsbHost::Absent);
+        assert_eq!(
+            journal.inputs(),
+            [
+                AcceptedInput::Board {
+                    at: Cycles(4),
+                    input: key(1)
+                },
+                AcceptedInput::UsbHost {
+                    at: Cycles(5),
+                    state: UsbHost::Absent
+                },
+            ]
+        );
+        for at in 1..MAX_JOURNAL_BOARD_INPUTS as u64 {
+            journal.record_board(Cycles(at), key(0));
+        }
+        assert!(journal.is_complete());
+        journal.record_board(Cycles(u64::MAX), key(1));
+        assert!(!journal.is_complete());
+        assert_eq!(journal.inputs(), []);
     }
 
     #[test]

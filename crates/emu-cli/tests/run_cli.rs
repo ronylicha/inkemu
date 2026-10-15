@@ -145,7 +145,7 @@ fn a_file_that_is_no_session_exits_2_before_any_rom_is_read() {
         .assert()
         .code(2)
         .stderr(contains(
-            "is refused: the file is a session of format `inkemu-session 9`, and this inkemu reads `inkemu-session 1` only",
+            "is refused: the file is a session of format `inkemu-session 9`, and this inkemu reads `inkemu-session 1` and `inkemu-session 2` only",
         ));
 }
 

@@ -308,6 +308,7 @@ fn record(firmware: &Firmware, cutting: Cutting) -> Recorded {
         stage = (firmware.after_call)(&mut m, &uart0, stage);
         let own_end = match stop {
             StopReason::DeepSleep => Some(End::DeepSleep),
+            StopReason::PowerOff => Some(End::PowerOff),
             StopReason::Idle => Some(End::Idle),
             StopReason::TimeBudget if matches!(cutting, Cutting::AtDeadline(cut) if nanos(m.device_time()) >= cut) => {
                 Some(End::Cut)

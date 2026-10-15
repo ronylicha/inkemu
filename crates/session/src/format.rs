@@ -1,39 +1,50 @@
-//! The format `inkemu-session 1` (G3, G4): a session as bytes, and back within constant bounds.
+//! The format `inkemu-session 2` (G3, G4; ADR 0013): a session as bytes, and back within constant
+//! bounds. Sessions of the format `inkemu-session 1` are read too.
 //!
-//! Binary, little-endian, the fields in this order: the version line `inkemu-session 1\n`; the
+//! Binary, little-endian, the fields in this order: the version line `inkemu-session 2\n`; the
 //! ROM revision (`u16`) and the SHA-256 of the ROM image; the profile id (`u8` length) and text
 //! (`u32` length) and the SHA-256 of the text; the flash size (`u32`), the SHA-256 of the flash,
-//! the length of the deflated flash (`u32`) and its bytes; `--strict-mmio` (`u8`), `--max-cycles`
-//! and `--max-time` (each a `u8` presence, then a `u64` when present); the cut (a `u8` reason, 0
-//! for none, then the `u64` instant); the USB host at power-on (`u8`); the number of inputs
-//! (`u32`), then each input: a `u8` tag (0 `uart0`, 1 `usb-serial-jtag`, 2 `uart1`, 3 the USB
-//! host), the `u64` date, then for a console a `u32` length and the bytes, for the host a `u8`
-//! state; the outcome: the end (`u8`), device time, cycles, instructions and trace hash (`u64`
-//! each), the SHA-256 of the final flash, then that of each console. Dates and instants are in
-//! cycles of the time base. Nothing follows.
+//! the length of the deflated flash (`u32`) and its bytes; the SD card at the start (`u8`
+//! presence, 0: no card; a card is the format's place for sub-project 2e); `--strict-mmio`
+//! (`u8`), `--max-cycles` and `--max-time` (each a `u8` presence, then a `u64` when present); the
+//! cut (a `u8` reason, 0 for none, then the `u64` instant); the USB host at power-on (`u8`); the
+//! number of inputs (`u32`), then each input: a `u8` tag (0 `uart0`, 1 `usb-serial-jtag`, 2
+//! `uart1`, 3 the USB host, 4 the board), the `u64` date, then for a console a `u32` length and
+//! the bytes, for the host a `u8` state, for the board a `u16` target and a `u32` value; the
+//! outcome: the end (`u8`), device time, cycles, instructions and trace hash (`u64` each), the
+//! SHA-256 of the final flash, the SD card at the end (`u8` presence, 0: none), then the SHA-256
+//! of each console. Dates and instants are in cycles of the time base. Nothing follows.
 //!
-//! The reader allocates from no length it reads: every length is checked against a constant
-//! bound and against the bytes left in the file before anything is copied, and the inputs are
-//! pushed one by one as they are read. The flash is inflated into the size of the device of the
+//! The format 1 is the same without the two presences of an SD card and without inputs of the
+//! board.
+//!
+//! The reader allocates from no length it has not bounded: every length is checked against a
+//! constant bound and against the bytes left in the file before anything is copied or reserved;
+//! the inputs are reserved at the count the file gives, no more than [`MAX_INPUTS`] and than the
+//! bytes left can hold, then pushed one by one as they are read. The flash is inflated into the size of the device of the
 //! profile, checked against the size the file gives and against [`MAX_FLASH_BYTES`] first.
 use crate::outcome::{Cut, CutReason, End, Limits, Outcome, hex, place};
 use boards::{DeviceProfile, ProfileError};
+use emu_core::BoardInput;
 use emu_core::Cycles;
 use flate2::write::DeflateEncoder;
 use flate2::{Compression, Decompress, FlushDecompress, Status};
 use sha2::{Digest as _, Sha256};
 use soc_esp32c3::flash::{MAX_FLASH_BYTES, MIN_FLASH_BYTES};
 use soc_esp32c3::{
-    AcceptedInput, ConsoleChannel, InputJournal, MAX_JOURNAL_CONSOLE_BYTES,
-    MAX_JOURNAL_CONSOLE_CHUNKS, MAX_JOURNAL_HOST_CHANGES, MAX_JOURNAL_INPUTS, RomImage, UsbHost,
+    AcceptedInput, ConsoleChannel, InputJournal, MAX_JOURNAL_BOARD_INPUTS,
+    MAX_JOURNAL_CONSOLE_BYTES, MAX_JOURNAL_CONSOLE_CHUNKS, MAX_JOURNAL_HOST_CHANGES,
+    MAX_JOURNAL_INPUTS, RomImage, UsbHost,
 };
 use std::fmt;
 use std::io::Write as _;
 
 /// The first line of a session, its version: a later format changes the number.
-pub const VERSION_LINE: &str = "inkemu-session 1";
+pub const VERSION_LINE: &str = "inkemu-session 2";
 /// The bytes a session begins with: [`VERSION_LINE`] and a line feed.
-const MAGIC: &[u8] = b"inkemu-session 1\n";
+const MAGIC: &[u8] = b"inkemu-session 2\n";
+/// The bytes a session of the format 1 begins with, which is still read.
+const MAGIC_1: &[u8] = b"inkemu-session 1\n";
 /// What every version line begins with: a file that does too is a session of another version.
 const MAGIC_PREFIX: &[u8] = b"inkemu-session ";
 /// The longest version line read back to name another version.
@@ -55,8 +66,10 @@ pub const MAX_CONSOLE_BYTES: usize = MAX_JOURNAL_CONSOLE_BYTES;
 pub const MAX_CONSOLE_CHUNKS: usize = MAX_JOURNAL_CONSOLE_CHUNKS;
 /// The most changes of the USB host over the run.
 pub const MAX_HOST_CHANGES: usize = MAX_JOURNAL_HOST_CHANGES;
-/// The most inputs a session holds: the chunks of the three consoles and the changes of the USB
-/// host, 65 536.
+/// The most inputs of the board over the run (ADR 0013).
+pub const MAX_BOARD_INPUTS: usize = MAX_JOURNAL_BOARD_INPUTS;
+/// The most inputs a session holds: the chunks of the three consoles, the changes of the USB
+/// host and the inputs of the board, 81 920.
 pub const MAX_INPUTS: usize = MAX_JOURNAL_INPUTS;
 /// The most memory the inputs of a session take once read ([`Session::inputs`]): its entries,
 /// each of a fixed size, and the bytes of its consoles, each channel at its bound. The
@@ -71,7 +84,10 @@ const SHA256_BYTES: usize = 32;
 const CONSOLE_INPUT_HEAD: usize = 1 + 8 + 4;
 /// The tag, the date and the state of a change of the USB host.
 const HOST_INPUT_BYTES: usize = 1 + 8 + 1;
-const OUTCOME_BYTES: usize = 1 + 4 * 8 + SHA256_BYTES * 4;
+/// The tag, the date, the target and the value of an input of the board.
+const BOARD_INPUT_BYTES: usize = 1 + 8 + 2 + 4;
+/// The outcome, the presence of an SD card at the end included.
+const OUTCOME_BYTES: usize = 1 + 4 * 8 + SHA256_BYTES * 4 + 1;
 /// The longest session: every field at its bound. A console input of `n` bytes costs
 /// `CONSOLE_INPUT_HEAD + n` bytes of file, one of its channel's chunks and at least `max(n, 1)`
 /// of its bytes, so a channel's inputs take at most `CONSOLE_INPUT_HEAD` bytes of file per chunk
@@ -89,12 +105,14 @@ pub const MAX_SESSION_BYTES: usize = MAGIC.len()
     + 4
     + MAX_DEFLATED_FLASH_BYTES
     + 1
+    + 1
     + 2 * 9
     + 9
     + 1
     + 4
     + 3 * (MAX_CONSOLE_CHUNKS * CONSOLE_INPUT_HEAD + MAX_CONSOLE_BYTES)
     + MAX_HOST_CHANGES * HOST_INPUT_BYTES
+    + MAX_BOARD_INPUTS * BOARD_INPUT_BYTES
     + OUTCOME_BYTES;
 
 /// The mask ROM a session was recorded on: never the ROM itself, which its licence keeps out of
@@ -163,6 +181,8 @@ pub enum Field {
     FlashSize,
     FlashSha256,
     DeflatedFlash,
+    /// The SD card the run started with.
+    SdCard,
     StrictMmio,
     MaxCycles,
     MaxTime,
@@ -176,12 +196,16 @@ pub enum Field {
     /// The inputs of a console channel, all of them, by their number.
     ConsoleChunks(ConsoleChannel),
     HostChanges,
+    /// The inputs of the board, all of them.
+    BoardInputs,
     End,
     DeviceTime,
     Cycles,
     Instructions,
     TraceHash,
     FinalFlashSha256,
+    /// The SD card the run ended with.
+    FinalSdCard,
     ConsoleSha256(ConsoleChannel),
 }
 
@@ -197,6 +221,7 @@ impl fmt::Display for Field {
             Field::FlashSize => f.write_str("the flash size"),
             Field::FlashSha256 => f.write_str("the SHA-256 of the starting flash"),
             Field::DeflatedFlash => f.write_str("the deflated starting flash"),
+            Field::SdCard => f.write_str("the starting SD card"),
             Field::StrictMmio => f.write_str("--strict-mmio"),
             Field::MaxCycles => f.write_str("--max-cycles"),
             Field::MaxTime => f.write_str("--max-time"),
@@ -211,12 +236,14 @@ impl fmt::Display for Field {
                 write!(f, "the number of inputs of {}", channel.name())
             }
             Field::HostChanges => f.write_str("the changes of the USB host"),
+            Field::BoardInputs => f.write_str("the inputs of the board"),
             Field::End => f.write_str("the end"),
             Field::DeviceTime => f.write_str("the device time"),
             Field::Cycles => f.write_str("the cycles"),
             Field::Instructions => f.write_str("the instructions"),
             Field::TraceHash => f.write_str("the trace hash"),
             Field::FinalFlashSha256 => f.write_str("the SHA-256 of the final flash"),
+            Field::FinalSdCard => f.write_str("the final SD card"),
             Field::ConsoleSha256(channel) => {
                 write!(f, "the SHA-256 of console {}", channel.name())
             }
@@ -235,7 +262,7 @@ pub enum ReadError {
     #[error("the file does not begin with `{VERSION_LINE}`; it is not a session of inkemu")]
     NotASession,
     #[error(
-        "the file is a session of format `{found}`, and this inkemu reads `{VERSION_LINE}` only; replay it with the inkemu that recorded it"
+        "the file is a session of format `{found}`, and this inkemu reads `inkemu-session 1` and `{VERSION_LINE}` only; replay it with the inkemu that recorded it"
     )]
     OtherVersion { found: String },
     #[error("the file ends inside {field}; it was cut short: record the run again")]
@@ -298,7 +325,7 @@ pub enum ReadError {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WriteError {
     #[error(
-        "the run received more input than a session holds ({MAX_CONSOLE_BYTES} bytes or {MAX_CONSOLE_CHUNKS} inputs on one console, or {MAX_HOST_CHANGES} changes of the USB host), so the machine's journal of it is incomplete; record a run that sends less, in fewer pieces"
+        "the run received more input than a session holds ({MAX_CONSOLE_BYTES} bytes or {MAX_CONSOLE_CHUNKS} inputs on one console, {MAX_HOST_CHANGES} changes of the USB host or {MAX_BOARD_INPUTS} inputs of the board), so the machine's journal of it is incomplete; record a run that sends less, in fewer pieces"
     )]
     IncompleteJournal,
     #[error("the machine was told to keep no journal of its inputs, so its run cannot be recorded")]
@@ -336,6 +363,7 @@ struct InputBudget {
     console: [usize; 3],
     chunks: [usize; 3],
     host_changes: usize,
+    board_inputs: usize,
 }
 
 impl InputBudget {
@@ -375,6 +403,19 @@ impl InputBudget {
         self.host_changes += 1;
         Ok(())
     }
+
+    /// Counts an input of the board, or names the bound it passes.
+    fn board_input(&mut self) -> Result<(), (Field, u64, u64)> {
+        if self.board_inputs >= MAX_BOARD_INPUTS {
+            return Err((
+                Field::BoardInputs,
+                self.board_inputs as u64 + 1,
+                MAX_BOARD_INPUTS as u64,
+            ));
+        }
+        self.board_inputs += 1;
+        Ok(())
+    }
 }
 
 const fn channel_tag(channel: ConsoleChannel) -> u8 {
@@ -385,6 +426,7 @@ const fn channel_tag(channel: ConsoleChannel) -> u8 {
     }
 }
 const HOST_TAG: u8 = 3;
+const BOARD_TAG: u8 = 4;
 
 const fn host_code(state: UsbHost) -> u8 {
     match state {
@@ -402,6 +444,7 @@ const fn end_code(end: End) -> u8 {
         End::DeepSleep => 3,
         End::StrictMmio => 4,
         End::Cut => 5,
+        End::PowerOff => 6,
     }
 }
 
@@ -496,6 +539,7 @@ impl Session {
                     budget.console(*channel, bytes.len())
                 }
                 AcceptedInput::UsbHost { .. } => budget.host_change(),
+                AcceptedInput::Board { .. } => budget.board_input(),
             };
             counted.map_err(|(field, value, max)| WriteError::TooLarge { field, value, max })?;
         }
@@ -548,6 +592,8 @@ impl Session {
         let deflated_len = u32::try_from(deflated.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&deflated_len.to_le_bytes());
         out.extend_from_slice(&deflated);
+        // No SD card: the place the card of sub-project 2e takes in the format.
+        out.push(0);
         out.push(u8::from(self.limits.strict_mmio));
         for limit in [self.limits.max_cycles, self.limits.max_time_nanos] {
             match limit {
@@ -582,6 +628,12 @@ impl Session {
                     out.extend_from_slice(&at.get().to_le_bytes());
                     out.push(host_code(*state));
                 }
+                AcceptedInput::Board { at, input } => {
+                    out.push(BOARD_TAG);
+                    out.extend_from_slice(&at.get().to_le_bytes());
+                    out.extend_from_slice(&input.target.to_le_bytes());
+                    out.extend_from_slice(&input.value.to_le_bytes());
+                }
             }
         }
         let outcome = &self.outcome;
@@ -595,6 +647,8 @@ impl Session {
             out.extend_from_slice(&value.to_le_bytes());
         }
         out.extend_from_slice(&outcome.flash_sha256);
+        // No SD card at the end either.
+        out.push(0);
         for digest in &outcome.consoles {
             out.extend_from_slice(digest);
         }
@@ -612,7 +666,11 @@ impl Session {
         if bytes.len() > MAX_SESSION_BYTES {
             return Err(ReadError::TooLong);
         }
-        let mut reader = Reader { bytes, at: 0 };
+        let mut reader = Reader {
+            bytes,
+            at: 0,
+            format: 2,
+        };
         reader.version()?;
         let rom = RomIdentity {
             revision: reader.u16(Field::RomRevision)?,
@@ -624,6 +682,7 @@ impl Session {
             .device()
             .map_err(|source| ReadError::Profile { source })?;
         let flash = reader.flash(device.flash.size())?;
+        reader.no_sd_card(Field::SdCard)?;
         let strict_mmio = match reader.u8(Field::StrictMmio)? {
             0 => false,
             1 => true,
@@ -672,6 +731,8 @@ impl Session {
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// The format of the file, 1 or 2, once its version line is read.
+    format: u8,
 }
 
 impl<'a> Reader<'a> {
@@ -728,11 +789,14 @@ impl<'a> Reader<'a> {
     }
 
     fn version(&mut self) -> Result<(), ReadError> {
-        if self.bytes.starts_with(MAGIC) {
-            self.at = MAGIC.len();
-            return Ok(());
+        for (magic, format) in [(MAGIC, 2), (MAGIC_1, 1)] {
+            if self.bytes.starts_with(magic) {
+                self.at = magic.len();
+                self.format = format;
+                return Ok(());
+            }
         }
-        if MAGIC.starts_with(self.bytes) {
+        if MAGIC.starts_with(self.bytes) || MAGIC_1.starts_with(self.bytes) {
             return Err(ReadError::Truncated {
                 field: Field::Version,
             });
@@ -751,6 +815,21 @@ impl<'a> Reader<'a> {
             });
         }
         Err(ReadError::NotASession)
+    }
+
+    /// The presence of an SD card in a session of the format 2: this inkemu holds none, so 0 is
+    /// the one value the field takes. A session of the format 1 has no such field.
+    fn no_sd_card(&mut self, field: Field) -> Result<(), ReadError> {
+        if self.format < 2 {
+            return Ok(());
+        }
+        match self.u8(field)? {
+            0 => Ok(()),
+            other => Err(ReadError::Invalid {
+                field,
+                value: other.into(),
+            }),
+        }
     }
 
     fn text(&mut self, len: usize, field: Field) -> Result<String, ReadError> {
@@ -871,7 +950,10 @@ impl<'a> Reader<'a> {
     fn inputs(&mut self) -> Result<Vec<AcceptedInput>, ReadError> {
         let count = self.length(Field::InputCount, MAX_INPUTS)?;
         let mut budget = InputBudget::default();
-        let mut inputs = Vec::new();
+        // As many entries as the count says, bounded by MAX_INPUTS and by what the bytes left can
+        // hold (an input takes ten bytes at least): the vector never grows past what it holds.
+        let room = (self.bytes.len() - self.at) / HOST_INPUT_BYTES;
+        let mut inputs = Vec::with_capacity(count.min(room));
         // At most MAX_INPUTS turns; each takes ten bytes of the file at least, so a count larger
         // than the file allows ends early, on the input it would be cut in.
         for index in 0..count {
@@ -882,6 +964,14 @@ impl<'a> Reader<'a> {
                 budget.host_change().map_err(too_large)?;
                 let state = self.usb_host(field)?;
                 AcceptedInput::UsbHost { at, state }
+            } else if tag == BOARD_TAG && self.format >= 2 {
+                budget.board_input().map_err(too_large)?;
+                let target = self.u16(field)?;
+                let value = self.u32(field)?;
+                AcceptedInput::Board {
+                    at,
+                    input: BoardInput { target, value },
+                }
             } else {
                 let channel = ConsoleChannel::ALL
                     .into_iter()
@@ -914,6 +1004,7 @@ impl<'a> Reader<'a> {
         let instructions = self.u64(Field::Instructions)?;
         let trace_hash = self.u64(Field::TraceHash)?;
         let flash_sha256 = self.sha256(Field::FinalFlashSha256)?;
+        self.no_sd_card(Field::FinalSdCard)?;
         let mut consoles = [[0u8; 32]; 3];
         for channel in ConsoleChannel::ALL {
             consoles[place(channel)] = self.sha256(Field::ConsoleSha256(channel))?;

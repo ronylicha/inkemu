@@ -439,7 +439,7 @@ mod tests {
         let error = read_session(&path).unwrap_err().to_string();
         assert!(
             error.ends_with(
-                "is refused: the file does not begin with `inkemu-session 1`; it is not a session of inkemu"
+                "is refused: the file does not begin with `inkemu-session 2`; it is not a session of inkemu"
             ),
             "{error}"
         );

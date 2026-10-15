@@ -422,6 +422,7 @@ impl Engine {
             StopReason::StrictMmio(_) => self.end_on(RunEnd::StrictMmio, Some(stop), output),
             StopReason::Idle => self.halt_on(Halt::Idle, stop, output),
             StopReason::DeepSleep => self.halt_on(Halt::DeepSleep, stop, output),
+            StopReason::PowerOff => self.end_on(RunEnd::PowerOff, Some(stop), output),
             StopReason::TimeBudget if paced => output.caught_up = true,
             StopReason::TimeBudget => self.end_on(RunEnd::TimeLimit, Some(stop), output),
             StopReason::CycleBudget

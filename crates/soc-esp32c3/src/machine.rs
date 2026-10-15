@@ -8,6 +8,7 @@ use crate::diag::{Diagnostic, Unsupported};
 use crate::flash::{FlashDevice, FlashImageError, FlashWrite, NorFlash};
 use crate::inputs::InputJournal;
 use crate::memmap::RESET_PC;
+use crate::periph::io::{BoardRefusal, MAX_PENDING_BOARD_INPUTS};
 use crate::periph::{AttachError, SpiWires, UsbHost};
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
@@ -16,8 +17,8 @@ use cpu_rv32::{
     MisalignedPolicy, QemuIcountTiming, StepOutcome, Trap,
 };
 use emu_core::{
-    AnalogSource, Clocked, Cycles, Frequency, GpioInput, GpioOutput, SpiTarget, TimingModel,
-    TraceHash,
+    AnalogSource, BoardInput, BoardInputError, BoardInputs, Clocked, Cycles, Frequency, GpioInput,
+    GpioOutput, SpiTarget, Supply, TimingModel, TraceHash,
 };
 
 /// `x2`, the stack pointer of the RISC-V calling convention.
@@ -102,6 +103,20 @@ pub enum InputError {
         "{MAX_PENDING_HOST_CHANGES} changes of the USB host are still to come; give the next ones once the run has reached some"
     )]
     TooManyHostChanges,
+    /// An input of the board, on a machine no board inputs were attached to.
+    #[error("the device has no input of its board: nothing was wired to take it")]
+    NoBoard,
+    /// The board refused the input.
+    #[error("{0}")]
+    Board(#[from] BoardInputError),
+    /// The inputs of the board still to act are as many as they may be.
+    #[error(
+        "{MAX_PENDING_BOARD_INPUTS} inputs of the board are still to come; give the next ones once the run has reached some"
+    )]
+    TooManyBoardInputs,
+    /// The device has no power any more: it takes no input.
+    #[error("the device is off: its supply failed; power it on again")]
+    PoweredOff,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,6 +156,9 @@ pub enum StopReason {
     /// (F5). As with [`StopReason::Idle`], device time stands still from here on and is not moved
     /// to a limit; [`Esp32C3::deep_sleep`] says since when and on which sources it waits.
     DeepSleep,
+    /// The board's supply failed (ADR 0013): the chip has no power and runs no further, whatever
+    /// a caller does; [`Esp32C3::power_lost_nanos`] says when.
+    PowerOff,
 }
 
 /// A chip in deep sleep, as a front end shows it (F9): read with [`Esp32C3::deep_sleep`].
@@ -557,6 +575,12 @@ impl Esp32C3 {
     /// next instruction ([`Hart::take_boundary`]) and the turn is [`Turn::Ready`] when nothing
     /// does.
     fn turn(&mut self, deadline: Option<Cycles>, slept: &mut Slept, boundary_only: bool) -> Turn {
+        // The board's supply failed: nothing runs any more (ADR 0013).
+        if self.bus.periph.io.power_lost().is_some() {
+            return Turn::DeepSlept {
+                stop: Some(StopReason::PowerOff),
+            };
+        }
         if self.powered_down {
             return self.deep_sleep_turn(deadline, slept);
         }
@@ -1217,6 +1241,61 @@ impl Esp32C3 {
         self.bus.periph.io.attach_clocked(&mut self.bus.ctx, chip);
     }
 
+    /// Attaches the inputs of the board's user (the keys, the power cable: ADR 0013), which
+    /// [`Esp32C3::send_board_input`] then takes. A second call replaces the first.
+    pub fn attach_board_inputs(&mut self, inputs: Box<dyn BoardInputs>) {
+        self.bus.periph.io.attach_board_inputs(inputs);
+    }
+
+    /// Attaches the supply of the board (ADR 0013): it is asked at once, then after each change of
+    /// what the chip drives on a pin and each input of the board that acts. Once it says the chip
+    /// has no power, the run stops for good ([`StopReason::PowerOff`]).
+    pub fn attach_supply(&mut self, supply: Box<dyn Supply>) {
+        self.bus.periph.io.attach_supply(&mut self.bus.ctx, supply);
+    }
+
+    /// The user acts on the board at device time `at` (a key, the power cable): the input is
+    /// journaled and acts at the next instant of the time base after `at`, the instruction under
+    /// way then ended (ADR 0013). A front end gives the present time; a replay gives every input
+    /// at power-on with its date.
+    ///
+    /// # Errors
+    /// [`InputError::InThePast`] for an input dated before the present time;
+    /// [`InputError::PoweredOff`] once the supply failed; [`InputError::NoBoard`] with no board
+    /// inputs attached; [`InputError::Board`] when the board refuses it;
+    /// [`InputError::TooManyBoardInputs`] when [`MAX_PENDING_BOARD_INPUTS`] wait already. Nothing
+    /// is taken then.
+    pub fn send_board_input(&mut self, at: Cycles, input: BoardInput) -> Result<(), InputError> {
+        self.check_date(at)?;
+        self.bus
+            .periph
+            .io
+            .queue_board_input(&mut self.bus.ctx, at, input)
+            .map_err(|refusal| match refusal {
+                BoardRefusal::NoBoard => InputError::NoBoard,
+                BoardRefusal::Board(error) => InputError::Board(error),
+                BoardRefusal::TooMany => InputError::TooManyBoardInputs,
+            })?;
+        self.journal.record_board(at, input);
+        Ok(())
+    }
+
+    /// The inputs of the board that have not acted yet.
+    #[must_use]
+    pub fn board_inputs_pending(&self) -> usize {
+        self.bus.periph.io.board_inputs_pending()
+    }
+
+    /// Device time at which the board's supply failed, in nanoseconds since power-on, once it has.
+    #[must_use]
+    pub fn power_lost_nanos(&self) -> Option<u64> {
+        self.bus
+            .periph
+            .io
+            .power_lost()
+            .map(|at| clock::TIME_BASE.cycles_to_nanos(at))
+    }
+
     /// An attached chip changed what it drives from outside the run (a button the user pressed):
     /// the pins are read again at the present device time, and a GPIO interrupt it triggers is
     /// raised. Recording such a change in a session is the caller's (ADR 0012).
@@ -1255,6 +1334,9 @@ impl Esp32C3 {
     }
 
     fn check_date(&self, at: Cycles) -> Result<(), InputError> {
+        if self.bus.periph.io.power_lost().is_some() {
+            return Err(InputError::PoweredOff);
+        }
         let now = self.device_time();
         if at < now {
             return Err(InputError::InThePast {
@@ -1417,6 +1499,9 @@ impl Esp32C3 {
         self.trace.as_ref().map(TraceHash::finish)
     }
 }
+
+#[cfg(test)]
+mod board_tests;
 
 #[cfg(test)]
 mod tests {

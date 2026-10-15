@@ -81,6 +81,13 @@ fn session() -> Session {
                 at: Cycles(5),
                 bytes: b"z".to_vec(),
             },
+            AcceptedInput::Board {
+                at: Cycles(40),
+                input: BoardInput {
+                    target: 0x0203,
+                    value: 0x0405_0607,
+                },
+            },
         ],
         outcome: outcome(End::Cut),
     }
@@ -94,6 +101,7 @@ struct Layout {
     flash_size: usize,
     flash_sha: usize,
     deflated_len: usize,
+    sd_card: usize,
     strict: usize,
     max_cycles: usize,
     max_time: usize,
@@ -112,7 +120,8 @@ fn layout(bytes: &[u8]) -> Layout {
     let flash_sha = flash_size + 4;
     let deflated_len = flash_sha + 32;
     let deflated = u32::from_le_bytes(bytes[deflated_len..deflated_len + 4].try_into().unwrap());
-    let strict = deflated_len + 4 + deflated as usize;
+    let sd_card = deflated_len + 4 + deflated as usize;
+    let strict = sd_card + 1;
     Layout {
         id_len,
         text_len,
@@ -120,6 +129,7 @@ fn layout(bytes: &[u8]) -> Layout {
         flash_size,
         flash_sha,
         deflated_len,
+        sd_card,
         strict,
         max_cycles: strict + 1,
         max_time: strict + 10,
@@ -152,7 +162,7 @@ fn flipped(at: usize) -> Vec<u8> {
 fn a_session_goes_to_bytes_and_back_unchanged() {
     let session = session();
     let bytes = session.to_bytes().unwrap();
-    assert!(bytes.starts_with(b"inkemu-session 1\n"));
+    assert!(bytes.starts_with(b"inkemu-session 2\n"));
     assert_eq!(Session::from_bytes(&bytes).unwrap(), session);
     // The erased flash deflates to a little: the file is small.
     assert!(bytes.len() < 8 * 1024, "{}", bytes.len());
@@ -163,20 +173,122 @@ fn a_session_goes_to_bytes_and_back_unchanged() {
 #[test]
 fn a_session_of_another_version_or_of_no_session_is_refused() {
     let mut other = session().to_bytes().unwrap();
-    other[MAGIC.len() - 2] = b'2';
+    other[MAGIC.len() - 2] = b'3';
     assert_eq!(
         read(&other),
         ReadError::OtherVersion {
-            found: "inkemu-session 2".to_owned()
+            found: "inkemu-session 3".to_owned()
         }
     );
     assert_eq!(read(b"hello"), ReadError::NotASession);
     assert_eq!(read(b"inkemu-session\n"), ReadError::NotASession);
+    assert_eq!(
+        read(b"inkemu-session 1"),
+        ReadError::Truncated {
+            field: Field::Version
+        }
+    );
     let message = read(&other).to_string();
     assert!(
-        message.contains("reads `inkemu-session 1` only"),
+        message.contains("reads `inkemu-session 1` and `inkemu-session 2` only"),
         "{message}"
     );
+}
+
+/// The bytes of `session`, which holds no input of the board, as the format 1 wrote them: the
+/// format 2 without its two presences of an SD card.
+fn as_format_1(session: &Session) -> Vec<u8> {
+    let mut bytes = session.to_bytes().unwrap();
+    let layout = layout(&bytes);
+    // The presence at the end first: removing the other moves it.
+    let final_card = layout.end + 1 + 4 * 8 + 32;
+    assert_eq!(bytes.remove(final_card), 0);
+    assert_eq!(bytes.remove(layout.sd_card), 0);
+    bytes[..MAGIC_1.len()].copy_from_slice(MAGIC_1);
+    bytes
+}
+
+#[test]
+fn a_session_of_the_format_1_is_still_read() {
+    let mut old = session();
+    old.inputs
+        .retain(|input| !matches!(input, AcceptedInput::Board { .. }));
+    assert_eq!(Session::from_bytes(&as_format_1(&old)).unwrap(), old);
+}
+
+#[test]
+fn an_input_of_the_board_in_a_session_of_the_format_1_is_refused() {
+    let mut old = session();
+    old.inputs
+        .retain(|input| !matches!(input, AcceptedInput::Board { .. }));
+    let mut bytes = as_format_1(&old);
+    // The first input's tag becomes that of the board, which the format 1 has not.
+    let first_input = layout(&session().to_bytes().unwrap()).first_input - 1;
+    bytes[first_input] = 4;
+    assert_eq!(
+        read(&bytes),
+        ReadError::Invalid {
+            field: Field::Input(0),
+            value: 4
+        }
+    );
+}
+
+#[test]
+fn an_sd_card_is_no_value_this_inkemu_reads_in_a_session() {
+    let bytes = session().to_bytes().unwrap();
+    let layout = layout(&bytes);
+    assert_eq!(
+        read(&patched(layout.sd_card, &[1])),
+        ReadError::Invalid {
+            field: Field::SdCard,
+            value: 1
+        }
+    );
+    assert_eq!(
+        read(&patched(layout.end + 1 + 4 * 8 + 32, &[1])),
+        ReadError::Invalid {
+            field: Field::FinalSdCard,
+            value: 1
+        }
+    );
+}
+
+#[test]
+fn the_inputs_of_the_board_beyond_their_bound_are_refused() {
+    let mut beyond = session();
+    beyond.inputs = (0..=MAX_BOARD_INPUTS as u64)
+        .map(|at| AcceptedInput::Board {
+            at: Cycles(at),
+            input: BoardInput {
+                target: 0,
+                value: 1,
+            },
+        })
+        .collect();
+    let refused = ReadError::TooLarge {
+        field: Field::BoardInputs,
+        value: MAX_BOARD_INPUTS as u64 + 1,
+        max: MAX_BOARD_INPUTS as u64,
+    };
+    assert_eq!(read(&beyond.encode().unwrap()), refused);
+    assert!(matches!(
+        beyond.to_bytes(),
+        Err(WriteError::TooLarge {
+            field: Field::BoardInputs,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_run_that_powered_off_is_an_end_of_its_own() {
+    let mut off = session();
+    off.limits.cut = None;
+    off.outcome = outcome(End::PowerOff);
+    let bytes = off.to_bytes().unwrap();
+    assert_eq!(Session::from_bytes(&bytes).unwrap(), off);
+    assert_eq!(End::PowerOff.name(), "the device powering off");
 }
 
 #[test]
@@ -245,7 +357,7 @@ fn each_length_one_past_its_bound_is_refused_before_anything_is_read_from_it() {
     );
     // A count the file does not hold ends on the first input that is not there: the bytes after
     // the inputs are no input, and then there are none left.
-    for count in [5, u32::try_from(MAX_INPUTS).unwrap()] {
+    for count in [6, u32::try_from(MAX_INPUTS).unwrap()] {
         let lying = patched(layout.count, &count.to_le_bytes());
         assert!(
             matches!(
@@ -253,7 +365,7 @@ fn each_length_one_past_its_bound_is_refused_before_anything_is_read_from_it() {
                 ReadError::Truncated {
                     field: Field::Input(_)
                 } | ReadError::Invalid {
-                    field: Field::Input(4),
+                    field: Field::Input(5),
                     ..
                 }
             ),
@@ -365,6 +477,15 @@ fn session_at_the_bounds(chunk: usize) -> Session {
             state: UsbHost::Open,
         });
     }
+    for at in 0..MAX_BOARD_INPUTS as u64 {
+        at_the_bounds.inputs.push(AcceptedInput::Board {
+            at: Cycles(at),
+            input: BoardInput {
+                target: u16::MAX,
+                value: u32::MAX,
+            },
+        });
+    }
     at_the_bounds
 }
 
@@ -387,7 +508,7 @@ fn a_session_at_the_bounds_of_its_inputs_takes_a_memory_bounded_by_a_constant() 
             .iter()
             .map(|input| match input {
                 AcceptedInput::Console { bytes, .. } => bytes.capacity(),
-                AcceptedInput::UsbHost { .. } => 0,
+                AcceptedInput::UsbHost { .. } | AcceptedInput::Board { .. } => 0,
             })
             .sum();
         assert!(console_bytes <= 3 * MAX_CONSOLE_BYTES, "{console_bytes}");
@@ -472,7 +593,7 @@ fn with_deflated(stream: &[u8]) -> Vec<u8> {
     let mut out = bytes[..layout.deflated_len].to_vec();
     out.extend_from_slice(&u32::try_from(stream.len()).unwrap().to_le_bytes());
     out.extend_from_slice(stream);
-    out.extend_from_slice(&bytes[layout.strict..]);
+    out.extend_from_slice(&bytes[layout.sd_card..]);
     out
 }
 
@@ -523,8 +644,8 @@ fn a_value_no_field_takes_is_refused_with_its_field() {
         (layout.max_time, 7, Field::MaxTime),
         (layout.cut, 4, Field::Cut),
         (layout.usb_host, 3, Field::UsbHost),
-        (layout.first_input, 4, Field::Input(0)),
-        (layout.end, 6, Field::End),
+        (layout.first_input, 5, Field::Input(0)),
+        (layout.end, 7, Field::End),
     ] {
         assert_eq!(
             read(&patched(at, &[value])),

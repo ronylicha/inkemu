@@ -34,12 +34,13 @@ pub use flash::{
     FlashConfig, FlashConfigError, FlashDevice, FlashImageError, FlashWrite, JedecId, NorFlash,
 };
 pub use inputs::{
-    AcceptedInput, InputJournal, MAX_JOURNAL_CONSOLE_BYTES, MAX_JOURNAL_CONSOLE_CHUNKS,
-    MAX_JOURNAL_HOST_CHANGES, MAX_JOURNAL_INPUTS,
+    AcceptedInput, InputJournal, MAX_JOURNAL_BOARD_INPUTS, MAX_JOURNAL_CONSOLE_BYTES,
+    MAX_JOURNAL_CONSOLE_CHUNKS, MAX_JOURNAL_HOST_CHANGES, MAX_JOURNAL_INPUTS,
 };
 pub use machine::{
     ConsoleChannel, DeepSleep, Esp32C3, Executed, InputError, MAX_PENDING_HOST_BYTES,
     MAX_PENDING_HOST_CHANGES, Stepped, StopReason,
 };
+pub use periph::io::MAX_PENDING_BOARD_INPUTS;
 pub use periph::{AttachError, SpiWires, UsbHost};
 pub use rom::{RomError, RomImage};

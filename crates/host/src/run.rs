@@ -71,6 +71,7 @@ fn pass_end(
         (Err(_), _) => Some(RunEnd::ConsoleError),
         (Ok(true), StopReason::Idle) => Some(RunEnd::Idle),
         (Ok(true), StopReason::DeepSleep) => Some(RunEnd::DeepSleep),
+        (Ok(true), StopReason::PowerOff) => Some(RunEnd::PowerOff),
         (Ok(true), StopReason::CycleBudget) if cycle_limit_reached => Some(RunEnd::Budget),
         (Ok(true), StopReason::TimeBudget) => Some(RunEnd::TimeLimit),
         // The end of a slice, or a CPU that sleeps while device time goes on: the next pass
@@ -107,6 +108,10 @@ pub fn say_why(log: &mut dyn Write, end: RunEnd, stop: Option<&StopReason>) {
         RunEnd::DeepSleep => writeln!(
             log,
             "inkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here"
+        ),
+        RunEnd::PowerOff => writeln!(
+            log,
+            "inkemu: the device powered off: its board cut its supply, so the run ends here; power it on again to go on"
         ),
         RunEnd::Budget => writeln!(
             log,
@@ -260,12 +265,15 @@ pub enum RunEnd {
     /// cut, and is not reproducible from one run to the next. The hash of a run ended by a limit
     /// is.
     Interrupted,
+    /// The board's supply failed: the device powered off (ADR 0013), what a firmware does when it
+    /// turns a battery device off, so the run ended normally.
+    PowerOff,
 }
 
 impl RunEnd {
     /// Every way a run can end, for what must hold for each of them: a variant added to the enum
     /// is added here.
-    pub const ALL: [RunEnd; 8] = [
+    pub const ALL: [RunEnd; 9] = [
         RunEnd::Budget,
         RunEnd::TimeLimit,
         RunEnd::ConsoleClosed,
@@ -274,6 +282,7 @@ impl RunEnd {
         RunEnd::Idle,
         RunEnd::Interrupted,
         RunEnd::DeepSleep,
+        RunEnd::PowerOff,
     ];
 
     /// The process exit code of a run that ended this way.
@@ -284,7 +293,8 @@ impl RunEnd {
             | RunEnd::TimeLimit
             | RunEnd::ConsoleClosed
             | RunEnd::Interrupted
-            | RunEnd::DeepSleep => EXIT_OK,
+            | RunEnd::DeepSleep
+            | RunEnd::PowerOff => EXIT_OK,
             RunEnd::ConsoleError => EXIT_ERROR,
             RunEnd::StrictMmio => EXIT_STRICT_MMIO,
             RunEnd::Idle => EXIT_IDLE,
@@ -307,7 +317,8 @@ impl RunEnd {
             | RunEnd::ConsoleError
             | RunEnd::Idle
             | RunEnd::Interrupted
-            | RunEnd::DeepSleep => EXIT_ERROR,
+            | RunEnd::DeepSleep
+            | RunEnd::PowerOff => EXIT_ERROR,
         }
     }
 }
@@ -551,6 +562,7 @@ pub const fn session_end(end: RunEnd) -> Result<Reached, CutReason> {
         RunEnd::TimeLimit => Ok(Reached::TimeLimit),
         RunEnd::Idle => Ok(Reached::Idle),
         RunEnd::DeepSleep => Ok(Reached::DeepSleep),
+        RunEnd::PowerOff => Ok(Reached::PowerOff),
         RunEnd::StrictMmio => Ok(Reached::StrictMmio),
         RunEnd::Interrupted => Err(CutReason::Interrupted),
         RunEnd::ConsoleClosed => Err(CutReason::ReaderGone),

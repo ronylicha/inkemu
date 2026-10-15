@@ -8,10 +8,13 @@
 //! The GPIO registers reach it at their offset from `0x6000_4000`, the IO MUX registers at their
 //! offset from the same base (`0x5000` and beyond): `Peripherals::device` routes both blocks here
 //! with the base of GPIO.
+mod board;
 mod pad;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use board::BoardRefusal;
+pub use board::MAX_PENDING_BOARD_INPUTS;
 pub(crate) use pad::FSPICS0;
 pub use pad::{PADS, Signal};
 
@@ -20,7 +23,8 @@ use crate::ctx::{Ctx, Deadline, Event, Source};
 use crate::diag::{Diagnostic, STUCK_CLOCKED_INSTANTS, Unsupported};
 use crate::periph::{Accepted, GPIO_BASE, IO_MUX_BASE, Storage, consecutive, index_in};
 use emu_core::{
-    AnalogSource, Clocked, Cycles, GpioInput, GpioOutput, Level, Nanos, Peripheral, SpiTarget,
+    AnalogSource, BoardInput, BoardInputs, Clocked, Cycles, GpioInput, GpioOutput, Level, Nanos,
+    Peripheral, SpiTarget, Supply,
 };
 use pad::{Drive, FUN_IE, Function, InputSource, PAD_DRIVER, PAD_MASK};
 use thiserror::Error;
@@ -291,8 +295,10 @@ pub struct IoMatrix {
     /// What the chip drives on each pad, as the attached chips last heard it.
     driven: [Option<Level>; PADS],
     chips: Chips,
-    /// The wake-up at the instant an attached chip said its level may change, or a clocked chip
-    /// must be advanced, whichever comes first.
+    /// The inputs of the board's user and its supply (ADR 0013).
+    board: board::Board,
+    /// The wake-up at the instant an attached chip said its level may change, a clocked chip
+    /// must be advanced, or an input of the board acts, whichever comes first.
     wake: Deadline,
 }
 
@@ -313,6 +319,7 @@ impl IoMatrix {
                 analog: Vec::new(),
                 clocked: Vec::new(),
             },
+            board: board::Board::default(),
             wake: Deadline::default(),
         };
         for pad in 0..PADS {
@@ -369,24 +376,64 @@ impl IoMatrix {
         }
     }
 
-    /// The earliest instant a clocked chip must be advanced at, from the present time, in cycles
-    /// of the time base: what a deep sleep moves device time to when nothing of the RTC domain
-    /// comes earlier. The chips are the board's, powered whatever the chip does.
+    /// The earliest instant a clocked chip must be advanced at, or an input of the board acts at,
+    /// from the present time, in cycles of the time base: what a deep sleep moves device time to
+    /// when nothing of the RTC domain comes earlier. The chips and the board have power whatever
+    /// the chip does.
     pub(crate) fn clocked_deadline(&mut self, ctx: &Ctx) -> Option<Cycles> {
         let at = nanos(ctx);
-        self.chips
+        let chips = self
+            .chips
             .clocked
             .iter_mut()
             .filter_map(|clocked| clocked.due(at))
             .min()
-            .map(|instant| TIME_BASE.nanos_to_cycles(u128::from(instant.get())))
+            .map(|instant| TIME_BASE.nanos_to_cycles(u128::from(instant.get())));
+        [chips, self.board.next_due()].into_iter().flatten().min()
     }
 
-    /// Advances the clocked chips whose deadline has come, and nothing else: during a deep sleep
-    /// the digital domain, the pads' interrupts with it, has no power.
+    /// Advances the clocked chips whose deadline has come and applies the inputs of the board
+    /// whose instant has come, and nothing else: during a deep sleep the digital domain, the
+    /// pads' interrupts with it, has no power. The supply is asked again.
     pub(crate) fn advance_clocked(&mut self, ctx: &mut Ctx) {
         let at = nanos(ctx);
         self.advance_due(ctx, at);
+        self.board.apply_due(ctx.now());
+        self.board.check_supply(ctx.now());
+    }
+
+    /// Attaches the inputs of the board's user (ADR 0013).
+    pub(crate) fn attach_board_inputs(&mut self, inputs: Box<dyn BoardInputs>) {
+        self.board.attach_inputs(inputs);
+    }
+
+    /// Attaches the supply of the board, and asks it at once whether the chip has power.
+    pub(crate) fn attach_supply(&mut self, ctx: &mut Ctx, supply: Box<dyn Supply>) {
+        self.board.attach_supply(supply);
+        self.board.check_supply(ctx.now());
+    }
+
+    /// Takes an input of the board dated `at`, not before the present time; it acts at the next
+    /// instant of the time base, for which a wake-up is armed.
+    pub(crate) fn queue_board_input(
+        &mut self,
+        ctx: &mut Ctx,
+        at: Cycles,
+        input: BoardInput,
+    ) -> Result<(), BoardRefusal> {
+        self.board.queue(at, input)?;
+        self.arm(ctx, nanos(ctx));
+        Ok(())
+    }
+
+    /// The inputs of the board that have not acted yet.
+    pub(crate) fn board_inputs_pending(&self) -> usize {
+        self.board.pending()
+    }
+
+    /// The instant the board's supply failed, once it has.
+    pub(crate) const fn power_lost(&self) -> Option<Cycles> {
+        self.board.power_lost()
     }
 
     /// Attaches a chip that is advanced in device time; its first deadline is armed at once.
@@ -575,6 +622,7 @@ impl IoMatrix {
     pub(crate) fn settle(&mut self, ctx: &mut Ctx) {
         let at = nanos(ctx);
         self.advance_due(ctx, at);
+        self.board.apply_due(ctx.now());
         let mut levels = 0;
         for pad in 0..PADS {
             let driven = self.drive_of(pad);
@@ -605,6 +653,7 @@ impl IoMatrix {
         self.trigger(self.input, input);
         self.input = input;
         ctx.irq(SOURCE, self.regs.status & self.cpu_enabled() != 0);
+        self.board.check_supply(ctx.now());
         self.arm(ctx, at);
     }
 
@@ -741,11 +790,9 @@ impl IoMatrix {
         // An instant converts to the first cycle at or after it, so device time at the wake-up is
         // never before the instant asked for. An earlier wake-up already armed is kept: woken
         // early, the model advances no chip whose deadline has not come and arms again.
-        match next {
-            Some(instant) => {
-                let cycles: Cycles = TIME_BASE.nanos_to_cycles(u128::from(instant.get()));
-                self.wake.arm(ctx, cycles, Event::Pins);
-            }
+        let chips = next.map(|instant| TIME_BASE.nanos_to_cycles(u128::from(instant.get())));
+        match [chips, self.board.next_due()].into_iter().flatten().min() {
+            Some(cycles) => self.wake.arm(ctx, cycles, Event::Pins),
             None => self.wake.cancel(ctx),
         }
     }

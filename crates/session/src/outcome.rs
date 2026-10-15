@@ -99,6 +99,7 @@ impl Limits {
             Reached::Idle => End::Idle,
             Reached::DeepSleep => End::DeepSleep,
             Reached::StrictMmio => End::StrictMmio,
+            Reached::PowerOff => End::PowerOff,
         }
     }
 }
@@ -111,6 +112,8 @@ pub enum Reached {
     Idle,
     DeepSleep,
     StrictMmio,
+    /// The board's supply failed (ADR 0013).
+    PowerOff,
 }
 
 /// How a recorded run ended.
@@ -128,17 +131,20 @@ pub enum End {
     StrictMmio,
     /// The host cut the run ([`Limits::cut`] says where and why).
     Cut,
+    /// The board's supply failed: the device powered off (ADR 0013).
+    PowerOff,
 }
 
 impl End {
     /// Every end, in the order of its code in the file.
-    pub const ALL: [End; 6] = [
+    pub const ALL: [End; 7] = [
         End::CycleLimit,
         End::TimeLimit,
         End::Idle,
         End::DeepSleep,
         End::StrictMmio,
         End::Cut,
+        End::PowerOff,
     ];
 
     /// The end as a summary names it.
@@ -151,6 +157,7 @@ impl End {
             End::DeepSleep => "a deep sleep nothing can end",
             End::StrictMmio => "a --strict-mmio stop",
             End::Cut => "the cut of the host",
+            End::PowerOff => "the device powering off",
         }
     }
 }

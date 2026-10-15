@@ -118,6 +118,7 @@ mod tests {
             RunEnd::Idle => 5,
             RunEnd::Interrupted => 6,
             RunEnd::DeepSleep => 7,
+            RunEnd::PowerOff => 8,
         };
         for (index, end) in RunEnd::ALL.into_iter().enumerate() {
             assert_eq!(place(end), index, "{end:?}");

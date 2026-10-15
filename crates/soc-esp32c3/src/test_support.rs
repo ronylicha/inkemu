@@ -600,7 +600,10 @@ pub fn drive(
             | StopReason::TimeBudget
             | StopReason::Asleep
             | StopReason::ConsoleOutput => {}
-            StopReason::StrictMmio(_) | StopReason::Idle | StopReason::DeepSleep => {
+            StopReason::StrictMmio(_)
+            | StopReason::Idle
+            | StopReason::DeepSleep
+            | StopReason::PowerOff => {
                 return Driven::Stopped(stop);
             }
         }
