@@ -62,9 +62,46 @@ trace.
 6. **La configuration UC8253 par défaut** pour le profil du X3 : CrossPoint pilote le premier lot par défaut ;
    `xteink-x3-uc8279d` existe pour le second.
 7. **Les touches de face** placées comme sur le X4 (hypothèse écrite dans le profil).
-8. **CrossPoint au premier démarrage** : il se bloque pour de bon sur le verrou de `Wire` ; c'est une faute du firmware
-   (RF §7), le modèle n'essaie pas de la contourner. Le test local et le README disent de garder la flash et de
-   démarrer deux fois.
+8. **CrossPoint au premier démarrage** : il se bloque pour de bon sur le mutex de `Wire`. Le coordinateur a refusé
+   cette conclusion sans preuve ; l'analyse de cause racine (section suivante) l'établit : faute du firmware, le
+   modèle n'a rien à corriger et n'essaie pas de la contourner (pas de NVS pré-rempli). Le test local vérifie la
+   signature des deux états du mutex ; le README dit de garder la flash et de démarrer deux fois.
+
+## Analyse de cause racine : le premier démarrage de CrossPoint sur le X3
+
+Détail et références de ligne : `docs/research/sp3-x3-firmware.md` §7.
+
+1. **Versions exactes.** pioarduino `55.03.311` livre Arduino-ESP32 **3.3.11** (son `platform.json`), pas 3.3.1
+   comme la recherche le disait ; les journaux du binaire portent les numéros de ligne de 3.3.11 (`Wire.cpp:556` pour
+   `write()`, 544 en 3.3.1), et son en-tête nomme ESP-IDF 5.5.5. Recherche corrigée.
+2. **La séquence.** `runProbePass()` : `Wire.begin()` crée le mutex, `Wire.end()` libère les tampons et rend le mutex
+   sans le détruire. `getWakeupReason()` → `isUsbConnected()` → `X3GPIO::readI2CReg16LE()` : `beginTransmission`
+   prend le mutex (il existe) ; `endTransmission(false)` rend 4 sur le tampon nul avant son seul `xSemaphoreGive`,
+   qui n'est que sur le chemin `sendStop` ; la seconde tentative ne reprend pas le mutex (même tâche). Puis
+   `Imu::begin()` → `ensureWire()` → `Wire.begin()` → `xSemaphoreTake(lock, portMAX_DELAY)` sur le mutex de sa propre
+   tâche : `xQueueSemaphoreTake` (IDF 5.5.1 et 5.5.5, identiques) n'a pas de test du détenteur, la tâche attend pour
+   toujours. Aucun chien de garde ne la relance (la tâche inactive tourne ; la tâche `loop` d'Arduino n'est pas
+   abonnée par défaut).
+3. **Ce que fait le modèle sur ce chemin : rien.** I2C0 instrumenté en local (un journal de chaque accès, retiré
+   ensuite, rien de commité) : le dernier accès est l'`INT_ENA` mis à zéro par le `Wire.end()` de la sonde ; aucun
+   accès ne suit pendant les 2,3 s jusqu'à la fin de la course, et une course de 30 s reste figée au même point. Le
+   blocage est dans l'ordonnanceur, pas dans un pilote qui attendrait une interruption. Les pistes matérielles
+   (`TRANS_COMPLETE`, `NACK`, `TIME_OUT`, durées, `FSM_RST`, `CLR_BUS`, état des lignes après un NACK, adresse absente
+   après une présente) ne sont pas sur ce chemin : la sonde de CrossPoint n'a fait que des lectures réussies
+   (score 3/3, 0x6A jamais sondé puisque 0x6B répond).
+4. **Contre-épreuve.** Le démarrage suivant ne diffère que par l'état du mutex : la sonde ne tourne pas, le mutex
+   n'existe pas, `beginTransmission` journalise `could not acquire lock` et ne prend rien ; l'écran d'accueil suit.
+   Les deux signatures sont vérifiées par le test local. Les verrous HAL sont compilés : la ligne
+   `could not acquire lock` de `beginTransmission` n'existe que sans `CONFIG_DISABLE_HAL_LOCKS`.
+5. **Sur un appareil réel.** L'amont a fusionné le 2026-10-01, après 1.6.5 (2026-09-27), « fix: Remove BQ27220
+   battery current USB detection for X3 » (PR #3809), qui retire exactement cette lecture brute ; son essai sur un X3
+   physique relève les mêmes lignes `could not acquire lock` et `NULL TX buffer pointer` au démarrage. Le ticket
+   #3498 (2026-09-11) signale un X3 « frozen after flashing ». Un X3 mis à jour depuis un CrossPoint antérieur garde
+   `cphw/dev_det` en NVS et ne prend jamais ce chemin ; le blocage n'arrive qu'une fois, à la première installation,
+   et le verdict est écrit avant lui.
+6. **Conclusion.** Faute du firmware, sans rapport avec un timing ; un vrai X3 neuf la rencontre aussi. Aucun
+   changement du modèle. Premier démarrage de CrossPoint 1.6.5 sous inkemu : sonde 3/3, verdict écrit, blocage ;
+   second : écran d'accueil.
 9. **Un flux pseudo-aléatoire par puce** ajouté après coup (règle 3-R2), qui a montré que la copie `N2OCP` pixel par
    pixel coûtait trop : elle copie désormais un octet de huit pixels à la fois.
 
@@ -78,7 +115,7 @@ trace.
 | SP4 | les registres d'I2C0 acceptés sans effet (`docs/registers-accepted-without-effect.md`) |
 | SP8 | la géométrie réelle du verre du X3 (quel bord porte G0), sa fréquence, les durées de l'UC8253 mesurées |
 | quand un firmware s'en sert | les alarmes et la broche INT du DS3231 ; les formes d'onde en gris de 49 octets de l'UC8279d |
-| amont (CrossPoint) | le blocage du premier démarrage sur le verrou de `Wire` |
+| amont (CrossPoint) | le blocage du premier démarrage sur le mutex de `Wire`, déjà corrigé après 1.6.5 (PR #3809) : vérifier la version suivante dès son premier démarrage |
 
 ## Limites de preuve
 

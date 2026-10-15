@@ -12,7 +12,7 @@ lists what this report confirms or corrects in `xteink-hardware.md`.
 |---|---|---|
 | **FI** | FreeInk SDK, the hardware layer of CrossPoint | `Free-Ink/freeink-sdk` at `111fdcc7f0176c3ee38391a160ee296bf492dbd8`, read file by file through `raw.githubusercontent.com` on 2026-10-15; nothing built or run. |
 | **CP** | CrossPoint Reader 1.6.5 | `crosspoint-reader/crosspoint-reader`, tag `1.6.5`, commit `93e98bb78702e29868a16a13b80c40e6b36ccdff`, read the same way. |
-| **AE** | Arduino-ESP32 core 3.3.1 (only to settle which I2C driver `Wire` uses) | `espressif/arduino-esp32` tag `3.3.1`. CP builds with pioarduino `55.03.311` (`CP:platformio.ini:10`), whose release notes say "Arduino v3.3.1 … IDF 5.5.1". |
+| **AE** | Arduino-ESP32 core 3.3.11 (which I2C driver `Wire` uses, and its lock) | `espressif/arduino-esp32` tag `3.3.11`. CP builds with pioarduino `55.03.311` (`CP:platformio.ini:10`), whose `platform.json` names `esp32-core-3.3.11.tar.xz` and its `-libs` package. **Correction (2026-10-15, root-cause analysis of §7):** the first version of this note read tag `3.3.1` from the release notes' wording; the logs of the shipped binary carry the line numbers of 3.3.11 (`Wire.cpp:424`, `:453`, `:556`; 3.3.1 has `write()` at `:544`), and its image header names ESP-IDF 5.5.5. The I2C code is the same in both for everything this note cites: `esp32-hal-i2c-ng.c` differs only in log formats and in silencing the IDF driver's own logs, and `Wire.cpp` only in `requestFrom`, which 3.3.11 makes give its lock back on a NULL buffer; line numbers below are those of 3.3.1 and fall within a few lines in 3.3.11. |
 
 Short file names: in FI `BoardConfig.h` (`libs/hardware/BoardConfig/include/`), `XteinkDetect.cpp` /
 `.h` (`libs/hardware/XteinkDetect/`), `EpdBus.cpp` / `.h` (`libs/display/FreeInkDisplay/src/bus/`),
@@ -289,13 +289,49 @@ reader, 20 Hz poll, 300 ms after wake ignored; gyro X (portrait) or Y (landscape
   `getWakeupReason()` (`CP:main.cpp:382`) — at that moment **`Wire` is not begun** (the probe ended
   with `Wire.end()`, nothing else begins it before `halTiltSensor.begin()`), so `endTransmission`
   fails on its NULL buffer (`Wire.cpp:452-455`) and the X3 boots as "no USB" [INF from SRC].
-- [INF, unverified] On the **uncached first boot** that same failed call leaves Wire's HAL mutex
-  taken: `beginTransmission` takes it (`Wire.cpp:419-429`), `endTransmission` returns 4 before
-  giving it back, and the next `Wire.begin()` (in `Imu::begin`) takes the same non-recursive
-  mutex with `portMAX_DELAY` (`Wire.cpp:286-291`). `CONFIG_DISABLE_HAL_LOCKS` defaults to `n`
-  (`AE:Kconfig.projbuild:160-162`). If the lib-builder sdkconfig keeps locks on, a first X3 boot
-  with empty `cphw` would hang in `halTiltSensor.begin()`; a cached boot would not. An emulator
-  can pre-seed `cphw/dev_det = 2` to avoid depending on this.
+- [SRC + RUN, verified 2026-10-15] On the **uncached first boot** that same failed call leaves
+  Wire's HAL mutex taken, and the next `Wire.begin()` blocks on it for ever. The sequence, in AE
+  3.3.11 (line numbers identical to 3.3.1 here):
+  1. `runProbePass()` (`FI:XteinkDetect.cpp:644-653`) calls `Wire.begin()`, which **creates**
+     the mutex `lock` (`Wire.cpp:280-286`), then `Wire.end()`, which frees the buffers
+     (`txBuffer = NULL`) and gives the mutex back but **keeps** it (`Wire.cpp:325-353`; only the
+     destructor deletes it, `:56-63`).
+  2. `getWakeupReason()` → `isUsbConnected()` → `X3GPIO::readI2CReg16LE()`
+     (`CP:HalGPIO.cpp:16-31`, `:245-257`): `Wire.beginTransmission()` finds `lock != NULL`, takes
+     it with `portMAX_DELAY` and records the task (`Wire.cpp:419-429`); `write()` fails on the NULL
+     buffer (`:542-546`, logged at `:556`); `endTransmission(false)` returns 4 at its NULL-buffer
+     check **before** the only `xSemaphoreGive` of the function, which runs on the `sendStop` path
+     only (`:452-463`). The second attempt (`delay(2)`, then again) skips the take because
+     `currentTaskHandle` is the same task, and fails the same way.
+  3. `halTiltSensor.begin()` → `Imu::begin()` → `ensureWire()` → `Wire.begin()`
+     (`FI:Imu.cpp:83-96`, `:157-169`) calls `xSemaphoreTake(lock, portMAX_DELAY)`
+     (`Wire.cpp:288`) on the mutex its own task holds. A FreeRTOS mutex is not recursive and
+     `xQueueSemaphoreTake` has no holder check (ESP-IDF v5.5.1 and v5.5.5,
+     `components/freertos/FreeRTOS-Kernel/queue.c:1697`, identical): the count is 0, the task goes
+     on the event list with an infinite timeout, and nothing gives the mutex: `setup()` never
+     returns. No watchdog fires: the idle task runs, and Arduino's loop task is not subscribed to
+     the task watchdog by default.
+
+  The **cached boot** differs only in the state of `lock`: no probe ran, so `lock` is NULL, and
+  `beginTransmission` logs `could not acquire lock` (`Wire.cpp:424`) and takes nothing; the boot
+  goes on. The two boots print exactly these lines (first boot: `write()` and `endTransmission()`
+  only; cached boot: `beginTransmission(): could not acquire lock` before each), which is the
+  observable signature of the two states. Nothing on this path touches the hardware: under inkemu,
+  with every access to I2C0 logged, the last one is the probe's `Wire.end()` (`INT_ENA` cleared)
+  and none follows during the 2.3 s after it, nor in a run of 30 s of device time; the hang is in
+  the scheduler, not in a driver waiting for the peripheral. HAL locks are compiled in: the
+  shipped binary logs `could not acquire lock` from `beginTransmission`, a line that exists only
+  when `CONFIG_DISABLE_HAL_LOCKS` is off.
+
+  On real units: upstream merged "fix: Remove BQ27220 battery current USB detection for X3"
+  (crosspoint-reader PR #3809, 2026-10-01, after 1.6.5 was tagged on 2026-09-27), which removes
+  `X3GPIO::readI2CReg16LE` and reads the current through `BatteryMonitor`, which begins the bus
+  first. Its test on a physical X3 reports the same `could not acquire lock` and `NULL TX buffer
+  pointer` lines on every boot of the baseline (those were reset boots of a unit with its cache
+  set). Issue #3498 (2026-09-11) reports an X3 "frozen after flashing". A unit that already ran
+  CrossPoint keeps `cphw/dev_det` in NVS through an update, so it never takes the first-boot path
+  again; the hang is met once, on a unit whose NVS has never held the cache (a first install), and
+  `dev_det` is written before it (`CP:HalGPIO.cpp:100-102`), so the next boot is a cached one.
 
 ## 8. Boot sequence on an X3 (CP 1.6.5)
 
