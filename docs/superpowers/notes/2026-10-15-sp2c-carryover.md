@@ -111,6 +111,30 @@ I1 et I4 restaient partiels ; six constats nouveaux, tous corrigés avec un test
   `early` jusqu'à la réponse, oublié si le démarrage est refusé) ; `app/src-tauri/deny.toml` reprend la liste de la
   racine, BSD-2-Clause comprise, et nomme ses trois différences.
 
+## Quatrième vérification (9353735..0a0385e) et ses corrections
+
+Six points, chacun avec un test qui échoue sans sa correction :
+
+1. **Flash en mémoire perdue à la fermeture** : une vie finie seule dont la flash n'a pas pu s'écrire la laisse dans
+   `FlashKeeper::next` ; un Stop sans vie (ou le canal coupé) l'écrit maintenant (`Worker::power_off` →
+   `FlashKeeper::keep_now` : reprise du fichier par `begin_keeping`, puis `save_content`) ou répond `NotKept`
+   (`a_power_off_after_a_life_writes_the_flash_it_left_in_memory`, répertoire non inscriptible puis rétabli).
+2. **Sauvetage après une écriture ratée** : sans machine, le sauvetage retente l'écriture de la flash restée en
+   mémoire ; l'échec entre dans le motif de la faute, et `NotKept` dit que la flash n'est pas gardée
+   (`a_rescue_after_a_failed_save_says_the_flash_was_not_kept`). Le sauvetage avec machine reprend aussi le fichier
+   quand la vie ne le tient plus.
+3. **Double fermeture** : `Shell::begin_closing` ; pendant une fermeture, fermeture, sortie et premier signal ne font
+   qu'empêcher et attendre, sans nouveau fil (`a_second_request_to_close_waits_for_the_first`).
+4. **Démarrages concurrents** : `Shell::keep` garde l'émulateur du plus grand numéro et éteint l'autre (son démarrage
+   répond `stopped`) ; une erreur de join de l'émulateur éteint ne fait plus échouer le démarrage gardé
+   (`the_later_start_is_kept_whatever_the_order_of_the_answers`).
+5. **Commande `frame`** : elle porte le numéro de démarrage et passe par `handle_of` (image vide pour un autre
+   émulateur) ; l'interface demande l'image de l'émulateur qui l'a annoncée (`FrameSignal.start`).
+6. **Tests de l'enveloppe avec de vrais émulateurs** : `host::test_support::looping_device` (fonction `test-support`
+   de `host`, jamais dans une version livrée), appareil qui boucle derrière la mire et dont l'extinction peut être
+   lente ; `the_shell_drives_one_start_and_stays_on_while_it_powers_off` échoue sans `stopping.begin()` (l'enveloppe
+   se dit éteinte pendant l'extinction) et sans `handle_of` (une commande à l'ancien numéro passerait).
+
 ## Laissé aux héritiers
 
 | Report | Héritier |
@@ -165,6 +189,11 @@ Après la troisième relecture : `cargo fmt --all --check` ; clippy `-D warnings
 vraie ROM de `host` : passés ; le front : Biome, `tsc`, Vitest 69 tests ; l'enveloppe : fmt, clippy `-D warnings`,
 `cargo test` (7), `cargo deny check` (avis, interdits, licences, sources : ok).
 
+Après la quatrième vérification : fmt ; clippy `-D warnings` sur `host` et `emu-cli` ; rustdoc `-D warnings` sur
+`host` ; `host` 264 tests et ses 2 tests de la vraie ROM ; `emu-cli` inchangé ; le front : Biome, `tsc`, Vitest 69
+tests ; l'enveloppe : fmt, clippy `-D warnings`, `cargo test --locked` (10, dont deux avec de vrais émulateurs),
+`cargo deny check` : ok.
+
 **Non fait ici, laissé à la CI** : `cargo test --workspace`, la couverture, les autres suites ignorées, `cargo deny`
 de l'espace de travail racine, l'étape WebAssembly, le job `app` lui-même. **Non vérifié du tout** : l'interface dans une vraie session utilisateur
 (clics, rendu de la mire, capture) — aucun outil de pilotage de WebKitGTK n'est en place ; le bundle Tauri n'a pas été
@@ -178,7 +207,7 @@ que cet agent n'a pas modifiée :
 | Fichier | À mettre à jour |
 |---|---|
 | `architecture_overview.md` | Nouvelle crate `host` (politique d'hôte partagée CLI/interface, membres de l'espace de travail) ; `app/` (React + Tauri, espace de travail Cargo séparé `app/src-tauri`) ; modèle à fil (`Esp32C3` non `Send`, machine construite sur le fil par `Recipe`) ; ADR 0011 ; ports `PanelSource`/`ButtonPort`. |
-| `backend_services.md` | Les dix modules déplacés de `crates/emu-cli/src/` vers `crates/host/src/` (mêmes noms, réexportés par `emu_cli`) ; `host::launch` (profil, console montrée, en-tête, note de flash, flash de départ, refus de chemins, ROM) ; `engine`, `device`, `ports`, `pattern`, `catalog`, `utf8`, `capture` ; `run.rs` : `say_why`, `say_where_the_run_stopped`, `deep_sleep_line`, `journal_prefix`, `say_an_incomplete_journal`, `SLICE_CYCLES` désormais publics ; `RunEnd` sérialisable ; `launch::{claimed_paths, rom_claim}`, `session_file::{check_output_path, write_through_temporary}`, `capture::save`, `flash_state::RunFlash::{begin_keeping, save_content}` ; dans `device` : `ConsoleBatch` (40 ms), `Worker::{rescue, tell, flush_console, capture, claimed}` (et ses champs `powering`, `fault`), `Emulator::holds_flash_file`, `Emulator::shutdown -> Result` ; `engine::Engine::finish` (la machine reste dans le moteur) ; dans l'enveloppe : `Stopping`, `StopGuard`, `same_start`, `Shell::{is_on, language, handle_of}`. |
+| `backend_services.md` | Les dix modules déplacés de `crates/emu-cli/src/` vers `crates/host/src/` (mêmes noms, réexportés par `emu_cli`) ; `host::launch` (profil, console montrée, en-tête, note de flash, flash de départ, refus de chemins, ROM) ; `engine`, `device`, `ports`, `pattern`, `catalog`, `utf8`, `capture` ; `run.rs` : `say_why`, `say_where_the_run_stopped`, `deep_sleep_line`, `journal_prefix`, `say_an_incomplete_journal`, `SLICE_CYCLES` désormais publics ; `RunEnd` sérialisable ; `launch::{claimed_paths, rom_claim}`, `session_file::{check_output_path, write_through_temporary}`, `capture::save`, `flash_state::RunFlash::{begin_keeping, save_content}` ; dans `device` : `ConsoleBatch` (40 ms), `Worker::{rescue, tell, flush_console, capture, claimed}` (et ses champs `powering`, `fault`), `Emulator::holds_flash_file`, `Emulator::shutdown -> Result` ; `engine::Engine::finish` (la machine reste dans le moteur) ; dans l'enveloppe : `Stopping`, `StopGuard`, `same_start`, `Shell::{is_on, language, handle_of, submit, frame_bytes, begin_closing, is_closing, end_closing}` ; `FlashKeeper::keep_now`, `Worker::power_off` ; `host::test_support::looping_device` (fonction `test-support`, pour les tests d'un frontal). |
 | `backend_models.md` | Types de `host` : `launch::{FlashRequest, RunRequest, ConsoleOrigin, Starting, StartError, RecordPathError}`, `ports::{Rotation, PanelOrigin, PanelDescription, RefreshKind, Region, PanelFrame, Edge, ButtonSpec, ButtonError, Life, PowerOnError, PanelSource, ButtonPort, Recipe}`, `catalog::{Look, DeviceView, ProfileRecipe, X4_BUTTONS, X3_BUTTONS}`, `engine::{Engine, Limits, Mode, Halt, State, Level, Notice, Output, EngineError, MachineStatus, DeepSleepStatus, LifeEnd}`, `device::{Speed, Setup, LaunchError, Recording, FlashKeeper, Launch, Command, CommandError, RunState, Status, VerdictView, Update, Observer, Handle, Pending, Emulator}`, `engine::Finished` ; `ports::{FrameParts, FrameError}` (`PanelFrame` à champs privés, `PanelFrame::new`) ; `capture::CaptureError` ; `session_file::OutputRefusal` ; `Command::Capture`, `CommandError::{OnItsThread, Capture, NotKept}`. |
 | `backend_controllers.md` | `main.rs` d'`emu-cli` appelle `host::launch` (plus de `profile_for`, `FlashOptions`, `RunRequest`, `ConsoleOrigin`, `shown_console`, `console_note`, `file_name`, `flash_note`, `load_rom`, `Starting`, `starting_flash`, `refuse_*`, `header` dans le binaire) ; sorties et codes inchangés. Nouveaux points d'entrée : les 7 commandes Tauri de `app/src-tauri/src/commands.rs` (`devices`, `power_on`, `open_replay`, `command` — synchrone, sa réponse par un canal, la capture en fait partie —, `frame`, `notices`, `set_language` ; `power_on`, `open_replay` et `command` portent le numéro de démarrage `start`) et leurs `kind` d'erreur (`profile`, `recordPath`, `flashFile`, `flashImage`, `firmware`, `rom`, `session`, `replay`, `powerOn`, `stopped`, `noLife`, `replaying`, `ended`, `nothingToStep`, `input`, `button`, `replayNotRecorded`, `notRecordable`, `onItsThread`, `notKept`, `ipc`, `maxTime`, `maxCycles`, `noImage`, `capture`, et `frame` côté interface) ; `lib.rs` : fermeture, sortie et signaux éteignent d'abord. |
 | `api_routes.md` | Scripts pnpm de `app/package.json` (`dev`, `build`, `typecheck`, `lint`, `test`, `check`, `tauri`) ; `pnpm tauri dev` ; job CI `app` (dont `cargo-deny` sur `app/src-tauri/Cargo.toml`) ; `rom-boot` : `run-ignored-tests.sh 2 --release -p host --test real_rom`. |
