@@ -371,9 +371,11 @@ fn console_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-/// H6: a card, the cable or a hold of the power key, on a device whose profile has no line for
-/// it (the X3), is refused before anything of the run is opened: no flash file nor its lock is
-/// made, the image is not read (here it does not even exist), and no ROM is looked for.
+/// H6: the cable, on a device whose profile has no line for it (the X3, wired since ADR 0015 with
+/// a card slot and a power key but no USB detect line), is refused before anything of the run is
+/// opened: no flash file nor its lock is made, the image is not read (here it does not even
+/// exist), and no ROM is looked for. A card or a hold on a device without a slot or a key is
+/// refused the same way (`boards::check_board_request`, tested on a bare profile in `boards`).
 #[test]
 fn a_board_option_the_device_has_no_line_for_is_refused_before_any_file_is_opened() {
     let dir = tempfile::tempdir().unwrap();
@@ -381,17 +383,17 @@ fn a_board_option_the_device_has_no_line_for_is_refused_before_any_file_is_opene
     std::fs::create_dir(&empty_rom_dir).unwrap();
     let flash_file = dir.path().join("x3.flash");
     let missing_card = dir.path().join("missing.img");
-    let card = ["--sd-image".to_owned(), missing_card.display().to_string()];
-    let cases: [(&[String], &str); 3] = [
-        (&card, "has no SD card slot in its profile"),
+    let card_and_cable = [
+        "--sd-image".to_owned(),
+        missing_card.display().to_string(),
+        "--usb-power".to_owned(),
+    ];
+    let cases: [(&[String], &str); 2] = [
         (
             &["--usb-power".to_owned()],
             "has no USB detect line in its profile",
         ),
-        (
-            &["--power-hold".to_owned(), "10".to_owned()],
-            "has no power key in its profile",
-        ),
+        (&card_and_cable, "has no USB detect line in its profile"),
     ];
     for (option, said) in cases {
         inkemu()

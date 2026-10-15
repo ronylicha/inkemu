@@ -73,7 +73,7 @@ export const fr = {
   "device.panel": "Écran de l’appareil",
   "device.noImage": "Pas encore d’image",
   "device.testPattern":
-    "Mire de test : l’écran et les boutons du {name} ne sont pas encore reliés au firmware (sous-projet 3). Ce qui s’affiche ne vient pas du firmware.",
+    "Mire de test : l’écran et les boutons du {name} ne sont pas reliés au firmware dans son profil. Ce qui s’affiche ne vient pas du firmware.",
   "device.keys":
     "Clavier quand l’appareil a le focus : flèches, Entrée (OK), Échap ou Retour arrière (retour), P (alimentation).",
   "device.approximate": "Rendu approché : paramètres optiques non mesurés",

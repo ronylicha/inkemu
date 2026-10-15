@@ -266,6 +266,86 @@ fn the_stock_firmware_powered_on_by_the_gesture() {
     assert_eq!(life.end, Some(RunEnd::TimeLimit), "{:?}", life.notices);
 }
 
+/// `CrossPoint` 1.6.5 on the X3 (ADR 0015). Its first boot finds the three chips of the I2C bus,
+/// takes the device for an X3 and keeps the verdict in NVS, then stops for good on a lock of
+/// Arduino's `Wire` that its own failed read of the gauge left taken (research
+/// `sp3-x3-firmware.md` §7): a firmware's fault, which a unit shows too. The second boot reads the
+/// verdict back, never takes that path, mounts the card and draws its home screen, which the
+/// rotation of the profile turns upright in the portrait.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_CROSSPOINT_X3_X4 (a file of the user's)"]
+fn crosspoint_1_6_5_on_the_x3_reaches_its_home_screen_at_its_second_boot() {
+    let firmware = pinned_file("INKEMU_CROSSPOINT_X3_X4", CROSSPOINT_X3_X4_SHA256);
+    let dir = tempfile::tempdir().unwrap();
+    let flash = dir.path().join("flash.bin");
+    let card = |create_mib| SdSetup {
+        path: dir.path().join("card.img"),
+        read_only: false,
+        create_mib,
+    };
+    // The first life makes the blank card and composes the flash; the second takes both again.
+    let life_of = |firmware: Option<PathBuf>, seconds: u64| {
+        let first = firmware.is_some();
+        let setup = Setup {
+            device: "x3".into(),
+            firmware,
+            flash_file: Some(flash.clone()),
+            rom_dir: Some(rom_dir()),
+            sd: Some(card(first.then_some(1024))),
+            limits: Limits {
+                max_cycles: None,
+                max_device_nanos: Some(seconds * 1_000_000_000),
+            },
+            ..Setup::default()
+        };
+        let (emulator, updates) = started(device::power_on(&setup).unwrap());
+        (emulator, first_life(&updates))
+    };
+    let (emulator, first) = life_of(Some(firmware), 2);
+    emulator.shutdown().unwrap();
+    eprintln!("first boot: {}", tail(&first.console, 800));
+    assert!(
+        first
+            .console
+            .contains("Xteink probe scores: pass1=3 pass2=3"),
+        "the three chips answer: {}",
+        first.console
+    );
+    let (emulator, second) = life_of(None, 10);
+    let png = capture_dir().join("crosspoint-1.6.5-x3.png");
+    emulator
+        .command(Command::Capture { path: png.clone() })
+        .unwrap();
+    let frame = emulator.frame().expect("an image");
+    emulator.shutdown().unwrap();
+    eprintln!(
+        "CrossPoint on the X3: {} refreshes {:?}, end {:?}, capture {}",
+        second.refreshes.len(),
+        second.refreshes,
+        second.end,
+        png.display()
+    );
+    eprintln!("console tail: {}", tail(&second.console, 1500));
+    for line in [
+        "Using cached device type: X3",
+        "SDK IMU initialized",
+        "SDK RTC found",
+        "[SD] SD card detected",
+    ] {
+        assert!(second.console.contains(line), "{line}: {}", second.console);
+    }
+    assert!(
+        second.refreshes.len() >= 2,
+        "the boot screen then another: {:?}",
+        second.refreshes
+    );
+    let (width, height, pixels) = host::capture::rotated(&frame, host::ports::Rotation::Deg90);
+    assert_eq!((width, height), (528, 792), "portrait");
+    let (left, top, right, bottom) = dark_box(&pixels, width as usize).expect("a screen");
+    eprintln!("the dark pixels lie in ({left}, {top}) to ({right}, {bottom})");
+    assert_eq!(second.end, Some(RunEnd::TimeLimit));
+}
+
 /// The last `chars` characters of `text`.
 fn tail(text: &str, chars: usize) -> String {
     let count = text.chars().count();

@@ -73,7 +73,7 @@ export const en: Catalog = {
   "device.panel": "Screen of the device",
   "device.noImage": "No image yet",
   "device.testPattern":
-    "Test pattern: the screen and the buttons of the {name} are not wired to the firmware yet (sub-project 3). What shows does not come from the firmware.",
+    "Test pattern: the screen and the buttons of the {name} are not wired to the firmware in its profile. What shows does not come from the firmware.",
   "device.keys":
     "Keyboard while the device has the focus: arrows, Enter (OK), Escape or Backspace (back), P (power).",
   "device.approximate": "Approximate rendering: optical parameters not measured",

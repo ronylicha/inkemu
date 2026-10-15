@@ -52,13 +52,15 @@ pub fn button_specs(wiring: &Wiring) -> Vec<ButtonSpec> {
 }
 
 /// The panel of a wired device: the controller's geometry, any shade, the rotation of the
-/// profile, and whether the model rests on parameters nobody measured (2d-D16, 2d-D18).
+/// profile, and whether the model rests on parameters nobody measured (2d-D16, 2d-D18), the X4's
+/// SSD1677 as the X3's UC8253 (ADR 0015).
 #[must_use]
 pub fn description(wiring: &Wiring) -> PanelDescription {
-    let config = wiring.display.config.ssd1677();
+    let config = wiring.display.config;
+    let (width, height) = config.size();
     PanelDescription {
-        width: u32::from(config.panel.width),
-        height: u32::from(config.panel.height),
+        width: u32::from(width),
+        height: u32::from(height),
         shades: Shades::Continuous,
         rotation: rotation(wiring.display.rotation),
         origin: PanelOrigin::Device,
@@ -100,8 +102,7 @@ impl PanelSource for WiredPanel {
     }
 
     fn poll(&mut self, _machine: &mut Esp32C3) -> Result<Option<PanelFrame>, FrameError> {
-        let lines = self.handle.lines();
-        let image = lines.chip().panel_image();
+        let image = self.handle.image();
         if image.generation <= self.shown {
             return Ok(None);
         }
@@ -219,7 +220,7 @@ mod tests {
     /// A display of the controller, `mode` its `0x22` option, begun at `at` nanoseconds and run to
     /// its end.
     fn display(handle: &PanelHandle, mode: u8, at: u64) {
-        let mut lines = handle.lines_mut();
+        let mut lines = handle.ssd1677().unwrap();
         let chip = lines.chip_mut();
         chip.write_command(Cycles(at), 0x22);
         chip.write_data(Cycles(at), mode);
@@ -254,7 +255,7 @@ mod tests {
         );
         display(&handle, 0xF7, 2_000_000);
         let full = panel.poll(&mut machine).unwrap().expect("the full refresh");
-        let published = handle.lines().chip().panel_image().clone();
+        let published = handle.image().clone();
         assert_eq!((full.generation(), full.refresh()), (1, RefreshKind::Full));
         assert_eq!(
             full.duration_nanos(),
