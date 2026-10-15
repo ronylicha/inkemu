@@ -10,6 +10,7 @@
 
 pub mod analog;
 pub mod ssd1677;
+pub mod switch;
 
 pub use analog::{Battery, BatteryError, ButtonLadder, LadderButton, LadderError, Millivolts};
 pub use ssd1677::lines::{
@@ -20,3 +21,4 @@ pub use ssd1677::{
     PanelGeometry, PanelImage, Plane, Provenance, RefreshKind, Ssd1677, Ssd1677Config,
     Ssd1677Timing, Stage, Temperature,
 };
+pub use switch::PushButton;
