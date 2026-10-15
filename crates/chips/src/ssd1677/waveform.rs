@@ -422,8 +422,34 @@ mod tests {
         // The other sign: saturated toward white.
         let t = w.transfer(Drive::Lut(3), i64::MAX, false, None);
         assert_eq!(t.apply(0), i64::MAX);
-        // Cut after the first frame (u64::MAX ns): already saturated.
-        let t = w.transfer(Drive::Lut(3), i64::MAX, true, Some(u64::MAX));
+        // A cut before the first frame of u64::MAX ns ends: a frame cut short does nothing.
+        // (`Some(u64::MAX)` would not cut: every phase's length saturates to it.)
+        let t = w.transfer(Drive::Lut(3), i64::MAX, true, Some(u64::MAX - 1));
+        assert_eq!(t.apply(i64::MAX), i64::MAX);
+        assert_eq!(t.apply(0), 0);
+        assert_eq!(t.apply(i64::MAX / 2), i64::MAX / 2);
+    }
+
+    #[test]
+    fn a_cut_after_the_first_of_very_long_frames_runs_exactly_one_frame() {
+        let mut setting = [0xFFu8; LUT_BYTES];
+        setting[106] = 0x4B;
+        setting[107] = 0x4B;
+        setting[108] = 0x3A;
+        setting[109] = 0xA0;
+        // 255 frames of a phase overflow u64 at this period, one frame does not.
+        let frame = u64::MAX / 2 + 1;
+        let w = Waveform::from_setting(&setting, &[frame; 16]);
+        assert_eq!(w.duration_ns(), u64::MAX);
+        // One frame of 17 V over `frame` ns saturates the drive: black from white, and the other
+        // sign white from black.
+        let t = w.transfer(Drive::Lut(3), i64::MAX, true, Some(frame));
         assert_eq!(t.apply(i64::MAX), 0);
+        assert_eq!(t.apply(0), 0);
+        let t = w.transfer(Drive::Lut(3), i64::MAX, false, Some(frame));
+        assert_eq!(t.apply(0), i64::MAX);
+        // One nanosecond earlier the first frame has not completed: nothing moves.
+        let t = w.transfer(Drive::Lut(3), i64::MAX, true, Some(frame - 1));
+        assert_eq!(t.apply(i64::MAX), i64::MAX);
     }
 }

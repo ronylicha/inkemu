@@ -83,8 +83,9 @@ fn kind(command: u8) -> Option<Kind> {
         | 0x47 => Write(Exactly(1)),
         0x2B | 0x4E | 0x4F => Write(Exactly(2)),
         // `0x1A`: the X4's firmware sends A[11:4] alone (`FreeInk` `Ssd1677Driver.cpp:469-470`
-        // at `7fcd3b34`, 300-301 at `111fdcc7`, the release 1.6.5), and the panel takes it: the byte of A[3:0] is optional, its nibble kept. `0x21`: some
-        // boards send a second byte, which the SSD1677's datasheet does not list; stored only.
+        // at `7fcd3b34`, 300-301 at `111fdcc7`, the release 1.6.5), and the panel takes it: the
+        // byte of A[3:0] is optional, its nibble kept. `0x21`: some boards send a second byte,
+        // which the SSD1677's datasheet does not list; stored only.
         0x1A | 0x21 => Write(Between(1, 2)),
         0x01 | 0x04 => Write(Exactly(3)),
         0x44 | 0x45 => Write(Exactly(4)),
