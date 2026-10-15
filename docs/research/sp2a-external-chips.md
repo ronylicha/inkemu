@@ -12,8 +12,30 @@ contradiction on BUSY). The design that rules on what follows is
 | Short name | What | Where, pinned |
 |---|---|---|
 | **DS** | Solomon Systech, *SSD1677 Advance Information*, Rev 1.0, Nov 2018, 47 pages (the PDF holds 46) | Good Display's page "IC Driver SSD1677" (`https://www.good-display.com/companyfile/170.html`), which serves `https://v4.cecdn.yun300.cn/100001_1909185148/SSD1677.pdf`; SHA-256 `4b5cc241f410722e54c4d756424907b90ed988502216ed5ed864dd0df78b7e0c`. Not stored in this repository. Solomon Systech's own page gives the document on request only. |
-| **FI** | FreeInk SDK, the hardware layer CrossPoint 1.6.5 builds on | `Free-Ink/freeink-sdk` at `7fcd3b34c108f28c086ade3b433924022dbc0998`, the commit the submodule `freeink-sdk` of `crosspoint-reader/crosspoint-reader` points to (read through the GitHub API on 2026-10-15; CrossPoint's `main` at `bb855ef935826e86c65574b5abbd4eab974d53e0`, latest release 1.6.5). The SSD1677 driver, its bus and the X4 LUTs are identical at FreeInk's head `e91e34e3da3bf87b6c3c896fe1b3d6dda1a8c7c2`; only a LUT of another board differs. |
-| **CP** | CrossPoint Reader | `crosspoint-reader/crosspoint-reader` at `bb855ef935826e86c65574b5abbd4eab974d53e0` |
+| **FI** | FreeInk SDK, the hardware layer of CrossPoint | Read at `Free-Ink/freeink-sdk` `7fcd3b34c108f28c086ade3b433924022dbc0998`, the commit the submodule `freeink-sdk` of CrossPoint's `main` points to (read through the GitHub API on 2026-10-15; CrossPoint's `main` at `bb855ef935826e86c65574b5abbd4eab974d53e0`). The release CrossPoint 1.6.5 (tag `1.6.5`, commit `93e98bb78702e29868a16a13b80c40e6b36ccdff`, 2026-09-27) builds on FreeInk `111fdcc7f0176c3ee38391a160ee296bf492dbd8`: its X4 path sends the same bytes (below). Line numbers cited in this report are those of `7fcd3b34`. The SSD1677 driver, its bus and the X4 LUTs are identical at FreeInk's head `e91e34e3da3bf87b6c3c896fe1b3d6dda1a8c7c2`; only a LUT of another board differs. |
+| **CP** | CrossPoint Reader | `crosspoint-reader/crosspoint-reader` at `bb855ef935826e86c65574b5abbd4eab974d53e0` (`main`) and at the tag `1.6.5` |
+
+**The release and the commit read.** Checked on 2026-10-15, file by file, after a review asked
+whether the FreeInk read is the one CrossPoint 1.6.5 runs:
+
+- `32a265fa86498c014e13a5bc16133bb021cb620c`, the FreeInk of CrossPoint's `e54c00873189ca01a2956ee5e911f49c91ceaa72`
+  (2026-10-10, a commit of `main` 56 commits after the tag, not the release), and `7fcd3b34` hold
+  byte-identical copies of every file this report reads: `Ssd1677Driver.cpp`, `Ssd1677Luts.h`,
+  `EpdBus.cpp`, `InputManager.cpp`, `InputManager.h`, `BatteryMonitor.cpp`, `BoardConfig.h`,
+  `LICENSE`, `NOTICE`.
+- At `111fdcc7` (the release) those files differ, but not on the X4's path. The bytes of
+  `lut_grayscale` and `lut_factory_quality` are the same (SHA-256 of the 110 bytes of the latter
+  `062a0305f8cc3240…` at the three commits and in this repository's copies). The hunks of the
+  driver's diff touch only other boards (Metalio, Picco, their LUTs), `blackPulseClean`,
+  `writeSecondUpdateControlByte`, `restoreInternalTemperature`, and the default SPI clock (40 MHz
+  against 20 MHz, without effect: the X4 sets 10 MHz). The X4's configuration
+  (`ssd1677DefaultConfig`), `initController`, `setRamArea`, `refresh` (`1A 5A`, one byte, lines
+  300-301 at `111fdcc7`, 469-470 at `7fcd3b34`), `powerOff` (`22 03`, `delay(200)`), `deepSleep`
+  (`10 03`), `EpdBus::reset` (10/10/10 ms), the ADC thresholds (3512…, `ADC_NO_BUTTON` 3900,
+  `ADC_11db`), the battery multiplier 2.0 and the X4's SPI clock of 10 MHz are the same.
+
+So §4 and §7–8 hold for the release 1.6.5 as for `main`; `LICENSE` and `NOTICE` are the same at
+the three commits (§9).
 | **PX** | Papyrix Reader, its `docs/ssd1677-driver.md` | `bigbag/papyrix-reader` at `ee071b173e29b1e81fc7e259260077d5ba981b38` |
 
 File paths below are relative to each repository; `FI:Ssd1677Driver.cpp:337` reads "line 337 of
@@ -87,6 +109,13 @@ which RAM row each gate shows: SM=0 GD=0 G*n* → ROW*n*; SM=0 GD=1 swaps pairs;
 G1 ROW340, G2 ROW1, G3 ROW341 …; SM=1 GD=1 G0 ROW340, G1 ROW0 …. TB=1 is reserved. The X4 writes
 `0xDF 0x01 0x02` (480 lines, SM=1) (FI `Ssd1677Driver.cpp:351-354`; `DRIVER_OUTPUT_SCAN = 0x02`).
 
+MUX can name up to 1 024 lines while the RAM has 680 rows, and the table is given for 680 only.
+The model generalises it with half = ⌈lines / 2⌉ (SM=1: even gates read rows 0, 1, …, odd gates
+rows half, half + 1, …) and leaves undriven every gate whose row would fall outside the RAM [HYP]:
+with 1 024 lines and SM=1, the odd gates past row 679 keep their state. A first version indexed
+the RAM with that row and panicked (review of PR #16, B1); a deterministic fuzz of commands, data,
+reads and resets now runs in the tests.
+
 ### 3.3 Waveform and LUT (§6.6–6.9)
 
 - 10 groups × 4 phases (A–D). TP[nX] = frames of the phase (0 skips it), RP[n] + 1 = repeats of
@@ -114,6 +143,13 @@ G1 ROW340, G2 ROW1, G3 ROW341 …; SM=1 GD=1 G0 ROW340, G1 ROW0 …. TB=1 is res
 | `0x04` VSL | 1Ah–3Ah even: −9 V − 0.5 V per two codes | POR 32h (−15 V) |
 | `0x2C` VCOM | 08h–A0h by four: −0.1 V per four codes from −0.2 V | POR 00h; the table prints 84h as −3.2 V where its step gives −3.3 V (a typo, [INF]) |
 
+The reference waveforms of the model's OTP (§5) use these reset values, VGH 00h, VSH1 41h, VSH2 A8h,
+VSL 32h, DCVCOM 00h. FI's factory grey LUT carries the same three source codes, which is why they
+were first taken from it; they now come from this table (§9).
+
+A value outside these ranges is reported once per command, at its first out-of-range byte, as a
+`ReservedValue`, and stored (review of PR #16, M3).
+
 ### 3.5 Display Update Control 2 (`0x22`, POR FFh) and Master Activation (`0x20`)
 
 The datasheet tabulates combinations (80h, 01h, C0h, 03h, 91h, 99h, B1h, B9h, C7h, CFh, F7h, FFh).
@@ -132,7 +168,9 @@ temperature, 10h load LUT, 08h display mode 2 (else 1), 04h display, 02h analog 
   reads it.
 - `0x14` HV ready (requires clock and analog; BUSY for at most 10 ms × (n+1) × m), `0x15` VCI
   detection (2.2–2.6 V), `0x28`/`0x29` VCOM sensing ((A[3:0]+1) s), `0x2F` status (bit 5 HV not
-  ready, bit 4 VCI low, bit 2 busy, bits 1:0 chip ID = 01).
+  ready, bit 4 VCI low, bit 2 busy, bits 1:0 chip ID = 01). With the clock and the analog supply
+  up, the model's detection succeeds after its cool-down; without them it cannot, and bit 5 reads
+  "not ready" [HYP] (review of PR #16, M2).
 - `0x3C` border (VBD): A[7:6] 00 follow LUT A[1:0], 01 fixed level A[5:4] (VSS, VSH1, VSL, VSH2),
   10 VCOM, 11 HiZ (POR C0h).
 - OTP programming (`0x08`, `0x2A`, `0x30`, `0x36`, `0x39`), OTP load (`0x31`), CRC (`0x34`,
@@ -179,6 +217,7 @@ Durations given by the sources, all approximate: full ~1.6–1.8 s, fast ~0.5–
 | RAM after deep sleep 11 | cleared to 0 [HYP] | FI: discarded; a deterministic value |
 | Deep-sleep codes 01, 10 | deep sleep keeping the RAM, reported as a reserved value [HYP] | the SSD1680's mode 1 (PX sends `0x01`) |
 | RAM after a hardware reset | kept [HYP] | the datasheet says nothing |
+| A hardware reset during an operation | cuts it; a display that has started is published as far as it went, one that has not started yet (still in the stages before the waveform) is abandoned without an image [HYP] (review of PR #16, M1) | the glass only moves once the waveform drives it |
 | RAM read: does the counter advance | it advances (Table 7-1) | §8.5 says the opposite; the command table is the more specific |
 | Optical response | §6 | |
 | Auto write: window or whole RAM | whole RAM [HYP] | the steps are defined on gates and sources, up to 680 and 960 |
@@ -212,7 +251,10 @@ lightens black ones by 45 % and 30 % ("grey" 9 frames, "dark grey" 6): levels 0.
 of white, in the order FI names them. The factory LUT, from white, gives 1.0, 0.6, 0.5 and 0 for
 codes 00, 01, 10, 11 (grey levels 255, 153, 128, 0), which the tests pin. That the default swing is
 "right" is not established; it is a parameter, and the interface says the panel is an
-approximation (spec §5.3).
+approximation (spec §5.3). The model makes that readable: the optics, the stage durations and the
+OTP waveforms each carry a `Provenance` (`Approximation` or `Measured`), all three
+`Approximation` by default, and `Ssd1677Config::is_approximation()` is true while any of them is
+(review of PR #16, M4). The calibration bench (SP8) is what can turn one into `Measured`.
 
 Each phase is a clamped translation of the state; a sequence of them is again one (`x ↦
 min(max(x + a, lo), hi)`), so a whole waveform costs one composition per phase and one evaluation
@@ -246,3 +288,25 @@ the X4 profile is expected to declare (SP2d), each one rounding back to its code
 (`docs/research/xteink-hardware.md` §1.1). Full charge ~4.2 V, empty ~3.45 V for 0 % in FI's notch
 table (`BatteryMonitor.cpp:862-875`). The model is a cell voltage, set by the user or a script,
 and a divider: the pin sees cell × R_bottom / (R_top + R_bottom).
+
+## 9. Licence hygiene
+
+What the crate takes from each source, and under what terms:
+
+| Source | Licence | Taken | Where |
+|---|---|---|---|
+| DS | Solomon Systech's document, no licence for redistribution | facts: commands, registers, codes, ranges, reset values; no text, table or figure copied | the code cites sections and tables; the PDF is not in this repository |
+| FI | MIT, Copyright (c) 2026 FreeInk; its `NOTICE` reproduces the MIT licence of the OpenX4 E-Paper Community SDK (Copyright (c) 2025 Open X4 E-Paper Contributors), from which its SSD1677 sequences and LUTs derive | facts about the X4 (byte sequences, pins, delays, thresholds, ratios), cited by file and line; **one table copied**: `lut_factory_quality`, 110 bytes, in test code only | `crates/chips/src/ssd1677/tests.rs` and `crates/chips/tests/x4_driver.rs`, each copy with a comment naming both copyrights and pointing to `third_party/freeink-sdk/` (`LICENSE`, `NOTICE`, `PROVENANCE.md`) |
+| CP | MIT | facts (the X4 is detected and driven through FI) | cited |
+| PX | MIT | facts (timings, the bit reading of `0x22`) | cited |
+
+A review of PR #16 (I1) found the copied table without the MIT notice, and the reference voltages of
+`reference.rs` taken from the same table. Fixes: the voltages now come from the datasheet's reset
+values (§3.4), so `reference.rs` holds no third-party data; FreeInk's `LICENSE` and `NOTICE`,
+unmodified, are in `third_party/freeink-sdk/` with a provenance (commits, hashes, the two copies).
+
+The inkemu binary contains nothing from FreeInk: no crate of the binary depends on `chips` yet, and
+both copies are test code, which no build of the binary compiles. The root `NOTICE` and the notices
+`inkemu licenses` prints therefore do not list FreeInk, as they do not list the CoreMark sources
+the tests build. The rule for what follows: a third-party table that enters code the binary
+compiles brings its notice into the root `NOTICE` and into `boards::notices` in the same change.

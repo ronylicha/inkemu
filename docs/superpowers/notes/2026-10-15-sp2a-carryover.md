@@ -1,8 +1,9 @@
 # SP2a — Note de passation
 
-Plan : `docs/superpowers/plans/2026-10-15-sp2a-chips.md` (2a-R1 à 2a-R23). Spec :
-`docs/superpowers/specs/2026-10-15-sp2a-chips-design.md` (A1–A17). Recherche : `docs/research/sp2a-external-chips.md`.
-Branche partie de `main` à `194f286`.
+Plan : `docs/superpowers/plans/2026-10-15-sp2a-chips.md` (2a-R1 à 2a-R32). Spec :
+`docs/superpowers/specs/2026-10-15-sp2a-chips-design.md` (A1–A20). Recherche : `docs/research/sp2a-external-chips.md`.
+Branche partie de `main` à `194f286`. Relecture de la PR #16 (à `1c47515`) : neuf constats, tous corrigés (section
+« Relecture de la PR #16 »).
 
 ## Résultat
 
@@ -12,18 +13,21 @@ Une crate `crates/chips` (dépend d'`emu-core` et de `thiserror`, aucune E/S hô
   noir et blanc et rouge, fenêtres, compteurs et les huit modes de saisie, LUT et voltages, séquence `22`/`20` étape
   par étape, OTP paramétrée (trois formes d'onde de référence pour le GDEQ0426T82, approximations), bordure, sommeil
   profond, resets logiciel et matériel, lectures, BUSY en temps d'appareil, diagnostics nommés et bornés ; modèle
-  optique entier qui produit une `PanelImage` en niveaux de gris après chaque affichage.
+  optique entier qui produit une `PanelImage` en niveaux de gris après chaque affichage. Aucune suite d'octets ne
+  la fait paniquer (test à graine fixe de 100 000 opérations). Optique, durées et formes d'onde portent une
+  `Provenance` ; `Ssd1677Config::is_approximation()` dit si l'image repose sur des valeurs non mesurées.
 - **Échelle de boutons** et **batterie** lues par l'ADC, en millivolts à la broche.
 
 Vérifié sur le poste de développement (partagé, `CARGO_BUILD_JOBS=3`) : `cargo fmt --all --check` ;
 `tools/ci/clippy.sh -p chips --all-targets --all-features -- -D warnings` ; `cargo doc -p chips` avec
-`RUSTDOCFLAGS=-D warnings` ; `cargo test -p chips` (79 tests unitaires, 8 d'intégration) ;
+`RUSTDOCFLAGS=-D warnings` ; `cargo test -p chips` (89 tests unitaires, 10 d'intégration) ;
 `cargo check --target wasm32-unknown-unknown -p chips` ; `cargo test -p boards --test host_io_ban` (3) ;
 `cargo test -p inkemu-lockstep --test readme` (2). **Non lancés**, laissés à la CI : la suite complète du workspace,
 clippy et rustdoc sur tout le workspace, la couverture.
 
 Ce que reproduisent les tests sur la dalle 800×480, avec les séquences exactes de `FreeInk` (pilote du X4 dans
-`CrossPoint` 1.6.5) et les durées par défaut :
+`CrossPoint` ; lu à `7fcd3b34`, sous-module de `main` ; la version 1.6.5 est sur `111fdcc7`, mêmes octets sur le
+chemin du X4, recherche §0) et les durées par défaut :
 
 | Séquence | BUSY | Image |
 |---|---|---|
@@ -41,7 +45,7 @@ Ce que reproduisent les tests sur la dalle 800×480, avec les séquences exactes
 use chips::{
     Battery, BatteryError, ButtonLadder, LadderButton, LadderError, Millivolts,
     ConfigError, Diagnostic, DiagnosticKind, DisplayMode, GateScan, Optics, OtpWaveform, PanelGeometry,
-    PanelImage, Plane, RefreshKind, Ssd1677, Ssd1677Config, Ssd1677Timing, Stage, Temperature,
+    PanelImage, Plane, Provenance, RefreshKind, Ssd1677, Ssd1677Config, Ssd1677Timing, Stage, Temperature,
 };
 // Aussi : chips::ssd1677::{RAM_SOURCES (960), RAM_GATES (680), LUT_BYTES (112), MAX_DIAGNOSTICS (1024)},
 // chips::ssd1677::reference::gdeq0426t82_otp() -> Vec<OtpWaveform>.
@@ -70,15 +74,17 @@ pub struct PanelImage {
     pub border: u8,
     pub generation: u64,      // 0 à la mise sous tension, +1 par affichage publié
     pub kind: RefreshKind,    // PowerOn | Full (mode 1) | Partial (mode 2)
-    pub interrupted: bool,    // reset matériel pendant l'affichage
+    pub interrupted: bool,    // reset matériel pendant l'affichage (avant son début : pas d'image)
     pub at: Cycles,
 }
 
+pub enum Provenance { Approximation, Measured }    // Approximation pour les défauts et l'OTP de référence
+
 pub struct Ssd1677Config {
     pub panel: PanelGeometry,            // gdeq0426t82() : 800×480, SM = 1, lignes inversées
-    pub optics: Optics,                  // full_swing (mV·ns), positive_drives_black, initial_gray
-    pub timing: Ssd1677Timing,           // durées en ns, frame_period: [u64; 16]
-    pub otp: Vec<OtpWaveform>,
+    pub optics: Optics,                  // full_swing (mV·ns), positive_drives_black, initial_gray, provenance
+    pub timing: Ssd1677Timing,           // durées en ns, frame_period: [u64; 16], provenance
+    pub otp: Vec<OtpWaveform>,           // OtpWaveform { mode, lower, upper, setting, provenance }
     pub busy_active_high: bool,          // true sur le X4
     pub ambient: Temperature,            // 25 °C
     pub external_sensor: Option<Temperature>, // None sur le X4
@@ -86,8 +92,12 @@ pub struct Ssd1677Config {
     pub user_id: [u8; 10],
 }
 // Ssd1677Config::gdeq0426t82() == Ssd1677Config::default().
+// Ssd1677Config::is_approximation(&self) -> bool : vrai tant qu'optique, durées ou une forme d'onde l'est ;
+// l'interface (SP2c) affiche alors « approximation ».
 
 impl ButtonLadder {
+    // Refuse : aucun bouton (NoButton), nom en double (DuplicateName), niveau pas sous le repos (NotBelowIdle),
+    // deux boutons au même niveau (DuplicateLevel).
     pub fn new(idle: Millivolts, buttons: Vec<LadderButton>) -> Result<ButtonLadder, LadderError>;
     pub fn idle(&self) -> Millivolts;
     pub fn buttons(&self) -> &[LadderButton];            // LadderButton { name: String, level: Millivolts }
@@ -133,8 +143,27 @@ Usage attendu dans SP2d :
 - **`0x1A` accepte un seul octet** (A17) : le demi-rafraîchissement du X4 n'en envoie qu'un.
 - **`0x46` remplit le plan rouge**, comme la fiche, contre le nom que lui donnent FreeInk et Papyrix (2a-R9).
 - **Une commande pendant BUSY est ignorée**, sauf la lecture d'état (A6).
-- **Formes d'onde OTP de référence** construites pour le modèle (A9), avec le bloc de tensions de la LUT d'usine.
+- **Formes d'onde OTP de référence** construites pour le modèle (A9), avec les tensions au reset de la fiche
+  (d'abord prises à la LUT d'usine de FreeInk, retirées à la relecture : I1).
 - **Les niveaux des échelles sont des tensions**, pas des codes (A14).
+- **MUX au-delà de 680 lignes** : les grilles dont la ligne de mémoire sortirait de la RAM ne sont pas pilotées (A12).
+- **`14` sans alimentations** : le bit « HV pas prête » se lève (A19).
+- **Reset avant le début de l'affichage** : abandonné sans image (A11).
+- **Le `NOTICE` racine ne liste pas FreeInk** : le binaire n'en contient rien (A20).
+
+## Relecture de la PR #16
+
+| Constat | Correction | Où |
+|---|---|---|
+| B1 (bloquant) : MUX > 680 avec SM = 1 puis affichage → panique | `ram_row_of_gate` et `Ram::bit` rendent `None` hors des 680 lignes, grilles non pilotées ; test unitaire, test d'intégration (`01 FF 03 02`), test à graine fixe de 100 000 opérations ; tous les autres chemins octet → index relus, bornés | `panel.rs`, `ram.rs`, `tests.rs`, `x4_driver.rs` ; 2a-R24 |
+| I1 : LUT de FreeInk (MIT) copiée sans avis | Tensions de référence = valeurs au reset de la fiche ; `third_party/freeink-sdk/` (`LICENSE`, `NOTICE` non modifiés, `PROVENANCE.md`) ; commentaire à chaque copie ; test qui inclut les deux fichiers ; README ; recherche §9 | 2a-R31, A20 |
+| M1 : reset avant le début de l'affichage publiait une image | Abandon sans image ni génération | `mod.rs` ; 2a-R25 |
+| M2 : `hv_not_ready` jamais vrai | Vrai sans horloge et analogique | `mod.rs` ; 2a-R27, A19 |
+| M3 : une `ReservedValue` par octet | Une par commande | `mod.rs` ; 2a-R26, A5 |
+| M4 : approximation non lisible | `Provenance`, `is_approximation()` | `config.rs` ; 2a-R28, A18 |
+| M5 : deux boutons au même niveau acceptés | `DuplicateLevel`, `NotBelowIdle` | `analog.rs` ; 2a-R29 |
+| M6 : tests faibles, cas manquants | Assertions exactes, cinq tests ajoutés | 2a-R30 |
+| M7 : commit de FreeInk attribué à 1.6.5 | 1.6.5 = `111fdcc7` ; lu à `7fcd3b34` ; identité du chemin X4 vérifiée fichier par fichier | recherche §0 ; 2a-R32 |
 
 ## Laissé aux héritiers
 
@@ -150,8 +179,11 @@ Usage attendu dans SP2d :
 
 ## Limites de preuve
 
-- Les séquences du firmware sont prises au code de FreeInk (celui de `CrossPoint` 1.6.5), pas observées sur un
-  appareil ni sur un firmware tournant sous inkemu (il faut SP2b et SP2d).
+- Les séquences du firmware sont prises au code de FreeInk (lu à `7fcd3b34` ; celui de `CrossPoint` 1.6.5,
+  `111fdcc7`, envoie les mêmes octets sur le chemin du X4), pas observées sur un appareil ni sur un firmware
+  tournant sous inkemu (il faut SP2b et SP2d).
+- Le test à graine fixe couvre une graine et 100 000 opérations sur une dalle 8×680 ; il ne prouve pas l'absence
+  de panique pour toute suite, il en attrape une classe (les chemins octet → index ont été relus à la main).
 - Les durées, l'OTP, l'amplitude optique, le sens de saisie en X décrémenté, l'état de la RAM au démarrage et après
   sommeil sont des hypothèses nommées (recherche §5) ; les tests épinglent le comportement du modèle, pas celui de
   la puce.
@@ -167,26 +199,35 @@ agents travaillent en parallèle) :
   rappelée à `next_deadline()` (ADR 0003), image du panneau publiée à la fin de l'affichage ; sources analogiques
   en millivolts à la broche. Interdiction des E/S hôte : sept copies de `clippy.toml` (ajout de `chips`).
 - **`backend_models.md`** : types publics de `chips` — `Millivolts`, `LadderButton`, `ButtonLadder`,
-  `LadderError`, `Battery`, `BatteryError` ; `Ssd1677`, `Ssd1677Config`, `PanelGeometry`, `GateScan`, `Optics`,
-  `Ssd1677Timing`, `Temperature`, `DisplayMode`, `OtpWaveform`, `ConfigError`, `PanelImage`, `RefreshKind`,
-  `Plane`, `Diagnostic`, `DiagnosticKind` (19 variantes), `Stage` ; constantes `RAM_SOURCES`, `RAM_GATES`,
-  `LUT_BYTES`, `MAX_DIAGNOSTICS`.
+  `LadderError` (`NoButton`, `DuplicateName`, `NotBelowIdle`, `DuplicateLevel`, `NoSuchButton`), `Battery`,
+  `BatteryError` ; `Ssd1677`, `Ssd1677Config` (`is_approximation()`), `PanelGeometry`, `GateScan`, `Optics`,
+  `Ssd1677Timing`, `Temperature`, `DisplayMode`, `OtpWaveform`, `Provenance` (`Approximation`, `Measured` ; champ
+  de `Optics`, `Ssd1677Timing`, `OtpWaveform`), `ConfigError`, `PanelImage`, `RefreshKind`, `Plane`,
+  `Diagnostic`, `DiagnosticKind` (19 variantes), `Stage` ; constantes `RAM_SOURCES`, `RAM_GATES`, `LUT_BYTES`,
+  `MAX_DIAGNOSTICS`.
 - **`backend_services.md`** : modules de `chips` — `analog.rs` ; `ssd1677/mod.rs` (table des commandes, machine à
   états, BUSY, resets, lectures, activation `22`/`20`), `config.rs` (paramètres, recherche de forme d'onde OTP,
   validation), `ram.rs` (plans, fenêtre, compteur, écriture automatique), `waveform.rs` (tables de tensions, LUT,
   translations bornées), `panel.rs` (grilles → lignes, état optique, `PanelImage`), `reference.rs` (OTP de
   référence du GDEQ0426T82), `diagnostic.rs`.
-- **`api_routes.md`** : tests de `chips` — 79 unitaires (`src/**`), 8 d'intégration (`tests/x4_driver.rs`,
-  séquences FreeInk) ; `host_io_ban` couvre sept crates ; l'étape « Build the model for WebAssembly » de la CI
+- **`api_routes.md`** : tests de `chips` — 89 unitaires (`src/**`, dont le test à graine fixe de 100 000
+  opérations), 10 d'intégration (`tests/x4_driver.rs`, séquences FreeInk, MUX au-delà de la RAM, présence de la
+  licence et de l'avis de FreeInk) ; `host_io_ban` couvre sept crates ; l'étape « Build the model for WebAssembly » de la CI
   inclut `-p chips`.
 - **`frontend_spa.md`** : ce que SP2a laisse à SP2c — `PanelImage` (niveaux de gris, bordure, génération, type,
   interrompue), `ram()` pour la vue technique, compteur de partiels à tenir côté interface, statut « approximation »
-  de l'OTP de référence et du modèle optique, température ambiante réglable (`set_ambient`).
+  lisible par `Ssd1677Config::is_approximation()` (`Provenance` de l'optique, des durées, de chaque forme d'onde),
+  température ambiante réglable (`set_ambient`).
 - **`frontend_nextjs.md`** : `chips` compile pour `wasm32-unknown-unknown`.
 - **`integrations.md`** : fiche technique SSD1677 Rev 1.0 (Good Display, SHA-256
-  `4b5cc241f410722e54c4d756424907b90ed988502216ed5ed864dd0df78b7e0c`, non stockée) ; FreeInk SDK
-  `7fcd3b34c108f28c086ade3b433924022dbc0998` (sous-module de CrossPoint `bb855ef9`), Papyrix `ee071b17` ; aucune
-  dépendance nouvelle.
+  `4b5cc241f410722e54c4d756424907b90ed988502216ed5ed864dd0df78b7e0c`, non stockée) ; FreeInk SDK (MIT) lu à
+  `7fcd3b34c108f28c086ade3b433924022dbc0998` (sous-module de CrossPoint `main` `bb855ef9`), CrossPoint 1.6.5
+  (étiquette sur `93e98bb7`) sur FreeInk `111fdcc7f0176c3ee38391a160ee296bf492dbd8`, mêmes octets sur le chemin du
+  X4 ; Papyrix `ee071b17` (MIT) ; **`third_party/freeink-sdk/`** : `LICENSE` et `NOTICE` de FreeInk non modifiés
+  (MIT FreeInk 2026, MIT OpenX4 2025) et `PROVENANCE.md`, pour la LUT `lut_factory_quality` (110 octets) copiée
+  dans deux fichiers de test ; le binaire n'en contient rien, `NOTICE` racine et `boards::notices` inchangés ;
+  aucune dépendance nouvelle.
 - **`database_schema.md`** : aucun état persistant ajouté ; l'image de la dalle n'est pas sauvegardée (laissé à
   SP2d/SP4).
-- **`tech_debt.md`** : hypothèses de SP2a (recherche §5) et reports du tableau « Laissé aux héritiers » ci-dessus.
+- **`tech_debt.md`** : hypothèses de SP2a (recherche §5) et reports du tableau « Laissé aux héritiers » ci-dessus ;
+  les neuf constats de la relecture de la PR #16 sont corrigés, aucun n'est reporté.
