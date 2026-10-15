@@ -11,6 +11,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# `host::test_support`: a device for the tests of a front end (the Tauri shell). Never in a release.
+test-support = ["soc-esp32c3/test-support"]
+
 [dependencies]
 emu-core.workspace = true
 firmware.workspace = true

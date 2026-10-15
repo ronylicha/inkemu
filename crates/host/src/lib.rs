@@ -28,4 +28,6 @@ pub mod run;
 pub mod script_file;
 pub mod session_file;
 pub mod term;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod utf8;

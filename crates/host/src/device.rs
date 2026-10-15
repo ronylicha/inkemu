@@ -265,11 +265,40 @@ impl FlashKeeper {
     /// Keeps `content`, the flash of a life that stopped on an internal error: writes it to the
     /// flash file, if the run has one. `false` when the file could not be written.
     fn rescue(&mut self, content: Vec<u8>, log: &mut dyn std::io::Write) -> bool {
-        let saved = self
-            .run_flash
-            .take()
-            .is_none_or(|run_flash| run_flash.save_content(&content, log));
-        self.next = Some(content);
+        self.keep_now(Some(content), log)
+    }
+
+    /// Writes `content`, or else the content kept in memory for the next life (a save that
+    /// failed), to the flash file now: the run ends and no next life will. Takes the file again
+    /// when this life no longer holds it. `false` when the file could not be taken or written:
+    /// the content then stays in memory, and the error is in `log`. `true` with nothing to write.
+    fn keep_now(&mut self, content: Option<Vec<u8>>, log: &mut dyn std::io::Write) -> bool {
+        let Some(content) = content.or_else(|| self.next.take()) else {
+            return true;
+        };
+        if self.file.is_none() {
+            self.next = Some(content);
+            return true;
+        }
+        let (run_flash, content) = if let Some(run_flash) = self.run_flash.take() {
+            (run_flash, content)
+        } else {
+            let mut seed = Some(Seed {
+                input: Input::Flash,
+                content,
+            });
+            match RunFlash::begin_keeping(self.file.as_deref(), true, &mut seed, self.size) {
+                Ok((run_flash, Some(content))) => (run_flash, content),
+                Ok((_, None)) => return true,
+                Err(e) => {
+                    let _ = writeln!(log, "error: {e}");
+                    self.next = seed.map(|seed| seed.content);
+                    return false;
+                }
+            }
+        };
+        let saved = run_flash.save_content(&content, log);
+        self.next = (!saved).then_some(content);
         saved
     }
 
@@ -1106,11 +1135,36 @@ impl Worker {
                 return;
             }
         }
-        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| self.end_life())) {
+        // Nobody can command the thread any more: it powers the device off as a Stop does.
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| self.power_off())) {
             self.rescue(&*panic);
             return;
         }
         self.tell(Update::Stopped);
+    }
+
+    /// The end of the run: the life that runs ends ([`Worker::end_life`]); with none, a flash a
+    /// life left in memory (its file could not be written when it ended on its own) is written
+    /// now, since no next life will. Gives what could not be kept.
+    fn power_off(&mut self) -> Vec<String> {
+        if self.engine.is_some() {
+            return self.end_life();
+        }
+        let Plan::Run { flash, .. } = &mut self.plan else {
+            return Vec::new();
+        };
+        let mut log = Vec::new();
+        flash.keep_now(None, &mut log);
+        let notices = Notice::from_log(&log);
+        let errors = notices
+            .iter()
+            .filter(|notice| notice.level == Level::Error)
+            .map(|notice| notice.text.clone())
+            .collect();
+        for notice in notices {
+            self.tell(Update::Notice(notice));
+        }
+        errors
     }
 
     /// Ends a run that panicked: writes the flash the device left, says why the emulator
@@ -1142,7 +1196,12 @@ impl Worker {
                     "error: the flash of the device could not be read after the internal error: what the last life wrote to it is lost"
                 );
             }
-            _ => {}
+            // No machine: a life that ended may have left its flash in memory (its file could
+            // not be written); written now, or said not kept.
+            (None, Plan::Run { flash, .. }) => {
+                let _ = catch_unwind(AssertUnwindSafe(|| flash.keep_now(None, &mut log)));
+            }
+            (_, Plan::Replay { .. }) => {}
         }
         let text = panic
             .downcast_ref::<&str>()
@@ -1310,7 +1369,7 @@ impl Worker {
                 self.begin_life(None)
             }
             Command::Stop => {
-                let errors = self.end_life();
+                let errors = self.power_off();
                 if errors.is_empty() {
                     Ok(())
                 } else {
@@ -2515,6 +2574,86 @@ mod tests {
         );
         assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
         until(&updates, |u| matches!(u, Update::Stopped));
+    }
+
+    /// A life that ended on its own and could not write its flash file leaves its flash in
+    /// memory: the power-off writes it, or says it could not.
+    #[cfg(unix)]
+    #[test]
+    fn a_power_off_after_a_life_writes_the_flash_it_left_in_memory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for writable_at_the_end in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let place = dir.path().join("kept");
+            std::fs::create_dir(&place).unwrap();
+            let file = place.join("flash.bin");
+            let keeper = FlashKeeper::begin(Some(file.clone()), false, None, 1 << 20).unwrap();
+            let launch = Launch::new(
+                writing_device(0x00, Arc::default()),
+                keeper,
+                Limits {
+                    max_cycles: Some(50_000),
+                    max_device_nanos: None,
+                },
+                LOOK,
+                None,
+            );
+            std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let (emulator, updates) = started(launch, Speed::Fastest);
+            until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+            assert!(!file.exists());
+            if writable_at_the_end {
+                std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let ended = emulator.shutdown();
+            std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+            if writable_at_the_end {
+                assert!(ended.is_ok(), "{ended:?}");
+                assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
+            } else {
+                assert!(
+                    matches!(&ended, Err(CommandError::NotKept(text)) if text.contains("flash.bin")),
+                    "{ended:?}"
+                );
+                assert!(!file.exists());
+            }
+        }
+    }
+
+    /// A panic after a life could not write its flash file: the rescue tries again, and the
+    /// power-off says the flash was not kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_rescue_after_a_failed_save_says_the_flash_was_not_kept() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("kept");
+        std::fs::create_dir(&place).unwrap();
+        let file = place.join("flash.bin");
+        let keeper = FlashKeeper::begin(Some(file.clone()), false, None, 1 << 20).unwrap();
+        let launch = Launch::new(
+            writing_device(0x00, Arc::default()),
+            keeper,
+            Limits {
+                max_cycles: Some(50_000),
+                max_device_nanos: None,
+            },
+            LOOK,
+            None,
+        );
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (emulator, updates) = started_breaking(
+            launch,
+            |u| matches!(u, Update::Notice(n) if n.text.starts_with("inkemu: stopped at pc")),
+        );
+        until(&updates, |u| matches!(u, Update::Stopped));
+        let ended = emulator.shutdown();
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(&ended, Err(CommandError::NotKept(text))
+                if text.contains("an observer broke") && text.contains("flash.bin")),
+            "{ended:?}"
+        );
     }
 
     /// An observer that panics on every notice still hears that the thread stopped.
