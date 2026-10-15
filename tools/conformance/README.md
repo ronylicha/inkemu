@@ -5,9 +5,11 @@ Test-only tooling: Docker images and third-party suites are never linked into or
 ## Pinned versions
 
 `versions.env` is the single source of pins: `RISCV_TESTS_COMMIT` (riscv-tests fixtures),
-`RISCV_ARCH_TEST_TAG`, `SAIL_RISCV_RELEASE`, `RISCOF_VERSION` (arch-test), and the expected test
-count per arch-test group (`ARCH_TEST_EXPECTED`, `ARCH_TEST_TOTAL`). Bump pins in a dedicated PR and
-re-count the groups deliberately.
+`RISCV_ARCH_TEST_TAG`, `SAIL_RISCV_RELEASE`, `RISCOF_VERSION` (arch-test), the expected test
+count per arch-test group (`ARCH_TEST_EXPECTED`, `ARCH_TEST_TOTAL`), and the riscv-tests the bench runs
+and skips (`RISCV_TESTS_RAN`, `RISCV_TESTS_SKIPPED`, held by `crates/emu-cli/tests/riscv_tests.rs`,
+which runs in the `check` job's `cargo test --workspace`). Bump pins in a dedicated PR and re-count
+deliberately.
 
 ## riscv-arch-test through RISCOF (`run-arch-test.sh`)
 

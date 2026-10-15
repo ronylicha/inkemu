@@ -1,4 +1,5 @@
-//! Runs every committed riscv-tests ELF; any failure outside the documented skip list fails CI.
+//! Runs every committed riscv-tests ELF; any failure outside the documented skip list fails CI, and
+//! so does a count of tests run or skipped other than the pins of `tools/conformance/versions.env`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use cpu_rv32::{HartConfig, MisalignedPolicy};
 use emu_cli::rvtest::{RunResult, TestMachine, bench_hart};
@@ -42,6 +43,17 @@ fn manifest() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The count `key` pins in `tools/conformance/versions.env`.
+fn pinned_count(key: &str) -> usize {
+    let text = std::fs::read_to_string(repo_root().join("tools/conformance/versions.env")).unwrap();
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("{key} is not in tools/conformance/versions.env"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("{key} in versions.env is not a count: {e}"))
+}
+
 fn fixtures() -> Vec<PathBuf> {
     manifest()
         .into_iter()
@@ -55,9 +67,11 @@ fn all_riscv_tests_pass_except_documented_skips() {
     let files = fixtures();
     let mut failures = Vec::new();
     let mut ran = 0_usize;
+    let mut skipped = 0_usize;
     for path in &files {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         if skips.contains(&name) {
+            skipped += 1;
             continue;
         }
         let mut m = TestMachine::from_elf(&std::fs::read(path).unwrap(), bench()).unwrap();
@@ -67,12 +81,22 @@ fn all_riscv_tests_pass_except_documented_skips() {
             other => failures.push(format!("{name}: {other:?}")),
         }
     }
-    println!("riscv-tests: {ran} ran, {} skipped", skips.len());
+    println!("riscv-tests: {ran} ran, {skipped} skipped");
     assert!(
         failures.is_empty(),
         "{} failing:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+    // A new skip-list entry or a lost ELF would otherwise leave this test green on fewer tests.
+    assert_eq!(
+        (ran, skipped),
+        (
+            pinned_count("RISCV_TESTS_RAN"),
+            pinned_count("RISCV_TESTS_SKIPPED")
+        ),
+        "riscv-tests ran and skipped differ from RISCV_TESTS_RAN / RISCV_TESTS_SKIPPED in \
+         tools/conformance/versions.env: re-count deliberately and update the pins with the change"
     );
 }
 
