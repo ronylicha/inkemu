@@ -30,7 +30,7 @@ const SQUARE_TOP: usize = 216;
 const SQUARE_SIDE: usize = 48;
 /// The trace of the first run below, measured on 2026-10-15 with every other assertion of the test
 /// passing (release build, twice, the same).
-const TRACE_HASH: u64 = 0xfe61_5ecc_12c4_2f8e;
+const TRACE_HASH: u64 = 0x0ba6_93fe_ad48_96b9;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut text, byte| {
@@ -142,33 +142,102 @@ fn press_after(machine: &mut Esp32C3, buttons: &ButtonsHandle, id: &str, delay: 
     released
 }
 
-/// The mean grey of the rectangle [left, left + width) × [top, top + height) of the glass.
-fn mean(image: &PanelImage, left: usize, top: usize, width: usize, height: usize) -> u64 {
-    let stride = usize::from(image.width);
-    let sum: u64 = (top..top + height)
-        .flat_map(|row| &image.pixels[row * stride + left..row * stride + left + width])
-        .map(|&grey| u64::from(grey))
-        .sum();
-    sum / (width * height) as u64
+const WIDTH: usize = 800;
+const HEIGHT: usize = 480;
+
+/// A rectangle of the glass, [left, right) × [top, bottom).
+#[derive(Clone, Copy, Debug)]
+struct Rect {
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
 }
 
-fn is_black(grey: u64) -> bool {
-    grey < 64
+impl Rect {
+    fn holds(self, x: usize, y: usize) -> bool {
+        (self.left..self.right).contains(&x) && (self.top..self.bottom).contains(&y)
+    }
 }
 
-fn is_white(grey: u64) -> bool {
-    grey > 192
+/// The square of the key at `place` in the profile's order (`show_press`).
+fn square(place: usize) -> Rect {
+    let left = 120 + 96 * place;
+    Rect {
+        left,
+        top: SQUARE_TOP,
+        right: left + SQUARE_SIDE,
+        bottom: SQUARE_TOP + SQUARE_SIDE,
+    }
 }
 
-/// The mean grey of the square of the key at `place` in the profile's order.
-fn square(image: &PanelImage, place: usize) -> u64 {
-    mean(
-        image,
-        120 + 96 * place,
-        SQUARE_TOP,
-        SQUARE_SIDE,
-        SQUARE_SIDE,
-    )
+/// The image a full refresh of the firmware ends on, built from its definition (`panel_part`): a
+/// full refresh drives every pixel to 0 or 255 under the model (2d-R10), so it is compared byte by
+/// byte. The second corner square is the one a life woken by the power key adds.
+fn expected_full(woken: bool) -> Vec<u8> {
+    let mut black = vec![
+        Rect {
+            left: 0,
+            top: 0,
+            right: WIDTH,
+            bottom: 4,
+        },
+        Rect {
+            left: 0,
+            top: HEIGHT - 4,
+            right: WIDTH,
+            bottom: HEIGHT,
+        },
+        Rect {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: HEIGHT,
+        },
+        Rect {
+            left: WIDTH - 4,
+            top: 0,
+            right: WIDTH,
+            bottom: HEIGHT,
+        },
+        Rect {
+            left: 16,
+            top: 16,
+            right: 80,
+            bottom: 80,
+        },
+    ];
+    if woken {
+        black.push(Rect {
+            left: WIDTH - 80,
+            top: HEIGHT - 80,
+            right: WIDTH - 16,
+            bottom: HEIGHT - 16,
+        });
+    }
+    (0..HEIGHT)
+        .flat_map(|y| (0..WIDTH).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            if black.iter().any(|r| r.holds(x, y)) {
+                0
+            } else {
+                255
+            }
+        })
+        .collect()
+}
+
+/// Checks a differential refresh that drew `drawn` black: every pixel of it at one dark grey (the
+/// reference fast waveform stops short of a full swing, so not 0), every other pixel exactly as
+/// `before` showed it (an unchanged pixel is not driven).
+fn assert_only_drawn_changed(before: &PanelImage, after: &PanelImage, drawn: Rect, what: &str) {
+    let dark = after.pixels[drawn.top * WIDTH + drawn.left];
+    assert!(dark < 64, "{what}: the square reads {dark}");
+    for (at, (&was, &is)) in before.pixels.iter().zip(&after.pixels).enumerate() {
+        let (x, y) = (at % WIDTH, at / WIDTH);
+        let expected = if drawn.holds(x, y) { dark } else { was };
+        assert_eq!(is, expected, "{what}: pixel ({x}, {y}), {was} before");
+    }
 }
 
 /// The image the glass showed last, checked to be of `generation` and `kind`.
@@ -219,49 +288,47 @@ fn the_x4_shows_its_frame_and_a_square_per_press_then_turns_off_on_its_power_key
         .unwrap_or_else(|| panic!("no battery line:\n{console}"));
     assert!(battery.abs_diff(3_900) <= 20, "battery {battery} mV");
 
-    let full = shown(&panel, 1, RefreshKind::Full);
-    assert_eq!((full.width, full.height), (800, 480));
-    // The frame on all four edges, the square in the top-left corner: the top row of the glass is
-    // the one the firmware wrote first, at the last RAM row.
-    assert!(is_black(mean(&full, 0, 0, 800, 4)), "top edge");
-    assert!(is_black(mean(&full, 0, 476, 800, 4)), "bottom edge");
-    assert!(is_black(mean(&full, 0, 0, 4, 480)), "left edge");
-    assert!(is_black(mean(&full, 796, 0, 4, 480)), "right edge");
-    assert!(is_black(mean(&full, 16, 16, 64, 64)), "corner square");
-    assert!(is_white(mean(&full, 100, 100, 600, 100)), "the middle");
-    for place in 0..6 {
-        assert!(is_white(square(&full, place)), "no square {place} yet");
-    }
+    let mut before = shown(&panel, 1, RefreshKind::Full);
+    assert_eq!(
+        (usize::from(before.width), usize::from(before.height)),
+        (WIDTH, HEIGHT)
+    );
+    // Byte by byte: the frame and the top-left square, where the firmware drew them, so the top
+    // row of the glass is the one written first, at the last RAM row.
+    assert!(
+        before.pixels == expected_full(false),
+        "the glass after the full refresh is not the frame and its corner square"
+    );
 
-    // Confirm, second of the profile's keys, then Down, the sixth.
-    for (refresh, (id, place)) in [("confirm", 1), ("down", 5)].into_iter().enumerate() {
+    // Every key of the two ladders, in the order of the profile: each a square at its place.
+    for (place, id) in ["back", "confirm", "left", "right", "up", "down"]
+        .into_iter()
+        .enumerate()
+    {
         press(&mut machine, &buttons, id);
-        let number = refresh + 1;
+        let number = place + 1;
         until(
             &mut machine,
             &mut consoles,
             &format!("x4_panel_buttons: partial refresh {number}, busy "),
         );
+        let console = consoles.text(ConsoleChannel::UsbSerialJtag);
         assert!(
-            consoles
-                .text(ConsoleChannel::UsbSerialJtag)
-                .contains(&format!("x4_panel_buttons: pressed {id}\n")),
-            "{id}"
+            console.contains(&format!(
+                "x4_panel_buttons: pressed {id}\nx4_panel_buttons: partial refresh {number}, busy "
+            )),
+            "{id} pressed, refresh {number}:\n{console}"
         );
-        let image = shown(&panel, 1 + number as u64, RefreshKind::Partial);
-        assert!(is_black(square(&image, place)), "the square of {id}");
-        assert!(
-            is_black(mean(&image, 16, 16, 64, 64)),
-            "the corner square stays"
-        );
-        assert!(
-            is_white(mean(&image, 100, 100, 600, 100)),
-            "the middle stays white"
-        );
-        for other in [0, 2, 3, 4] {
-            assert!(is_white(square(&image, other)), "no square {other}");
-        }
+        let after = shown(&panel, 1 + number as u64, RefreshKind::Partial);
+        assert_only_drawn_changed(&before, &after, square(place), id);
+        before = after;
     }
+    let console = consoles.text(ConsoleChannel::UsbSerialJtag);
+    assert_eq!(
+        console.matches("x4_panel_buttons: pressed ").count(),
+        6,
+        "one press read per key:\n{console}"
+    );
 
     // The power key, armed: the latch let go while the key still holds the supply, then off.
     let released = press(&mut machine, &buttons, "power");
@@ -307,8 +374,8 @@ fn with_the_cable_in_the_power_key_sends_the_x4_to_deep_sleep_and_wakes_it() {
     );
     let first = shown(&panel, 1, RefreshKind::Full);
     assert!(
-        is_white(mean(&first, 720, 400, 64, 64)),
-        "no second square yet"
+        first.pixels == expected_full(false),
+        "the first life draws the frame and its top-left square only"
     );
 
     press(&mut machine, &buttons, "power");
@@ -344,16 +411,12 @@ fn with_the_cable_in_the_power_key_sends_the_x4_to_deep_sleep_and_wakes_it() {
         ),
         "{console}"
     );
+    // The panel's RAM is lost to its reset; the full refresh ends every pixel on the new image.
     let second = shown(&panel, 2, RefreshKind::Full);
     assert!(
-        is_black(mean(&second, 16, 16, 64, 64)),
-        "the first corner square"
+        second.pixels == expected_full(true),
+        "the woken life draws the frame and both corner squares"
     );
-    assert!(
-        is_black(mean(&second, 720, 400, 64, 64)),
-        "the second corner square"
-    );
-    assert!(is_white(mean(&second, 100, 100, 600, 100)), "the middle");
     assert_eq!(machine.power_lost_nanos(), None);
     // The one event of the run is the wake: a core reset of cause deep sleep, at the press.
     match consoles.diagnostics.as_slice() {
