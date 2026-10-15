@@ -178,6 +178,7 @@ export const en: Catalog = {
   "error.sdImage": "The SD card image cannot be used.",
   "error.board": "This device has no line for what was asked of it.",
   "error.notRecorded": "The life is not recorded.",
+  "error.sdCard": "The SD card cannot be put in the device.",
   "error.replay": "This session cannot be replayed here.",
   "error.powerOn": "The device cannot be powered on.",
   "error.stopped": "The emulator has stopped.",

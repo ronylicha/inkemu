@@ -178,6 +178,7 @@ export const fr = {
   "error.sdImage": "L’image de la carte SD est inutilisable.",
   "error.board": "Cet appareil n’a pas la ligne demandée.",
   "error.notRecorded": "La vie n’est pas enregistrée.",
+  "error.sdCard": "La carte SD ne peut pas être mise dans l’appareil.",
   "error.replay": "Cette session ne peut pas être rejouée ici.",
   "error.powerOn": "L’appareil ne peut pas être mis sous tension.",
   "error.stopped": "L’émulateur est arrêté.",

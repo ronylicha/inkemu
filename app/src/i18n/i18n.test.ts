@@ -42,6 +42,7 @@ const ERROR_KINDS = [
   "nothingToStep",
   "notKept",
   "notRecorded",
+  "sdCard",
   "notRecordable",
   "onItsThread",
   "powerOn",

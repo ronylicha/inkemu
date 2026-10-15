@@ -9,10 +9,14 @@
 use crate::sd_image::{SdImage, SdImageError, files_of_the_sd_image};
 use crate::session_file::Claimed;
 use boards::{SdHandle, SdStart};
-use chips::sdcard::{BlockSource, Changes, Overlay, SdCard, SdCardConfig};
+use chips::sdcard::{
+    Block, BlockSource, BlockStorage as _, Changes, Overlay, SdCard, SdCardConfig, StorageError,
+};
 use session::{SdCardError, SdCardStart};
+use std::cell::RefCell;
 use std::io::Write;
 use std::path::Path;
+use std::rc::Rc;
 
 /// The files of the SD image at `path` as claims: what a session, a flash file or a capture of
 /// the same run must not be.
@@ -83,12 +87,126 @@ impl LifeCard {
 /// Commits what `card` holds of the life to `image` and says it in `log`: the summary line, the
 /// notice of the commit when it has one, or the error. `false` when the changes are not kept.
 pub fn commit_and_say(image: &mut SdImage, card: &LifeCard, log: &mut dyn Write) -> bool {
-    let Some(changes) = card.changes() else {
-        return true;
-    };
+    card.changes()
+        .is_none_or(|changes| commit_changes(image, &changes, log))
+}
+
+/// One layer of changes over the content a card starts from.
+type Layer = Overlay<Box<dyn BlockSource>>;
+
+/// The changes the image has not taken, read by the life that runs over them and kept by the run:
+/// one overlay, two holders on the thread of the run.
+#[derive(Debug, Clone)]
+struct Shared(Rc<RefCell<Layer>>);
+
+impl BlockSource for Shared {
+    fn block_count(&self) -> u64 {
+        self.0.borrow().block_count()
+    }
+
+    fn read_block(&mut self, lba: u64, into: &mut Block) -> Result<(), StorageError> {
+        self.0.borrow_mut().read_block(lba, into)
+    }
+}
+
+/// The card of a run across its lives, as [`crate::device::FlashKeeper`] keeps its flash (R1):
+/// what its lives wrote and its image could not take yet stays in memory, an overlay on the
+/// image; the next life starts from it, and each end of a life and the power-off write it again.
+/// A life never starts on a card that misses what the last one wrote, nor waits for the image.
+#[derive(Debug, Default)]
+pub struct CardKeeper {
+    unwritten: Option<Shared>,
+}
+
+impl CardKeeper {
+    /// Whether changes are waiting for the image.
+    #[must_use]
+    pub fn is_unwritten(&self) -> bool {
+        self.unwritten.is_some()
+    }
+
+    /// The card of the next life over `image` ([`card_of_a_life`]), the changes waiting read
+    /// over it: the life does not read the image again then, so a save of it that did not end
+    /// does not refuse the life (the overlay holds every block that save would change).
+    ///
+    /// # Errors
+    /// Those of [`SdImage::source`], when no change is waiting.
+    pub fn card_of_a_life(&self, image: &mut SdImage) -> Result<SdStart, SdImageError> {
+        let Some(unwritten) = &self.unwritten else {
+            return card_of_a_life(image);
+        };
+        Ok(SdStart {
+            source: Box::new(unwritten.clone()),
+            config: SdCardConfig {
+                write_protected: image.write_protected(),
+                ..SdCardConfig::default()
+            },
+        })
+    }
+
+    /// The card a session records ([`recorded_card`]), with the changes waiting.
+    ///
+    /// # Errors
+    /// Those of [`recorded_card`].
+    pub fn recorded_card(&self, image: &mut SdImage) -> Result<SdCardStart, String> {
+        let Some(unwritten) = &self.unwritten else {
+            return recorded_card(image);
+        };
+        SdCardStart::read(&mut unwritten.clone(), image.write_protected()).map_err(|e| match e {
+            SdCardError::TooFull { .. } => format!("the run is not recorded: {e}"),
+            other => other.to_string(),
+        })
+    }
+
+    /// Adds what a life left on its card to the changes waiting. The life ran over them
+    /// ([`CardKeeper::card_of_a_life`]): its own changes go on top, its erases first, then its
+    /// writes, which is the content the life read.
+    pub fn take_in(&mut self, card: LifeCard) {
+        let Some(storage) = card.storage else {
+            return;
+        };
+        let Some(unwritten) = &self.unwritten else {
+            self.unwritten = Some(Shared(Rc::new(RefCell::new(storage))));
+            return;
+        };
+        let changes = storage.changes();
+        let mut layer = unwritten.0.borrow_mut();
+        // INVARIANT: the life's overlay has the block count of the one under it, which checked
+        // every range and block: neither can be refused here.
+        for (first, count) in changes.erased() {
+            let _ = layer.erase(first, count);
+        }
+        for (lba, block) in changes.blocks() {
+            let _ = layer.write_block(lba, block);
+        }
+    }
+
+    /// Writes the changes waiting to `image`, and says it in `log` as [`commit_and_say`] does.
+    /// Changes the image could not take stay waiting, with a line that says where they are and
+    /// what frees them. `false` then.
+    pub fn commit_and_say(&mut self, image: &mut SdImage, log: &mut dyn Write) -> bool {
+        let Some(unwritten) = &self.unwritten else {
+            return true;
+        };
+        let written = commit_changes(image, &unwritten.0.borrow().changes(), log);
+        if written {
+            self.unwritten = None;
+        } else {
+            let _ = writeln!(
+                log,
+                "error: what the device wrote to its SD card is not in {} yet: it is kept in memory, the next life of the device starts from it, and it is written again when a life ends and when the device is powered off; free some room on the disk of the image, or make its directory writable",
+                image.shown()
+            );
+        }
+        written
+    }
+}
+
+/// [`commit_and_say`] of `changes`.
+fn commit_changes(image: &mut SdImage, changes: &Changes<'_>, log: &mut dyn Write) -> bool {
     let capacity = image.capacity();
     let written = changes.written_count();
-    match image.commit(&changes) {
+    match image.commit(changes) {
         Ok(committed) => {
             let _ = writeln!(
                 log,
@@ -113,7 +231,62 @@ pub fn commit_and_say(image: &mut SdImage, card: &LifeCard, log: &mut dyn Write)
 mod tests {
     use super::*;
     use crate::sd_image::Access;
-    use chips::sdcard::{BLOCK_BYTES, BlockStorage as _};
+    use chips::sdcard::BLOCK_BYTES;
+
+    /// The first byte of block `lba` of the image at `path`.
+    fn byte_of(path: &Path, lba: usize) -> u8 {
+        std::fs::read(path).unwrap()[lba * BLOCK_BYTES]
+    }
+
+    /// R1: a life's changes the image did not take are read by the next life, which builds on
+    /// them (its erase undoes a block of the last life, its write adds one); one commit writes
+    /// them all, and the keeper waits for nothing after it.
+    #[test]
+    fn a_keeper_lays_the_next_life_over_the_unwritten_changes_then_writes_them_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.img");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let mut image = SdImage::open(&path, Access::ReadWrite, &[], &mut Vec::new()).unwrap();
+        let mut keeper = CardKeeper::default();
+        let mut first = Overlay::new(keeper.card_of_a_life(&mut image).unwrap().source);
+        first.write_block(3, &[0x5A; BLOCK_BYTES]).unwrap();
+        first.write_block(5, &[0x77; BLOCK_BYTES]).unwrap();
+        // Its commit did not happen (it failed): the changes wait.
+        keeper.take_in(LifeCard {
+            storage: Some(first),
+        });
+        assert!(keeper.is_unwritten());
+        let mut second = Overlay::new(keeper.card_of_a_life(&mut image).unwrap().source);
+        let mut block = [0; BLOCK_BYTES];
+        second.read_block(3, &mut block).unwrap();
+        assert_eq!(
+            block[0], 0x5A,
+            "the next life reads what the last one wrote"
+        );
+        assert_eq!(byte_of(&path, 3), 0, "the image does not hold it yet");
+        second.erase(5, 1).unwrap();
+        second.write_block(4, &[0x6B; BLOCK_BYTES]).unwrap();
+        keeper.take_in(LifeCard {
+            storage: Some(second),
+        });
+        let recorded = keeper.recorded_card(&mut image).unwrap();
+        assert_eq!(recorded.ranges().len(), 1, "blocks 3 and 4, block 5 erased");
+        let mut log = Vec::new();
+        assert!(keeper.commit_and_say(&mut image, &mut log));
+        assert!(!keeper.is_unwritten());
+        assert!(
+            String::from_utf8(log)
+                .unwrap()
+                .ends_with("2 blocks written\n")
+        );
+        assert_eq!(
+            [byte_of(&path, 3), byte_of(&path, 4), byte_of(&path, 5)],
+            [0x5A, 0x6B, 0]
+        );
+    }
 
     #[test]
     fn the_files_of_the_image_are_claims_and_none_without_an_image() {
