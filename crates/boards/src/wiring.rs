@@ -4,8 +4,13 @@
 //!
 //! A profile says it in `[wiring]` and `[power]`; this module reads those tables, refuses what
 //! cannot be wired, naming the key, and gives the rest typed. Attaching it to a machine is the work
-//! of [`crate::wired`]. A profile without `[wiring]` (the X3) is a bare `SoC`.
-use chips::{Battery, ButtonLadder, LadderButton, Millivolts, Ssd1677Config};
+//! of [`crate::wired`]. A profile without `[wiring]` is a bare `SoC`. The X3 (design of SP3, ADR
+//! 0015) adds an I2C bus with its three chips (`[wiring.i2c]`), a UC8253 controller and the switched
+//! supply of its card.
+use chips::{
+    Battery, Bq27220Config, ButtonLadder, DateTime, Ds3231Config, LadderButton, Millivolts,
+    Qmi8658Config, Ssd1677Config, Uc8253Config,
+};
 use emu_core::Level;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -90,7 +95,10 @@ impl Rotation {
 /// A display controller inkemu models.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Controller {
+    /// The X4's.
     Ssd1677,
+    /// The X3's, in either of its batches ([`chips::uc8253::Variant`]).
+    Uc8253,
 }
 
 /// A named configuration of a controller: the panel behind it and how the model drives it.
@@ -98,14 +106,48 @@ pub enum Controller {
 pub enum PanelConfig {
     /// The X4's panel ([`Ssd1677Config::gdeq0426t82`]).
     Gdeq0426t82,
+    /// The X3's panel behind the first batch's controller ([`Uc8253Config::xteink_x3`]).
+    XteinkX3,
+    /// The X3's panel behind the later batch's `UC8279d` ([`Uc8253Config::xteink_x3_uc8279d`]).
+    XteinkX3Uc8279d,
+}
+
+/// The configuration of a controller, of its own type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControllerConfig {
+    Ssd1677(Ssd1677Config),
+    Uc8253(Uc8253Config),
 }
 
 impl PanelConfig {
     /// The configuration of the controller.
     #[must_use]
-    pub fn ssd1677(self) -> Ssd1677Config {
+    pub fn controller(self) -> ControllerConfig {
         match self {
-            PanelConfig::Gdeq0426t82 => Ssd1677Config::gdeq0426t82(),
+            PanelConfig::Gdeq0426t82 => ControllerConfig::Ssd1677(Ssd1677Config::gdeq0426t82()),
+            PanelConfig::XteinkX3 => ControllerConfig::Uc8253(Uc8253Config::xteink_x3()),
+            PanelConfig::XteinkX3Uc8279d => {
+                ControllerConfig::Uc8253(Uc8253Config::xteink_x3_uc8279d())
+            }
+        }
+    }
+
+    /// The glass, in pixels: its width (the controller's sources) and height (its gates).
+    #[must_use]
+    pub fn size(self) -> (u16, u16) {
+        match self.controller() {
+            ControllerConfig::Ssd1677(config) => (config.panel.width, config.panel.height),
+            ControllerConfig::Uc8253(config) => (config.panel.sources, config.panel.gates),
+        }
+    }
+
+    /// Whether what the model shows rests on parameters nobody measured: an interface says
+    /// "approximation" while it is true.
+    #[must_use]
+    pub fn is_approximation(self) -> bool {
+        match self.controller() {
+            ControllerConfig::Ssd1677(config) => config.is_approximation(),
+            ControllerConfig::Uc8253(config) => config.is_approximation(),
         }
     }
 }
@@ -168,6 +210,22 @@ pub struct PowerLines {
 pub struct SdWiring {
     pub cs: u8,
     pub miso: u8,
+    /// The pin that switches the card's supply, high on (the X3's GPIO13); `None` for a card always
+    /// powered (the X4's).
+    pub power: Option<u8>,
+}
+
+/// The I2C bus and the chips on it (ADR 0015): the X3's gauge, clock and motion sensor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct I2cWiring {
+    pub scl: u8,
+    pub sda: u8,
+    /// A BQ27220 fuel gauge, at `0x55`.
+    pub gauge: Option<Bq27220Config>,
+    /// A DS3231 real-time clock, at `0x68`.
+    pub clock: Option<Ds3231Config>,
+    /// A QMI8658 motion sensor, at the address its configuration names.
+    pub motion: Option<Qmi8658Config>,
 }
 
 /// The gesture that turns the device on (2d-D14): the key and how long it is held.
@@ -205,6 +263,7 @@ pub struct Wiring {
     pub battery: Option<BatteryWiring>,
     pub power: Option<PowerLines>,
     pub sd: Option<SdWiring>,
+    pub i2c: Option<I2cWiring>,
     /// The power-on gesture of `[power]`, when the device has a power key.
     pub gesture: Option<PowerGesture>,
 }
@@ -264,6 +323,7 @@ pub(crate) struct RawWiring {
     battery: Option<RawBattery>,
     power: Option<RawPowerLines>,
     sd: Option<RawSd>,
+    i2c: Option<RawI2c>,
 }
 
 #[derive(Deserialize)]
@@ -334,6 +394,45 @@ struct RawPowerLines {
 struct RawSd {
     cs: u8,
     miso: u8,
+    power: Option<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawI2c {
+    scl: u8,
+    sda: u8,
+    bq27220: Option<RawGauge>,
+    ds3231: Option<RawClock>,
+    qmi8658: Option<RawMotion>,
+}
+
+/// What a profile says of a BQ27220: the values a battery at rest reads; the gauge derives its
+/// other registers from them (`Bq27220Config`'s defaults).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGauge {
+    voltage_mv: u16,
+    state_of_charge: u16,
+    current_ma: i16,
+}
+
+/// What a profile says of a DS3231: the time it shows at power-on, as `YYYY-MM-DDTHH:MM:SS`, and
+/// whether its oscillator-stop flag is set (a clock never set).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawClock {
+    start: String,
+    oscillator_stopped: bool,
+}
+
+/// What a profile says of a QMI8658: its address and the acceleration it feels at rest, in
+/// thousandths of g along its X, Y and Z axes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMotion {
+    address: u8,
+    acceleration_mg: [i32; 3],
 }
 
 #[derive(Deserialize)]
@@ -411,17 +510,25 @@ impl Names {
 fn display(raw: &RawDisplay, pins: &mut Pins) -> Result<DisplayWiring, String> {
     let controller = match raw.controller.as_str() {
         "ssd1677" => Controller::Ssd1677,
+        "uc8253" => Controller::Uc8253,
         other => {
             return Err(format!(
-                "`wiring.display.controller` = \"{other}\": inkemu models no such controller; the controllers it models: ssd1677"
+                "`wiring.display.controller` = \"{other}\": inkemu models no such controller; the controllers it models: ssd1677, uc8253"
             ));
         }
     };
-    let config = match raw.config.as_str() {
-        "gdeq0426t82" => PanelConfig::Gdeq0426t82,
-        other => {
+    let config = match (controller, raw.config.as_str()) {
+        (Controller::Ssd1677, "gdeq0426t82") => PanelConfig::Gdeq0426t82,
+        (Controller::Uc8253, "xteink-x3") => PanelConfig::XteinkX3,
+        (Controller::Uc8253, "xteink-x3-uc8279d") => PanelConfig::XteinkX3Uc8279d,
+        (Controller::Ssd1677, other) => {
             return Err(format!(
                 "`wiring.display.config` = \"{other}\": the SSD1677 has no such configuration; its configurations: gdeq0426t82"
+            ));
+        }
+        (Controller::Uc8253, other) => {
+            return Err(format!(
+                "`wiring.display.config` = \"{other}\": the UC8253 has no such configuration; its configurations: xteink-x3, xteink-x3-uc8279d"
             ));
         }
     };
@@ -559,17 +666,8 @@ pub(crate) fn check(
             })
         }
     };
-    let sd = match raw.sd {
-        None => None,
-        Some(raw) => {
-            pins.take(raw.cs, "wiring.sd.cs".to_owned())?;
-            pins.take(raw.miso, "wiring.sd.miso".to_owned())?;
-            Some(SdWiring {
-                cs: raw.cs,
-                miso: raw.miso,
-            })
-        }
-    };
+    let sd = raw.sd.map(|raw| sd(&raw, &mut pins)).transpose()?;
+    let i2c = raw.i2c.map(|raw| i2c(raw, &mut pins)).transpose()?;
     let gesture = match power {
         None => None,
         Some(power) => {
@@ -594,8 +692,114 @@ pub(crate) fn check(
         battery,
         power: power_lines,
         sd,
+        i2c,
         gesture,
     }))
+}
+
+/// The card slot of `[wiring.sd]`: its select, its MISO and the pin that switches its supply.
+fn sd(raw: &RawSd, pins: &mut Pins) -> Result<SdWiring, String> {
+    pins.take(raw.cs, "wiring.sd.cs".to_owned())?;
+    pins.take(raw.miso, "wiring.sd.miso".to_owned())?;
+    if let Some(power) = raw.power {
+        pins.take(power, "wiring.sd.power".to_owned())?;
+    }
+    Ok(SdWiring {
+        cs: raw.cs,
+        miso: raw.miso,
+        power: raw.power,
+    })
+}
+
+/// The I2C bus of `[wiring.i2c]` and its chips, each checked as the chip itself would refuse it.
+fn i2c(raw: RawI2c, pins: &mut Pins) -> Result<I2cWiring, String> {
+    pins.take(raw.scl, "wiring.i2c.scl".to_owned())?;
+    pins.take(raw.sda, "wiring.i2c.sda".to_owned())?;
+    let gauge = raw
+        .bq27220
+        .map(|raw| {
+            let config = Bq27220Config {
+                voltage_mv: raw.voltage_mv,
+                state_of_charge: raw.state_of_charge,
+                current_ma: raw.current_ma,
+                average_current_ma: raw.current_ma,
+                ..Bq27220Config::default()
+            };
+            chips::Bq27220::new(config.clone())
+                .map(|_| config)
+                .map_err(|error| format!("`wiring.i2c.bq27220`: {error}"))
+        })
+        .transpose()?;
+    let clock = raw
+        .ds3231
+        .map(|raw| {
+            let start = date_time(&raw.start).ok_or_else(|| {
+                format!(
+                    "`wiring.i2c.ds3231.start` = \"{}\": a time is `YYYY-MM-DDTHH:MM:SS` between 2000-01-01T00:00:00 and 2199-12-31T23:59:59; write it so",
+                    raw.start
+                )
+            })?;
+            let config = Ds3231Config {
+                start,
+                oscillator_stopped: raw.oscillator_stopped,
+                ..Ds3231Config::default()
+            };
+            chips::Ds3231::new(config)
+                .map(|_| config)
+                .map_err(|error| format!("`wiring.i2c.ds3231`: {error}"))
+        })
+        .transpose()?;
+    let motion = raw
+        .qmi8658
+        .map(|raw| {
+            let config = Qmi8658Config {
+                address: raw.address,
+                acceleration_mg: raw.acceleration_mg,
+                ..Qmi8658Config::default()
+            };
+            chips::Qmi8658::new(config)
+                .map(|_| config)
+                .map_err(|error| format!("`wiring.i2c.qmi8658`: {error}"))
+        })
+        .transpose()?;
+    Ok(I2cWiring {
+        scl: raw.scl,
+        sda: raw.sda,
+        gauge,
+        clock,
+        motion,
+    })
+}
+
+/// `YYYY-MM-DDTHH:MM:SS`, a time a DS3231 can show; `None` for anything else.
+fn date_time(text: &str) -> Option<DateTime> {
+    let (date, time) = text.split_once('T')?;
+    let numbers = |part: &str, separator: char| -> Option<Vec<u16>> {
+        part.split(separator)
+            .map(|field| {
+                (field.len() >= 2 && field.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| field.parse().ok())
+                    .flatten()
+            })
+            .collect()
+    };
+    let (date, time) = (numbers(date, '-')?, numbers(time, ':')?);
+    let [year, month, day] = date.as_slice() else {
+        return None;
+    };
+    let [hour, minute, second] = time.as_slice() else {
+        return None;
+    };
+    let small = |value: u16| u8::try_from(value).ok();
+    DateTime::new(
+        *year,
+        small(*month)?,
+        small(*day)?,
+        small(*hour)?,
+        small(*minute)?,
+        small(*second)?,
+    )
+    .ok()
 }
 
 #[cfg(test)]
@@ -626,7 +830,119 @@ mod tests {
     #[test]
     fn a_profile_without_wiring_loads_bare() {
         assert_eq!(load("").unwrap().wiring, None);
-        assert_eq!(builtin("x3").unwrap().wiring, None);
+    }
+
+    /// ADR 0015: the X3 is wired as the research found it: the X4's display bus with its UC8253,
+    /// the X4's ladders with the side keys on the left and right edges, the card's switched
+    /// supply on GPIO13, and the three chips of its I2C bus on GPIO0 and GPIO20.
+    #[test]
+    fn the_x3_is_wired_as_the_research_found_it() {
+        let wiring = builtin("x3").unwrap().wiring.unwrap();
+        let display = wiring.display;
+        assert_eq!(
+            (display.controller, display.config, display.rotation),
+            (Controller::Uc8253, PanelConfig::XteinkX3, Rotation::Deg90)
+        );
+        assert_eq!(
+            (
+                display.sclk,
+                display.mosi,
+                display.cs,
+                display.dc,
+                display.rst,
+                display.busy
+            ),
+            (8, 10, 21, 4, 5, 6)
+        );
+        assert_eq!(display.config.size(), (792, 528));
+        assert!(display.config.is_approximation());
+        let ids: Vec<String> = wiring.buttons().into_iter().map(|b| b.id).collect();
+        assert_eq!(
+            ids,
+            ["power", "back", "confirm", "left", "right", "up", "down"]
+        );
+        let edges: Vec<Edge> = wiring.buttons().iter().map(|b| b.placement.edge).collect();
+        assert_eq!(edges[5..], [Edge::Left, Edge::Right], "up, then down");
+        assert_eq!(wiring.target_of(USB_POWER), None, "no cable line");
+        assert_eq!((wiring.battery, wiring.power), (None, None));
+        assert_eq!(
+            wiring.sd,
+            Some(SdWiring {
+                cs: 12,
+                miso: 7,
+                power: Some(13)
+            })
+        );
+        let i2c = wiring.i2c.unwrap();
+        assert_eq!((i2c.scl, i2c.sda), (0, 20));
+        let gauge = i2c.gauge.unwrap();
+        assert_eq!(
+            (gauge.voltage_mv, gauge.state_of_charge, gauge.current_ma),
+            (3850, 70, -15)
+        );
+        let clock = i2c.clock.unwrap();
+        assert_eq!(clock.start, DateTime::new(2026, 1, 1, 0, 0, 0).unwrap());
+        assert!(!clock.oscillator_stopped);
+        let motion = i2c.motion.unwrap();
+        assert_eq!(
+            (motion.address, motion.acceleration_mg),
+            (0x6B, [0, 0, 1000])
+        );
+        assert_eq!(
+            wiring.gesture,
+            Some(PowerGesture {
+                key: "power".to_owned(),
+                hold_ms: 1500
+            })
+        );
+    }
+
+    const I2C: &str = "[wiring.i2c]\nscl = 0\nsda = 20\n";
+
+    #[test]
+    fn the_i2c_chips_are_refused_as_the_chips_refuse_them_naming_the_key() {
+        let detail = refusal(&format!(
+            "{DISPLAY}{I2C}[wiring.i2c.bq27220]\nvoltage_mv = 3850\nstate_of_charge = 101\ncurrent_ma = 0\n"
+        ));
+        assert!(detail.starts_with("`wiring.i2c.bq27220`: "), "{detail}");
+        let detail = refusal(&format!(
+            "{DISPLAY}{I2C}[wiring.i2c.qmi8658]\naddress = 0x6C\nacceleration_mg = [0, 0, 1000]\n"
+        ));
+        assert!(detail.starts_with("`wiring.i2c.qmi8658`: "), "{detail}");
+        for start in [
+            "2026-13-01T00:00:00",
+            "1999-12-31T23:59:59",
+            "2026-01-01 00:00:00",
+        ] {
+            let detail = refusal(&format!(
+                "{DISPLAY}{I2C}[wiring.i2c.ds3231]\nstart = \"{start}\"\noscillator_stopped = true\n"
+            ));
+            assert!(
+                detail.starts_with(&format!("`wiring.i2c.ds3231.start` = \"{start}\"")),
+                "{detail}"
+            );
+        }
+        let detail = refusal(&format!("{DISPLAY}[wiring.i2c]\nscl = 4\nsda = 20\n"));
+        assert!(
+            detail.starts_with("`wiring.i2c.scl` = 4: GPIO4 is already `wiring.display.dc`"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_controller_takes_only_its_own_configurations() {
+        let detail = refusal(&DISPLAY.replace("\"ssd1677\"", "\"uc8253\""));
+        assert!(
+            detail.starts_with(
+                "`wiring.display.config` = \"gdeq0426t82\": the UC8253 has no such configuration"
+            ),
+            "{detail}"
+        );
+        let x3 = DISPLAY
+            .replace("\"ssd1677\"", "\"uc8253\"")
+            .replace("\"gdeq0426t82\"", "\"xteink-x3-uc8279d\"");
+        let wiring = load(&x3).unwrap().wiring.unwrap();
+        assert_eq!(wiring.display.config, PanelConfig::XteinkX3Uc8279d);
     }
 
     #[test]
@@ -658,7 +974,15 @@ mod tests {
                 usb_detect: 20
             })
         );
-        assert_eq!(wiring.sd, Some(SdWiring { cs: 12, miso: 7 }));
+        assert_eq!(
+            wiring.sd,
+            Some(SdWiring {
+                cs: 12,
+                miso: 7,
+                power: None
+            })
+        );
+        assert_eq!(wiring.i2c, None, "the X4 has no I2C chip");
         assert_eq!(
             wiring.gesture,
             Some(PowerGesture {
@@ -725,7 +1049,11 @@ mod tests {
         let shared = load(&format!("{DISPLAY}[wiring.sd]\ncs = 12\nmiso = 7\n")).unwrap();
         assert_eq!(
             shared.wiring.unwrap().sd,
-            Some(SdWiring { cs: 12, miso: 7 })
+            Some(SdWiring {
+                cs: 12,
+                miso: 7,
+                power: None
+            })
         );
         let detail = refusal(&format!("{DISPLAY}[wiring.sd]\ncs = 21\nmiso = 7\n"));
         assert!(

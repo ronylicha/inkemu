@@ -14,8 +14,8 @@
 use crate::format::Session;
 use crate::outcome::{ConsoleDigests, End, Limits, NoTraceHash, Outcome, Reached, hex};
 use boards::{
-    ButtonsHandle, MachineOptions, PanelHandle, ProfileError, SdHandle, SdStart, Wired, WiredError,
-    WiredOptions,
+    ButtonsHandle, I2cHandle, MachineOptions, PanelHandle, ProfileError, SdHandle, SdStart, Wired,
+    WiredError, WiredOptions,
 };
 use chips::sdcard::{Overlay, SdCard, SdCardConfig};
 use emu_core::Cycles;
@@ -67,6 +67,7 @@ pub struct Replay {
     panel: Option<PanelHandle>,
     buttons: Option<ButtonsHandle>,
     sd: Option<SdHandle>,
+    i2c: Option<I2cHandle>,
     limits: Limits,
     consoles: ConsoleDigests,
     end: Option<End>,
@@ -116,6 +117,7 @@ impl Replay {
             panel,
             buttons,
             sd,
+            i2c,
         } = Wired::power_on(&device, rom, Some(session.flash.clone()), options, wired)
             .map_err(|source| ReplayError::Device { source })?;
         machine.forgo_input_journal();
@@ -134,6 +136,7 @@ impl Replay {
             panel,
             buttons,
             sd,
+            i2c,
             limits: session.limits,
             consoles: ConsoleDigests::default(),
             end: None,
@@ -170,6 +173,7 @@ impl Replay {
             panel: self.panel,
             buttons: self.buttons,
             sd: self.sd,
+            i2c: self.i2c,
         }
     }
 

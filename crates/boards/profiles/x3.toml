@@ -78,3 +78,90 @@ type = "data"
 subtype = "coredump"
 offset = 0xFF0000
 size = 0x10000
+
+# The chips around the SoC and the keys of the user: docs/research/sp3-x3-firmware.md (pins,
+# levels, sequences, from FreeInk 111fdcc7 and CrossPoint 1.6.5) and docs/research/sp3-x3-chips.md
+# (the chips). The design of sub-project 3, ADR 0015.
+# The display bus is the X4's (section 1); the controller is the first batch's, which FreeInk calls
+# UC8253 and drives with the command layout of the UC8179 (chips research, section 1). A later X3
+# carries a UC8279d: config = "xteink-x3-uc8279d".
+[wiring.display]
+controller = "uc8253"
+config = "xteink-x3"
+sclk = 8
+mosi = 10
+cs = 21
+dc = 4
+rst = 5
+busy = 6
+# Clockwise: the glass shows the framebuffer as FreeInk holds it, 792 × 528, and the firmware draws
+# portrait into it with x' = y, y' = 527 - x (section 9): a quarter turn clockwise shows it upright.
+rotation = 90
+
+# The ladders are the X4's: same pins, same thresholds, "X3 and X4 share this pinout" (section 9),
+# so the X4's levels. The side keys differ: Up on the left edge, Down on the right (section 9).
+# ASSUMPTION: the front keys sit as on the X4, left to right; the X3's shell is not described.
+[[wiring.ladder]]
+pin = 1
+idle_mv = 3300
+buttons = [
+  { id = "back", mv = 2448, edge = "bottom", order = 0 },
+  { id = "confirm", mv = 1896, edge = "bottom", order = 1 },
+  { id = "left", mv = 1061, edge = "bottom", order = 2 },
+  { id = "right", mv = 4, edge = "bottom", order = 3 },
+]
+
+[[wiring.ladder]]
+pin = 2
+idle_mv = 3300
+buttons = [
+  { id = "up", mv = 1584, edge = "left", order = 0 },
+  { id = "down", mv = 4, edge = "right", order = 0 },
+]
+
+# Low while pressed; released, the pad's pull-up (CrossPoint configures INPUT_PULLUP, section 8).
+[wiring.button.power]
+pin = 3
+active = "low"
+edge = "top"
+order = 0
+
+# The card shares the display's SCLK and MOSI; GPIO13 switches its supply, high on (section 1:
+# "confirmed by X3 factory-firmware RE"). The X3 has no power latch and no USB detect line: its
+# battery is read by the gauge, and it powers off into deep sleep (section 8).
+[wiring.sd]
+cs = 12
+miso = 7
+power = 13
+
+# The I2C bus: SDA GPIO20, SCL GPIO0, 400 kHz, the gauge, the clock and the motion sensor
+# (section 1; chips research, sections 3 to 5). Their values are parameters of the model, not
+# facts of a unit.
+[wiring.i2c]
+scl = 0
+sda = 20
+
+# ASSUMPTION: a battery at rest, 3.85 V and 70 %, discharging 15 mA (chips research, section 3.5).
+[wiring.i2c.bq27220]
+voltage_mv = 3850
+state_of_charge = 70
+current_ma = -15
+
+# A clock already set, kept by its battery: the oscillator-stop flag clear. It runs from this time
+# at power-on by the device's time, never the host's: a session replays the same clock.
+# ASSUMPTION: the time of the clock at power-on; a profile or a later sub-project chooses another.
+[wiring.i2c.ds3231]
+start = "2026-01-01T00:00:00"
+oscillator_stopped = false
+
+# At 0x6B, lying flat, screen up: 1 g along Z (chips research, section 5.5).
+# ASSUMPTION: the sensor's mounting on the board, which no source gives.
+[wiring.i2c.qmi8658]
+address = 0x6B
+acceleration_mg = [0, 0, 1000]
+
+# Every X3 cold boot is taken for a press of the power key, which CrossPoint checks is held 10 ms
+# (section 8, step 5); the hold of the X4's profile, which a user's press lasts.
+[power]
+key = "power"
+hold_ms = 1500
