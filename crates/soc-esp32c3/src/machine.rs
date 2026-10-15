@@ -16,7 +16,8 @@ use cpu_rv32::{
     MisalignedPolicy, QemuIcountTiming, StepOutcome, Trap,
 };
 use emu_core::{
-    AnalogSource, Cycles, Frequency, GpioInput, GpioOutput, SpiTarget, TimingModel, TraceHash,
+    AnalogSource, Clocked, Cycles, Frequency, GpioInput, GpioOutput, SpiTarget, TimingModel,
+    TraceHash,
 };
 
 /// `x2`, the stack pointer of the RISC-V calling convention.
@@ -1178,6 +1179,16 @@ impl Esp32C3 {
         chip: Box<dyn AnalogSource>,
     ) -> Result<(), AttachError> {
         self.bus.periph.io.attach_analog(pin, chip)
+    }
+
+    /// Attaches a chip that does work of its own over time (a display controller running a
+    /// refresh): the machine advances it to each deadline it names, in device time, whether the
+    /// CPU runs, waits for an interrupt or sleeps until a timer, and asks for its next deadline
+    /// after each call to it (ADR 0012). The same chip is usually attached by its lines too,
+    /// shared through `Rc<RefCell<_>>`: whatever a call on a line changes, its deadline is asked
+    /// again. A chip is advanced at most once at one instant.
+    pub fn attach_clocked(&mut self, chip: Box<dyn Clocked>) {
+        self.bus.periph.io.attach_clocked(&mut self.bus.ctx, chip);
     }
 
     /// An attached chip changed what it drives from outside the run (a button the user pressed):
@@ -5136,5 +5147,82 @@ mod tests {
             Err(AttachError::NoSuchPin { pin: 22 })
         ));
         assert_eq!(m.drain_diagnostics(), []);
+    }
+
+    /// A chip that has work at the instants of `deadlines`, and records when it is advanced.
+    #[derive(Debug, Default)]
+    struct Refresh {
+        deadlines: Vec<u64>,
+        advanced: Vec<u64>,
+        /// Answers `at` itself to every question: work always due, which must not hold the
+        /// machine at one instant.
+        always_due: bool,
+    }
+
+    impl Clocked for Refresh {
+        fn next_deadline(&mut self, at: emu_core::Nanos) -> Option<emu_core::Nanos> {
+            if self.always_due {
+                return Some(at);
+            }
+            self.deadlines.first().copied().map(emu_core::Nanos)
+        }
+
+        fn advance(&mut self, at: emu_core::Nanos) {
+            self.advanced.push(at.get());
+            self.deadlines.retain(|&deadline| deadline > at.get());
+        }
+    }
+
+    /// No watchdog at reset (another boot mode): only the chip's deadlines can wake the CPU.
+    fn quiet_machine(program: &[u32]) -> Esp32C3 {
+        machine_with(
+            program,
+            SocConfig {
+                strapping: 0,
+                ..SocConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_clocked_chip_is_advanced_at_its_deadlines_while_the_cpu_waits_for_an_interrupt() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        // Instants on cycles of the time base (6.25 ns), so that the wake-up is exactly there.
+        let chip = Rc::new(RefCell::new(Refresh {
+            deadlines: vec![1_000_000, 2_500_000],
+            ..Refresh::default()
+        }));
+        let mut m = quiet_machine(&[wfi(), HANG]);
+        m.attach_clocked(Box::new(Rc::clone(&chip)));
+        assert_eq!(
+            m.run_until(Cycles(10_000)),
+            StopReason::Idle,
+            "nothing left to wake the CPU once the chip has no deadline"
+        );
+        assert_eq!(chip.borrow().advanced, [1_000_000, 2_500_000]);
+        assert_eq!(m.device_time_nanos(), 2_500_000, "time stopped at the last");
+        assert_eq!(m.cycles().get(), 3, "only `wfi` was executed");
+        assert_eq!(m.drain_diagnostics(), []);
+    }
+
+    #[test]
+    fn a_clocked_chip_always_due_is_advanced_once_per_instant_and_holds_nothing() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let chip = Rc::new(RefCell::new(Refresh {
+            always_due: true,
+            ..Refresh::default()
+        }));
+        let mut m = quiet_machine(&[addi(1, 0, 1), addi(1, 1, 1), wfi(), HANG]);
+        m.attach_clocked(Box::new(Rc::clone(&chip)));
+        assert_eq!(m.run_until(Cycles(10_000)), StopReason::Idle);
+        let advanced = chip.borrow().advanced.clone();
+        assert_ne!(advanced, [], "advanced at least once");
+        assert!(
+            advanced.windows(2).all(|pair| pair[0] < pair[1]),
+            "once per instant, in order of time: {advanced:?}"
+        );
+        assert_eq!(m.cycles().get(), 5, "the two `addi` and the `wfi` ran");
     }
 }

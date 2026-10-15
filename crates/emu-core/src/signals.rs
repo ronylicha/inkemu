@@ -1,14 +1,16 @@
 //! The signals between a system-on-chip and the chips around it (spec §3.2, ADR 0012).
 //!
 //! A chip outside the `SoC` (a display controller, a memory card, a button ladder) never sees the
-//! `SoC`: it sees lines. Four traits say what a chip does on them, and nothing here knows which `SoC`
-//! drives the other end:
+//! `SoC`: it sees lines. Four traits say what a chip does on them, a fifth when it lives in time,
+//! and nothing here knows which `SoC` drives the other end:
 //!
 //! - [`GpioInput`]: the chip drives a line the `SoC` reads (a button, a BUSY line);
 //! - [`GpioOutput`]: the chip watches a line the `SoC` drives (a reset, a power latch);
 //! - [`SpiTarget`]: the chip sits on an SPI bus the `SoC` masters, selected by its chip-select line,
 //!   with an optional data/command line;
-//! - [`AnalogSource`]: the chip puts a voltage on an analog input.
+//! - [`AnalogSource`]: the chip puts a voltage on an analog input;
+//! - [`Clocked`]: the chip does work of its own over time (a display refresh) and is advanced to
+//!   the instants it names, whatever the `SoC` is doing meanwhile.
 //!
 //! The `SoC` calls them; a chip never calls the `SoC`. Time is device time in nanoseconds since
 //! power-on ([`Nanos`]), not cycles of a clock of the `SoC`: a chip counts its own durations (a
@@ -16,7 +18,7 @@
 //! time gives a deterministic run.
 //!
 //! A chip that has several lines (the BUSY output and the SPI interface of a display controller)
-//! is attached once per line; `Rc<RefCell<T>>` implements the four traits for `T`, so the same chip
+//! is attached once per line; `Rc<RefCell<T>>` implements the five traits for `T`, so the same chip
 //! can be shared between its attachments. The `SoC` never calls a chip from within a call to that
 //! chip, so the `RefCell` is never borrowed twice.
 use std::cell::RefCell;
@@ -73,8 +75,14 @@ pub trait GpioInput: std::fmt::Debug {
     /// itself, without anything the `SoC` does: the end of a busy period, the next edge of a clock
     /// the chip generates. `None` (the default): not before the `SoC` acts on the chip again.
     ///
-    /// The `SoC` asks after every call it makes to the chip, and calls [`GpioInput::level`] again at
-    /// that instant when it needs to see the change as it happens (an interrupt on the line).
+    /// The `SoC` asks only while an interrupt is configured on the line (on the ESP32-C3,
+    /// `GPIO_PINn.INT_TYPE` not 0), each time it works its pads out again: at each access to the
+    /// pad registers, at each transfer of its SPI controller, when the caller says an input
+    /// changed, and at the instant it was woken for. It then wakes at the instant given and
+    /// calls [`GpioInput::level`] there, so that the edge raises the interrupt as it happens.
+    /// Without an interrupt on the line, a change is seen at the next read of the line, not
+    /// before: a chip that must act at an instant whatever the `SoC` reads implements
+    /// [`Clocked`].
     fn next_change(&mut self, at: Nanos) -> Option<Nanos> {
         let _ = at;
         None
@@ -94,17 +102,30 @@ pub trait GpioOutput: std::fmt::Debug {
 ///
 /// The transfers are whole: the bytes the master clocked out, and the bytes the chip clocked back,
 /// one for one. A chip sees a transfer only while it is selected; traffic made by toggling the
-/// lines one by one from software is seen as level changes by a [`GpioOutput`] on those lines,
-/// not here.
+/// lines one by one from software (the half-duplex read of a panel on its MOSI line, for one) is
+/// seen as level changes by a [`GpioOutput`] on the clock and data lines, and answered by a
+/// [`GpioInput`] on the line the chip drives, not here.
+///
+/// - A selection may come without a transfer: a driver routing its chip-select pin can pulse it
+///   (ESP-IDF's `spicommon_cs_initialize` drives it low for a few instructions before it connects
+///   the controller's chip select). A selection alone is no command.
+/// - With a chip select the controller drives itself, [`SpiTarget::select`] with `true`, the
+///   transfer and [`SpiTarget::select`] with `false` come at the same instant, the end of the
+///   transaction: the controller asserts and releases the line around its own clock pulses. With
+///   a chip select driven from software, the selection spans as many transfers as the software
+///   makes before releasing it.
 pub trait SpiTarget: std::fmt::Debug {
     /// The chip-select line changed at `at`: `selected` is `true` when it became active (low).
     fn select(&mut self, selected: bool, at: Nanos);
 
     /// One transfer while the chip is selected, ending at `at`. `mosi` holds the bytes the master
-    /// sent, first byte first, most significant bit first. `miso` is as long as `mosi` and holds the
-    /// level the data-in line idles at (`0xFF` or `0x00`): the chip overwrites the bytes it drives.
-    /// `dc` is the level of the chip's data/command line during the transfer, `None` when the chip
-    /// has no such line.
+    /// sent, first byte first, most significant bit first. `dc` is the level of the chip's
+    /// data/command line during the transfer, `None` when the chip has no such line.
+    ///
+    /// `miso` is as long as `mosi` and holds what the master would read if the chip drove nothing:
+    /// `0xFF` when the master's data-in line reads high at that instant (a pull-up on the pad), `0x00`
+    /// when it reads low (a pad with no pull, or a pull-down). The chip overwrites the bytes it
+    /// drives.
     fn transfer(&mut self, dc: Option<Level>, mosi: &[u8], miso: &mut [u8], at: Nanos);
 }
 
@@ -112,6 +133,25 @@ pub trait SpiTarget: std::fmt::Debug {
 pub trait AnalogSource: std::fmt::Debug {
     /// The voltage on the line at `at`, in millivolts.
     fn millivolts(&mut self, at: Nanos) -> u32;
+}
+
+/// A chip that does work of its own over time (a display controller running a refresh, a card
+/// finishing a write): the `SoC` advances it to each instant it names, in device time, whether
+/// the `SoC` is running, waiting for an interrupt or waiting for a timer.
+///
+/// The `SoC` asks [`Clocked::next_deadline`] when the chip is attached and again after every call
+/// it makes to the chip (an advance, a transfer, a level asked or heard), and wakes at the instant
+/// given to call [`Clocked::advance`] there. Calls come in order of time, and a chip is advanced
+/// at most once at a given instant: a deadline that is not after the instant the chip was last
+/// advanced at waits for time to move on, so a chip cannot hold the `SoC` at one instant.
+pub trait Clocked: std::fmt::Debug {
+    /// The instant the chip must be advanced at, at the latest: `at` or before when it has work
+    /// due now, `None` when it has nothing to do until the `SoC` acts on it.
+    fn next_deadline(&mut self, at: Nanos) -> Option<Nanos>;
+
+    /// Brings the chip to `at`, doing the work due by then. `at` is device time when the `SoC` is
+    /// woken: the deadline, or the first instant of the `SoC`'s time base at or after it.
+    fn advance(&mut self, at: Nanos);
 }
 
 impl<T: GpioInput + ?Sized> GpioInput for Rc<RefCell<T>> {
@@ -143,6 +183,16 @@ impl<T: SpiTarget + ?Sized> SpiTarget for Rc<RefCell<T>> {
 impl<T: AnalogSource + ?Sized> AnalogSource for Rc<RefCell<T>> {
     fn millivolts(&mut self, at: Nanos) -> u32 {
         self.borrow_mut().millivolts(at)
+    }
+}
+
+impl<T: Clocked + ?Sized> Clocked for Rc<RefCell<T>> {
+    fn next_deadline(&mut self, at: Nanos) -> Option<Nanos> {
+        self.borrow_mut().next_deadline(at)
+    }
+
+    fn advance(&mut self, at: Nanos) {
+        self.borrow_mut().advance(at);
     }
 }
 
@@ -202,6 +252,17 @@ mod tests {
         }
     }
 
+    impl Clocked for Recorder {
+        fn next_deadline(&mut self, at: Nanos) -> Option<Nanos> {
+            self.calls.push(format!("next_deadline {}", at.get()));
+            Some(Nanos(at.get() + 10))
+        }
+
+        fn advance(&mut self, at: Nanos) {
+            self.calls.push(format!("advance {}", at.get()));
+        }
+    }
+
     #[test]
     fn a_shared_chip_answers_every_attachment_it_is_shared_between() {
         let chip = Rc::new(RefCell::new(Recorder::default()));
@@ -209,6 +270,7 @@ mod tests {
         let mut as_output: Box<dyn GpioOutput> = Box::new(Rc::clone(&chip));
         let mut as_target: Box<dyn SpiTarget> = Box::new(Rc::clone(&chip));
         let mut as_source: Box<dyn AnalogSource> = Box::new(Rc::clone(&chip));
+        let mut as_clocked: Box<dyn Clocked> = Box::new(Rc::clone(&chip));
         assert_eq!(as_input.level(Nanos(1)), Some(Level::High));
         assert_eq!(as_input.next_change(Nanos(1)), None, "the default");
         as_output.driven(Some(Level::Low), Nanos(2));
@@ -217,6 +279,8 @@ mod tests {
         as_target.transfer(Some(Level::High), &[0x12, 0x34], &mut miso, Nanos(4));
         assert_eq!(miso, [0x13, 0x35]);
         assert_eq!(as_source.millivolts(Nanos(5)), 1650);
+        assert_eq!(as_clocked.next_deadline(Nanos(6)), Some(Nanos(16)));
+        as_clocked.advance(Nanos(16));
         assert_eq!(
             chip.borrow().calls,
             [
@@ -225,6 +289,8 @@ mod tests {
                 "select true 3",
                 "transfer Some(High) [12, 34] 4",
                 "millivolts 5",
+                "next_deadline 6",
+                "advance 16",
             ]
         );
     }

@@ -285,6 +285,67 @@ fn the_pins_are_read_again_at_the_instant_a_chip_announces_while_an_interrupt_wa
     assert_eq!(ctx.next_wake(), None, "the chip announces nothing more");
 }
 
+/// A panel whose reset line starts a 2 µs piece of work, which drives its BUSY line high while it
+/// lasts: a clocked chip shared between its lines.
+#[derive(Debug, Default)]
+struct Busy {
+    until: Option<Nanos>,
+    advanced: Vec<u64>,
+}
+
+impl GpioOutput for Busy {
+    fn driven(&mut self, level: Option<Level>, at: Nanos) {
+        if level == Some(Level::High) {
+            self.until = Some(Nanos(at.get() + 2_000));
+        }
+    }
+}
+
+impl GpioInput for Busy {
+    fn level(&mut self, _at: Nanos) -> Option<Level> {
+        Some(Level::from_bool(self.until.is_some()))
+    }
+}
+
+impl Clocked for Busy {
+    fn next_deadline(&mut self, _at: Nanos) -> Option<Nanos> {
+        self.until
+    }
+
+    fn advance(&mut self, at: Nanos) {
+        self.advanced.push(at.get());
+        if self.until.is_some_and(|until| until <= at) {
+            self.until = None;
+        }
+    }
+}
+
+#[test]
+fn a_clocked_chip_is_asked_its_deadline_after_a_call_on_its_lines_and_advanced_there() {
+    // No interrupt on BUSY: only the clocked attachment brings the chip to the end of its work.
+    let ctx = &mut Ctx::default();
+    let mut io = IoMatrix::new(0x8);
+    let chip = Rc::new(RefCell::new(Busy::default()));
+    io.attach_output(ctx, 5, Box::new(Rc::clone(&chip)))
+        .unwrap();
+    io.attach_input(ctx, 6, Box::new(Rc::clone(&chip))).unwrap();
+    io.attach_clocked(ctx, Box::new(Rc::clone(&chip)));
+    write(&mut io, ctx, pad_reg(6), GPIO_PAD);
+    assert_eq!(ctx.next_wake(), None, "no work: no wake-up");
+    output(&mut io, ctx, 5, true);
+    assert_eq!(read(&mut io, ctx, IN) & (1 << 6), 1 << 6, "busy");
+    // 2 µs is 320 cycles of the time base.
+    assert_eq!(ctx.next_wake(), Some(Cycles(320)));
+    ctx.sleep_until(Cycles(320));
+    pump(ctx, |ctx, event| {
+        assert_eq!(event, Event::Pins);
+        io.wake(ctx);
+    });
+    assert_eq!(chip.borrow().advanced, [2_000], "at its deadline, once");
+    assert_eq!(ctx.next_wake(), None, "the chip has nothing more to do");
+    assert_eq!(read(&mut io, ctx, IN) & (1 << 6), 0, "no longer busy");
+}
+
 #[test]
 fn a_signal_of_a_peripheral_the_model_lacks_and_an_nmi_are_refused_by_name() {
     let ctx = &mut Ctx::default();
