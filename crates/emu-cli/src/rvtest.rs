@@ -1,5 +1,5 @@
 //! Minimal test machine for riscv-tests and riscv-arch-test: RAM at `0x8000_0000` plus a `tohost` mailbox.
-use cpu_rv32::{DatasheetTiming, Hart, HartConfig, StepOutcome};
+use cpu_rv32::{Core, DatasheetTiming, Hart, HartConfig, MisalignedPolicy, StepOutcome};
 use emu_core::{AccessKind, AccessSize, Bus, BusError, Ram, ReadOutcome, TraceHash};
 use goblin::elf::{Elf, program_header::PT_LOAD};
 use thiserror::Error;
@@ -27,6 +27,18 @@ pub enum RvTestError {
         "signature region is outside test RAM; check that begin_signature and end_signature lie inside a loaded segment"
     )]
     SignatureOutOfRange,
+}
+
+/// The hart the conformance suites run on: machine and user modes with a 16-entry PMP
+/// ([`Core::MachineUser`], the machine `tools/conformance/riscof/sail` configures Sail as), its
+/// misaligned loads and stores trapping unless `misaligned` says otherwise.
+#[must_use]
+pub fn bench_hart(misaligned: MisalignedPolicy) -> HartConfig {
+    HartConfig {
+        misaligned,
+        core: Core::MachineUser,
+        ..HartConfig::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

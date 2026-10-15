@@ -1,7 +1,7 @@
 //! Runs every committed riscv-tests ELF; any failure outside the documented skip list fails CI.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use cpu_rv32::HartConfig;
-use emu_cli::rvtest::{RunResult, TestMachine};
+use cpu_rv32::{HartConfig, MisalignedPolicy};
+use emu_cli::rvtest::{RunResult, TestMachine, bench_hart};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
@@ -9,6 +9,11 @@ const MAX_STEPS: u64 = 5_000_000;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// The hart `inkemu rvtest` runs the suites on.
+fn bench() -> HartConfig {
+    bench_hart(MisalignedPolicy::Trap)
 }
 
 fn fixture_dir() -> PathBuf {
@@ -55,8 +60,7 @@ fn all_riscv_tests_pass_except_documented_skips() {
         if skips.contains(&name) {
             continue;
         }
-        let mut m =
-            TestMachine::from_elf(&std::fs::read(path).unwrap(), HartConfig::default()).unwrap();
+        let mut m = TestMachine::from_elf(&std::fs::read(path).unwrap(), bench()).unwrap();
         ran += 1;
         match m.run(MAX_STEPS) {
             RunResult::Passed => {}
@@ -127,7 +131,7 @@ fn skip_list_entries_exist_and_have_reasons() {
 fn same_test_twice_gives_same_trace_hash() {
     let bytes = std::fs::read(fixture_dir().join("rv32ui-p-add")).unwrap();
     let run = || {
-        let mut m = TestMachine::from_elf(&bytes, HartConfig::default()).unwrap();
+        let mut m = TestMachine::from_elf(&bytes, bench()).unwrap();
         assert_eq!(m.run(MAX_STEPS), RunResult::Passed);
         m.trace_hash()
     };
@@ -141,7 +145,7 @@ const LW_SIGNATURE: [u32; 4] = [0x00ff_00ff, 0xff00_ff00, 0x0ff0_0ff0, 0xf00f_f0
 #[test]
 fn signature_returns_the_words_of_the_signature_region() {
     let bytes = std::fs::read(fixture_dir().join("rv32ui-p-lw")).unwrap();
-    let mut m = TestMachine::from_elf(&bytes, HartConfig::default()).unwrap();
+    let mut m = TestMachine::from_elf(&bytes, bench()).unwrap();
     assert_eq!(m.run(MAX_STEPS), RunResult::Passed);
     assert_eq!(m.signature().unwrap(), LW_SIGNATURE);
 }
@@ -150,7 +154,7 @@ fn signature_returns_the_words_of_the_signature_region() {
 fn signature_is_empty_when_the_region_is_empty() {
     // rv32ui-p-add has begin_signature == end_signature.
     let bytes = std::fs::read(fixture_dir().join("rv32ui-p-add")).unwrap();
-    let mut m = TestMachine::from_elf(&bytes, HartConfig::default()).unwrap();
+    let mut m = TestMachine::from_elf(&bytes, bench()).unwrap();
     assert_eq!(m.run(MAX_STEPS), RunResult::Passed);
     assert_eq!(m.signature().unwrap(), Vec::<u32>::new());
 }
