@@ -205,14 +205,27 @@ Une carte SD en mode SPI (`chips::sdcard`), sur la broche CS 12 et la MISO 7 du 
 brute puis à un dossier de l'hôte, dont le contenu de départ entre dans la session comme la flash ; c'est ce qui
 mène CrossPoint à son écran d'accueil.
 
-## 9. Ce qui dépend de la version finale de SP2b
+## 9. Ce qui dépend de SP2b (vérifié sur `main` à `0a04195`, tâche 0) et de SP2e
 
-| Point | Hypothèse de ce document | Si SP2b diffère |
+SP2b est fusionné (PR #18). Chaque point a été relu dans `crates/emu-core/src/signals.rs`,
+`crates/soc-esp32c3/src/periph/io/mod.rs`, `machine.rs`, `periph/rtc_cntl/` et la section « Pour SP2d » de la note
+de SP2b.
+
+| Point | Constaté | Effet sur SP2d |
 |---|---|---|
-| `Clocked` et `Esp32C3::attach_clocked` publics | présents, avec la sémantique du fichier `signals.rs` de la branche | adapter 2d-D5 au contrat livré |
-| Une même broche porte un `SpiTarget` (SCLK, MOSI, CS, D/C) et des `GpioOutput` ; la broche 10 porte aussi un `GpioInput` | permis (`InputTaken` seulement pour deux entrées) | sinon, une seule attache par puce qui multiplexe ses rôles |
-| Un transfert de GP-SPI2 ne fait pas entendre de fronts de bit aux `GpioOutput` de SCLK et MOSI | vrai (la sortie du pad est le signal du périphérique, à son repos) | l'adaptateur bit-bang ignore les fronts pendant une sélection matérielle |
-| `next_change` demandé seulement si une interruption GPIO est configurée | vrai ; SP2d l'étend aux broches de réveil pendant un sommeil profond | — |
-| `inputs_changed` réévalue les broches | la livraison d'une entrée de carte réutilise ce chemin interne | — |
-| La conversion tension → code de l'ADC (`Calibration::reading`) | testable par la machine (une conversion lancée par un petit programme ou une fonction de test) | sinon, exposer la conversion en `test-support` |
-| Les registres `PAD_HOLD`, `DIG_PAD_HOLD`, `GPIO_WAKEUP` | stockés ou acceptés sans effet aujourd'hui | SP2d leur donne leur effet dans tous les cas |
+| `Clocked`, `Esp32C3::attach_clocked` | publics ; une puce cadencée est avancée à ses échéances pendant l'exécution, un `WFI`, un sommeil profond et à travers un reset du cœur, avant tout autre appel à une puce, une fois par instant (une échéance restée due est reprise au cycle suivant) ; 1 000 avances sans progrès la nomment (`ClockedChipStuck`) ; un sommeil profond ne finit faute de réveil qu'une fois qu'aucune puce n'a d'échéance | 2d-D5 inchangé ; le SSD1677 n'a d'échéance que pendant une opération : il ne retient pas un sommeil |
+| Plusieurs attaches sur une broche | une seule `GpioInput` par broche (`InputTaken`) ; des `GpioOutput` en nombre ; les broches d'un `SpiTarget` ne sont pas réservées | les rôles du SSD1677 se branchent tels quels (MOSI : une sortie observée, une entrée pilotée) |
+| Fronts de GP-SPI2 sur les `GpioOutput` | aucun : une broche routée sur `FSPICLK`/`FSPID` est entendue au niveau de repos du signal, pas bit à bit (`IoMatrix::settle`, `signal_high`) | le bit-bang ne voit que le trafic écrit par GPIO |
+| `next_change` | demandé seulement quand `GPIO_PINn.INT_TYPE` ≠ 0 ; en sommeil profond, seules les puces cadencées sont avancées, les broches ne sont pas évaluées | SP2d ajoute l'évaluation des broches de réveil en sommeil et leur `next_change` (2d-D11) |
+| `inputs_changed` | appelle `IoMatrix::settle` | l'application d'une entrée de carte appelle le même `settle` |
+| Conversion de l'ADC | `Calibration::reading` est `pub(crate)` | les tensions des échelles se vérifient par une conversion réelle de la machine (un petit programme qui lance une conversion), sans rien exposer |
+| `PAD_HOLD`, `DIG_PAD_HOLD`, `GPIO_WAKEUP`, `EXT_WAKEUP_CONF`, `DIG_ISO` | stockés sans effet (table de `rtc_cntl/mod.rs`) ; `WAKEUP_ENA` bit 2 est signalé puis ignoré (le sommeil ne se fie qu'au timer) | SP2d leur donne leur effet (2d-D11, 2d-D12) et retire le refus |
+
+**SP2e (carte SD, PR #19, non fusionné).** Sa spec §9 liste ses ajouts aux tâches 0, 4, 9, 11 à 15, 17 et 18 :
+`chips::sdcard::lines::SdLines` (`SpiTarget` d'un `SdSlot`, base 1 GHz), `[wiring.sd] cs = 12, miso = 7`
+(SCLK et MOSI partagés avec l'écran), `WiredOptions.sd: Option<SdStart>` et une poignée `SdHandle`, la carte dans le
+format de session 2, `inkemu run --sd-image`, `Setup.sd`, la boîte de démarrage, et CrossPoint jusqu'à son écran
+d'accueil avec une image vierge. SP2d prépare les points d'accroche sans dépendre de ses types : la validation du
+profil admet le partage de SCLK et MOSI par deux cibles SPI, `WiredOptions` et `Setup` sont des structures qu'on
+étend, et le format 2 garde ses entrées dans des sections étiquetées qu'une section de carte peut suivre. La carte
+n'est branchée qu'après la fusion de SP2e.
