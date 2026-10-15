@@ -9,6 +9,7 @@ use host::engine::{Limits, Notice};
 use serde::{Deserialize, Serialize};
 use soc_esp32c3::{ConsoleChannel, UsbHost};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use tauri::State;
 use tauri::ipc::{Channel, Response};
@@ -94,6 +95,8 @@ pub struct Shell {
     running: Mutex<Option<Running>>,
     stopping: Stopping,
     language: Mutex<Language>,
+    /// A closing of the application is under way ([`Shell::begin_closing`]).
+    closing: AtomicBool,
 }
 
 /// Refuses a command meant for the emulator of start `asked` when the one held is another (or
@@ -160,16 +163,6 @@ impl Shell {
             .is_some_and(|running| running.emulator.holds_flash_file(path))
     }
 
-    /// A handle to the running emulator, whichever it is: for its image.
-    fn handle(&self) -> Result<Handle, ErrorDto> {
-        self.running
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map(|running| running.emulator.handle())
-            .ok_or_else(|| ErrorDto::from(CommandError::Stopped))
-    }
-
     /// A handle to the emulator of start `start`, refused when another runs ([`same_start`]).
     fn handle_of(&self, start: u64) -> Result<Handle, ErrorDto> {
         let running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
@@ -180,14 +173,52 @@ impl Shell {
             .ok_or_else(|| ErrorDto::from(CommandError::Stopped))
     }
 
-    /// Keeps `emulator` as start `start`, and gives back the one it replaces (two starts at
-    /// once), counted as a power-off under way, which the caller powers off without the lock.
-    fn keep(&self, start: u64, emulator: Emulator) -> Option<(Emulator, StopGuard)> {
-        self.running
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    /// Keeps, of `emulator` (start `start`) and the one that runs, the one of the later start:
+    /// two starts answered out of order leave the one the user asked for last. Says whether
+    /// `emulator` is kept, and gives back the other, counted as a power-off under way, which the
+    /// caller powers off without the lock.
+    fn keep(&self, start: u64, emulator: Emulator) -> (bool, Option<(Emulator, StopGuard)>) {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        if running.as_ref().is_some_and(|held| held.start > start) {
+            return (false, Some((emulator, self.stopping.begin())));
+        }
+        let replaced = running
             .replace(Running { start, emulator })
-            .map(|replaced| (replaced.emulator, self.stopping.begin()))
+            .map(|replaced| (replaced.emulator, self.stopping.begin()));
+        (true, replaced)
+    }
+
+    /// Gives `command` to the emulator of start `start`, refused when another runs
+    /// ([`Shell::handle_of`]).
+    fn submit(&self, start: u64, command: Command) -> Result<device::Pending, ErrorDto> {
+        Ok(self.handle_of(start)?.submit(command)?)
+    }
+
+    /// The last image of the emulator of start `start`, encoded; empty before its first, or when
+    /// another runs.
+    fn frame_bytes(&self, start: u64) -> Vec<u8> {
+        self.handle_of(start)
+            .ok()
+            .and_then(|handle| handle.frame())
+            .map(|frame| frame.encode())
+            .unwrap_or_default()
+    }
+
+    /// Marks the application as closing: `true` for the first request, which powers off and
+    /// closes; the requests that follow only wait for it (2c-R17).
+    pub fn begin_closing(&self) -> bool {
+        !self.closing.swap(true, Ordering::SeqCst)
+    }
+
+    /// Whether a closing is under way.
+    #[must_use]
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+
+    /// The closing is done: the window may go.
+    pub fn end_closing(&self) {
+        self.closing.store(false, Ordering::SeqCst);
     }
 }
 
@@ -370,18 +401,25 @@ async fn start(
         }),
     )
     .map_err(|e| ErrorDto::new("powerOn", e))?;
-    if let Some((replaced, under_way)) = shell.keep(number, emulator) {
+    let (kept, other) = shell.keep(number, emulator);
+    if let Some((other, under_way)) = other {
         // What its last life could not keep reaches the journal through its own updates, which
         // the interface keeps (app/src/state/reducer.ts). Counted until it ends: the
-        // application does not close while it writes.
+        // application does not close while it writes. Its thread failing to join says nothing
+        // of the emulator kept: the start is answered all the same.
         let _ = tauri::async_runtime::spawn_blocking(move || {
-            let ended = replaced.shutdown();
+            let ended = other.shutdown();
             drop(under_way);
             ended
         })
-        .await?;
+        .await;
     }
-    Ok(started)
+    if kept {
+        Ok(started)
+    } else {
+        // A later start was answered first: this one is powered off, as replaced.
+        Err(ErrorDto::from(CommandError::Stopped))
+    }
 }
 
 /// The language the interface speaks, said when it starts and whenever the user changes it: the
@@ -474,7 +512,7 @@ pub fn command(
     start: u64,
     answer: Channel<Option<ErrorDto>>,
 ) -> Result<(), ErrorDto> {
-    let pending = shell.handle_of(start)?.submit(command.into_command()?)?;
+    let pending = shell.submit(start, command.into_command()?)?;
     tauri::async_runtime::spawn_blocking(move || {
         // A window that closed takes no answer.
         let _ = answer.send(pending.wait().err().map(ErrorDto::from));
@@ -482,18 +520,13 @@ pub fn command(
     Ok(())
 }
 
-/// The last image of the panel, encoded (`PanelFrame::encode`); empty before the first.
+/// The last image of the panel of the emulator of start `start`, encoded (`PanelFrame::encode`);
+/// empty before the first, or when another emulator runs.
 // Tauri hands a command its state by value: the signature is the framework's.
 #[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
-pub fn frame(shell: State<'_, Shell>) -> Response {
-    let bytes = shell
-        .handle()
-        .ok()
-        .and_then(|handle| handle.frame())
-        .map(|frame| frame.encode())
-        .unwrap_or_default();
-    Response::new(bytes)
+pub fn frame(shell: State<'_, Shell>, start: u64) -> Response {
+    Response::new(shell.frame_bytes(start))
 }
 
 /// The notices of the material inkemu embeds (`inkemu licenses`).
@@ -505,6 +538,93 @@ pub fn notices() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::{self, Receiver};
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_secs(60);
+
+    /// A real emulator of `host`'s looping test device, whose power-off lasts `slow_end`, and
+    /// its updates.
+    fn emulator(slow_end: Duration) -> (Emulator, Receiver<Update>) {
+        let (sender, updates) = mpsc::channel();
+        let emulator = Emulator::start(
+            host::test_support::looping_device(slow_end),
+            Speed::Fastest,
+            Box::new(move |update| {
+                let _ = sender.send(update);
+            }),
+        )
+        .unwrap();
+        (emulator, updates)
+    }
+
+    fn first_frame(updates: &Receiver<Update>) {
+        let asked = Instant::now();
+        while asked.elapsed() < WAIT {
+            if let Ok(Update::Frame { .. }) = updates.recv_timeout(WAIT) {
+                return;
+            }
+        }
+        panic!("no frame");
+    }
+
+    /// With a real emulator: commands and images go only to the start they name, and the shell
+    /// stays on while the emulator's power-off (slow here) writes its files, which a power-off of
+    /// the shell waits for.
+    #[test]
+    fn the_shell_drives_one_start_and_stays_on_while_it_powers_off() {
+        let shell = Arc::new(Shell::default());
+        let (running, updates) = emulator(Duration::from_millis(400));
+        let (kept, replaced) = shell.keep(1, running);
+        assert!(kept && replaced.is_none());
+        first_frame(&updates);
+        // An earlier start's command is refused; the running one's is done.
+        assert_eq!(shell.submit(0, Command::Pause).unwrap_err().kind, "stopped");
+        shell.submit(1, Command::Pause).unwrap().wait().unwrap();
+        assert_ne!(shell.frame_bytes(1), Vec::<u8>::new());
+        assert_eq!(shell.frame_bytes(0), Vec::<u8>::new());
+        let off = Arc::clone(&shell);
+        let asked = Instant::now();
+        let powering_off = std::thread::spawn(move || off.power_off());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(shell.is_on(), "on while the power-off writes");
+        assert_eq!(powering_off.join().unwrap(), Ok(()));
+        assert!(asked.elapsed() >= Duration::from_millis(350));
+        assert!(!shell.is_on());
+    }
+
+    /// Two starts answered out of order: the later start's emulator is kept, the other powered
+    /// off, and its start is refused.
+    #[test]
+    fn the_later_start_is_kept_whatever_the_order_of_the_answers() {
+        let shell = Shell::default();
+        let (later, _later_updates) = emulator(Duration::ZERO);
+        let (earlier, _earlier_updates) = emulator(Duration::ZERO);
+        let (kept, other) = shell.keep(2, later);
+        assert!(kept && other.is_none());
+        let (kept, other) = shell.keep(1, earlier);
+        assert!(!kept);
+        let (earlier, under_way) = other.unwrap();
+        assert!(shell.is_on());
+        earlier.shutdown().unwrap();
+        drop(under_way);
+        shell.submit(2, Command::Pause).unwrap().wait().unwrap();
+        assert_eq!(shell.submit(1, Command::Pause).unwrap_err().kind, "stopped");
+        assert_eq!(shell.power_off(), Ok(()));
+    }
+
+    /// The first request to close powers off; those that follow only wait for it.
+    #[test]
+    fn a_second_request_to_close_waits_for_the_first() {
+        let shell = Shell::default();
+        assert!(!shell.is_closing());
+        assert!(shell.begin_closing());
+        assert!(!shell.begin_closing());
+        assert!(shell.is_closing());
+        shell.end_closing();
+        assert!(!shell.is_closing());
+        assert!(shell.begin_closing());
+    }
 
     #[test]
     fn a_command_of_the_interface_reads_as_a_command_of_the_host() {
@@ -579,7 +699,7 @@ mod tests {
     #[test]
     fn a_shell_without_an_emulator_says_it_has_stopped() {
         let shell = Shell::default();
-        assert_eq!(shell.handle().unwrap_err().kind, "stopped");
+        assert_eq!(shell.handle_of(1).unwrap_err().kind, "stopped");
         assert!(!shell.is_on());
         assert!(!shell.holds_flash_file(std::path::Path::new("flash.bin")));
         assert_eq!(shell.power_off(), Ok(()));

@@ -35,29 +35,38 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::set_language,
         ])
         .on_window_event(|window, event| {
+            let shell = window.state::<Shell>();
             if let WindowEvent::CloseRequested { api, .. } = event
-                && window.state::<Shell>().is_on()
+                && (shell.is_on() || shell.is_closing())
             {
-                // The window stays until the device is off; closing it again then finds nothing
-                // running and goes through.
+                // The window stays until the device is off and its dialog answered; closing it
+                // again meanwhile only waits for the first closing, whose dialog must show.
                 api.prevent_close();
-                let window = window.clone();
-                std::thread::spawn(move || {
-                    power_off_telling(window.app_handle());
-                    let _ = window.close();
-                });
+                if shell.begin_closing() {
+                    let window = window.clone();
+                    std::thread::spawn(move || {
+                        power_off_telling(window.app_handle());
+                        window.state::<Shell>().end_closing();
+                        let _ = window.close();
+                    });
+                }
             }
         })
         .build(tauri::generate_context!())?;
     watch_signals(app.handle().clone());
     app.run(|app, event| match event {
-        RunEvent::ExitRequested { api, code, .. } if app.state::<Shell>().is_on() => {
+        RunEvent::ExitRequested { api, code, .. }
+            if app.state::<Shell>().is_on() || app.state::<Shell>().is_closing() =>
+        {
             api.prevent_exit();
-            let app = app.clone();
-            std::thread::spawn(move || {
-                power_off_telling(&app);
-                app.exit(code.unwrap_or(0));
-            });
+            if app.state::<Shell>().begin_closing() {
+                let app = app.clone();
+                std::thread::spawn(move || {
+                    power_off_telling(&app);
+                    app.state::<Shell>().end_closing();
+                    app.exit(code.unwrap_or(0));
+                });
+            }
         }
         // The last resort, when the process ends some other way: nothing is left to tell.
         RunEvent::Exit => {
@@ -95,13 +104,19 @@ fn watch_signals(app: AppHandle) {
         if signalled.swap(true, Ordering::SeqCst) {
             std::process::exit(130);
         }
+        let shell = app.state::<Shell>();
+        // A closing under way powers off and exits itself, after its dialog: the signal leaves
+        // it to it (a second signal still exits at once).
+        if !shell.begin_closing() {
+            return;
+        }
         // No dialog: the user may be gone (a session that ends); the same words, in the
         // interface's language, go to the terminal.
-        let shell = app.state::<Shell>();
         if let Err(detail) = shell.power_off() {
             let (title, text) = commands::closing_dialog(shell.language(), &detail);
             eprintln!("{title}\n{text}");
         }
+        shell.end_closing();
         app.exit(130);
     });
     if let Err(e) = watched {

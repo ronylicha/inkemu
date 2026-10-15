@@ -5,11 +5,12 @@ import { asHostError, useHost } from "../ipc/host";
 import type { HostError, PanelDescription } from "../ipc/types";
 import { type FlashStep, flashSteps } from "../panel/refresh";
 import { fitScale, toPicture, turnedSize } from "../panel/render";
+import type { FrameSignal } from "../state/reducer";
 
 interface Props {
   panel: PanelDescription;
   /** The last refresh the host announced; a change fetches its image. */
-  signal: { generation: number; life: number } | null;
+  signal: FrameSignal | null;
   /** An image that could not be fetched or read: the panel keeps the last one. */
   onError(error: HostError): void;
 }
@@ -61,7 +62,8 @@ export function PanelCanvas({ panel, signal, onError }: Props) {
     let cancelled = false;
     const timers: number[] = [];
     host
-      .frame()
+      // The image of the emulator that announced it: the shell gives none of another.
+      .frame(signal.start)
       .then((frame) => {
         if (cancelled || frame === null) {
           return;

@@ -75,7 +75,8 @@ describe("reducer", () => {
       { event: "lifeEnded", data: { life: 1, end: "interrupted", verdict: null } },
     );
     expect(state.status).toEqual(status);
-    expect(state.frame).toEqual({ generation: 3, life: 1 });
+    // Of the emulator that announced it, the first start's.
+    expect(state.frame).toEqual({ start: 1, generation: 3, life: 1 });
     expect(state.lastEnd).toEqual({ life: 1, end: "interrupted", verdict: null });
     state = send(state, 1, { event: "stopped" });
     expect(state.phase).toBe("off");

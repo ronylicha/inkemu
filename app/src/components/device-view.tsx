@@ -2,13 +2,14 @@ import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n/i18n";
 import type { ButtonSpec, Edge, HostError, Look, Status } from "../ipc/types";
 import { buttonForKey } from "../keyboard";
+import type { FrameSignal } from "../state/reducer";
 import { labelOf } from "./labels";
 import { PanelCanvas } from "./panel-canvas";
 
 interface Props {
   look: Look;
   deviceName: string;
-  signal: { generation: number; life: number } | null;
+  signal: FrameSignal | null;
   status: Status | null;
   /** Presses (`true`) or releases a button. */
   onButton(id: string, pressed: boolean): void;

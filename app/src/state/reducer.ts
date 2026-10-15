@@ -29,6 +29,13 @@ export interface JournalEntry extends Notice {
   id: number;
 }
 
+/** A refresh the host announced: of which emulator (its start), which life, which generation. */
+export interface FrameSignal {
+  start: number;
+  generation: number;
+  life: number;
+}
+
 export interface LifeEnd {
   life: number;
   end: RunEnd;
@@ -58,7 +65,7 @@ export interface AppState {
   status: Status | null;
   lastEnd: LifeEnd | null;
   /** The generation of the last refresh the host announced, and of which life. */
-  frame: { generation: number; life: number } | null;
+  frame: FrameSignal | null;
   error: HostError | null;
   /** The last line of the interface's own, which a screen reader announces. */
   told: string;
@@ -144,7 +151,14 @@ function applyUpdate(state: AppState, update: Update): AppState {
     case "notice":
       return withNotices(state, [update.data]);
     case "frame":
-      return { ...state, frame: { generation: update.data.generation, life: update.data.life } };
+      return {
+        ...state,
+        frame: {
+          start: state.current,
+          generation: update.data.generation,
+          life: update.data.life,
+        },
+      };
     case "status":
       return { ...state, status: update.data };
     case "lifeEnded":

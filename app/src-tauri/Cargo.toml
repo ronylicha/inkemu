@@ -35,6 +35,8 @@ soc-esp32c3 = { path = "../../crates/soc-esp32c3" }
 
 [dev-dependencies]
 serde_json = "1"
+# The looping test device of `host`, to drive the shell with real emulators.
+host = { path = "../../crates/host", features = ["test-support"] }
 
 # The lints of the root workspace, which this one does not inherit.
 [lints.rust]
