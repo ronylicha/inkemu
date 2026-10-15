@@ -150,11 +150,13 @@ jobs:
         # Each command must run exactly the expected number of tests, all passing: a renamed or
         # un-ignored test would otherwise leave this job green with nothing proven. Every suite
         # runs even when one before it fails, so that one run shows every failure, and the step
-        # fails at the end if any did.
+        # fails at the end if any did. The command line's suite holds the SD card run and its replay
+        # (sub-project 2e) and the presses of a console script on the X4 (sub-project 2d), which need
+        # the ROM only.
         run: |
           failed=0
           tools/ci/run-ignored-tests.sh 19 --release -p soc-esp32c3 --test real_rom -- --ignored || failed=1
-          tools/ci/run-ignored-tests.sh 28 --release -p emu-cli --test run_cli -- --ignored --skip reference_firmware || failed=1
+          tools/ci/run-ignored-tests.sh 30 --release -p emu-cli --test run_cli -- --ignored --skip reference_firmware || failed=1
           tools/ci/run-ignored-tests.sh 2 --release -p host --test real_rom -- --ignored || failed=1
           exit "$failed"
   reference-boot:
