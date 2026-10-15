@@ -3,6 +3,7 @@
 
 pub mod decode;
 mod decode_c;
+pub mod disasm;
 pub mod instr;
 
 pub use decode::decode;

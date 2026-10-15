@@ -8,7 +8,9 @@ import { labelOf } from "./labels";
  */
 export function ErrorBanner({ error, onDismiss }: { error: HostError; onDismiss(): void }) {
   const { t } = useI18n();
-  const title = labelOf(t, "error", error.kind);
+  // An address the host offers goes into the interface's own sentence, in its language.
+  const params = error.suggested === undefined ? undefined : { suggested: error.suggested };
+  const title = labelOf(t, "error", error.kind, params);
   return (
     <div className="error" role="alert">
       <strong>{t("error.title")}</strong> {title === error.kind ? error.message : title}

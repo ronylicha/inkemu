@@ -116,6 +116,118 @@ export interface Status {
   replay: string | null;
   machine: MachineStatus | null;
   usbConsoleSilenced: boolean;
+  /** Where a point of the debugger stopped the run, until it runs, steps or powers on again. */
+  stop: StopView | null;
+}
+
+// The debugger (design SP4a): `crates/debugger/src/{points,view}.rs`.
+
+/** Which accesses of the CPU a watchpoint stops on. */
+export type WatchOn = "read" | "write" | "access";
+export const WATCH_ONS: readonly WatchOn[] = ["read", "write", "access"];
+
+export interface Watchpoint {
+  address: number;
+  length: number;
+  on: WatchOn;
+}
+
+/** The points of the debugger, as the host shows them and as a start takes them. */
+export interface Points {
+  /** In increasing order. */
+  breakpoints: number[];
+  watchpoints: Watchpoint[];
+}
+
+export const NO_POINTS: Points = { breakpoints: [], watchpoints: [] };
+
+/** Why a point of the debugger stopped the run. */
+export type StopView =
+  | { kind: "breakpoint"; pc: number }
+  | {
+      kind: "watchpoint";
+      address: number;
+      size: number;
+      access: "read" | "write";
+      value: number;
+      pc: number;
+    };
+
+export interface RegisterView {
+  number: number;
+  /** Its ABI name. */
+  name: string;
+  value: number;
+}
+
+export interface CsrView {
+  address: number;
+  name: string;
+  value: number;
+}
+
+export interface CpuView {
+  pc: number;
+  privilege: "machine" | "user";
+  /** The CPU waits in `wfi`: `pc` is the instruction after it. */
+  asleep: boolean;
+  registers: RegisterView[];
+  csrs: CsrView[];
+}
+
+export interface Instruction {
+  text: string;
+  /** A 16-bit parcel, written in its expanded form. */
+  compressed: boolean;
+}
+
+export interface DisassemblyLine {
+  address: number;
+  length: number;
+  /** `null` where no code can be read. */
+  instruction: Instruction | null;
+  /** A page of the flash the CPU executed nothing from: not read (ADR 0016 §6). */
+  notExecuted: boolean;
+  current: boolean;
+  breakpoint: boolean;
+}
+
+export type Region =
+  | "rom"
+  | "sram"
+  | "sram0"
+  | "rtc"
+  | "flash"
+  | "unbacked"
+  | "registers"
+  | "unmapped";
+
+export interface RegionSpan {
+  start: number;
+  length: number;
+  region: Region;
+}
+
+export interface MemoryView {
+  address: number;
+  /** A byte, or `null` where none is shown: `regions` says why. */
+  bytes: (number | null)[];
+  regions: RegionSpan[];
+}
+
+export interface DebugView {
+  cpu: CpuView;
+  disassembly: DisassemblyLine[];
+  memory: MemoryView | null;
+  points: Points;
+}
+
+/** What the debugger panel asks to see. */
+export interface ViewRequest {
+  /** `null`: the code around the PC. */
+  disassemblyAt: number | null;
+  disassemblyLines: number | null;
+  memory: { address: number; length: number } | null;
 }
 
 export type VerdictView =
@@ -166,7 +278,9 @@ export type Command =
   | { kind: "usbHost"; host: UsbHost }
   | { kind: "button"; id: string; pressed: boolean }
   | { kind: "record"; path: string }
-  | { kind: "capture"; path: string };
+  | { kind: "capture"; path: string }
+  | { kind: "breakpoint"; address: number; set: boolean }
+  | { kind: "watchpoint"; address: number; length: number; on: WatchOn; set: boolean };
 
 /** What starting a run or a replay gives back. */
 export interface Started {
@@ -180,6 +294,9 @@ export interface Started {
 export interface HostError {
   kind: string;
   message: string;
+  /** An address the host offers in place of the one refused (`0x40380100`), said in the
+   * interface's words: the instruction-bus address of a breakpoint refused on a data-bus alias. */
+  suggested?: string;
 }
 
 export function isHostError(value: unknown): value is HostError {

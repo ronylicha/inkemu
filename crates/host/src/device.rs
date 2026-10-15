@@ -26,8 +26,9 @@ use crate::sd_run::{self, CardKeeper};
 use crate::session_file::{self, Claimed, SessionFileError};
 use crate::term::sanitize;
 use boards::{DeviceProfile, MachineOptions, ProfileError};
+use debugger::{DebugView, PointError, Points, StopView, ViewRequest};
 use session::{ProfileText, RomIdentity, Session};
-use soc_esp32c3::{ConsoleChannel, Esp32C3, RomImage, UsbHost};
+use soc_esp32c3::{ConsoleChannel, Esp32C3, RomImage, UsbHost, Watch};
 use std::io::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -408,6 +409,9 @@ pub struct Launch {
     /// The console to show first, and the name of the device.
     pub console: ConsoleChannel,
     pub device_name: String,
+    /// The points of the debugger the run starts with, before its first instruction
+    /// ([`Launch::with_points`]).
+    points: Points,
     /// Faults the tests inject on the thread, where nothing else can make it fail there.
     #[cfg(test)]
     faults: Faults,
@@ -470,9 +474,18 @@ impl Launch {
             look,
             console: ConsoleChannel::Uart0,
             device_name: String::new(),
+            points: Points::default(),
             #[cfg(test)]
             faults: Faults::default(),
         }
+    }
+
+    /// The run or replay, its debugger holding `points` from its first instruction: a user who
+    /// starts again keeps the points of the run before (design `SP4a`, 4a-D8).
+    #[must_use]
+    pub fn with_points(mut self, points: Points) -> Launch {
+        self.points = points;
+        self
     }
 
     /// The run, whose device the button `key` powers on again once it turned itself off
@@ -499,6 +512,7 @@ impl Launch {
             look,
             console: ConsoleChannel::Uart0,
             device_name: String::new(),
+            points: Points::default(),
             #[cfg(test)]
             faults: Faults::default(),
         }
@@ -817,6 +831,7 @@ fn launch_of(
         look,
         console,
         device_name,
+        points: Points::default(),
         #[cfg(test)]
         faults: Faults::default(),
     }
@@ -919,6 +934,7 @@ pub fn open_replay(
         look,
         console: shown,
         device_name,
+        points: Points::default(),
         #[cfg(test)]
         faults: Faults::default(),
     })
@@ -954,6 +970,17 @@ pub enum Command {
     /// that path ([`crate::capture::save`]).
     Capture {
         path: PathBuf,
+    },
+    /// Sets (`set`) or clears a breakpoint before the instruction at `address`: for this life and
+    /// the next ones of the emulator (design `SP4a`, 4a-D8).
+    Breakpoint {
+        address: u32,
+        set: bool,
+    },
+    /// Sets or clears a watchpoint.
+    Watchpoint {
+        watch: Watch,
+        set: bool,
     },
 }
 
@@ -999,6 +1026,9 @@ pub enum CommandError {
     /// what frees it. A reset would meet the same card: it is not the remedy (R1).
     #[error("{0}")]
     SdCard(String),
+    /// A point of the debugger was refused: the message says why and what to give instead.
+    #[error("{0}")]
+    Point(#[from] PointError),
 }
 
 impl CommandError {
@@ -1024,6 +1054,7 @@ impl CommandError {
             CommandError::NotKept(_) => "notKept",
             CommandError::NotRecorded(_) => "notRecorded",
             CommandError::SdCard(_) => "sdCard",
+            CommandError::Point(error) => error.kind(),
         }
     }
 }
@@ -1060,6 +1091,9 @@ pub struct Status {
     pub machine: Option<MachineStatus>,
     /// Nothing reaches the USB-Serial-JTAG console while the USB host is not open.
     pub usb_console_silenced: bool,
+    /// Where a point of the debugger stopped the run, until it runs, steps or powers on again
+    /// (design `SP4a`, 4a-D9).
+    pub stop: Option<StopView>,
 }
 
 /// How a replay compared with its session.
@@ -1113,9 +1147,16 @@ pub enum Update {
 /// command the emulator hands the update to another thread, which commands it.
 pub type Observer = Box<dyn FnMut(Update) + Send>;
 
-struct Request {
-    command: Command,
-    reply: Sender<Result<(), CommandError>>,
+/// What a handle asks of the thread: a command, or a view of the machine for the debugger.
+enum Request {
+    Command {
+        command: Command,
+        reply: Sender<Result<(), CommandError>>,
+    },
+    Inspect {
+        view: ViewRequest,
+        reply: Sender<Result<DebugView, CommandError>>,
+    },
 }
 
 /// The answer to come of a submitted command ([`Handle::submit`]).
@@ -1177,9 +1218,28 @@ impl Handle {
         }
         let (reply, answer) = mpsc::channel();
         self.requests
-            .send(Request { command, reply })
+            .send(Request::Command { command, reply })
             .map_err(|_| CommandError::Stopped)?;
         Ok(Pending { answer })
+    }
+
+    /// What the debugger shows of the machine (design `SP4a`, 4a-D10): read by the thread between
+    /// two passes, as a command is done, from the life that runs, or, once a life has ended, from
+    /// the state it ended in until the next one powers on. Reading changes nothing.
+    ///
+    /// # Errors
+    /// [`CommandError::NoLife`] (or [`CommandError::ReplayEnded`]) before the first life,
+    /// [`CommandError::Stopped`] when the thread has stopped, [`CommandError::OnItsThread`] from
+    /// the emulator's own thread.
+    pub fn inspect(&self, view: ViewRequest) -> Result<DebugView, CommandError> {
+        if std::thread::current().id() == self.thread {
+            return Err(CommandError::OnItsThread);
+        }
+        let (reply, answer) = mpsc::channel();
+        self.requests
+            .send(Request::Inspect { view, reply })
+            .map_err(|_| CommandError::Stopped)?;
+        answer.recv().map_err(|_| CommandError::Stopped)?
     }
 
     /// The image of the last refresh of the panel.
@@ -1233,6 +1293,7 @@ impl Emulator {
             look,
             console,
             device_name,
+            points,
             #[cfg(test)]
             faults,
             ..
@@ -1276,6 +1337,9 @@ impl Emulator {
                     powering: None,
                     card: CardKeeper::default(),
                     fault: rescued,
+                    points,
+                    stop: None,
+                    ended: None,
                     #[cfg(test)]
                     faults,
                 }
@@ -1328,6 +1392,14 @@ impl Emulator {
     /// [`CommandError`]: the command was refused, or the thread has stopped.
     pub fn command(&self, command: Command) -> Result<(), CommandError> {
         self.handle.command(command)
+    }
+
+    /// [`Handle::inspect`].
+    ///
+    /// # Errors
+    /// As [`Handle::inspect`].
+    pub fn inspect(&self, view: ViewRequest) -> Result<DebugView, CommandError> {
+        self.handle.inspect(view)
     }
 
     /// [`Handle::frame`].
@@ -1424,6 +1496,13 @@ struct Worker {
     /// (H2, R1).
     card: CardKeeper,
     fault: Fault,
+    /// The points of the debugger, the emulator's: each new life is given them (4a-D8).
+    points: Points,
+    /// Where a point stopped the run, until it runs, steps or powers on again (4a-D9).
+    stop: Option<StopView>,
+    /// The machine of the last life once it ended, until the next one powers on: its state stays
+    /// readable by the debugger (4a-D10). It holds no file: the flash and the card were kept.
+    ended: Option<Esp32C3>,
     #[cfg(test)]
     faults: Faults,
 }
@@ -1469,7 +1548,20 @@ impl Worker {
                     Err(_) => break,
                 }
             };
-            if let Some(Request { command, reply }) = request {
+            if let Some(Request::Inspect { view, reply }) = request {
+                match catch_unwind(AssertUnwindSafe(|| self.inspect(&view))) {
+                    Ok(result) => {
+                        let _ = reply.send(result);
+                    }
+                    Err(panic) => {
+                        self.rescue(&*panic);
+                        let _ = reply.send(Err(CommandError::Stopped));
+                        return;
+                    }
+                }
+                continue;
+            }
+            if let Some(Request::Command { command, reply }) = request {
                 let stop = command == Command::Stop;
                 let done = catch_unwind(AssertUnwindSafe(|| {
                     let result = self.handle(command);
@@ -1719,10 +1811,18 @@ impl Worker {
         let Some(engine) = self.engine.as_mut() else {
             return;
         };
-        let output = engine.pass(pace);
+        let mut output = engine.pass(pace);
         self.caught_up = output.caught_up;
         let state = engine.state();
+        let stop = output.stop.take();
         self.emit(output);
+        if let Some(stop) = stop {
+            // A point of the debugger: the run pauses where it stopped, and says so (4a-D9).
+            self.running = false;
+            self.said_stop(stop);
+            self.send_status(true);
+            return;
+        }
         match state {
             State::Ended(_) => {
                 self.end_life();
@@ -1733,10 +1833,54 @@ impl Worker {
         }
     }
 
+    /// Keeps where a point of the debugger stopped the run, for the status, and says it in the
+    /// journal.
+    fn said_stop(&mut self, stop: soc_esp32c3::DebugStop) {
+        let view = StopView::from(stop);
+        self.stop = Some(view);
+        self.notice(Level::Info, view.describe());
+    }
+
+    /// What the debugger shows: the machine of the life that runs, else the one the last life
+    /// ended in (4a-D10).
+    fn inspect(&self, view: &ViewRequest) -> Result<DebugView, CommandError> {
+        let machine = self
+            .engine
+            .as_ref()
+            .map(Engine::machine)
+            .or(self.ended.as_ref())
+            .ok_or_else(|| self.no_life())?;
+        Ok(debugger::inspect(machine, &self.points, view))
+    }
+
+    /// A life powers on with `machine`: it is counted, its end is not known yet, and the
+    /// debugger gives it the points of the emulator before its first instruction (4a-D8) and
+    /// shows it from now on, with no stop, in place of the state the last life ended in.
+    fn count_the_new_life(&mut self, machine: &mut Esp32C3) {
+        self.life += 1;
+        self.last_end = None;
+        self.points.apply(machine);
+        self.stop = None;
+        self.ended = None;
+    }
+
+    /// Sets or clears a point, and gives the points to the machine that runs.
+    fn change_points(
+        &mut self,
+        change: impl FnOnce(&mut Points) -> Result<(), PointError>,
+    ) -> Result<(), CommandError> {
+        change(&mut self.points)?;
+        if let Some(engine) = self.engine.as_mut() {
+            engine.set_points(&self.points);
+        }
+        Ok(())
+    }
+
     fn handle(&mut self, command: Command) -> Result<(), CommandError> {
         match command {
             Command::Run => {
                 self.running = true;
+                self.stop = None;
                 self.rebase();
                 self.engine
                     .as_ref()
@@ -1750,11 +1894,17 @@ impl Worker {
             Command::Step => {
                 let refused = self.no_life();
                 let engine = self.engine.as_mut().ok_or(refused)?;
-                let output = engine.step()?;
+                let mut output = engine.step()?;
                 // A step pauses the run; a refused one changes nothing.
                 self.running = false;
                 let ended = matches!(engine.state(), State::Ended(_));
+                let touched = output.stop.take();
                 self.emit(output);
+                // The stop is the step's own: a watched access it made, or none (4a-D9).
+                self.stop = None;
+                if let Some(touched) = touched {
+                    self.said_stop(touched);
+                }
                 if ended {
                     self.end_life();
                 }
@@ -1800,6 +1950,23 @@ impl Worker {
             }
             Command::Record { path } => self.record(path),
             Command::Capture { path } => self.capture(&path),
+            Command::Breakpoint { address, set: true } => {
+                self.change_points(|points| points.set_breakpoint(address))
+            }
+            Command::Breakpoint {
+                address,
+                set: false,
+            } => self.change_points(|points| {
+                points.clear_breakpoint(address);
+                Ok(())
+            }),
+            Command::Watchpoint { watch, set: true } => {
+                self.change_points(|points| points.set_watchpoint(watch))
+            }
+            Command::Watchpoint { watch, set: false } => self.change_points(|points| {
+                points.clear_watchpoint(watch);
+                Ok(())
+            }),
         }
     }
 
@@ -2028,7 +2195,7 @@ impl Worker {
         } else {
             self.recipe.power_on(content, recorded, sd)
         };
-        let life = match powered {
+        let mut life = match powered {
             Ok(life) => life,
             Err(e) => {
                 let kept = self.powering.take();
@@ -2063,8 +2230,7 @@ impl Worker {
             (Some(None) | None, _) => Mode::Run { recorder: None },
         };
         self.recording = if recorded { record } else { None };
-        self.life += 1;
-        self.last_end = None;
+        self.count_the_new_life(&mut life.machine);
         // The machine holds the flash from here: the rescue reads it there.
         let engine = self.engine.insert(Engine::new(life, mode, limits));
         self.powering = None;
@@ -2116,8 +2282,9 @@ impl Worker {
         if let (Some(result), Some(path)) = (finished.session.take(), self.recording.take()) {
             write_session(result, &path, &mut session_log);
         }
-        // Kept: the machine goes.
-        self.engine = None;
+        // Kept: the life goes, its machine stays for the debugger until the next life (4a-D10).
+        self.ended = self.engine.take().map(Engine::into_machine);
+        self.stop = None;
         let mut verdict_log = Vec::new();
         let verdict = finished
             .verdict
@@ -2181,6 +2348,7 @@ impl Worker {
             replay,
             machine,
             usb_console_silenced,
+            stop: self.stop,
         }
     }
 
@@ -2299,8 +2467,11 @@ mod tests {
     use super::*;
     use crate::engine::fixtures::{echo, idle, life, options};
     use crate::pattern::{self, fixtures::PANEL, fixtures::buttons as fixture_buttons};
+    use crate::test_support::{counting_device, counting_increment, counting_store};
+    use debugger::MemoryRequest;
+    use soc_esp32c3::memmap::{ROM_BASE, SRAM_DBUS_BASE};
     use soc_esp32c3::test_support::{HANG, flash_program, flat_rom, stop_watchdogs};
-    use soc_esp32c3::{Esp32C3, FlashConfig, JedecId, SocConfig};
+    use soc_esp32c3::{Esp32C3, FlashConfig, JedecId, SocConfig, WatchOn};
     use std::sync::mpsc::Receiver;
 
     const WAIT: Duration = Duration::from_secs(60);
@@ -4212,5 +4383,459 @@ mod tests {
             serde_json::to_string(&console).unwrap(),
             r#"{"event":"console","data":{"channel":"usb-serial-jtag","text":"a"}}"#
         );
+    }
+
+    /// The stop of the debugger the next paused status says.
+    fn stopped(updates: &Receiver<Update>) -> StopView {
+        status(updates, |s| s.run == RunState::Paused && s.stop.is_some())
+            .stop
+            .unwrap()
+    }
+
+    /// What the debugger shows, with the first word of the SRAM.
+    fn debug_view(emulator: &Emulator) -> DebugView {
+        emulator
+            .inspect(ViewRequest {
+                disassembly_at: None,
+                disassembly_lines: None,
+                memory: Some(MemoryRequest {
+                    address: SRAM_DBUS_BASE,
+                    length: 4,
+                }),
+            })
+            .unwrap()
+    }
+
+    /// `t1`, which the counting device counts in.
+    fn count(view: &DebugView) -> u32 {
+        view.cpu.registers[6].value
+    }
+
+    /// The word the counting device stores.
+    fn stored(view: &DebugView) -> u32 {
+        let bytes: Vec<u8> = view
+            .memory
+            .as_ref()
+            .unwrap()
+            .bytes
+            .iter()
+            .map(|byte| byte.unwrap())
+            .collect();
+        u32::from_le_bytes(bytes.try_into().unwrap())
+    }
+
+    const COUNT: Watch = Watch {
+        address: SRAM_DBUS_BASE,
+        length: 4,
+        on: WatchOn::Write,
+    };
+
+    /// A breakpoint pauses the run before its instruction and says so, in the status and the
+    /// journal; Run goes past it to its next pass; a breakpoint cleared stops nothing (`SP4a`).
+    #[test]
+    fn a_breakpoint_pauses_the_run_says_it_and_run_goes_past_it() {
+        let mut points = Points::default();
+        points.set_breakpoint(counting_increment()).unwrap();
+        let (emulator, updates) = started(counting_device().with_points(points), Speed::Fastest);
+        let said = until(&updates, |u| matches!(u, Update::Notice(_)));
+        assert!(
+            matches!(said.last(), Some(Update::Notice(n)) if n.text == format!("inkemu: breakpoint at {:#010x}: the device stops before its instruction", counting_increment())),
+            "{said:?}"
+        );
+        assert_eq!(
+            stopped(&updates),
+            StopView::Breakpoint {
+                pc: counting_increment()
+            }
+        );
+        let first = debug_view(&emulator);
+        assert_eq!(first.cpu.pc, counting_increment());
+        assert_eq!(count(&first), 0, "before its first increment");
+        assert!(
+            first
+                .disassembly
+                .iter()
+                .any(|line| line.current && line.breakpoint)
+        );
+
+        emulator.command(Command::Run).unwrap();
+        assert_eq!(
+            stopped(&updates),
+            StopView::Breakpoint {
+                pc: counting_increment()
+            }
+        );
+        let second = debug_view(&emulator);
+        assert_eq!(
+            (count(&second), stored(&second)),
+            (1, 1),
+            "one turn of the loop"
+        );
+
+        emulator
+            .command(Command::Breakpoint {
+                address: counting_increment(),
+                set: false,
+            })
+            .unwrap();
+        emulator.command(Command::Run).unwrap();
+        // Inspected while it runs: the count goes on past the breakpoint it no longer has.
+        let begun = Instant::now();
+        while count(&debug_view(&emulator)) <= 1 {
+            assert!(begun.elapsed() < WAIT, "the count stays at 1");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        emulator.command(Command::Pause).unwrap();
+        // A pause of the user is no stop of the debugger.
+        status(&updates, |s| s.run == RunState::Paused && s.stop.is_none());
+        emulator.shutdown().unwrap();
+    }
+
+    /// A watchpoint set while the device runs stops it after the store, which is done.
+    #[test]
+    fn a_watchpoint_set_while_it_runs_stops_after_the_store() {
+        let (emulator, updates) = started(counting_device(), Speed::Fastest);
+        status(&updates, |s| s.run == RunState::Running);
+        emulator
+            .command(Command::Watchpoint {
+                watch: COUNT,
+                set: true,
+            })
+            .unwrap();
+        let stop = stopped(&updates);
+        let StopView::Watchpoint {
+            address,
+            size,
+            access,
+            value,
+            pc,
+        } = stop
+        else {
+            panic!("{stop:?}");
+        };
+        assert_eq!(
+            (address, size, access, pc),
+            (SRAM_DBUS_BASE, 4, "write", counting_store())
+        );
+        let seen = debug_view(&emulator);
+        assert_eq!(stored(&seen), value, "the store is done");
+        assert_eq!(seen.cpu.pc, counting_store() + 4, "at the next instruction");
+        assert_eq!(seen.points.watchpoints.len(), 1);
+        emulator.shutdown().unwrap();
+    }
+
+    /// The points belong to the emulator: they stop the next life too. A step says the watched
+    /// access it made.
+    #[test]
+    fn the_points_survive_a_reset_and_a_step_says_its_access() {
+        let mut points = Points::default();
+        points.set_breakpoint(counting_store()).unwrap();
+        points.set_watchpoint(COUNT).unwrap();
+        let (emulator, updates) = started(counting_device().with_points(points), Speed::Fastest);
+        assert_eq!(
+            stopped(&updates),
+            StopView::Breakpoint {
+                pc: counting_store()
+            }
+        );
+        emulator.command(Command::Step).unwrap();
+        let stepped = status(&updates, |s| {
+            matches!(s.stop, Some(StopView::Watchpoint { value: 1, .. }))
+        });
+        assert_eq!(stepped.run, RunState::Paused);
+        emulator.command(Command::Reset).unwrap();
+        emulator.command(Command::Run).unwrap();
+        let again = status(&updates, |s| s.life == 2 && s.stop.is_some());
+        assert_eq!(
+            again.stop,
+            Some(StopView::Breakpoint {
+                pc: counting_store()
+            })
+        );
+        assert_eq!(
+            count(&debug_view(&emulator)),
+            1,
+            "the new life's first turn"
+        );
+        emulator.shutdown().unwrap();
+    }
+
+    /// A point the debugger refuses is named, with why.
+    #[test]
+    fn a_point_the_debugger_refuses_is_named() {
+        let (emulator, _updates) = started(counting_device(), Speed::Fastest);
+        let odd = emulator
+            .command(Command::Breakpoint {
+                address: counting_increment() + 1,
+                set: true,
+            })
+            .unwrap_err();
+        assert_eq!(odd.kind(), "point");
+        assert!(odd.to_string().contains("is odd"), "{odd}");
+        let alias = emulator
+            .command(Command::Breakpoint {
+                address: soc_esp32c3::memmap::SRAM_DBUS_BASE,
+                set: true,
+            })
+            .unwrap_err();
+        assert_eq!(alias.kind(), "dataBusAlias");
+        assert!(
+            alias.to_string().contains("set it at 0x40380000"),
+            "{alias}"
+        );
+        let flash = emulator
+            .command(Command::Watchpoint {
+                watch: Watch {
+                    address: soc_esp32c3::memmap::FLASH_DBUS_BASE,
+                    length: 4,
+                    on: WatchOn::Read,
+                },
+                set: true,
+            })
+            .unwrap_err();
+        assert!(flash.to_string().contains("personal data"), "{flash}");
+        assert_eq!(debug_view(&emulator).points.breakpoints, Vec::<u32>::new());
+        emulator.shutdown().unwrap();
+    }
+
+    /// The state a life ended in stays readable until the next life powers on.
+    #[test]
+    fn the_state_a_life_ended_in_stays_readable_until_the_next() {
+        let launch = Launch::new(
+            x4(echo()),
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits {
+                max_cycles: Some(50_000),
+                max_device_nanos: None,
+            },
+            look(),
+            None,
+        );
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+        let ended = debug_view(&emulator);
+        assert!(ended.cpu.pc >= soc_esp32c3::memmap::ROM_BASE);
+        assert_eq!(
+            ended.cpu.registers[5].value,
+            crate::engine::fixtures::UART0,
+            "t0 holds the UART"
+        );
+        // Paused, the next life waits at its first instruction: what the debugger shows is its.
+        emulator.command(Command::Pause).unwrap();
+        emulator.command(Command::Reset).unwrap();
+        let fresh = debug_view(&emulator);
+        assert_eq!(fresh.cpu.pc, soc_esp32c3::memmap::ROM_BASE);
+        assert_eq!(fresh.cpu.registers[5].value, 0);
+        emulator.shutdown().unwrap();
+    }
+
+    /// A replay stopped at breakpoints and watchpoints, and run on after each stop, gives the
+    /// verdict "identical": the points change nothing of the run (4a-D4).
+    #[test]
+    fn a_replay_stopped_at_points_is_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.inkrec");
+        let launch = Launch::new(
+            x4(echo()),
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits {
+                max_cycles: None,
+                max_device_nanos: Some(20_000_000),
+            },
+            look(),
+            Some(x4_recording()),
+        );
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+        emulator
+            .command(Command::Record { path: path.clone() })
+            .unwrap();
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
+        emulator.shutdown().unwrap();
+
+        let session = session_file::read_session(&path).unwrap();
+        let replay_of = session.clone();
+        let recipe = Box::new(FnRecipe(move |_: Option<Vec<u8>>, _: bool| {
+            let machine = session::Replay::start(&replay_of, echo())
+                .unwrap()
+                .into_machine();
+            let (panel, buttons) = pattern::ports(PANEL, &fixture_buttons());
+            Life {
+                machine,
+                panel,
+                buttons,
+                sd: None,
+            }
+        }));
+        // `echo` prints `ready` with an `addi` and a `sw` per letter after its `lui`: a
+        // breakpoint on the `addi` of `e` and of `y`, and the five stores to the FIFO watched.
+        let mut points = Points::default();
+        points.set_breakpoint(ROM_BASE + 4 * 3).unwrap();
+        points.set_breakpoint(ROM_BASE + 4 * 9).unwrap();
+        points
+            .set_watchpoint(Watch {
+                address: crate::engine::fixtures::UART0,
+                length: 4,
+                on: WatchOn::Write,
+            })
+            .unwrap();
+        let (replay, updates) = started(
+            Launch::replay(recipe, session, "run.inkrec".to_owned(), look()).with_points(points),
+            Speed::Fastest,
+        );
+        let mut stops = 0;
+        let verdict = loop {
+            let seen = until(&updates, |u| {
+                matches!(u, Update::LifeEnded { .. })
+                    || matches!(u, Update::Notice(n) if n.text.starts_with("inkemu: breakpoint") || n.text.starts_with("inkemu: watchpoint"))
+            });
+            if let Some(Update::LifeEnded { verdict, .. }) = seen.last() {
+                break verdict.clone();
+            }
+            stops += 1;
+            replay.command(Command::Run).unwrap();
+        };
+        assert_eq!(stops, 7, "two breakpoints and five stores");
+        assert_eq!(verdict, Some(VerdictView::Identical));
+    }
+
+    /// A breakpoint stop or a watchpoint stop, as the journal says it.
+    fn is_a_stop(update: &Update) -> bool {
+        matches!(update, Update::Notice(n) if n.text.starts_with("inkemu: breakpoint") || n.text.starts_with("inkemu: watchpoint"))
+    }
+
+    /// A session of `echo` recorded at `path`, with `hi\r` sent to UART0 while the recorded life
+    /// stood at a breakpoint on the `addi` of `e` (word 3), before the echo loop.
+    fn session_with_console_input(path: &std::path::Path) -> session::Session {
+        // A breakpoint on the `addi` of `e`, before the echo loop: each life stops there, so
+        // the input goes in at a known place of the recorded life.
+        let mut before_the_loop = Points::default();
+        before_the_loop.set_breakpoint(ROM_BASE + 4 * 3).unwrap();
+        let launch = Launch::new(
+            x4(echo()),
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits {
+                max_cycles: None,
+                max_device_nanos: Some(20_000_000),
+            },
+            look(),
+            Some(x4_recording()),
+        )
+        .with_points(before_the_loop);
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, is_a_stop);
+        emulator.command(Command::Run).unwrap();
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+        emulator
+            .command(Command::Record {
+                path: path.to_path_buf(),
+            })
+            .unwrap();
+        until(&updates, is_a_stop);
+        emulator
+            .command(Command::Console {
+                channel: UART0,
+                bytes: b"hi\r".to_vec(),
+            })
+            .unwrap();
+        emulator.command(Command::Run).unwrap();
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
+        emulator.shutdown().unwrap();
+        session_file::read_session(path).unwrap()
+    }
+
+    /// `session` replayed with `points`, run on after each stop: the stops, what UART0 showed,
+    /// and the verdict.
+    fn replay_stopped_at(
+        session: session::Session,
+        points: Points,
+    ) -> (u32, String, Option<VerdictView>) {
+        let replay_of = session.clone();
+        let recipe = Box::new(FnRecipe(move |_: Option<Vec<u8>>, _: bool| {
+            let machine = session::Replay::start(&replay_of, echo())
+                .unwrap()
+                .into_machine();
+            let (panel, buttons) = pattern::ports(PANEL, &fixture_buttons());
+            Life {
+                machine,
+                panel,
+                buttons,
+                sd: None,
+            }
+        }));
+        let (replay, updates) = started(
+            Launch::replay(recipe, session, "run.inkrec".to_owned(), look()).with_points(points),
+            Speed::Fastest,
+        );
+        let mut stops = 0;
+        let mut echoed = String::new();
+        let verdict = loop {
+            let seen = until(&updates, |u| {
+                matches!(u, Update::LifeEnded { .. }) || is_a_stop(u)
+            });
+            for update in &seen {
+                if let Update::Console { channel, text } = update
+                    && *channel == UART0.name()
+                {
+                    echoed.push_str(text);
+                }
+            }
+            if let Some(Update::LifeEnded { verdict, .. }) = seen.last() {
+                break verdict.clone();
+            }
+            stops += 1;
+            replay.command(Command::Run).unwrap();
+        };
+        (stops, echoed, verdict)
+    }
+
+    /// A session with input from the console, replayed stopped at points on the way of that
+    /// input (where `echo` reads each byte, and where it stores each to the FIFO), gives the
+    /// verdict "identical": the stops change nothing of when the input reaches the machine.
+    #[test]
+    fn a_replay_with_console_input_stopped_at_points_is_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_with_console_input(&dir.path().join("run.inkrec"));
+        // `echo` prints `ready` in 11 words, then polls the FIFO (word 11), reads a byte
+        // (word 13) and stores it back (word 14).
+        let mut points = Points::default();
+        points.set_breakpoint(ROM_BASE + 4 * 3).unwrap();
+        points.set_breakpoint(ROM_BASE + 4 * 13).unwrap();
+        points
+            .set_watchpoint(Watch {
+                address: crate::engine::fixtures::UART0,
+                length: 4,
+                on: WatchOn::Write,
+            })
+            .unwrap();
+        let (stops, echoed, verdict) = replay_stopped_at(session, points);
+        assert!(echoed.ends_with("hi\r"), "{echoed:?}");
+        assert_eq!(
+            stops, 12,
+            "the `addi` of `e`, three reads, five stores of `ready`, three of the echo"
+        );
+        assert_eq!(verdict, Some(VerdictView::Identical));
+    }
+
+    /// The same session replayed with breakpoints in the echo loop only: no stop is at the
+    /// boundary where the input was given (word 3), so the input reaches the machine between two
+    /// stops, inside a call that runs on; the replay is still identical.
+    #[test]
+    fn a_replay_whose_stops_are_not_where_the_input_came_is_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_with_console_input(&dir.path().join("run.inkrec"));
+        // The read of a byte (word 13), its store (word 14) and the jump back (word 15): reached
+        // only once a byte has arrived; not the poll (word 11), which spins until then.
+        let mut points = Points::default();
+        for word in 13..=15 {
+            points.set_breakpoint(ROM_BASE + 4 * word).unwrap();
+        }
+        let (stops, echoed, verdict) = replay_stopped_at(session, points);
+        assert!(echoed.ends_with("hi\r"), "{echoed:?}");
+        assert_eq!(
+            stops, 9,
+            "three words of the loop for each of the three bytes"
+        );
+        assert_eq!(verdict, Some(VerdictView::Identical));
     }
 }

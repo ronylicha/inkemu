@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { serialized } from "./host";
+import { asHostError, serialized } from "./host";
+
+describe("asHostError", () => {
+  it("keeps the address a refusal suggests, and nothing that is not one", () => {
+    const refusal = { kind: "dataBusAlias", message: "detail", suggested: "0x40380100" };
+    expect(asHostError(refusal)).toEqual(refusal);
+    expect(asHostError({ kind: "point", message: "detail", suggested: 7 })).toEqual({
+      kind: "point",
+      message: "detail",
+    });
+  });
+});
 
 describe("serialized", () => {
   it("starts a call once the one before has settled: a release never overtakes its press", async () => {

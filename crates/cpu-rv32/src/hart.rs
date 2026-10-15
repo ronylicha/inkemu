@@ -207,14 +207,33 @@ impl Hart {
             // presents (the instruction after `wfi` then runs: `InterruptModel::Controller`).
             self.waiting = false;
         }
-        // A machine interrupt is always enabled below machine mode, whatever `mstatus.MIE` says
-        // (privileged specification, "Machine Status Register").
-        let enabled = self.privilege == Privilege::User || self.csr.mstatus & MSTATUS_MIE != 0;
-        if enabled && let Some(line) = pending {
+        if self.interrupts_enabled()
+            && let Some(line) = pending
+        {
             self.enter_trap(MCAUSE_INTERRUPT | line, 0);
             return Boundary::Interrupted { cause: line };
         }
         Boundary::Ready
+    }
+
+    /// Whether a pending line is taken: a machine interrupt is always enabled below machine
+    /// mode, whatever `mstatus.MIE` says (privileged specification, "Machine Status Register").
+    fn interrupts_enabled(&self) -> bool {
+        self.privilege == Privilege::User || self.csr.mstatus & MSTATUS_MIE != 0
+    }
+
+    /// Whether the next [`Hart::step`] executes the instruction at `pc`: no `wfi` waits without a
+    /// line, and no interrupt is taken first. What [`Hart::take_boundary`] would answer
+    /// [`Boundary::Ready`] to, without acting: for a debugger, which stops before an instruction
+    /// only when it is about to run.
+    #[must_use]
+    pub fn executes_next(&self) -> bool {
+        match self.pending_line() {
+            // No line: the hart runs unless a `wfi` waits.
+            None => !self.waiting,
+            // A line ends any wait; the hart takes it first when interrupts are enabled.
+            Some(_) => !self.interrupts_enabled(),
+        }
     }
 
     /// The last instruction the hart fetched and decoded, whether it retired or raised an
@@ -1067,6 +1086,26 @@ mod tests {
         assert_eq!((h.x[2], h.instret), (0, 1), "nothing else executed");
         // `MIE` is clear in the handler: nothing more stands before its first instruction.
         assert_eq!(h.take_boundary(), Boundary::Ready);
+    }
+
+    /// What a debugger asks before an instruction: whether it runs next. It changes nothing.
+    #[test]
+    fn the_next_instruction_runs_unless_a_wfi_waits_or_an_interrupt_comes_first() {
+        let (mut h, mut m) = machine(&[wfi(), addi(1, 0, 1)], MisalignedPolicy::Trap);
+        assert!(h.executes_next());
+        assert!(h.csr.write(MIE, 1 << 3));
+        run(&mut h, &mut m, 1);
+        assert!(!h.executes_next(), "the wfi waits");
+        h.set_interrupt_pending(3, true);
+        assert!(
+            h.executes_next(),
+            "a masked line ends the wait: the next instruction runs"
+        );
+        assert!(h.is_waiting(), "asking changed nothing");
+        assert!(h.csr.write(MSTATUS, MSTATUS_MIE));
+        assert!(!h.executes_next(), "an enabled line is taken first");
+        assert_eq!(h.take_boundary(), Boundary::Interrupted { cause: 3 });
+        assert!(h.executes_next(), "in the handler, MIE is clear");
     }
 
     #[test]
