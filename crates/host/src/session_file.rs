@@ -124,7 +124,7 @@ fn directory_of(path: &Path) -> Option<PathBuf> {
 /// Whether the two paths lead to one file, by whatever route, or would once it is created: the
 /// same name in the same directory, every link in the directories resolved. The flash file of a
 /// first run does not exist yet, and a session written at its path would replace it at the end.
-fn same_place(one: &Path, other: &Path) -> bool {
+pub(crate) fn same_place(one: &Path, other: &Path) -> bool {
     if same_file(one, other) {
         return true;
     }

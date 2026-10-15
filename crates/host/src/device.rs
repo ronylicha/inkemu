@@ -634,6 +634,10 @@ pub enum CommandError {
     OnItsThread,
     #[error("{0}")]
     Capture(#[from] crate::capture::CaptureError),
+    /// The last life ended without keeping all it had to (its flash file, its session): the
+    /// errors, one per line, as the journal said them.
+    #[error("{0}")]
+    NotKept(String),
 }
 
 impl CommandError {
@@ -655,6 +659,7 @@ impl CommandError {
             CommandError::OnItsThread => "onItsThread",
             CommandError::Capture(crate::capture::CaptureError::NoImage) => "noImage",
             CommandError::Capture(_) => "capture",
+            CommandError::NotKept(_) => "notKept",
         }
     }
 }
@@ -829,6 +834,8 @@ pub struct Emulator {
     look: Look,
     console: ConsoleChannel,
     device_name: String,
+    /// The flash file the run holds, locked, until its thread ends.
+    flash_file: Option<PathBuf>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -857,6 +864,10 @@ impl Emulator {
             device_name,
             ..
         } = launch;
+        let flash_file = match &plan {
+            Plan::Run { flash, .. } => flash.file.clone(),
+            Plan::Replay { .. } => None,
+        };
         let slot = Arc::clone(&frame);
         let rotation = look.panel.rotation;
         // The worker holds machines, which stay on the thread: it is built there (2c-R4).
@@ -893,8 +904,18 @@ impl Emulator {
             look,
             console,
             device_name,
+            flash_file,
             thread: Some(thread),
         })
+    }
+
+    /// Whether the run holds the flash file at `path`, by whatever route the path leads there:
+    /// a run that starts on that file must wait until this one is powered off, which releases it.
+    #[must_use]
+    pub fn holds_flash_file(&self, path: &Path) -> bool {
+        self.flash_file
+            .as_deref()
+            .is_some_and(|file| session_file::same_place(file, path))
     }
 
     /// A handle to command the emulator from any thread.
@@ -935,22 +956,32 @@ impl Emulator {
     }
 
     /// Ends the last life and waits for the thread.
-    pub fn shutdown(mut self) {
-        self.stop_and_join();
+    ///
+    /// # Errors
+    /// [`CommandError::NotKept`] when the last life could not keep its flash file or its session:
+    /// what a closing application tells its user. A thread that had already stopped (after an
+    /// internal error, which it said) gives no error.
+    pub fn shutdown(mut self) -> Result<(), CommandError> {
+        self.stop_and_join()
     }
 
-    fn stop_and_join(&mut self) {
+    fn stop_and_join(&mut self) -> Result<(), CommandError> {
         let Some(thread) = self.thread.take() else {
-            return;
+            return Ok(());
         };
-        let _ = self.command(Command::Stop);
+        let stopped = self.command(Command::Stop);
         let _ = thread.join();
+        match stopped {
+            Err(CommandError::Stopped) => Ok(()),
+            other => other,
+        }
     }
 }
 
 impl Drop for Emulator {
     fn drop(&mut self) {
-        self.stop_and_join();
+        // What the last life could not keep is in the journal; a drop has no one to tell more.
+        let _ = self.stop_and_join();
     }
 }
 
@@ -1235,8 +1266,12 @@ impl Worker {
                 self.begin_life(None)
             }
             Command::Stop => {
-                self.end_life();
-                Ok(())
+                let errors = self.end_life();
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(CommandError::NotKept(errors.join("\n")))
+                }
             }
             Command::Speed(speed) => {
                 self.speed = speed;
@@ -1420,25 +1455,42 @@ impl Worker {
 
     /// Ends the life, if there is one: its last console text and summary, its session or
     /// verdict, its flash.
-    fn end_life(&mut self) {
+    ///
+    /// Gives the errors of what the life had to keep (its session, its flash file): the reasons
+    /// a power-off must tell its user before the application closes.
+    fn end_life(&mut self) -> Vec<String> {
         let Some(engine) = self.engine.take() else {
-            return;
+            return Vec::new();
         };
         let mut ended = engine.end();
         let output = std::mem::take(&mut ended.output);
         self.emit(output);
-        let mut log = Vec::new();
+        let mut session_log = Vec::new();
         if let (Some(result), Some(path)) = (ended.session.take(), self.recording.take()) {
-            write_session(result, &path, &mut log);
+            write_session(result, &path, &mut session_log);
         }
+        let mut verdict_log = Vec::new();
         let verdict = ended
             .verdict
             .take()
-            .map(|result| verdict_view(result, &mut log));
+            .map(|result| verdict_view(result, &mut verdict_log));
+        let mut flash_log = Vec::new();
         if let Plan::Run { flash, .. } = &mut self.plan {
-            flash.finish(&ended, &mut log);
+            flash.finish(&ended, &mut flash_log);
         }
-        for notice in Notice::from_log(&log) {
+        let session_notices = Notice::from_log(&session_log);
+        let flash_notices = Notice::from_log(&flash_log);
+        let errors = session_notices
+            .iter()
+            .chain(&flash_notices)
+            .filter(|notice| notice.level == Level::Error)
+            .map(|notice| notice.text.clone())
+            .collect();
+        for notice in session_notices
+            .into_iter()
+            .chain(Notice::from_log(&verdict_log))
+            .chain(flash_notices)
+        {
             self.tell(Update::Notice(notice));
         }
         self.last_end = Some(ended.end);
@@ -1447,6 +1499,7 @@ impl Worker {
             end: ended.end,
             verdict,
         });
+        errors
     }
 
     fn status(&mut self) -> Status {
@@ -1809,7 +1862,7 @@ mod tests {
             machine.usb_host == "absent" || machine.usb_host_changes_pending == 1,
             "the change is made, or waits for the CPU to wake: {machine:?}"
         );
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
     }
 
     /// A limit ends a life on its own; the run then waits for a reset, and refuses inputs.
@@ -1904,7 +1957,7 @@ mod tests {
             )),
             "{recorded:?}"
         );
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
 
         let session = session_file::read_session(&path).unwrap();
         let replay_of = session.clone();
@@ -2032,7 +2085,7 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
         emulator.command(Command::Reset).unwrap();
         until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
         let powered = powered.lock().unwrap();
         assert_eq!(powered[0], None, "the first life starts erased");
         assert_eq!(
@@ -2156,7 +2209,7 @@ mod tests {
             ));
             emulator.command(Command::Reset).unwrap();
             until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
-            emulator.shutdown();
+            emulator.shutdown().unwrap();
             let powered = powered.lock().unwrap();
             assert_eq!(
                 *powered,
@@ -2202,9 +2255,38 @@ mod tests {
         assert!(!file.exists());
         emulator.command(Command::Reset).unwrap();
         until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
         assert_eq!(*powered.lock().unwrap(), [None, Some(vec![0x00])]);
         assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
+    }
+
+    /// A power-off whose flash file cannot be written says so to its caller, which tells the user
+    /// before the application closes.
+    #[cfg(unix)]
+    #[test]
+    fn a_shutdown_that_cannot_keep_the_flash_says_why() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("kept");
+        std::fs::create_dir(&place).unwrap();
+        let file = place.join("flash.bin");
+        let keeper = FlashKeeper::begin(Some(file), false, None, 1 << 20).unwrap();
+        let launch = Launch::new(
+            writing_device(0x00, Arc::default()),
+            keeper,
+            Limits::default(),
+            LOOK,
+            None,
+        );
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::Frame { .. }));
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let ended = emulator.shutdown();
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(&ended, Err(CommandError::NotKept(text)) if text.contains("flash.bin")),
+            "{ended:?}"
+        );
     }
 
     /// A power-on refused because the flash file cannot be taken keeps the content in memory:
@@ -2241,7 +2323,7 @@ mod tests {
         );
         emulator.command(Command::Reset).unwrap();
         until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
         assert_eq!(*powered.lock().unwrap(), [None, Some(vec![0x00])]);
         assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
     }
@@ -2319,7 +2401,7 @@ mod tests {
             emulator.command(Command::Run),
             Err(CommandError::Stopped)
         ));
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
     }
 
     /// A port that panics during a command answers it as stopped, and the thread says so.
@@ -2345,7 +2427,7 @@ mod tests {
                 if n.text.contains("a button port broke"))),
             "{seen:#?}"
         );
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
     }
 
     /// A capture refuses every path the run reads or writes (the flash file, its lock and its
@@ -2364,6 +2446,8 @@ mod tests {
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
         until(&updates, |u| matches!(u, Update::Frame { .. }));
+        assert!(emulator.holds_flash_file(&dir.path().join(".").join("flash.bin")));
+        assert!(!emulator.holds_flash_file(&dir.path().join("other.bin")));
         let claimed = crate::flash_state::files_of_the_flash_file(&file);
         assert!(claimed.len() >= 3, "{claimed:?}");
         for (path, _) in claimed {
@@ -2386,7 +2470,7 @@ mod tests {
             .command(Command::Capture { path: png.clone() })
             .unwrap();
         assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
     }
 
     /// Console text is joined while it stays on one channel, sent at once the first time, then at
@@ -2439,7 +2523,7 @@ mod tests {
                 shown += text.len();
             }
         }
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
         assert!(shown > 100, "the firmware printed {shown} bytes");
         // At most one batch per 40 ms, one per status (every 100 ms), and the first: 30 at most
         // in 600 ms, where a pass per update would have sent hundreds.
@@ -2476,7 +2560,7 @@ mod tests {
             answer.wait().unwrap();
         }
         shows(&updates, UART0, "abc\r");
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
     }
 
     /// The speed is measured only while the machine runs: a pause or a step forgets it, and
@@ -2507,7 +2591,7 @@ mod tests {
         }
         emulator.command(Command::Run).unwrap();
         until(&updates, measured);
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
     }
 
     /// A command from the observer, on the emulator's thread, is refused instead of waiting for
@@ -2543,7 +2627,7 @@ mod tests {
             "{answer:?}"
         );
         drop(handle.lock().unwrap().take());
-        emulator.shutdown();
+        emulator.shutdown().unwrap();
     }
 
     /// A machine powered on with the recorder's options keeps its trace hash.

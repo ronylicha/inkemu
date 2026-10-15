@@ -123,7 +123,7 @@ fn a_recorded_life_replays_identically_on_the_mask_rom() {
         )),
         "{life:?}"
     );
-    emulator.shutdown();
+    emulator.shutdown().unwrap();
     let replay = device::open_replay(&session, Some(rom_dir()), None).unwrap();
     let (_replay, updates) = started(replay);
     let life = first_life(&updates);
