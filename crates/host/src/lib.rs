@@ -1,4 +1,4 @@
-//! The host policy of inkemu's front ends (design of sub-project 2c, ADR 0010).
+//! The host policy of inkemu's front ends (design of sub-project 2c, ADR 0011).
 //!
 //! What a front end does around a machine lives here, so that the command line and the desktop
 //! application do the same: the files a run reads and writes and the refusals that guard them, the

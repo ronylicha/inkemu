@@ -288,7 +288,7 @@ pnpm tauri dev           # Vite on port 1420, then the window
 pnpm check               # Biome, the types (TypeScript 7) and the tests (Vitest)
 ```
 
-The ROM is downloaded into the cache on first use, as for `inkemu run`. The shell is a Cargo workspace of its own (`app/src-tauri`); no package is built or signed yet (sub-project 9). See [ADR 0010](docs/adr/0010-crate-hote-et-ports.md) (French).
+The ROM is downloaded into the cache on first use, as for `inkemu run`. The shell is a Cargo workspace of its own (`app/src-tauri`); no package is built or signed yet (sub-project 9). See [ADR 0011](docs/adr/0011-crate-hote-et-ports.md) (French).
 
 ### For developers: the lockstep against QEMU
 
@@ -382,7 +382,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 - [ADR 0007](docs/adr/0007-format-des-sessions.md): the format of a recorded session, how it is read and how it is replayed (French)
 - [ADR 0008](docs/adr/0008-lockstep-et-differences-admises.md): the lockstep against QEMU and its admitted differences (French), with [the table](docs/lockstep-differences.md)
 - [ADR 0009](docs/adr/0009-temps-de-reference-coremark.md): the reference of time, CoreMark within 15 % of the score Espressif publishes, and why that does not make the timing model calibrated (French)
-- [ADR 0010](docs/adr/0010-crate-hote-et-ports.md): the host library, the emulator on its thread, and the ports of the screen and the buttons (French)
+- [ADR 0011](docs/adr/0011-crate-hote-et-ports.md): the host library, the emulator on its thread, and the ports of the screen and the buttons (French)
 
 ## Français
 
@@ -455,7 +455,7 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
 
 **L'écran est pour l'instant une mire de test.** Le SSD1677 du X4 et ses boutons sont reliés au firmware au sous-projet 2d ; d'ici là, la fenêtre le dit, et ce que montre l'écran et font les boutons vient d'une mire d'inkemu, pas du firmware. Tout le reste est l'émulateur réel : la fenêtre et la commande partagent une bibliothèque hôte, `crates/host`.
 
-Pour la lancer en développement (Node.js 24 avec corepack, la chaîne Rust du dépôt et, sous Linux, les bibliothèques des [prérequis de Tauri](https://v2.tauri.app/start/prerequisites/) : `libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev`) : `cd app`, `corepack enable`, `pnpm install`, puis `pnpm tauri dev` (Vite sur le port 1420, puis la fenêtre) ; `pnpm check` lance Biome, les types (TypeScript 7) et les tests (Vitest). La ROM est téléchargée dans le cache à la première utilisation, comme pour `inkemu run`. L'enveloppe est un espace de travail Cargo à part (`app/src-tauri`) ; aucun paquet n'est encore construit ni signé (sous-projet 9). Voir l'[ADR 0010](docs/adr/0010-crate-hote-et-ports.md).
+Pour la lancer en développement (Node.js 24 avec corepack, la chaîne Rust du dépôt et, sous Linux, les bibliothèques des [prérequis de Tauri](https://v2.tauri.app/start/prerequisites/) : `libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev`) : `cd app`, `corepack enable`, `pnpm install`, puis `pnpm tauri dev` (Vite sur le port 1420, puis la fenêtre) ; `pnpm check` lance Biome, les types (TypeScript 7) et les tests (Vitest). La ROM est téléchargée dans le cache à la première utilisation, comme pour `inkemu run`. L'enveloppe est un espace de travail Cargo à part (`app/src-tauri`) ; aucun paquet n'est encore construit ni signé (sous-projet 9). Voir l'[ADR 0011](docs/adr/0011-crate-hote-et-ports.md).
 
 ### Pour les développeurs : le lockstep avec QEMU
 
@@ -511,7 +511,7 @@ Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtens
 
 ### Documentation
 
-La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) [0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash), [0005](docs/adr/0005-bootloader-embarque.md) (bootloader embarqué), [0006](docs/adr/0006-entrees-des-consoles.md) (entrées des consoles et hôte USB), [0007](docs/adr/0007-format-des-sessions.md) (format des sessions) et [0008](docs/adr/0008-lockstep-et-differences-admises.md) (lockstep et différences admises, avec [le tableau](docs/lockstep-differences.md)), [0009](docs/adr/0009-temps-de-reference-coremark.md) (le temps de référence : CoreMark dans ±15 % du score publié) et [0010](docs/adr/0010-crate-hote-et-ports.md) (la crate hôte, l'émulateur sur un fil, les ports de l'écran et des boutons) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
+La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) [0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash), [0005](docs/adr/0005-bootloader-embarque.md) (bootloader embarqué), [0006](docs/adr/0006-entrees-des-consoles.md) (entrées des consoles et hôte USB), [0007](docs/adr/0007-format-des-sessions.md) (format des sessions) et [0008](docs/adr/0008-lockstep-et-differences-admises.md) (lockstep et différences admises, avec [le tableau](docs/lockstep-differences.md)), [0009](docs/adr/0009-temps-de-reference-coremark.md) (le temps de référence : CoreMark dans ±15 % du score publié) et [0011](docs/adr/0011-crate-hote-et-ports.md) (la crate hôte, l'émulateur sur un fil, les ports de l'écran et des boutons) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
 
 ### Matériel tiers et licence
 

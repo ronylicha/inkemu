@@ -1,5 +1,5 @@
 //! Where the panel image and the buttons of a device plug into the engine (design of sub-project
-//! 2c, §4; ADR 0010).
+//! 2c, §4; ADR 0011).
 //!
 //! A front end shows what a [`PanelSource`] gives and presses what a [`ButtonPort`] offers; it
 //! knows nothing of the chips behind them. Until the display controller and the button ladder are

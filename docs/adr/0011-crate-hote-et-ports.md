@@ -1,4 +1,4 @@
-# ADR 0010 — La crate hôte, l'émulateur sur un fil et les ports de l'écran et des boutons
+# ADR 0011 — La crate hôte, l'émulateur sur un fil et les ports de l'écran et des boutons
 
 - Date : 2026-10-15
 - Statut : accepté (plan SP2c)

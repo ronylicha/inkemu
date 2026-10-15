@@ -5,7 +5,7 @@ Date : 2026-10-15. Spec globale : `docs/superpowers/specs/2026-10-11-inkemu-desi
 un Web Worker) »), §6.5 (interface et langues). Recherche : `docs/research/sp2c-app-stack.md` (versions et API de
 Tauri, ST ci-dessous). Héritage : ADR 0004 (entrées d'une exécution, fichier de flash), ADR 0005 (bootloader
 embarqué), ADR 0006 (entrées des consoles), ADR 0007 (sessions) ; les notes de passation de SP1b-3b à SP1b-4e,
-qui listent ce que la CLI a laissé « à refaire en bibliothèque ». Décision d'architecture : ADR 0010.
+qui listent ce que la CLI a laissé « à refaire en bibliothèque ». Décision d'architecture : ADR 0011 (le numéro 0010 revient à l'ADR de SP1b-4f, mergé avant).
 
 SP2 se fait en chantiers parallèles : SP2a (crate `chips` : SSD1677, échelle de boutons, batterie), SP2b
 (périphériques du SoC), **SP2c (ce document : l'application)**, SP2d (câblage du X4, raccord de l'écran réel à

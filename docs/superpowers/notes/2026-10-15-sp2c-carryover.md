@@ -2,7 +2,7 @@
 
 Plan : `docs/superpowers/plans/2026-10-15-sp2c-app.md` (2c-R1–2c-R10). Spec :
 `docs/superpowers/specs/2026-10-15-sp2c-app-design.md` (C1–C18). Recherche : `docs/research/sp2c-app-stack.md`.
-ADR 0010 (nouvel). Branche `worktree-agent-ae1327c5f7394d5b2`, partie de `main` `194f286`, ni mergée ni poussée.
+ADR 0011 (nouvel ; le numéro 0010 revient à l'ADR de SP1b-4f, mergé avant). Branche `worktree-agent-ae1327c5f7394d5b2`, partie de `main` `194f286`, ni mergée ni poussée.
 
 ## Résultat
 
@@ -106,7 +106,7 @@ que cet agent n'a pas modifiée :
 
 | Fichier | À mettre à jour |
 |---|---|
-| `architecture_overview.md` | Nouvelle crate `host` (politique d'hôte partagée CLI/interface, membres de l'espace de travail) ; `app/` (React + Tauri, espace de travail Cargo séparé `app/src-tauri`) ; modèle à fil (`Esp32C3` non `Send`, machine construite sur le fil par `Recipe`) ; ADR 0010 ; ports `PanelSource`/`ButtonPort`. |
+| `architecture_overview.md` | Nouvelle crate `host` (politique d'hôte partagée CLI/interface, membres de l'espace de travail) ; `app/` (React + Tauri, espace de travail Cargo séparé `app/src-tauri`) ; modèle à fil (`Esp32C3` non `Send`, machine construite sur le fil par `Recipe`) ; ADR 0011 ; ports `PanelSource`/`ButtonPort`. |
 | `backend_services.md` | Les dix modules déplacés de `crates/emu-cli/src/` vers `crates/host/src/` (mêmes noms, réexportés par `emu_cli`) ; `host::launch` (profil, console montrée, en-tête, note de flash, flash de départ, refus de chemins, ROM) ; `engine`, `device`, `ports`, `pattern`, `catalog`, `utf8`, `capture` ; `run.rs` : `say_why`, `say_where_the_run_stopped`, `deep_sleep_line`, `journal_prefix`, `say_an_incomplete_journal`, `SLICE_CYCLES` désormais publics ; `RunEnd` sérialisable. |
 | `backend_models.md` | Types de `host` : `launch::{FlashRequest, RunRequest, ConsoleOrigin, Starting, StartError, RecordPathError}`, `ports::{Rotation, PanelOrigin, PanelDescription, RefreshKind, Region, PanelFrame, Edge, ButtonSpec, ButtonError, Life, PowerOnError, PanelSource, ButtonPort, Recipe}`, `catalog::{Look, DeviceView, ProfileRecipe, X4_BUTTONS, X3_BUTTONS}`, `engine::{Engine, Limits, Mode, Halt, State, Level, Notice, Output, EngineError, MachineStatus, DeepSleepStatus, LifeEnd}`, `device::{Speed, Setup, LaunchError, Recording, FlashKeeper, Launch, Command, CommandError, RunState, Status, VerdictView, Update, Observer, Handle, Emulator}`. |
 | `backend_controllers.md` | `main.rs` d'`emu-cli` appelle `host::launch` (plus de `profile_for`, `FlashOptions`, `RunRequest`, `ConsoleOrigin`, `shown_console`, `console_note`, `file_name`, `flash_note`, `load_rom`, `Starting`, `starting_flash`, `refuse_*`, `header` dans le binaire) ; sorties et codes inchangés. Nouveaux points d'entrée : les 7 commandes Tauri de `app/src-tauri/src/commands.rs` et leurs `kind` d'erreur (`profile`, `recordPath`, `flashFile`, `flashImage`, `firmware`, `rom`, `session`, `replay`, `powerOn`, `stopped`, `noLife`, `replaying`, `ended`, `nothingToStep`, `input`, `button`, `replayNotRecorded`, `notRecordable`, `ipc`, `maxTime`, `maxCycles`, `noImage`, `capture`). |
@@ -115,4 +115,4 @@ que cet agent n'a pas modifiée :
 | `integrations.md` | Tauri 2.12.4 / tauri-build 2.7.3 / tauri-plugin-dialog 2.8.3, `@tauri-apps/cli` 2.12.3, React 19.3.1, Vite 8.3.4, TypeScript 7.0.2, Vitest 5.0.4, jsdom 30.1.2, Testing Library, Biome 2.5.15, pnpm 12.11.2 (corepack ; `minimumReleaseAge` et ses exceptions) ; paquets apt de Tauri en CI ; `serde_json` en dépendance de test de `host`. |
 | `database_schema.md` | Pas de base ; nouveaux fichiers écrits par l'interface : session `.inkrec` à chaque fin d'une vie enregistrée, fichier de flash à chaque fin de vie, capture PNG au chemin choisi ; `localStorage` : `inkemu.language`, `inkemu.theme`. |
 | `tech_debt.md` | Les reports du tableau « Laissé aux héritiers » ; les deux hypothèses de `catalog.rs` ; les exceptions `minimumReleaseAgeExclude` à retirer après le 2026-10-16. |
-| `MEMORY.md` | Ligne d'état : SP2c fait sur sa branche (non mergé, non poussé), ADR 0010. |
+| `MEMORY.md` | Ligne d'état : SP2c fait sur sa branche (non mergé, non poussé), ADR 0011. |
