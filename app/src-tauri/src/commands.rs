@@ -1,6 +1,7 @@
 //! The commands of the interface (app/src/ipc/host.ts calls them by these names). Each one turns
 //! what the interface sends into the types of `host`, calls it, and turns its answer back; a
 //! refusal is an [`ErrorDto`] whose `kind` the interface translates.
+use debugger::{DebugView, PointError, Points, PointsRequest, ViewRequest};
 use host::catalog::{self, DeviceView, Look};
 use host::device::{
     self, Command, CommandError, Emulator, Handle, LaunchError, SdSetup, Setup, Speed, Update,
@@ -325,6 +326,18 @@ impl From<tauri::Error> for ErrorDto {
     }
 }
 
+impl From<PointError> for ErrorDto {
+    fn from(error: PointError) -> ErrorDto {
+        ErrorDto::from(CommandError::Point(error))
+    }
+}
+
+/// The points of the debugger a start begins with: the ones the interface kept from the run
+/// before (design `SP4a`, 4a-D8), each checked as when it is set alone.
+fn points_of(request: Option<PointsRequest>) -> Result<Points, ErrorDto> {
+    Ok(Points::from_request(&request.unwrap_or_default())?)
+}
+
 /// The form of a run, as app/src/ipc/types.ts writes it.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -432,12 +445,37 @@ pub enum CommandDto {
     Step,
     Reset,
     Stop,
-    Speed { speed: Speed },
-    Console { channel: String, bytes: Vec<u8> },
-    UsbHost { host: String },
-    Button { id: String, pressed: bool },
-    Record { path: PathBuf },
-    Capture { path: PathBuf },
+    Speed {
+        speed: Speed,
+    },
+    Console {
+        channel: String,
+        bytes: Vec<u8>,
+    },
+    UsbHost {
+        host: String,
+    },
+    Button {
+        id: String,
+        pressed: bool,
+    },
+    Record {
+        path: PathBuf,
+    },
+    Capture {
+        path: PathBuf,
+    },
+    Breakpoint {
+        address: u32,
+        set: bool,
+    },
+    /// `on`: `read`, `write` or `access`.
+    Watchpoint {
+        address: u32,
+        length: u32,
+        on: String,
+        set: bool,
+    },
 }
 
 impl CommandDto {
@@ -457,6 +495,21 @@ impl CommandDto {
             CommandDto::Button { id, pressed } => Command::Button { id, pressed },
             CommandDto::Record { path } => Command::Record { path },
             CommandDto::Capture { path } => Command::Capture { path },
+            CommandDto::Breakpoint { address, set } => Command::Breakpoint { address, set },
+            CommandDto::Watchpoint {
+                address,
+                length,
+                on,
+                set,
+            } => Command::Watchpoint {
+                watch: debugger::WatchRequest {
+                    address,
+                    length,
+                    on,
+                }
+                .watch()?,
+                set,
+            },
         })
     }
 }
@@ -542,15 +595,19 @@ pub fn devices() -> Result<Vec<DeviceView>, ErrorDto> {
 /// start leaves it as it was. Only a start on a file it holds, its flash file or its SD image,
 /// powers it off first, since its power-off writes that file and releases its lock; and every
 /// start waits for the power-offs under way, whose emulators may still hold such a file (R4).
+///
+/// `points` are the points of the debugger the run begins with, before its first instruction.
 #[tauri::command]
 pub async fn power_on(
     shell: State<'_, Shell>,
     setup: SetupDto,
     speed: Speed,
     start: u64,
+    points: Option<PointsRequest>,
     on_update: Channel<Update>,
 ) -> Result<StartedDto, ErrorDto> {
     let setup = setup.into_setup()?;
+    let points = points_of(points)?;
     let shell = shell.inner();
     if shell.holds_a_file_of(&setup) {
         off_the_main_thread(shell).await?;
@@ -560,7 +617,7 @@ pub async fn power_on(
         after_the_power_offs(&stopping, || device::power_on(&setup))
     })
     .await??;
-    self::start(shell, launch, speed, start, on_update).await
+    self::start(shell, launch.with_points(points), speed, start, on_update).await
 }
 
 /// Does `start` once no power-off is under way: an emulator a start replaced, or one powered
@@ -572,7 +629,8 @@ fn after_the_power_offs<T>(stopping: &Stopping, start: impl FnOnce() -> T) -> T 
     start()
 }
 
-/// Opens a session and replays it as `inkemu replay` does.
+/// Opens a session and replays it as `inkemu replay` does, with the points of the debugger
+/// `points`: they stop the replay without changing it.
 #[tauri::command]
 pub async fn open_replay(
     shell: State<'_, Shell>,
@@ -580,13 +638,22 @@ pub async fn open_replay(
     rom_dir: Option<PathBuf>,
     speed: Speed,
     start: u64,
+    points: Option<PointsRequest>,
     on_update: Channel<Update>,
 ) -> Result<StartedDto, ErrorDto> {
+    let points = points_of(points)?;
     // A replay holds no file of a run: the device that runs goes on until the replay is ready.
     let launch =
         tauri::async_runtime::spawn_blocking(move || device::open_replay(&path, rom_dir, None))
             .await??;
-    self::start(shell.inner(), launch, speed, start, on_update).await
+    self::start(
+        shell.inner(),
+        launch.with_points(points),
+        speed,
+        start,
+        on_update,
+    )
+    .await
 }
 
 /// Powers off the emulator that runs, off the interface's thread: its last life writes its files.
@@ -638,6 +705,22 @@ pub fn frame(shell: State<'_, Shell>, start: u64) -> Response {
 #[tauri::command]
 pub fn notices() -> String {
     boards::notices::notices_text()
+}
+
+/// What the debugger shows of the emulator of start `start` (design `SP4a`): its CPU, its code,
+/// the memory `view` asks for, its points. The emulator's thread reads it between two passes;
+/// the answer is awaited off the interface's thread.
+#[tauri::command]
+pub async fn inspect(
+    shell: State<'_, Shell>,
+    start: u64,
+    view: ViewRequest,
+) -> Result<DebugView, ErrorDto> {
+    let shell = shell.inner();
+    let handle = shell.handle_of(start)?;
+    tauri::async_runtime::spawn_blocking(move || handle.inspect(view))
+        .await?
+        .map_err(ErrorDto::from)
 }
 
 #[cfg(test)]
@@ -882,6 +965,94 @@ mod tests {
             .into_command()
             .unwrap_err();
         assert_eq!(unknown.kind, "input");
+    }
+
+    /// The points of the debugger, as the interface writes them (design `SP4a`).
+    #[test]
+    fn a_point_of_the_interface_reads_as_a_point_of_the_host() {
+        let read = |json: &str| {
+            serde_json::from_str::<CommandDto>(json)
+                .unwrap()
+                .into_command()
+        };
+        assert_eq!(
+            read(r#"{"kind":"breakpoint","address":1073741828,"set":true}"#).unwrap(),
+            Command::Breakpoint {
+                address: 0x4000_0004,
+                set: true
+            }
+        );
+        assert_eq!(
+            read(
+                r#"{"kind":"watchpoint","address":1070071808,"length":4,"on":"write","set":false}"#
+            )
+            .unwrap(),
+            Command::Watchpoint {
+                watch: soc_esp32c3::Watch {
+                    address: 0x3FC8_0000,
+                    length: 4,
+                    on: soc_esp32c3::WatchOn::Write
+                },
+                set: false
+            }
+        );
+        let refused = read(r#"{"kind":"watchpoint","address":0,"length":4,"on":"run","set":true}"#)
+            .unwrap_err();
+        assert_eq!(refused.kind, "point");
+        assert!(refused.message.contains("`run`"), "{}", refused.message);
+    }
+
+    /// A start begins with the points the interface kept, each checked; none is no point.
+    #[test]
+    fn the_points_a_start_begins_with_are_checked() {
+        assert_eq!(points_of(None).unwrap(), Points::default());
+        let kept: PointsRequest =
+            serde_json::from_str(r#"{"breakpoints":[1073741824],"watchpoints":[]}"#).unwrap();
+        assert_eq!(points_of(Some(kept)).unwrap().breakpoints().count(), 1);
+        let odd: PointsRequest = serde_json::from_str(r#"{"breakpoints":[1073741825]}"#).unwrap();
+        assert_eq!(points_of(Some(odd)).unwrap_err().kind, "point");
+    }
+
+    /// The debugger reads the emulator of the start it names, stopped at the breakpoint it began
+    /// with; another start's is refused.
+    #[test]
+    fn the_debugger_reads_the_emulator_of_its_start() {
+        let shell = Shell::default();
+        let mut points = Points::default();
+        points
+            .set_breakpoint(host::test_support::counting_increment())
+            .unwrap();
+        let (sender, updates) = mpsc::channel();
+        let running = Emulator::start(
+            host::test_support::counting_device().with_points(points),
+            Speed::Fastest,
+            Box::new(move |update| {
+                let _ = sender.send(update);
+            }),
+        )
+        .unwrap();
+        let (kept, _) = shell.keep(1, running);
+        assert!(kept);
+        let asked = Instant::now();
+        loop {
+            assert!(asked.elapsed() < WAIT, "no stop");
+            if let Ok(Update::Status(status)) = updates.recv_timeout(WAIT)
+                && status.stop.is_some()
+            {
+                break;
+            }
+        }
+        let view = shell
+            .handle_of(1)
+            .unwrap()
+            .inspect(ViewRequest::default())
+            .unwrap();
+        assert_eq!(view.cpu.pc, host::test_support::counting_increment());
+        assert_eq!(view.points.breakpoints, [view.cpu.pc]);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["cpu"]["registers"][1]["name"], "ra");
+        assert_eq!(shell.handle_of(0).unwrap_err().kind, "stopped");
+        assert_eq!(shell.power_off(), Ok(()));
     }
 
     fn form(max_time: &str, max_cycles: &str) -> SetupDto {

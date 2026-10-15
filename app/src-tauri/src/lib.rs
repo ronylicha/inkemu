@@ -35,6 +35,7 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::frame,
             commands::notices,
             commands::set_language,
+            commands::inspect,
         ])
         .on_window_event(|window, event| {
             let shell = window.state::<Shell>();

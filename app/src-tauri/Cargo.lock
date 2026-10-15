@@ -594,6 +594,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "debugger"
+version = "0.1.0"
+dependencies = [
+ "cpu-rv32",
+ "serde",
+ "soc-esp32c3",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "defmt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1376,6 +1386,8 @@ dependencies = [
  "boards",
  "chips",
  "console-script",
+ "cpu-rv32",
+ "debugger",
  "emu-core",
  "etcetera",
  "firmware",
@@ -1673,6 +1685,7 @@ version = "0.1.0"
 dependencies = [
  "boards",
  "ctrlc",
+ "debugger",
  "host",
  "serde",
  "serde_json",
