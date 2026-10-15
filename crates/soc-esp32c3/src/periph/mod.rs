@@ -11,13 +11,15 @@ pub mod assist_debug;
 pub mod counter;
 pub mod efuse;
 pub mod extmem;
-pub mod gpio;
+pub mod i2c0;
 pub mod intmatrix;
-pub mod io_mux;
+pub mod io;
 pub mod mmu;
 pub mod rtc_cntl;
+pub mod saradc;
 pub mod sensitive;
 pub mod sha;
+pub mod spi2;
 pub mod spi_mem;
 pub(crate) mod stages;
 pub mod system;
@@ -31,14 +33,16 @@ pub use apb_ctrl::ApbCtrl;
 pub use assist_debug::AssistDebug;
 pub use efuse::Efuse;
 pub use extmem::Extmem;
-pub use gpio::Gpio;
+pub use i2c0::I2c0;
 pub use intmatrix::IntMatrix;
-pub use io_mux::IoMux;
+pub use io::{AttachError, IoMatrix, SpiWires};
 pub use mmu::MmuTable;
 pub use rtc_cntl::RtcCntl;
+pub use saradc::SarAdc;
 pub use sensitive::Sensitive;
 pub use sha::Sha;
 pub use spi_mem::{Spi0, Spi1};
+pub use spi2::Spi2;
 pub use system::System;
 pub use systimer::Systimer;
 pub use timg::Timg;
@@ -270,18 +274,19 @@ impl Peripheral<Ctx> for AcceptedBlock {
 #[must_use]
 pub fn accepted_without_effect() -> Vec<Accepted> {
     let mut rows = [
-        io_mux::accepted(),
+        io::accepted(),
         rtc_cntl::accepted(),
-        gpio::accepted(),
         sensitive::accepted(),
         system::accepted(),
         intmatrix::accepted(),
         assist_debug::accepted(),
         extmem::accepted(),
         spi_mem::accepted(),
+        spi2::accepted(),
+        i2c0::accepted(),
         apb_ctrl::accepted(),
         ana_i2c::accepted(),
-        APB_SARADC_ACCEPTED.to_vec(),
+        saradc::accepted(),
         RADIO_POWER_ACCEPTED.to_vec(),
     ]
     .concat();
@@ -361,18 +366,11 @@ const SYSTIMER: (u32, u32) = (SYSTIMER_BASE, 0x6002_4000);
 /// `DR_REG_APB_SARADC_BASE` (ESP-IDF `reg_base.h`; report BC §A.2).
 pub(crate) const APB_SARADC_BASE: u32 = 0x6004_0000;
 const APB_SARADC: (u32, u32) = (APB_SARADC_BASE, 0x6004_1000);
-
-/// The bootloader configures the SAR ADC as an entropy source for the RNG (BA §2 rows 79 to 85).
-const WHY_SARADC: &str = "SAR ADC configuration: no conversion is performed";
-const APB_SARADC_ACCEPTED: [Accepted; 7] = [
-    Accepted::svd("APB_SARADC", "CTRL", WHY_SARADC, "SP2"),
-    Accepted::svd("APB_SARADC", "CTRL2", WHY_SARADC, "SP2"),
-    Accepted::svd("APB_SARADC", "FSM_WAIT", WHY_SARADC, "SP2"),
-    Accepted::svd("APB_SARADC", "SAR_PATT_TAB1", WHY_SARADC, "SP2"),
-    Accepted::svd("APB_SARADC", "SAR_PATT_TAB2", WHY_SARADC, "SP2"),
-    Accepted::svd("APB_SARADC", "DMA_CONF", WHY_SARADC, "SP2"),
-    Accepted::svd("APB_SARADC", "CLKM_CONF", WHY_SARADC, "SP2"),
-];
+/// `DR_REG_SPI2_BASE` and `DR_REG_I2C_EXT_BASE` (`reg_base.h`; research P §C, §D).
+pub(crate) const SPI2_BASE: u32 = 0x6002_4000;
+const SPI2: (u32, u32) = (SPI2_BASE, 0x6002_5000);
+pub(crate) const I2C0_BASE: u32 = 0x6001_3000;
+const I2C0: (u32, u32) = (I2C0_BASE, 0x6001_4000);
 /// Radio memory power bits `rtc_sleep_pu` sets in the application's `rtc_init` (BA §3 rows 30 to 33).
 /// Only `BB.BBPD_CTRL` is in the SVD; the three others are named in ESP-IDF `nrx_reg.h`
 /// (`NRXPD_CTRL`), `fe_reg.h` (`FE_GEN_CTRL`, `FE2_TX_INTERP_CTRL`) (decision D17).
@@ -395,10 +393,8 @@ const RADIO_POWER_ACCEPTED: [Accepted; 4] = [
 
 #[derive(Debug)]
 pub struct Peripherals {
-    /// The strapping pins of the device, latched at power-on: what a reset rebuilds from.
-    strapping: u32,
-    pub gpio: Gpio,
-    pub io_mux: IoMux,
+    /// The GPIO matrix and the IO MUX, with the chips of the board (ADR 0010).
+    pub io: IoMatrix,
     pub intmatrix: IntMatrix,
     pub rtc_cntl: RtcCntl,
     pub system: System,
@@ -415,7 +411,9 @@ pub struct Peripherals {
     pub timg0: Timg,
     pub timg1: Timg,
     pub systimer: Systimer,
-    pub apb_saradc: AcceptedBlock,
+    pub saradc: SarAdc,
+    pub spi2: Spi2,
+    pub i2c0: I2c0,
     /// Four isolated words: its base is 0, so its offsets are absolute addresses.
     pub radio_power: AcceptedBlock,
     pub uart0: Uart,
@@ -447,10 +445,9 @@ impl Peripherals {
     ) -> Peripherals {
         let flash_boot = config.strapping & STRAP_SPI_FAST_FLASH_BOOT != 0;
         let efuse = Efuse::new(config.chip_revision);
+        let saradc = SarAdc::new(&efuse);
         let mut periph = Peripherals {
-            strapping: config.strapping,
-            gpio: Gpio::new(config.strapping),
-            io_mux: IoMux::new(),
+            io: IoMatrix::new(config.strapping),
             intmatrix: IntMatrix::new(),
             rtc_cntl: RtcCntl::new(flash_boot, efuse.wdt_delay_sel(), ctx.now()),
             system: System::new(),
@@ -467,7 +464,9 @@ impl Peripherals {
             timg0: Timg::new(Group::Timg0, flash_boot, ctx),
             timg1: Timg::new(Group::Timg1, flash_boot, ctx),
             systimer: Systimer::new(ctx.now()).with_qemu_compat(config.qemu_compat),
-            apb_saradc: AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED),
+            saradc,
+            spi2: Spi2::new(),
+            i2c0: I2c0::new(),
             radio_power: AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED),
             uart0: Uart::new(0, UART0_BASE),
             uart1: Uart::new(1, UART1_BASE),
@@ -517,6 +516,11 @@ impl Peripherals {
             Event::Uart(_) => self.uart1.wake(ctx),
             Event::UsbSerialJtag => self.usb_serial_jtag.wake(ctx),
             Event::ModuleReset(module) => self.reset_module(ctx, module),
+            Event::Pins => self.io.wake(ctx),
+            // GP-SPI2 and the SAR ADC reach the pads through the matrix (ADR 0010).
+            Event::Spi2 => self.spi2.wake(ctx, &mut self.io),
+            Event::I2c0 => self.i2c0.wake(ctx),
+            Event::SarAdc => self.saradc.wake(ctx, &mut self.io),
         }
     }
 
@@ -540,6 +544,9 @@ impl Peripherals {
             Module::Systimer => self.systimer.reset(ctx),
             Module::Sha => self.sha = Sha::new(),
             Module::UsbDevice => self.usb_serial_jtag.reset(ctx),
+            Module::Spi2 => self.spi2.reset(ctx, &mut self.io),
+            Module::I2c0 => self.i2c0.reset(ctx),
+            Module::ApbSaradc => self.saradc.reset(ctx),
         }
     }
 
@@ -616,8 +623,12 @@ impl Peripherals {
     }
 
     fn core_reset(&mut self, ctx: &mut Ctx) {
-        self.gpio = Gpio::new(self.strapping);
-        self.io_mux = IoMux::new();
+        // GP-SPI2 releases the chip selects it holds before the matrix forgets its routing; the
+        // chips of the board stay and hear their lines go back to their reset state.
+        self.spi2.reset(ctx, &mut self.io);
+        self.io.reset(ctx);
+        self.i2c0.reset(ctx);
+        self.saradc.reset(ctx);
         self.intmatrix = IntMatrix::new();
         self.system = System::new();
         self.extmem = Extmem::new();
@@ -628,7 +639,6 @@ impl Peripherals {
         self.sha = Sha::new();
         self.apb_ctrl.reset();
         self.ana_i2c.reset();
-        self.apb_saradc = AcceptedBlock::new(APB_SARADC_BASE, &APB_SARADC_ACCEPTED);
         self.radio_power = AcceptedBlock::new(0, &RADIO_POWER_ACCEPTED);
         self.uart0.reset(ctx);
         self.uart1.reset(ctx);
@@ -646,10 +656,9 @@ impl Peripherals {
     /// The device that owns the register at `addr`, with its base address.
     pub(crate) fn device(&mut self, addr: u32) -> Option<(&mut dyn Peripheral<Ctx>, u32)> {
         let within = |block: (u32, u32)| (block.0..block.1).contains(&addr);
-        if within(GPIO) {
-            Some((&mut self.gpio, GPIO_BASE))
-        } else if within(IO_MUX) {
-            Some((&mut self.io_mux, IO_MUX_BASE))
+        if within(GPIO) || within(IO_MUX) {
+            // One model for both blocks, the IO MUX at its offset from the base of GPIO.
+            Some((&mut self.io, GPIO_BASE))
         } else if within(RTC_CNTL) {
             Some((&mut self.rtc_cntl, RTC_CNTL_BASE))
         } else if within(EFUSE) {
@@ -683,7 +692,11 @@ impl Peripherals {
         } else if within(SYSTIMER) {
             Some((&mut self.systimer, SYSTIMER_BASE))
         } else if within(APB_SARADC) {
-            Some((&mut self.apb_saradc, APB_SARADC_BASE))
+            Some((&mut self.saradc, APB_SARADC_BASE))
+        } else if within(SPI2) {
+            Some((&mut self.spi2, SPI2_BASE))
+        } else if within(I2C0) {
+            Some((&mut self.i2c0, I2C0_BASE))
         } else if within(UART0) {
             Some((&mut self.uart0, UART0_BASE))
         } else if within(UART1) {
@@ -910,8 +923,8 @@ mod tests {
         assert_eq!(read(svd("APB_SARADC", "CLKM_CONF")), Some(4));
         assert_eq!(
             read(svd("APB_SARADC", "ONETIME_SAMPLE")),
-            None,
-            "conversions are SP2"
+            Some(0x1A00_0000),
+            "conversions are modelled (SP2b)"
         );
         for addr in [
             svd("BB", "BBPD_CTRL"),
@@ -960,7 +973,11 @@ mod tests {
         assert_eq!(base_of(&mut p, 0x6000_87FC), Some(RTC_CNTL_BASE));
         assert_eq!(base_of(&mut p, 0x6000_8800), Some(EFUSE_BASE));
         assert_eq!(base_of(&mut p, 0x6000_8FFC), Some(EFUSE_BASE));
-        assert_eq!(base_of(&mut p, 0x6000_9000), Some(IO_MUX_BASE));
+        assert_eq!(
+            base_of(&mut p, 0x6000_9000),
+            Some(GPIO_BASE),
+            "IO_MUX, answered by the IO matrix from the base of GPIO"
+        );
     }
 
     #[test]
@@ -1338,6 +1355,9 @@ mod tests {
             Module::Systimer,
             Module::Sha,
             Module::UsbDevice,
+            Module::Spi2,
+            Module::I2c0,
+            Module::ApbSaradc,
         ] {
             p.deliver(ctx, Event::ModuleReset(module));
             assert_eq!(ctx.take_signal(), None, "{module:?}");

@@ -8,14 +8,16 @@ use crate::diag::{Diagnostic, Unsupported};
 use crate::flash::{FlashDevice, FlashImageError, FlashWrite, NorFlash};
 use crate::inputs::InputJournal;
 use crate::memmap::RESET_PC;
-use crate::periph::UsbHost;
+use crate::periph::{AttachError, SpiWires, UsbHost};
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
 use cpu_rv32::{
     Boundary, DatasheetTiming, Decoded, Exception, Hart, HartConfig, InterruptModel,
     MisalignedPolicy, QemuIcountTiming, StepOutcome, Trap, VendorCsrs,
 };
-use emu_core::{Cycles, Frequency, TimingModel, TraceHash};
+use emu_core::{
+    AnalogSource, Cycles, Frequency, GpioInput, GpioOutput, SpiTarget, TimingModel, TraceHash,
+};
 
 /// `x2`, the stack pointer of the RISC-V calling convention.
 const STACK_POINTER: usize = 2;
@@ -1128,6 +1130,61 @@ impl Esp32C3 {
     /// The USB host now, the changes due by now applied.
     pub fn usb_host(&mut self) -> UsbHost {
         self.bus.periph.usb_serial_jtag.host(&mut self.bus.ctx)
+    }
+
+    /// Attaches a chip that drives pin `pin` (a button, a BUSY line, a detection line): wherever
+    /// the pad is an input, the `SoC` reads the level the chip gives (ADR 0010). A chip whose level
+    /// changes by itself says when (`GpioInput::next_change`); one changed from outside the run
+    /// is read again by [`Esp32C3::inputs_changed`].
+    /// # Errors
+    /// [`AttachError`] when the pin does not exist or a chip already drives it.
+    pub fn attach_input(&mut self, pin: u8, chip: Box<dyn GpioInput>) -> Result<(), AttachError> {
+        self.bus
+            .periph
+            .io
+            .attach_input(&mut self.bus.ctx, pin, chip)
+    }
+
+    /// Attaches a chip that watches pin `pin` (a reset line, a power latch): it hears at once what
+    /// the `SoC` drives there, then every change.
+    /// # Errors
+    /// [`AttachError`] when the pin does not exist.
+    pub fn attach_output(&mut self, pin: u8, chip: Box<dyn GpioOutput>) -> Result<(), AttachError> {
+        self.bus.periph.io.attach_output(&self.bus.ctx, pin, chip)
+    }
+
+    /// Attaches a chip to GP-SPI2 by the pins of its lines: it receives each transaction while
+    /// its chip select is low, with its data/command line, at the instant the transaction ends.
+    /// # Errors
+    /// [`AttachError`] when one of the pins does not exist.
+    pub fn attach_spi(
+        &mut self,
+        wires: SpiWires,
+        chip: Box<dyn SpiTarget>,
+    ) -> Result<(), AttachError> {
+        self.bus
+            .periph
+            .io
+            .attach_spi(&mut self.bus.ctx, wires, chip)
+    }
+
+    /// Attaches a chip that puts a voltage on pin `pin`, one of GPIO0 to GPIO5: the SAR ADC
+    /// converts it.
+    /// # Errors
+    /// [`AttachError`] when the pin has no ADC channel or already has an analog chip.
+    pub fn attach_analog(
+        &mut self,
+        pin: u8,
+        chip: Box<dyn AnalogSource>,
+    ) -> Result<(), AttachError> {
+        self.bus.periph.io.attach_analog(pin, chip)
+    }
+
+    /// An attached chip changed what it drives from outside the run (a button the user pressed):
+    /// the pins are read again at the present device time, and a GPIO interrupt it triggers is
+    /// raised. Recording such a change in a session is the caller's (ADR 0010).
+    pub fn inputs_changed(&mut self) {
+        self.bus.periph.io.settle(&mut self.bus.ctx);
     }
 
     /// The changes of the USB host still to come, those due by now applied first; during a deep
@@ -5000,5 +5057,84 @@ mod tests {
             datasheet.step();
         }
         assert_eq!(datasheet.device_time_nanos(), 1_250);
+    }
+
+    /// A chip that holds a pin at a level the test sets, and records what the `SoC` drives on
+    /// another.
+    #[derive(Debug, Default)]
+    struct Pins {
+        driven_low: bool,
+        heard: Vec<Option<emu_core::Level>>,
+    }
+
+    impl GpioInput for Pins {
+        fn level(&mut self, _at: emu_core::Nanos) -> Option<emu_core::Level> {
+            Some(emu_core::Level::from_bool(!self.driven_low))
+        }
+    }
+
+    impl GpioOutput for Pins {
+        fn driven(&mut self, level: Option<emu_core::Level>, _at: emu_core::Nanos) {
+            self.heard.push(level);
+        }
+    }
+
+    #[test]
+    fn chips_attached_to_the_machine_drive_and_hear_its_pins() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        const GPIO_PAD: u32 = (1 << 12) | (1 << 9);
+        let gpio = |name| svd_regs::esp32c3::addr("GPIO", name);
+        let mut m = machine(&[HANG]);
+        let chip = Rc::new(RefCell::new(Pins {
+            driven_low: true,
+            ..Pins::default()
+        }));
+        m.attach_input(3, Box::new(Rc::clone(&chip))).unwrap();
+        m.attach_output(4, Box::new(Rc::clone(&chip))).unwrap();
+        for pad in ["GPIO3", "GPIO4"] {
+            let at = svd_regs::esp32c3::addr("IO_MUX", pad);
+            m.bus.write(at, AccessSize::Word, GPIO_PAD).unwrap();
+        }
+        assert_eq!(bus_word(&mut m, gpio("IN")) & (1 << 3), 0, "held low");
+        // Any edge of GPIO3 interrupts the CPU (`INT_TYPE` 3, `INT_ENA` bit 13).
+        let pin3 = gpio("PIN3");
+        m.bus
+            .write(pin3, AccessSize::Word, (3 << 7) | (1 << 13))
+            .unwrap();
+        chip.borrow_mut().driven_low = false;
+        assert_eq!(
+            m.bus.ctx.sources() & (1 << 16),
+            0,
+            "nothing has read the pins since the chip changed"
+        );
+        m.inputs_changed();
+        assert_eq!(
+            m.bus.ctx.sources() & (1 << 16),
+            1 << 16,
+            "the change is seen at once, its edge raises the GPIO interrupt"
+        );
+        assert_eq!(bus_word(&mut m, gpio("IN")) & (1 << 3), 1 << 3);
+        assert_eq!(bus_word(&mut m, gpio("STATUS")) & (1 << 3), 1 << 3);
+        // GPIO4 without its pull-up and not yet an output floats: nothing drives it.
+        for (register, level) in [
+            ("OUT_W1TC", None),
+            ("ENABLE_W1TS", Some(emu_core::Level::Low)),
+            ("OUT_W1TS", Some(emu_core::Level::High)),
+        ] {
+            m.bus
+                .write(gpio(register), AccessSize::Word, 1 << 4)
+                .unwrap();
+            assert_eq!(chip.borrow().heard.last(), Some(&level), "{register}");
+        }
+        assert!(matches!(
+            m.attach_input(3, Box::new(Rc::clone(&chip))),
+            Err(AttachError::InputTaken { pin: 3 })
+        ));
+        assert!(matches!(
+            m.attach_input(22, Box::new(Rc::clone(&chip))),
+            Err(AttachError::NoSuchPin { pin: 22 })
+        ));
+        assert_eq!(m.drain_diagnostics(), []);
     }
 }

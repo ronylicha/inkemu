@@ -766,7 +766,7 @@ fn deep_sleep_line(sleep: &DeepSleep) -> String {
                 "it waits for nothing".to_owned()
             } else {
                 let gpio = if unmodelled & DeepSleep::GPIO != 0 {
-                    " (GPIO, bit 2, belongs to sub-project 2)"
+                    " (GPIO, bit 2, belongs to sub-project 2d)"
                 } else {
                     ""
                 };
@@ -1708,7 +1708,7 @@ mod tests {
         assert_eq!(run.end, RunEnd::DeepSleep);
         for line in [
             "warning: the chip went into deep sleep with wake sources inkemu does not model (WAKEUP_ENA 0x00004, pc ",
-            "it waits for a wake source inkemu does not model (GPIO, bit 2, belongs to sub-project 2): WAKEUP_ENA 0x00004\n",
+            "it waits for a wake source inkemu does not model (GPIO, bit 2, belongs to sub-project 2d): WAKEUP_ENA 0x00004\n",
         ] {
             assert!(run.log.contains(line), "`{line}` is missing:\n{}", run.log);
         }
@@ -1787,7 +1787,7 @@ mod tests {
         );
         assert_eq!(
             line(None, DeepSleep::TIMER | DeepSleep::GPIO),
-            "inkemu: the device is in deep sleep since 1500 us of device time; it waits for a wake source inkemu does not model (GPIO, bit 2, belongs to sub-project 2): WAKEUP_ENA 0x0000c; the RTC timer is a wake source but its alarm is not enabled (SLP_TIMER1.MAIN_TIMER_ALARM_EN)"
+            "inkemu: the device is in deep sleep since 1500 us of device time; it waits for a wake source inkemu does not model (GPIO, bit 2, belongs to sub-project 2d): WAKEUP_ENA 0x0000c; the RTC timer is a wake source but its alarm is not enabled (SLP_TIMER1.MAIN_TIMER_ALARM_EN)"
         );
     }
 

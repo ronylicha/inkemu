@@ -142,6 +142,20 @@ impl Efuse {
         u16::try_from(major * BLK_MAJOR_WEIGHT + minor).unwrap_or(u16::MAX)
     }
 
+    /// BLOCK2, the system data that holds the calibration of the analog blocks: the eight words
+    /// `RD_SYS_PART1_DATA0..7`, bit 0 of the block in bit 0 of the first (`esp_efuse_table.csv`).
+    #[must_use]
+    pub fn system_data(&self) -> [u32; 8] {
+        let first = reg("RD_SYS_PART1_DATA0");
+        std::array::from_fn(|n| {
+            let at = first + 4 * u32::try_from(n).unwrap_or(0);
+            self.read_mirror
+                .iter()
+                .find(|&&(offset, _)| offset == at)
+                .map_or(0, |&(_, value)| value)
+        })
+    }
+
     /// `WDT_DELAY_SEL`, `RD_REPEAT_DATA1[17:16]`: the multiplier of the stage 0 timeout of the RTC
     /// watchdog (`IDF:hal/esp32c3/include/hal/rwdt_ll.h:119`; report TW §C.3).
     #[must_use]

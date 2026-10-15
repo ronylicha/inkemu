@@ -32,28 +32,28 @@ const WHY: &str =
 
 pub(crate) fn accepted() -> Vec<Accepted> {
     vec![
-        Accepted::at("ANA_I2C", "HOST0_CMD", ANA_I2C_BASE + HOST0_CMD, WHY, "SP2"),
-        Accepted::at("ANA_I2C", "HOST1_CMD", ANA_I2C_BASE + HOST1_CMD, WHY, "SP2"),
+        Accepted::at("ANA_I2C", "HOST0_CMD", ANA_I2C_BASE + HOST0_CMD, WHY, "SP8"),
+        Accepted::at("ANA_I2C", "HOST1_CMD", ANA_I2C_BASE + HOST1_CMD, WHY, "SP8"),
         Accepted::at(
             "ANA_I2C",
             "I2C_MST_ANA_CONF0",
             ANA_I2C_BASE + I2C_MST_ANA_CONF0,
             WHY,
-            "SP2",
+            "SP8",
         ),
         Accepted::at(
             "ANA_I2C",
             "ANA_CONFIG",
             ANA_I2C_BASE + ANA_CONFIG,
             WHY,
-            "SP2",
+            "SP8",
         ),
         Accepted::at(
             "ANA_I2C",
             "ANA_CONFIG2",
             ANA_I2C_BASE + ANA_CONFIG2,
             WHY,
-            "SP2",
+            "SP8",
         ),
     ]
 }

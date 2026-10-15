@@ -115,6 +115,70 @@ pub enum Unsupported {
     /// A write of `USB_DEVICE.EP1` while the IN endpoint had no room: the byte was ignored
     /// (report USJ O.6).
     UsbInFull,
+    /// `GPIO.FUNCn_OUT_SEL_CFG` routes to pad `pin` the output signal `signal` of a peripheral the
+    /// model does not have (2b-D5): the pad is not driven.
+    PadSignal { pin: u8, signal: u32 },
+    /// `GPIO.PINn.INT_ENA` asks for an interrupt besides the CPU's (bit 0): the NMI or another
+    /// target the model does not have (2b-D6). `int_ena` is the field.
+    PadInterrupt { pin: u8, int_ena: u32 },
+    /// A transaction of GP-SPI2 the model does not carry out (2b-D7).
+    Spi2 { refusal: Spi2Refusal },
+    /// An operation of I2C0 the model does not carry out (2b-D9).
+    I2c { refusal: I2cRefusal },
+    /// An operation of the SAR ADC the model does not carry out (2b-D10).
+    Adc { refusal: AdcRefusal },
+}
+
+/// Why GP-SPI2 refused a transaction (2b-D7). The transaction ends at once, as if it had run:
+/// `CMD.USR` falls and `TRANS_DONE` rises, nothing reaches a chip and `W0..W15` keep their bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spi2Refusal {
+    /// `DMA_CONF.DMA_TX_ENA` or `DMA_RX_ENA`: the data would come from GDMA, not modelled.
+    Dma,
+    /// A phase on two or four lines (`CTRL.FCMD_*`, `FADDR_*`, `FREAD_*`, `USER.FWRITE_*`,
+    /// `QPI_MODE`).
+    MultiLine,
+    /// A dummy phase (`USER.USR_DUMMY`).
+    Dummy,
+    /// A 3-wire transfer, MOSI and MISO on one line (`USER.SIO`).
+    ThreeWire,
+    /// A command phase of `bits` bits: only 8 and 16 are modelled.
+    CommandLength { bits: u32 },
+    /// An address phase of `bits` bits: only 8, 16, 24 and 32 are modelled.
+    AddressLength { bits: u32 },
+    /// A data phase of `bits` bits: only whole bytes up to the 512 bits of `W0..W15`.
+    DataLength { bits: u32 },
+    /// A transaction started in slave mode (`SLAVE.MODE`).
+    Slave,
+    /// A segmented transfer (`SLAVE.USR_CONF`, `USER.USR_CONF_NXT`).
+    Segmented,
+}
+
+/// Why I2C0 refused an operation (2b-D9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum I2cRefusal {
+    /// `CTR.TRANS_START` in slave mode (`CTR.MS_MODE` clear): the sequence did not run.
+    Slave,
+    /// `CTR.TRANS_START` with `FIFO_CONF.NONFIFO_EN` set: the sequence did not run.
+    NonFifo,
+    /// `CLK_CONF.SCLK_SEL` selects `RC_FAST`, or `SCLK_DIV_A`/`SCLK_DIV_B` a fractional divider: the
+    /// sequence ran, timed with the crystal divided by `SCLK_DIV_NUM + 1`. `clk_conf` is the
+    /// register.
+    Clock { clk_conf: u32 },
+}
+
+/// Why the SAR ADC refused an operation (2b-D10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdcRefusal {
+    /// A multi-channel scan was started (`CTRL.SARADC_START`, `SARADC_START_FORCE` or
+    /// `CTRL2.SARADC_TIMER_EN`): nothing was sampled.
+    Scan,
+    /// A one-shot start with both units selected (`ONETIME_SAMPLE` bits 30 and 31): nothing was
+    /// sampled.
+    BothUnits,
+    /// `CLKM_CONF.CLK_SEL` other than 2, the APB clock ESP-IDF selects: the conversion was timed
+    /// with the APB clock. `clk_sel` is the field.
+    Clock { clk_sel: u32 },
 }
 
 /// A UART mode the model refuses by name when software sets it (report UR §10, A4).
@@ -315,14 +379,6 @@ impl Unsupported {
                 f,
                 "SPI1.FLASH_SUS_CTRL asks for a program/erase suspend or resume (value {sus_ctrl:#010x}, pc {pc:#010x}) but a flash operation completes at once here and is never suspended, so nothing was sent to the flash; build the firmware without flash suspend: no auto-suspend (CONFIG_SPI_FLASH_AUTO_SUSPEND=n, the ESP-IDF default) and no suspend or resume sent by software (FLASH_PES and FLASH_PER, which ESP-IDF writes only with CONFIG_SPI_FLASH_SOFTWARE_RESUME)"
             ),
-            Unsupported::ShaDma => write!(
-                f,
-                "SHA.DMA_BLOCK_NUM, DMA_START or DMA_CONTINUE was written (pc {pc:#010x}) but only the typical SHA mode is modeled, so DMA-SHA produces no digest; use firmware that hashes through SHA.START/CONTINUE until DMA-SHA is emulated"
-            ),
-            Unsupported::ShaMode { mode } => write!(
-                f,
-                "SHA.MODE {mode} selects an algorithm the ESP32-C3 accelerator does not have (pc {pc:#010x}), so the block was not hashed; use SHA-1 (0), SHA-224 (1) or SHA-256 (2)"
-            ),
             Unsupported::ClockSource {
                 sysclk_conf,
                 cpu_per_conf,
@@ -343,6 +399,116 @@ impl Unsupported {
             | Unsupported::UartEmptyRead { .. }
             | Unsupported::UsbEmptyRead
             | Unsupported::UsbInFull => self.describe_serial(pc, f),
+            Unsupported::ShaDma
+            | Unsupported::ShaMode { .. }
+            | Unsupported::PadSignal { .. }
+            | Unsupported::PadInterrupt { .. }
+            | Unsupported::Spi2 { .. }
+            | Unsupported::I2c { .. }
+            | Unsupported::Adc { .. } => self.describe_devices(pc, f),
+        }
+    }
+
+    /// The messages of the refusals of the SHA accelerator, the pads, GP-SPI2, I2C0 and the SAR
+    /// ADC, for [`Unsupported::describe`].
+    fn describe_devices(self, pc: u32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unsupported::ShaDma => write!(
+                f,
+                "SHA.DMA_BLOCK_NUM, DMA_START or DMA_CONTINUE was written (pc {pc:#010x}) but only the typical SHA mode is modeled, so DMA-SHA produces no digest; use firmware that hashes through SHA.START/CONTINUE until DMA-SHA is emulated"
+            ),
+            Unsupported::ShaMode { mode } => write!(
+                f,
+                "SHA.MODE {mode} selects an algorithm the ESP32-C3 accelerator does not have (pc {pc:#010x}), so the block was not hashed; use SHA-1 (0), SHA-224 (1) or SHA-256 (2)"
+            ),
+            Unsupported::PadSignal { pin, signal } => write!(
+                f,
+                "GPIO.FUNC{pin}_OUT_SEL_CFG routes output signal {signal} to GPIO{pin} (pc {pc:#010x}), a signal of a peripheral inkemu does not model, so the pin is not driven; route the plain GPIO output (128), U0TXD (6), I2C0 (53, 54) or GP-SPI2 (63 to 73) there, or leave the pin an input"
+            ),
+            Unsupported::PadInterrupt { pin, int_ena } => write!(
+                f,
+                "GPIO.PIN{pin}.INT_ENA asks for the pin's interrupt beyond the CPU's (value {int_ena:#04x}, pc {pc:#010x}), which inkemu does not model, so only the CPU interrupt (bit 0) is raised; write INT_ENA = 1, as ESP-IDF does"
+            ),
+            Unsupported::Spi2 { refusal } => {
+                let (asked, remedy) = Self::describe_spi2(refusal);
+                write!(
+                    f,
+                    "GP-SPI2 was asked for {asked} (pc {pc:#010x}), which inkemu does not model, so the transaction ended at once with nothing sent: CMD.USR fell, DMA_INT_RAW.TRANS_DONE rose and W0..W15 keep their bytes; {remedy}"
+                )
+            }
+            Unsupported::I2c { refusal } => match refusal {
+                I2cRefusal::Slave => write!(
+                    f,
+                    "I2C0 was started (CTR.TRANS_START) in slave mode (pc {pc:#010x}), which inkemu does not model, so nothing ran; set CTR.MS_MODE for a master"
+                ),
+                I2cRefusal::NonFifo => write!(
+                    f,
+                    "I2C0 was started (CTR.TRANS_START) with FIFO_CONF.NONFIFO_EN set (pc {pc:#010x}), whose RAM addressing inkemu does not model, so nothing ran; clear NONFIFO_EN and write the bytes to I2C0.DATA"
+                ),
+                I2cRefusal::Clock { clk_conf } => write!(
+                    f,
+                    "I2C0 ran with a source clock inkemu does not model (CLK_CONF {clk_conf:#010x}, RC_FAST or a fractional divider, pc {pc:#010x}), so its bits were timed with the 40 MHz crystal divided by SCLK_DIV_NUM + 1; select the crystal (SCLK_SEL = 0) with SCLK_DIV_A = SCLK_DIV_B = 0"
+                ),
+            },
+            Unsupported::Adc { refusal } => match refusal {
+                AdcRefusal::Scan => write!(
+                    f,
+                    "the SAR ADC was asked for a multi-channel scan (APB_SARADC.CTRL SARADC_START or SARADC_START_FORCE, or CTRL2.SARADC_TIMER_EN, pc {pc:#010x}), which inkemu does not model, so nothing was sampled; read the channels one at a time with ONETIME_SAMPLE (adc_oneshot_read)"
+                ),
+                AdcRefusal::BothUnits => write!(
+                    f,
+                    "a one-shot conversion of the SAR ADC was started with both units selected (APB_SARADC.ONETIME_SAMPLE bits 30 and 31, pc {pc:#010x}), and which one converts is not documented, so nothing was sampled; select one unit per conversion"
+                ),
+                AdcRefusal::Clock { clk_sel } => write!(
+                    f,
+                    "the SAR ADC converted with APB_SARADC.CLKM_CONF.CLK_SEL = {clk_sel} (pc {pc:#010x}), a clock inkemu does not model, so the conversion was timed with the APB clock; select the APB clock (CLK_SEL = 2), as ESP-IDF does"
+                ),
+            },
+            // INVARIANT: `describe` hands only the refusals above to this function.
+            _ => Ok(()),
+        }
+    }
+
+    /// What a refused transaction of GP-SPI2 asked for, then the remedy, as the message says them.
+    fn describe_spi2(refusal: Spi2Refusal) -> (String, &'static str) {
+        let fixed = |asked: &str, remedy| (asked.to_owned(), remedy);
+        match refusal {
+            Spi2Refusal::Dma => fixed(
+                "a transaction fed by GDMA (DMA_CONF.DMA_TX_ENA or DMA_RX_ENA)",
+                "move the data through W0..W15 (CPU mode), as Arduino's SPIClass and spi_master without a DMA channel do",
+            ),
+            Spi2Refusal::MultiLine => fixed(
+                "a phase on two or four lines (CTRL FCMD/FADDR/FREAD dual or quad, USER FWRITE dual or quad, or QPI_MODE)",
+                "use one-line phases",
+            ),
+            Spi2Refusal::Dummy => fixed(
+                "a dummy phase (USER.USR_DUMMY)",
+                "send the dummy clocks as data bytes",
+            ),
+            Spi2Refusal::ThreeWire => fixed(
+                "a 3-wire transfer (USER.SIO)",
+                "use separate MOSI and MISO lines",
+            ),
+            Spi2Refusal::CommandLength { bits } => (
+                format!("a command phase of {bits} bits (USER2.USR_COMMAND_BITLEN)"),
+                "send a command of 8 or 16 bits",
+            ),
+            Spi2Refusal::AddressLength { bits } => (
+                format!("an address phase of {bits} bits (USER1.USR_ADDR_BITLEN)"),
+                "send an address of 8, 16, 24 or 32 bits",
+            ),
+            Spi2Refusal::DataLength { bits } => (
+                format!("a data phase of {bits} bits (MS_DLEN)"),
+                "send whole bytes, 64 at most, what W0..W15 hold",
+            ),
+            Spi2Refusal::Slave => fixed(
+                "a transaction in slave mode (SLAVE.MODE)",
+                "use GP-SPI2 as a master",
+            ),
+            Spi2Refusal::Segmented => fixed(
+                "a segmented transfer (SLAVE.USR_CONF or USER.USR_CONF_NXT)",
+                "send single transactions",
+            ),
         }
     }
 
@@ -360,7 +526,7 @@ impl Unsupported {
             ),
             Unsupported::SleepWakeSource { wakeup_ena } => {
                 let gpio = if wakeup_ena & GPIO_WAKE != 0 {
-                    "; the GPIO wake (bit 2) belongs to sub-project 2, which models the pins"
+                    "; the GPIO wake (bit 2) belongs to sub-project 2d, which wires the buttons of the X4"
                 } else {
                     ""
                 };
@@ -503,6 +669,21 @@ pub enum Diagnostic {
 /// Deduplication key: what the diagnostic is about, not where it was first seen.
 type Key = (u8, u32, u32);
 
+/// The kind of a refusal of GP-SPI2, for its deduplication key: the lengths are one kind each.
+const fn spi2_kind(refusal: Spi2Refusal) -> u32 {
+    match refusal {
+        Spi2Refusal::Dma => 0,
+        Spi2Refusal::MultiLine => 1,
+        Spi2Refusal::Dummy => 2,
+        Spi2Refusal::ThreeWire => 3,
+        Spi2Refusal::CommandLength { .. } => 4,
+        Spi2Refusal::AddressLength { .. } => 5,
+        Spi2Refusal::DataLength { .. } => 6,
+        Spi2Refusal::Slave => 7,
+        Spi2Refusal::Segmented => 8,
+    }
+}
+
 impl Diagnostic {
     /// `None` for a reset: each one is listed (see [`Diagnostic::Reset`]).
     fn key(&self) -> Option<Key> {
@@ -563,6 +744,30 @@ impl Diagnostic {
                 Unsupported::FlashProgramLength { addr } => (15, addr >> 24, 0),
                 Unsupported::FlashCommandBits { .. } => (16, 0, 0),
                 Unsupported::FlashSuspend { .. } => (17, 0, 0),
+                // One line per pin and signal: 22 pins, 128 signals at most.
+                Unsupported::PadSignal { pin, signal } => (33, u32::from(pin), signal),
+                Unsupported::PadInterrupt { pin, .. } => (34, u32::from(pin), 0),
+                // One line per kind of refusal; a length is one line for every length, as for
+                // SPI1, so that a firmware refused in a loop cannot fill the table.
+                Unsupported::Spi2 { refusal } => (35, spi2_kind(refusal), 0),
+                Unsupported::I2c { refusal } => (
+                    36,
+                    match refusal {
+                        I2cRefusal::Slave => 0,
+                        I2cRefusal::NonFifo => 1,
+                        I2cRefusal::Clock { .. } => 2,
+                    },
+                    0,
+                ),
+                Unsupported::Adc { refusal } => (
+                    37,
+                    match refusal {
+                        AdcRefusal::Scan => 0,
+                        AdcRefusal::BothUnits => 1,
+                        AdcRefusal::Clock { clk_sel } => 2 + clk_sel,
+                    },
+                    0,
+                ),
             },
             Diagnostic::FlashMapping { entry, fault, .. } => (10, entry, fault as u32),
             // One line per flash page: the firmware reads the page again at many addresses.
@@ -1468,7 +1673,7 @@ mod tests {
             ),
             (
                 unsupported(Unsupported::SleepWakeSource { wakeup_ena: 0xC }),
-                "(WAKEUP_ENA 0x0000c, pc 0x40381000); the GPIO wake (bit 2) belongs to sub-project 2",
+                "(WAKEUP_ENA 0x0000c, pc 0x40381000); the GPIO wake (bit 2) belongs to sub-project 2d",
             ),
             (
                 unsupported(Unsupported::SleepWakeSource { wakeup_ena: 0x48 }),
@@ -1627,6 +1832,108 @@ mod tests {
         ];
         for (what, needle) in texts {
             assert_cause_then_remedy(&unsupported(what), needle);
+        }
+    }
+
+    #[test]
+    fn the_refusals_of_the_pads_spi2_i2c0_and_the_adc_state_the_cause_then_the_remedy() {
+        let texts = [
+            (
+                Unsupported::PadSignal { pin: 9, signal: 45 },
+                "GPIO.FUNC9_OUT_SEL_CFG routes output signal 45 to GPIO9 (pc 0x40381000)",
+            ),
+            (
+                Unsupported::PadInterrupt { pin: 3, int_ena: 2 },
+                "GPIO.PIN3.INT_ENA asks for the pin's interrupt beyond the CPU's (value 0x02, pc 0x40381000)",
+            ),
+            (
+                Unsupported::Spi2 {
+                    refusal: Spi2Refusal::Dma,
+                },
+                "GP-SPI2 was asked for a transaction fed by GDMA (DMA_CONF.DMA_TX_ENA or DMA_RX_ENA) (pc 0x40381000)",
+            ),
+            (
+                Unsupported::Spi2 {
+                    refusal: Spi2Refusal::DataLength { bits: 520 },
+                },
+                "a data phase of 520 bits (MS_DLEN)",
+            ),
+            (
+                Unsupported::Spi2 {
+                    refusal: Spi2Refusal::CommandLength { bits: 4 },
+                },
+                "a command phase of 4 bits",
+            ),
+            (
+                Unsupported::Spi2 {
+                    refusal: Spi2Refusal::AddressLength { bits: 12 },
+                },
+                "an address phase of 12 bits",
+            ),
+            (
+                Unsupported::I2c {
+                    refusal: I2cRefusal::Slave,
+                },
+                "I2C0 was started (CTR.TRANS_START) in slave mode (pc 0x40381000)",
+            ),
+            (
+                Unsupported::I2c {
+                    refusal: I2cRefusal::NonFifo,
+                },
+                "FIFO_CONF.NONFIFO_EN set (pc 0x40381000)",
+            ),
+            (
+                Unsupported::I2c {
+                    refusal: I2cRefusal::Clock {
+                        clk_conf: 0x10_0000,
+                    },
+                },
+                "I2C0 ran with a source clock inkemu does not model (CLK_CONF 0x00100000",
+            ),
+            (
+                Unsupported::Adc {
+                    refusal: AdcRefusal::Scan,
+                },
+                "the SAR ADC was asked for a multi-channel scan",
+            ),
+            (
+                Unsupported::Adc {
+                    refusal: AdcRefusal::BothUnits,
+                },
+                "with both units selected",
+            ),
+            (
+                Unsupported::Adc {
+                    refusal: AdcRefusal::Clock { clk_sel: 1 },
+                },
+                "CLKM_CONF.CLK_SEL = 1 (pc 0x40381000)",
+            ),
+        ];
+        for (what, needle) in texts {
+            assert_cause_then_remedy(&unsupported(what), needle);
+        }
+        // Every kind of refusal of GP-SPI2 has a text and a key of its own.
+        let all = [
+            Spi2Refusal::Dma,
+            Spi2Refusal::MultiLine,
+            Spi2Refusal::Dummy,
+            Spi2Refusal::ThreeWire,
+            Spi2Refusal::CommandLength { bits: 4 },
+            Spi2Refusal::AddressLength { bits: 4 },
+            Spi2Refusal::DataLength { bits: 4 },
+            Spi2Refusal::Slave,
+            Spi2Refusal::Segmented,
+        ];
+        let mut kinds: Vec<u32> = all.iter().map(|&r| spi2_kind(r)).collect();
+        kinds.dedup();
+        assert_eq!(kinds.len(), all.len());
+        for refusal in all {
+            assert!(
+                unsupported(Unsupported::Spi2 { refusal })
+                    .to_string()
+                    .contains("so the transaction ended at once with nothing sent"),
+                "{refusal:?}"
+            );
         }
     }
 

@@ -78,6 +78,12 @@ pub enum Module {
     Systimer,
     Sha,
     UsbDevice,
+    /// GP-SPI2 (`PERIP_RST_EN0` bit 6).
+    Spi2,
+    /// I2C0 (`PERIP_RST_EN0` bit 7).
+    I2c0,
+    /// The SAR ADC controller (`PERIP_RST_EN0` bit 28).
+    ApbSaradc,
 }
 
 /// What a device is called for, besides register accesses: at the instant it asked for (a wake-up),
@@ -119,6 +125,15 @@ pub enum Event {
     RtcMemoryCrc,
     /// To every device that counts APB clock cycles: the clock selection changed.
     ClockChanged,
+    /// Wake-up of the IO matrix: a chip attached to a pin whose GPIO interrupt is configured said
+    /// its level may change at this instant (`GpioInput::next_change`).
+    Pins,
+    /// Wake-up of GP-SPI2: its transaction ends.
+    Spi2,
+    /// Wake-up of I2C0: its command sequence reaches the point it stops at.
+    I2c0,
+    /// Wake-up of the SAR ADC: its one-shot conversion ends.
+    SarAdc,
     /// To the named module: `SYSTEM.PERIP_RST_EN0/1` put it in reset.
     ModuleReset(Module),
 }
