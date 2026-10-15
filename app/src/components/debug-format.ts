@@ -29,13 +29,17 @@ export interface MemoryRow {
   bytes: (number | null)[];
 }
 
+/** The last address of the address space: a view ends there and never folds back onto 0. */
+const LAST_ADDRESS = 0xffff_ffff;
+
 /** The bytes of `memory`, `perRow` to a row, each row with the address of its first byte. */
 export function memoryRows(memory: MemoryView, perRow = 16): MemoryRow[] {
   const rows: MemoryRow[] = [];
-  for (let offset = 0; offset < memory.bytes.length; offset += perRow) {
+  const end = Math.min(memory.bytes.length, LAST_ADDRESS - memory.address + 1);
+  for (let offset = 0; offset < end; offset += perRow) {
     rows.push({
-      address: (memory.address + offset) >>> 0,
-      bytes: memory.bytes.slice(offset, offset + perRow),
+      address: memory.address + offset,
+      bytes: memory.bytes.slice(offset, Math.min(offset + perRow, end)),
     });
   }
   return rows;

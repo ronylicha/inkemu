@@ -390,7 +390,11 @@ pub fn disassembly(machine: &Esp32C3, points: &Points, request: &ViewRequest) ->
 /// windows, whose content is never shown (4a-D6), nor for registers, never read (4a-D5).
 #[must_use]
 pub fn memory(machine: &Esp32C3, request: MemoryRequest) -> MemoryView {
-    let length = request.length.min(MAX_MEMORY_BYTES);
+    // The view ends where the address space does: it never folds back onto 0x00000000.
+    let to_the_end = (1u64 << 32) - u64::from(request.address);
+    let length = u32::try_from(to_the_end)
+        .map_or(request.length, |left| request.length.min(left))
+        .min(MAX_MEMORY_BYTES);
     let mut bytes = Vec::new();
     let mut regions: Vec<RegionSpan> = Vec::new();
     for (peeked, offset) in machine
@@ -691,6 +695,45 @@ mod tests {
             },
         );
         assert_eq!(long.bytes.len(), MAX_MEMORY_BYTES as usize);
+    }
+
+    /// A view near the top of the address space ends with it: its last byte is 0xffffffff, and
+    /// nothing folds back onto 0x00000000.
+    #[test]
+    fn the_memory_ends_where_the_address_space_does() {
+        let (machine, _) = run_to_the_hang();
+        let top = memory(
+            &machine,
+            MemoryRequest {
+                address: u32::MAX - 1,
+                length: 16,
+            },
+        );
+        assert_eq!(top.bytes.len(), 2);
+        assert_eq!(
+            top.regions,
+            [RegionSpan {
+                start: u32::MAX - 1,
+                length: 2,
+                region: Region::Unmapped
+            }]
+        );
+        let last = memory(
+            &machine,
+            MemoryRequest {
+                address: u32::MAX,
+                length: MAX_MEMORY_BYTES,
+            },
+        );
+        assert_eq!(last.bytes.len(), 1);
+        let first = memory(
+            &machine,
+            MemoryRequest {
+                address: 0,
+                length: 4,
+            },
+        );
+        assert_eq!(first.bytes.len(), 4, "from 0, the whole length");
     }
 
     #[test]

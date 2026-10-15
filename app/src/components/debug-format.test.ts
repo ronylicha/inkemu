@@ -37,9 +37,16 @@ describe("parseLength", () => {
 describe("memory rows", () => {
   it("cut the bytes 16 to a row, each with its address", () => {
     const bytes = Array.from({ length: 20 }, (_, i) => i);
-    const rows = memoryRows({ address: 0xffff_fff0, bytes, regions: [] });
-    expect(rows.map((row) => row.address)).toEqual([0xffff_fff0, 0x0000_0000]);
+    const rows = memoryRows({ address: 0x3fc8_0000, bytes, regions: [] });
+    expect(rows.map((row) => row.address)).toEqual([0x3fc8_0000, 0x3fc8_0010]);
     expect(rows[1]?.bytes).toEqual([16, 17, 18, 19]);
+  });
+
+  it("end where the address space does, never folding back onto 0", () => {
+    const bytes = Array.from({ length: 20 }, (_, i) => i);
+    const rows = memoryRows({ address: 0xffff_fff8, bytes, regions: [] });
+    expect(rows.map((row) => row.address)).toEqual([0xffff_fff8]);
+    expect(rows[0]?.bytes).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
   });
 
   it("show a byte not shown as dots, and as a space in the text", () => {
