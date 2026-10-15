@@ -434,6 +434,22 @@ pub trait Recipe: Send {
         recorded: bool,
         sd: Option<boards::SdStart>,
     ) -> Result<Life, PowerOnError>;
+
+    /// [`Recipe::power_on`] for a power-on by the user's own press of the power key (H4): the
+    /// device gets no power-on gesture, since the caller presses the key at power-on and the
+    /// user's release ends the hold, as on the device. A device without a gesture powers on as
+    /// [`Recipe::power_on`] does.
+    ///
+    /// # Errors
+    /// Those of [`Recipe::power_on`].
+    fn power_on_by_key(
+        &mut self,
+        flash: Option<Vec<u8>>,
+        recorded: bool,
+        sd: Option<boards::SdStart>,
+    ) -> Result<Life, PowerOnError> {
+        self.power_on(flash, recorded, sd)
+    }
 }
 
 #[cfg(test)]

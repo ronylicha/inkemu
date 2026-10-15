@@ -87,10 +87,33 @@ pub struct DeviceView {
     pub shipped_bootloader: Option<&'static str>,
     /// Why no bootloader inkemu ships starts it, when none does: a bootloader must be given.
     pub no_bootloader: Option<String>,
-    /// The device has an SD card slot: an interface offers a card when it starts.
-    pub sd_slot: bool,
+    /// The SD card slot of the device, when it has one: an interface offers a card when it
+    /// starts, and a new blank one within these sizes.
+    pub sd_slot: Option<SdSlotView>,
     /// The device has a USB detection line: an interface offers the cable when it starts.
     pub usb_power: bool,
+}
+
+/// What an interface needs of a card slot: the sizes of a new blank card it may ask for, the
+/// bounds `host::sd_format` holds (an interface keeps no copy of them, H9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SdSlotView {
+    /// The smallest new card: FAT32's least.
+    pub min_mib: u64,
+    /// The largest: what the CSD of the SPI mode can say.
+    pub max_mib: u64,
+    /// The size offered first: 1 GiB.
+    pub default_mib: u64,
+}
+
+impl SdSlotView {
+    /// The slot of every device that has one.
+    pub const OF_A_DEVICE: SdSlotView = SdSlotView {
+        min_mib: crate::sd_format::MIN_MEBIBYTES,
+        max_mib: crate::sd_format::MAX_MEBIBYTES,
+        default_mib: 1024,
+    };
 }
 
 /// The built-in devices, in the order of their profiles.
@@ -111,7 +134,9 @@ pub fn devices() -> Result<Vec<DeviceView>, boards::ProfileError> {
                 look: look(&profile),
                 console: profile.console.name(),
                 flash_mib: profile.flash.size() >> 20,
-                sd_slot: wiring.is_some_and(|wiring| wiring.sd.is_some()),
+                sd_slot: wiring
+                    .is_some_and(|wiring| wiring.sd.is_some())
+                    .then_some(SdSlotView::OF_A_DEVICE),
                 usb_power: wiring.is_some_and(|wiring| wiring.power.is_some()),
                 id: profile.id,
                 name: profile.name,
@@ -185,6 +210,19 @@ impl Recipe for ProfileRecipe {
         let wired = Wired::power_on(&self.profile, self.rom.clone(), flash, options, wired)?;
         Ok(life_of(&self.profile, wired))
     }
+
+    fn power_on_by_key(
+        &mut self,
+        flash: Option<Vec<u8>>,
+        recorded: bool,
+        sd: Option<SdStart>,
+    ) -> Result<Life, PowerOnError> {
+        let board = self.board;
+        self.board.power_hold_ms = Some(0);
+        let life = self.power_on(flash, recorded, sd);
+        self.board = board;
+        life
+    }
 }
 
 #[cfg(test)]
@@ -241,7 +279,16 @@ mod tests {
             (x4.name.as_str(), x4.console, x4.flash_mib),
             ("Xteink X4", "usb-serial-jtag", 16)
         );
-        assert!(x4.sd_slot && x4.usb_power);
+        assert!(x4.usb_power);
+        assert_eq!(
+            x4.sd_slot,
+            Some(SdSlotView {
+                min_mib: 64,
+                max_mib: 2_097_024,
+                default_mib: 1024
+            }),
+            "the bounds of a new card are host's"
+        );
         assert_eq!(x4.look, look(&profile("x4")));
         assert_ne!(
             x4.shipped_bootloader.is_some(),
@@ -249,7 +296,7 @@ mod tests {
             "one or the other"
         );
         let x3 = devices.iter().find(|d| d.id == "x3").unwrap();
-        assert!(!x3.sd_slot && !x3.usb_power);
+        assert!(x3.sd_slot.is_none() && !x3.usb_power);
     }
 
     /// Every button sits at its own place along its edge.

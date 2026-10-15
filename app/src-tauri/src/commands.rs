@@ -177,6 +177,29 @@ impl Shell {
             .is_some_and(|running| running.emulator.holds_flash_file(path))
     }
 
+    /// Whether the running emulator holds the SD image at `path`.
+    fn holds_sd_image(&self, path: &std::path::Path) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|running| running.emulator.holds_sd_image(path))
+    }
+
+    /// Whether the running emulator holds a file `setup` would take, locked: its flash file or
+    /// its SD image. That emulator is powered off first, as the user asked for the new run
+    /// (H3): a lock held by the same process would refuse the new run otherwise.
+    fn holds_a_file_of(&self, setup: &Setup) -> bool {
+        setup
+            .flash_file
+            .as_deref()
+            .is_some_and(|file| self.holds_flash_file(file))
+            || setup
+                .sd
+                .as_ref()
+                .is_some_and(|sd| self.holds_sd_image(&sd.path))
+    }
+
     /// A handle to the emulator of start `start`, refused when another runs ([`same_start`]).
     fn handle_of(&self, start: u64) -> Result<Handle, ErrorDto> {
         let running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
@@ -528,11 +551,7 @@ pub async fn power_on(
 ) -> Result<StartedDto, ErrorDto> {
     let setup = setup.into_setup()?;
     let shell = shell.inner();
-    if setup
-        .flash_file
-        .as_deref()
-        .is_some_and(|file| shell.holds_flash_file(file))
-    {
+    if shell.holds_a_file_of(&setup) {
         off_the_main_thread(shell).await?;
     }
     let launch = tauri::async_runtime::spawn_blocking(move || device::power_on(&setup)).await??;
@@ -683,6 +702,49 @@ mod tests {
         shell.submit(2, Command::Pause).unwrap().wait().unwrap();
         assert_eq!(shell.submit(1, Command::Pause).unwrap_err().kind, "stopped");
         assert_eq!(shell.power_off(), Ok(()));
+    }
+
+    /// H3: a run that holds the SD image a new start asks for is powered off first, as one
+    /// holding its flash file is: the image is locked by the run, and the new one could not
+    /// open it.
+    #[test]
+    fn a_start_on_the_card_the_running_device_holds_powers_that_device_off_first() {
+        let dir = std::env::temp_dir().join(format!("inkemu-shell-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let card = dir.join("card.img");
+        std::fs::File::create(&card)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let shell = Shell::default();
+        let (sender, _updates) = mpsc::channel();
+        let running = Emulator::start(
+            host::test_support::looping_device_with_sd(&card),
+            Speed::Fastest,
+            Box::new(move |update| {
+                let _ = sender.send(update);
+            }),
+        )
+        .unwrap();
+        let (kept, _) = shell.keep(1, running);
+        assert!(kept);
+        let on_card = |path: PathBuf| Setup {
+            device: "x4".into(),
+            sd: Some(device::SdSetup {
+                path,
+                read_only: false,
+                create_mib: None,
+            }),
+            ..Setup::default()
+        };
+        assert!(shell.holds_a_file_of(&on_card(card.clone())));
+        // The same file by another spelling of its path is the same card.
+        assert!(shell.holds_a_file_of(&on_card(dir.join(".").join("card.img"))));
+        assert!(!shell.holds_a_file_of(&on_card(dir.join("other.img"))));
+        assert!(!shell.holds_a_file_of(&Setup::default()));
+        assert_eq!(shell.power_off(), Ok(()));
+        assert!(!shell.holds_a_file_of(&on_card(card)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The first request to close powers off; those that follow only wait for it.

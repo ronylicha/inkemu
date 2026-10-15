@@ -534,6 +534,20 @@ fn open_sd_image(
 
 /// The device of `profile` powered on with its wiring, `flash` in it (erased for `None`), and the
 /// card of `sd_image` in its slot.
+/// Refuses an option the device has no line for (a card, the cable, a hold of a power key it
+/// lacks), before any file of the run is opened and before the ROM is read (H6).
+fn refuse_board_options(
+    profile: &boards::DeviceProfile,
+    power_on: &PowerOn<'_>,
+) -> Result<(), boards::WiredError> {
+    let board = boards::BoardRequest {
+        sd: power_on.sd_image.is_some(),
+        usb_power: power_on.usb_power,
+        power_hold_ms: power_on.power_hold_ms,
+    };
+    boards::check_board_request(profile, board).map(drop)
+}
+
 fn power_on_wired(
     profile: &boards::DeviceProfile,
     rom: soc_esp32c3::RomImage,
@@ -605,6 +619,9 @@ fn run_device(
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
+    if let Err(e) = refuse_board_options(&profile, power_on) {
+        return fail(&e);
+    }
     let (run_options, console_note) = request.resolve(&profile, machine_options.usb_host);
     // Read before anything else of the run: a refused script needs no flash and no ROM.
     let script = match console_script.map(script_file::read_script).transpose() {

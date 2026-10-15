@@ -86,6 +86,23 @@ fn x4_pattern_look() -> catalog::Look {
     look
 }
 
+/// [`looping_device`] holding the SD image at `path`, opened and locked as a run opens it: the
+/// image a second run on the same card cannot open while this one lives.
+///
+/// # Panics
+/// When the image cannot be opened.
+#[must_use]
+pub fn looping_device_with_sd(path: &std::path::Path) -> Launch {
+    let image = crate::sd_image::SdImage::open(
+        path,
+        crate::sd_image::Access::ReadWrite,
+        &[],
+        &mut Vec::new(),
+    )
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    looping_device(Duration::ZERO).with_sd(image)
+}
+
 /// A run of the looping device, with no flash file and no limit, whose power-off lasts at least
 /// `slow_end`.
 #[must_use]

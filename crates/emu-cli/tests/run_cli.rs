@@ -371,6 +371,50 @@ fn console_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
+/// H6: a card, the cable or a hold of the power key, on a device whose profile has no line for
+/// it (the X3), is refused before anything of the run is opened: no flash file nor its lock is
+/// made, the image is not read (here it does not even exist), and no ROM is looked for.
+#[test]
+fn a_board_option_the_device_has_no_line_for_is_refused_before_any_file_is_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty_rom_dir = dir.path().join("roms");
+    std::fs::create_dir(&empty_rom_dir).unwrap();
+    let flash_file = dir.path().join("x3.flash");
+    let missing_card = dir.path().join("missing.img");
+    let card = ["--sd-image".to_owned(), missing_card.display().to_string()];
+    let cases: [(&[String], &str); 3] = [
+        (&card, "has no SD card slot in its profile"),
+        (
+            &["--usb-power".to_owned()],
+            "has no USB detect line in its profile",
+        ),
+        (
+            &["--power-hold".to_owned(), "10".to_owned()],
+            "has no power key in its profile",
+        ),
+    ];
+    for (option, said) in cases {
+        inkemu()
+            .args(["run", "--device", "x3", "--rom-dir"])
+            .arg(&empty_rom_dir)
+            .arg("--flash-file")
+            .arg(&flash_file)
+            .args(option)
+            .assert()
+            .code(2)
+            .stderr(
+                contains(said)
+                    .and(contains("esp32c3").not())
+                    .and(contains("missing.img").not()),
+            );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["roms"], "{option:?} left {left:?}");
+    }
+}
+
 #[test]
 fn a_refused_console_script_exits_2_at_its_line_and_column_before_any_rom_is_read() {
     let (dir, script) = console_script("wait 3\n");

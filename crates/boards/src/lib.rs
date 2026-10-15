@@ -5,7 +5,8 @@ pub mod wired;
 pub mod wiring;
 
 pub use wired::{
-    ButtonsHandle, PanelHandle, SdHandle, SdStart, Wired, WiredCard, WiredError, WiredOptions,
+    BoardRequest, ButtonsHandle, PanelHandle, SdHandle, SdStart, Wired, WiredCard, WiredError,
+    WiredOptions, check_board_request,
 };
 
 use firmware::bootloader::{ShippedBootloader, shipped};

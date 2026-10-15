@@ -374,6 +374,31 @@ fn the_x4_slot_holds_the_card_it_is_given_and_hands_it_back() {
 
 /// 2d-R4: a device without `[wiring]` is the bare machine, and refuses what it has no line for.
 #[test]
+fn a_request_of_the_board_is_checked_against_the_profile_without_a_machine() {
+    let x3 = builtin("x3").unwrap();
+    let ask = |sd, usb_power, power_hold_ms| BoardRequest {
+        sd,
+        usb_power,
+        power_hold_ms,
+    };
+    assert_eq!(check_board_request(&x3, ask(false, false, None)), Ok(0));
+    assert_eq!(check_board_request(&x3, ask(false, false, Some(0))), Ok(0));
+    for request in [
+        ask(true, false, None),
+        ask(false, true, None),
+        ask(false, false, Some(5)),
+    ] {
+        assert!(check_board_request(&x3, request).is_err(), "{request:?}");
+    }
+    let x4 = x4();
+    assert_eq!(check_board_request(&x4, ask(true, true, None)), Ok(1_500));
+    assert_eq!(
+        check_board_request(&x4, ask(false, false, Some(80))),
+        Ok(80)
+    );
+}
+
+#[test]
 fn the_x3_powers_on_bare_and_refuses_what_it_has_no_wiring_for() {
     let x3 = builtin("x3").unwrap();
     let wired = power_on(&x3, &[HANG], WiredOptions::default());

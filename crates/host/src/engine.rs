@@ -191,7 +191,8 @@ pub struct LifeEnd {
     pub verdict: Option<Result<Verdict, NoTraceHash>>,
     /// The session of a recorded run.
     pub session: Option<Result<Session, RecordError>>,
-    /// The card taken out of the slot ([`Finished::card`]).
+    /// The card taken out of the slot, with what the life changed on it: for the SD image of a
+    /// run to keep (a replay's card is the session's, and is only compared).
     pub card: LifeCard,
 }
 
@@ -289,8 +290,25 @@ impl Engine {
         self.buttons.reaches_firmware()
     }
 
-    /// The card taken out of the slot, with what the life changed on it: for a rescue after an
-    /// internal error, which [`Engine::finish`] did not reach.
+    /// The card in the slot as a session would record it now, its blocks as the life sees them
+    /// (its image with what it wrote), the card left where it is; `None` with no card.
+    #[must_use]
+    pub fn card_as_recorded(
+        &self,
+        write_protected: bool,
+    ) -> Option<Result<session::SdCardStart, session::SdCardError>> {
+        let handle = self.sd.as_ref()?;
+        let mut lines = handle.lines();
+        let card = lines.slot_mut().card_mut()?;
+        Some(session::SdCardStart::read(
+            card.storage_mut(),
+            write_protected,
+        ))
+    }
+
+    /// The card taken out of the slot, with what the life changed on it: for the end of a life
+    /// once [`Engine::finish`] is done, and for a rescue after an internal error. Once taken,
+    /// the slot is empty.
     #[must_use]
     pub fn take_card(&self) -> LifeCard {
         LifeCard::take(self.sd.as_ref())
@@ -629,18 +647,19 @@ impl Engine {
     pub fn end(mut self) -> LifeEnd {
         let finished = self.finish();
         LifeEnd {
+            card: self.take_card(),
             machine: self.machine,
             end: finished.end,
             output: finished.output,
             verdict: finished.verdict,
             session: finished.session,
-            card: finished.card,
         }
     }
 
-    /// [`Engine::end`], the machine left in the engine ([`Engine::machine`]): what holds the
-    /// flash stays where a caller that must keep it can read it, whatever fails after. The
-    /// engine is then done: it is not to run again.
+    /// [`Engine::end`], the machine and the card left in the engine ([`Engine::machine`],
+    /// [`Engine::take_card`]): what holds the flash and what the life wrote on its card stay
+    /// where a caller that must keep them can read them, whatever fails after. The engine is
+    /// then done: it is not to run again.
     pub fn finish(&mut self) -> Finished {
         let end = self.end_now();
         let mut output = Output::default();
@@ -650,8 +669,13 @@ impl Engine {
         run::say_where_the_run_stopped(&mut self.machine, None, &mut log);
         output.notices.extend(Notice::from_log(&log));
         let mode = std::mem::replace(&mut self.mode, Mode::Run { recorder: None });
-        let card = LifeCard::take(self.sd.as_ref());
-        let changes = card.changes();
+        // Read in the slot, not taken out of it: a panic from here on leaves the card where
+        // the rescue looks for it.
+        let slot = self.sd.as_ref().map(SdHandle::lines);
+        let changes = slot
+            .as_ref()
+            .and_then(|lines| lines.slot().card())
+            .map(|card| card.storage().changes());
         let (verdict, session) = match mode {
             Mode::Replay { session, digests } => (
                 Some(verdict(
@@ -676,12 +700,11 @@ impl Engine {
             output,
             verdict,
             session,
-            card,
         }
     }
 }
 
-/// The end of a life without its machine ([`Engine::finish`]).
+/// The end of a life without its machine nor its card ([`Engine::finish`]).
 #[derive(Debug)]
 pub struct Finished {
     pub end: RunEnd,
@@ -690,9 +713,6 @@ pub struct Finished {
     pub verdict: Option<Result<Verdict, NoTraceHash>>,
     /// The session of a recorded run.
     pub session: Option<Result<Session, RecordError>>,
-    /// The card taken out of the slot, with what the life changed on it: for the SD image of a
-    /// run to keep (a replay's card is the session's, and is only compared).
-    pub card: LifeCard,
 }
 
 #[cfg(test)]

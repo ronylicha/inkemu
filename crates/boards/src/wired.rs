@@ -83,6 +83,43 @@ pub enum WiredError {
     Gesture(InputError),
 }
 
+/// What a run asks of a device's board beyond its machine: a card in its slot, a cable, a hold
+/// of its power key other than its profile's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BoardRequest {
+    pub sd: bool,
+    pub usb_power: bool,
+    /// `None` for the hold of the profile, `Some(0)` for none.
+    pub power_hold_ms: Option<u32>,
+}
+
+/// Checks `request` against the wiring of `profile`, as [`Wired::power_on`] does: a front end
+/// calls it before it opens a file or loads a ROM for the run, so that an option the device has
+/// no line for is refused first (H6). Gives the hold of the power-on gesture, 0 for none.
+///
+/// # Errors
+/// [`WiredError::NoSdSlot`], [`WiredError::NoUsbDetect`], [`WiredError::NoPowerKey`].
+pub fn check_board_request(
+    profile: &DeviceProfile,
+    request: BoardRequest,
+) -> Result<u32, WiredError> {
+    let device = || profile.name.clone();
+    let wiring = profile.wiring.as_ref();
+    if request.sd && wiring.is_none_or(|wiring| wiring.sd.is_none()) {
+        return Err(WiredError::NoSdSlot { device: device() });
+    }
+    if request.usb_power && wiring.is_none_or(|wiring| wiring.power.is_none()) {
+        return Err(WiredError::NoUsbDetect { device: device() });
+    }
+    let gesture = wiring.and_then(|wiring| wiring.gesture.as_ref());
+    match (gesture, request.power_hold_ms) {
+        (_, Some(0)) | (None, None) => Ok(0),
+        (Some(gesture), None) => Ok(gesture.hold_ms),
+        (Some(_), Some(hold)) => Ok(hold),
+        (None, Some(_)) => Err(WiredError::NoPowerKey { device: device() }),
+    }
+}
+
 /// What the board holds that its inputs change and its supply depends on.
 #[derive(Debug)]
 struct BoardState {
@@ -352,39 +389,25 @@ impl Wired {
         options: MachineOptions,
         wired: WiredOptions,
     ) -> Result<Wired, WiredError> {
+        let hold_ms = check_board_request(
+            profile,
+            BoardRequest {
+                sd: wired.sd.is_some(),
+                usb_power: wired.usb_power,
+                power_hold_ms: wired.power_hold_ms,
+            },
+        )?;
         let mut machine = match flash {
             Some(image) => profile.instantiate_with_flash(rom, image, options)?,
             None => profile.instantiate(rom, options),
         };
-        let device = || profile.name.clone();
         let Some(wiring) = &profile.wiring else {
-            if wired.sd.is_some() {
-                return Err(WiredError::NoSdSlot { device: device() });
-            }
-            if wired.usb_power {
-                return Err(WiredError::NoUsbDetect { device: device() });
-            }
-            if wired.power_hold_ms.is_some_and(|hold| hold > 0) {
-                return Err(WiredError::NoPowerKey { device: device() });
-            }
             return Ok(Wired {
                 machine,
                 panel: None,
                 buttons: None,
                 sd: None,
             });
-        };
-        if wired.sd.is_some() && wiring.sd.is_none() {
-            return Err(WiredError::NoSdSlot { device: device() });
-        }
-        if wired.usb_power && wiring.power.is_none() {
-            return Err(WiredError::NoUsbDetect { device: device() });
-        }
-        let hold_ms = match (&wiring.gesture, wired.power_hold_ms) {
-            (_, Some(0)) | (None, None) => 0,
-            (Some(gesture), None) => gesture.hold_ms,
-            (Some(_), Some(hold)) => hold,
-            (None, Some(_)) => return Err(WiredError::NoPowerKey { device: device() }),
         };
         let panel = attach_display(&mut machine, wiring)?;
         let sd = attach_sd(&mut machine, wiring, wired.sd)?;
