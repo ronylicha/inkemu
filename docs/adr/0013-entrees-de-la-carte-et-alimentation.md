@@ -54,8 +54,11 @@ ne s'éteignait pas.
    et haut, GPIO0 à 5) au premier instant où une broche de réveil est à son niveau, ou à l'échéance du timer RTC si
    elle vient avant ; la cause et `GPIO_WAKEUP_STATUS` sont latchées, puis vient le reset de cause 5 (SP1b-3f). Un
    sommeil dont rien ne peut réveiller la machine seule (ni timer, ni entrée de carte en attente, ni changement annoncé
-   par une puce) finit toujours l'exécution. Les broches maintenues (`PAD_HOLD`, `DIG_PAD_HOLD`, maintien automatique
-   en sommeil) gardent leur sortie à travers un reset du cœur et ignorent les écritures jusqu'à leur libération.
+   par une puce) finit toujours l'exécution. Les broches maintenues par leur propre bit (`PAD_HOLD` pour GPIO0 à 5,
+   `DIG_PAD_HOLD` pour GPIO6 à 21) gardent leur sortie à travers un reset du cœur et ignorent les écritures jusqu'à
+   leur libération. **Le maintien automatique en sommeil et l'isolement des broches (`DIG_ISO`) ne sont pas
+   modélisés** : le registre est accepté et gardé sans effet ; une broche garde sa configuration à travers le sommeil,
+   et seul son bit de maintien garde sa sortie à travers le reset du réveil (héritier : SP4).
 6. **Les sessions passent au format 2** (`inkemu-session 2`) : une entrée de carte y a l'étiquette 4 (instant en
    cycles, cible `u16`, valeur `u32`), et la carte SD de départ y entre (ADR 0014). Le lecteur lit les formats 1 et 2 ;
    l'enregistreur écrit le 2. Le rejeu reconstruit la machine câblée depuis le profil de la session, **sans geste**
