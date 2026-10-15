@@ -1355,6 +1355,14 @@ impl Worker {
     }
 
     fn measure_speed(&mut self) {
+        // A machine that does not run (paused, stepped, waiting for an input, ended) has no
+        // speed: a window across a pause would measure the pause. The measure starts again when
+        // it runs.
+        if !self.wants_to_run() {
+            self.measure = None;
+            self.speed_ratio = None;
+            return;
+        }
         let Some(engine) = self.engine.as_ref() else {
             return;
         };
@@ -2192,6 +2200,37 @@ mod tests {
                 if n.text.contains("a button port broke"))),
             "{seen:#?}"
         );
+        emulator.shutdown();
+    }
+
+    /// The speed is measured only while the machine runs: a pause or a step forgets it, and
+    /// running again measures it afresh.
+    #[test]
+    fn the_speed_is_forgotten_across_a_pause_and_a_step() {
+        let launch = Launch::new(
+            writing_device(0x00, Arc::default()),
+            FlashKeeper::without_file(None, 1 << 20),
+            Limits::default(),
+            LOOK,
+            None,
+        );
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        let measured =
+            |u: &Update| matches!(u, Update::Status(s) if s.speed_ratio.is_some_and(|r| r > 0.0));
+        until(&updates, measured);
+        for command in [Command::Pause, Command::Step] {
+            emulator.command(command.clone()).unwrap();
+            let seen = until(
+                &updates,
+                |u| matches!(u, Update::Status(s) if s.run == RunState::Paused),
+            );
+            let Some(Update::Status(status)) = seen.last() else {
+                unreachable!()
+            };
+            assert_eq!(status.speed_ratio, None, "after {command:?}");
+        }
+        emulator.command(Command::Run).unwrap();
+        until(&updates, measured);
         emulator.shutdown();
     }
 
