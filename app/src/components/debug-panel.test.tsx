@@ -149,11 +149,17 @@ describe("DebugPanel", () => {
     await user.type(screen.getByRole("textbox", { name: "Watch from the address" }), "3fc80010");
     const length = screen.getByRole("textbox", { name: "Bytes" });
     await user.clear(length);
-    await user.type(length, "5000");
+    await user.type(length, "8 bytes");
     await user.selectOptions(screen.getByRole("combobox", { name: "Stop on" }), "access");
     await user.click(screen.getByRole("button", { name: "Watch" }));
     expect(length).toHaveAttribute("aria-invalid", "true");
     expect(onCommand).not.toHaveBeenCalled();
+    // A number out of the host's bounds goes to the host, which refuses it with its bounds.
+    await user.clear(length);
+    await user.type(length, "5000");
+    await user.click(screen.getByRole("button", { name: "Watch" }));
+    expect(length).toHaveAttribute("aria-invalid", "false");
+    expect(onCommand).toHaveBeenLastCalledWith(expect.objectContaining({ length: 5000 }));
     await user.clear(length);
     await user.type(length, "8");
     await user.click(screen.getByRole("button", { name: "Watch" }));

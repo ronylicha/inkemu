@@ -25,10 +25,14 @@ describe("parseAddress", () => {
 });
 
 describe("parseLength", () => {
-  it("reads 1 to 4096 bytes in decimal", () => {
+  it("reads a number of bytes in decimal, and leaves its bounds to the host", () => {
     expect(parseLength("4")).toBe(4);
     expect(parseLength(" 4096 ")).toBe(4096);
-    for (const text of ["0", "4097", "", "0x4", "-1", "2.5"]) {
+    // Out of the host's bounds, but a number: the host refuses it, with its bounds.
+    expect(parseLength("0")).toBe(0);
+    expect(parseLength("4097")).toBe(4097);
+    expect(parseLength("4294967295")).toBe(0xffff_ffff);
+    for (const text of ["", "0x4", "-1", "2.5", "4294967296", "12345678901"]) {
       expect(parseLength(text), text).toBeNull();
     }
   });

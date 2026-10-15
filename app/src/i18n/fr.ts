@@ -280,6 +280,6 @@ export const fr = {
   "debug.watch.item": "{bytes} à {address}, {on}",
   "debug.remove.watchpoint": "Retirer le point de surveillance : {item}",
   "debug.invalidAddress": "Une adresse en hexadécimal, de 1 à 8 chiffres, par exemple 0x3fc80000.",
-  "debug.invalidLength": "Un nombre d’octets de 1 à 4096.",
+  "debug.invalidLength": "Un nombre d’octets, en décimal, par exemple 4.",
   "debug.remove": "Retirer",
 } as const;

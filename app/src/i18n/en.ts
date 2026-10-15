@@ -279,6 +279,6 @@ export const en: Catalog = {
   "debug.watch.item": "{bytes} at {address}, {on}",
   "debug.remove.watchpoint": "Remove the watchpoint: {item}",
   "debug.invalidAddress": "An address in hexadecimal, 1 to 8 digits, such as 0x3fc80000.",
-  "debug.invalidLength": "A number of bytes from 1 to 4096.",
+  "debug.invalidLength": "A number of bytes, in decimal, such as 4.",
   "debug.remove": "Remove",
 };

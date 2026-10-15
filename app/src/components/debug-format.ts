@@ -5,8 +5,9 @@
 import type { MemoryView, RegionSpan } from "../ipc/types";
 
 const ADDRESS = /^(?:0[xX])?([0-9a-fA-F]{1,8})$/;
-const LENGTH = /^[0-9]{1,4}$/;
-export const MAX_WATCH_LENGTH = 4096;
+const LENGTH = /^[0-9]{1,10}$/;
+/** The largest number the host can read as a length: a `u32`. */
+const MAX_U32 = 0xffff_ffff;
 
 /** The address `text` names: hexadecimal, `0x` optional, 1 to 8 digits; `null` otherwise. */
 export function parseAddress(text: string): number | null {
@@ -14,14 +15,16 @@ export function parseAddress(text: string): number | null {
   return digits === undefined ? null : Number.parseInt(digits, 16);
 }
 
-/** The bytes of a watchpoint `text` names: 1 to 4096, in decimal; `null` otherwise. */
+/** The bytes of a watchpoint `text` names: a number in decimal that fits 32 bits; `null`
+ * otherwise. How many bytes a watchpoint may cover is the host's to say (plan ruling 4a-R8): it
+ * refuses a length out of its bounds, with them. */
 export function parseLength(text: string): number | null {
   const trimmed = text.trim();
   if (!LENGTH.test(trimmed)) {
     return null;
   }
   const length = Number.parseInt(trimmed, 10);
-  return length >= 1 && length <= MAX_WATCH_LENGTH ? length : null;
+  return length <= MAX_U32 ? length : null;
 }
 
 export interface MemoryRow {
