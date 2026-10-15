@@ -600,6 +600,12 @@ IO_MUX n'est pas un périphérique de QEMU. inkemu a la valeur de reset du SVD (
 `0xB00`) et ce que la ROM et ESP-IDF y écrivent (le bit 12 de `MCU_SEL` pour GPIO12–13, les tirages
 de GPIO14–17 pour la flash) ; QEMU lit 0.
 
+**Révision du 2026-10-15 (relecture de SP2b).** La valeur de reset `0xB00` porte aussi `FUN_WPU`
+(bit 8, le tirage vers le haut), que la phrase ci-dessus oubliait : `FUN_WPU` (bit 8), `FUN_IE`
+(bit 9) et `FUN_DRV` = 2 (bits 10–11). Le masque `0x00000B00` le couvrait déjà ; aucun paramètre,
+compte ni usage ne change. Depuis SP2b, inkemu fait de ces bits le niveau d'une broche que rien ne
+pilote (tirée haut) : décision 2b-D4 de `docs/superpowers/specs/2026-10-15-sp2b-soc-peripherals-design.md`.
+
 Paramètres :
 
 ```text

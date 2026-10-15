@@ -18,3 +18,7 @@ thiserror.workspace = true
 [dev-dependencies]
 soc-esp32c3 = { workspace = true, features = ["test-support"] }
 firmware = { workspace = true, features = ["test-support"] }
+# The test on the reference firmware `soc_signals` attaches chips to the pins of the X4 through the
+# signal traits, and checks the image it is given against its pinned SHA-256.
+emu-core.workspace = true
+sha2.workspace = true

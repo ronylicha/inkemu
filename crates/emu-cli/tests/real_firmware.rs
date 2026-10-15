@@ -3,8 +3,10 @@
 //! firmware 3.0.2 EN of the X4 (a dump of the whole 16 MiB flash of a unit, given to `--flash`).
 //! They show criterion 2 of the spec (`docs/superpowers/specs/2026-10-11-inkemu-design.md`,
 //! §10.3): the ROM, the bootloader and the application run, the firmware's boot lines reach
-//! standard output, and the first accesses to what later sub-projects model (GPIO, I2C0, SPI2, the
-//! SAR ADC) are warnings that name their register, never a silent stop.
+//! standard output, and what the model still lacks is a warning that names it, never a silent
+//! stop. Since sub-project 2b models the GPIO matrix, GP-SPI2, I2C0 and the SAR ADC, `CrossPoint`
+//! runs to its idle loop with no warning at all, and the stock firmware reads its buttons and goes
+//! back to deep sleep, waiting for the power button that sub-project 2d wires.
 //!
 //! Neither file is in this repository, is downloaded or is run anywhere but here, on the machine of
 //! a user who has it: these tests run nowhere in the CI. Each one reads the path of its file from
@@ -40,12 +42,13 @@ const CROSSPOINT_X3_X4_SHA256: &str =
 const STOCK_X4_FLASH_SHA256: &str =
     "03866a1fc23a6a624469f508da3a747159b2315303b98779fd8161276a989a88";
 
-/// The device time each run is given: the two lives of `CrossPoint`, and several of the stock
-/// firmware, end before it (measured 2026-10-14, release build).
+/// The device time each run is given: `CrossPoint` reaches its idle loop at 2.3 s, the stock
+/// firmware goes to deep sleep at 0.64 s (measured 2026-10-15, release build).
 const SECONDS: &str = "5";
 
 /// The panic of the interrupt watchdog of ESP-IDF, the same text in v4.4 and v5.5
-/// (`esp_system/panic.c`): both firmwares wait for the SAR ADC with their interrupts masked.
+/// (`esp_system/panic.c`): both firmwares waited for the SAR ADC with their interrupts masked
+/// until sub-project 2b modelled it; the wait now ends and no run panics.
 const INTERRUPT_WATCHDOG_PANIC: &str =
     "Guru Meditation Error: Core  0 panic'ed (Interrupt wdt timeout on CPU0).";
 
@@ -157,70 +160,39 @@ impl Run {
         }
     }
 
-    /// Fails unless a warning names a register of `peripheral`: a firmware that touches a block
-    /// the model does not have is told so by name.
-    fn assert_named_warning(&self, peripheral: &str) {
-        let named = format!(": {peripheral}.");
+    /// Fails when the log holds a warning, or the console the panic of the interrupt watchdog.
+    fn assert_no_warning_and_no_panic(&self) {
         assert!(
-            self.log
-                .lines()
-                .any(|line| line.starts_with("warning: unmodeled register ")
-                    && line.contains(&named)),
-            "no warning names a register of {peripheral}:\n{}",
-            self.log
-        );
-    }
-
-    /// Fails when an access went to an address where no register is documented.
-    fn assert_nothing_undocumented(&self) {
-        assert!(
-            !self.log.contains("no register is documented there"),
+            !self.log.lines().any(|line| line.starts_with("warning: ")),
             "{}",
             self.log
         );
+        assert!(
+            !self.console.contains(INTERRUPT_WATCHDOG_PANIC),
+            "{}",
+            without_stack_dump(&self.console)
+        );
     }
 
-    /// The first warning of the run, without its prefix: what `--strict-mmio` stops on. A CPU
-    /// exception is a warning that does not stop a strict run (it is what the firmware does on
-    /// the device), so it is passed over.
-    fn first_warning(&self) -> &str {
+    /// The warnings of the run, without their prefix.
+    fn warnings(&self) -> Vec<&str> {
         self.log
             .lines()
             .filter_map(|line| line.strip_prefix("warning: "))
-            .find(|diagnostic| !diagnostic.starts_with("CPU exception: "))
-            .unwrap_or_else(|| panic!("no warning:\n{}", self.log))
+            .collect()
     }
-}
-
-/// The same run under `--strict-mmio`: exit code 3 at the first warning of the lenient run, which
-/// names `register` (`PERIPHERAL.NAME`) and its address.
-fn assert_strict_stop(input: &str, file: &str, lenient: &Run, register: &str, address: &str) {
-    let strict = Run::of(&run(input, file, &["--strict-mmio"]));
-    assert_eq!(strict.code, Some(3), "{}", strict.log);
-    let stop = strict
-        .log
-        .lines()
-        .find_map(|line| line.strip_prefix("inkemu: stopped by --strict-mmio: "))
-        .unwrap_or_else(|| panic!("no strict stop:\n{}", strict.log));
-    assert!(
-        stop.starts_with("unmodeled register ")
-            && stop.contains(&format!(": {register} at {address} ")),
-        "the stop names {register} at {address}: {stop}"
-    );
-    // A strict run is the lenient run up to its first warning: the two runs agree on it.
-    assert_eq!(stop, lenient.first_warning(), "{}", lenient.log);
 }
 
 /// `CrossPoint` 1.6.5 from its release asset, without a console option: the ROM, the bootloader
 /// inkemu ships and the application; its own log on USB-Serial-JTAG, the console of the X4
-/// profile; the board identified as an X4; the wait for the SAR ADC with interrupts masked, which
-/// the interrupt watchdog ends with a panic and a CPU reset; and a second life, which finds the
-/// verdict X4 in NVS, skips the I2C probe and reaches the SD card and the panel before the same
-/// wait (`docs/superpowers/specs/2026-10-14-sp1b-3e-design.md`, §2). Under `--strict-mmio` the run
-/// stops at the first register a later sub-project models.
+/// profile; the I2C probe, whose address bytes get the NACK of an empty bus, so the board is an X4;
+/// the SD card and the panel, which nothing answers yet (sub-project 2d attaches them); then the
+/// idle loop, with no warning and no panic: the wait for the SAR ADC that the interrupt watchdog
+/// ended before sub-project 2b now ends with a reading. Under `--strict-mmio` the run is the same
+/// run: nothing stops it.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_CROSSPOINT_X3_X4 (a file of the user's)"]
-fn crosspoint_1_6_5_x3_x4_starts_and_names_what_the_model_lacks() {
+fn crosspoint_1_6_5_x3_x4_runs_to_its_idle_loop_without_a_warning() {
     let file = pinned_file(
         "INKEMU_CROSSPOINT_X3_X4",
         "/path/to/crosspoint-1.6.5-x3-x4.bin",
@@ -239,13 +211,12 @@ fn crosspoint_1_6_5_x3_x4_starts_and_names_what_the_model_lacks() {
         "ESP-ROM:esp32c3-api1-20210207\n",
         "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
         ") boot: ESP-IDF v5.5.2 2nd stage bootloader\n",
-        // The first life probes the board over I2C, finds nothing, which means X4, and stores the
-        // verdict in NVS before the wait for the ADC.
+        // The bootloader's timed scan of the SAR ADC, which feeds the random number generator.
+        ") boot: Enabling RNG early entropy source...\n",
+        ") boot: Disabling RNG early entropy source...\n",
+        // A NACK ends each probe as on an X4: ESP-IDF's driver reports it as an invalid state.
+        "i2c_master_transmit_receive failed: [259] ESP_ERR_INVALID_STATE\n",
         "[INF] [HW] Xteink probe scores: pass1=0 pass2=0 verdict=0\n",
-        INTERRUPT_WATCHDOG_PANIC,
-        "rst:0xc (RTC_SW_CPU_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
-        // The second life reads the verdict back: the NVS write survived the CPU reset.
-        "[INF] [HW] Using cached device type: X4\n",
         "[INF] [MAIN] Hardware detect: X4\n",
         "[SD] SD card not detected (",
         "Wait complete:  CMD_SOFT_RESET (0 ms)\n",
@@ -253,31 +224,25 @@ fn crosspoint_1_6_5_x3_x4_starts_and_names_what_the_model_lacks() {
     assert!(
         lenient
             .log
-            .contains("\ninkemu: reset by the firmware, a CPU reset (rst:0xc) at pc "),
+            .contains("\ninkemu: device-time limit reached; "),
         "{}",
         lenient.log
     );
-    for peripheral in ["GPIO", "I2C0", "SPI2", "APB_SARADC"] {
-        lenient.assert_named_warning(peripheral);
-    }
-    lenient.assert_nothing_undocumented();
-    assert_strict_stop(
-        "--firmware",
-        &file,
-        &lenient,
-        "APB_SARADC.APB_TSENS_CTRL",
-        "0x60040058",
-    );
+    lenient.assert_no_warning_and_no_panic();
+    let strict = Run::of(&run("--firmware", &file, &["--strict-mmio"]));
+    assert_eq!(strict.code, Some(0), "{}", strict.log);
+    strict.assert_no_warning_and_no_panic();
 }
 
 /// The stock firmware of the X4 from a dump of a unit, without a console option: its bootloader
-/// (silent), its application (ESP-IDF v4.4.7), the same wait for the SAR ADC, a panic of the
-/// interrupt watchdog and a core reset (`rst:0x3`), again and again. Under `--strict-mmio` the run
-/// stops at the pad of GPIO13, the power latch of the board, which the application sets up before
-/// it touches any other block inkemu lacks.
+/// (silent) and its application (ESP-IDF v4.4.7), which reads the SAR ADC and the buttons, finds
+/// the power button released and goes back to deep sleep with only the GPIO wake enabled, as an
+/// X4 does when nothing holds its power button: the run ends there, the one warning naming the
+/// wake that sub-project 2d models. Under `--strict-mmio` the run stops on that warning.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_STOCK_X4_FLASH (a file of the user's)"]
-fn the_stock_x4_firmware_starts_and_names_what_the_model_lacks() {
+fn the_stock_x4_firmware_goes_back_to_deep_sleep_without_its_power_button() {
+    const GPIO_WAKE: &str = "the chip went into deep sleep with wake sources inkemu does not model (WAKEUP_ENA 0x00004, pc ";
     let file = pinned_file(
         "INKEMU_STOCK_X4_FLASH",
         "/path/to/x4-stock-3.0.2-en-flash.bin",
@@ -288,24 +253,34 @@ fn the_stock_x4_firmware_starts_and_names_what_the_model_lacks() {
     lenient.assert_in_order(&[
         "ESP-ROM:esp32c3-api1-20210207\n",
         "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
-        INTERRUPT_WATCHDOG_PANIC,
-        "rst:0x3 (RTC_SW_SYS_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
-        INTERRUPT_WATCHDOG_PANIC,
-        "rst:0x3 (RTC_SW_SYS_RST),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
     ]);
     assert!(
-        lenient
-            .log
-            .contains("\ninkemu: reset by the firmware, a core reset (rst:0x3) at pc "),
+        lenient.log.contains(
+            "\ninkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here\n"
+        ),
         "{}",
         lenient.log
     );
-    for peripheral in ["GPIO", "APB_SARADC"] {
-        lenient.assert_named_warning(peripheral);
-    }
-    // ESP-IDF v4.4 polls SPI1 `FSM` (`0x60002054`) before each status read of the flash.
-    lenient.assert_nothing_undocumented();
-    assert_strict_stop("--flash", &file, &lenient, "GPIO.PIN13", "0x600040a8");
+    let warnings = lenient.warnings();
+    assert!(
+        warnings.len() == 1 && warnings[0].starts_with(GPIO_WAKE),
+        "{}",
+        lenient.log
+    );
+    assert!(
+        !lenient.console.contains(INTERRUPT_WATCHDOG_PANIC),
+        "{}",
+        without_stack_dump(&lenient.console)
+    );
+    let strict = Run::of(&run("--flash", &file, &["--strict-mmio"]));
+    assert_eq!(strict.code, Some(3), "{}", strict.log);
+    let stop = strict
+        .log
+        .lines()
+        .find_map(|line| line.strip_prefix("inkemu: stopped by --strict-mmio: "))
+        .unwrap_or_else(|| panic!("no strict stop:\n{}", strict.log));
+    // A strict run is the lenient run up to its first warning: the two runs agree on it.
+    assert_eq!(stop, warnings[0], "{}", strict.log);
 }
 
 /// A failure quotes the console without the stack dump of the panic, and says how many lines it

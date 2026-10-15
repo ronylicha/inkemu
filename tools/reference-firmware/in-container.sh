@@ -108,9 +108,11 @@ symbols nvs_rw_value_cxx
 # sdkconfig.defaults of its own, echoes what the host sends to USB-Serial-JTAG; the third is this
 # directory's own, a console on USB-Serial-JTAG that needs a host reading the port. The last two are
 # this directory's too: adc_wait_panic waits for the SAR ADC with interrupts masked, as CrossPoint
-# does, until the interrupt watchdog panics, and its next life finds the core dump the panic wrote;
-# deep_sleep_timer counts its lives in RTC memory through three deep sleeps on the RTC timer and a
-# fourth with no wake source. The last one, coremark_example, is Espressif's CoreMark example and
+# does, then for a conversion nothing started, until the interrupt watchdog panics, and its next
+# life finds the core dump the panic wrote; deep_sleep_timer counts its lives in RTC memory through
+# three deep sleeps on the RTC timer and a fourth with no wake source; soc_signals drives GPIO,
+# GP-SPI2, the SAR ADC and I2C0 through the ESP-IDF drivers on the pins of the X4, for a test that
+# attaches chips to them. Before it, coremark_example is Espressif's CoreMark example and
 # component, copied unmodified into this directory (coremark_example/PROVENANCE.md): the build has no
 # network and no component manager. Its copied files are checked first, against their pinned hashes;
 # the CoreMark run rules ask for the benchmark's files unmodified. The directory must hold exactly
@@ -140,7 +142,8 @@ for project in \
   "/ref/usb_serial_jtag_console:SHA256SUMS.inputs-usj-console" \
   "/ref/adc_wait_panic:SHA256SUMS.inputs-adc-wait-panic" \
   "/ref/deep_sleep_timer:SHA256SUMS.inputs-deep-sleep-timer" \
-  "/ref/coremark_example:SHA256SUMS.inputs-coremark"; do
+  "/ref/coremark_example:SHA256SUMS.inputs-coremark" \
+  "/ref/soc_signals:SHA256SUMS.inputs-soc-signals"; do
   source="${project%%:*}"
   name="$(basename "$source")"
   build_example "$source" "/ref/${project##*:}"
