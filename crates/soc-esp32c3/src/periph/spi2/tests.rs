@@ -191,12 +191,13 @@ fn a_phase_sent_least_significant_bit_first_reaches_the_chip_reversed() {
     b.write(CTRL, WR_BIT_ORDER | RD_BIT_ORDER);
     b.write(USER, DOUTDIN | USR_MOSI | USR_MISO);
     b.write(MS_DLEN, 7);
-    b.write(W0, 0x01);
+    b.write(W0, 0x03);
     b.write(CMD, USR);
     b.run_to(128);
-    // 0x01 sent LSB first is 0x80 on the wire; the chip answers 0x81, read LSB first: 0x81.
-    assert_eq!(b.calls()[1], "transfer None [80] at 800");
-    assert_eq!(b.read(W0) & 0xFF, 0x81);
+    // 0x03 sent LSB first is 0xC0 on the wire; the chip answers 0xC1 (1100_0001), read LSB first:
+    // 0x83 (1000_0011). Neither byte reads the same both ways, so each reversal shows.
+    assert_eq!(b.calls()[1], "transfer None [c0] at 800");
+    assert_eq!(b.read(W0) & 0xFF, 0x83);
 }
 
 #[test]
