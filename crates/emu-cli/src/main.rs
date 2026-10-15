@@ -213,6 +213,18 @@ enum SdAction {
         #[arg(long, default_value = host::sd_format::DEFAULT_LABEL)]
         label: String,
     },
+    /// Finish the save of an SD image that a run left unfinished: its journal is checked whole,
+    /// then applied. Every run does it when it opens the image; this does it alone. Exit codes:
+    /// 0 applied, or nothing to finish; 2 refused (the journal, the image, its lock).
+    Recover {
+        /// The image whose save to finish.
+        path: PathBuf,
+        /// Apply the journal even if it was written for another image file: an image copied,
+        /// or moved to another filesystem, with its journal. Every other check still holds; given
+        /// another image's journal, this overwrites blocks of this image.
+        #[arg(long)]
+        accept_journal: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -342,13 +354,48 @@ fn main() -> ExitCode {
         Command::Sd {
             action: SdAction::Create { path, size, label },
         } => run_sd_create(&path, size, &label),
+        Command::Sd {
+            action:
+                SdAction::Recover {
+                    path,
+                    accept_journal,
+                },
+        } => run_sd_recover(&path, accept_journal),
+    }
+}
+
+/// `inkemu sd recover`: the save of the image finished, or nothing to finish, said in a line.
+fn run_sd_recover(path: &Path, accept_journal: bool) -> ExitCode {
+    use host::sd_image::{JournalOrigin, Recovered, SdImage};
+    let origin = if accept_journal {
+        JournalOrigin::Accepted
+    } else {
+        JournalOrigin::ThisImage
+    };
+    // A recovery alone: no other file of a run to keep apart from. Its lines go to stderr.
+    match SdImage::recover_save(path, origin, &[], &mut io::stderr()) {
+        Ok(recovered) => {
+            let what = match recovered {
+                Recovered::Nothing => "no unfinished save, nothing to do".to_owned(),
+                Recovered::Finished(committed) => format!(
+                    "the unfinished save is applied ({} blocks, {} erased ranges)",
+                    committed.blocks, committed.erased_ranges
+                ),
+            };
+            let line = format!("{}: {what}\n", sanitize(&path.display().to_string()));
+            match print_stdout(&line) {
+                ControlFlow::Continue(()) => ExitCode::SUCCESS,
+                ControlFlow::Break(code) => code,
+            }
+        }
+        Err(e) => fail(&e),
     }
 }
 
 /// `inkemu sd create`: the image, then a line that says what it is.
 fn run_sd_create(path: &Path, mebibytes: u64, label: &str) -> ExitCode {
     // A creation alone: no other file of a run to keep apart from.
-    match host::sd_format::create_blank(path, mebibytes, label, &[]) {
+    match host::sd_format::create_blank(path, mebibytes, label, &[], &mut io::stderr()) {
         Ok(layout) => {
             let line = format!(
                 "{}: {}\n",

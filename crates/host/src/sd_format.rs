@@ -9,8 +9,9 @@
 //! label give the same bytes (2e-R8). `CrossPoint` needs nothing on the volume to reach its home
 //! screen; it creates its `/.crosspoint` directory itself (research §3).
 //!
-//! The file is sparse: its size is set, and only the structures are written; the rest reads
-//! zeros. It is written under a temporary name, mode `0600` on Unix, flushed, then moved to its
+//! Its size is set, and only the structures are written; the rest reads zeros. On Unix
+//! filesystems the file is then sparse; on NTFS, a file is not sparse unless marked so, and the
+//! image takes its whole size on the disk from its creation. It is written under a temporary name, mode `0600` on Unix, flushed, then moved to its
 //! name without ever replacing what took it meanwhile (`rename_no_replace`). A journal left
 //! there by a former image is refused: the new image would apply it as its own.
 use crate::flash_state::temporary_path;
@@ -361,7 +362,8 @@ fn volume_label(label: &str) -> Result<[u8; 11], SdFormatError> {
 
 /// Creates a blank image of `mebibytes` MiB at `path`, labelled `label`, and gives its layout.
 /// `claimed` are the files a run already reads or writes (empty from the command line): the
-/// image, its temporary name and its journals must be none of them.
+/// image, its temporary name and its journals must be none of them. `log` gets the warning of an
+/// image created whose temporary name could not be removed.
 ///
 /// # Errors
 /// [`SdFormatError`]: a size or a label FAT32 cannot take, a path that names no file or where
@@ -372,6 +374,7 @@ pub fn create_blank(
     mebibytes: u64,
     label: &str,
     claimed: &[Claimed],
+    log: &mut dyn std::io::Write,
 ) -> Result<Fat32Layout, SdFormatError> {
     let layout = Fat32Layout::new(mebibytes, label)?;
     let shown_path = shown(path);
@@ -443,7 +446,16 @@ pub fn create_blank(
         .map_err(|e| failed("write", &temporary, &e))?;
     drop(file);
     match rename_no_replace(&temporary, path) {
-        Ok(()) => {}
+        Ok(None) => {}
+        // The image is in place under its name; the temporary one is a second name of it.
+        Ok(Some(e)) => {
+            let _ = writeln!(
+                log,
+                "inkemu: warning: the SD image {shown_path} is created, but {} could not be removed ({}); it is a second name of the same file (a hard link), so writing either writes the image: remove it",
+                shown(&temporary),
+                sanitize(&e.to_string())
+            );
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let _ = std::fs::remove_file(&temporary);
             return Err(SdFormatError::Exists { path: shown_path });
@@ -460,26 +472,39 @@ pub fn create_blank(
 /// `to` is made a hard link to `from`, which fails when `to` exists, then `from` is removed. On
 /// a filesystem without hard links, the last resort is a check then a rename, which leaves a
 /// window where a file created at `to` would be replaced.
-pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+///
+/// `Ok(Some(error))`: `to` is in place, but `from`, a second name of the same file after the
+/// hard link, could not be removed; the caller says so.
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<Option<std::io::Error>> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use nix::errno::Errno;
         use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
         match renameat2(AT_FDCWD, from, AT_FDCWD, to, RenameFlags::RENAME_NOREPLACE) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(None),
             // The kernel or the filesystem does not take the flag: the links below.
             Err(Errno::EINVAL | Errno::ENOSYS | Errno::EOPNOTSUPP) => {}
             Err(e) => return Err(e.into()),
         }
     }
+    link_into_place(from, to, |from| std::fs::remove_file(from))
+}
+
+/// The links of [`rename_no_replace`]: `to` made a hard link to `from`, then `from` removed by
+/// `remove`. Once the link exists, `to` is in place: a failed removal is told, not an error.
+fn link_into_place(
+    from: &Path,
+    to: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<Option<std::io::Error>> {
     match std::fs::hard_link(from, to) {
-        Ok(()) => std::fs::remove_file(from),
+        Ok(()) => Ok(remove(from).err()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
         Err(_) => {
             if std::fs::symlink_metadata(to).is_ok() {
                 return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
             }
-            std::fs::rename(from, to)
+            std::fs::rename(from, to).map(|()| None)
         }
     }
 }
@@ -609,8 +634,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let one = dir.path().join("one.img");
         let two = dir.path().join("two.img");
-        let layout = create_blank(&one, 64, DEFAULT_LABEL, &[]).unwrap();
-        create_blank(&two, 64, DEFAULT_LABEL, &[]).unwrap();
+        let layout = create_blank(&one, 64, DEFAULT_LABEL, &[], &mut Vec::new()).unwrap();
+        create_blank(&two, 64, DEFAULT_LABEL, &[], &mut Vec::new()).unwrap();
         assert_eq!(std::fs::read(&one).unwrap(), std::fs::read(&two).unwrap());
         assert_eq!(std::fs::metadata(&one).unwrap().len(), layout.bytes());
         assert!(!dir.path().join(".one.img.tmp").exists());
@@ -625,7 +650,7 @@ mod tests {
                 metadata.blocks()
             );
         }
-        let error = create_blank(&one, 64, DEFAULT_LABEL, &[])
+        let error = create_blank(&one, 64, DEFAULT_LABEL, &[], &mut Vec::new())
             .unwrap_err()
             .to_string();
         assert!(error.contains("already exists"), "{error}");
@@ -634,11 +659,12 @@ mod tests {
             64,
             DEFAULT_LABEL,
             &[],
+            &mut Vec::new(),
         )
         .unwrap_err()
         .to_string();
         assert!(error.starts_with("cannot create the SD image"), "{error}");
-        let error = create_blank(Path::new("dir/"), 64, DEFAULT_LABEL, &[])
+        let error = create_blank(Path::new("dir/"), 64, DEFAULT_LABEL, &[], &mut Vec::new())
             .unwrap_err()
             .to_string();
         assert!(error.contains("names no file"), "{error}");
@@ -656,9 +682,28 @@ mod tests {
         assert_eq!(std::fs::read(&from).unwrap(), b"new");
         assert_eq!(std::fs::read(&to).unwrap(), b"somebody's");
         std::fs::remove_file(&to).unwrap();
-        rename_no_replace(&from, &to).unwrap();
+        assert!(rename_no_replace(&from, &to).unwrap().is_none());
         assert!(!from.exists());
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        // The links, as elsewhere than Linux: the same refusal.
+        std::fs::write(&from, b"newer").unwrap();
+        let error = link_into_place(&from, &to, |from| std::fs::remove_file(from)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_link_in_place_whose_temporary_name_stays_is_a_success_told() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+        std::fs::write(&from, b"image").unwrap();
+        let left = link_into_place(&from, &to, |_| Err(std::io::Error::other("busy")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(left.to_string(), "busy");
+        assert_eq!(std::fs::read(&to).unwrap(), b"image", "in place");
+        assert!(from.exists(), "the second name, told to the caller");
     }
 
     #[test]
@@ -668,7 +713,7 @@ mod tests {
         for left in [".card.img.journal", ".card.img.journal.tmp"] {
             let journal = dir.path().join(left);
             std::fs::write(&journal, b"a former image's").unwrap();
-            let error = create_blank(&path, 64, DEFAULT_LABEL, &[])
+            let error = create_blank(&path, 64, DEFAULT_LABEL, &[], &mut Vec::new())
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("is the journal of an image"), "{error}");
@@ -696,7 +741,7 @@ mod tests {
                 path: file,
                 what: "the session of --record".into(),
             };
-            let error = create_blank(&path, 64, DEFAULT_LABEL, &[claim])
+            let error = create_blank(&path, 64, DEFAULT_LABEL, &[claim], &mut Vec::new())
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -744,7 +789,7 @@ mod tests {
     fn another_fat_implementation_reads_the_volume_and_writes_to_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("card.img");
-        let layout = create_blank(&path, 300, "My Card", &[]).unwrap();
+        let layout = create_blank(&path, 300, "My Card", &[], &mut Vec::new()).unwrap();
         let file = OpenOptions::new()
             .read(true)
             .write(true)

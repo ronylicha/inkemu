@@ -16,11 +16,14 @@
 //!   refused ([`SdImageError::UnfinishedSave`]). A later save never writes over a journal that was
 //!   not applied.
 //!
-//! A journal is bound to its image: its header holds the identity of the image file (device and
-//! inode on Unix), which its SHA-256 covers. It is read in a stream, its length checked against
-//! the longest journal the card can have before anything is read: nothing is allocated from what
-//! the file says. An erased range is punched out of the file where the filesystem can (Linux), so
-//! erasing a card frees its space instead of writing zeros.
+//! A journal is bound to its image: its header holds the identity of the image file (its inode and
+//! birth time on Unix, see `identity_of`), which its SHA-256 covers; [`SdImage::recover_save`]
+//! with [`JournalOrigin::Accepted`] applies one written for another file, at the user's word. A
+//! journal refused may have been half applied: no message says the image is intact. The image is
+//! read and written at offsets, never through a shared position. A journal is read in a stream,
+//! its length checked against the longest journal the card can have before anything is read:
+//! nothing is allocated from what the file says. An erased range is punched out of the file where
+//! the filesystem can (Linux), so erasing a card frees its space instead of writing zeros.
 //!
 //! The image is never replaced, so the lock is on the image itself (no `.lock` file). The lock is
 //! advisory: another program that writes the image during a run makes the run irreproducible;
@@ -50,6 +53,10 @@ const WRITTEN_BYTES: u64 = 8 + BLOCK;
 const ZERO_CHUNK: u64 = 1024 * 1024;
 /// What a journal is read by, a chunk at a time.
 const READ_CHUNK: usize = 64 * 1024;
+
+/// What a journal that cannot be applied leaves the user to decide: a journal takes its name only
+/// once it is complete, so its application may have begun.
+const PARTLY_WRITTEN: &str = "Keep the journal until you decide: moving it away uses the image as it is, possibly part-written, so check its files then (a FAT repair such as fsck.vfat or chkdsk finds what a cut save left)";
 
 /// The mode of a journal on Unix: the card's content is the user's alone (ADR 0004 point 5).
 #[cfg(unix)]
@@ -109,7 +116,8 @@ pub enum SdImageError {
     )]
     PendingJournal { path: String, journal: String },
     #[error(
-        "the journal {journal} of the SD image {path} is not one inkemu wrote for it ({why}); nothing was applied: move the journal away, and the image is as the last complete save left it"
+        "the journal {journal} of the SD image {path} cannot be applied ({why}); nothing of it was applied now, but the save that wrote it may have begun to change the image before it stopped, so the image may hold part of that save. {partly}",
+        partly = PARTLY_WRITTEN
     )]
     BadJournal {
         path: String,
@@ -117,7 +125,13 @@ pub enum SdImageError {
         why: String,
     },
     #[error(
-        "the journal {journal} of the SD image {path} is {len} bytes, more than any journal of this card ({max}); nothing was applied: move the journal away, and the image is as the last complete save left it"
+        "the journal {journal} was written for another image file than the SD image {path} (a copy, or an image moved to another filesystem, is another file); nothing of it was applied now. If the journal is truly this image's, `inkemu sd recover {path} --accept-journal` checks it, then applies it: applied to another image, it would overwrite blocks of that image. Otherwise the image may hold part of the save that wrote the journal. {partly}",
+        partly = PARTLY_WRITTEN
+    )]
+    ForeignJournal { path: String, journal: String },
+    #[error(
+        "the journal {journal} of the SD image {path} is {len} bytes, more than any journal of this card ({max}): inkemu did not write it for this card, and nothing of it was applied; if a save of this image was interrupted, the image may hold part of it. {partly}",
+        partly = PARTLY_WRITTEN
     )]
     JournalTooLong {
         path: String,
@@ -246,14 +260,36 @@ pub struct SdImage {
     /// anything else reads or writes the card.
     pending: bool,
     /// The number of writes to the image after which a write fails: a fault the tests inject.
-    /// Always `None` outside them.
+    #[cfg(test)]
     fail_after: Option<usize>,
+}
+
+/// Whose journal an opening applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalOrigin {
+    /// Only a journal written for this image file: the identity in its header must be the
+    /// image's. What every run does.
+    ThisImage,
+    /// A journal of any identity, which the user says is this image's (an image copied, or moved
+    /// to another filesystem, with its journal): every other check still holds.
+    Accepted,
+}
+
+/// What [`SdImage::recover_save`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recovered {
+    /// No journal: the last save of the image ended.
+    Nothing,
+    /// A journal, applied then removed.
+    Finished(Committed),
 }
 
 /// What a walk through a journal does with its entries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Walk {
-    Check,
+    /// Check every entry, and the identity of the image unless the journal is accepted.
+    Check(JournalOrigin),
+    /// Write every entry, once all of them are checked.
     Apply,
 }
 
@@ -261,6 +297,8 @@ enum Walk {
 enum WalkError {
     /// The journal is not one this image takes.
     Bad(String),
+    /// The journal was written for another image file.
+    Foreign,
     /// The journal cannot be read.
     Read(std::io::Error),
     /// The image cannot be written.
@@ -282,6 +320,33 @@ impl SdImage {
         claimed: &[Claimed],
         log: &mut dyn Write,
     ) -> Result<SdImage, SdImageError> {
+        Self::open_with(path, access, claimed, JournalOrigin::ThisImage, log)
+            .map(|(image, _)| image)
+    }
+
+    /// Finishes the save of the image at `path` that did not end, if one did not: what
+    /// `inkemu sd recover` does. With [`JournalOrigin::Accepted`], a journal written for another
+    /// image file is applied too, once every other check holds; the image is then closed.
+    ///
+    /// # Errors
+    /// Those of [`SdImage::open`] for writing.
+    pub fn recover_save(
+        path: &Path,
+        origin: JournalOrigin,
+        claimed: &[Claimed],
+        log: &mut dyn Write,
+    ) -> Result<Recovered, SdImageError> {
+        Self::open_with(path, Access::ReadWrite, claimed, origin, log)
+            .map(|(_, found)| found.map_or(Recovered::Nothing, Recovered::Finished))
+    }
+
+    fn open_with(
+        path: &Path,
+        access: Access,
+        claimed: &[Claimed],
+        origin: JournalOrigin,
+        log: &mut dyn Write,
+    ) -> Result<(SdImage, Option<Committed>), SdImageError> {
         let shown_path = shown(path);
         let no_name = || SdImageError::NoFileName {
             path: shown_path.clone(),
@@ -377,10 +442,11 @@ impl SdImage {
             identity,
             file,
             pending: false,
+            #[cfg(test)]
             fail_after: None,
         };
-        image.recover(log)?;
-        Ok(image)
+        let found = image.recover(origin, log)?;
+        Ok((image, found))
     }
 
     /// The path of the image, with its control characters escaped: for messages.
@@ -466,7 +532,7 @@ impl SdImage {
                 journal: shown(&self.journal),
             });
         }
-        self.replay_journal()
+        self.replay_journal(JournalOrigin::ThisImage)
             .and_then(|_| self.remove_journal())
             .map_err(|e| SdImageError::UnfinishedSave {
                 path: self.shown.clone(),
@@ -583,6 +649,7 @@ impl SdImage {
     }
 
     /// A fault the tests inject: the write fails once `fail_after` writes went through.
+    #[cfg(test)]
     fn injected_fault(&mut self) -> std::io::Result<()> {
         match self.fail_after {
             Some(0) => Err(std::io::Error::other("a write failure the test injects")),
@@ -594,11 +661,20 @@ impl SdImage {
         }
     }
 
+    /// Outside the tests, no fault is injected.
+    #[cfg(not(test))]
+    #[expect(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "the signature of the version the tests inject faults through"
+    )]
+    fn injected_fault(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
         self.injected_fault()?;
-        let mut file = &self.file;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(bytes)
+        write_all_at(&self.file, bytes, offset)
     }
 
     /// Makes `count` blocks from `first` read zeros: a hole punched where the filesystem can,
@@ -620,9 +696,14 @@ impl SdImage {
         Ok(())
     }
 
-    /// What an interrupted save left: a temporary journal is removed, a journal is applied.
-    /// Read-only, nothing is touched or read: a journal present is refused.
-    fn recover(&mut self, log: &mut dyn Write) -> Result<(), SdImageError> {
+    /// What an interrupted save left: a temporary journal is removed, a journal of `origin` is
+    /// applied, and what it wrote is given. Read-only, nothing is touched or read: a journal
+    /// present is refused.
+    fn recover(
+        &mut self,
+        origin: JournalOrigin,
+        log: &mut dyn Write,
+    ) -> Result<Option<Committed>, SdImageError> {
         if self.access == Access::ReadOnly {
             if std::fs::symlink_metadata(&self.journal).is_ok() {
                 return Err(SdImageError::PendingJournal {
@@ -630,7 +711,7 @@ impl SdImage {
                     journal: shown(&self.journal),
                 });
             }
-            return Ok(());
+            return Ok(None);
         }
         if std::fs::symlink_metadata(&self.temporary).is_ok() {
             std::fs::remove_file(&self.temporary)
@@ -643,7 +724,7 @@ impl SdImage {
             );
         }
         match std::fs::symlink_metadata(&self.journal) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
                 return Err(self.bad_journal(format!(
                     "it cannot be looked at: {}",
@@ -656,7 +737,7 @@ impl SdImage {
             }
             Ok(_) => {}
         }
-        let committed = self.replay_journal()?;
+        let committed = self.replay_journal(origin)?;
         self.remove_journal()?;
         let _ = writeln!(
             log,
@@ -666,7 +747,7 @@ impl SdImage {
         if let Some(notice) = committed.notice() {
             let _ = writeln!(log, "inkemu: {notice}");
         }
-        Ok(())
+        Ok(Some(committed))
     }
 
     fn bad_journal(&self, why: String) -> SdImageError {
@@ -679,7 +760,7 @@ impl SdImage {
 
     /// Checks the journal on the disk whole, then applies it, reading it in a stream. Nothing
     /// is written unless all of it is checked.
-    fn replay_journal(&mut self) -> Result<Committed, SdImageError> {
+    fn replay_journal(&mut self, origin: JournalOrigin) -> Result<Committed, SdImageError> {
         let read_error = |image: &SdImage, e: &std::io::Error| {
             image.bad_journal(format!("it cannot be read: {}", sanitize(&e.to_string())))
         };
@@ -713,13 +794,17 @@ impl SdImage {
         }
         let to_error = |image: &mut SdImage, error: WalkError| match error {
             WalkError::Bad(why) => image.bad_journal(why),
+            WalkError::Foreign => SdImageError::ForeignJournal {
+                path: image.shown.clone(),
+                journal: shown(&image.journal),
+            },
             WalkError::Read(e) => read_error(image, &e),
             WalkError::Write(action, e) => {
                 image.pending = true;
                 image.failed(action, &image.path, &e)
             }
         };
-        if let Err(error) = self.walk(&journal, body, Walk::Check) {
+        if let Err(error) = self.walk(&journal, body, Walk::Check(origin)) {
             return Err(to_error(self, error));
         }
         let committed = match self.walk(&journal, body, Walk::Apply) {
@@ -750,10 +835,8 @@ impl SdImage {
         }
         let mut identity = [0u8; IDENTITY_BYTES];
         reader.fill(&mut identity, "the identity of its image")?;
-        if identity != self.identity {
-            return Err(WalkError::Bad(
-                "it was written for another image file".to_owned(),
-            ));
+        if walk == Walk::Check(JournalOrigin::ThisImage) && !same_image(&self.identity, &identity) {
+            return Err(WalkError::Foreign);
         }
         let capacity = self.capacity.blocks();
         let blocks = reader.u64("the size of the card")?;
@@ -875,26 +958,52 @@ fn digest_matches(journal: &File, body: u64) -> std::io::Result<bool> {
     Ok(hasher.finalize().as_slice() == digest)
 }
 
-/// The identity of the image file a journal is bound to: its device and inode on Unix; elsewhere,
-/// where the standard library gives no identity, the SHA-256 of its canonical path.
+/// The identity of the image file a journal is bound to: 8 bytes that name the file, then its
+/// birth time in nanoseconds since 1970 (0 when the filesystem does not keep it), little-endian.
+///
+/// - **Unix**: the inode, then the birth time (`statx`). The device is not part of it: a USB
+///   drive plugged in again, or an NFS mount, gets another device number, and the journal of the
+///   image on it would be refused. An inode freed and given to a new file is told apart by the
+///   birth time; where the filesystem keeps none, the inode alone decides, and a journal left
+///   beside a new file that took the inode of a removed image would be applied to it.
+/// - **Elsewhere** (Windows): the first 8 bytes of the SHA-256 of the canonical path, then the
+///   creation time. NTFS tunnelling gives a file created under the name of a file removed less
+///   than 15 seconds before the creation time of the removed one: within that window, a journal
+///   left by the removed image would be applied to the new one.
 fn identity_of(file: &File, path: &Path) -> std::io::Result<[u8; IDENTITY_BYTES]> {
+    let metadata = file.metadata()?;
     let mut identity = [0u8; IDENTITY_BYTES];
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
         let _ = path;
-        let metadata = file.metadata()?;
-        identity[..8].copy_from_slice(&metadata.dev().to_le_bytes());
-        identity[8..].copy_from_slice(&metadata.ino().to_le_bytes());
+        identity[..8].copy_from_slice(&metadata.ino().to_le_bytes());
     }
     #[cfg(not(unix))]
     {
-        let _ = file;
         let canonical = std::fs::canonicalize(path)?;
         let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
-        identity.copy_from_slice(&digest[..IDENTITY_BYTES]);
+        identity[..8].copy_from_slice(&digest[..8]);
     }
+    let birth = metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        });
+    identity[8..].copy_from_slice(&birth.to_le_bytes());
     Ok(identity)
+}
+
+/// Whether a journal's identity names the image: the same file, and the same birth time unless
+/// one of them is unknown (0).
+fn same_image(image: &[u8; IDENTITY_BYTES], journal: &[u8; IDENTITY_BYTES]) -> bool {
+    let (image_file, image_birth) = image.split_at(8);
+    let (journal_file, journal_birth) = journal.split_at(8);
+    let unknown = |birth: &[u8]| birth.iter().all(|&byte| byte == 0);
+    image_file == journal_file
+        && (image_birth == journal_birth || unknown(image_birth) || unknown(journal_birth))
 }
 
 /// Writes a journal: the version line, the identity of the image, the card's blocks (`u64`), the
@@ -978,7 +1087,6 @@ fn zero_data(file: &File, offset: u64, len: u64) -> std::io::Result<u64> {
     let end = offset.saturating_add(len);
     let zeros = vec![0u8; usize::try_from(ZERO_CHUNK).unwrap_or(BLOCK_BYTES)];
     let mut written = 0;
-    let mut writer = file;
     for (start, stop) in data_extents(file, offset, end)? {
         let mut at = start;
         while at < stop {
@@ -987,13 +1095,64 @@ fn zero_data(file: &File, offset: u64, len: u64) -> std::io::Result<u64> {
                 .ok()
                 .and_then(|chunk| zeros.get(..chunk))
                 .unwrap_or(&zeros);
-            writer.seek(SeekFrom::Start(at))?;
-            writer.write_all(bytes)?;
+            write_all_at(file, bytes, at)?;
             at += chunk;
             written += chunk;
         }
     }
     Ok(written)
+}
+
+/// Which `lseek` a search for data asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seek {
+    Data,
+    Hole,
+}
+
+/// What an `lseek` for data or for a hole answered.
+#[derive(Debug)]
+enum Sought {
+    /// The offset it found.
+    At(u64),
+    /// No data from there to the end of the file (`ENXIO`).
+    NoMore,
+    /// The filesystem does not tell its holes (`EINVAL`, `EOPNOTSUPP`).
+    Unknown,
+    Failed(std::io::Error),
+}
+
+/// The parts of `[start, end)` that hold data, as `seek` tells them. Where it stops telling, from
+/// there to `end` counts as data, and what was found before is kept: data is never left out.
+fn extents_by(
+    start: u64,
+    end: u64,
+    mut seek: impl FnMut(u64, Seek) -> Sought,
+) -> std::io::Result<Vec<(u64, u64)>> {
+    let mut extents = Vec::new();
+    let mut at = start;
+    while at < end {
+        let data = match seek(at, Seek::Data) {
+            Sought::At(data) => data,
+            Sought::NoMore => break,
+            Sought::Unknown => {
+                extents.push((at, end));
+                break;
+            }
+            Sought::Failed(e) => return Err(e),
+        };
+        if data >= end {
+            break;
+        }
+        let hole = match seek(data, Seek::Hole) {
+            Sought::At(hole) => hole.clamp(data, end),
+            Sought::NoMore | Sought::Unknown => end,
+            Sought::Failed(e) => return Err(e),
+        };
+        extents.push((data, hole));
+        at = hole.max(data + 1);
+    }
+    Ok(extents)
 }
 
 /// The parts of `[start, end)` of `file` that hold data, by `SEEK_DATA` and `SEEK_HOLE`; the
@@ -1002,35 +1161,81 @@ fn zero_data(file: &File, offset: u64, len: u64) -> std::io::Result<u64> {
 fn data_extents(file: &File, start: u64, end: u64) -> std::io::Result<Vec<(u64, u64)>> {
     use nix::errno::Errno;
     use nix::unistd::{Whence, lseek};
-    let to_off = |value: u64| {
-        nix::libc::off_t::try_from(value)
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
-    };
-    let to_u64 = |value: nix::libc::off_t| u64::try_from(value).unwrap_or(0);
-    let mut extents = Vec::new();
-    let mut at = start;
-    while at < end {
-        let data = match lseek(file, to_off(at)?, Whence::SeekData) {
-            Ok(data) => to_u64(data),
-            // No data from `at` to the end of the file.
-            Err(Errno::ENXIO) => break,
-            // The filesystem does not tell its holes: the whole range is written.
-            Err(Errno::EINVAL | Errno::EOPNOTSUPP) => return Ok(vec![(at, end)]),
-            Err(e) => return Err(e.into()),
+    extents_by(start, end, |at, seek| {
+        let Ok(offset) = nix::libc::off_t::try_from(at) else {
+            return Sought::Failed(std::io::Error::from(std::io::ErrorKind::InvalidInput));
         };
-        if data >= end {
-            break;
+        let whence = match seek {
+            Seek::Data => Whence::SeekData,
+            Seek::Hole => Whence::SeekHole,
+        };
+        match lseek(file, offset, whence) {
+            Ok(found) => Sought::At(u64::try_from(found).unwrap_or(0)),
+            Err(Errno::ENXIO) => Sought::NoMore,
+            Err(Errno::EINVAL | Errno::EOPNOTSUPP) => Sought::Unknown,
+            Err(e) => Sought::Failed(e.into()),
         }
-        let hole = to_u64(lseek(file, to_off(data)?, Whence::SeekHole)?).min(end);
-        extents.push((data, hole.max(data)));
-        at = hole.max(data + 1);
-    }
-    Ok(extents)
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple", target_os = "freebsd")))]
 fn data_extents(_file: &File, start: u64, end: u64) -> std::io::Result<Vec<(u64, u64)>> {
-    Ok(vec![(start, end)])
+    extents_by(start, end, |_, _| Sought::Unknown)
+}
+
+/// Reads `into` from `offset` of `file` without moving a position: the handles of one file share
+/// theirs, and a life reads the image while its save writes it.
+fn read_exact_at(file: &File, into: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, into, offset)
+    }
+    #[cfg(windows)]
+    {
+        let mut done = 0;
+        while done < into.len() {
+            let rest = into.get_mut(done..).unwrap_or_default();
+            match std::os::windows::fs::FileExt::seek_read(file, rest, offset + done as u64) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(read) => done += read,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, into, offset);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// Writes `bytes` at `offset` of `file` without moving a position (see [`read_exact_at`]).
+fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::write_all_at(file, bytes, offset)
+    }
+    #[cfg(windows)]
+    {
+        let mut done = 0;
+        while done < bytes.len() {
+            let rest = bytes.get(done..).unwrap_or_default();
+            match std::os::windows::fs::FileExt::seek_write(file, rest, offset + done as u64) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(written) => done += written,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, bytes, offset);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Flushes the directory of `path`, so that a rename or a removal in it outlives a crash. Not
@@ -1064,14 +1269,11 @@ impl BlockSource for FileBlocks {
                 blocks: self.blocks,
             });
         }
-        self.file
-            .seek(SeekFrom::Start(lba * BLOCK))
-            .and_then(|_| self.file.read_exact(into))
-            .map_err(|e| StorageError::Failed {
-                action: "read",
-                lba,
-                detail: sanitize(&e.to_string()),
-            })
+        read_exact_at(&self.file, into, lba * BLOCK).map_err(|e| StorageError::Failed {
+            action: "read",
+            lba,
+            detail: sanitize(&e.to_string()),
+        })
     }
 }
 
@@ -1322,7 +1524,7 @@ mod tests {
             std::fs::write(&journal, &bytes).unwrap();
             let error = open_error(&path, Access::ReadWrite);
             assert!(error.contains(why), "{error}");
-            assert!(error.contains("nothing was applied"), "{error}");
+            assert_is_honest(&error);
             assert!(journal.exists(), "left for the user");
         }
         assert_eq!(std::fs::read(&path).unwrap(), vec![0; 1024 * 1024]);
@@ -1343,7 +1545,118 @@ mod tests {
         .unwrap();
         let error = open_error(&two, Access::ReadWrite);
         assert!(error.contains("written for another image file"), "{error}");
+        assert!(error.contains("--accept-journal"), "{error}");
+        assert_is_honest(&error);
         assert_eq!(std::fs::read(&two).unwrap(), vec![0; 1024 * 1024]);
+        // The user says it is this image's: every other check holds, then it is applied.
+        let mut log = Vec::new();
+        let recovered =
+            SdImage::recover_save(&two, JournalOrigin::Accepted, &[], &mut log).unwrap();
+        assert_eq!(
+            recovered,
+            Recovered::Finished(Committed {
+                blocks: 1,
+                ..Committed::default()
+            })
+        );
+        assert_eq!(block_of(&two, 1), [1; BLOCK_BYTES]);
+        assert!(!dir.path().join(".two.img.journal").exists());
+        assert_eq!(
+            SdImage::recover_save(&two, JournalOrigin::ThisImage, &[], &mut Vec::new()).unwrap(),
+            Recovered::Nothing
+        );
+    }
+
+    #[test]
+    fn an_accepted_journal_is_still_checked_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = image(dir.path(), "one.img", MIB, &[]);
+        let two = image(dir.path(), "two.img", MIB, &[]);
+        let image = open(&one);
+        let mut overlay = Overlay::new(SparseBlocks::new(MIB / BLOCK));
+        overlay.write_block(1, &[1; BLOCK_BYTES]).unwrap();
+        let bytes = journal_of(&image, &overlay.changes());
+        let journal = dir.path().join(".two.img.journal");
+        std::fs::write(&journal, &bytes[..bytes.len() - 1]).unwrap();
+        let error = SdImage::recover_save(&two, JournalOrigin::Accepted, &[], &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SHA-256 does not match"), "{error}");
+        assert!(journal.exists());
+        assert_eq!(std::fs::read(&two).unwrap(), vec![0; 1024 * 1024]);
+    }
+
+    /// A refused journal may have been half applied: no message says the image is intact.
+    fn assert_is_honest(error: &str) {
+        assert!(
+            !error.contains("as the last complete save left it"),
+            "{error}"
+        );
+        assert!(error.contains("may hold part of"), "{error}");
+        assert!(
+            error.contains("Keep the journal until you decide"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_identity_is_the_file_and_its_birth_not_the_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = image(dir.path(), "card.img", MIB, &[]);
+        let file = File::open(&path).unwrap();
+        let identity = identity_of(&file, &path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(identity[..8], file.metadata().unwrap().ino().to_le_bytes());
+        }
+        let birth = file.metadata().unwrap().created().map(|time| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        });
+        if let Ok(birth) = birth {
+            assert_eq!(
+                u128::from(u64::from_le_bytes(identity[8..].try_into().unwrap())),
+                birth
+            );
+        }
+        let with = |file: u64, birth: u64| {
+            let mut identity = [0u8; IDENTITY_BYTES];
+            identity[..8].copy_from_slice(&file.to_le_bytes());
+            identity[8..].copy_from_slice(&birth.to_le_bytes());
+            identity
+        };
+        assert!(same_image(&with(7, 100), &with(7, 100)));
+        assert!(
+            !same_image(&with(7, 100), &with(7, 101)),
+            "an inode given again"
+        );
+        assert!(!same_image(&with(7, 100), &with(8, 100)));
+        assert!(same_image(&with(7, 0), &with(7, 100)), "no birth time kept");
+        assert!(same_image(&with(7, 100), &with(7, 0)), "no birth time kept");
+    }
+
+    #[test]
+    fn a_journal_of_the_same_inode_born_at_another_time_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = image(dir.path(), "card.img", MIB, &[]);
+        let image = open(&path);
+        if image.identity[8..].iter().all(|&byte| byte == 0) {
+            // This filesystem keeps no birth time: the inode alone decides (see `identity_of`).
+            return;
+        }
+        let mut other = image.identity;
+        other[8] ^= 1;
+        let mut overlay = Overlay::new(SparseBlocks::new(MIB / BLOCK));
+        overlay.write_block(1, &[1; BLOCK_BYTES]).unwrap();
+        let mut bytes = Vec::new();
+        encode_journal(&mut bytes, &other, MIB / BLOCK, &overlay.changes()).unwrap();
+        drop(image);
+        std::fs::write(dir.path().join(".card.img.journal"), bytes).unwrap();
+        let error = open_error(&path, Access::ReadWrite);
+        assert!(error.contains("written for another image file"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0; 1024 * 1024]);
     }
 
     #[test]
@@ -1358,6 +1671,7 @@ mod tests {
             error.contains("1099511627776 bytes, more than any journal"),
             "{error}"
         );
+        assert_is_honest(&error);
         // 20 bytes of magic, 16 of identity, 3 counts of 8 and the 32 of the digest.
         assert_eq!(max_journal_bytes(2048), 92 + 16 * 1024 + 520 * 2048);
     }
@@ -1461,9 +1775,15 @@ mod tests {
             .open(&path)
             .unwrap();
         let written = zero_data(&file, 0, 8 * MIB).unwrap();
+        // Two blocks of data, each in one allocation unit of the filesystem (`st_blksize`: 4 KiB
+        // on ext4, the record size on ZFS), which `SEEK_DATA` reports whole.
+        let unit = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&path).unwrap().blksize().max(BLOCK)
+        };
         assert!(
-            written > 0 && written <= 64 * 1024,
-            "{written} bytes of zeros"
+            written > 0 && written <= 2 * unit,
+            "{written} bytes of zeros, allocation unit {unit}"
         );
         assert!(allocated(&path) <= before, "no room taken");
         assert!(std::fs::read(&path).unwrap().iter().all(|&byte| byte == 0));
@@ -1529,7 +1849,10 @@ mod tests {
             nix::sys::stat::Mode::S_IRWXU,
         )
         .unwrap();
-        let error = image.replay_journal().unwrap_err().to_string();
+        let error = image
+            .replay_journal(JournalOrigin::ThisImage)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("not a regular file"), "{error}");
     }
 
@@ -1678,6 +2001,51 @@ mod tests {
                 blocks: 2048
             }
         );
+    }
+
+    #[test]
+    fn a_life_reads_while_a_save_writes_without_sharing_a_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = image(dir.path(), "card.img", MIB, &[]);
+        let mut image = open(&path);
+        image.write_at(0, &[0xAA; BLOCK_BYTES]).unwrap();
+        // The source is another handle on the same open file: a position would be shared.
+        let mut source = image.source().unwrap();
+        let writer = &mut image;
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for _ in 0..20_000 {
+                    writer.write_at(BLOCK, &[0xBB; BLOCK_BYTES]).unwrap();
+                }
+            });
+            for _ in 0..20_000 {
+                assert_eq!(read(&mut source, 0), [0xAA; BLOCK_BYTES]);
+            }
+        });
+        drop(image);
+        assert_eq!(block_of(&path, 0), [0xAA; BLOCK_BYTES]);
+        assert_eq!(block_of(&path, 1), [0xBB; BLOCK_BYTES]);
+    }
+
+    #[test]
+    fn data_found_before_the_filesystem_stops_telling_is_kept() {
+        let extents = extents_by(0, 100, |at, seek| match (at, seek) {
+            (0, Seek::Data) => Sought::At(10),
+            (10, Seek::Hole) => Sought::At(20),
+            _ => Sought::Unknown,
+        })
+        .unwrap();
+        assert_eq!(extents, vec![(10, 20), (20, 100)]);
+        assert_eq!(
+            extents_by(0, 100, |_, _| Sought::Unknown).unwrap(),
+            vec![(0, 100)]
+        );
+        assert_eq!(
+            extents_by(0, 100, |_, _| Sought::NoMore).unwrap(),
+            Vec::<(u64, u64)>::new()
+        );
+        let failed = extents_by(0, 100, |_, _| Sought::Failed(std::io::Error::other("EIO")));
+        assert!(failed.is_err(), "an error is not taken for a hole");
     }
 
     #[cfg(unix)]

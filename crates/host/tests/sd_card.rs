@@ -139,7 +139,7 @@ fn mounts_as_sdfat_would(host: &mut Host) -> u32 {
 fn a_blank_standard_capacity_image_mounts_through_the_card_and_keeps_a_life_s_write() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("card.img");
-    create_blank(&path, 64, DEFAULT_LABEL, &[]).unwrap();
+    create_blank(&path, 64, DEFAULT_LABEL, &[], &mut Vec::new()).unwrap();
     let mut image = SdImage::open(&path, Access::ReadWrite, &[], &mut Vec::new()).unwrap();
     let mut host = Host::new(&mut image);
     assert_eq!(host.initialize(), CardKind::Sdsc);
@@ -161,7 +161,7 @@ fn a_blank_standard_capacity_image_mounts_through_the_card_and_keeps_a_life_s_wr
 fn a_blank_high_capacity_image_mounts_through_the_card() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("big.img");
-    create_blank(&path, 4096, "BIG", &[]).unwrap();
+    create_blank(&path, 4096, "BIG", &[], &mut Vec::new()).unwrap();
     let mut image = SdImage::open(&path, Access::ReadOnly, &[], &mut Vec::new()).unwrap();
     let mut host = Host::new(&mut image);
     assert_eq!(host.initialize(), CardKind::Sdhc);
