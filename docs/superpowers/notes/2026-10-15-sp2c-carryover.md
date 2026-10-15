@@ -135,6 +135,19 @@ Six points, chacun avec un test qui échoue sans sa correction :
    lente ; `the_shell_drives_one_start_and_stays_on_while_it_powers_off` échoue sans `stopping.begin()` (l'enveloppe
    se dit éteinte pendant l'extinction) et sans `handle_of` (une commande à l'ancien numéro passerait).
 
+## Cinquième vérification (0a0385e..f3b3a78) et ses corrections
+
+- **A** une fermeture qui panique ne bloque plus les suivantes : `Shell::begin_closing` rend une garde
+  (`ClosingGuard`) dont le `Drop` lève le drapeau, dans les trois chemins (fenêtre, sortie, signal)
+  (`a_closing_that_panics_still_ends`) ; le chemin du signal sort en 130 quoi que l'extinction ait fait, panique
+  comprise ; plus aucun `eprintln!` sur ces chemins (`writeln!` sur stderr, résultat ignoré : un terminal disparu ne
+  fait rien paniquer).
+- **B** la réponse d'un démarrage écarté (ni en cours ni affiché) va au journal, sans bannière (test du reducer).
+- **C** `crates/host/tests/test_support_is_test_only.rs` lit tous les manifestes (crates de l'espace de travail et
+  `app/src-tauri`) et refuse la fonction `test-support` de `host` hors des dépendances de dev : dépendance normale ou
+  de construction, pour toute cible, ou fonction qui l'active ; un second test vérifie que chacune de ces formes est
+  trouvée. Il tourne avec `cargo test --workspace` en CI.
+
 ## Laissé aux héritiers
 
 | Report | Héritier |
@@ -193,6 +206,10 @@ Après la quatrième vérification : fmt ; clippy `-D warnings` sur `host` et `e
 `host` ; `host` 264 tests et ses 2 tests de la vraie ROM ; `emu-cli` inchangé ; le front : Biome, `tsc`, Vitest 69
 tests ; l'enveloppe : fmt, clippy `-D warnings`, `cargo test --locked` (10, dont deux avec de vrais émulateurs),
 `cargo deny check` : ok.
+
+Après la cinquième vérification : fmt ; clippy `-D warnings` sur `host` et `emu-cli` ; `host` 264 tests et 2 de
+`test_support_is_test_only` ; `emu-cli` inchangé ; le front : Biome, `tsc`, Vitest 70 tests ; l'enveloppe : fmt,
+clippy `-D warnings`, `cargo test --locked` (11).
 
 **Non fait ici, laissé à la CI** : `cargo test --workspace`, la couverture, les autres suites ignorées, `cargo deny`
 de l'espace de travail racine, l'étape WebAssembly, le job `app` lui-même. **Non vérifié du tout** : l'interface dans une vraie session utilisateur
