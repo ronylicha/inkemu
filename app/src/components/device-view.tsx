@@ -86,6 +86,8 @@ export function DeviceView({ look, deviceName, signal, status, onButton, onFrame
 
   const halt = status?.halt ?? null;
   const asleep = status?.machine?.deepSleep != null;
+  // The board cut its supply: the device is off until its power key turns it on (a new life).
+  const off = status?.end === "powerOff";
 
   return (
     <div className="device-wrap">
@@ -132,13 +134,20 @@ export function DeviceView({ look, deviceName, signal, status, onButton, onFrame
         ))}
         <div className="device-screen">
           <PanelCanvas panel={look.panel} signal={signal} onError={onFrameError} />
-          {asleep ? (
+          {off ? (
+            <p className="device-badge">{t("device.off")}</p>
+          ) : asleep ? (
             <p className="device-badge">{t("device.asleep")}</p>
           ) : halt !== null ? (
             <p className="device-badge">{t("device.waiting")}</p>
           ) : null}
         </div>
       </div>
+      {look.panel.approximate ? (
+        <p className="hint" role="note">
+          {t("device.approximate")}
+        </p>
+      ) : null}
       <p id="device-keys" className="hint">
         {t("device.keys")}
       </p>

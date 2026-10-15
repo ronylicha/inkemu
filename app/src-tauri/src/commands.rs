@@ -3,7 +3,7 @@
 //! refusal is an [`ErrorDto`] whose `kind` the interface translates.
 use host::catalog::{self, DeviceView, Look};
 use host::device::{
-    self, Command, CommandError, Emulator, Handle, LaunchError, Setup, Speed, Update,
+    self, Command, CommandError, Emulator, Handle, LaunchError, SdSetup, Setup, Speed, Update,
 };
 use host::engine::{Limits, Notice};
 use serde::{Deserialize, Serialize};
@@ -319,6 +319,30 @@ pub struct SetupDto {
     max_time: String,
     max_cycles: String,
     console: Option<String>,
+    /// A USB cable powers the device from the start (`--usb-power`).
+    usb_power: bool,
+    /// The SD card in the slot, when the device has one and the form gives a card.
+    sd: Option<SdDto>,
+}
+
+/// The SD card of the form (`--sd-image`, `--sd-read-only`, or a blank image made first).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SdDto {
+    path: PathBuf,
+    read_only: bool,
+    /// Make a blank card of this many MiB at `path` first; `null` for an existing image.
+    create_mib: Option<u64>,
+}
+
+impl From<SdDto> for SdSetup {
+    fn from(card: SdDto) -> SdSetup {
+        SdSetup {
+            path: card.path,
+            read_only: card.read_only,
+            create_mib: card.create_mib,
+        }
+    }
 }
 
 fn usb_host(name: &str) -> Result<UsbHost, ErrorDto> {
@@ -370,6 +394,8 @@ impl SetupDto {
                 max_device_nanos,
             },
             console: self.console.as_deref().map(console_channel).transpose()?,
+            usb_power: self.usb_power,
+            sd: self.sd.map(SdSetup::from),
         })
     }
 }
@@ -433,7 +459,7 @@ async fn start(
 ) -> Result<StartedDto, ErrorDto> {
     let started = StartedDto {
         notices: launch.notices.clone(),
-        look: launch.look,
+        look: launch.look.clone(),
         console: launch.console.name(),
         device_name: launch.device_name.clone(),
     };
@@ -759,6 +785,8 @@ mod tests {
             "maxTime": max_time,
             "maxCycles": max_cycles,
             "console": "uart0",
+            "usbPower": true,
+            "sd": { "path": "/tmp/card.img", "readOnly": false, "createMib": 1024 },
         }))
         .unwrap()
     }
@@ -770,6 +798,15 @@ mod tests {
         assert_eq!(setup.limits.max_cycles, Some(1000));
         assert_eq!(setup.console, Some(ConsoleChannel::Uart0));
         assert_eq!(setup.firmware, Some(PathBuf::from("/tmp/app.bin")));
+        assert!(setup.usb_power);
+        assert_eq!(
+            setup.sd,
+            Some(SdSetup {
+                path: PathBuf::from("/tmp/card.img"),
+                read_only: false,
+                create_mib: Some(1024),
+            })
+        );
         let none = form(" ", "").into_setup().unwrap();
         assert_eq!(none.limits, Limits::default());
         assert_eq!(form("-1", "").into_setup().unwrap_err().kind, "maxTime");

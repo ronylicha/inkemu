@@ -10,8 +10,8 @@ import { decodeFrame, type Frame } from "./frame";
 import type { Command, DeviceView, HostError, Setup, Speed, Started, Update } from "./types";
 import { isHostError } from "./types";
 
-export type FileKind = "firmware" | "bootloader" | "flash" | "session" | "romDir";
-export type SaveKind = "flashFile" | "session" | "capture";
+export type FileKind = "firmware" | "bootloader" | "flash" | "session" | "romDir" | "sdImage";
+export type SaveKind = "flashFile" | "session" | "capture" | "sdImage";
 
 /**
  * Every start is numbered by the window (`start`); a command names the start it is meant for, and
@@ -67,6 +67,7 @@ const FILTERS: Record<FileKind | SaveKind, { name: string; extensions: string[] 
   romDir: [],
   flashFile: [{ name: "Flash file", extensions: ["flash", "bin"] }],
   capture: [{ name: "PNG", extensions: ["png"] }],
+  sdImage: [{ name: "SD card image", extensions: ["img", "bin"] }],
 };
 
 function channelOf(onUpdate: (update: Update) => void): Channel<Update> {

@@ -19,18 +19,25 @@ export type RunEnd =
   | "strictMmio"
   | "idle"
   | "deepSleep"
-  | "interrupted";
+  | "interrupted"
+  /** The board cut its supply: the device is off; its power key turns it on again. */
+  | "powerOff";
 export type RefreshKind = "full" | "partial";
 export type Edge = "top" | "right" | "bottom" | "left";
 export type PanelOrigin = "testPattern" | "device";
 export type Rotation = 0 | 90 | 180 | 270;
 
+/** The greys of a panel: a few levels (a test pattern), or any value from 0 to 255. */
+export type Shades = { levels: number } | "continuous";
+
 export interface PanelDescription {
   width: number;
   height: number;
-  grayLevels: number;
+  shades: Shades;
   rotation: Rotation;
   origin: PanelOrigin;
+  /** The image rests on optical parameters nobody measured: the interface says so. */
+  approximate: boolean;
 }
 
 export interface ButtonSpec {
@@ -52,6 +59,19 @@ export interface DeviceView {
   look: Look;
   shippedBootloader: string | null;
   noBootloader: string | null;
+  /** The device has an SD card slot: the form offers a card. */
+  sdSlot: boolean;
+  /** The device sees a USB cable: the form offers to plug one in. */
+  usbPower: boolean;
+}
+
+/** The SD card a run starts with: an existing image, or a blank one made first. */
+export interface SdCard {
+  path: string;
+  /** The card is write-protected: the image is never written. */
+  readOnly: boolean;
+  /** Make a blank card of this many MiB at `path` first; `null` for an existing image. */
+  createMib: number | null;
 }
 
 export interface Notice {
@@ -122,6 +142,10 @@ export interface Setup {
   /** CPU cycles; empty for no limit. */
   maxCycles: string;
   console: ConsoleChannel | null;
+  /** A USB cable powers the device from the start (`--usb-power`). */
+  usbPower: boolean;
+  /** The card in the slot (`--sd-image`); `null` for an empty slot. */
+  sd: SdCard | null;
 }
 
 export type Command =

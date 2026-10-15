@@ -6,7 +6,7 @@ import { fitScale, toPicture, turnedSize } from "./render";
 const frame: Frame = {
   width: 3,
   height: 2,
-  grayLevels: 4,
+  shades: { levels: 4 },
   generation: 1,
   refresh: "full",
   region: null,

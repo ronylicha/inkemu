@@ -1,23 +1,56 @@
 import { fireEvent, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { LOOK, status } from "../test/fake-host";
+import type { Look, Status } from "../ipc/types";
+import { LOOK, status, WIRED_LOOK } from "../test/fake-host";
 import { renderWith } from "../test/render";
 import { DeviceView } from "./device-view";
 
-function device(onButton = vi.fn()) {
+function device(onButton = vi.fn(), look: Look = LOOK, shown: Status = status()) {
   renderWith(
     <DeviceView
-      look={LOOK}
+      look={look}
       deviceName="Xteink X4"
       signal={null}
-      status={status()}
+      status={shown}
       onButton={onButton}
       onFrameError={vi.fn()}
     />,
   );
   return onButton;
 }
+
+describe("DeviceView of a wired device", () => {
+  it("says its rendering is approximate, and shows no test-pattern banner", () => {
+    device(vi.fn(), WIRED_LOOK);
+    expect(
+      screen.getByText("Approximate rendering: optical parameters not measured"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Test pattern/)).toBeNull();
+  });
+
+  it("says nothing of an approximation for a test pattern", () => {
+    device();
+    expect(screen.queryByText(/Approximate rendering/)).toBeNull();
+    expect(screen.getByText(/Test pattern/)).toBeInTheDocument();
+  });
+
+  it("shows the device off once its board cut the supply, and its power key still presses", () => {
+    const onButton = device(
+      vi.fn(),
+      WIRED_LOOK,
+      status({ run: "ended", end: "powerOff", machine: null }),
+    );
+    expect(screen.getByText(/^Off: the ink keeps the last image/)).toBeInTheDocument();
+    const power = screen.getByRole("button", { name: "Power" });
+    fireEvent.pointerDown(power);
+    fireEvent.pointerUp(power);
+    expect(onButton.mock.calls).toEqual([
+      ["power", true],
+      ["power", false],
+    ]);
+  });
+});
 
 describe("DeviceView", () => {
   it("releases a key held on the device when the window loses the focus", () => {

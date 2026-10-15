@@ -1,11 +1,49 @@
 import { type FormEvent, useState } from "react";
 import { useI18n } from "../i18n/i18n";
 import { asHostError, type FileKind, type SaveKind, useHost } from "../ipc/host";
-import { type DeviceView, type Setup, USB_HOSTS, type UsbHost } from "../ipc/types";
+import { type DeviceView, type SdCard, type Setup, USB_HOSTS, type UsbHost } from "../ipc/types";
 import { labelOf } from "./labels";
 import { Modal } from "./modal";
 
 type Source = "erased" | "image" | "firmware";
+
+/** The card of the form: none, an image that exists, or a blank one made first. */
+export type SdKind = "none" | "existing" | "new";
+const SD_KINDS: readonly SdKind[] = ["none", "existing", "new"];
+
+/** The size a new card is offered at: 1 GiB, as `inkemu sd create` makes by default. */
+export const DEFAULT_SD_MIB = "1024";
+/** The bounds of a blank card (`host::sd_format::{MIN_MEBIBYTES, MAX_MEBIBYTES}`). */
+const MIN_SD_MIB = 64;
+const MAX_SD_MIB = 2 * 1024 * 1024;
+
+/**
+ * The card the form describes: `null` for an empty slot, `undefined` while the form misses
+ * something (no image chosen, a size that is not a whole number of MiB within the bounds).
+ */
+export function sdCardOf(
+  kind: SdKind,
+  path: string | null,
+  readOnly: boolean,
+  sizeMib: string,
+): SdCard | null | undefined {
+  if (kind === "none") {
+    return null;
+  }
+  if (path === null) {
+    return undefined;
+  }
+  if (kind === "existing") {
+    return { path, readOnly, createMib: null };
+  }
+  const text = sizeMib.trim();
+  const mib = Number(text);
+  if (!/^\d+$/.test(text) || mib < MIN_SD_MIB || mib > MAX_SD_MIB) {
+    return undefined;
+  }
+  // A card made blank for this run is written: write-protecting it would keep it empty.
+  return { path, readOnly: false, createMib: mib };
+}
 
 interface Props {
   devices: readonly DeviceView[];
@@ -64,8 +102,15 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
   const [maxCycles, setMaxCycles] = useState("");
   const [strictMmio, setStrictMmio] = useState(false);
   const [romDir, setRomDir] = useState<string | null>(null);
+  const [usbPower, setUsbPower] = useState(false);
+  const [sdKind, setSdKind] = useState<SdKind>("none");
+  const [sdPath, setSdPath] = useState<string | null>(null);
+  const [sdReadOnly, setSdReadOnly] = useState(false);
+  const [sdSizeMib, setSdSizeMib] = useState(DEFAULT_SD_MIB);
   const [pickError, setPickError] = useState<string | null>(null);
   const chosen = devices.find((one) => one.id === device);
+  const hasSlot = chosen?.sdSlot ?? false;
+  const sd = hasSlot ? sdCardOf(sdKind, sdPath, sdReadOnly, sdSizeMib) : null;
   /** A path from the system's dialog; a dialog that fails is said in the form, and picks nothing. */
   const picked = async (pick: Promise<string | null>) => {
     try {
@@ -81,9 +126,10 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
   const pickSave = (kind: SaveKind) => () => picked(host.pickSavePath(kind));
 
   const ready =
-    source === "erased" ||
-    (source === "image" && image !== null) ||
-    (source === "firmware" && firmware !== null);
+    sd !== undefined &&
+    (source === "erased" ||
+      (source === "image" && image !== null) ||
+      (source === "firmware" && firmware !== null));
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -101,6 +147,8 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
       maxTime: maxTime.trim(),
       maxCycles: maxCycles.trim(),
       console: null,
+      usbPower: (chosen?.usbPower ?? false) && usbPower,
+      sd: sd ?? null,
     });
   };
 
@@ -194,6 +242,75 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
             ))}
           </select>
         </label>
+        {chosen?.usbPower ? (
+          <label>
+            <input
+              type="checkbox"
+              checked={usbPower}
+              onChange={(event) => setUsbPower(event.target.checked)}
+            />{" "}
+            {t("start.usbPower")}
+          </label>
+        ) : null}
+        {hasSlot ? (
+          <fieldset>
+            <legend>{t("start.sd")}</legend>
+            {SD_KINDS.map((one) => (
+              <label key={one}>
+                <input
+                  type="radio"
+                  name="sd"
+                  value={one}
+                  checked={sdKind === one}
+                  onChange={() => {
+                    setSdKind(one);
+                    // An image picked to open is not a path to create, nor the reverse.
+                    setSdPath(null);
+                  }}
+                />{" "}
+                {labelOf(t, "start.sd", one)}
+              </label>
+            ))}
+            {sdKind === "existing" ? (
+              <>
+                <PathField
+                  label={t("start.sd.image")}
+                  path={sdPath}
+                  pick={pickFile("sdImage")}
+                  onPath={setSdPath}
+                />
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={sdReadOnly}
+                    onChange={(event) => setSdReadOnly(event.target.checked)}
+                  />{" "}
+                  {t("start.sd.readOnly")}
+                </label>
+              </>
+            ) : null}
+            {sdKind === "new" ? (
+              <>
+                <PathField
+                  label={t("start.sd.newImage")}
+                  path={sdPath}
+                  pick={pickSave("sdImage")}
+                  onPath={setSdPath}
+                />
+                <label>
+                  {t("start.sd.size")}{" "}
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={sdSizeMib}
+                    aria-invalid={sdPath !== null && sd === undefined}
+                    onChange={(event) => setSdSizeMib(event.target.value)}
+                  />
+                </label>
+              </>
+            ) : null}
+          </fieldset>
+        ) : null}
         <PathField
           label={t("start.record")}
           path={record}

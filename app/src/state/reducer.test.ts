@@ -3,7 +3,14 @@ import type { Look, Started, Status, Update } from "../ipc/types";
 import { type AppState, initialState, MAX_JOURNAL, reducer } from "./reducer";
 
 const look: Look = {
-  panel: { width: 800, height: 480, grayLevels: 4, rotation: 90, origin: "testPattern" },
+  panel: {
+    width: 800,
+    height: 480,
+    shades: { levels: 4 },
+    rotation: 90,
+    origin: "testPattern",
+    approximate: false,
+  },
   buttons: [{ id: "power", edge: "top", order: 0 }],
 };
 
@@ -202,6 +209,8 @@ describe("reducer", () => {
             look,
             shippedBootloader: null,
             noBootloader: null,
+            sdSlot: false,
+            usbPower: false,
           },
         ],
       },

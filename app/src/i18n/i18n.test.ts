@@ -49,6 +49,7 @@ const ERROR_KINDS = [
   "replaying",
   "replayNotRecorded",
   "rom",
+  "sdImage",
   "session",
   "stopped",
 ] as const;

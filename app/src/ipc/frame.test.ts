@@ -7,7 +7,7 @@ import { decodeFrame, FrameError } from "./frame";
  */
 function encoded(): ArrayBuffer {
   const bytes = new Uint8Array(48 + 6);
-  bytes.set([0x49, 0x4b, 0x50, 0x46, 1, 1, 4, 1]);
+  bytes.set([0x49, 0x4b, 0x50, 0x46, 2, 1, 4, 1]);
   const view = new DataView(bytes.buffer);
   view.setUint32(8, 3, true);
   view.setUint32(12, 2, true);
@@ -27,7 +27,7 @@ describe("decodeFrame", () => {
     expect(frame).toMatchObject({
       width: 3,
       height: 2,
-      grayLevels: 4,
+      shades: { levels: 4 },
       generation: 0x0001_0304_0506_0708,
       refresh: "partial",
       region: { x: 1, y: 0, width: 2, height: 1 },
@@ -48,12 +48,21 @@ describe("decodeFrame", () => {
     expect(frame.durationNanos).toBe(1_700_000_000);
   });
 
+  it("reads continuous shades from a 0 in the levels byte", () => {
+    const buffer = encoded();
+    new Uint8Array(buffer)[6] = 0;
+    expect(decodeFrame(buffer).shades).toBe("continuous");
+  });
+
   it("refuses what is not a frame", () => {
     expect(() => decodeFrame(new ArrayBuffer(10))).toThrow(FrameError);
     const truncated = encoded().slice(0, 50);
     expect(() => decodeFrame(truncated)).toThrow(/holds 2 pixels/);
-    const other = encoded();
-    new Uint8Array(other)[4] = 2;
-    expect(() => decodeFrame(other)).toThrow(/version 2/);
+    const older = encoded();
+    new Uint8Array(older)[4] = 1;
+    expect(() => decodeFrame(older)).toThrow(/version 1/);
+    const single = encoded();
+    new Uint8Array(single)[6] = 1;
+    expect(() => decodeFrame(single)).toThrow(/1 grey level/);
   });
 });

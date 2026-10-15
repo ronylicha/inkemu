@@ -1,11 +1,12 @@
 // The panel image as the host encodes it (`PanelFrame::encode`, crates/host/src/ports.rs): a
 // 48-byte little-endian header, then one byte per pixel in the controller's scan order.
 
-import type { RefreshKind } from "./types";
+import type { RefreshKind, Shades } from "./types";
 
 export const FRAME_HEADER_LEN = 48;
 const MAGIC = [0x49, 0x4b, 0x50, 0x46]; // "IKPF"
-const VERSION = 1;
+/** Version 2 says continuous shades by a 0 in byte 6 (`FRAME_VERSION`, ports.rs). */
+const VERSION = 2;
 
 export interface Region {
   x: number;
@@ -17,7 +18,7 @@ export interface Region {
 export interface Frame {
   width: number;
   height: number;
-  grayLevels: number;
+  shades: Shades;
   generation: number;
   refresh: RefreshKind;
   region: Region | null;
@@ -46,10 +47,14 @@ export function decodeFrame(buffer: ArrayBuffer): Frame {
   }
   const duration = view.getBigUint64(24, true);
   const hasRegion = bytes[7] === 1;
+  const levels = bytes[6] ?? 0;
+  if (levels === 1) {
+    throw new FrameError("a panel frame of 1 grey level");
+  }
   return {
     width,
     height,
-    grayLevels: bytes[6] ?? 2,
+    shades: levels === 0 ? "continuous" : { levels },
     generation: Number(view.getBigUint64(16, true)),
     refresh: bytes[5] === 0 ? "full" : "partial",
     region: hasRegion
