@@ -9,6 +9,7 @@
 //! The rest serves the interface: [`ports`] are where the panel image and the buttons of a device
 //! plug in, with a test pattern ([`pattern`]) until the display is wired, and [`catalog`] chooses
 //! them per device.
+pub mod capture;
 pub mod catalog;
 pub mod exit;
 pub mod firmware_file;
@@ -23,3 +24,4 @@ pub mod run;
 pub mod script_file;
 pub mod session_file;
 pub mod term;
+pub mod utf8;
