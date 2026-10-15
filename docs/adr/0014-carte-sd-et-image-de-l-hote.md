@@ -36,9 +36,31 @@ pas y entrer telle quelle.
    place, vidé, et effacé. À l'ouverture, un journal présent est vérifié (SHA-256) et appliqué, ou refusé en le
    nommant ; un temporaire présent est effacé. Après n'importe quelle interruption, l'image est celle d'avant la vie
    ou celle d'après, jamais un mélange : la garantie du fichier temporaire renommé, pour un coût proportionnel à ce
-   que la vie a écrit.
+   que la vie a écrit. Les règles qui la tiennent :
+   - **un journal non appliqué passe avant tout** : quand son application échoue (disque plein, erreur d'E/S), il
+     reste et l'image s'en souvient ; avant que la vie suivante lise (`source`) ou sauve (`commit`), il est
+     réappliqué, et s'il ne peut toujours pas l'être la vie est refusée (`UnfinishedSave`). Une sauvegarde n'écrit
+     jamais par-dessus un journal non appliqué ;
+   - **un journal est lié à son image** : son en-tête (format `inkemu-sd-journal 2`) porte l'identité du fichier
+     image, périphérique et inode sous Unix, ailleurs les 16 premiers octets du SHA-256 du chemin canonique (la
+     bibliothèque standard n'y donne pas d'identité stable) ; le condensat la couvre. Le journal d'une autre image
+     de même taille, laissé à ce nom, est refusé. `inkemu sd create` refuse de créer une image là où un journal ou
+     son temporaire existe déjà ;
+   - **rien n'est alloué d'après le journal** : sa longueur est comparée avant toute lecture à celle du plus long
+     journal de la carte (en-tête de 92 octets, une plage effacée de 16 octets tous les deux blocs au plus, chaque
+     bloc écrit une fois en 520 octets) ; il est vérifié puis appliqué en flux, en deux passes, et la sauvegarde
+     applique directement les changements validés, sans relire le journal ;
+   - **ce qui est ouvert est jugé** : un journal est ouvert sans suivre de lien ni attendre un tube, puis son type est
+     revérifié sur le descripteur. En lecture seule, un journal présent est refusé sans être lu, et rien n'est effacé.
+   Un **effacement** libère la place où le système de fichiers le permet : Linux perce un trou
+   (`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`). Sur macOS et Windows, les appels équivalents
+   (`F_PUNCHHOLE`, `FSCTL_SET_ZERO_DATA`) n'ont pas d'enveloppe sûre dans nos dépendances et l'espace de travail
+   interdit `unsafe` : les zéros sont écrits sur les seules parties qui portent des données (`SEEK_DATA`/`SEEK_HOLE`
+   sur macOS et FreeBSD ; sur toute la plage ailleurs), et la ligne de fin de vie le dit.
 5. **Une image vierge** est formatée par notre code (FAT32, MBR, disposition de l'association SD), déterministe,
-   creuse, écrite sous un nom temporaire en `0600` puis renommée. La seule crate de formatage FAT répandue (`fatfs`)
+   creuse, écrite sous un nom temporaire en `0600` puis mise à son nom sans jamais remplacer ce qui l'aurait pris
+   entre-temps (`renameat2(RENAME_NOREPLACE)` sous Linux glibc, sinon un lien dur puis l'effacement du temporaire ;
+   sur un système de fichiers sans liens durs, en dernier recours, une vérification puis un renommage). La seule crate de formatage FAT répandue (`fatfs`)
    n'a pas de version depuis janvier 2023 : elle ne sert qu'en dépendance de test, pour relire nos images.
 6. **Dans une session**, la carte entrera avec le format 2 de SP2d : capacité, protection, plages de blocs non nuls
    compressées (au plus 64 Mio), empreinte de cette forme canonique ; le résultat comparé portera l'empreinte des
@@ -46,8 +68,14 @@ pas y entrer telle quelle.
 
 ## Conséquences
 
-- Une image de 32 Gio n'occupe en mémoire que ce que la vie écrit ; un effacement de toute la carte est une plage.
+- Une image de 32 Gio n'occupe en mémoire que ce que la vie écrit ; un effacement de toute la carte est une plage
+  dans la surcouche et dans le journal (16 octets).
+- Sur le disque, effacer toute la carte libère sa place sous Linux et ne coûte que le percement du trou. Sur macOS,
+  il coûte l'écriture de zéros sur ce que l'image contenait (jusqu'à sa taille pleine pour une image remplie), sans
+  la faire grossir ; sous Windows, l'écriture de zéros sur toute la plage, qui remplit le fichier creux.
 - Une fin de vie écrit ce qui a changé deux fois (journal, puis en place) ; c'est le prix de l'atomicité.
+- Une vie qui suit une sauvegarde inachevée commence par la finir ; tant qu'elle ne le peut pas, la carte ne sert
+  pas, plutôt que de lire une image à moitié écrite.
 - Un tiers qui écrit l'image pendant une exécution (le verrou est consultatif) rend l'exécution non reproductible ;
   la taille est revérifiée à chaque `commit`, et la session ne dépend jamais du fichier.
 - Le format de session change une seule fois pour les boutons et la carte (SP2d, tâche 12).
