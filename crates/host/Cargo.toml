@@ -17,6 +17,7 @@ test-support = ["soc-esp32c3/test-support"]
 
 [dependencies]
 emu-core.workspace = true
+chips.workspace = true
 firmware.workspace = true
 soc-esp32c3.workspace = true
 boards.workspace = true
@@ -32,7 +33,9 @@ etcetera.workspace = true
 
 # `O_NOFOLLOW` and `O_NONBLOCK`, to open the flash file without following a link or blocking on a pipe.
 [target.'cfg(unix)'.dependencies]
-nix.workspace = true
+# `fs`: punching holes into an SD image when its card is erased (`fallocate`, `lseek` with
+# `SEEK_DATA`/`SEEK_HOLE`) and creating a blank image without replacing a file (`renameat2`).
+nix = { workspace = true, features = ["fs"] }
 
 # `mkfifo`, for the tests of what an open does when a pipe sits at the name of a file.
 [target.'cfg(unix)'.dev-dependencies]
@@ -40,6 +43,9 @@ nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Reads back the FAT32 images `sd_format` makes: another implementation than ours. A test
+# dependency only; its last release is from January 2023 (design SP2e, 2e-D15).
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
 # Reads the manifests of the repository: `test-support` stays out of every normal build.
 toml.workspace = true
 # The shape the interface reads the updates in.
