@@ -19,6 +19,7 @@ use crate::flash_state::{FlashStateError, Input, RunFlash, Seed};
 use crate::launch::{self, FlashRequest, RecordPathError, RunRequest, StartError};
 use crate::ports::{Life, PanelFrame, PowerOnError, Recipe, RefreshKind};
 use crate::record::{self, Recorder, Verdict};
+use crate::resources::Resources;
 use crate::rom_store::{self, RomStoreError};
 use crate::run::RunEnd;
 use crate::sd_image::{Access, SdImage};
@@ -27,6 +28,7 @@ use crate::session_file::{self, Claimed, SessionFileError};
 use crate::term::sanitize;
 use boards::{DeviceProfile, MachineOptions, ProfileError};
 use debugger::{DebugView, PointError, Points, StopView, ViewRequest};
+use monitor::MonitorView;
 use session::{ProfileText, RomIdentity, Session};
 use soc_esp32c3::{ConsoleChannel, Esp32C3, RomImage, UsbHost, Watch};
 use std::io::Write as _;
@@ -1157,6 +1159,9 @@ enum Request {
         view: ViewRequest,
         reply: Sender<Result<DebugView, CommandError>>,
     },
+    Monitor {
+        reply: Sender<Result<MonitorView, CommandError>>,
+    },
 }
 
 /// The answer to come of a submitted command ([`Handle::submit`]).
@@ -1238,6 +1243,25 @@ impl Handle {
         let (reply, answer) = mpsc::channel();
         self.requests
             .send(Request::Inspect { view, reply })
+            .map_err(|_| CommandError::Stopped)?;
+        answer.recv().map_err(|_| CommandError::Stopped)?
+    }
+
+    /// What the resource monitor shows of the machine (design `SP4b`): read by the thread between
+    /// two passes, from the life that runs or, once a life has ended, from the state it ended in
+    /// until the next one powers on, as [`Handle::inspect`] reads. Each reading is the start of
+    /// the recent window of the next one in the same life. Reading changes nothing of the
+    /// machine.
+    ///
+    /// # Errors
+    /// As [`Handle::inspect`].
+    pub fn monitor(&self) -> Result<MonitorView, CommandError> {
+        if std::thread::current().id() == self.thread {
+            return Err(CommandError::OnItsThread);
+        }
+        let (reply, answer) = mpsc::channel();
+        self.requests
+            .send(Request::Monitor { reply })
             .map_err(|_| CommandError::Stopped)?;
         answer.recv().map_err(|_| CommandError::Stopped)?
     }
@@ -1340,6 +1364,7 @@ impl Emulator {
                     points,
                     stop: None,
                     ended: None,
+                    resources: Resources::default(),
                     #[cfg(test)]
                     faults,
                 }
@@ -1400,6 +1425,14 @@ impl Emulator {
     /// As [`Handle::inspect`].
     pub fn inspect(&self, view: ViewRequest) -> Result<DebugView, CommandError> {
         self.handle.inspect(view)
+    }
+
+    /// [`Handle::monitor`].
+    ///
+    /// # Errors
+    /// As [`Handle::monitor`].
+    pub fn monitor(&self) -> Result<MonitorView, CommandError> {
+        self.handle.monitor()
     }
 
     /// [`Handle::frame`].
@@ -1503,6 +1536,8 @@ struct Worker {
     /// The machine of the last life once it ended, until the next one powers on: its state stays
     /// readable by the debugger (4a-D10). It holds no file: the flash and the card were kept.
     ended: Option<Esp32C3>,
+    /// What the resource monitor keeps between two readings (design `SP4b`).
+    resources: Resources,
     #[cfg(test)]
     faults: Faults,
 }
@@ -1550,6 +1585,19 @@ impl Worker {
             };
             if let Some(Request::Inspect { view, reply }) = request {
                 match catch_unwind(AssertUnwindSafe(|| self.inspect(&view))) {
+                    Ok(result) => {
+                        let _ = reply.send(result);
+                    }
+                    Err(panic) => {
+                        self.rescue(&*panic);
+                        let _ = reply.send(Err(CommandError::Stopped));
+                        return;
+                    }
+                }
+                continue;
+            }
+            if let Some(Request::Monitor { reply }) = request {
+                match catch_unwind(AssertUnwindSafe(|| self.monitor())) {
                     Ok(result) => {
                         let _ = reply.send(result);
                     }
@@ -1765,6 +1813,7 @@ impl Worker {
         }
         if let Some(frame) = output.frame {
             let (generation, refresh) = (frame.generation(), frame.refresh());
+            self.resources.note_refresh(generation, refresh);
             *self.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
             self.tell(Update::Frame {
                 generation,
@@ -1853,6 +1902,18 @@ impl Worker {
         Ok(debugger::inspect(machine, &self.points, view))
     }
 
+    /// What the resource monitor shows: the machine of the life that runs, else the one the last
+    /// life ended in, as the debugger reads.
+    fn monitor(&mut self) -> Result<MonitorView, CommandError> {
+        let machine = self
+            .engine
+            .as_ref()
+            .map(Engine::machine)
+            .or(self.ended.as_ref())
+            .ok_or_else(|| self.no_life())?;
+        Ok(self.resources.view(self.life, machine, self.speed_ratio))
+    }
+
     /// A life powers on with `machine`: it is counted, its end is not known yet, and the
     /// debugger gives it the points of the emulator before its first instruction (4a-D8) and
     /// shows it from now on, with no stop, in place of the state the last life ended in.
@@ -1862,6 +1923,7 @@ impl Worker {
         self.points.apply(machine);
         self.stop = None;
         self.ended = None;
+        self.resources.new_life();
     }
 
     /// Sets or clears a point, and gives the points to the machine that runs.
@@ -4836,6 +4898,86 @@ mod tests {
             stops, 9,
             "three words of the loop for each of the three bytes"
         );
+        assert_eq!(verdict, Some(VerdictView::Identical));
+    }
+
+    /// The monitor reads the life that runs, the state an ended life left until the next one
+    /// powers on, and a new life from nothing: no window from the life before, its own panel.
+    #[test]
+    fn the_monitor_reads_a_life_and_the_state_an_ended_one_left() {
+        let launch = Launch::new(
+            x4(echo()),
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits {
+                max_cycles: Some(50_000),
+                max_device_nanos: None,
+            },
+            look(),
+            None,
+        );
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+        let ended = emulator.monitor().unwrap();
+        assert!(ended.instructions > 0);
+        assert!(ended.time.load_permille.is_some());
+        let uart0 = ended
+            .peripherals
+            .iter()
+            .find(|block| block.peripherals == ["UART0"])
+            .unwrap();
+        assert!(uart0.writes >= 5, "`ready` went through the FIFO");
+        assert!(ended.panel.is_some_and(|panel| panel.refreshes >= 1));
+        assert_eq!(ended.recent, None, "the first reading of the life");
+        let again = emulator.monitor().unwrap();
+        assert_eq!(again.recent, None, "device time has not moved since");
+        assert_eq!(again.instructions, ended.instructions);
+
+        emulator.command(Command::Pause).unwrap();
+        emulator.command(Command::Reset).unwrap();
+        let fresh = emulator.monitor().unwrap();
+        assert_eq!((fresh.instructions, fresh.device_time_nanos), (0, 0));
+        assert_eq!(fresh.recent, None);
+        emulator.shutdown().unwrap();
+    }
+
+    /// A session replayed while the monitor reads it every two milliseconds of host time, between
+    /// passes, gives the verdict "identical": observing changes nothing of the run (4b-D4).
+    #[test]
+    fn a_replay_read_by_the_monitor_all_along_is_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_with_console_input(&dir.path().join("run.inkrec"));
+        let replay_of = session.clone();
+        let recipe = Box::new(FnRecipe(move |_: Option<Vec<u8>>, _: bool| {
+            let machine = session::Replay::start(&replay_of, echo())
+                .unwrap()
+                .into_machine();
+            let (panel, buttons) = pattern::ports(PANEL, &fixture_buttons());
+            Life {
+                machine,
+                panel,
+                buttons,
+                sd: None,
+            }
+        }));
+        let (replay, updates) = started(
+            Launch::replay(recipe, session, "run.inkrec".to_owned(), look()),
+            Speed::RealTime,
+        );
+        let (mut readings, mut windows) = (0u32, 0u32);
+        // Readings spaced as a panel spaces them, more often: a reading the thread serves comes
+        // between two passes, and a client that never let it wait would hold its pace back.
+        let verdict = loop {
+            if let Ok(Update::LifeEnded { verdict, .. }) =
+                updates.recv_timeout(Duration::from_millis(2))
+            {
+                break verdict;
+            }
+            let view = replay.monitor().unwrap();
+            readings += 1;
+            windows += u32::from(view.recent.is_some());
+        };
+        assert!(readings > 3, "{readings} readings");
+        assert!(windows > 0);
         assert_eq!(verdict, Some(VerdictView::Identical));
     }
 }

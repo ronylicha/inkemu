@@ -523,6 +523,7 @@ dependencies = [
  "fatfs",
  "firmware",
  "flate2",
+ "monitor",
  "nix",
  "serde",
  "serde_json",

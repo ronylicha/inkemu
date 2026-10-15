@@ -26,6 +26,8 @@ console-script.workspace = true
 session.workspace = true
 # The debugger's points and views (design SP4a): the thread holds the points and serves inspection.
 debugger.workspace = true
+# The resource monitor's view (design SP4b): the thread serves it with its own measures.
+monitor.workspace = true
 # Only with `test-support` (above).
 cpu-rv32 = { workspace = true, optional = true }
 serde.workspace = true

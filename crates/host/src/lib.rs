@@ -10,7 +10,8 @@
 //! [`device`] runs it on a thread of its own and takes commands, [`ports`] are where the panel
 //! image and the buttons of a device plug in, with a test pattern ([`pattern`]) until the display
 //! is wired, and [`catalog`] chooses them per device. [`utf8`] decodes the consoles as they speak
-//! and [`capture`] makes a PNG of the panel.
+//! and [`capture`] makes a PNG of the panel. [`resources`] keeps what the resource monitor needs
+//! between two readings.
 //!
 //! The SD card of a device (design `SP2e`, ADR 0014) is kept in an image file: [`sd_image`] opens,
 //! locks and writes it through a journal, and [`sd_format`] creates a blank FAT32 one;
@@ -29,6 +30,7 @@ pub mod pattern;
 pub mod ports;
 pub mod ports_wired;
 pub mod record;
+pub mod resources;
 pub mod rom_store;
 pub mod run;
 pub mod script_file;
