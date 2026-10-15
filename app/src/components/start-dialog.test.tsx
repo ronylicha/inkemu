@@ -133,6 +133,20 @@ describe("StartDialog", () => {
     expect(submit).toHaveAccessibleDescription(said);
   });
 
+  it("describes the size field by what is missing only when the size is", async () => {
+    dialog();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("radio", { name: "A new blank card" }));
+    await chooseCard(user);
+    const size = screen.getByRole("textbox", { name: /Size in MiB/ });
+    // The application is what is missing, not the size.
+    expect(screen.getByRole("button", { name: "Power on" })).toHaveAccessibleDescription(
+      "Choose an application to start the device.",
+    );
+    expect(size).not.toHaveAttribute("aria-describedby");
+    expect(size).toHaveAttribute("aria-invalid", "false");
+  });
+
   it("says in French what the form misses", async () => {
     const host = fakeHost();
     renderWith(

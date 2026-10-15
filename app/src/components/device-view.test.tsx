@@ -53,6 +53,35 @@ describe("DeviceView of a wired device", () => {
   });
 });
 
+describe("DeviceView of a replay", () => {
+  it("shows a device the session turned off as off, without asking for a hold it cannot take", () => {
+    const off = status({ run: "ended", end: "powerOff", machine: null, replay: "life.inkrec" });
+    device(vi.fn(), WIRED_LOOK, off);
+    expect(
+      screen.getByText("Off, as in the session: a replay cannot turn the device on again"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Hold the power button/)).toBeNull();
+  });
+
+  it("says it in French", () => {
+    renderWith(
+      <DeviceView
+        look={WIRED_LOOK}
+        deviceName="Xteink X4"
+        signal={null}
+        status={status({ run: "ended", end: "powerOff", machine: null, replay: "life.inkrec" })}
+        onButton={vi.fn()}
+        onFrameError={vi.fn()}
+      />,
+      { language: "fr" },
+    );
+    expect(
+      screen.getByText("Éteint, comme dans la session : un rejeu ne peut pas rallumer l’appareil"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Maintenez/)).toBeNull();
+  });
+});
+
 describe("DeviceView", () => {
   it("releases a key held on the device when the window loses the focus", () => {
     const onButton = device();

@@ -87,7 +87,9 @@ export function DeviceView({ look, deviceName, signal, status, onButton, onFrame
   const halt = status?.halt ?? null;
   const asleep = status?.machine?.deepSleep != null;
   // The board cut its supply: the device is off until its power key turns it on (a new life).
+  // A replay takes no input: what it shows off stays off (R5).
   const off = status?.end === "powerOff";
+  const offText = status?.replay != null ? t("device.offReplayed") : t("device.off");
 
   return (
     <div className="device-wrap">
@@ -135,7 +137,7 @@ export function DeviceView({ look, deviceName, signal, status, onButton, onFrame
         <div className="device-screen">
           <PanelCanvas panel={look.panel} signal={signal} onError={onFrameError} />
           {off ? (
-            <p className="device-badge">{t("device.off")}</p>
+            <p className="device-badge">{offText}</p>
           ) : asleep ? (
             <p className="device-badge">{t("device.asleep")}</p>
           ) : halt !== null ? (

@@ -78,6 +78,7 @@ export const en: Catalog = {
     "Keyboard while the device has the focus: arrows, Enter (OK), Escape or Backspace (back), P (power).",
   "device.approximate": "Approximate rendering: optical parameters not measured",
   "device.off": "Hold the power button to turn it on",
+  "device.offReplayed": "Off, as in the session: a replay cannot turn the device on again",
   "device.asleep": "Deep sleep: the ink keeps the last image.",
   "device.waiting": "Waiting for an input",
 

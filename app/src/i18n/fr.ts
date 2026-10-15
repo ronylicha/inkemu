@@ -78,6 +78,7 @@ export const fr = {
     "Clavier quand l’appareil a le focus : flèches, Entrée (OK), Échap ou Retour arrière (retour), P (alimentation).",
   "device.approximate": "Rendu approché : paramètres optiques non mesurés",
   "device.off": "Maintenez le bouton d’allumage pour allumer",
+  "device.offReplayed": "Éteint, comme dans la session : un rejeu ne peut pas rallumer l’appareil",
   "device.asleep": "Sommeil profond : l’encre garde la dernière image.",
   "device.waiting": "En attente d’une entrée",
 

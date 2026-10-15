@@ -171,6 +171,8 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
 
   const missing = missingOf({ source, image, firmware, sdKind, sdPath, sdSizeMib, slot });
   const ready = missing === null;
+  // The size field is described by what is missing only when the size is what is missing (R6).
+  const sizeMissing = missing?.key === "start.missing.sdSize";
   const missingText =
     missing === null
       ? null
@@ -350,8 +352,8 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
                     type="text"
                     inputMode="numeric"
                     value={sdSizeMib}
-                    aria-invalid={missing?.key === "start.missing.sdSize"}
-                    aria-describedby={missing === null ? undefined : "start-missing"}
+                    aria-invalid={sizeMissing}
+                    aria-describedby={sizeMissing ? "start-missing" : undefined}
                     onChange={(event) => setSdSizeTyped(event.target.value)}
                   />
                 </label>
