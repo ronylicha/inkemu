@@ -24,7 +24,8 @@ const LANGUAGE_NAMES: Record<Language, string> = { fr: "Français", en: "English
 
 /**
  * The controls of the emulator. Which are enabled follows the status the host sent: the
- * interface decides nothing about the device.
+ * interface decides nothing about the device. A labelled region, not an ARIA toolbar: it holds
+ * selects, which take the arrow keys a toolbar would use to move between its controls; Tab moves.
  */
 export function Toolbar(props: Props) {
   const { phase, status, speed, hasImage, theme } = props;
@@ -34,7 +35,7 @@ export function Toolbar(props: Props) {
   const live = on && (run === "running" || run === "paused");
   const replaying = status?.replay != null;
   return (
-    <div role="toolbar" aria-label={t("toolbar.label")} className="toolbar">
+    <section aria-label={t("toolbar.label")} className="toolbar">
       <button type="button" onClick={props.onPowerOn} disabled={phase === "starting"}>
         {phase === "starting" ? t("start.starting") : t("toolbar.powerOn")}
       </button>
@@ -104,6 +105,6 @@ export function Toolbar(props: Props) {
       <button type="button" onClick={props.onAbout}>
         {t("toolbar.about")}
       </button>
-    </div>
+    </section>
   );
 }
