@@ -852,7 +852,15 @@ impl Esp32C3 {
     /// The chips of the board have power whatever the chip does: a clocked chip (ADR 0012) whose
     /// deadline comes first is advanced at it, alone, without the pads being worked out (their
     /// interrupts belong to the digital domain), and the sleep goes on. Nothing is due only when
-    /// neither the RTC domain nor a clocked chip has anything to come.
+    /// neither the RTC domain nor a clocked chip has anything to come. A chip always due (whose
+    /// deadline never moves past the instant it is advanced to) is advanced at every cycle of the
+    /// time base, so a sleep with it is never [`Sleep::NothingDue`]: only `deadline` (the
+    /// device-time limit of the call, `--max-time`) or the RTC domain ends it, and the chip is
+    /// named once as stuck ([`Diagnostic::ClockedChipStuck`]).
+    ///
+    /// When a chip's deadline and the call of the RTC domain fall at one instant, the chip is
+    /// advanced first, once, then the RTC domain is called (and its reset, if it asks for one,
+    /// rebuilds the digital domain).
     fn sleep_deeply(&mut self, deadline: Option<Cycles>) -> Sleep {
         let now = self.bus.ctx.now();
         let call = self.bus.periph.rtc_cntl.next_call();
@@ -869,7 +877,7 @@ impl Esp32C3 {
         }
         self.bus.ctx.sleep_until(target);
         if chips.is_some_and(|chips| chips <= target) {
-            self.bus.periph.io.advance_clocked(&self.bus.ctx);
+            self.bus.periph.io.advance_clocked(&mut self.bus.ctx);
         }
         if call.is_some_and(|call| call <= target) {
             self.bus.wake_rtc_domain();
@@ -5307,6 +5315,96 @@ mod tests {
             "the board's chip went on"
         );
         assert_eq!(m.device_time_nanos(), 1_000_000);
+    }
+
+    /// `m` run until `stop` returns true or the stop is not `Asleep`, a hundred calls at most,
+    /// each to device time `limit`: the last stop.
+    fn run_to(m: &mut Esp32C3, limit: u64, stop: impl Fn(&Esp32C3) -> bool) -> StopReason {
+        let mut reason = StopReason::CycleBudget;
+        for _ in 0..100 {
+            reason = m.run_within(Cycles(u64::MAX), Some(limit));
+            if stop(m) || reason != StopReason::Asleep {
+                break;
+            }
+        }
+        reason
+    }
+
+    #[test]
+    fn a_deep_sleep_with_a_chip_always_due_ends_only_at_the_limit_of_device_time() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut m = machine(&sleep_for_ever());
+        let chip = Rc::new(RefCell::new(Refresh {
+            always_due: true,
+            ..Refresh::default()
+        }));
+        m.attach_clocked(Box::new(Rc::clone(&chip)));
+        assert_eq!(
+            run_to(&mut m, 20_000, |_| false),
+            StopReason::TimeBudget,
+            "never DeepSleep: the chip always has work"
+        );
+        assert_eq!(m.device_time_nanos(), 20_000);
+        assert!(m.deep_sleep().is_some());
+        assert_eq!(chip.borrow().advanced.last(), Some(&20_000));
+    }
+
+    #[test]
+    fn a_chip_always_due_is_named_once_as_stuck() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut m = quiet_machine(&[wfi(), HANG]);
+        let chip = Rc::new(RefCell::new(Refresh {
+            always_due: true,
+            ..Refresh::default()
+        }));
+        m.attach_clocked(Box::new(Rc::clone(&chip)));
+        // A thousand advances take 6.25 µs of waiting; 20 µs is three times that.
+        assert_eq!(
+            m.run_within(Cycles(10_000), Some(20_000)),
+            StopReason::TimeBudget
+        );
+        assert!(chip.borrow().advanced.len() > 2 * crate::diag::STUCK_CLOCKED_INSTANTS as usize);
+        assert_eq!(
+            m.drain_diagnostics(),
+            [Diagnostic::ClockedChipStuck { chip: 0 }],
+            "once, though it stayed stuck"
+        );
+        // A chip that progresses is never named (the other tests of clocked chips drain none).
+    }
+
+    #[test]
+    fn a_deadline_at_the_instant_of_the_rtc_call_advances_the_chip_once_then_the_wake_resets() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut m = machine(&sleep_on_the_rtc_timer(0x2000, TIMER_WAKE_STATE));
+        run_to(&mut m, 1_000_000, |m| m.deep_sleep().is_some());
+        let wake = m
+            .deep_sleep()
+            .and_then(|sleep| sleep.timer_wake_nanos)
+            .expect("asleep, the RTC timer armed");
+        let chip = Rc::new(RefCell::new(Refresh {
+            deadlines: vec![wake],
+            ..Refresh::default()
+        }));
+        m.attach_clocked(Box::new(Rc::clone(&chip)));
+        run_to(&mut m, wake + 1_000_000, |m| m.resets() == 1);
+        assert_eq!(m.resets(), 1, "the wake from deep sleep");
+        assert_eq!(
+            chip.borrow().advanced,
+            [wake],
+            "once, at the wake's instant"
+        );
+        let reset_at = m.drain_diagnostics().iter().find_map(|d| match d {
+            Diagnostic::Reset { at_us, .. } => Some(*at_us),
+            _ => None,
+        });
+        assert_eq!(
+            reset_at,
+            Some(wake / 1_000),
+            "the reset at the same instant"
+        );
     }
 
     #[test]

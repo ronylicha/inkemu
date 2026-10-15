@@ -11,6 +11,13 @@ use std::fmt;
 /// but no longer listed: a runaway program must not grow the log without bound.
 pub const MAX_DISTINCT_DIAGNOSTICS: usize = 4096;
 
+/// How many advances in a row (each at a later instant than the one before) leave a clocked chip
+/// still due before [`Diagnostic::ClockedChipStuck`] names it. A chip with real work ends a piece
+/// of it and names a later deadline; 1 000 advances in a row (6.25 µs of device time while the
+/// CPU waits, a thousand instructions while it runs) is far beyond any chip that progresses, and
+/// short enough to name a stuck one before the run is long slow.
+pub const STUCK_CLOCKED_INSTANTS: u32 = 1_000;
+
 /// Past this many resets, further ones are counted (see [`Diagnostics::unlisted_resets`]) but no
 /// longer listed. Resets have a bound of their own: each one is an entry of the journal, so they
 /// would fill the table of [`MAX_DISTINCT_DIAGNOSTICS`] in a reset loop and hide every later
@@ -679,6 +686,13 @@ pub enum Diagnostic {
         /// of a run counts them.
         at_us: u64,
     },
+    /// A clocked chip of the board (ADR 0012) stayed due after each of
+    /// [`STUCK_CLOCKED_INSTANTS`] advances in a row: its deadline does not move
+    /// past the instant it is advanced to, so the machine advances it at every instant, which is
+    /// slow, and a sleep with it never ends for want of a wake. Listed once per chip. `chip` is
+    /// its rank among the clocked chips, in the order they were attached, from 0. It is a fault of
+    /// the chip's model, not of the firmware or of the `SoC`'s: it does not stop a strict run.
+    ClockedChipStuck { chip: u32 },
     /// Emitted once when [`MAX_DISTINCT_DIAGNOSTICS`] is reached.
     Suppressed,
     /// Emitted once when [`MAX_LISTED_RESETS`] resets have been listed: the later ones are
@@ -722,6 +736,7 @@ impl Diagnostic {
             Diagnostic::SubWordWrite { addr, bytes, .. } => (2, addr, bytes),
             Diagnostic::Exception { cause, pc, .. } => (3, pc, cause.code()),
             Diagnostic::Suppressed => (4, 0, 0),
+            Diagnostic::ClockedChipStuck { chip } => (38, chip, 0),
             Diagnostic::Unsupported { what, .. } => match what {
                 Unsupported::FlashCommand { opcode } => (5, u32::from(opcode), 0),
                 Unsupported::ShaDma => (6, 0, 0),
@@ -912,13 +927,30 @@ impl fmt::Display for Diagnostic {
                 "reset by {cause} (rst:{code:#x}) at pc {pc:#010x}, sp {sp:#010x}, at {at_us} us of device time",
                 code = cause.code()
             ),
-            Diagnostic::Suppressed => write!(
+            Diagnostic::Suppressed
+            | Diagnostic::ClockedChipStuck { .. }
+            | Diagnostic::UnlistedResets => self.describe_run(f),
+        }
+    }
+}
+
+impl Diagnostic {
+    /// The diagnostics about the run itself rather than one access: the limits of the journal and
+    /// a chip of the board that does not progress.
+    fn describe_run(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Diagnostic::ClockedChipStuck { chip } => write!(
                 f,
-                "more than {MAX_DISTINCT_DIAGNOSTICS} distinct diagnostics; further new ones are counted but not listed"
+                "clocked chip {chip} (in the order the chips were attached, from 0) was still due after {STUCK_CLOCKED_INSTANTS} advances in a row: its deadline never moves past the instant it is advanced to, so it is advanced at every instant of the time base, which slows the run, and a sleep with it never ends for want of a wake; make Clocked::next_deadline answer an instant after the one Clocked::advance reached, or None"
             ),
             Diagnostic::UnlistedResets => write!(
                 f,
                 "more than {MAX_LISTED_RESETS} resets; further ones are counted but not listed"
+            ),
+            // `Suppressed`: `fmt` hands this function those three only.
+            _ => write!(
+                f,
+                "more than {MAX_DISTINCT_DIAGNOSTICS} distinct diagnostics; further new ones are counted but not listed"
             ),
         }
     }

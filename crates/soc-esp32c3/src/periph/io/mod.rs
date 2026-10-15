@@ -17,7 +17,7 @@ pub use pad::{PADS, Signal};
 
 use crate::clock::TIME_BASE;
 use crate::ctx::{Ctx, Deadline, Event, Source};
-use crate::diag::Unsupported;
+use crate::diag::{Diagnostic, STUCK_CLOCKED_INSTANTS, Unsupported};
 use crate::periph::{Accepted, GPIO_BASE, IO_MUX_BASE, Storage, consecutive, index_in};
 use emu_core::{
     AnalogSource, Clocked, Cycles, GpioInput, GpioOutput, Level, Nanos, Peripheral, SpiTarget,
@@ -165,6 +165,10 @@ struct ClockedChip {
     chip: Box<dyn Clocked>,
     /// The last instant the chip was advanced at: it is not advanced twice at one instant.
     advanced_at: Option<Nanos>,
+    /// Advances in a row that left the chip still due.
+    stuck: u32,
+    /// Whether [`Diagnostic::ClockedChipStuck`] has named the chip already.
+    reported: bool,
 }
 
 impl ClockedChip {
@@ -340,11 +344,27 @@ impl IoMatrix {
     /// Advances to `at`, in the order they were attached, the clocked chips whose deadline has
     /// come and that were not advanced at `at` yet. Called before any other call to a chip at
     /// `at`: a chip never answers for an instant past its deadline before it reaches it.
-    fn advance_due(&mut self, at: Nanos) {
-        for clocked in &mut self.chips.clocked {
-            if clocked.due(at) == Some(at) {
-                clocked.chip.advance(at);
-                clocked.advanced_at = Some(at);
+    ///
+    /// A chip still due right after each of [`STUCK_CLOCKED_INSTANTS`] advances in a row (each at
+    /// a later instant than the one before) is named once ([`Diagnostic::ClockedChipStuck`]).
+    fn advance_due(&mut self, ctx: &mut Ctx, at: Nanos) {
+        for (rank, clocked) in self.chips.clocked.iter_mut().enumerate() {
+            if clocked.due(at) != Some(at) {
+                continue;
+            }
+            clocked.chip.advance(at);
+            clocked.advanced_at = Some(at);
+            let still_due = clocked.chip.next_deadline(at).is_some_and(|d| d <= at);
+            clocked.stuck = if still_due {
+                clocked.stuck.saturating_add(1)
+            } else {
+                0
+            };
+            if clocked.stuck >= STUCK_CLOCKED_INSTANTS && !clocked.reported {
+                clocked.reported = true;
+                ctx.diag.record(Diagnostic::ClockedChipStuck {
+                    chip: u32::try_from(rank).unwrap_or(u32::MAX),
+                });
             }
         }
     }
@@ -364,8 +384,9 @@ impl IoMatrix {
 
     /// Advances the clocked chips whose deadline has come, and nothing else: during a deep sleep
     /// the digital domain, the pads' interrupts with it, has no power.
-    pub(crate) fn advance_clocked(&mut self, ctx: &Ctx) {
-        self.advance_due(nanos(ctx));
+    pub(crate) fn advance_clocked(&mut self, ctx: &mut Ctx) {
+        let at = nanos(ctx);
+        self.advance_due(ctx, at);
     }
 
     /// Attaches a chip that is advanced in device time; its first deadline is armed at once.
@@ -373,6 +394,8 @@ impl IoMatrix {
         self.chips.clocked.push(ClockedChip {
             chip,
             advanced_at: None,
+            stuck: 0,
+            reported: false,
         });
         self.settle(ctx);
     }
@@ -405,7 +428,7 @@ impl IoMatrix {
     /// firmware (P, open question 6 for the rest level).
     pub(crate) fn spi_transfer(&mut self, ctx: &mut Ctx, mosi: &[u8]) -> Vec<u8> {
         let at = nanos(ctx);
-        self.advance_due(at);
+        self.advance_due(ctx, at);
         let clocks = self.pads_carrying(pad::FSPICLK);
         let data = self.pads_carrying(pad::FSPID);
         let (miso_pad, rest) = match self.input_of(pad::FSPIQ) {
@@ -441,7 +464,7 @@ impl IoMatrix {
     /// analog chip attached there says, else the pad's level (`PAD_SUPPLY_MV` high, 0 low).
     pub(crate) fn millivolts(&mut self, ctx: &mut Ctx, pad: usize) -> u32 {
         let at = nanos(ctx);
-        self.advance_due(at);
+        self.advance_due(ctx, at);
         if let Some((_, source)) = self.chips.analog.iter_mut().find(|(p, _)| *p == pad) {
             let millivolts = source.millivolts(at);
             // The call may have changed what a clocked chip has to do.
@@ -487,7 +510,7 @@ impl IoMatrix {
     ) -> Result<(), AttachError> {
         let pad = pad_of(pin)?;
         let at = nanos(ctx);
-        self.advance_due(at);
+        self.advance_due(ctx, at);
         chip.driven(self.driven[pad], at);
         self.chips.outputs.push((pad, chip));
         self.arm(ctx, at);
@@ -551,7 +574,7 @@ impl IoMatrix {
     /// announced or the next deadline of a clocked chip.
     pub(crate) fn settle(&mut self, ctx: &mut Ctx) {
         let at = nanos(ctx);
-        self.advance_due(at);
+        self.advance_due(ctx, at);
         let mut levels = 0;
         for pad in 0..PADS {
             let driven = self.drive_of(pad);

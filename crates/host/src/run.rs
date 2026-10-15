@@ -459,6 +459,7 @@ pub const fn journal_prefix(diagnostic: &Diagnostic) -> &'static str {
         | Diagnostic::FlashMapping { .. }
         | Diagnostic::StaleFlashWindow { .. }
         | Diagnostic::Exception { .. }
+        | Diagnostic::ClockedChipStuck { .. }
         | Diagnostic::Suppressed => "warning",
     }
 }
