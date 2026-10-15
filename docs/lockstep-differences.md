@@ -91,6 +91,29 @@ l'USB-Serial-JTAG diffèrent (ligne 19), et une source haute chez QEMU et basse 
 la même observation. Ni l'un ni l'autre n'est admis : ce serait une ligne sur l'instant d'une
 interruption, que le lockstep doit prouver. La note de passation de SP1b-4d donne la mesure.
 
+**Révision du 2026-10-15 (SP1b-4e, décision K8 ; `docs/research/coremark-esp32c3.md` §6).** Lu dans
+les sources de l'étiquette `esp-develop-9.2.2-20250817`, celle du QEMU épinglé :
+
+- **Le tick.** QEMU ancre l'alarme périodique sur son horloge virtuelle lue pendant le rangement
+  (`esp_systimer_comparator_reprogram`, `hw/timer/esp_systimer.c` lignes 105–154), qui, sous
+  `-icount`, compte le rangement lui-même ; inkemu l'ancre au début du rangement : c'est l'une des
+  deux instructions. L'autre n'est pas dans `esp_systimer.c` (10 ms y font exactement un nombre
+  entier d'instructions de 8 ns, sans arrondi au compte du compteur) ; une piste, non établie,
+  est l'arrondi de l'échéance par `icount_round` après un saut de l'horloge pendant un `wfi`. Rien
+  n'est admis : la règle de SP1b-4d ne permet un réglage que pour un écart sourcé dans
+  `esp_systimer.c`, et l'ancrage d'inkemu reste une hypothèse que seule la puce tranche (sous-projet 8).
+- **Le `MEIP` d'`usb_serial_jtag_echo`.** L'hypothèse ci-dessus est réfutée : l'USB-Serial-JTAG de QEMU
+  (`hw/misc/esp32c3_jtag.c`) n'a aucune sortie d'interruption, sa source est toujours basse. Remesuré
+  le 2026-10-15 (arrêt à 2 525 511, `csrs mstatus` en `0x4038025c`, `mcause` 0x80000003) : la ligne 3
+  est l'interruption logicielle (`FROM_CPU_INTR0`, priorité 1) et le gestionnaire vient de ranger le
+  seuil 2. La matrice de l'étiquette garde un bit « en attente » collant pour une source montée quand
+  le CPU ne pouvait pas la prendre, et le CPU laisse `MEIP` levé tant qu'elle en rapporte un, même
+  sous le seuil (voir la ligne 4, révision du même jour). C'est un artefact du QEMU épinglé, pas un
+  état d'inkemu. Il n'a pas de ligne : une ligne appartient à une fenêtre qui l'utilise, et aucune
+  application composée n'a de fenêtre tant que le tick n'est pas tranché ; son traitement va avec le
+  tick au sous-projet 8. La ligne en attente est déduite du code et de l'état à l'arrêt, pas lue
+  dans QEMU.
+
 ## La fin d'une fenêtre (H4, corrigée le 2026-10-14, puis par SP1b-4d)
 
 La comparaison traverse les resets des deux côtés à la fois que sa fenêtre déclare (SP1b-4d,
@@ -344,6 +367,22 @@ Paramètres :
 ```text
 meip retard 3
 ```
+
+**Révision du 2026-10-15 (SP1b-4e, décision K8 c ; `docs/research/coremark-esp32c3.md` §6.2).** La
+source citée plus haut n'est pas celle du QEMU que le lockstep fait tourner :
+`esp32c3_intmatrix_line_should_assert` et `esp_cpu_update_parent_irq` sont des fonctions de la branche
+`esp-develop` d'`espressif/qemu`, plus récente que l'étiquette `esp-develop-9.2.2-20250817` du build
+épinglé (`QEMU_ESP_BUILD`). Dans cette étiquette, la matrice (`hw/riscv/esp32c3_intmatrix.c`) envoie
+une impulsion sur la ligne et garde un bit « en attente » pour une source montée quand le CPU ne
+pouvait pas la prendre ; le CPU (`target/riscv/esp_cpu.c`) ramène toutes les lignes sur `MEIP`, le
+lève à l'impulsion, **ne le baisse pas quand il prend l'interruption**, et ne le baisse qu'à une
+vérification des interruptions avec `MIE` posé, si la matrice ne rapporte plus rien en attente.
+Le « retard » de trois instructions dont le mécanisme n'était pas identifié est ce `MEIP` resté
+levé depuis l'interruption prise : le rangement du seuil, `fence`, `li`, puis `csrs mstatus`, après
+lequel la vérification le baisse. La condition de niveau que calcule le lockstep coïncide avec le
+`MEIP` de l'étiquette tant que la ligne prise est haute et au-dessus du seuil, ce qui est la mesure
+ci-dessus. La ligne, ses paramètres, ses usages et les épingles des fenêtres ne changent pas ; seule
+sa source est corrigée.
 
 ### Ligne 5 — le compteur de cycles
 
