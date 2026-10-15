@@ -29,7 +29,8 @@ export const X4: DeviceView = {
   look: LOOK,
   shippedBootloader: "esp-idf-v5.5.2-esp32c3-dio",
   noBootloader: null,
-  sdSlot: true,
+  // The sizes host::catalog gives for a new card.
+  sdSlot: { minMib: 64, maxMib: 2_097_024, defaultMib: 1024 },
   usbPower: true,
 };
 

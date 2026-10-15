@@ -59,10 +59,17 @@ export interface DeviceView {
   look: Look;
   shippedBootloader: string | null;
   noBootloader: string | null;
-  /** The device has an SD card slot: the form offers a card. */
-  sdSlot: boolean;
+  /** The SD card slot of the device, when it has one: the form offers a card. */
+  sdSlot: SdSlotView | null;
   /** The device sees a USB cable: the form offers to plug one in. */
   usbPower: boolean;
+}
+
+/** The sizes of a new blank card the host makes (`host::catalog::SdSlotView`): never copied here. */
+export interface SdSlotView {
+  minMib: number;
+  maxMib: number;
+  defaultMib: number;
 }
 
 /** The SD card a run starts with: an existing image, or a blank one made first. */

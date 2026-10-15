@@ -25,6 +25,7 @@ describe("catalogs", () => {
  * name.
  */
 const ERROR_KINDS = [
+  "board",
   "button",
   "capture",
   "ended",
@@ -40,6 +41,7 @@ const ERROR_KINDS = [
   "noLife",
   "nothingToStep",
   "notKept",
+  "notRecorded",
   "notRecordable",
   "onItsThread",
   "powerOn",

@@ -49,7 +49,12 @@ export const fr = {
   "start.sd.image": "Image de la carte",
   "start.sd.newImage": "Nouvelle image de carte",
   "start.sd.readOnly": "Protégée en écriture (l’image n’est jamais écrite)",
-  "start.sd.size": "Taille en Mio (de 64 à 2097024)",
+  "start.sd.size": "Taille en Mio (de {min} à {max})",
+  "start.missing.image": "Choisissez une image de flash pour démarrer l’appareil.",
+  "start.missing.firmware": "Choisissez une application pour démarrer l’appareil.",
+  "start.missing.sdImage": "Choisissez l’image de la carte SD.",
+  "start.missing.sdSize":
+    "La taille d’une nouvelle carte est un nombre entier de Mio, de {min} à {max}.",
   "start.record": "Enregistrer la session dans",
   "start.advanced": "Options avancées",
   "start.maxTime": "Limite de temps d’appareil (secondes)",
@@ -72,8 +77,7 @@ export const fr = {
   "device.keys":
     "Clavier quand l’appareil a le focus : flèches, Entrée (OK), Échap ou Retour arrière (retour), P (alimentation).",
   "device.approximate": "Rendu approché : paramètres optiques non mesurés",
-  "device.off":
-    "Éteint : l’encre garde la dernière image. Appuyez sur le bouton marche pour l’allumer.",
+  "device.off": "Maintenez le bouton d’allumage pour allumer",
   "device.asleep": "Sommeil profond : l’encre garde la dernière image.",
   "device.waiting": "En attente d’une entrée",
 
@@ -172,6 +176,8 @@ export const fr = {
   "error.rom": "La ROM masque d’Espressif n’est pas disponible.",
   "error.session": "Ce fichier n’est pas une session lisible.",
   "error.sdImage": "L’image de la carte SD est inutilisable.",
+  "error.board": "Cet appareil n’a pas la ligne demandée.",
+  "error.notRecorded": "La vie n’est pas enregistrée.",
   "error.replay": "Cette session ne peut pas être rejouée ici.",
   "error.powerOn": "L’appareil ne peut pas être mis sous tension.",
   "error.stopped": "L’émulateur est arrêté.",

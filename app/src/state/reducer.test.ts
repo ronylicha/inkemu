@@ -209,7 +209,7 @@ describe("reducer", () => {
             look,
             shippedBootloader: null,
             noBootloader: null,
-            sdSlot: false,
+            sdSlot: null,
             usbPower: false,
           },
         ],

@@ -161,7 +161,7 @@ describe("App", () => {
     await user.click(capture);
     expect(host.saveCapture).toHaveBeenCalledWith("/home/user/out.png", 1);
     // The image is asked of the emulator that announced it.
-    expect(host.frame).toHaveBeenCalledWith(1);
+    expect(host.frame).toHaveBeenCalledWith(1, { width: 8, height: 4 });
     await waitFor(() =>
       expect(screen.getByRole("log", { name: "Journal" })).toHaveTextContent(
         "Capture saved: out.png",

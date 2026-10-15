@@ -41,7 +41,8 @@ describe("DeviceView of a wired device", () => {
       WIRED_LOOK,
       status({ run: "ended", end: "powerOff", machine: null }),
     );
-    expect(screen.getByText(/^Off: the ink keeps the last image/)).toBeInTheDocument();
+    // The gesture that turns it on is a hold, not a click (2d-D14).
+    expect(screen.getByText("Hold the power button to turn it on")).toBeInTheDocument();
     const power = screen.getByRole("button", { name: "Power" });
     fireEvent.pointerDown(power);
     fireEvent.pointerUp(power);

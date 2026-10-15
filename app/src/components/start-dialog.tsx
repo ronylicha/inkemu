@@ -1,7 +1,14 @@
 import { type FormEvent, useState } from "react";
 import { useI18n } from "../i18n/i18n";
 import { asHostError, type FileKind, type SaveKind, useHost } from "../ipc/host";
-import { type DeviceView, type SdCard, type Setup, USB_HOSTS, type UsbHost } from "../ipc/types";
+import {
+  type DeviceView,
+  type SdCard,
+  type SdSlotView,
+  type Setup,
+  USB_HOSTS,
+  type UsbHost,
+} from "../ipc/types";
 import { labelOf } from "./labels";
 import { Modal } from "./modal";
 
@@ -11,24 +18,23 @@ type Source = "erased" | "image" | "firmware";
 export type SdKind = "none" | "existing" | "new";
 const SD_KINDS: readonly SdKind[] = ["none", "existing", "new"];
 
-/** The size a new card is offered at: 1 GiB, as `inkemu sd create` makes by default. */
-export const DEFAULT_SD_MIB = "1024";
-/**
- * The bounds of a blank card (`host::sd_format::{MIN_MEBIBYTES, MAX_MEBIBYTES}`): FAT32's least,
- * and the largest capacity the CSD of the SPI mode can say, (C_SIZE + 1) × 512 KiB.
- */
-const MIN_SD_MIB = 64;
-const MAX_SD_MIB = 2_097_024;
+/** Whether `text` is a whole number of MiB within the sizes the host makes a new card at. */
+function isCardSize(text: string, slot: SdSlotView): boolean {
+  const mib = Number(text.trim());
+  return /^\d+$/.test(text.trim()) && mib >= slot.minMib && mib <= slot.maxMib;
+}
 
 /**
  * The card the form describes: `null` for an empty slot, `undefined` while the form misses
- * something (no image chosen, a size that is not a whole number of MiB within the bounds).
+ * something (no image chosen, a size that is not a whole number of MiB within the bounds the host
+ * gives, `slot`).
  */
 export function sdCardOf(
   kind: SdKind,
   path: string | null,
   readOnly: boolean,
   sizeMib: string,
+  slot: SdSlotView,
 ): SdCard | null | undefined {
   if (kind === "none") {
     return null;
@@ -39,13 +45,46 @@ export function sdCardOf(
   if (kind === "existing") {
     return { path, readOnly, createMib: null };
   }
-  const text = sizeMib.trim();
-  const mib = Number(text);
-  if (!/^\d+$/.test(text) || mib < MIN_SD_MIB || mib > MAX_SD_MIB) {
+  if (!isCardSize(sizeMib, slot)) {
     return undefined;
   }
   // A card made blank for this run is written: write-protecting it would keep it empty.
-  return { path, readOnly: false, createMib: mib };
+  return { path, readOnly: false, createMib: Number(sizeMib.trim()) };
+}
+
+/** What the form still misses before the device can start, said under the button (H9). */
+export type Missing =
+  | { key: "start.missing.image" }
+  | { key: "start.missing.firmware" }
+  | { key: "start.missing.sdImage" }
+  | { key: "start.missing.sdSize"; min: number; max: number };
+
+/** The first thing the form misses, `null` when it is complete. */
+export function missingOf(form: {
+  source: Source;
+  image: string | null;
+  firmware: string | null;
+  sdKind: SdKind;
+  sdPath: string | null;
+  sdSizeMib: string;
+  slot: SdSlotView | null;
+}): Missing | null {
+  if (form.source === "image" && form.image === null) {
+    return { key: "start.missing.image" };
+  }
+  if (form.source === "firmware" && form.firmware === null) {
+    return { key: "start.missing.firmware" };
+  }
+  if (form.slot === null || form.sdKind === "none") {
+    return null;
+  }
+  if (form.sdPath === null) {
+    return { key: "start.missing.sdImage" };
+  }
+  if (form.sdKind === "new" && !isCardSize(form.sdSizeMib, form.slot)) {
+    return { key: "start.missing.sdSize", min: form.slot.minMib, max: form.slot.maxMib };
+  }
+  return null;
 }
 
 interface Props {
@@ -109,11 +148,13 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
   const [sdKind, setSdKind] = useState<SdKind>("none");
   const [sdPath, setSdPath] = useState<string | null>(null);
   const [sdReadOnly, setSdReadOnly] = useState(false);
-  const [sdSizeMib, setSdSizeMib] = useState(DEFAULT_SD_MIB);
+  // `null` until the user types one: the size the host offers first.
+  const [sdSizeTyped, setSdSizeTyped] = useState<string | null>(null);
   const [pickError, setPickError] = useState<string | null>(null);
   const chosen = devices.find((one) => one.id === device);
-  const hasSlot = chosen?.sdSlot ?? false;
-  const sd = hasSlot ? sdCardOf(sdKind, sdPath, sdReadOnly, sdSizeMib) : null;
+  const slot = chosen?.sdSlot ?? null;
+  const sdSizeMib = sdSizeTyped ?? String(slot?.defaultMib ?? "");
+  const sd = slot === null ? null : sdCardOf(sdKind, sdPath, sdReadOnly, sdSizeMib, slot);
   /** A path from the system's dialog; a dialog that fails is said in the form, and picks nothing. */
   const picked = async (pick: Promise<string | null>) => {
     try {
@@ -128,11 +169,14 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
   const pickFile = (kind: FileKind) => () => picked(host.pickFile(kind));
   const pickSave = (kind: SaveKind) => () => picked(host.pickSavePath(kind));
 
-  const ready =
-    sd !== undefined &&
-    (source === "erased" ||
-      (source === "image" && image !== null) ||
-      (source === "firmware" && firmware !== null));
+  const missing = missingOf({ source, image, firmware, sdKind, sdPath, sdSizeMib, slot });
+  const ready = missing === null;
+  const missingText =
+    missing === null
+      ? null
+      : missing.key === "start.missing.sdSize"
+        ? t(missing.key, { min: missing.min, max: missing.max })
+        : t(missing.key);
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -255,7 +299,7 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
             {t("start.usbPower")}
           </label>
         ) : null}
-        {hasSlot ? (
+        {slot !== null ? (
           <fieldset>
             <legend>{t("start.sd")}</legend>
             {SD_KINDS.map((one) => (
@@ -301,13 +345,14 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
                   onPath={setSdPath}
                 />
                 <label>
-                  {t("start.sd.size")}{" "}
+                  {t("start.sd.size", { min: slot.minMib, max: slot.maxMib })}{" "}
                   <input
                     type="text"
                     inputMode="numeric"
                     value={sdSizeMib}
-                    aria-invalid={sdPath !== null && sd === undefined}
-                    onChange={(event) => setSdSizeMib(event.target.value)}
+                    aria-invalid={missing?.key === "start.missing.sdSize"}
+                    aria-describedby={missing === null ? undefined : "start-missing"}
+                    onChange={(event) => setSdSizeTyped(event.target.value)}
                   />
                 </label>
               </>
@@ -359,10 +404,19 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
           <button type="button" onClick={onClose}>
             {t("start.cancel")}
           </button>
-          <button type="submit" disabled={!ready}>
+          <button
+            type="submit"
+            disabled={!ready}
+            aria-describedby={missingText === null ? undefined : "start-missing"}
+          >
             {t("start.submit")}
           </button>
         </div>
+        {missingText === null ? null : (
+          <p id="start-missing" className="hint" role="status">
+            {missingText}
+          </p>
+        )}
       </form>
     </Modal>
   );
