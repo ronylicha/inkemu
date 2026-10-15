@@ -6,47 +6,8 @@ use emu_core::Cycles;
 use super::config::{GateScan, Optics, PanelGeometry, RAM_GATES};
 use super::ram::{Plane, Ram};
 use super::waveform::{Drive, Waveform};
-
-/// What a published image comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RefreshKind {
-    /// The glass at power-on, before any refresh (generation 0).
-    PowerOn,
-    /// A refresh in display mode 1: every pixel driven by its LUT (`0xF7`, `0xD7` on the X4).
-    Full,
-    /// A refresh in display mode 2: on the X4 the differential one (`0xFC`) and the custom-LUT one
-    /// (`0xCC`).
-    Partial,
-}
-
-/// The physical panel after a refresh: what the glass shows, not what the RAM holds.
-///
-/// The grey levels come from a model of the glass, not from a measurement: each pixel moves in
-/// proportion to its voltage and the time it is applied, and stops at black or white. Its
-/// parameters (the drive of a full swing, the frame periods, the waveforms of the OTP) are not
-/// measured on a device; [`Ssd1677Config::is_approximation`](super::Ssd1677Config::is_approximation)
-/// says so, and an interface showing this image must say "approximation" while it is true (spec
-/// §5.3). Which pixels a refresh drives, and whether they end black or white, follow the
-/// controller's documented behaviour; the intermediate greys and the trace of partial refreshes are
-/// the model's.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PanelImage {
-    pub width: u16,
-    pub height: u16,
-    /// Row by row from the top-left corner of the glass, one byte a pixel: 0 black, 255 white.
-    pub pixels: Vec<u8>,
-    /// The border (VBD), 0 black to 255 white.
-    pub border: u8,
-    /// 0 at power-on, then one more for every refresh published.
-    pub generation: u64,
-    pub kind: RefreshKind,
-    /// A hardware reset cut the display short: the image is the state the glass had reached.
-    pub interrupted: bool,
-    /// The instant the display began driving the glass (`Cycles::ZERO` at power-on).
-    pub started: Cycles,
-    /// The instant the display ended (or was cut).
-    pub at: Cycles,
-}
+pub use crate::glass::{PanelImage, RefreshKind};
+use crate::glass::{gray, level};
 
 /// The RAM row gate `gate` shows when `lines` gates are scanned with `scan` (datasheet Table 8-2):
 /// `None` when the gate is not scanned, or when it would show a row past the RAM (a MUX the
@@ -273,18 +234,6 @@ impl Panel {
     }
 }
 
-/// The optical state of grey level `gray`.
-fn level(gray: u8, swing: i64) -> i64 {
-    let scaled = i128::from(swing) * i128::from(gray) / 255;
-    i64::try_from(scaled).unwrap_or(swing)
-}
-
-/// The grey level of optical state `state`, rounded to the nearest (half up).
-fn gray(state: i64, swing: i64) -> u8 {
-    let scaled = (2 * i128::from(state) * 255 + i128::from(swing)) / (2 * i128::from(swing));
-    u8::try_from(scaled.clamp(0, 255)).unwrap_or(u8::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,16 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn grey_levels_round_and_the_power_on_image_is_uniform() {
-        let swing = 6_000;
-        assert_eq!(gray(0, swing), 0);
-        assert_eq!(gray(swing, swing), 255);
-        assert_eq!(gray(swing / 2, swing), 128);
-        assert_eq!(level(255, swing), swing);
-        assert_eq!(level(0, swing), 0);
-        for g in [0u8, 1, 77, 128, 254, 255] {
-            assert_eq!(gray(level(g, swing), swing), g);
-        }
+    fn the_power_on_image_is_uniform() {
         let optics = Optics {
             initial_gray: 200,
             ..Optics::default()

@@ -379,6 +379,28 @@ impl<S: BlockStorage> SdCard<S> {
         self.dropped
     }
 
+    /// The card lost its supply and got it back at `now` (a board that switches the card's rail,
+    /// the X3's GPIO13: ADR 0015): everything but what it stores returns to its power-on state,
+    /// in SD mode: a power cycle is the only way out of SPI mode. A block the host was still
+    /// sending is lost; what the card had already stored stays.
+    pub fn power_cycle(&mut self, now: Cycles) {
+        self.advance(now);
+        self.selected = false;
+        self.spi = false;
+        self.init = Init::NotStarted;
+        self.cmd8 = false;
+        self.acmd41_seen = false;
+        self.app = false;
+        self.crc_on = false;
+        self.block_len = 512;
+        self.status = 0;
+        self.erase = Erase::default();
+        self.well_written = 0;
+        self.busy_until = None;
+        self.phase = Phase::Idle;
+        self.out.clear();
+    }
+
     /// The chip-select line changed at `now`: `selected` when it became active (low).
     /// Deselecting drops what is not yet shifted out, a command in the middle, a block in the
     /// middle; a multiple read ends; programming goes on (design 2e-D8).
