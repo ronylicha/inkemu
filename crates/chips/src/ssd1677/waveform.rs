@@ -414,7 +414,16 @@ mod tests {
         setting[109] = 0xA0;
         let w = Waveform::from_setting(&setting, &[u64::MAX; 16]);
         assert_eq!(w.duration_ns(), u64::MAX);
+        // Every phase of LUT3 is VSH2 (17 V) against no VCOM swing (code 11): a saturated drive
+        // toward black, whatever the start.
         let t = w.transfer(Drive::Lut(3), i64::MAX, true, None);
-        assert!((0..=i64::MAX).contains(&t.apply(0)));
+        assert_eq!(t.apply(i64::MAX), 0);
+        assert_eq!(t.apply(0), 0);
+        // The other sign: saturated toward white.
+        let t = w.transfer(Drive::Lut(3), i64::MAX, false, None);
+        assert_eq!(t.apply(0), i64::MAX);
+        // Cut after the first frame (u64::MAX ns): already saturated.
+        let t = w.transfer(Drive::Lut(3), i64::MAX, true, Some(u64::MAX));
+        assert_eq!(t.apply(i64::MAX), 0);
     }
 }

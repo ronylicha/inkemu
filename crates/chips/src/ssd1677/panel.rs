@@ -3,7 +3,7 @@
 
 use emu_core::Cycles;
 
-use super::config::{GateScan, Optics, PanelGeometry};
+use super::config::{GateScan, Optics, PanelGeometry, RAM_GATES};
 use super::ram::{Plane, Ram};
 use super::waveform::{Drive, Waveform};
 
@@ -20,6 +20,15 @@ pub enum RefreshKind {
 }
 
 /// The physical panel after a refresh: what the glass shows, not what the RAM holds.
+///
+/// The grey levels come from a model of the glass, not from a measurement: each pixel moves in
+/// proportion to its voltage and the time it is applied, and stops at black or white. Its
+/// parameters (the drive of a full swing, the frame periods, the waveforms of the OTP) are not
+/// measured on a device; [`Ssd1677Config::is_approximation`](super::Ssd1677Config::is_approximation)
+/// says so, and an interface showing this image must say "approximation" while it is true (spec
+/// §5.3). Which pixels a refresh drives, and whether they end black or white, follow the
+/// controller's documented behaviour; the intermediate greys and the trace of partial refreshes are
+/// the model's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PanelImage {
     pub width: u16,
@@ -38,7 +47,9 @@ pub struct PanelImage {
 }
 
 /// The RAM row gate `gate` shows when `lines` gates are scanned with `scan` (datasheet Table 8-2):
-/// `None` when the gate is not scanned.
+/// `None` when the gate is not scanned, or when it would show a row past the RAM (a MUX the
+/// firmware set beyond 680 lines with SM = 1 sends the upper half of the gates there): such a gate
+/// is not driven.
 pub(crate) fn ram_row_of_gate(gate: u16, scan: GateScan, lines: u16) -> Option<u16> {
     if gate >= lines {
         return None;
@@ -53,7 +64,7 @@ pub(crate) fn ram_row_of_gate(gate: u16, scan: GateScan, lines: u16) -> Option<u
         (true, true) if even => half + gate / 2,
         (true, true) => gate / 2,
     };
-    (row < lines).then_some(row)
+    (row < lines && row < RAM_GATES).then_some(row)
 }
 
 /// The RAM-plane options of `0x21`: a nibble per plane, normal, read as 0, or inverted.
@@ -191,15 +202,17 @@ impl Panel {
         let mut luts = Vec::with_capacity(self.states.len());
         for y in 0..self.geometry.height {
             for x in 0..self.geometry.width {
+                // A pixel whose RAM bit lies past the RAM is not driven: no index can fall outside it.
                 let lut = self
                     .ram_pixel(x, y, scan)
-                    .map_or(UNDRIVEN, |(column, row)| {
-                        let red = scan.red.apply(ram.bit(Plane::Red, column, row));
+                    .and_then(|(column, row)| {
+                        let red = scan.red.apply(ram.bit(Plane::Red, column, row)?);
                         let black_white =
                             scan.black_white
-                                .apply(ram.bit(Plane::BlackWhite, column, row));
-                        u8::from(red) << 1 | u8::from(black_white)
-                    });
+                                .apply(ram.bit(Plane::BlackWhite, column, row)?);
+                        Some(u8::from(red) << 1 | u8::from(black_white))
+                    })
+                    .unwrap_or(UNDRIVEN);
                 luts.push(lut);
             }
         }
@@ -308,6 +321,13 @@ mod tests {
         assert_eq!(ram_row_of_gate(479, scan, 480), Some(479));
         assert_eq!(ram_row_of_gate(1, scan, 480), Some(240));
         assert_eq!(ram_row_of_gate(480, scan, 480), None);
+        // MUX 3FFh (1024 lines) with SM = 1: odd gates show rows from 512, past the RAM from 680.
+        assert_eq!(ram_row_of_gate(335, scan, 1024), Some(679));
+        assert_eq!(ram_row_of_gate(337, scan, 1024), None);
+        assert_eq!(ram_row_of_gate(679, scan, 1024), None);
+        assert_eq!(ram_row_of_gate(678, scan, 1024), Some(339));
+        // 681 lines (MUX 2A8h): the last gate of a 680-row panel would show row 680.
+        assert_eq!(ram_row_of_gate(679, scan, 681), None);
         // An odd count with GD = 1: the last gate would show a row past the count.
         assert_eq!(
             ram_row_of_gate(

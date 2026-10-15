@@ -31,9 +31,22 @@ pub enum LadderError {
     #[error("two buttons of the ladder are named `{0}`")]
     DuplicateName(String),
     #[error(
-        "the button `{name}` reads {level}, the idle level of the ladder: pressing it would not be seen"
+        "the button `{name}` reads {level}, not below the idle level {idle} of the ladder: a key \
+         pulls the pin down from the pull-up rail"
     )]
-    AtIdleLevel { name: String, level: Millivolts },
+    NotBelowIdle {
+        name: String,
+        level: Millivolts,
+        idle: Millivolts,
+    },
+    #[error(
+        "the buttons `{first}` and `{second}` both read {level}: the firmware could not tell them apart"
+    )]
+    DuplicateLevel {
+        first: String,
+        second: String,
+        level: Millivolts,
+    },
     #[error("the ladder has no button {index} (it has {count})")]
     NoSuchButton { index: usize, count: usize },
 }
@@ -55,7 +68,7 @@ impl ButtonLadder {
     /// A ladder at rest.
     ///
     /// # Errors
-    /// No button, two buttons with one name, or a button at the idle level.
+    /// No button, two buttons with one name or one level, or a button at or above the idle level.
     pub fn new(idle: Millivolts, buttons: Vec<LadderButton>) -> Result<ButtonLadder, LadderError> {
         if buttons.is_empty() {
             return Err(LadderError::NoButton);
@@ -64,9 +77,17 @@ impl ButtonLadder {
             if buttons[..index].iter().any(|b| b.name == button.name) {
                 return Err(LadderError::DuplicateName(button.name.clone()));
             }
-            if button.level == idle {
-                return Err(LadderError::AtIdleLevel {
+            if button.level >= idle {
+                return Err(LadderError::NotBelowIdle {
                     name: button.name.clone(),
+                    level: button.level,
+                    idle,
+                });
+            }
+            if let Some(first) = buttons[..index].iter().find(|b| b.level == button.level) {
+                return Err(LadderError::DuplicateLevel {
+                    first: first.name.clone(),
+                    second: button.name.clone(),
                     level: button.level,
                 });
             }
@@ -280,14 +301,51 @@ mod tests {
         let refused = ButtonLadder::new(Millivolts(3300), vec![button("down", 3300)]);
         assert_eq!(
             refused,
-            Err(LadderError::AtIdleLevel {
+            Err(LadderError::NotBelowIdle {
                 name: "down".to_owned(),
-                level: Millivolts(3300)
+                level: Millivolts(3300),
+                idle: Millivolts(3300)
             })
         );
         assert_eq!(
             refused.unwrap_err().to_string(),
-            "the button `down` reads 3300 mV, the idle level of the ladder: pressing it would not be seen"
+            "the button `down` reads 3300 mV, not below the idle level 3300 mV of the ladder: a key \
+             pulls the pin down from the pull-up rail"
+        );
+    }
+
+    #[test]
+    fn a_key_above_the_idle_level_is_refused() {
+        assert_eq!(
+            ButtonLadder::new(
+                Millivolts(3300),
+                vec![button("up", 5), button("down", 3301)]
+            ),
+            Err(LadderError::NotBelowIdle {
+                name: "down".to_owned(),
+                level: Millivolts(3301),
+                idle: Millivolts(3300)
+            })
+        );
+    }
+
+    #[test]
+    fn two_keys_at_one_level_are_refused() {
+        let refused = ButtonLadder::new(
+            Millivolts(3300),
+            vec![button("right", 3), button("left", 911), button("down", 3)],
+        );
+        assert_eq!(
+            refused,
+            Err(LadderError::DuplicateLevel {
+                first: "right".to_owned(),
+                second: "down".to_owned(),
+                level: Millivolts(3)
+            })
+        );
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "the buttons `right` and `down` both read 3 mV: the firmware could not tell them apart"
         );
     }
 

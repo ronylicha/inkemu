@@ -20,8 +20,8 @@ mod waveform;
 use emu_core::{Cycles, Frequency};
 
 pub use config::{
-    ConfigError, DisplayMode, GateScan, LUT_BYTES, Optics, OtpWaveform, PanelGeometry, RAM_GATES,
-    RAM_SOURCES, Ssd1677Config, Ssd1677Timing, Temperature,
+    ConfigError, DisplayMode, GateScan, LUT_BYTES, Optics, OtpWaveform, PanelGeometry, Provenance,
+    RAM_GATES, RAM_SOURCES, Ssd1677Config, Ssd1677Timing, Temperature,
 };
 pub use diagnostic::{Diagnostic, DiagnosticKind, Stage};
 pub use panel::{PanelImage, RefreshKind};
@@ -226,6 +226,8 @@ pub struct Ssd1677 {
     display: Option<Display>,
     current: Current,
     status: Status,
+    /// The current command already reported a reserved value: one report per command (A5).
+    reserved_reported: bool,
     diagnostics: Vec<Diagnostic>,
     dropped: u64,
 }
@@ -261,6 +263,7 @@ impl Ssd1677 {
             display: None,
             current: Current::Idle,
             status: Status::default(),
+            reserved_reported: false,
             diagnostics: Vec::new(),
             dropped: 0,
             config,
@@ -350,11 +353,15 @@ impl Ssd1677 {
             (true, Power::InReset) | (false, Power::Running | Power::Asleep) => {}
             (true, _) => {
                 self.close_command();
-                if let Some(display) = self.display.take() {
+                // A display cut once its first frame may have run publishes what the glass
+                // reached; one whose stages before it (supplies, temperature, LUT) had not ended
+                // is abandoned: the glass did not change.
+                if let Some(display) = self.display.take_if(|d| d.started <= self.now) {
                     self.report(DiagnosticKind::ResetDuringDisplay);
                     let into = self.ns_between(display.started, self.now);
                     self.panel.finish(&display, self.now, Some(into));
                 }
+                self.display = None;
                 self.restore_registers();
                 self.busy_until = None;
                 self.power = Power::InReset;
@@ -492,8 +499,13 @@ impl Ssd1677 {
         }
     }
 
+    /// Reports the first reserved or unlisted value of the current command; the others of the
+    /// same command are not reported again.
     fn reserved(&mut self, command: u8, value: u8) {
-        self.report(DiagnosticKind::ReservedValue { command, value });
+        if !self.reserved_reported {
+            self.reserved_reported = true;
+            self.report(DiagnosticKind::ReservedValue { command, value });
+        }
     }
 
     /// `ns` nanoseconds after now, as an instant.
@@ -534,6 +546,7 @@ impl Ssd1677 {
             }
         }
         self.current = Current::Ignoring;
+        self.reserved_reported = false;
     }
 
     /// The registers at their reset values, the supplies off, the status bits cleared.
@@ -837,7 +850,8 @@ impl Ssd1677 {
     }
 
     /// `0x14`: n = `A[6:4]`, m = `A[2:0]`. With the supplies up the HV is ready at the first
-    /// detection, after a cool-down of 10 ms × (n + 1).
+    /// detection, after a cool-down of 10 ms × (n + 1). Without them (the command requires CLKEN
+    /// and ANALOGEN) the detection cannot succeed: status bit 5 reads "not ready".
     fn hv_ready_detection(&mut self, byte: u8) {
         if byte & 0x88 != 0 {
             self.reserved(0x14, byte);
@@ -846,6 +860,8 @@ impl Ssd1677 {
             self.status.hv_not_ready = false;
             let cool_down = u64::from((byte >> 4) & 0b111) + 1;
             self.busy_for(cool_down * 10 * MILLISECOND);
+        } else {
+            self.status.hv_not_ready = true;
         }
     }
 

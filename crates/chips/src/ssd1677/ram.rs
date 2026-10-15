@@ -171,10 +171,10 @@ impl Ram {
         Ram::index(at).map(|index| self.plane(plane)[index])
     }
 
-    /// The bit of pixel (`x`, `row`), both within the RAM.
-    pub(crate) fn bit(&self, plane: Plane, x: u16, row: u16) -> bool {
-        let byte = self.plane(plane)[usize::from(row) * ROW_BYTES + usize::from(x / 8)];
-        byte & (0x80 >> (x % 8)) != 0
+    /// The bit of pixel (`x`, `row`); `None` past the RAM.
+    pub(crate) fn bit(&self, plane: Plane, x: u16, row: u16) -> Option<bool> {
+        self.read(plane, Counter { x, y: row })
+            .map(|byte| byte & (0x80 >> (x % 8)) != 0)
     }
 
     /// The auto write of `0x46`/`0x47` (datasheet Table 7-1): bit 7 is the value of the first
@@ -316,11 +316,14 @@ mod tests {
             ram.read(Plane::BlackWhite, Counter { x: 952, y: 679 }),
             Some(0xA5)
         );
-        // The most significant bit is the leftmost pixel of the byte.
-        assert!(ram.bit(Plane::BlackWhite, 952, 679));
-        assert!(!ram.bit(Plane::BlackWhite, 953, 679));
-        assert!(ram.bit(Plane::BlackWhite, 959, 679));
-        assert_ne!(Plane::Red, Plane::BlackWhite);
+        // The most significant bit is the leftmost pixel of the byte; past the RAM, no bit.
+        assert_eq!(ram.bit(Plane::BlackWhite, 952, 679), Some(true));
+        assert_eq!(ram.bit(Plane::BlackWhite, 953, 679), Some(false));
+        assert_eq!(ram.bit(Plane::BlackWhite, 959, 679), Some(true));
+        assert_eq!(ram.bit(Plane::Red, 959, 679), Some(false));
+        assert_eq!(ram.bit(Plane::BlackWhite, 960, 0), None);
+        assert_eq!(ram.bit(Plane::BlackWhite, 0, 680), None);
+        assert_eq!(ram.bit(Plane::Red, u16::MAX, u16::MAX), None);
     }
 
     #[test]

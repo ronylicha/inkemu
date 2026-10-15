@@ -332,6 +332,40 @@ fn deep_sleep_holds_busy_until_begin_wakes_the_controller() {
 }
 
 #[test]
+fn a_mux_past_the_ram_leaves_the_gates_past_it_undriven_without_a_panic() {
+    let mut x4 = X4::new();
+    x4.begin();
+    // MUX 3FFh (1024 lines) with SM = 1: odd gates show RAM rows from 512, and G337 to G479 rows
+    // past the 680 of the RAM.
+    x4.cmd(0x01, &[0xFF, 0x03, 0x02]);
+    // Both planes black: first value 0, steps of 680 gates and 960 sources.
+    x4.cmd(0x46, &[0x77]);
+    x4.wait_busy();
+    x4.cmd(0x47, &[0x77]);
+    x4.wait_busy();
+    x4.refresh(Mode::Full);
+    let image = x4.image();
+    let white_rows = (0..HEIGHT)
+        .filter(|&y| (0..WIDTH).all(|x| pixel(image, x, y) == 255))
+        .count();
+    let black_rows = (0..HEIGHT)
+        .filter(|&y| (0..WIDTH).all(|x| pixel(image, x, y) == 0))
+        .count();
+    assert_eq!(
+        (white_rows, black_rows),
+        (72, 408),
+        "72 odd gates from G337 to G479"
+    );
+    assert_eq!(
+        x4.diagnostics(),
+        [DiagnosticKind::ReservedValue {
+            command: 0x01,
+            value: 0x03
+        }]
+    );
+}
+
+#[test]
 fn the_x4_family_probe_finds_no_uc81xx_answer() {
     let mut x4 = X4::new();
     x4.reset();

@@ -69,9 +69,21 @@ impl Default for PanelGeometry {
     }
 }
 
+/// Where a set of parameters comes from, for an interface to say whether it shows a measured
+/// panel (spec §1.3 point 4, §5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Provenance {
+    /// Built for the model where no source gives the panel's own values: shown as "approximation".
+    Approximation,
+    /// Measured on a device, or read from its OTP.
+    Measured,
+}
+
 /// How the glass answers the waveform (spec §5.3, research §6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Optics {
+    /// The defaults are not measured: [`Provenance::Approximation`].
+    pub provenance: Provenance,
     /// The drive a pixel needs to go from black to white, in millivolt-nanoseconds (the pixel's
     /// voltage times the time it is applied). ASSUMPTION: 6 V·s by default; not measured.
     pub full_swing: u64,
@@ -85,6 +97,7 @@ pub struct Optics {
 impl Default for Optics {
     fn default() -> Self {
         Optics {
+            provenance: Provenance::Approximation,
             full_swing: 6_000 * MILLISECOND * 1_000,
             positive_drives_black: true,
             initial_gray: 255,
@@ -96,6 +109,8 @@ impl Default for Optics {
 /// datasheet does not give is an ASSUMPTION (research §5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ssd1677Timing {
+    /// The defaults are sourced approximations and assumptions: [`Provenance::Approximation`].
+    pub provenance: Provenance,
     /// Starting the clock (`0x22` bit 7).
     pub clock_on: u64,
     /// Starting the analog supplies (bit 6): about 100 ms (Papyrix).
@@ -124,6 +139,7 @@ pub struct Ssd1677Timing {
 impl Default for Ssd1677Timing {
     fn default() -> Self {
         Ssd1677Timing {
+            provenance: Provenance::Approximation,
             clock_on: 0,
             analog_on: 100 * MILLISECOND,
             analog_off: 200 * MILLISECOND,
@@ -216,6 +232,8 @@ pub struct OtpWaveform {
     pub upper: Temperature,
     /// The 112 bytes of the setting, laid out as the LUT register (datasheet Figure 6-6).
     pub setting: [u8; LUT_BYTES],
+    /// The reference settings of [`super::reference`] are [`Provenance::Approximation`].
+    pub provenance: Provenance,
 }
 
 /// The waveform the controller loads for `mode` at `temperature`: the last setting of that mode
@@ -266,6 +284,19 @@ impl Ssd1677Config {
             vci_millivolts: 3_300,
             user_id: [0; 10],
         }
+    }
+
+    /// Whether any part of what the model shows rests on values not measured on a device: the
+    /// optics, the durations or a waveform of the OTP. An interface showing the panel says
+    /// "approximation" when it is true; it is true of the defaults.
+    #[must_use]
+    pub fn is_approximation(&self) -> bool {
+        self.optics.provenance == Provenance::Approximation
+            || self.timing.provenance == Provenance::Approximation
+            || self
+                .otp
+                .iter()
+                .any(|w| w.provenance == Provenance::Approximation)
     }
 
     /// The parameters a model cannot be built on.
@@ -383,6 +414,7 @@ mod tests {
             lower: Temperature::from_celsius(lower),
             upper: Temperature::from_celsius(upper),
             setting,
+            provenance: Provenance::Measured,
         }
     }
 
@@ -411,6 +443,29 @@ mod tests {
         assert_eq!((config.panel.width, config.panel.height), (800, 480));
         assert_eq!(config.validate(), Ok(()));
         assert_eq!(PanelGeometry::default(), PanelGeometry::gdeq0426t82());
+    }
+
+    #[test]
+    fn the_defaults_are_an_approximation_until_every_part_is_measured() {
+        let mut config = Ssd1677Config::default();
+        assert!(config.is_approximation());
+        assert_eq!(config.optics.provenance, Provenance::Approximation);
+        assert_eq!(config.timing.provenance, Provenance::Approximation);
+        assert!(
+            config
+                .otp
+                .iter()
+                .all(|w| w.provenance == Provenance::Approximation)
+        );
+        config.optics.provenance = Provenance::Measured;
+        config.timing.provenance = Provenance::Measured;
+        assert!(config.is_approximation(), "the reference OTP still is");
+        for waveform in &mut config.otp {
+            waveform.provenance = Provenance::Measured;
+        }
+        assert!(!config.is_approximation());
+        config.timing.provenance = Provenance::Approximation;
+        assert!(config.is_approximation());
     }
 
     #[test]

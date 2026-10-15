@@ -14,6 +14,6 @@ pub mod ssd1677;
 pub use analog::{Battery, BatteryError, ButtonLadder, LadderButton, LadderError, Millivolts};
 pub use ssd1677::{
     ConfigError, Diagnostic, DiagnosticKind, DisplayMode, GateScan, Optics, OtpWaveform,
-    PanelGeometry, PanelImage, Plane, RefreshKind, Ssd1677, Ssd1677Config, Ssd1677Timing, Stage,
-    Temperature,
+    PanelGeometry, PanelImage, Plane, Provenance, RefreshKind, Ssd1677, Ssd1677Config,
+    Ssd1677Timing, Stage, Temperature,
 };

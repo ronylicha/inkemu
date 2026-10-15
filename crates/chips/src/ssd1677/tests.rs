@@ -215,6 +215,25 @@ fn an_unknown_command_is_reported_and_its_data_ignored() {
 #[test]
 fn reserved_and_unmodelled_commands_are_named_and_their_data_accepted() {
     let mut h = Host::new();
+    // A state to keep: RAM bytes, a counter mid-row, the temperature, VCOM, a display option, an ID.
+    h.send(0x24, &[0x12, 0x34]);
+    h.send(0x26, &[0x56]);
+    h.send(0x1A, &[0x19, 0x00]);
+    h.send(0x2C, &[0x30]);
+    h.send(0x37, &[0, 0, 0, 0, 0, 0, 7, 8, 9, 10]);
+    h.send(0x38, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    let snapshot = |h: &mut Host| {
+        (
+            h.chip.ram(Plane::BlackWhite).to_vec(),
+            h.chip.ram(Plane::Red).to_vec(),
+            h.read(0x1B, 2),
+            h.read(0x2D, 11),
+            h.read(0x2E, 10),
+            h.status(),
+            h.chip.panel_image().generation,
+        )
+    };
+    let before = snapshot(&mut h);
     h.send(0x3A, &[1]);
     h.send(0x3B, &[]);
     let unsupported = [
@@ -246,6 +265,18 @@ fn reserved_and_unmodelled_commands_are_named_and_their_data_accepted() {
     );
     assert_eq!(h.diagnostics(), expected);
     assert!(!h.chip.is_busy(h.now));
+    assert_eq!(h.chip.next_deadline(), None);
+    // RAM and registers unchanged; the counter still where the first writes left it.
+    assert_eq!(
+        snapshot(&mut h),
+        before,
+        "a reserved or unmodelled command changed the state"
+    );
+    h.send(0x24, &[0x9A]);
+    assert_eq!(
+        &h.chip.ram(Plane::BlackWhite)[..4],
+        [0x12, 0x34, 0x00, 0x9A]
+    );
 }
 
 #[test]
@@ -392,28 +423,39 @@ fn driver_output_control_chooses_the_scanned_gates_and_their_order() {
     h.update(0xF7);
     let rows: Vec<u8> = (0..4).map(|y| h.pixel(0, y)).collect();
     assert_eq!(rows, [255, 0, 255, 255]);
-    // TB = 1 is reserved; a MUX past 680 lines too.
+    // A MUX past 680 lines and TB = 1, both reserved: one report for the command.
     h.send(0x01, &[0xFF, 0x03, 0x01]);
+    let value = |value| D::ReservedValue {
+        command: 0x01,
+        value,
+    };
+    assert_eq!(h.diagnostics(), [value(0x00), value(0x00), value(0x03)]);
+}
+
+#[test]
+fn a_mux_past_the_ram_with_sm_leaves_the_gates_past_the_ram_undriven() {
+    // A panel of all 680 gates; MUX 2A8h (681 lines) with SM = 1 sends gate 679 to row 680.
+    let mut config = small();
+    config.panel.height = 680;
+    config.panel.width = 8;
+    let mut h = Host::with(config);
+    h.send(0x01, &[0xA8, 0x02, 0x02]);
+    h.send(0x47, &[0x77]);
+    h.wait();
+    h.update(0xF7);
+    let image = h.chip.panel_image();
+    let white_rows: Vec<usize> = (0..680).filter(|&y| image.pixels[y * 8] == 255).collect();
+    assert_eq!(
+        white_rows,
+        [679],
+        "only the gate past the RAM stays undriven"
+    );
     assert_eq!(
         h.diagnostics(),
-        [
-            D::ReservedValue {
-                command: 0x01,
-                value: 0x00
-            },
-            D::ReservedValue {
-                command: 0x01,
-                value: 0x00
-            },
-            D::ReservedValue {
-                command: 0x01,
-                value: 0x03
-            },
-            D::ReservedValue {
-                command: 0x01,
-                value: 0x01
-            },
-        ]
+        [D::ReservedValue {
+            command: 0x01,
+            value: 0x02
+        }]
     );
 }
 
@@ -430,15 +472,16 @@ fn voltage_registers_check_their_codes_and_booster_and_vcom_control_have_no_effe
     h.send(0x04, &[0x22, 0xCF, 0x33]);
     h.send(0x2C, &[0x31]);
     let value = |command, value| D::ReservedValue { command, value };
+    // One report per command, its first reserved value (`0x04` had three).
     assert_eq!(
         h.diagnostics(),
-        [
-            value(0x03, 0x06),
-            value(0x04, 0x22),
-            value(0x04, 0xCF),
-            value(0x04, 0x33),
-            value(0x2C, 0x31)
-        ]
+        [value(0x03, 0x06), value(0x04, 0x22), value(0x2C, 0x31)]
+    );
+    h.send(0x04, &[0x41, 0xA8, 0x33]);
+    assert_eq!(
+        h.diagnostics(),
+        [value(0x04, 0x33)],
+        "a later byte, reported"
     );
 }
 
@@ -895,8 +938,14 @@ fn a_display_of_no_frame_is_published_at_once() {
     load_lut(&mut h, &[0; 110]);
     assert_eq!(h.update(0x0C), 0);
     assert_eq!(h.chip.panel_image().generation, 1);
-    // The three 0 codes of 0x04 are not listed (those of 0x03 and 0x2C are): reported.
-    assert_eq!(h.diagnostics().len(), 3);
+    // The 0 codes of 0x04 are not listed (those of 0x03 and 0x2C are): one report for the command.
+    assert_eq!(
+        h.diagnostics(),
+        [D::ReservedValue {
+            command: 0x04,
+            value: 0x00
+        }]
+    );
 }
 
 #[test]
@@ -1050,4 +1099,176 @@ fn vcom_sensing_holds_busy_for_its_duration() {
             value: 0x01
         }]
     );
+}
+
+#[test]
+fn hv_ready_detection_without_the_supplies_reads_not_ready() {
+    let mut h = Host::new();
+    h.send(0x14, &[0x00]);
+    assert!(!h.chip.is_busy(h.now));
+    assert_eq!(h.status(), 0b0010_0001, "bit 5: not ready");
+    h.power_on();
+    h.send(0x14, &[0x00]);
+    assert_eq!(h.wait(), ms(10));
+    assert_eq!(h.status(), 0b0000_0001);
+    h.update(0x03);
+    h.send(0x14, &[0x00]);
+    assert_eq!(h.status(), 0b0010_0001);
+    let skipped = D::WithoutClock {
+        stage: Stage::HvReadyDetection,
+    };
+    assert_eq!(h.diagnostics(), [skipped.clone(), skipped]);
+    // A reset clears the flag.
+    h.send(0x12, &[]);
+    h.wait();
+    assert_eq!(h.status(), 0b0000_0001);
+}
+
+// --- Resets during an operation, BUSY polarity, RAM ping-pong ---------------------------
+
+#[test]
+fn a_hardware_reset_before_the_display_starts_abandons_it() {
+    let mut h = Host::new();
+    h.fill_rows(0x24, &[0x00; 4]);
+    h.send(0x22, &[0xF7]);
+    h.send(0x20, &[]);
+    // The display starts at 106 ms (analog on, temperature, LUT): a reset at 50 ms comes first.
+    h.skip(ms(50));
+    h.chip.set_reset(h.now, true);
+    let image = h.chip.panel_image();
+    assert_eq!((image.generation, image.kind), (0, RefreshKind::PowerOn));
+    assert!(image.pixels.iter().all(|&p| p == 255));
+    assert_eq!(h.chip.next_deadline(), None);
+    assert_eq!(h.diagnostics(), []);
+    // At the instant it starts, the display has begun though no frame has run: published as cut,
+    // the glass unchanged.
+    h.chip.set_reset(h.now, false);
+    h.wait();
+    h.send(0x18, &[0x80]);
+    h.send(0x22, &[0xF7]);
+    h.send(0x20, &[]);
+    h.skip(ms(106));
+    h.chip.set_reset(h.now, true);
+    let image = h.chip.panel_image();
+    assert_eq!((image.generation, image.interrupted), (1, true));
+    assert!(image.pixels.iter().all(|&p| p == 255));
+    assert_eq!(h.diagnostics(), [D::ResetDuringDisplay]);
+}
+
+#[test]
+fn a_hardware_reset_cuts_a_busy_operation_without_a_display() {
+    type Start = fn(&mut Host);
+    let starts: [(&str, Start); 3] = [
+        ("SW reset", |h| h.send(0x12, &[])),
+        ("auto write", |h| h.send(0x46, &[0xF7])),
+        ("analog on", |h| {
+            h.send(0x22, &[0xC0]);
+            h.send(0x20, &[]);
+        }),
+    ];
+    for (name, start) in starts {
+        let mut h = Host::new();
+        start(&mut h);
+        assert!(h.chip.is_busy(h.now), "{name}");
+        h.skip(ms(1) / 2);
+        h.chip.set_reset(h.now, true);
+        assert!(!h.chip.is_busy(h.now), "{name}");
+        assert_eq!(h.chip.next_deadline(), None, "{name}");
+        h.chip.set_reset(h.now, false);
+        assert_eq!(h.chip.next_deadline(), Some(h.now + ms(1)), "{name}");
+        assert_eq!(h.wait(), ms(1), "{name}");
+        // The supplies are off again: a display needs them started anew.
+        assert_eq!(h.update(0x04), 0, "{name}");
+        assert_eq!(
+            h.diagnostics(),
+            [D::WithoutClock {
+                stage: Stage::Display
+            }],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn an_inverted_busy_pin_reads_high_in_reset_and_low_in_deep_sleep() {
+    let mut config = small();
+    config.busy_active_high = false;
+    let mut h = Host::with(config);
+    h.chip.set_reset(h.now, true);
+    assert!(!h.chip.is_busy(h.now));
+    assert!(
+        h.chip.busy_pin(h.now),
+        "not busy while RES# is low: high on an inverted line"
+    );
+    h.chip.set_reset(h.now, false);
+    assert!(!h.chip.busy_pin(h.now), "busy for the reset time");
+    h.wait();
+    assert!(h.chip.busy_pin(h.now));
+    h.send(0x10, &[0x03]);
+    assert!(h.chip.is_busy(h.now));
+    assert!(
+        !h.chip.busy_pin(h.now),
+        "busy in deep sleep: low on an inverted line"
+    );
+    h.skip(ms(60_000));
+    assert!(!h.chip.busy_pin(h.now));
+}
+
+#[test]
+fn ram_ping_pong_in_display_mode_two_is_reported() {
+    let mut h = Host::new();
+    h.power_on();
+    // 0x37 byte F, bit 6: RAM ping-pong, for display mode 2 only.
+    h.send(0x37, &[0, 0, 0, 0, 0, 0x40, 0, 0, 0, 0]);
+    h.update(0xFC);
+    h.update(0xF7);
+    assert_eq!(h.diagnostics(), [D::RamPingPong]);
+    assert_eq!(h.chip.panel_image().generation, 2, "both displays ran");
+}
+
+/// A deterministic xorshift generator for the test below.
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+#[test]
+fn no_sequence_of_bytes_resets_and_reads_makes_the_chip_panic() {
+    // All 680 gates, so that a MUX and a scan order the firmware sets reach every row.
+    let mut config = small();
+    config.panel.width = 8;
+    config.panel.height = 680;
+    let mut h = Host::with(config);
+    let commands: Vec<u8> = (0..=u8::MAX).filter(|&c| kind(c).is_some()).collect();
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    for _ in 0..100_000 {
+        let draw = xorshift(&mut state);
+        let [operation, choice, byte, data, ..] = draw.to_le_bytes();
+        match operation % 16 {
+            0..=4 => {
+                let command = if choice % 4 == 0 {
+                    byte
+                } else {
+                    commands[usize::from(byte) % commands.len()]
+                };
+                h.chip.write_command(h.now, command);
+            }
+            5..=11 => h.chip.write_data(h.now, data),
+            12 => {
+                let _ = h.chip.read_data(h.now);
+            }
+            13 => h.chip.set_reset(h.now, choice % 2 == 0),
+            14 => {
+                if let Some(next) = h.chip.next_deadline() {
+                    h.now = h.now.max(next);
+                    h.chip.advance(h.now);
+                }
+            }
+            _ => h.skip(u64::from(choice) * 1_000),
+        }
+        let _ = h.chip.take_diagnostics();
+    }
+    assert!(h.chip.panel_image().generation > 0, "displays ran");
 }

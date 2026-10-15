@@ -16,21 +16,25 @@
 //! stops short of a full swing, so partial refreshes leave a trace that only a full one clears, as
 //! on the glass.
 
-use super::config::{DisplayMode, LUT_BYTES, OtpWaveform, Temperature};
+use super::config::{DisplayMode, LUT_BYTES, OtpWaveform, Provenance, Temperature};
 
 /// VS codes.
 const VSS: u8 = 0b00;
 const VSH1: u8 = 0b01;
 const VSL: u8 = 0b10;
 
-/// The voltages of every setting: VGH 20 V (17h), VSH1 15 V (41h), VSH2 5 V (A8h), VSL −15 V (32h),
-/// DCVCOM −1.2 V (30h), the voltage block of the X4's factory grey LUT (`FreeInk`
-/// `lut_factory_quality`). ASSUMPTION: the panel's OTP holds the same.
-const VOLTAGES: [u8; 5] = [0x17, 0x41, 0xA8, 0x32, 0x30];
+/// The voltages of every setting: the reset values of the datasheet (Table 7-1), VGH 20 V (00h),
+/// VSH1 15 V (41h), VSH2 5 V (A8h), VSL −15 V (32h), DCVCOM 0 V (00h). ASSUMPTION: the panel's
+/// OTP drives with the same source levels; VGH and DCVCOM move no pixel in the model.
+///
+/// Provenance: nothing in this module is copied from a third-party file. The settings are built
+/// here; the voltages are the datasheet's (the X4's factory grey LUT in `FreeInk`, MIT, uses the
+/// same three source codes because they are the reset values; see
+/// `third_party/freeink-sdk/PROVENANCE.md`).
+const VOLTAGES: [u8; 5] = [0x00, 0x41, 0xA8, 0x32, 0x00];
 
-/// The frame-rate bytes: code 2 for every group, as the X4's factory LUT (all codes take the same
-/// period by default).
-const FRAME_RATE: u8 = 0x22;
+/// The frame-rate bytes: code 0 for every group (all codes take the same period by default).
+const FRAME_RATE: u8 = 0x00;
 
 /// A setting whose group `g` runs phase A for `frames[g]` frames, then phase B for `rest[g]`
 /// frames at VSS, with `codes[lut][g]` as phase A's source code of LUT0 to LUT3.
@@ -64,18 +68,21 @@ pub fn gdeq0426t82_otp() -> Vec<OtpWaveform> {
             lower: Temperature::MIN,
             upper: fifty,
             setting: setting(&[20; 4], &[], [&black_4, &white_4, &black_4, &white_4]),
+            provenance: Provenance::Approximation,
         },
         OtpWaveform {
             mode: DisplayMode::One,
             lower: fifty,
             upper: Temperature::MAX,
             setting: setting(&[25; 3], &[], [&black_3, &white_3, &black_3, &white_3]),
+            provenance: Provenance::Approximation,
         },
         OtpWaveform {
             mode: DisplayMode::Two,
             lower: Temperature::MIN,
             upper: Temperature::MAX,
             setting: setting(&[19], &[6], [&[VSS], &[VSL], &[VSH1], &[VSS]]),
+            provenance: Provenance::Approximation,
         },
     ]
 }
