@@ -1,10 +1,28 @@
 #!/usr/bin/env bash
-# Builds inkemu and runs riscv-arch-test (RV32IMC + Zicsr + Zifencei) against Sail through RISCOF.
+# Builds inkemu and runs riscv-arch-test (RV32IMC + Zicsr + Zifencei, machine and user modes, a
+# 16-entry PMP) against Sail through RISCOF.
 # Groups and their expected test counts are pinned in tools/conformance/versions.env.
 # Set ARCH_TEST_KEEP=<dir> to keep RISCOF's work dir (ELFs, logs, signatures) for debugging.
+# Set ARCH_TEST_ONLY="<group> ..." to run only these groups, each with its pinned count, and their
+# sum as the total (a local check; the CI runs every group).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 source tools/conformance/versions.env
+if [[ -n "${ARCH_TEST_ONLY:-}" ]]; then
+  only_expected=""
+  only_total=0
+  for group in $ARCH_TEST_ONLY; do
+    entry=""
+    for pinned in $ARCH_TEST_EXPECTED; do
+      [[ "${pinned%%=*}" == "$group" ]] && entry="$pinned"
+    done
+    [[ -n "$entry" ]] || { echo "arch-test: unknown group $group (versions.env: $ARCH_TEST_EXPECTED)" >&2; exit 2; }
+    only_expected="$only_expected $entry"
+    only_total=$((only_total + ${entry#*=}))
+  done
+  ARCH_TEST_EXPECTED="${only_expected# }"
+  ARCH_TEST_TOTAL="$only_total"
+fi
 cargo build --release -p emu-cli
 docker build -q -t inkemu/riscof \
   --build-arg RISCV_ARCH_TEST_TAG="$RISCV_ARCH_TEST_TAG" \
@@ -20,19 +38,25 @@ docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1
   -v "$PWD:/work" "${keep_args[@]}" -w /tmp inkemu/riscof bash -euo pipefail -c '
   # The suite is the arch-test groups listed in ARCH_TEST_EXPECTED. I, M, C and Zifencei are the
   # unprivileged groups; privilege/ holds the M-mode trap tests (ecall, ebreak, misaligned
-  # accesses). The A/B/F/D/K/V/... groups are not part of this ISA and RISCOF drops them from the
-  # ISA YAML. pmp32/ needs enforced PMP. The generic hart this bench runs has no PMP CSRs and the
-  # ISA YAML does not advertise them (the ESP32-C3 hart stores them, unenforced, since SP1b-2), yet
-  # RISCOF selects pmp32/ anyway, so it is left out of the suite directory itself.
+  # accesses); pmp32/ the PMP tests, in machine and user modes. The A/B/F/D/K/V/... groups are not
+  # part of this ISA and RISCOF drops them from the ISA YAML.
   groups=""
   for entry in $ARCH_TEST_EXPECTED; do groups="$groups ${entry%%=*}"; done
-  echo "arch-test groups:$groups (pmp32 excluded: PMP is stored on the ESP32-C3 hart and not enforced; SP1b-4 enforces it and re-enables pmp32 by adding it back to ARCH_TEST_EXPECTED)"
+  echo "arch-test groups:$groups"
   # RISCOF deletes and recreates its work dir, so a kept copy is made on exit instead of a mount.
   trap "[[ -d /keep ]] && cp -r /tmp/riscof_work/. /tmp/riscof.log /keep/ || true" EXIT
   src=/opt/riscv-arch-test/riscv-test-suite
   suite=/tmp/suite
   mkdir -p "$suite/rv32i_m"
   cp -r "$src/env" "$suite/env"
+  # The hart has no S-mode: the environment of the tests that declare an S-mode trap routine
+  # (pmp32/) gets its S scaffolding compiled out, the same for inkemu and for Sail
+  # (tools/conformance/riscof/arch-test-env-no-smode.patch, ADR 0010). The original must be the one
+  # the patch was written against.
+  echo "cfb0d028baed0fd63e9bf6b8adbbd2a67d2e72b49e58a104659c5b87708f37bc  $suite/env/arch_test.h" \
+    | sha256sum --quiet -c - \
+    || { echo "arch-test: env/arch_test.h is not the one the no-S-mode patch was written against" >&2; exit 1; }
+  patch --quiet --forward -p1 -d "$suite/env" < /work/tools/conformance/riscof/arch-test-env-no-smode.patch
   for group in $groups; do cp -r "$src/rv32i_m/$group" "$suite/rv32i_m/$group"; done
   # riscof exits 0 on several fatal errors and writes its verdicts to stderr: judge the log, not the status.
   riscof run --config=/work/tools/conformance/riscof/config.ini \

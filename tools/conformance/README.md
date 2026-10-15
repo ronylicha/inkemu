@@ -14,6 +14,7 @@ re-count the groups deliberately.
 ```bash
 tools/conformance/run-arch-test.sh                       # builds inkemu, builds the image, runs everything
 ARCH_TEST_KEEP=/tmp/archtest tools/conformance/run-arch-test.sh   # also keep ELFs, logs and signatures
+ARCH_TEST_ONLY=pmp32 tools/conformance/run-arch-test.sh            # only these groups, with their pinned counts
 ```
 
 Requires Docker and the Rust toolchain. RISCOF compiles each test, runs it on `inkemu rvtest` and on
@@ -21,20 +22,29 @@ Sail (formal reference model), and compares the signatures. The script exits 0 o
 ran and passed exactly the pinned number of tests (a missing group or a shrunk group fails with the
 group name and expected vs actual).
 
-- Groups run: `I M C Zifencei privilege` (92 tests with riscv-arch-test 3.10.0).
-- **Excluded: `pmp32`.** RISCOF selects it for any DUT with Zicsr (the tests carry no PMP feature
-  check) but the generic hart this bench runs has no PMP CSRs and the ISA YAML does not advertise
-  them. The ESP32-C3 hart stores the PMP registers (`pmpcfg0..3`, `pmpaddr0..15`) since SP1b-2 and
-  does not enforce them; enforcement arrives in SP1b-4. To re-enable `pmp32` then: add
-  `pmp32=<count>` to `ARCH_TEST_EXPECTED` and update `ARCH_TEST_TOTAL` in `versions.env`; the script
-  copies exactly the groups listed there.
+- Groups run: `I M C Zifencei privilege pmp32` (133 tests with riscv-arch-test 3.10.0, 41 of them
+  in `pmp32`). The script copies exactly the groups listed in `ARCH_TEST_EXPECTED`.
+- **The hart under test** is inkemu's conformance bench (`cpu_rv32::Core::MachineUser`, the hart
+  `inkemu rvtest` runs): RV32IMC + Zicsr + Zifencei with machine and user modes, as the ESP32-C3
+  (TRM register 1.6), and a 16-entry PMP with a grain of 4 bytes. Where the privileged
+  specification leaves a choice, the bench makes Sail's, and the ESP32-C3 core of inkemu keeps its
+  own (the TRM's PMP has no static priority): `docs/research/esp32c3-pmp-and-user-mode.md`, ADR 0010.
+- **`pmp32` runs with a patched environment.** 40 of its 41 tests declare an S-mode trap routine,
+  and the arch-test environment then runs S-mode code that a hart without S-mode cannot run (it
+  loops for ever, on Sail as on inkemu). `run-arch-test.sh` applies
+  `riscof/arch-test-env-no-smode.patch` to the copy of `env/arch_test.h` both models compile with,
+  after checking the original's SHA-256: the S prolog and epilog and the `medeleg` accesses are
+  compiled out, nothing of the tests is touched, and their "S-mode" parts run in user mode on both
+  models. The patch says what each hunk does.
 - **No Zicsr group.** riscv-arch-test 3.10.0 has no `Zicsr` directory: CSR instructions are covered
   only through the `privilege` tests (ecall, ebreak, misaligned accesses), whose trap handlers use
   csrr/csrw/csrrw and whose signatures record mepc/mcause/mtval.
 - **The reference is configured as the same machine as the DUT** (`riscof/sail/inkemu_rv32imc.json`
   applied over Sail's `--rv32` defaults, driven through the adapter `riscof/sail/riscv_sim_RV32`).
-  Sail's defaults enable A/F/D/V/B/S/U/H and non-trapping misaligned accesses, which changes the
-  trap-handler signatures.
+  Sail's defaults enable A/F/D/V/B/S/H and non-trapping misaligned accesses, which changes the
+  trap-handler signatures; the override keeps U, makes a `pmpcfg` write of R = 0 with W = 1 leave
+  the entry as it was (`PMP_Ignore`, as inkemu and QEMU), and lets `wfi` wait in user mode unless
+  `mstatus.TW` is set. Sail's default PMP (16 entries, grain 0) is the bench's.
 
 ### Misaligned-access policy: three places that must change together
 

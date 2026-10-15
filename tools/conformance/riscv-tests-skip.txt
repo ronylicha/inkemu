@@ -1,4 +1,3 @@
 # One test per line: <file name> # <reason>. A skip is only allowed for a feature the current stage does not implement yet.
 rv32ui-p-ma_data # misaligned data accesses trap by default (MisalignedPolicy::Trap); the C3 behaviour is arbitrated by the QEMU lockstep in SP1b (spec §4.4)
-rv32mi-p-breakpoint # Sdtrig trigger CSRs (tselect/tdata1/tdata2/tcontrol) not implemented in SP1a (core only); SP1b implements the ESP32-C3 PMP/trigger CSRs (spec §10.2 item 5)
-rv32mi-p-pmpaddr # the generic hart this test runs on has no PMP CSRs; the ESP32-C3 hart stores pmpcfg0-3/pmpaddr0-15 since SP1b-2 and enforces them only from SP1b-4, when the arch-test group pmp32 is re-enabled (spec §10.2 item 5)
+rv32mi-p-breakpoint # Sdtrig trigger CSRs (tselect/tdata1/tdata2/tcontrol) not implemented; the ESP32-C3 trigger CSRs go with the debugger to sub-project 4 (note 2026-10-14-sp1b-4-decoupage.md)
