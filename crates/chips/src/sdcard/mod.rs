@@ -13,6 +13,7 @@
 //! or none: an empty slot never drives MISO.
 mod crc;
 mod diagnostic;
+pub mod lines;
 mod registers;
 mod storage;
 #[cfg(test)]
