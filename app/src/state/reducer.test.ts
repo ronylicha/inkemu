@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Look, Status } from "../ipc/types";
-import { initialState, MAX_JOURNAL, reducer } from "./reducer";
+import type { Look, Started, Status, Update } from "../ipc/types";
+import { type AppState, initialState, MAX_JOURNAL, reducer } from "./reducer";
 
 const look: Look = {
   panel: { width: 800, height: 480, grayLevels: 4, rotation: 90, origin: "testPattern" },
@@ -20,82 +20,139 @@ const status: Status = {
   usbConsoleSilenced: false,
 };
 
-function started() {
-  const starting = reducer(initialState(), { type: "starting" });
-  return reducer(starting, {
-    type: "started",
-    started: {
-      notices: [{ level: "info", text: "inkemu: Xteink X4" }],
-      look,
-      console: "uart0",
-      deviceName: "Xteink X4",
-    },
-  });
+const answer: Started = {
+  notices: [{ level: "info", text: "inkemu: Xteink X4" }],
+  look,
+  console: "uart0",
+  deviceName: "Xteink X4",
+};
+
+function started(from: AppState = initialState(), start = 1) {
+  const starting = reducer(from, { type: "starting", start });
+  return reducer(starting, { type: "started", start, started: answer });
 }
+
+const send = (state: AppState, start: number, ...updates: Update[]) =>
+  reducer(state, { type: "updates", start, updates });
+
+const text = (channel: "uart0" | "usb-serial-jtag", value: string): Update => ({
+  event: "console",
+  data: { channel, text: value },
+});
 
 describe("reducer", () => {
   it("starts a run with what the host gave back", () => {
     const state = started();
     expect(state.phase).toBe("on");
+    expect(state.current).toBe(1);
+    expect(state.starting).toBeNull();
     expect(state.console).toBe("uart0");
     expect(state.journal).toEqual([{ id: 0, level: "info", text: "inkemu: Xteink X4" }]);
   });
 
   it("keeps the console text of each channel apart", () => {
-    let state = started();
-    state = reducer(state, {
-      type: "update",
-      update: { event: "console", data: { channel: "uart0", text: "a\r\n" } },
-    });
-    state = reducer(state, {
-      type: "update",
-      update: { event: "console", data: { channel: "usb-serial-jtag", text: "b" } },
-    });
+    let state = send(started(), 1, text("uart0", "a\r\n"), text("usb-serial-jtag", "b"));
     expect(state.consoles).toEqual({ uart0: "a\n", uart1: "", "usb-serial-jtag": "b" });
     state = reducer(state, { type: "clearConsole", channel: "uart0" });
     expect(state.consoles.uart0).toBe("");
   });
 
+  it("removes a colour escape cut between two pieces of a console's text", () => {
+    const esc = String.fromCharCode(27);
+    let state = send(started(), 1, text("uart0", `ok${esc}[0;3`), text("usb-serial-jtag", "x"));
+    expect(state.consoles.uart0).toBe("ok");
+    state = send(state, 1, text("uart0", `2mgreen${esc}[0m\n`));
+    expect(state.consoles.uart0).toBe("okgreen\n");
+    expect(state.consoles["usb-serial-jtag"]).toBe("x");
+  });
+
   it("keeps the last status, refresh and end the host sent", () => {
-    let state = started();
-    state = reducer(state, { type: "update", update: { event: "status", data: status } });
-    state = reducer(state, {
-      type: "update",
-      update: { event: "frame", data: { generation: 3, refresh: "full", life: 1 } },
-    });
-    state = reducer(state, {
-      type: "update",
-      update: {
-        event: "lifeEnded",
-        data: { life: 1, end: "interrupted", verdict: null },
-      },
-    });
+    let state = send(
+      started(),
+      1,
+      { event: "status", data: status },
+      { event: "frame", data: { generation: 3, refresh: "full", life: 1 } },
+      { event: "lifeEnded", data: { life: 1, end: "interrupted", verdict: null } },
+    );
     expect(state.status).toEqual(status);
     expect(state.frame).toEqual({ generation: 3, life: 1 });
     expect(state.lastEnd).toEqual({ life: 1, end: "interrupted", verdict: null });
-    state = reducer(state, { type: "update", update: { event: "stopped" } });
+    state = send(state, 1, { event: "stopped" });
     expect(state.phase).toBe("off");
+  });
+
+  it("keeps only the notices of an emulator a newer one replaced", () => {
+    let state = send(started(), 1, text("uart0", "old"));
+    state = started(state, 2);
+    state = send(
+      state,
+      1,
+      text("uart0", "late"),
+      { event: "status", data: { ...status, life: 9 } },
+      { event: "notice", data: { level: "error", text: "error: the flash was not saved" } },
+      { event: "stopped" },
+    );
+    expect(state.current).toBe(2);
+    expect(state.phase).toBe("on");
+    expect(state.consoles.uart0).toBe("");
+    expect(state.status).toBeNull();
+    expect(state.journal.at(-1)?.text).toBe("error: the flash was not saved");
+  });
+
+  it("shows a new emulator from its first update, even before its start is answered", () => {
+    let state = send(started(), 1, text("uart0", "old"));
+    state = reducer(state, { type: "starting", start: 2 });
+    state = send(state, 1, text("uart0", " more"));
+    expect(state.consoles.uart0).toBe("old more");
+    state = send(state, 2, text("uart0", "new"));
+    expect(state.current).toBe(2);
+    expect(state.consoles.uart0).toBe("new");
+    state = reducer(state, { type: "started", start: 2, started: answer });
+    expect(state.consoles.uart0).toBe("new");
+    expect(state.starting).toBeNull();
+  });
+
+  it("leaves the device that runs as it is when a start is refused, and shows why", () => {
+    let state = send(started(), 1, text("uart0", "running"));
+    state = reducer(state, { type: "starting", start: 2 });
+    state = reducer(state, { type: "failed", start: 2, error: { kind: "rom", message: "m" } });
+    expect(state.phase).toBe("on");
+    expect(state.current).toBe(1);
+    expect(state.starting).toBeNull();
+    expect(state.error).toEqual({ kind: "rom", message: "m" });
+    state = send(state, 1, text("uart0", " still"));
+    expect(state.consoles.uart0).toBe("running still");
+    expect(reducer(state, { type: "dismissError" }).error).toBeNull();
+  });
+
+  it("stays off when a first start is refused", () => {
+    const starting = reducer(initialState(), { type: "starting", start: 1 });
+    const failed = reducer(starting, {
+      type: "failed",
+      start: 1,
+      error: { kind: "rom", message: "m" },
+    });
+    expect(failed.phase).toBe("off");
+    expect(failed.starting).toBeNull();
   });
 
   it("bounds the journal, the oldest entries going first, with stable keys", () => {
     let state = started();
     for (let i = 0; i < MAX_JOURNAL + 5; i += 1) {
-      state = reducer(state, {
-        type: "update",
-        update: { event: "notice", data: { level: "warning", text: `w${i}` } },
-      });
+      state = send(state, 1, { event: "notice", data: { level: "warning", text: `w${i}` } });
     }
     expect(state.journal).toHaveLength(MAX_JOURNAL);
     expect(state.journal[0]?.id).toBe(6);
     expect(state.journal.at(-1)?.text).toBe(`w${MAX_JOURNAL + 4}`);
   });
 
-  it("goes back to off when a start is refused, and shows why", () => {
-    const starting = reducer(initialState(), { type: "starting" });
-    const failed = reducer(starting, { type: "failed", error: { kind: "rom", message: "m" } });
-    expect(failed.phase).toBe("off");
-    expect(failed.error).toEqual({ kind: "rom", message: "m" });
-    expect(reducer(failed, { type: "dismissError" }).error).toBeNull();
+  it("adds the interface's own lines to the journal", () => {
+    const state = reducer(started(), {
+      type: "said",
+      notice: { level: "info", text: "Capture saved: a.png" },
+    });
+    expect(state.journal.at(-1)).toEqual({ id: 1, level: "info", text: "Capture saved: a.png" });
+    expect(state.told).toBe("Capture saved: a.png");
   });
 
   it("selects the first device when the kept one is not listed", () => {

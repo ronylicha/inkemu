@@ -13,12 +13,41 @@ function device(onButton = vi.fn()) {
       signal={null}
       status={status()}
       onButton={onButton}
+      onFrameError={vi.fn()}
     />,
   );
   return onButton;
 }
 
 describe("DeviceView", () => {
+  it("releases a key held on the device when the window loses the focus", () => {
+    const onButton = device();
+    const area = screen.getByRole("application", { name: "Device Xteink X4" });
+    fireEvent.keyDown(area, { key: "ArrowUp" });
+    fireEvent.blur(window);
+    expect(onButton.mock.calls).toEqual([
+      ["up", true],
+      ["up", false],
+    ]);
+    // The key comes up elsewhere: nothing more is sent.
+    fireEvent.keyUp(area, { key: "ArrowUp" });
+    expect(onButton).toHaveBeenCalledTimes(2);
+  });
+
+  it("releases a key held on the device when the focus leaves it, not when it goes to a button", () => {
+    const onButton = device();
+    const area = screen.getByRole("application", { name: "Device Xteink X4" });
+    const power = screen.getByRole("button", { name: "Power" });
+    fireEvent.keyDown(area, { key: "Enter" });
+    fireEvent.blur(area, { relatedTarget: power });
+    expect(onButton.mock.calls).toEqual([["confirm", true]]);
+    fireEvent.blur(area, { relatedTarget: document.body });
+    expect(onButton.mock.calls).toEqual([
+      ["confirm", true],
+      ["confirm", false],
+    ]);
+  });
+
   it("presses a button on pointer down and releases it on pointer up", () => {
     const onButton = device();
     const power = screen.getByRole("button", { name: "Power" });

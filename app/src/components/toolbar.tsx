@@ -6,6 +6,8 @@ import { labelOf } from "./labels";
 
 interface Props {
   phase: AppState["phase"];
+  /** A start waits for its answer. */
+  starting: boolean;
   status: Status | null;
   speed: Speed;
   hasImage: boolean;
@@ -28,7 +30,7 @@ const LANGUAGE_NAMES: Record<Language, string> = { fr: "Français", en: "English
  * selects, which take the arrow keys a toolbar would use to move between its controls; Tab moves.
  */
 export function Toolbar(props: Props) {
-  const { phase, status, speed, hasImage, theme } = props;
+  const { phase, starting, status, speed, hasImage, theme } = props;
   const { t, language, setLanguage } = useI18n();
   const on = phase === "on";
   const run = status?.run ?? null;
@@ -36,8 +38,8 @@ export function Toolbar(props: Props) {
   const replaying = status?.replay != null;
   return (
     <section aria-label={t("toolbar.label")} className="toolbar">
-      <button type="button" onClick={props.onPowerOn} disabled={phase === "starting"}>
-        {phase === "starting" ? t("start.starting") : t("toolbar.powerOn")}
+      <button type="button" onClick={props.onPowerOn} disabled={starting}>
+        {starting ? t("start.starting") : t("toolbar.powerOn")}
       </button>
       {run === "running" ? (
         <button type="button" onClick={() => props.onCommand({ kind: "pause" })} disabled={!on}>
@@ -72,7 +74,7 @@ export function Toolbar(props: Props) {
       >
         {t("toolbar.record")}
       </button>
-      <button type="button" onClick={props.onReplay} disabled={phase === "starting"}>
+      <button type="button" onClick={props.onReplay} disabled={starting}>
         {t("toolbar.replay")}
       </button>
       <button type="button" onClick={props.onCapture} disabled={!hasImage}>

@@ -39,8 +39,11 @@ describe("App", () => {
       });
       host.send({ event: "status", data: status() });
     });
-    expect(screen.getByRole("log", { name: "USB-Serial-JTAG" })).toHaveTextContent(
-      "ESP-ROM:esp32c3",
+    // The updates are drawn at the next frame of the screen.
+    await waitFor(() =>
+      expect(screen.getByRole("log", { name: "USB-Serial-JTAG" })).toHaveTextContent(
+        "ESP-ROM:esp32c3",
+      ),
     );
     expect(screen.getByRole("log", { name: "Journal" })).toHaveTextContent("inkemu: Xteink X4");
     expect(screen.getByText("0x40000400")).toBeInTheDocument();
@@ -78,5 +81,66 @@ describe("App", () => {
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(open).toHaveFocus();
+  });
+
+  /** Powers the fake device on from the dialog, its first file chosen. */
+  async function powerOn(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole("button", { name: "Power on…" }));
+    await user.click(screen.getAllByRole("button", { name: "Choose…" })[0] as HTMLElement);
+    await user.click(screen.getByRole("button", { name: "Power on" }));
+  }
+
+  it("keeps the device that runs when a second start is refused", async () => {
+    const host = fakeHost();
+    const user = userEvent.setup();
+    renderWith(<App />, { host });
+    await powerOn(user);
+    await screen.findByText(/inkemu: Xteink X4/);
+    act(() => {
+      host.send({ event: "console", data: { channel: "usb-serial-jtag", text: "first" } });
+      host.send({ event: "status", data: status() });
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("log", { name: "USB-Serial-JTAG" })).toHaveTextContent("first"),
+    );
+    vi.mocked(host.powerOn).mockRejectedValueOnce({ kind: "firmware", message: "not an app" });
+    await powerOn(user);
+    expect(await screen.findByRole("alert")).toHaveTextContent("not an app");
+    act(() => {
+      host.send({ event: "console", data: { channel: "usb-serial-jtag", text: " still" } });
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("log", { name: "USB-Serial-JTAG" })).toHaveTextContent("first still"),
+    );
+    expect(screen.getByRole("button", { name: "Pause" })).toBeEnabled();
+  });
+
+  it("says in the journal where a capture went, and why one was refused", async () => {
+    const host = fakeHost();
+    const user = userEvent.setup();
+    renderWith(<App />, { host });
+    await powerOn(user);
+    await screen.findByText(/inkemu: Xteink X4/);
+    act(() => {
+      host.send({ event: "frame", data: { generation: 1, refresh: "full", life: 1 } });
+      host.send({ event: "status", data: status() });
+    });
+    const capture = await screen.findByRole("button", { name: "Capture the screen" });
+    await waitFor(() => expect(capture).toBeEnabled());
+    await user.click(capture);
+    expect(host.saveCapture).toHaveBeenCalledWith("/home/user/out.png");
+    await waitFor(() =>
+      expect(screen.getByRole("log", { name: "Journal" })).toHaveTextContent(
+        "Capture saved: out.png",
+      ),
+    );
+    vi.mocked(host.saveCapture).mockRejectedValueOnce({
+      kind: "capture",
+      message: "the capture cannot be written to /home/user/out.png: it is the flash file",
+    });
+    await user.click(capture);
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("The capture could not be written.");
+    expect(alert).toHaveTextContent("it is the flash file");
   });
 });

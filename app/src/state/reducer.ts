@@ -1,5 +1,10 @@
 // The state of the interface: what the host sent, kept as it sent it. Nothing here decides what
 // the device does (plan ruling 2c-R10).
+//
+// Every start is numbered by the window (`start`), and every update carries the number of the
+// emulator that sent it: the state shows one emulator, and an emulator that a newer one replaced
+// may still be sending its last updates. Of those, only the notices are kept, in the journal (what
+// its last life could not keep, for instance); the rest would show another device (2c-R18).
 
 import type {
   ConsoleChannel,
@@ -13,7 +18,7 @@ import type {
   Update,
   VerdictView,
 } from "../ipc/types";
-import { appendConsole } from "./console";
+import { appendConsole, holdOpenEscape } from "./console";
 
 export const MAX_JOURNAL = 1000;
 
@@ -29,8 +34,12 @@ export interface LifeEnd {
 }
 
 export interface AppState {
-  /** No emulator, one starting, one running or ended but not powered off. */
-  phase: "off" | "starting" | "on";
+  /** Whether the emulator shown runs or ended without being powered off. */
+  phase: "off" | "on";
+  /** The number of the emulator shown; 0 before the first. */
+  current: number;
+  /** The number of a start not answered yet, which the shown emulator outlives if it is refused. */
+  starting: number | null;
   devices: DeviceView[];
   device: string;
   look: Look | null;
@@ -38,6 +47,8 @@ export interface AppState {
   /** The console shown first. */
   console: ConsoleChannel;
   consoles: Record<ConsoleChannel, string>;
+  /** Per console, the start of an escape its last piece of text ended in. */
+  held: Record<ConsoleChannel, string>;
   journal: JournalEntry[];
   nextEntry: number;
   status: Status | null;
@@ -45,15 +56,20 @@ export interface AppState {
   /** The generation of the last refresh the host announced, and of which life. */
   frame: { generation: number; life: number } | null;
   error: HostError | null;
+  /** The last line of the interface's own, which a screen reader announces. */
+  told: string;
 }
 
 export type Action =
   | { type: "devices"; devices: DeviceView[] }
   | { type: "selectDevice"; device: string }
-  | { type: "starting" }
-  | { type: "started"; started: Started }
-  | { type: "failed"; error: HostError }
-  | { type: "update"; update: Update }
+  | { type: "starting"; start: number }
+  | { type: "started"; start: number; started: Started }
+  /** A refusal; `start` names the start it answers, if it answers one. */
+  | { type: "failed"; error: HostError; start?: number }
+  | { type: "updates"; start: number; updates: Update[] }
+  /** A line of the interface's own, translated: what a capture or a recording became. */
+  | { type: "said"; notice: Notice }
   | { type: "clearConsole"; channel: ConsoleChannel }
   | { type: "dismissError" };
 
@@ -66,18 +82,22 @@ const EMPTY_CONSOLES: Record<ConsoleChannel, string> = {
 export function initialState(): AppState {
   return {
     phase: "off",
+    current: 0,
+    starting: null,
     devices: [],
     device: "x4",
     look: null,
     deviceName: "",
     console: "usb-serial-jtag",
     consoles: EMPTY_CONSOLES,
+    held: EMPTY_CONSOLES,
     journal: [],
     nextEntry: 0,
     status: null,
     lastEnd: null,
     frame: null,
     error: null,
+    told: "",
   };
 }
 
@@ -91,13 +111,29 @@ function withNotices(state: AppState, notices: readonly Notice[]): AppState {
   };
 }
 
+/** The state showing emulator `start` from its beginning: what the one before showed goes. */
+function adopt(state: AppState, start: number): AppState {
+  return {
+    ...state,
+    phase: "on",
+    current: start,
+    consoles: EMPTY_CONSOLES,
+    held: EMPTY_CONSOLES,
+    status: null,
+    lastEnd: null,
+    frame: null,
+  };
+}
+
 function applyUpdate(state: AppState, update: Update): AppState {
   switch (update.event) {
     case "console": {
       const { channel, text } = update.data;
+      const [ready, held] = holdOpenEscape(state.held[channel] + text);
       return {
         ...state,
-        consoles: { ...state.consoles, [channel]: appendConsole(state.consoles[channel], text) },
+        consoles: { ...state.consoles, [channel]: appendConsole(state.consoles[channel], ready) },
+        held: { ...state.held, [channel]: held },
       };
     }
     case "notice":
@@ -113,6 +149,23 @@ function applyUpdate(state: AppState, update: Update): AppState {
   }
 }
 
+function applyUpdates(state: AppState, start: number, updates: readonly Update[]): AppState {
+  let next = state;
+  if (start === state.starting && start !== state.current) {
+    // The new emulator speaks before its start is answered: it is the one shown from now on.
+    next = adopt(state, start);
+  } else if (start !== state.current) {
+    return withNotices(
+      state,
+      updates.flatMap((update) => (update.event === "notice" ? [update.data] : [])),
+    );
+  }
+  for (const update of updates) {
+    next = applyUpdate(next, update);
+  }
+  return next;
+}
+
 export function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "devices": {
@@ -123,36 +176,38 @@ export function reducer(state: AppState, action: Action): AppState {
     case "selectDevice":
       return { ...state, device: action.device };
     case "starting":
-      return {
-        ...state,
-        phase: "starting",
-        consoles: EMPTY_CONSOLES,
-        status: null,
-        lastEnd: null,
-        frame: null,
-        error: null,
-      };
-    case "started":
+      return { ...state, starting: action.start, error: null };
+    case "started": {
+      // Adopted already when it spoke first; its phase is then what its updates made it.
+      const shown = state.current === action.start ? state : adopt(state, action.start);
       return withNotices(
         {
-          ...state,
-          phase: "on",
+          ...shown,
+          starting: state.starting === action.start ? null : state.starting,
           look: action.started.look,
           deviceName: action.started.deviceName,
           console: action.started.console,
         },
         action.started.notices,
       );
+    }
     case "failed":
       return {
         ...state,
-        phase: state.phase === "starting" ? "off" : state.phase,
+        starting:
+          action.start !== undefined && action.start === state.starting ? null : state.starting,
         error: action.error,
       };
-    case "update":
-      return applyUpdate(state, action.update);
+    case "updates":
+      return applyUpdates(state, action.start, action.updates);
+    case "said":
+      return withNotices({ ...state, told: action.notice.text }, [action.notice]);
     case "clearConsole":
-      return { ...state, consoles: { ...state.consoles, [action.channel]: "" } };
+      return {
+        ...state,
+        consoles: { ...state.consoles, [action.channel]: "" },
+        held: { ...state.held, [action.channel]: "" },
+      };
     case "dismissError":
       return { ...state, error: null };
   }

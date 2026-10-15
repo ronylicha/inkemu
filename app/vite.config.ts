@@ -21,5 +21,9 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
+    // The tests of the whole window click through dialogs and wait for frames: a few seconds each
+    // when every file runs at once, more on a shared runner. A test that waits for ever still
+    // fails, after 20 s.
+    testTimeout: 20_000,
   },
 });

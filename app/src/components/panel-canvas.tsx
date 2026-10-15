@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n/i18n";
-import { useHost } from "../ipc/host";
-import type { PanelDescription } from "../ipc/types";
+import { FrameError } from "../ipc/frame";
+import { asHostError, useHost } from "../ipc/host";
+import type { HostError, PanelDescription } from "../ipc/types";
 import { type FlashStep, flashSteps } from "../panel/refresh";
 import { fitScale, toPicture, turnedSize } from "../panel/render";
 
@@ -9,6 +10,8 @@ interface Props {
   panel: PanelDescription;
   /** The last refresh the host announced; a change fetches its image. */
   signal: { generation: number; life: number } | null;
+  /** An image that could not be fetched or read: the panel keeps the last one. */
+  onError(error: HostError): void;
 }
 
 function prefersReducedMotion(): boolean {
@@ -22,9 +25,12 @@ function prefersReducedMotion(): boolean {
  * The screen of the device: the panel's pixels, turned as it is mounted, scaled by a whole
  * number so that nothing blurs, and the flash of a full refresh before its image.
  */
-export function PanelCanvas({ panel, signal }: Props) {
+export function PanelCanvas({ panel, signal, onError }: Props) {
   const host = useHost();
   const { t } = useI18n();
+  // The latest handler, read when a fetch fails: a new handler does not fetch the image again.
+  const report = useRef(onError);
+  report.current = onError;
   const room = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const size = turnedSize(panel.width, panel.height, panel.rotation);
@@ -76,8 +82,15 @@ export function PanelCanvas({ panel, signal }: Props) {
         }
         timers.push(window.setTimeout(draw, at));
       })
-      .catch(() => {
-        // The next refresh asks again; a frame that could not be read leaves the last image.
+      .catch((reason: unknown) => {
+        // The panel keeps the last image, and the next refresh asks again; the user is told.
+        if (!cancelled) {
+          report.current(
+            reason instanceof FrameError
+              ? { kind: "frame", message: reason.message }
+              : asHostError(reason),
+          );
+        }
       });
     return () => {
       cancelled = true;

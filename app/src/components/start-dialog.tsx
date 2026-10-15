@@ -1,6 +1,6 @@
 import { type FormEvent, useState } from "react";
 import { useI18n } from "../i18n/i18n";
-import { type FileKind, type SaveKind, useHost } from "../ipc/host";
+import { asHostError, type FileKind, type SaveKind, useHost } from "../ipc/host";
 import { type DeviceView, type Setup, USB_HOSTS, type UsbHost } from "../ipc/types";
 import { labelOf } from "./labels";
 import { Modal } from "./modal";
@@ -64,9 +64,21 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
   const [maxCycles, setMaxCycles] = useState("");
   const [strictMmio, setStrictMmio] = useState(false);
   const [romDir, setRomDir] = useState<string | null>(null);
+  const [pickError, setPickError] = useState<string | null>(null);
   const chosen = devices.find((one) => one.id === device);
-  const pickFile = (kind: FileKind) => () => host.pickFile(kind);
-  const pickSave = (kind: SaveKind) => () => host.pickSavePath(kind);
+  /** A path from the system's dialog; a dialog that fails is said in the form, and picks nothing. */
+  const picked = async (pick: Promise<string | null>) => {
+    try {
+      const path = await pick;
+      setPickError(null);
+      return path;
+    } catch (reason) {
+      setPickError(t("start.pickFailed", { detail: asHostError(reason).message }));
+      return null;
+    }
+  };
+  const pickFile = (kind: FileKind) => () => picked(host.pickFile(kind));
+  const pickSave = (kind: SaveKind) => () => picked(host.pickSavePath(kind));
 
   const ready =
     source === "erased" ||
@@ -95,6 +107,11 @@ export function StartDialog({ devices, device, onDevice, onStart, onClose }: Pro
   return (
     <Modal title={t("start.title")} onClose={onClose}>
       <form onSubmit={submit} className="start-form">
+        {pickError === null ? null : (
+          <p className="error" role="alert">
+            {pickError}
+          </p>
+        )}
         <label>
           {t("start.device")}{" "}
           <select value={device} onChange={(event) => onDevice(event.target.value)}>

@@ -7,11 +7,12 @@ import { status } from "../test/fake-host";
 import { renderWith } from "../test/render";
 import { Toolbar } from "./toolbar";
 
-function toolbar(phase: AppState["phase"], current: Status | null) {
+function toolbar(phase: AppState["phase"], current: Status | null, starting = false) {
   const onCommand = vi.fn();
   renderWith(
     <Toolbar
       phase={phase}
+      starting={starting}
       status={current}
       speed="realTime"
       hasImage={false}
@@ -30,6 +31,12 @@ function toolbar(phase: AppState["phase"], current: Status | null) {
 }
 
 describe("Toolbar", () => {
+  it("waits for a start without taking the controls of the device that runs", () => {
+    toolbar("on", status({ run: "running" }), true);
+    expect(screen.getByRole("button", { name: "Starting…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Pause" })).toBeEnabled();
+  });
+
   it("offers to power on only, when no device runs", () => {
     toolbar("off", null);
     expect(screen.getByRole("button", { name: "Power on…" })).toBeEnabled();

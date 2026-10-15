@@ -1,9 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { appendConsole, cleanText, lineBytes } from "./console";
+import { appendConsole, cleanText, holdOpenEscape, lineBytes } from "./console";
 
 const ESC = String.fromCharCode(27);
 
 describe("console text", () => {
+  it("holds an escape a piece ends in, until the piece that ends it", () => {
+    expect(holdOpenEscape(`ok${ESC}[0;3`)).toEqual(["ok", `${ESC}[0;3`]);
+    expect(holdOpenEscape(`ok${ESC}`)).toEqual(["ok", ESC]);
+    expect(holdOpenEscape(`ok${ESC}[0m`)).toEqual([`ok${ESC}[0m`, ""]);
+    expect(holdOpenEscape("plain")).toEqual(["plain", ""]);
+    // Too long to be an escape: text, shown as it is.
+    const long = `${ESC}[${"1;".repeat(20)}`;
+    expect(holdOpenEscape(long)).toEqual([long, ""]);
+  });
+
   it("loses the colours of the ESP-IDF log and keeps one line end", () => {
     expect(cleanText(`${ESC}[0;32mI (31) boot: ok${ESC}[0m\r\n`)).toBe("I (31) boot: ok\n");
     expect(cleanText("a\rb")).toBe("ab");

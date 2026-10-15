@@ -54,6 +54,7 @@ export const en: Catalog = {
   "start.cancel": "Cancel",
   "start.submit": "Power on",
   "start.starting": "Starting…",
+  "start.pickFailed": "The system's dialog could not open: {detail}",
 
   "device.label": "Device {name}",
   "device.panel": "Screen of the device",
@@ -175,6 +176,10 @@ export const en: Catalog = {
   "error.ipc": "The interface could not reach the emulator.",
   "error.capture": "The capture could not be written.",
   "error.noImage": "No image to capture.",
+  "error.frame": "The image of the panel could not be read.",
+  "error.notKept": "The device was powered off without keeping everything.",
+  "said.captured": "Capture saved: {name}",
+  "said.recording": "The device is powered on again, and this life is recorded into {name}",
 
   "about.title": "About inkemu",
   "about.intro":

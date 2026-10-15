@@ -53,6 +53,7 @@ export const fr = {
   "start.cancel": "Annuler",
   "start.submit": "Allumer",
   "start.starting": "Démarrage…",
+  "start.pickFailed": "La boîte de dialogue du système n’a pas pu s’ouvrir : {detail}",
 
   "device.label": "Appareil {name}",
   "device.panel": "Écran de l’appareil",
@@ -174,6 +175,10 @@ export const fr = {
   "error.ipc": "L’interface n’a pas pu joindre l’émulateur.",
   "error.capture": "La capture n’a pas pu être écrite.",
   "error.noImage": "Aucune image à capturer.",
+  "error.frame": "L’image de l’écran n’a pas pu être lue.",
+  "error.notKept": "L’appareil a été éteint sans tout conserver.",
+  "said.captured": "Capture enregistrée : {name}",
+  "said.recording": "L’appareil est rallumé, et cette vie est enregistrée dans {name}",
 
   "about.title": "À propos d’inkemu",
   "about.intro":

@@ -1,6 +1,6 @@
-import { type KeyboardEvent, useState } from "react";
+import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { useI18n } from "../i18n/i18n";
-import type { ButtonSpec, Edge, Look, Status } from "../ipc/types";
+import type { ButtonSpec, Edge, HostError, Look, Status } from "../ipc/types";
 import { buttonForKey } from "../keyboard";
 import { labelOf } from "./labels";
 import { PanelCanvas } from "./panel-canvas";
@@ -12,6 +12,8 @@ interface Props {
   status: Status | null;
   /** Presses (`true`) or releases a button. */
   onButton(id: string, pressed: boolean): void;
+  /** An image of the panel that could not be read. */
+  onFrameError(error: HostError): void;
 }
 
 const EDGES: readonly Edge[] = ["top", "left", "right", "bottom"];
@@ -24,25 +26,44 @@ function onEdge(buttons: readonly ButtonSpec[], edge: Edge): ButtonSpec[] {
  * The device: its screen, with its buttons around it where they sit on the device. A button
  * presses on pointer down and releases on pointer up, or with Space and Enter while it has the
  * focus; the device itself takes the arrows, Enter, Escape, Backspace and P (keyboard.ts).
+ *
+ * A button is never left pressed by a release the device cannot see: when the focus leaves the
+ * device, or the window loses it (another application, a dialog of the system), every button
+ * still down is released.
  */
-export function DeviceView({ look, deviceName, signal, status, onButton }: Props) {
+export function DeviceView({ look, deviceName, signal, status, onButton, onFrameError }: Props) {
   const { t } = useI18n();
   const [down, setDown] = useState<ReadonlySet<string>>(new Set());
+  // What is down now, for a release that comes from outside a render (the window's blur).
+  const held = useRef<ReadonlySet<string>>(down);
   const ids = look.buttons.map((button) => button.id);
 
   const set = (id: string, pressed: boolean) => {
-    if (down.has(id) === pressed) {
+    if (held.current.has(id) === pressed) {
       return;
     }
-    const next = new Set(down);
+    const next = new Set(held.current);
     if (pressed) {
       next.add(id);
     } else {
       next.delete(id);
     }
+    held.current = next;
     setDown(next);
     onButton(id, pressed);
   };
+
+  const releaseAll = useRef(() => {});
+  releaseAll.current = () => {
+    for (const id of held.current) {
+      set(id, false);
+    }
+  };
+  useEffect(() => {
+    const release = () => releaseAll.current();
+    window.addEventListener("blur", release);
+    return () => window.removeEventListener("blur", release);
+  }, []);
 
   const deviceKey = (event: KeyboardEvent<HTMLElement>, pressed: boolean) => {
     if (event.target !== event.currentTarget || event.repeat) {
@@ -81,6 +102,12 @@ export function DeviceView({ look, deviceName, signal, status, onButton }: Props
         tabIndex={0}
         onKeyDown={(event) => deviceKey(event, true)}
         onKeyUp={(event) => deviceKey(event, false)}
+        onBlur={(event) => {
+          // The focus going from the device to one of its buttons, or back, keeps them down.
+          if (!event.currentTarget.contains(event.relatedTarget)) {
+            releaseAll.current();
+          }
+        }}
       >
         {EDGES.map((edge) => (
           <div key={edge} className={`device-edge device-edge-${edge}`}>
@@ -103,7 +130,7 @@ export function DeviceView({ look, deviceName, signal, status, onButton }: Props
           </div>
         ))}
         <div className="device-screen">
-          <PanelCanvas panel={look.panel} signal={signal} />
+          <PanelCanvas panel={look.panel} signal={signal} onError={onFrameError} />
           {asleep ? (
             <p className="device-badge">{t("device.asleep")}</p>
           ) : halt !== null ? (

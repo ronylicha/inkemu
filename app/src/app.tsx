@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { AboutDialog } from "./components/about-dialog";
 import { ConsolePanel } from "./components/console-panel";
 import { DeviceView } from "./components/device-view";
@@ -10,9 +10,15 @@ import { StatusPanel } from "./components/status-panel";
 import { Toolbar } from "./components/toolbar";
 import { useI18n } from "./i18n/i18n";
 import { asHostError, useHost } from "./ipc/host";
-import type { Command, Setup, Speed, Update } from "./ipc/types";
+import type { Command, Setup, Speed, Started, Update } from "./ipc/types";
+import { updateBatcher } from "./state/batch";
 import { initialState, reducer } from "./state/reducer";
 import { useTheme } from "./use-theme";
+
+/** The name of the file at `path`, as the journal shows it. */
+function fileName(path: string): string {
+  return path.split(/[/\\]/).at(-1) ?? path;
+}
 
 /**
  * The window: the controls, the device, its status, its consoles and its journal. It keeps what
@@ -24,8 +30,15 @@ export function App() {
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
   const [theme, setTheme] = useTheme();
   const [speed, setSpeed] = useState<Speed>("realTime");
-  const [starting, setStarting] = useState(false);
+  const [asking, setAsking] = useState(false);
   const [about, setAbout] = useState(false);
+  // Every start is numbered: the updates of an emulator carry its number (reducer.ts).
+  const starts = useRef(0);
+  const batcher = useMemo(
+    () => updateBatcher((start, updates) => dispatch({ type: "updates", start, updates })),
+    [],
+  );
+  useEffect(() => () => batcher.cancel(), [batcher]);
 
   useEffect(() => {
     host
@@ -35,43 +48,70 @@ export function App() {
   }, [host]);
 
   const failed = (reason: unknown) => dispatch({ type: "failed", error: asHostError(reason) });
-  const onUpdate = (update: Update) => dispatch({ type: "update", update });
   const command = (next: Command) => {
     host.command(next).catch(failed);
   };
 
+  /** Starts what `begin` starts, numbered, its updates gathered per frame. */
+  const start = (begin: (onUpdate: (update: Update) => void) => Promise<Started>) => {
+    starts.current += 1;
+    const number = starts.current;
+    dispatch({ type: "starting", start: number });
+    begin((update) => batcher.push(number, update))
+      .then((started) => {
+        batcher.flush();
+        dispatch({ type: "started", start: number, started });
+      })
+      .catch((reason: unknown) =>
+        dispatch({ type: "failed", start: number, error: asHostError(reason) }),
+      );
+  };
+
   const powerOn = (setup: Setup) => {
-    setStarting(false);
-    dispatch({ type: "starting" });
-    host
-      .powerOn(setup, speed, onUpdate)
-      .then((started) => dispatch({ type: "started", started }))
-      .catch(failed);
+    setAsking(false);
+    start((onUpdate) => host.powerOn(setup, speed, onUpdate));
   };
 
   const replay = async () => {
-    const path = await host.pickFile("session");
-    if (path === null) {
-      return;
+    try {
+      const path = await host.pickFile("session");
+      if (path !== null) {
+        start((onUpdate) => host.openReplay(path, null, speed, onUpdate));
+      }
+    } catch (reason) {
+      failed(reason);
     }
-    dispatch({ type: "starting" });
-    host
-      .openReplay(path, null, speed, onUpdate)
-      .then((started) => dispatch({ type: "started", started }))
-      .catch(failed);
   };
 
   const record = async () => {
-    const path = await host.pickSavePath("session");
-    if (path !== null) {
-      command({ kind: "record", path });
+    try {
+      const path = await host.pickSavePath("session");
+      if (path === null) {
+        return;
+      }
+      await host.command({ kind: "record", path });
+      dispatch({
+        type: "said",
+        notice: { level: "info", text: t("said.recording", { name: fileName(path) }) },
+      });
+    } catch (reason) {
+      failed(reason);
     }
   };
 
   const capture = async () => {
-    const path = await host.pickSavePath("capture");
-    if (path !== null) {
-      host.saveCapture(path).catch(failed);
+    try {
+      const path = await host.pickSavePath("capture");
+      if (path === null) {
+        return;
+      }
+      await host.saveCapture(path);
+      dispatch({
+        type: "said",
+        notice: { level: "info", text: t("said.captured", { name: fileName(path) }) },
+      });
+    } catch (reason) {
+      failed(reason);
     }
   };
 
@@ -96,11 +136,12 @@ export function App() {
         <h1 className="sr-only">{t("app.title")}</h1>
         <Toolbar
           phase={state.phase}
+          starting={state.starting !== null}
           status={status}
           speed={status?.speed ?? speed}
           hasImage={state.frame !== null}
           theme={theme}
-          onPowerOn={() => setStarting(true)}
+          onPowerOn={() => setAsking(true)}
           onCommand={command}
           onSpeed={changeSpeed}
           onRecord={record}
@@ -124,6 +165,7 @@ export function App() {
               signal={state.frame}
               status={status}
               onButton={(id, pressed) => command({ kind: "button", id, pressed })}
+              onFrameError={failed}
             />
           )}
         </div>
@@ -145,13 +187,16 @@ export function App() {
       <div className="sr-only" role="status" aria-live="polite">
         {announcement}
       </div>
-      {starting ? (
+      <div className="sr-only" aria-live="polite">
+        {state.told}
+      </div>
+      {asking ? (
         <StartDialog
           devices={state.devices}
           device={state.device}
           onDevice={(device) => dispatch({ type: "selectDevice", device })}
           onStart={powerOn}
-          onClose={() => setStarting(false)}
+          onClose={() => setAsking(false)}
         />
       ) : null}
       {about ? <AboutDialog onClose={() => setAbout(false)} /> : null}
