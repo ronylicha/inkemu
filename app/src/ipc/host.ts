@@ -62,18 +62,54 @@ function channelOf(onUpdate: (update: Update) => void): Channel<Update> {
   return channel;
 }
 
+/**
+ * `run`, one call at a time: each call starts once the one before has settled, whatever its
+ * outcome. The emulator does the commands in the order they reach it; this keeps that order the
+ * order the user gave them (a press before its release), even when one takes long (2c-R16).
+ */
+export function serialized<A extends unknown[], T>(
+  run: (...args: A) => Promise<T>,
+): (...args: A) => Promise<T> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return (...args) => {
+    const next = tail.then(() => run(...args));
+    tail = next.catch(() => undefined);
+    return next;
+  };
+}
+
+/**
+ * Gives a command to the emulator: the shell gives it at once, in the order it received it, and
+ * answers through a channel once the emulator has done it.
+ */
+function sendCommand(command: Command): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const answer = new Channel<HostError | null>();
+    answer.onmessage = (refusal) => {
+      if (refusal === null) {
+        resolve();
+      } else {
+        reject(asHostError(refusal));
+      }
+    };
+    call<void>("command", { command, answer }).catch(reject);
+  });
+}
+
+const command = serialized(sendCommand);
+
 export const tauriHost: HostApi = {
   devices: () => call<DeviceView[]>("devices"),
   powerOn: (setup, speed, onUpdate) =>
     call<Started>("power_on", { setup, speed, onUpdate: channelOf(onUpdate) }),
   openReplay: (path, romDir, speed, onUpdate) =>
     call<Started>("open_replay", { path, romDir, speed, onUpdate: channelOf(onUpdate) }),
-  command: (command) => call<void>("command", { command }),
+  command,
   frame: async () => {
     const buffer = await call<ArrayBuffer>("frame");
     return buffer.byteLength === 0 ? null : decodeFrame(buffer);
   },
-  saveCapture: (path) => call<void>("save_capture", { path }),
+  saveCapture: (path) => command({ kind: "capture", path }),
   notices: () => call<string>("notices"),
   pickFile: async (kind) => {
     const picked = await open({

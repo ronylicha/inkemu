@@ -134,7 +134,8 @@ export type Command =
   | { kind: "console"; channel: ConsoleChannel; bytes: number[] }
   | { kind: "usbHost"; host: UsbHost }
   | { kind: "button"; id: string; pressed: boolean }
-  | { kind: "record"; path: string };
+  | { kind: "record"; path: string }
+  | { kind: "capture"; path: string };
 
 /** What starting a run or a replay gives back. */
 export interface Started {

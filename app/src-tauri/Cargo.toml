@@ -27,6 +27,8 @@ tauri-build = { version = "2.7.3", features = [] }
 tauri = { version = "2.12.4", features = [] }
 tauri-plugin-dialog = "2.8.3"
 serde = { version = "1", features = ["derive"] }
+# SIGINT and SIGTERM power the device off before the application exits, as in the command line.
+ctrlc = { version = "3.5", features = ["termination"] }
 host = { path = "../../crates/host" }
 boards = { path = "../../crates/boards" }
 soc-esp32c3 = { path = "../../crates/soc-esp32c3" }

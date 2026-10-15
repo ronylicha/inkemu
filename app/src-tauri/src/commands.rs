@@ -21,15 +21,37 @@ pub struct Shell {
 
 impl Shell {
     /// Ends the last life of the running emulator, if any, and waits for it.
-    pub fn power_off(&self) {
+    ///
+    /// # Errors
+    /// What the last life could not keep (its flash file, its session), one error per line: the
+    /// application tells its user before it closes.
+    pub fn power_off(&self) -> Result<(), String> {
         let running = self
             .emulator
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if let Some(emulator) = running {
-            emulator.shutdown();
+        match running {
+            Some(emulator) => emulator.shutdown().map_err(|e| e.to_string()),
+            None => Ok(()),
         }
+    }
+
+    /// Whether an emulator runs, which a power-off must end before the application closes.
+    pub fn is_on(&self) -> bool {
+        self.emulator
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Whether the running emulator holds the flash file at `path`.
+    fn holds_flash_file(&self, path: &std::path::Path) -> bool {
+        self.emulator
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|emulator| emulator.holds_flash_file(path))
     }
 
     fn handle(&self) -> Result<Handle, ErrorDto> {
@@ -171,6 +193,7 @@ pub enum CommandDto {
     UsbHost { host: String },
     Button { id: String, pressed: bool },
     Record { path: PathBuf },
+    Capture { path: PathBuf },
 }
 
 impl CommandDto {
@@ -189,6 +212,7 @@ impl CommandDto {
             CommandDto::UsbHost { host } => Command::UsbHost(usb_host(&host)?),
             CommandDto::Button { id, pressed } => Command::Button { id, pressed },
             CommandDto::Record { path } => Command::Record { path },
+            CommandDto::Capture { path } => Command::Capture { path },
         })
     }
 }
@@ -228,7 +252,9 @@ async fn start(
     )
     .map_err(|e| ErrorDto::new("powerOn", e))?;
     if let Some(replaced) = shell.keep(emulator) {
-        tauri::async_runtime::spawn_blocking(move || replaced.shutdown()).await?;
+        // What its last life could not keep reaches the journal through its own updates, which
+        // the interface keeps (app/src/state/reducer.ts).
+        let _ = tauri::async_runtime::spawn_blocking(move || replaced.shutdown()).await?;
     }
     Ok(started)
 }
@@ -241,6 +267,10 @@ pub fn devices() -> Result<Vec<DeviceView>, ErrorDto> {
 
 /// Powers a device on as `inkemu run` does. The checks and the ROM, which may be downloaded, run
 /// off the interface's thread.
+///
+/// The device that runs goes on running until the new one has passed every check: a refused
+/// start leaves it as it was. Only a start on the flash file it holds powers it off first, since
+/// its power-off writes that file and releases its lock.
 #[tauri::command]
 pub async fn power_on(
     shell: State<'_, Shell>,
@@ -249,10 +279,16 @@ pub async fn power_on(
     on_update: Channel<Update>,
 ) -> Result<StartedDto, ErrorDto> {
     let setup = setup.into_setup()?;
-    let previous = shell.inner();
-    off_the_main_thread(previous).await?;
+    let shell = shell.inner();
+    if setup
+        .flash_file
+        .as_deref()
+        .is_some_and(|file| shell.holds_flash_file(file))
+    {
+        off_the_main_thread(shell).await?;
+    }
     let launch = tauri::async_runtime::spawn_blocking(move || device::power_on(&setup)).await??;
-    start(shell.inner(), launch, speed, on_update).await
+    start(shell, launch, speed, on_update).await
 }
 
 /// Opens a session and replays it as `inkemu replay` does.
@@ -264,7 +300,7 @@ pub async fn open_replay(
     speed: Speed,
     on_update: Channel<Update>,
 ) -> Result<StartedDto, ErrorDto> {
-    off_the_main_thread(shell.inner()).await?;
+    // A replay holds no file of a run: the device that runs goes on until the replay is ready.
     let launch =
         tauri::async_runtime::spawn_blocking(move || device::open_replay(&path, rom_dir, None))
             .await??;
@@ -279,19 +315,31 @@ async fn off_the_main_thread(shell: &Shell) -> Result<(), ErrorDto> {
         .unwrap_or_else(PoisonError::into_inner)
         .take();
     if let Some(emulator) = running {
-        tauri::async_runtime::spawn_blocking(move || emulator.shutdown()).await?;
+        // What its last life could not keep reaches the journal through its own updates.
+        let _ = tauri::async_runtime::spawn_blocking(move || emulator.shutdown()).await?;
     }
     Ok(())
 }
 
-/// Sends a command to the emulator and waits for its answer, off the interface's thread.
+/// Gives a command to the emulator, then answers through `answer` once it is done.
+///
+/// The command is given here, on the thread that receives the interface's calls in the order the
+/// interface made them, so that the emulator does them in that order (a press before its
+/// release); the answer is awaited on another thread, never this one (2c-R16).
+// Tauri hands a command its state by value: the signature is the framework's.
+#[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
-pub async fn command(shell: State<'_, Shell>, command: CommandDto) -> Result<(), ErrorDto> {
-    let command = command.into_command()?;
-    let handle = shell.handle()?;
-    tauri::async_runtime::spawn_blocking(move || handle.command(command))
-        .await?
-        .map_err(ErrorDto::from)
+pub fn command(
+    shell: State<'_, Shell>,
+    command: CommandDto,
+    answer: Channel<Option<ErrorDto>>,
+) -> Result<(), ErrorDto> {
+    let pending = shell.handle()?.submit(command.into_command()?)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // A window that closed takes no answer.
+        let _ = answer.send(pending.wait().err().map(ErrorDto::from));
+    });
+    Ok(())
 }
 
 /// The last image of the panel, encoded (`PanelFrame::encode`); empty before the first.
@@ -306,18 +354,6 @@ pub fn frame(shell: State<'_, Shell>) -> Response {
         .map(|frame| frame.encode())
         .unwrap_or_default();
     Response::new(bytes)
-}
-
-/// Writes a PNG of the screen as the user sees it to `path`, chosen in the system's dialog.
-#[tauri::command]
-pub async fn save_capture(shell: State<'_, Shell>, path: PathBuf) -> Result<(), ErrorDto> {
-    let png = shell
-        .handle()?
-        .capture()
-        .ok_or_else(|| ErrorDto::new("noImage", "the panel has shown no image yet"))?;
-    tauri::async_runtime::spawn_blocking(move || std::fs::write(&path, png))
-        .await?
-        .map_err(|e| ErrorDto::new("capture", e))
 }
 
 /// The notices of the material inkemu embeds (`inkemu licenses`).
@@ -404,6 +440,22 @@ mod tests {
     fn a_shell_without_an_emulator_says_it_has_stopped() {
         let shell = Shell::default();
         assert_eq!(shell.handle().unwrap_err().kind, "stopped");
-        shell.power_off();
+        assert!(!shell.is_on());
+        assert!(!shell.holds_flash_file(std::path::Path::new("flash.bin")));
+        assert_eq!(shell.power_off(), Ok(()));
+    }
+
+    #[test]
+    fn a_capture_of_the_interface_is_a_command_of_the_host() {
+        let read = serde_json::from_str::<CommandDto>(r#"{"kind":"capture","path":"/tmp/a.png"}"#)
+            .unwrap()
+            .into_command()
+            .unwrap();
+        assert_eq!(
+            read,
+            Command::Capture {
+                path: PathBuf::from("/tmp/a.png")
+            }
+        );
     }
 }
