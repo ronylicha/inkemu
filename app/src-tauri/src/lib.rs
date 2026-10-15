@@ -11,10 +11,11 @@
 //! last one has written its files. A second signal exits at once, with 130: a power-off still
 //! under way then loses what its last life had not written yet (its flash file, its session).
 mod commands;
+mod signals;
 
 use commands::Shell;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::{AppHandle, Manager as _, RunEvent, WindowEvent};
 use tauri_plugin_dialog::{DialogExt as _, MessageDialogKind};
 
@@ -97,31 +98,25 @@ fn power_off_telling(app: &AppHandle) {
 }
 
 /// On `SIGINT` or `SIGTERM` (Ctrl-C in the terminal that started it, a session that ends), the
-/// application powers the device off, waits for every power-off under way, and exits; a second
-/// signal exits at once, losing what a power-off under way had not written yet.
+/// application powers the device off, waits for every power-off under way, and exits, on a thread
+/// of its own; a second signal exits at once, losing what a power-off under way had not written
+/// yet ([`signals::Signals`]).
 fn watch_signals(app: AppHandle) {
-    let signalled = AtomicBool::new(false);
-    let watched = ctrlc::set_handler(move || {
-        if signalled.swap(true, Ordering::SeqCst) {
-            std::process::exit(130);
-        }
-        // A closing under way powers off and exits itself, after its dialog: the signal leaves
-        // it to it (a second signal still exits at once).
-        let Some(closing) = app.state::<Shell>().begin_closing() else {
-            return;
-        };
+    let powering_off = app.clone();
+    let signals = signals::Signals::new(
         // No dialog: the user may be gone (a session that ends); the same words, in the
-        // interface's language, go to the terminal. The application exits whatever the
-        // power-off did, a panic included: a signal that does not end it would be lost.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let shell = app.state::<Shell>();
+        // interface's language, go to the terminal. A closing of the window under way does not
+        // hold the exit back: `power_off` waits for every power-off, not for a dialog.
+        Arc::new(move || {
+            let shell = powering_off.state::<Shell>();
             if let Err(detail) = shell.power_off() {
                 tell_the_terminal(&shell, &detail);
             }
-        }));
-        drop(closing);
-        app.exit(130);
-    });
+        }),
+        Arc::new(move |code| app.exit(code)),
+        Arc::new(|code| std::process::exit(code)),
+    );
+    let watched = ctrlc::set_handler(move || signals.receive());
     if let Err(e) = watched {
         // A terminal that is gone (`EPIPE`, `EIO`) is not a reason to stop.
         let _ = writeln!(
