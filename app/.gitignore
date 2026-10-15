@@ -1,0 +1,4 @@
+# What the desktop shell builds and generates: the Cargo target of its own workspace, and the
+# permission schemas tauri-build writes on every build.
+src-tauri/target/
+src-tauri/gen/schemas/

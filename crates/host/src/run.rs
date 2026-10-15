@@ -85,7 +85,7 @@ fn pass_end(
 
 /// The first line of the summary: why the run ended. A console that failed has said so in the
 /// line before; `stop` carries the violation of a strict stop.
-fn say_why(log: &mut dyn Write, end: RunEnd, stop: Option<&StopReason>) {
+pub fn say_why(log: &mut dyn Write, end: RunEnd, stop: Option<&StopReason>) {
     let _ = match end {
         RunEnd::Interrupted => writeln!(log, "inkemu: interrupted by the user"),
         RunEnd::StrictMmio => match stop {
@@ -121,7 +121,7 @@ fn say_why(log: &mut dyn Write, end: RunEnd, stop: Option<&StopReason>) {
 
 /// Cycles executed between two flushes of the console and the diagnostics: a fraction of a second
 /// of host time, so output appears as the firmware prints it.
-const SLICE_CYCLES: u64 = 1_000_000;
+pub const SLICE_CYCLES: u64 = 1_000_000;
 
 /// How many of the most repeated diagnostics the end-of-run summary lists.
 const MAX_REPEATED_SHOWN: usize = 3;
@@ -237,7 +237,8 @@ pub fn parse_device_seconds(text: &str) -> Result<u64, String> {
         })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub enum RunEnd {
     /// The cycle limit (`--max-cycles`) was reached.
     Budget,
@@ -405,7 +406,7 @@ pub fn exit_code_of_run(end: RunEnd, script: Option<&ScriptStatus>, saved: bool)
 /// the run will not be recorded: the user of a recorded run can stop it at once instead of
 /// learning it at its end. Gives whether it said so. A machine told to keep no journal (a
 /// replay) has nothing to say.
-fn say_an_incomplete_journal(machine: &Esp32C3, log: &mut dyn Write) -> bool {
+pub fn say_an_incomplete_journal(machine: &Esp32C3, log: &mut dyn Write) -> bool {
     let journal = machine.input_journal();
     if journal.is_complete() || journal.is_forgone() {
         return false;
@@ -448,7 +449,8 @@ fn log_reader_gone(log: &mut dyn Write) {
 /// What the line of `diagnostic` starts with. A reset is an event of the run, as the restart a
 /// firmware asks for is: it is said in inkemu's own voice. Everything else is something the
 /// emulation did not do as the device would, or a fault of the firmware: a warning.
-const fn journal_prefix(diagnostic: &Diagnostic) -> &'static str {
+#[must_use]
+pub const fn journal_prefix(diagnostic: &Diagnostic) -> &'static str {
     match diagnostic {
         Diagnostic::Reset { .. } | Diagnostic::UnlistedResets => "inkemu",
         Diagnostic::UnmodeledMmio { .. }
@@ -667,7 +669,7 @@ pub fn execute_with_script(
 /// The lines of the summary after why the run ended: where the machine stopped, its device
 /// time and clock, its deep sleep, the USB host, how far `script` got, the diagnostics and the
 /// trace hash.
-fn say_where_the_run_stopped(
+pub fn say_where_the_run_stopped(
     machine: &mut Esp32C3,
     script: Option<&ScriptRun>,
     log: &mut dyn Write,
@@ -751,7 +753,8 @@ fn flush_the_other_consoles(
 
 /// The line of the summary of a run that ends with the device in deep sleep (F5, F9): since when
 /// it sleeps, and when the RTC timer wakes it or what it waits for instead.
-fn deep_sleep_line(sleep: &DeepSleep) -> String {
+#[must_use]
+pub fn deep_sleep_line(sleep: &DeepSleep) -> String {
     let since = sleep.since_nanos / 1_000;
     let waits = match sleep.timer_wake_nanos {
         Some(wake) => format!("the RTC timer wakes it at {} us", wake / 1_000),

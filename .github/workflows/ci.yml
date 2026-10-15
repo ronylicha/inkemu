@@ -47,6 +47,55 @@ jobs:
         with: { toolchain: "1.99.0", components: "llvm-tools-preview" }
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --workspace --fail-under-lines 80
+  app:
+    # The desktop application (design of sub-project 2c, C18): the interface's lint, types, tests
+    # and production build, then the Tauri shell, which is a Cargo workspace of its own, formatted,
+    # linted, tested and built on Linux. No bundle and no signature: those are sub-project 9's.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      # The version of pnpm is the `packageManager` of app/package.json.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: app/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - name: Interface
+        working-directory: app
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm lint
+          pnpm typecheck
+          pnpm test
+          pnpm build
+      # The shell's dependency tree (Tauri, WebKitGTK, GTK 3) is checked as the root one is, against
+      # its own rules: app/src-tauri/deny.toml, which cargo-deny finds beside the manifest.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: app/src-tauri/Cargo.toml
+      # The libraries the Tauri guide lists for Debian and Ubuntu (docs/research/sp2c-app-stack.md).
+      - name: Install the system libraries of Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          components: "rustfmt, clippy"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      - name: Desktop shell
+        working-directory: app/src-tauri
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo build --locked
   arch-test:
     # riscv-arch-test through RISCOF against Sail. On pushes to main it always runs. On PRs it is
     # skipped only when the diff provably touches nothing it depends on: any error computing the
@@ -106,6 +155,7 @@ jobs:
           failed=0
           tools/ci/run-ignored-tests.sh 19 --release -p soc-esp32c3 --test real_rom -- --ignored || failed=1
           tools/ci/run-ignored-tests.sh 28 --release -p emu-cli --test run_cli -- --ignored --skip reference_firmware || failed=1
+          tools/ci/run-ignored-tests.sh 2 --release -p host --test real_rom -- --ignored || failed=1
           exit "$failed"
   reference-boot:
     # Boots the reference firmware (stock ESP-IDF bootloader + hello_world) from the real mask ROM
