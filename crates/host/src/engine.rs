@@ -358,11 +358,20 @@ impl Engine {
         }
     }
 
+    /// Takes the image of a refresh that completed. An image the port could not make is a fault
+    /// of the port, said in the journal; the panel keeps its last image.
     fn poll_panel(&mut self, output: &mut Output) {
-        if let Some(frame) = self.panel.poll(&mut self.machine) {
-            let frame = Arc::new(frame);
-            self.frame = Some(Arc::clone(&frame));
-            output.frame = Some(frame);
+        match self.panel.poll(&mut self.machine) {
+            Ok(Some(frame)) => {
+                let frame = Arc::new(frame);
+                self.frame = Some(Arc::clone(&frame));
+                output.frame = Some(frame);
+            }
+            Ok(None) => {}
+            Err(e) => output.notices.push(Notice {
+                level: Level::Error,
+                text: format!("error: the panel gave an image it cannot show: {e}"),
+            }),
         }
     }
 
@@ -726,6 +735,44 @@ mod tests {
 
     const UART0: ConsoleChannel = ConsoleChannel::Uart0;
 
+    /// A panel whose every refresh gives parts that are not an image.
+    struct BrokenPanel(crate::ports::PanelDescription);
+
+    impl crate::ports::PanelSource for BrokenPanel {
+        fn describe(&self) -> crate::ports::PanelDescription {
+            self.0
+        }
+
+        fn poll(
+            &mut self,
+            _: &mut Esp32C3,
+        ) -> Result<Option<PanelFrame>, crate::ports::FrameError> {
+            Err(crate::ports::FrameError::Generation)
+        }
+    }
+
+    /// An image the port cannot make is said in the journal, and the panel keeps no image.
+    #[test]
+    fn a_panel_image_that_cannot_be_shown_is_said() {
+        let mut broken = life(echo(), false);
+        broken.panel = Box::new(BrokenPanel(broken.panel.describe()));
+        let mut engine = Engine::new(broken, Mode::Run { recorder: None }, Limits::default());
+        let output = engine.begin();
+        assert!(output.frame.is_none());
+        assert!(engine.frame().is_none());
+        assert!(
+            output
+                .notices
+                .iter()
+                .any(|notice| notice.level == Level::Error
+                    && notice
+                        .text
+                        .contains("the panel gave an image it cannot show")),
+            "{:?}",
+            output.notices
+        );
+    }
+
     #[test]
     fn a_life_begins_with_the_first_image_of_its_panel() {
         let mut engine = Engine::new(
@@ -735,8 +782,11 @@ mod tests {
         );
         let output = engine.begin();
         let frame = output.frame.expect("the first refresh");
-        assert_eq!((frame.generation, frame.refresh), (1, RefreshKind::Full));
-        assert_eq!(engine.frame().map(|f| f.generation), Some(1));
+        assert_eq!(
+            (frame.generation(), frame.refresh()),
+            (1, RefreshKind::Full)
+        );
+        assert_eq!(engine.frame().map(|f| f.generation()), Some(1));
         assert_eq!(engine.buttons().len(), 2);
         assert!(!engine.buttons_reach_firmware());
     }
@@ -895,7 +945,7 @@ mod tests {
         engine.begin();
         let output = engine.button("confirm", true).unwrap();
         let frame: Arc<PanelFrame> = output.frame.expect("a press is a refresh");
-        assert_eq!(frame.generation, 2);
+        assert_eq!(frame.generation(), 2);
         assert!(matches!(
             engine.button("home", true),
             Err(EngineError::Button(ButtonError::Unknown { .. }))

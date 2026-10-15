@@ -97,13 +97,13 @@ pub struct Region {
     pub height: u32,
 }
 
-/// The image a panel shows after a refresh that completed.
+/// What a [`PanelSource`] says a refresh shows, before [`PanelFrame::new`] checks it.
 ///
 /// `pixels` holds `width × height` bytes in native scan order, line after line: 0 is black, 255
 /// white, and every value lies on one of the `gray_levels` evenly spaced levels (four levels: 0,
 /// 85, 170, 255).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PanelFrame {
+pub struct FrameParts {
     pub width: u32,
     pub height: u32,
     pub gray_levels: u8,
@@ -117,6 +117,39 @@ pub struct PanelFrame {
     pub pixels: Arc<[u8]>,
 }
 
+/// Why the parts of a refresh are not an image a panel can show: a fault of the port that gave
+/// them, which the engine says in the journal while the panel keeps its last image.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FrameError {
+    #[error("a panel image of {width} × {height} pixels shows nothing")]
+    Empty { width: u32, height: u32 },
+    #[error("a {width} × {height} panel image holds {len} pixels")]
+    Pixels { width: u32, height: u32, len: usize },
+    #[error("a panel image of {0} grey levels: a panel shows 2 levels at least")]
+    Levels(u8),
+    #[error("a panel image of generation 0: the refreshes of a life count from 1")]
+    Generation,
+    #[error(
+        "the region at ({x}, {y}) of {region_width} × {region_height} pixels is not within the {width} × {height} panel"
+    )]
+    Region {
+        x: u32,
+        y: u32,
+        region_width: u32,
+        region_height: u32,
+        width: u32,
+        height: u32,
+    },
+}
+
+/// The image a panel shows after a refresh that completed: [`FrameParts`] that
+/// [`PanelFrame::new`] found consistent, so that an interface can draw and encode it without
+/// checking it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelFrame {
+    parts: FrameParts,
+}
+
 /// The first bytes of an encoded [`PanelFrame`].
 pub const FRAME_MAGIC: [u8; 4] = *b"IKPF";
 /// The version of the encoding that follows [`FRAME_MAGIC`].
@@ -125,6 +158,94 @@ pub const FRAME_VERSION: u8 = 1;
 pub const FRAME_HEADER_LEN: usize = 48;
 
 impl PanelFrame {
+    /// Checks `parts`: a panel of at least one pixel, exactly `width × height` pixels, two grey
+    /// levels at least, a generation counted from 1, and a region within the panel, not empty.
+    ///
+    /// # Errors
+    /// [`FrameError`] naming the first part that is not consistent.
+    pub fn new(parts: FrameParts) -> Result<PanelFrame, FrameError> {
+        let (width, height) = (parts.width, parts.height);
+        if width == 0 || height == 0 {
+            return Err(FrameError::Empty { width, height });
+        }
+        let expected = usize::try_from(u64::from(width) * u64::from(height)).ok();
+        if expected != Some(parts.pixels.len()) {
+            return Err(FrameError::Pixels {
+                width,
+                height,
+                len: parts.pixels.len(),
+            });
+        }
+        if parts.gray_levels < 2 {
+            return Err(FrameError::Levels(parts.gray_levels));
+        }
+        if parts.generation == 0 {
+            return Err(FrameError::Generation);
+        }
+        if let Some(region) = parts.region {
+            let within = |start: u32, length: u32, side: u32| {
+                length > 0 && u64::from(start) + u64::from(length) <= u64::from(side)
+            };
+            if !within(region.x, region.width, width) || !within(region.y, region.height, height) {
+                return Err(FrameError::Region {
+                    x: region.x,
+                    y: region.y,
+                    region_width: region.width,
+                    region_height: region.height,
+                    width,
+                    height,
+                });
+            }
+        }
+        Ok(PanelFrame { parts })
+    }
+
+    /// Pixels per line, in the controller's native scan order.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.parts.width
+    }
+
+    /// Lines, in the controller's native scan order.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.parts.height
+    }
+
+    #[must_use]
+    pub const fn gray_levels(&self) -> u8 {
+        self.parts.gray_levels
+    }
+
+    /// Strictly increasing from 1 over a life: one per completed refresh.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.parts.generation
+    }
+
+    #[must_use]
+    pub const fn refresh(&self) -> RefreshKind {
+        self.parts.refresh
+    }
+
+    /// The rectangle the refresh drove; `None` for the whole panel.
+    #[must_use]
+    pub const fn region(&self) -> Option<Region> {
+        self.parts.region
+    }
+
+    /// How long the refresh lasts in device time, when the controller's model knows it.
+    #[must_use]
+    pub const fn duration_nanos(&self) -> Option<u64> {
+        self.parts.duration_nanos
+    }
+
+    /// `width × height` bytes, line after line.
+    #[must_use]
+    pub fn pixels(&self) -> &[u8] {
+        &self.parts.pixels
+    }
+
     /// The value of grey level `level` (0 is black) on a panel of `levels` levels.
     #[must_use]
     pub fn level_value(level: u8, levels: u8) -> u8 {
@@ -151,20 +272,21 @@ impl PanelFrame {
     /// | 32 | 16 | region: x, y, width, height (zeros when none) |
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(FRAME_HEADER_LEN + self.pixels.len());
+        let parts = &self.parts;
+        let mut bytes = Vec::with_capacity(FRAME_HEADER_LEN + parts.pixels.len());
         bytes.extend_from_slice(&FRAME_MAGIC);
         bytes.push(FRAME_VERSION);
-        bytes.push(match self.refresh {
+        bytes.push(match parts.refresh {
             RefreshKind::Full => 0,
             RefreshKind::Partial => 1,
         });
-        bytes.push(self.gray_levels);
-        bytes.push(u8::from(self.region.is_some()));
-        bytes.extend_from_slice(&self.width.to_le_bytes());
-        bytes.extend_from_slice(&self.height.to_le_bytes());
-        bytes.extend_from_slice(&self.generation.to_le_bytes());
-        bytes.extend_from_slice(&self.duration_nanos.unwrap_or(u64::MAX).to_le_bytes());
-        let region = self.region.unwrap_or(Region {
+        bytes.push(parts.gray_levels);
+        bytes.push(u8::from(parts.region.is_some()));
+        bytes.extend_from_slice(&parts.width.to_le_bytes());
+        bytes.extend_from_slice(&parts.height.to_le_bytes());
+        bytes.extend_from_slice(&parts.generation.to_le_bytes());
+        bytes.extend_from_slice(&parts.duration_nanos.unwrap_or(u64::MAX).to_le_bytes());
+        let region = parts.region.unwrap_or(Region {
             x: 0,
             y: 0,
             width: 0,
@@ -173,7 +295,7 @@ impl PanelFrame {
         for value in [region.x, region.y, region.width, region.height] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
-        bytes.extend_from_slice(&self.pixels);
+        bytes.extend_from_slice(&parts.pixels);
         bytes
     }
 }
@@ -185,7 +307,11 @@ pub trait PanelSource {
 
     /// The image of the last refresh that completed since the previous call, if any; `None` when
     /// no refresh completed. Several refreshes between two calls give only the last one.
-    fn poll(&mut self, machine: &mut Esp32C3) -> Option<PanelFrame>;
+    ///
+    /// # Errors
+    /// [`FrameError`] when the refresh gave parts that are not an image ([`PanelFrame::new`]):
+    /// the engine says so in the journal and the panel keeps its last image.
+    fn poll(&mut self, machine: &mut Esp32C3) -> Result<Option<PanelFrame>, FrameError>;
 }
 
 /// Where a button sits on a device, as its user sees it.
@@ -314,7 +440,7 @@ mod tests {
     /// The interface decodes this layout: a change here is a change of the version.
     #[test]
     fn an_encoded_frame_is_its_header_then_its_pixels() {
-        let frame = PanelFrame {
+        let frame = PanelFrame::new(FrameParts {
             width: 3,
             height: 2,
             gray_levels: 4,
@@ -328,7 +454,8 @@ mod tests {
             }),
             duration_nanos: None,
             pixels: Arc::from([0u8, 85, 170, 255, 0, 85].as_slice()),
-        };
+        })
+        .unwrap();
         let bytes = frame.encode();
         assert_eq!(bytes.len(), FRAME_HEADER_LEN + 6);
         assert_eq!(&bytes[..4], b"IKPF");
@@ -345,7 +472,7 @@ mod tests {
 
     #[test]
     fn a_full_refresh_without_a_region_encodes_zeros_there() {
-        let frame = PanelFrame {
+        let frame = PanelFrame::new(FrameParts {
             width: 1,
             height: 1,
             gray_levels: 2,
@@ -354,10 +481,82 @@ mod tests {
             region: None,
             duration_nanos: Some(1_700_000_000),
             pixels: Arc::from([255u8].as_slice()),
-        };
+        })
+        .unwrap();
         let bytes = frame.encode();
         assert_eq!(bytes[5..8], [0, 2, 0]);
         assert_eq!(bytes[24..32], 1_700_000_000u64.to_le_bytes());
         assert_eq!(bytes[32..48], [0; 16]);
+    }
+
+    /// Parts that are not an image are refused, each for its first fault: an interface never
+    /// receives a frame whose pixels do not fill its sides.
+    #[test]
+    fn parts_that_are_not_an_image_are_refused() {
+        let good = FrameParts {
+            width: 3,
+            height: 2,
+            gray_levels: 2,
+            generation: 1,
+            refresh: RefreshKind::Partial,
+            region: Some(Region {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 1,
+            }),
+            duration_nanos: None,
+            pixels: Arc::from([0u8; 6].as_slice()),
+        };
+        assert!(PanelFrame::new(good.clone()).is_ok());
+        let refused = |change: fn(&mut FrameParts)| {
+            let mut parts = good.clone();
+            change(&mut parts);
+            PanelFrame::new(parts).unwrap_err()
+        };
+        assert_eq!(
+            refused(|p| p.width = 0),
+            FrameError::Empty {
+                width: 0,
+                height: 2
+            }
+        );
+        assert_eq!(
+            refused(|p| p.pixels = Arc::from([0u8; 5].as_slice())),
+            FrameError::Pixels {
+                width: 3,
+                height: 2,
+                len: 5
+            }
+        );
+        assert_eq!(refused(|p| p.gray_levels = 1), FrameError::Levels(1));
+        assert_eq!(refused(|p| p.generation = 0), FrameError::Generation);
+        for region in [
+            Region {
+                x: 2,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+            Region {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 1,
+            },
+            Region {
+                x: u32::MAX,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        ] {
+            let mut parts = good.clone();
+            parts.region = Some(region);
+            assert!(
+                matches!(PanelFrame::new(parts), Err(FrameError::Region { .. })),
+                "{region:?}"
+            );
+        }
     }
 }

@@ -14,8 +14,8 @@
 //! refresh of the squares, and every tenth refresh a full one, as e-ink firmware does to clear
 //! ghosting.
 use crate::ports::{
-    ButtonError, ButtonPort, ButtonSpec, PanelDescription, PanelFrame, PanelOrigin, PanelSource,
-    RefreshKind, Region,
+    ButtonError, ButtonPort, ButtonSpec, FrameError, FrameParts, PanelDescription, PanelFrame,
+    PanelOrigin, PanelSource, RefreshKind, Region,
 };
 use soc_esp32c3::Esp32C3;
 use std::cell::RefCell;
@@ -257,10 +257,10 @@ impl PatternPanel {
         );
     }
 
-    fn frame(&mut self, region: Option<Region>) -> PanelFrame {
+    fn frame(&mut self, region: Option<Region>) -> Result<PanelFrame, FrameError> {
         self.generation += 1;
         let full = region.is_none() || self.generation % FULL_EVERY == 1;
-        PanelFrame {
+        PanelFrame::new(FrameParts {
             width: self.width(),
             height: self.height(),
             gray_levels: self.description.gray_levels,
@@ -277,7 +277,7 @@ impl PatternPanel {
                 PARTIAL_REFRESH_NANOS
             }),
             pixels: Arc::from(self.pixels.as_slice()),
-        }
+        })
     }
 }
 
@@ -303,14 +303,14 @@ impl PanelSource for PatternPanel {
         self.description
     }
 
-    fn poll(&mut self, machine: &mut Esp32C3) -> Option<PanelFrame> {
+    fn poll(&mut self, machine: &mut Esp32C3) -> Result<Option<PanelFrame>, FrameError> {
         self.poll_at(machine.device_time_nanos())
     }
 }
 
 impl PatternPanel {
     /// [`PanelSource::poll`] at `device_nanos` of device time.
-    fn poll_at(&mut self, device_nanos: u64) -> Option<PanelFrame> {
+    fn poll_at(&mut self, device_nanos: u64) -> Result<Option<PanelFrame>, FrameError> {
         let second = device_nanos / NANOS_PER_SECOND;
         let Some(shown) = self.second else {
             self.second = Some(second);
@@ -318,7 +318,7 @@ impl PatternPanel {
             self.draw_squares();
             self.draw_bar(second);
             self.shared.borrow_mut().changed = false;
-            return Some(self.frame(None));
+            return self.frame(None).map(Some);
         };
         let mut region = None;
         if self.shared.borrow().changed {
@@ -337,7 +337,7 @@ impl PatternPanel {
             self.draw_squares();
             self.draw_bar(second);
         }
-        region.map(|region| self.frame(Some(region)))
+        region.map(|region| self.frame(Some(region))).transpose()
     }
 }
 
@@ -430,20 +430,20 @@ mod tests {
     fn the_first_image_is_a_full_refresh_with_every_level() {
         let mut machine = machine();
         let (mut panel, _) = ports(PANEL, &BUTTONS);
-        let frame = panel.poll(&mut machine).expect("a first image");
-        assert_eq!(frame.generation, 1);
-        assert_eq!(frame.refresh, RefreshKind::Full);
-        assert_eq!(frame.region, None);
-        assert_eq!(frame.duration_nanos, Some(FULL_REFRESH_NANOS));
-        assert_eq!(frame.pixels.len(), 200 * 120);
+        let frame = panel.poll(&mut machine).unwrap().expect("a first image");
+        assert_eq!(frame.generation(), 1);
+        assert_eq!(frame.refresh(), RefreshKind::Full);
+        assert_eq!(frame.region(), None);
+        assert_eq!(frame.duration_nanos(), Some(FULL_REFRESH_NANOS));
+        assert_eq!(frame.pixels().len(), 200 * 120);
         for value in [0u8, 85, 170, 255] {
-            assert!(frame.pixels.contains(&value), "{value}");
+            assert!(frame.pixels().contains(&value), "{value}");
         }
         assert!(
-            frame.pixels.iter().all(|p| [0, 85, 170, 255].contains(p)),
+            frame.pixels().iter().all(|p| [0, 85, 170, 255].contains(p)),
             "every pixel lies on a level"
         );
-        assert_eq!(panel.poll(&mut machine), None);
+        assert_eq!(panel.poll(&mut machine), Ok(None));
     }
 
     /// A pressed button is a partial refresh of the squares, its square filled; a release is
@@ -452,43 +452,46 @@ mod tests {
     fn a_button_is_a_partial_refresh_of_its_square() {
         let mut machine = machine();
         let (mut panel, mut buttons) = ports(PANEL, &BUTTONS);
-        let first = panel.poll(&mut machine).unwrap();
+        let first = panel.poll(&mut machine).unwrap().unwrap();
         buttons.set(&mut machine, "confirm", true).unwrap();
-        let pressed = panel.poll(&mut machine).expect("the press shows");
-        assert_eq!(pressed.generation, 2);
-        assert_eq!(pressed.refresh, RefreshKind::Partial);
-        let region = pressed.region.expect("a partial refresh names its region");
+        let pressed = panel.poll(&mut machine).unwrap().expect("the press shows");
+        assert_eq!(pressed.generation(), 2);
+        assert_eq!(pressed.refresh(), RefreshKind::Partial);
+        let region = pressed
+            .region()
+            .expect("a partial refresh names its region");
         // The middle of the second square: white before, black now.
         let x = region.x + SQUARE_PITCH + SQUARE / 2;
         let y = region.y + SQUARE / 2;
         let at = (y * 200 + x) as usize;
-        assert_eq!((first.pixels[at], pressed.pixels[at]), (WHITE, BLACK));
+        assert_eq!((first.pixels()[at], pressed.pixels()[at]), (WHITE, BLACK));
         // Pressing it again changes nothing.
         buttons.set(&mut machine, "confirm", true).unwrap();
-        assert_eq!(panel.poll(&mut machine), None);
+        assert_eq!(panel.poll(&mut machine), Ok(None));
         buttons.set(&mut machine, "confirm", false).unwrap();
-        let released = panel.poll(&mut machine).unwrap();
-        assert_eq!(released.pixels[at], WHITE);
+        let released = panel.poll(&mut machine).unwrap().unwrap();
+        assert_eq!(released.pixels()[at], WHITE);
         assert_eq!(
             buttons.set(&mut machine, "home", true),
             Err(ButtonError::Unknown { id: "home".into() })
         );
-        assert_eq!(panel.poll(&mut machine), None);
+        assert_eq!(panel.poll(&mut machine), Ok(None));
     }
 
     /// Each second of device time is a refresh of the bar, and every tenth refresh is full.
     #[test]
     fn device_time_fills_the_bar_and_every_tenth_refresh_is_full() {
         let (mut panel, _) = pattern(PANEL, &BUTTONS);
-        panel.poll_at(0).unwrap();
-        assert_eq!(panel.poll_at(NANOS_PER_SECOND - 1), None);
+        panel.poll_at(0).unwrap().unwrap();
+        assert_eq!(panel.poll_at(NANOS_PER_SECOND - 1), Ok(None));
         let mut kinds = Vec::new();
         for second in 1..=10u64 {
             let frame = panel
                 .poll_at(second * NANOS_PER_SECOND)
+                .unwrap()
                 .expect("a new second is a refresh");
-            assert_eq!(frame.generation, second + 1);
-            kinds.push(frame.refresh);
+            assert_eq!(frame.generation(), second + 1);
+            kinds.push(frame.refresh());
         }
         let full: Vec<u64> = kinds
             .iter()

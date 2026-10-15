@@ -17,16 +17,17 @@ const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
 /// The pixels of `frame` turned by `rotation`, and their width and height.
 #[must_use]
 pub fn rotated(frame: &PanelFrame, rotation: Rotation) -> (u32, u32, Vec<u8>) {
-    let (width, height) = (frame.width as usize, frame.height as usize);
-    let at = |x: usize, y: usize| frame.pixels.get(y * width + x).copied().unwrap_or(0);
+    let (frame_width, frame_height) = (frame.width(), frame.height());
+    let (width, height) = (frame_width as usize, frame_height as usize);
+    let at = |x: usize, y: usize| frame.pixels().get(y * width + x).copied().unwrap_or(0);
     match rotation {
-        Rotation::Deg0 => (frame.width, frame.height, frame.pixels.to_vec()),
+        Rotation::Deg0 => (frame_width, frame_height, frame.pixels().to_vec()),
         Rotation::Deg180 => {
             let pixels = (0..height)
                 .flat_map(|y| (0..width).map(move |x| (width - 1 - x, height - 1 - y)))
                 .map(|(x, y)| at(x, y))
                 .collect();
-            (frame.width, frame.height, pixels)
+            (frame_width, frame_height, pixels)
         }
         // Clockwise: the first line of the image is the first column of the panel, read from
         // its bottom.
@@ -35,14 +36,14 @@ pub fn rotated(frame: &PanelFrame, rotation: Rotation) -> (u32, u32, Vec<u8>) {
                 .flat_map(|x| (0..height).map(move |y| (x, height - 1 - y)))
                 .map(|(x, y)| at(x, y))
                 .collect();
-            (frame.height, frame.width, pixels)
+            (frame_height, frame_width, pixels)
         }
         Rotation::Deg270 => {
             let pixels = (0..width)
                 .flat_map(|x| (0..height).map(move |y| (width - 1 - x, y)))
                 .map(|(x, y)| at(x, y))
                 .collect();
-            (frame.height, frame.width, pixels)
+            (frame_height, frame_width, pixels)
         }
     }
 }
@@ -147,14 +148,14 @@ pub fn save(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::RefreshKind;
+    use crate::ports::{FrameParts, RefreshKind};
     use flate2::read::ZlibDecoder;
     use std::io::Read as _;
     use std::sync::Arc;
 
     /// 3 × 2: a, b, c / d, e, f.
     fn frame() -> PanelFrame {
-        PanelFrame {
+        PanelFrame::new(FrameParts {
             width: 3,
             height: 2,
             gray_levels: 4,
@@ -163,7 +164,8 @@ mod tests {
             region: None,
             duration_nanos: None,
             pixels: Arc::from([1u8, 2, 3, 4, 5, 6].as_slice()),
-        }
+        })
+        .unwrap()
     }
 
     #[test]

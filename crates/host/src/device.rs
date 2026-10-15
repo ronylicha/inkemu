@@ -1177,7 +1177,7 @@ impl Worker {
             self.tell(Update::Notice(notice));
         }
         if let Some(frame) = output.frame {
-            let (generation, refresh) = (frame.generation, frame.refresh);
+            let (generation, refresh) = (frame.generation(), frame.refresh());
             *self.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
             self.tell(Update::Frame {
                 generation,
@@ -1778,7 +1778,7 @@ mod tests {
             )),
             "{first:?}"
         );
-        assert_eq!(emulator.frame().map(|f| f.generation), Some(1));
+        assert_eq!(emulator.frame().map(|f| f.generation()), Some(1));
         let dir = tempfile::tempdir().unwrap();
         let png = dir.path().join("screen.png");
         emulator
@@ -2336,7 +2336,10 @@ mod tests {
             self.0.describe()
         }
 
-        fn poll(&mut self, machine: &mut Esp32C3) -> Option<PanelFrame> {
+        fn poll(
+            &mut self,
+            machine: &mut Esp32C3,
+        ) -> Result<Option<PanelFrame>, crate::ports::FrameError> {
             assert!(machine.flash_modified_sectors() == 0, "a panel port broke");
             self.0.poll(machine)
         }
