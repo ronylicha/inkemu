@@ -37,12 +37,16 @@ pub struct SocBus {
 mod debug;
 
 /// The address a watchpoint compares: an SRAM address of the instruction bus as its data-bus
-/// twin (the same cell), every other address as it is.
+/// twin, an address of the data-bus alias of the mask ROM as its instruction-bus one (the same
+/// cell, as `locate` routes them), every other address as it is.
 #[must_use]
 pub(crate) fn canonical(addr: u32) -> u32 {
-    match offset_in(addr, 1, SRAM_IBUS_BASE, SRAM_SIZE) {
-        Some(offset) => SRAM_DBUS_BASE + offset,
-        None => addr,
+    if let Some(offset) = offset_in(addr, 1, SRAM_IBUS_BASE, SRAM_SIZE) {
+        SRAM_DBUS_BASE + offset
+    } else if let Some(offset) = offset_in(addr, 1, DROM_BASE, DROM_SIZE) {
+        ROM_BASE + DROM_ROM_OFFSET + offset
+    } else {
+        addr
     }
 }
 

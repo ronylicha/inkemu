@@ -60,9 +60,11 @@ impl Stops for DebugStops {
     }
 
     /// A breakpoint stops the machine before its instruction, when the CPU is about to execute
-    /// it: not while the CPU waits in `wfi` (its `pc` is then the instruction after the `wfi`,
-    /// reached when an interrupt returns there), nor in a deep sleep or once the supply failed;
-    /// and not at the boundary the last call stopped at, which the machine leaves first.
+    /// it ([`cpu_rv32::Hart::executes_next`]): not while the CPU waits in `wfi` (its `pc` is then
+    /// the instruction after the `wfi`), nor when an interrupt is taken first (the machine stops
+    /// when the handler returns there), nor in a deep sleep or once the supply failed; and not
+    /// at the boundary the last call stopped at or the last step reached, which the machine
+    /// leaves first, as a debugger steps over the breakpoint it resumes from.
     #[inline]
     fn before(machine: &mut Esp32C3) -> Result<(), DebugStop> {
         if machine.breakpoints.is_empty() {
@@ -70,7 +72,7 @@ impl Stops for DebugStops {
         }
         let pc = machine.hart.pc;
         let executing = !machine.powered_down
-            && !machine.hart.is_waiting()
+            && machine.hart.executes_next()
             && machine.bus.periph.io.power_lost().is_none();
         if executing
             && machine.breakpoint_left != Some(pc)
@@ -212,6 +214,25 @@ mod tests {
             assert_eq!(m.x()[usize::from(T1)], count, "the increment before it ran");
             assert_eq!(word(&m, SRAM_DBUS_BASE), count - 1, "the store has not run");
         }
+    }
+
+    /// A step that ends on a breakpoint leaves it, as a stop at it does: the run that follows
+    /// executes it and stops there the next time round.
+    #[test]
+    fn a_run_after_a_step_onto_a_breakpoint_goes_past_it() {
+        let (program, [_, store, _]) = counting();
+        let mut m = machine(&program, &SocConfig::default());
+        m.set_breakpoints(&[at(store)]);
+        while m.pc() != at(store) {
+            m.step();
+        }
+        assert_eq!(m.x()[usize::from(T1)], 1);
+        assert_eq!(
+            m.run_stopping(FAR, None),
+            RunStop::Debug(DebugStop::Breakpoint { pc: at(store) })
+        );
+        assert_eq!(m.x()[usize::from(T1)], 2, "one turn of the loop, not none");
+        assert_eq!(word(&m, SRAM_DBUS_BASE), 1);
     }
 
     #[test]

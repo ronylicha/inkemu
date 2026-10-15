@@ -529,9 +529,19 @@ impl Esp32C3 {
     /// executes nothing, goes on to it, and reports the interrupt and the sleep met on the way
     /// with no [`Stepped::executed`]. A caller that adds the calls up until one returns no
     /// [`StopReason::Asleep`] gets what one call without the bound would have given.
+    ///
+    /// For a debugger: a step notes its own access to watched bytes only
+    /// ([`Esp32C3::take_watch_hit`]), and the run that follows it goes past a breakpoint at the
+    /// boundary it reached, as the run that follows a breakpoint stop does.
     pub fn step(&mut self) -> Stepped {
-        // A step notes its own access to watched bytes only ([`Esp32C3::take_watch_hit`]).
         self.bus.take_watch_hit();
+        let stepped = self.step_to_boundary();
+        self.breakpoint_left = Some(self.hart.pc);
+        stepped
+    }
+
+    /// [`Esp32C3::step`], without what it does for a debugger.
+    fn step_to_boundary(&mut self) -> Stepped {
         let mut slept = Slept::default();
         let mut stepped = Stepped {
             executed: None,

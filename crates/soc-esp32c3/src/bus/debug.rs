@@ -36,9 +36,19 @@ impl SocBus {
         }
     }
 
-    /// Watches the accesses `watches` cover from now on, in place of the ones before.
+    /// Watches the accesses `watches` cover from now on, in place of the ones before. An access
+    /// noted and not taken yet stays only if a watchpoint of the new list covers it: a cleared
+    /// watchpoint stops nothing any more.
     pub(crate) fn set_watches(&mut self, watches: &[Watch]) {
         self.watches = watches.to_vec();
+        if let Some(hit) = self.watch_hit
+            && !self
+                .watches
+                .iter()
+                .any(|watch| watch.covers(canonical(hit.address), u32::from(hit.size), hit.access))
+        {
+            self.watch_hit = None;
+        }
     }
 
     /// The access noted since the last call, if any; the next access to watched bytes is noted
@@ -87,8 +97,8 @@ mod tests {
     use crate::debug::WatchOn;
     use crate::flash::NorFlash;
     use crate::memmap::{
-        FLASH_DBUS_BASE, FLASH_IBUS_BASE, PERIPH_BASE, ROM_BASE, RTC_RAM_BASE, SRAM_DBUS_BASE,
-        SRAM_IBUS_BASE, SRAM0_BASE,
+        DROM_BASE, DROM_ROM_OFFSET, FLASH_DBUS_BASE, FLASH_IBUS_BASE, PERIPH_BASE, ROM_BASE,
+        RTC_RAM_BASE, SRAM_DBUS_BASE, SRAM_IBUS_BASE, SRAM0_BASE,
     };
     use crate::periph::mmu::{MMU_ENTRY_INVALID, MMU_TABLE_BASE};
     use crate::test_support::flat_rom;
@@ -167,6 +177,34 @@ mod tests {
         b.read(SRAM_IBUS_BASE + 0x40, AccessSize::Word, AccessKind::Load)
             .unwrap();
         assert!(b.take_watch_hit().is_some());
+    }
+
+    #[test]
+    fn the_rom_is_watched_through_its_data_bus_alias() {
+        let mut b = bus();
+        // The data-bus alias shows the ROM from its offset `DROM_ROM_OFFSET`.
+        b.set_watches(&[watch(ROM_BASE + DROM_ROM_OFFSET + 8, 4, WatchOn::Read)]);
+        b.read(DROM_BASE + 8, AccessSize::Word, AccessKind::Load)
+            .unwrap();
+        assert_eq!(
+            b.take_watch_hit().map(|hit| hit.address),
+            Some(DROM_BASE + 8)
+        );
+    }
+
+    #[test]
+    fn a_noted_access_a_cleared_watchpoint_covered_is_forgotten() {
+        let mut b = bus();
+        let kept = watch(SRAM_DBUS_BASE, 4, WatchOn::Write);
+        b.set_watches(&[kept, watch(SRAM_DBUS_BASE + 16, 4, WatchOn::Write)]);
+        b.write(SRAM_DBUS_BASE, AccessSize::Word, 1).unwrap();
+        b.set_watches(&[kept]);
+        assert!(b.take_watch_hit().is_some(), "still covered: kept");
+        b.write(SRAM_DBUS_BASE, AccessSize::Word, 2).unwrap();
+        b.set_watches(&[watch(SRAM_DBUS_BASE + 16, 4, WatchOn::Write)]);
+        assert_eq!(b.take_watch_hit(), None, "its watchpoint cleared: gone");
+        b.write(SRAM_DBUS_BASE + 16, AccessSize::Word, 3).unwrap();
+        assert!(b.take_watch_hit().is_some(), "and the next access is noted");
     }
 
     #[test]
