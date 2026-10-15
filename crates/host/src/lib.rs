@@ -27,6 +27,7 @@ pub mod flash_state;
 pub mod launch;
 pub mod pattern;
 pub mod ports;
+pub mod ports_wired;
 pub mod record;
 pub mod rom_store;
 pub mod run;

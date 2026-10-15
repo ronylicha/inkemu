@@ -5,8 +5,9 @@
 //! §10.3): the ROM, the bootloader and the application run, the firmware's boot lines reach
 //! standard output, and what the model still lacks is a warning that names it, never a silent
 //! stop. Since sub-project 2b models the GPIO matrix, GP-SPI2, I2C0 and the SAR ADC, `CrossPoint`
-//! runs to its idle loop with no warning at all, and the stock firmware reads its buttons and goes
-//! back to deep sleep, waiting for the power button that sub-project 2d wires.
+//! runs to its idle loop with no warning at all; since sub-project 2d wires the board, the stock
+//! firmware stays on while the gesture of the profile holds its power button, and turns itself off
+//! when the button is let go at once.
 //!
 //! Neither file is in this repository, is downloaded or is run anywhere but here, on the machine of
 //! a user who has it: these tests run nowhere in the CI. Each one reads the path of its file from
@@ -43,7 +44,8 @@ const STOCK_X4_FLASH_SHA256: &str =
     "03866a1fc23a6a624469f508da3a747159b2315303b98779fd8161276a989a88";
 
 /// The device time each run is given: `CrossPoint` reaches its idle loop at 2.3 s, the stock
-/// firmware goes to deep sleep at 0.64 s (measured 2026-10-15, release build).
+/// firmware turns itself off at 0.64 s when its power button is let go at once (measured
+/// 2026-10-15, release build).
 const SECONDS: &str = "5";
 
 /// The panic of the interrupt watchdog of ESP-IDF, the same text in v4.4 and v5.5
@@ -173,14 +175,6 @@ impl Run {
             without_stack_dump(&self.console)
         );
     }
-
-    /// The warnings of the run, without their prefix.
-    fn warnings(&self) -> Vec<&str> {
-        self.log
-            .lines()
-            .filter_map(|line| line.strip_prefix("warning: "))
-            .collect()
-    }
 }
 
 /// `CrossPoint` 1.6.5 from its release asset, without a console option: the ROM, the bootloader
@@ -234,15 +228,14 @@ fn crosspoint_1_6_5_x3_x4_runs_to_its_idle_loop_without_a_warning() {
     strict.assert_no_warning_and_no_panic();
 }
 
-/// The stock firmware of the X4 from a dump of a unit, without a console option: its bootloader
-/// (silent) and its application (ESP-IDF v4.4.7), which reads the SAR ADC and the buttons, finds
-/// the power button released and goes back to deep sleep with only the GPIO wake enabled, as an
-/// X4 does when nothing holds its power button: the run ends there, the one warning naming the
-/// wake that sub-project 2d models. Under `--strict-mmio` the run stops on that warning.
+/// The stock firmware of the X4 from a dump of a unit, without a console option, powered on by the
+/// gesture of the X4 profile (the power button held 1.5 s, sub-project 2d): its bootloader
+/// (silent) and its application (ESP-IDF v4.4.7), which finds the power button held, keeps its
+/// supply latched and stays on to the time limit, with no warning and no panic. Under
+/// `--strict-mmio` the run is the same run.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_STOCK_X4_FLASH (a file of the user's)"]
-fn the_stock_x4_firmware_goes_back_to_deep_sleep_without_its_power_button() {
-    const GPIO_WAKE: &str = "the chip went into deep sleep with wake sources inkemu does not model (WAKEUP_ENA 0x00004, pc ";
+fn the_stock_x4_firmware_stays_on_when_its_power_button_is_held() {
     let file = pinned_file(
         "INKEMU_STOCK_X4_FLASH",
         "/path/to/x4-stock-3.0.2-en-flash.bin",
@@ -255,32 +248,44 @@ fn the_stock_x4_firmware_goes_back_to_deep_sleep_without_its_power_button() {
         "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
     ]);
     assert!(
+        lenient
+            .log
+            .contains("\ninkemu: device-time limit reached; "),
+        "{}",
+        lenient.log
+    );
+    lenient.assert_no_warning_and_no_panic();
+    let strict = Run::of(&run("--flash", &file, &["--strict-mmio"]));
+    assert_eq!(strict.code, Some(0), "{}", strict.log);
+    strict.assert_no_warning_and_no_panic();
+}
+
+/// The same firmware with `--power-hold 0`, as when the power button is let go at once: it reads
+/// its buttons, finds the power button released and lets go of the latch of its supply; with no
+/// cable the board cuts the supply and the run ends there (0.64 s of device time, measured
+/// 2026-10-15), with no warning: the X4 is off, as a real one is.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_STOCK_X4_FLASH (a file of the user's)"]
+fn the_stock_x4_firmware_turns_itself_off_when_its_power_button_is_let_go() {
+    let file = pinned_file(
+        "INKEMU_STOCK_X4_FLASH",
+        "/path/to/x4-stock-3.0.2-en-flash.bin",
+        STOCK_X4_FLASH_SHA256,
+    );
+    let lenient = Run::of(&run("--flash", &file, &["--power-hold", "0"]));
+    assert_eq!(lenient.code, Some(0), "{}", lenient.log);
+    lenient.assert_in_order(&[
+        "ESP-ROM:esp32c3-api1-20210207\n",
+        "rst:0x1 (POWERON),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+    ]);
+    assert!(
         lenient.log.contains(
-            "\ninkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here\n"
+            "\ninkemu: the device powered off: its board cut its supply, so the run ends here; "
         ),
         "{}",
         lenient.log
     );
-    let warnings = lenient.warnings();
-    assert!(
-        warnings.len() == 1 && warnings[0].starts_with(GPIO_WAKE),
-        "{}",
-        lenient.log
-    );
-    assert!(
-        !lenient.console.contains(INTERRUPT_WATCHDOG_PANIC),
-        "{}",
-        without_stack_dump(&lenient.console)
-    );
-    let strict = Run::of(&run("--flash", &file, &["--strict-mmio"]));
-    assert_eq!(strict.code, Some(3), "{}", strict.log);
-    let stop = strict
-        .log
-        .lines()
-        .find_map(|line| line.strip_prefix("inkemu: stopped by --strict-mmio: "))
-        .unwrap_or_else(|| panic!("no strict stop:\n{}", strict.log));
-    // A strict run is the lenient run up to its first warning: the two runs agree on it.
-    assert_eq!(stop, warnings[0], "{}", strict.log);
+    lenient.assert_no_warning_and_no_panic();
 }
 
 /// A failure quotes the console without the stack dump of the panic, and says how many lines it

@@ -142,8 +142,10 @@ cs = 12
 miso = 7
 
 # On battery the X4 starts only while its power key is held, and CrossPoint checks it still is.
-# ASSUMPTION: how long a user holds it; CrossPoint verifies 10 ms, the stock firmware's minimum is
-# not known.
+# ASSUMPTION: how long a user holds it. CrossPoint verifies 10 ms; the stock firmware 3.0.2 holds
+# its latch only after about a second of device time (measured 2026-10-15 on the model: a hold of
+# 1000 ms lets the X4 go off when the key is let go, 1200 ms keeps it on), so a user holds it
+# longer than that.
 [power]
 key = "power"
-hold_ms = 1000
+hold_ms = 1500

@@ -217,7 +217,7 @@ fn powering_the_x4_on_journals_the_press_and_release_of_its_power_key_and_the_ca
         board_inputs(&wired.machine),
         [
             (Cycles::ZERO, press(1)),
-            (cycles(1_000 * MILLISECOND), press(0))
+            (cycles(1_500 * MILLISECOND), press(0))
         ],
         "the profile's hold"
     );

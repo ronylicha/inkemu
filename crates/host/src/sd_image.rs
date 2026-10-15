@@ -491,6 +491,12 @@ impl SdImage {
         &self.shown
     }
 
+    /// The path of the image, as it was opened: for the refusals of the other files of the run.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The capacity of the card the image is.
     #[must_use]
     pub fn capacity(&self) -> Capacity {

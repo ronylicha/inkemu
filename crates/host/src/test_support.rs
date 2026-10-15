@@ -42,11 +42,16 @@ struct LoopingDevice {
 }
 
 impl Recipe for LoopingDevice {
-    fn power_on(&mut self, _flash: Option<Vec<u8>>, _: bool) -> Result<Life, PowerOnError> {
+    fn power_on(
+        &mut self,
+        _flash: Option<Vec<u8>>,
+        _: bool,
+        _: Option<boards::SdStart>,
+    ) -> Result<Life, PowerOnError> {
         let mut program = stop_watchdogs();
         program.push(HANG);
-        let look = catalog::look("x4");
-        let (panel, buttons) = pattern::ports(look.panel, look.buttons);
+        let look = x4_pattern_look();
+        let (panel, buttons) = pattern::ports(look.panel, &look.buttons);
         Ok(Life {
             machine: Esp32C3::new(flat_rom(&program), &SocConfig::default()),
             panel: Box::new(SlowToEnd {
@@ -54,8 +59,31 @@ impl Recipe for LoopingDevice {
                 slow_end: self.slow_end,
             }),
             buttons,
+            sd: None,
         })
     }
+}
+
+/// The look of the X4 behind the test pattern: its panel and its keys, drawn by the pattern.
+fn x4_pattern_look() -> catalog::Look {
+    let mut look = boards::builtin("x4").map_or_else(
+        |_| catalog::Look {
+            panel: crate::ports::PanelDescription {
+                width: 800,
+                height: 480,
+                shades: crate::ports::Shades::Levels(4),
+                rotation: crate::ports::Rotation::Deg90,
+                origin: crate::ports::PanelOrigin::TestPattern,
+                approximate: false,
+            },
+            buttons: Vec::new(),
+        },
+        |x4| catalog::look(&x4),
+    );
+    look.panel.origin = crate::ports::PanelOrigin::TestPattern;
+    look.panel.shades = crate::ports::Shades::Levels(4);
+    look.panel.approximate = false;
+    look
 }
 
 /// A run of the looping device, with no flash file and no limit, whose power-off lasts at least
@@ -66,7 +94,7 @@ pub fn looping_device(slow_end: Duration) -> Launch {
         Box::new(LoopingDevice { slow_end }),
         FlashKeeper::without_file(None, 4 << 20),
         Limits::default(),
-        catalog::look("x4"),
+        x4_pattern_look(),
         None,
     )
 }

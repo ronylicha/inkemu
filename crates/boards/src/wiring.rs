@@ -663,7 +663,7 @@ mod tests {
             wiring.gesture,
             Some(PowerGesture {
                 key: "power".to_owned(),
-                hold_ms: 1000
+                hold_ms: 1500
             })
         );
         let power = &wiring.keys[0];
