@@ -40,9 +40,12 @@ pub struct SocBus {
     /// cache misses, so the note costs one bit set per decoding, not per instruction executed.
     /// Every reset keeps it: it is the history of the machine, not a state of the chip.
     executed: PageSet,
+    /// The register accesses of the CPU by block, for a resource monitor ([`usage`]).
+    registers: usage::RegisterAccesses,
 }
 
 mod debug;
+mod usage;
 
 /// The address a watchpoint compares: an SRAM address of the instruction bus as its data-bus
 /// twin, an address of the data-bus alias of the mask ROM as its instruction-bus one (the same
@@ -157,6 +160,7 @@ impl SocBus {
             watches: Vec::new(),
             watch_hit: None,
             executed: PageSet::default(),
+            registers: usage::RegisterAccesses::new(),
         }
     }
 
@@ -342,6 +346,7 @@ impl SocBus {
             return Err(BusError::Misaligned { addr, size });
         }
         let reg_addr = addr & !(REGISTER_BYTES - 1);
+        self.note_register(reg_addr, Access::Read);
         let modelled = self
             .periph
             .device(reg_addr)
@@ -363,6 +368,7 @@ impl SocBus {
             return Err(BusError::Misaligned { addr, size });
         }
         let reg_addr = addr & !(REGISTER_BYTES - 1);
+        self.note_register(reg_addr, Access::Write);
         let word = (value & size_mask(size)) << (8 * (addr - reg_addr));
         if size != AccessSize::Word {
             self.ctx.diag.record(Diagnostic::SubWordWrite {

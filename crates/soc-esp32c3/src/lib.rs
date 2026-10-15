@@ -5,8 +5,8 @@
 //! image built from an Espressif ROM ELF ([`rom`]), the address space that routes each access to
 //! the ROM, the RAMs, the flash windows or a peripheral ([`bus`]), the modelled peripherals
 //! ([`periph`]), the diagnostics that report what is not modelled ([`diag`]), the machine that
-//! runs one hart on all of it ([`machine`]) and the journal of the inputs it accepted
-//! ([`inputs`]).
+//! runs one hart on all of it ([`machine`]), the journal of the inputs it accepted ([`inputs`]),
+//! and what it counts of its own use for a resource monitor ([`usage`]).
 //!
 //! This crate performs no host I/O (no file, network or clock): callers hand it bytes.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -27,6 +27,7 @@ pub mod reset;
 pub mod rom;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+pub mod usage;
 
 pub use chip::ChipRevision;
 pub use config::{CompatActs, QemuCompat, SocConfig, Timing};
@@ -46,3 +47,4 @@ pub use machine::{
 pub use periph::io::MAX_PENDING_BOARD_INPUTS;
 pub use periph::{AttachError, SpiWires, UsbHost};
 pub use rom::{RomError, RomImage};
+pub use usage::Usage;
