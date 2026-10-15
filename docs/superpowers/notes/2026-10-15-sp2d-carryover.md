@@ -109,7 +109,10 @@ le neutralisant puis en le rétablissant).
   `a_record_the_card_refuses_gives_the_card_s_remedy_not_a_reset`, et celui de `CardKeeper` dans `sd_run`.
 - **R2** : `OpenedSd` tient l'image ouverte et sait si ce lancement l'a créée ; un refus après sa création (par
   `SdImage::open` ou par l'acceptation du fichier de flash) ferme l'image puis supprime cette image vierge, et
-  seulement elle (`open_the_card_and_accept_the_flash`).
+  seulement elle (`open_the_card_and_accept_the_flash`, `OpenedSd::refused`). Une suppression qui échoue est dite
+  avec le refus (`LaunchError::BlankImageLeft`, qui garde le genre du refus) : le chemin de l'image, la cause, et que
+  l'utilisateur peut l'effacer (test `a_blank_image_a_refused_start_cannot_remove_is_said_with_the_refusal`, dossier
+  non inscriptible au nettoyage).
 - **R3** : la CLI ouvre la carte après la ROM, comme l'application ; le contrôle qui n'ouvre aucun fichier (la carte
   n'est aucun fichier de la run, ni ses journaux) est fait avant la ROM dans les deux
   (`SdImage::refuse_the_files_of_the_run`, factorisé d'`open`). Le test CLI qui l'exigeait avant la ROM reste vrai ;
@@ -215,10 +218,9 @@ relectures (`870286a`, `2f645ab`), avec les cinq suites de référence.
   le chemin qu'elle prend dans `host` (`device::power_on`, `Emulator`, ports, captures) est celui des tests locaux de
   CrossPoint et du firmware d'origine, qui écrivent ce que l'écran montre.
 - La durée du geste est une mesure sur le modèle, pas sur un appareil.
-- R2 : une image vierge qu'un lancement refusé n'arrive pas à supprimer reste en place sans que rien ne le dise (le
-  refus du lancement est déjà rapporté ; rien de l'utilisateur n'est perdu). Le refus d'`SdImage::open` juste après une
-  création n'est pas reproductible par un test (`create_blank` vérifie les mêmes chemins) : le test passe par le refus
-  du fichier de flash, qui exerce le même garde.
+- R2 : le refus d'`SdImage::open` juste après une création n'est pas reproductible par un test (`create_blank`
+  vérifie les mêmes chemins) : le test passe par le refus du fichier de flash, qui exerce le même chemin
+  (`OpenedSd::refused`).
 - L'écran est une approximation (formes d'onde construites, optique supposée) ; les tests comparent au modèle, pas au
   verre d'un X4.
 - CrossPoint et le firmware d'origine ne tournent qu'en local ; la CI tient le même chemin avec `x4_panel_buttons`.
@@ -233,7 +235,7 @@ Fichiers de la cartographie du projet à mettre à jour (la mémoire n'a pas ét
 | Fichier | Ce qui change |
 |---|---|
 | `architecture_overview.md` | SP2d fait : `boards::Wired` (machine câblée), entrées de la carte par la machine, `Supply` et `PowerOff`, réveil par broche, format de session 2 ; ADR 0013 |
-| `backend_models.md` | `emu-core` : `BoardInput`, `BoardInputs`, `Supply` ; `soc-esp32c3` : `Wake` (`RtcTimer`, `Pins`), `Diagnostic::Reset.woken_by`, `InputError::BeyondTime` ; `boards` : `Wiring`, `Wired`, `WiredOptions`, `WiredError`, `PanelHandle`, `ButtonsHandle`, `SdHandle`, `SdStart`, `BoardRequest` ; `host::ports` : `Shades`, `PanelDescription.approximate`, `ButtonError::Refused` (sans `NotInSession`), `PowerOnError::Device` ; `host::device` : `Setup.usb_power`, `Setup.sd`/`SdSetup`, `LaunchError::SdImage`, `LaunchError::Board`, `CommandError::NotRecorded`, `CommandError::SdCard` (genre `sdCard`), `Recipe::power_on_by_key` ; `host::sd_run::CardKeeper` (changements de carte non écrits, en surcouche) ; `host::catalog` : `DeviceView.sd_slot` (`SdSlotView`, `SdSlotView::OF_A_DEVICE`) ; `RunEnd::PowerOff` |
+| `backend_models.md` | `emu-core` : `BoardInput`, `BoardInputs`, `Supply` ; `soc-esp32c3` : `Wake` (`RtcTimer`, `Pins`), `Diagnostic::Reset.woken_by`, `InputError::BeyondTime` ; `boards` : `Wiring`, `Wired`, `WiredOptions`, `WiredError`, `PanelHandle`, `ButtonsHandle`, `SdHandle`, `SdStart`, `BoardRequest` ; `host::ports` : `Shades`, `PanelDescription.approximate`, `ButtonError::Refused` (sans `NotInSession`), `PowerOnError::Device` ; `host::device` : `Setup.usb_power`, `Setup.sd`/`SdSetup`, `LaunchError::SdImage`, `LaunchError::Board`, `LaunchError::BlankImageLeft` (`kind()` n'est plus `const`), `CommandError::NotRecorded`, `CommandError::SdCard` (genre `sdCard`), `Recipe::power_on_by_key` ; `host::sd_run::CardKeeper` (changements de carte non écrits, en surcouche) ; `host::catalog` : `DeviceView.sd_slot` (`SdSlotView`, `SdSlotView::OF_A_DEVICE`) ; `RunEnd::PowerOff` |
 | `backend_services.md` | `boards::wiring`, `boards::wired`, `boards::check_board_request` (CLI, `Wired::power_on`, `device::power_on`) ; `host::ports_wired`, `host::catalog` (`look(&DeviceProfile)`, `life_of`, `ports_of`), `host::sd_run` ; `Engine::finish` qui lit la carte en place, `Worker.card` (`CardKeeper` : la vie suivante lit les changements non écrits, chaque fin de vie et l'extinction réessaient), `Emulator::holds_sd_image` ; `device::power_on` : `SdImage::refuse_the_files_of_the_run` avant la ROM, `open_the_card_and_accept_the_flash` et `OpenedSd` (une image vierge d'un lancement refusé est supprimée) ; enveloppe : `after_the_power_offs` (un lancement attend les extinctions en cours) ; `chips::ssd1677::lines`, échelles, batterie, bouton poussoir, `SdLines` ; `IoMatrix::millivolts`/`spi_transfer` qui appliquent d'abord les entrées dues |
 | `backend_controllers.md`, `api_routes.md` | `inkemu run --power-hold`, `--usb-power`, `--sd-image`, `--sd-read-only` (refusées d'abord sur un appareil sans la ligne ; l'image ouverte après la ROM, ses chemins contrôlés avant, comme dans l'application) ; ligne « the device powered off… » (code 0) ; ligne de reset « woken from deep sleep by GPIO3 » ; ligne `sd card:` du résumé ; scripts `press`/`release` ; `x4_panel_buttons` et ses tests (`boards` `reference_panel` 2, `run_cli reference_firmware` 16, `rom-boot` 30 tests ignorés de `run_cli`) ; `INKEMU_X4_PANEL_APP` ; genres d'erreur `board` et `notRecorded` de l'enveloppe |
 | `database_schema.md` | session `inkemu-session 2` (entrées de carte, étiquette 4 ; carte SD de départ) ; image de carte écrite en place par son journal |

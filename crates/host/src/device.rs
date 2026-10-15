@@ -161,13 +161,21 @@ pub enum LaunchError {
     /// The setup asks the board for a line the device has not: a card, the cable (H6).
     #[error("{0}")]
     Board(#[from] boards::WiredError),
+    /// `refusal`, after which the blank SD image the start made could not be removed: `notice`
+    /// gives its path, why, and that the user may delete it (R2).
+    #[error("{refusal}\n{notice}")]
+    BlankImageLeft {
+        refusal: Box<LaunchError>,
+        notice: String,
+    },
 }
 
 impl LaunchError {
-    /// A stable name of what was refused.
+    /// A stable name of what was refused: that of the refusal, whatever it left behind.
     #[must_use]
-    pub const fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
+            LaunchError::BlankImageLeft { refusal, .. } => refusal.kind(),
             LaunchError::Profile(_) => "profile",
             LaunchError::RecordPath(_) => "recordPath",
             LaunchError::FlashFile(_) => "flashFile",
@@ -503,7 +511,8 @@ impl Launch {
 }
 
 /// The SD image a start opened. A blank image the start made is removed when the start is refused
-/// before the run holds it, and only that one: an image the user gave is never removed (R2).
+/// before the run holds it ([`OpenedSd::refused`]), and only that one: an image the user gave is
+/// never removed; one that cannot be removed is said with the refusal (R2).
 #[derive(Default)]
 struct OpenedSd {
     image: Option<SdImage>,
@@ -513,20 +522,29 @@ struct OpenedSd {
 
 impl OpenedSd {
     /// The image, for the run that holds it from now on: nothing is removed.
-    fn into_image(mut self) -> Option<SdImage> {
-        self.made = None;
-        self.image.take()
+    fn into_image(self) -> Option<SdImage> {
+        self.image
     }
-}
 
-impl Drop for OpenedSd {
-    fn drop(&mut self) {
-        // Closed and unlocked first: a file still open cannot be removed on every system. A
-        // removal that fails leaves a blank image, which the refusal of the start already
-        // explains; nothing of the user's is lost.
-        drop(self.image.take());
-        if let Some(path) = self.made.take() {
-            let _ = std::fs::remove_file(path);
+    /// `refusal`, the refusal of the start, once the image is closed and the blank image the
+    /// start made removed. A removal that fails is said with the refusal, by the path of the
+    /// image and its cause: the user may delete it.
+    fn refused(self, refusal: LaunchError) -> LaunchError {
+        // Closed and unlocked first: a file still open cannot be removed on every system.
+        drop(self.image);
+        let Some(path) = self.made else {
+            return refusal;
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => refusal,
+            Err(e) => LaunchError::BlankImageLeft {
+                refusal: Box::new(refusal),
+                notice: format!(
+                    "warning: the blank SD image {} this start made could not be removed: {}; nothing of yours is in it, so you may delete it",
+                    sanitize(&path.display().to_string()),
+                    sanitize(&e.to_string())
+                ),
+            },
         }
     }
 }
@@ -541,8 +559,10 @@ fn open_the_card_and_accept_the_flash(
     log: &mut Vec<u8>,
 ) -> Result<Option<SdImage>, LaunchError> {
     let opened = open_sd(setup, flash, rom, log)?;
-    if let Some(run_flash) = run_flash {
-        run_flash.accept(log)?;
+    if let Some(run_flash) = run_flash
+        && let Err(e) = run_flash.accept(log)
+    {
+        return Err(opened.refused(e.into()));
     }
     Ok(opened.into_image())
 }
@@ -607,10 +627,10 @@ fn open_sd(
     } else {
         Access::ReadWrite
     };
-    opened.image = Some(
-        SdImage::open(&sd.path, access, &claimed, log)
-            .map_err(|e| LaunchError::SdImage(e.to_string()))?,
-    );
+    match SdImage::open(&sd.path, access, &claimed, log) {
+        Ok(image) => opened.image = Some(image),
+        Err(e) => return Err(opened.refused(LaunchError::SdImage(e.to_string()))),
+    }
     Ok(opened)
 }
 
@@ -2983,6 +3003,44 @@ mod tests {
             assert_eq!(refused.kind(), "flashFile", "{refused}");
             assert_eq!(card.exists(), create_mib.is_none(), "{}", card.display());
         }
+    }
+
+    /// R2: a blank image a refused start cannot remove (its directory takes no change at the
+    /// cleanup) is said with the refusal: its path, why, and that the user may delete it. The
+    /// refusal keeps its kind.
+    #[cfg(unix)]
+    #[test]
+    fn a_blank_image_a_refused_start_cannot_remove_is_said_with_the_refusal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("cards");
+        std::fs::create_dir(&place).unwrap();
+        let card = place.join("new.img");
+        std::fs::File::create(&card).unwrap();
+        let made = || OpenedSd {
+            image: None,
+            made: Some(card.clone()),
+        };
+        let refusal = || LaunchError::SdImage("the start is refused".to_owned());
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = made().refused(refusal());
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(refused.kind(), "sdImage");
+        let text = refused.to_string();
+        assert!(
+            text.starts_with("the start is refused\nwarning: the blank SD image ")
+                && text.contains(&card.display().to_string())
+                && text.contains("this start made could not be removed: ")
+                && text.ends_with("nothing of yours is in it, so you may delete it"),
+            "{text}"
+        );
+        assert!(card.exists());
+        // Removable, the refusal alone is said, and the image is gone.
+        assert_eq!(
+            made().refused(refusal()).to_string(),
+            "the start is refused"
+        );
+        assert!(!card.exists());
     }
 
     /// H6: a card or the cable asked of a device without the line is refused first, before the
