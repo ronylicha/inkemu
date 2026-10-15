@@ -93,7 +93,11 @@ Esp32C3::inputs_changed()
   l'échéance est venue. Une puce n'est avancée qu'une fois par instant : une échéance qui n'est pas après cet instant
   est reprise au cycle suivant de la base de temps (pas de boucle sur un cycle ; une puce toujours due est avancée à
   chaque cycle). L'instant passé à `advance` est exactement le premier cycle de la base de temps (6,25 ns) à
-  l'échéance ou après quand le CPU attend ; au plus tard la fin de l'instruction en cours quand il exécute.
+  l'échéance ou après quand le CPU attend ; au plus tard la fin de l'instruction en cours quand il exécute. Une puce
+  toujours due empêche un sommeil profond de finir faute de réveil (seuls `--max-time` ou le domaine RTC l'arrêtent)
+  et, restée due après 1 000 avances de suite (`STUCK_CLOCKED_INSTANTS`), elle est nommée une fois
+  (`Diagnostic::ClockedChipStuck`, un avertissement qui n'arrête pas une exécution stricte). Une échéance au même
+  instant que l'appel RTC avance la puce une fois, puis le réveil fait son reset.
 - **`next_change`** n'est demandé que si une interruption GPIO est configurée sur la broche ; sans elle, un niveau se
   relit à la lecture suivante. Le temps propre d'une puce passe par `Clocked`, pas par `next_change`.
 - **SPI.** Une sélection peut venir sans trame (2b-R6) ; avec le CS matériel, sélection, transfert et désélection sont
@@ -153,7 +157,8 @@ Fichiers et types à reporter dans la cartographie du projet :
   InputTaken, NoAnalogChannel, AnalogTaken), SpiWires {sclk, mosi, miso, cs, dc}}` ; `diag::{Spi2Refusal (Dma,
   MultiLine, Dummy, ThreeWire, CommandLength, AddressLength, DataLength, Slave, Segmented), I2cRefusal (Slave,
   NonFifo, Clock, StartWhileRunning), AdcRefusal (Scan, BothUnits, StartWhileConverting, Clock)}` et les `Unsupported::{PadSignal,
-  PadInterrupt, Spi2, I2c, Adc}` ; `ctx::Module::{Spi2, I2c0, ApbSaradc}`, `ctx::Event::{Pins, Spi2, I2c0, SarAdc}`.
+  PadInterrupt, Spi2, I2c, Adc}` ; `Diagnostic::ClockedChipStuck { chip }` et `diag::STUCK_CLOCKED_INSTANTS` (1 000) ;
+  `ctx::Module::{Spi2, I2c0, ApbSaradc}`, `ctx::Event::{Pins, Spi2, I2c0, SarAdc}`.
 - `backend_services.md` : `periph/io/` (`IoMatrix` : GPIO et IO MUX, `pad.rs` résolution des broches et niveaux de
   repos des signaux, interruptions GPIO source 16, `Event::Pins` pour les changements annoncés et les échéances des
   puces `Clocked` (`ClockedChip`, une avance par instant), `spi_transfer`, `millivolts`) remplace
