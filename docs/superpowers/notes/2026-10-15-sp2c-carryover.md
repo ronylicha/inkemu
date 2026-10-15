@@ -130,6 +130,13 @@ passes complètes), `vite build` ; l'enveloppe : fmt, clippy `-D warnings`, `car
 `cargo deny check` (avis, interdits, licences, sources : ok) ; la fenêtre lancée puis arrêtée par `SIGTERM` sort en
 130 (le gestionnaire a éteint puis quitté ; sans lui, 143).
 
+Après la fusion de `main` `7d3e56f` (SP1b-4f, SP2a) : `cargo check --workspace --all-targets` ; `cargo fmt --all
+--check` ; clippy `-D warnings` sur `host`, `emu-cli` et `cpu-rv32` ; `cargo test -p host -p emu-cli` : `host` 259,
+`emu-cli` 8, 5, 7, 2, 1, `riscv_tests` 7 (un de plus venu de 4f), `run_cli` 62 et 42 ignorés, `rvtest_cli` 9 ; le
+front : Biome, `tsc`, Vitest 67 tests ; l'enveloppe : clippy `--locked -D warnings`, `cargo test --locked` (5). `host`
+n'a pas de `clippy.toml` : il fait des E/S par conception et n'est pas dans la liste de `host_io_ban.rs` (7 crates,
+`chips` comprise).
+
 **Non fait ici, laissé à la CI** : `cargo test --workspace`, la couverture, les autres suites ignorées, `cargo deny`
 de l'espace de travail racine, l'étape WebAssembly, le job `app` lui-même. **Non vérifié du tout** : l'interface dans une vraie session utilisateur
 (clics, rendu de la mire, capture) — aucun outil de pilotage de WebKitGTK n'est en place ; le bundle Tauri n'a pas été
