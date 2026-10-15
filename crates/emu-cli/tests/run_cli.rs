@@ -4768,10 +4768,15 @@ fn x4_runs_the_coremark_reference_firmware_within_15_percent_of_the_published_sc
     }
     assert!(!console.contains("ERROR!"), "score {score}:\n{console}");
     // The firmware's line above is its configuration (`CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`); this
-    // one is the clock inkemu's CPU ran at, which turns the timing model's cycles into time.
+    // one is the clock of inkemu's CPU at the end of the run, as its summary prints it, whether
+    // the CPU is asleep then (`; the CPU is asleep, …` follows) or not (the line ends there). It
+    // is not the clock of the timed part of CoreMark, which no line of the summary gives.
     assert!(
-        log.contains("; CPU clock at 160 MHz;"),
-        "inkemu's CPU did not end at 160 MHz (score {score}):\n{log}"
+        log.lines().any(|line| {
+            line.split_once("; CPU clock at 160 MHz")
+                .is_some_and(|(_, rest)| rest.is_empty() || rest.starts_with(';'))
+        }),
+        "inkemu's CPU was not at 160 MHz at the end of the run (score {score}):\n{log}"
     );
     let iterations = coremark_iterations_with_known_final_crc(&console, score);
     let ticks: f64 = coremark_field(&console, "Total ticks      :")
