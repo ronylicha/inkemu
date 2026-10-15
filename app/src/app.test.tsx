@@ -83,6 +83,15 @@ describe("App", () => {
     expect(open).toHaveFocus();
   });
 
+  it("tells the shell its language at once and at every change, for the dialog before closing", async () => {
+    const host = fakeHost();
+    const user = userEvent.setup();
+    renderWith(<App />, { host, language: "fr" });
+    await waitFor(() => expect(host.setLanguage).toHaveBeenCalledWith("fr"));
+    await user.selectOptions(screen.getByRole("combobox", { name: "Langue" }), "en");
+    await waitFor(() => expect(host.setLanguage).toHaveBeenLastCalledWith("en"));
+  });
+
   /** Powers the fake device on from the dialog, its first file chosen. */
   async function powerOn(user: ReturnType<typeof userEvent.setup>) {
     await user.click(screen.getByRole("button", { name: "Power on…" }));

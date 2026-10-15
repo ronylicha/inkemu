@@ -13,10 +13,38 @@ use std::sync::{Mutex, PoisonError};
 use tauri::State;
 use tauri::ipc::{Channel, Response};
 
-/// The emulator the window drives, if one runs.
+/// The languages of the interface (app/src/i18n/i18n.ts), which the shell speaks in its own
+/// dialogs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    Fr,
+    #[default]
+    En,
+}
+
+/// The title and the text of the dialog that tells, before the window closes, what the last life
+/// of the device could not keep; `detail` is the host's own lines, as the journal shows them.
+#[must_use]
+pub fn closing_dialog(language: Language, detail: &str) -> (String, String) {
+    let (title, lead) = match language {
+        Language::Fr => (
+            "inkemu : l'appareil a été éteint sans tout conserver",
+            "L'appareil a été éteint avant la fermeture, mais ceci n'a pas pu être conservé :",
+        ),
+        Language::En => (
+            "inkemu: the device was powered off without keeping everything",
+            "The device was powered off before closing, but this could not be kept:",
+        ),
+    };
+    (title.to_owned(), format!("{lead}\n\n{detail}"))
+}
+
+/// The emulator the window drives, if one runs, and the language the interface speaks.
 #[derive(Debug, Default)]
 pub struct Shell {
     emulator: Mutex<Option<Emulator>>,
+    language: Mutex<Language>,
 }
 
 impl Shell {
@@ -35,6 +63,12 @@ impl Shell {
             Some(emulator) => emulator.shutdown().map_err(|e| e.to_string()),
             None => Ok(()),
         }
+    }
+
+    /// The language the interface last said it speaks; English until it says.
+    #[must_use]
+    pub fn language(&self) -> Language {
+        *self.language.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether an emulator runs, which a power-off must end before the application closes.
@@ -259,6 +293,18 @@ async fn start(
     Ok(started)
 }
 
+/// The language the interface speaks, said when it starts and whenever the user changes it: the
+/// shell's own dialogs (the one before the window closes) speak it too.
+// Tauri hands a command its state by value: the signature is the framework's.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+pub fn set_language(shell: State<'_, Shell>, language: Language) {
+    *shell
+        .language
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = language;
+}
+
 /// The built-in devices.
 #[tauri::command]
 pub fn devices() -> Result<Vec<DeviceView>, ErrorDto> {
@@ -443,6 +489,31 @@ mod tests {
         assert!(!shell.is_on());
         assert!(!shell.holds_flash_file(std::path::Path::new("flash.bin")));
         assert_eq!(shell.power_off(), Ok(()));
+    }
+
+    /// The dialog before closing speaks the language the interface last said, English before it
+    /// says one; the host's lines follow as they are.
+    #[test]
+    fn the_closing_dialog_speaks_the_language_of_the_interface() {
+        let shell = Shell::default();
+        assert_eq!(shell.language(), Language::En);
+        *shell
+            .language
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            serde_json::from_str::<Language>(r#""fr""#).unwrap();
+        assert_eq!(shell.language(), Language::Fr);
+        let (title, text) = closing_dialog(shell.language(), "error: cannot write flash.bin");
+        assert!(title.contains("éteint sans tout conserver"), "{title}");
+        assert!(text.starts_with("L'appareil a été éteint"), "{text}");
+        assert!(text.ends_with("error: cannot write flash.bin"), "{text}");
+        let (title, text) = closing_dialog(Language::En, "x");
+        assert!(
+            title.contains("powered off without keeping everything"),
+            "{title}"
+        );
+        assert!(text.ends_with("\n\nx"), "{text}");
+        assert!(serde_json::from_str::<Language>(r#""de""#).is_err());
     }
 
     #[test]

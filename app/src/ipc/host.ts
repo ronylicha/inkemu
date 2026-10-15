@@ -5,6 +5,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { createContext, useContext } from "react";
+import type { Language } from "../i18n/i18n";
 import { decodeFrame, type Frame } from "./frame";
 import type { Command, DeviceView, HostError, Setup, Speed, Started, Update } from "./types";
 import { isHostError } from "./types";
@@ -26,6 +27,8 @@ export interface HostApi {
   frame(): Promise<Frame | null>;
   saveCapture(path: string): Promise<void>;
   notices(): Promise<string>;
+  /** Tells the shell the language of the interface, which its own dialogs speak. */
+  setLanguage(language: Language): Promise<void>;
   pickFile(kind: FileKind): Promise<string | null>;
   pickSavePath(kind: SaveKind): Promise<string | null>;
 }
@@ -111,6 +114,7 @@ export const tauriHost: HostApi = {
   },
   saveCapture: (path) => command({ kind: "capture", path }),
   notices: () => call<string>("notices"),
+  setLanguage: (language) => call<void>("set_language", { language }),
   pickFile: async (kind) => {
     const picked = await open({
       multiple: false,

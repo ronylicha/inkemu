@@ -26,7 +26,7 @@ function fileName(path: string): string {
  */
 export function App() {
   const host = useHost();
-  const { t } = useI18n();
+  const { t, language } = useI18n();
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
   const [theme, setTheme] = useTheme();
   const [speed, setSpeed] = useState<Speed>("realTime");
@@ -39,6 +39,14 @@ export function App() {
     [],
   );
   useEffect(() => () => batcher.cancel(), [batcher]);
+
+  // The shell speaks the interface's language in its own dialogs (the one before closing): it is
+  // told at once and at every change.
+  useEffect(() => {
+    host
+      .setLanguage(language)
+      .catch((reason: unknown) => dispatch({ type: "failed", error: asHostError(reason) }));
+  }, [host, language]);
 
   useEffect(() => {
     host

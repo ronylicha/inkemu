@@ -5,7 +5,8 @@
 //! **Closing.** The application never closes on a running device: closing the window, quitting
 //! the application or a `SIGINT`/`SIGTERM` first powers it off, as its power button would, so
 //! that its last life writes its flash file and its session (2c-R17). A power-off that could not
-//! keep them is told to the user before the window goes.
+//! keep them is told to the user before the window goes, in the language the interface speaks
+//! (`set_language`), in a dialog or, for a signal, on the terminal.
 mod commands;
 
 use commands::Shell;
@@ -28,6 +29,7 @@ pub fn run() -> Result<(), tauri::Error> {
             commands::command,
             commands::frame,
             commands::notices,
+            commands::set_language,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event
@@ -56,8 +58,10 @@ pub fn run() -> Result<(), tauri::Error> {
         }
         // The last resort, when the process ends some other way: nothing is left to tell.
         RunEvent::Exit => {
-            if let Err(text) = app.state::<Shell>().power_off() {
-                eprintln!("inkemu: {text}");
+            let shell = app.state::<Shell>();
+            if let Err(detail) = shell.power_off() {
+                let (title, text) = commands::closing_dialog(shell.language(), &detail);
+                eprintln!("{title}\n{text}");
             }
         }
         _ => {}
@@ -68,10 +72,12 @@ pub fn run() -> Result<(), tauri::Error> {
 /// Powers the device off, and tells the user what its last life could not keep. Called off the
 /// main thread: the dialog waits for the user.
 fn power_off_telling(app: &AppHandle) {
-    if let Err(text) = app.state::<Shell>().power_off() {
+    let shell = app.state::<Shell>();
+    if let Err(detail) = shell.power_off() {
+        let (title, text) = commands::closing_dialog(shell.language(), &detail);
         app.dialog()
             .message(text)
-            .title("inkemu: the device was powered off without keeping everything")
+            .title(title)
             .kind(MessageDialogKind::Error)
             .blocking_show();
     }
@@ -85,9 +91,12 @@ fn watch_signals(app: AppHandle) {
         if signalled.swap(true, Ordering::SeqCst) {
             std::process::exit(130);
         }
-        // No dialog: the user may be gone (a session that ends); the error goes to the terminal.
-        if let Err(text) = app.state::<Shell>().power_off() {
-            eprintln!("inkemu: {text}");
+        // No dialog: the user may be gone (a session that ends); the same words, in the
+        // interface's language, go to the terminal.
+        let shell = app.state::<Shell>();
+        if let Err(detail) = shell.power_off() {
+            let (title, text) = commands::closing_dialog(shell.language(), &detail);
+            eprintln!("{title}\n{text}");
         }
         app.exit(130);
     });

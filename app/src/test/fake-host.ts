@@ -78,6 +78,7 @@ export function fakeHost(overrides: Partial<HostApi> = {}): FakeHost {
     frame: vi.fn(async () => null),
     saveCapture: vi.fn(async () => undefined),
     notices: vi.fn(async () => "NOTICE"),
+    setLanguage: vi.fn(async () => undefined),
     pickFile: vi.fn(async () => "/home/user/fw/app.bin"),
     pickSavePath: vi.fn(async () => "/home/user/out.png"),
     ...overrides,
