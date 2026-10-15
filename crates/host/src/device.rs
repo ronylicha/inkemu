@@ -661,10 +661,54 @@ struct Request {
 /// The image of the last refresh, shared between the thread and its handle.
 type FrameSlot = Arc<Mutex<Option<Arc<PanelFrame>>>>;
 
-/// A machine running on its own thread.
-pub struct Emulator {
+/// What any thread may hold of a running emulator to command it and read its panel: cheap to
+/// clone, so that a caller never holds a lock while it waits for an answer.
+#[derive(Clone)]
+pub struct Handle {
     requests: Sender<Request>,
     frame: FrameSlot,
+    rotation: crate::ports::Rotation,
+}
+
+impl std::fmt::Debug for Handle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Handle").finish_non_exhaustive()
+    }
+}
+
+impl Handle {
+    /// Does `command` between two passes of the machine, and gives its result.
+    ///
+    /// # Errors
+    /// [`CommandError`]: the command was refused, or the thread has stopped.
+    pub fn command(&self, command: Command) -> Result<(), CommandError> {
+        let (reply, answer) = mpsc::channel();
+        self.requests
+            .send(Request { command, reply })
+            .map_err(|_| CommandError::Stopped)?;
+        answer.recv().map_err(|_| CommandError::Stopped)?
+    }
+
+    /// The image of the last refresh of the panel.
+    #[must_use]
+    pub fn frame(&self) -> Option<Arc<PanelFrame>> {
+        self.frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A PNG of the last image as the user of the device sees it.
+    #[must_use]
+    pub fn capture(&self) -> Option<Vec<u8>> {
+        self.frame()
+            .map(|frame| crate::capture::png(&frame, self.rotation))
+    }
+}
+
+/// A machine running on its own thread. Dropping it ends its last life and waits for the thread.
+pub struct Emulator {
+    handle: Handle,
     look: Look,
     console: ConsoleChannel,
     device_name: String,
@@ -721,8 +765,11 @@ impl Emulator {
                 .serve(&receiver);
             })?;
         Ok(Emulator {
-            requests,
-            frame,
+            handle: Handle {
+                requests,
+                frame,
+                rotation: look.panel.rotation,
+            },
             look,
             console,
             device_name,
@@ -730,32 +777,36 @@ impl Emulator {
         })
     }
 
-    /// Does `command` between two passes of the machine, and gives its result.
+    /// A handle to command the emulator from any thread.
+    #[must_use]
+    pub fn handle(&self) -> Handle {
+        self.handle.clone()
+    }
+
+    /// [`Handle::command`].
     ///
     /// # Errors
     /// [`CommandError`]: the command was refused, or the thread has stopped.
     pub fn command(&self, command: Command) -> Result<(), CommandError> {
-        let (reply, answer) = mpsc::channel();
-        self.requests
-            .send(Request { command, reply })
-            .map_err(|_| CommandError::Stopped)?;
-        answer.recv().map_err(|_| CommandError::Stopped)?
+        self.handle.command(command)
     }
 
-    /// The image of the last refresh of the panel.
+    /// [`Handle::frame`].
     #[must_use]
     pub fn frame(&self) -> Option<Arc<PanelFrame>> {
-        self.frame
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.handle.frame()
     }
 
-    /// A PNG of the last image as the user of the device sees it.
+    /// [`Handle::capture`].
     #[must_use]
     pub fn capture(&self) -> Option<Vec<u8>> {
-        self.frame()
-            .map(|frame| crate::capture::png(&frame, self.look.panel.rotation))
+        self.handle.capture()
+    }
+
+    /// The name of the device, escaped.
+    #[must_use]
+    pub fn device_name(&self) -> &str {
+        &self.device_name
     }
 
     #[must_use]
