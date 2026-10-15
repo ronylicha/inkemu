@@ -41,6 +41,12 @@ pas y entrer telle quelle.
      reste et l'image s'en souvient ; avant que la vie suivante lise (`source`) ou sauve (`commit`), il est
      réappliqué, et s'il ne peut toujours pas l'être la vie est refusée (`UnfinishedSave`). Une sauvegarde n'écrit
      jamais par-dessus un journal non appliqué ;
+   - **dans l'application, une carte non écrite suit la règle de la flash** (SP2d, R1) : ce que les vies ont écrit
+     et que l'image n'a pas pris reste en mémoire, en surcouche posée sur l'image (`host::sd_run::CardKeeper`) ; la
+     vie suivante démarre dessus sans relire l'image (la surcouche couvre chaque bloc qu'une sauvegarde interrompue
+     aurait changé, donc un `UnfinishedSave` ne la refuse pas), chaque fin de vie et l'extinction réessaient
+     d'écrire le tout, et ce qui n'est toujours pas écrit à l'extinction est dit (`NotKept`), avec son remède :
+     libérer de la place sur le disque de l'image, ou rendre son dossier inscriptible ;
    - **un journal est lié à son image** : son en-tête (format `inkemu-sd-journal 2`) porte l'identité du fichier
      image, que le condensat couvre : 8 octets qui nomment le fichier, puis sa date de naissance en nanosecondes
      (0 si le système de fichiers n'en garde pas). Sous Unix, l'inode et la date de naissance (`statx`) ; le
