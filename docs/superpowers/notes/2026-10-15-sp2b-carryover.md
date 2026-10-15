@@ -1,6 +1,6 @@
 # SP2b — Note de passation
 
-Plan : `docs/superpowers/plans/2026-10-15-sp2b-soc-peripherals.md` (2b-R1 à 2b-R11). Spec :
+Plan : `docs/superpowers/plans/2026-10-15-sp2b-soc-peripherals.md` (2b-R1 à 2b-R13). Spec :
 `docs/superpowers/specs/2026-10-15-sp2b-soc-peripherals-design.md` (2b-D1 à 2b-D14, D10, D13 et D14 précisées par
 2b-R2 à 2b-R4). Recherche : `docs/research/esp32c3-soc-peripherals-sp2b.md`. ADR 0012 (nouvel). Point de départ :
 `main` à `194f286`, fusionné ensuite avec `main` à `7d3e56f` (SP1b-4f, SP2a).
@@ -31,7 +31,7 @@ Mesures du 2026-10-15, construction release de cette branche, ROM rev3, poste de
 
 ## Décisions prises sans l'utilisateur
 
-2b-D1 à 2b-D14 de la spec et 2b-R1 à 2b-R11 du plan. Les plus engageantes :
+2b-D1 à 2b-D14 de la spec et 2b-R1 à 2b-R13 du plan. Les plus engageantes :
 
 - les cinq traits et le branchement par broches (ADR 0012) : SP2d ne fait que câbler ;
 - `Clocked` et `attach_clocked` : une puce avancée en temps d'appareil, une fois par instant au plus (2b-R8) ;
@@ -86,17 +86,23 @@ Esp32C3::inputs_changed()
 - **Le temps.** Une puce qui travaille d'elle-même (le SSD1677 : `advance` et `next_deadline` de SP2a) se branche
   aussi par `attach_clocked`, partagée avec ses lignes par `Rc<RefCell<_>>`. Le SoC lui demande son échéance au
   branchement et après chaque appel qu'il fait à une puce, arme une échéance dans son ordonnanceur en temps
-  d'appareil, et l'y avance, que le CPU exécute, attende une interruption ou dorme jusqu'à un timer ; puis il relit
-  les broches (BUSY) et lève l'interruption GPIO sur front. Une puce n'est avancée qu'une fois par instant : une
-  échéance qui n'est pas après cet instant attend que le temps passe (pas de boucle sur un cycle). L'instant passé à
-  `advance` est le premier cycle de la base de temps (6,25 ns) à l'échéance ou après.
+  d'appareil, et l'y avance, que le CPU exécute, attende une interruption, dorme jusqu'à un timer ou que la puce soit
+  en sommeil profond (la carte reste alimentée ; seules les puces cadencées sont avancées, sans évaluer les broches,
+  et le sommeil ne finit faute de réveil qu'une fois qu'aucune n'a plus d'échéance) ; puis il relit les broches
+  (BUSY) et lève l'interruption GPIO sur front. Avant tout autre appel à une puce, il avance d'abord celles dont
+  l'échéance est venue. Une puce n'est avancée qu'une fois par instant : une échéance qui n'est pas après cet instant
+  est reprise au cycle suivant de la base de temps (pas de boucle sur un cycle ; une puce toujours due est avancée à
+  chaque cycle). L'instant passé à `advance` est exactement le premier cycle de la base de temps (6,25 ns) à
+  l'échéance ou après quand le CPU attend ; au plus tard la fin de l'instruction en cours quand il exécute.
 - **`next_change`** n'est demandé que si une interruption GPIO est configurée sur la broche ; sans elle, un niveau se
   relit à la lecture suivante. Le temps propre d'une puce passe par `Clocked`, pas par `next_change`.
 - **SPI.** Une sélection peut venir sans trame (2b-R6) ; avec le CS matériel, sélection, transfert et désélection sont
   au même instant ; `miso` arrive prérempli de `0xFF` ou `0x00` selon le niveau de la ligne d'entrée. La lecture
   demi-duplex du panneau est du bit-bang : `GpioOutput` sur SCLK et MOSI, `GpioInput` sur MOSI.
 - **Les refus** finissent l'opération (fin de transaction de SPI2, `TRANS_COMPLETE` d'I2C0, fin des deux unités du
-  SAR ADC) : un firmware ne reste jamais suspendu à un bit qui ne monterait pas.
+  SAR ADC) : un firmware ne reste jamais suspendu à un bit qui ne monterait pas. Un second départ pendant une
+  opération (I2C0 `StartWhileRunning`, SAR ADC `StartWhileConverting`) est refusé par nom et l'opération en cours
+  garde sa fin.
 
 ## Laissé aux héritiers
 
@@ -123,7 +129,7 @@ Esp32C3::inputs_changed()
 
 - **Vérifié en local** : `cargo fmt --all --check` ; `tools/ci/clippy.sh` (`-D warnings`) sur `soc-esp32c3`,
   `emu-core`, `emu-cli`, `boards` ; rustdoc (`-D warnings`, éléments privés) sur `soc-esp32c3` et `emu-core` ; tests
-  unitaires de `soc-esp32c3` (700 après la relecture), `emu-core`, `boards`, `emu-cli` (bibliothèque) ; la table des registres acceptés ;
+  unitaires de `soc-esp32c3` (706 après les deux relectures), `emu-core`, `boards`, `emu-cli` (bibliothèque) ; la table des registres acceptés ;
   les suites ignorées listées plus haut ; `build.sh` entier deux fois dans `espressif/idf:v5.5.2` ; les trois fenêtres
   du lockstep de la CI contre QEMU et la fenêtre locale `crosspoint` (`cargo test --release -p inkemu-lockstep --test
   crosspoint -- --ignored` : 31 088 420 instructions, fin et usages épinglés inchangés, 1 383 s), un conteneur à la
@@ -146,7 +152,7 @@ Fichiers et types à reporter dans la cartographie du projet :
 - `backend_models.md` : `emu_core::{Level, Nanos}` et les cinq traits ; `soc_esp32c3::{AttachError (NoSuchPin,
   InputTaken, NoAnalogChannel, AnalogTaken), SpiWires {sclk, mosi, miso, cs, dc}}` ; `diag::{Spi2Refusal (Dma,
   MultiLine, Dummy, ThreeWire, CommandLength, AddressLength, DataLength, Slave, Segmented), I2cRefusal (Slave,
-  NonFifo, Clock, StartWhileRunning), AdcRefusal (Scan, BothUnits, Clock)}` et les `Unsupported::{PadSignal,
+  NonFifo, Clock, StartWhileRunning), AdcRefusal (Scan, BothUnits, StartWhileConverting, Clock)}` et les `Unsupported::{PadSignal,
   PadInterrupt, Spi2, I2c, Adc}` ; `ctx::Module::{Spi2, I2c0, ApbSaradc}`, `ctx::Event::{Pins, Spi2, I2c0, SarAdc}`.
 - `backend_services.md` : `periph/io/` (`IoMatrix` : GPIO et IO MUX, `pad.rs` résolution des broches et niveaux de
   repos des signaux, interruptions GPIO source 16, `Event::Pins` pour les changements annoncés et les échéances des

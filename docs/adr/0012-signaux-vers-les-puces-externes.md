@@ -59,11 +59,19 @@ GPIO).
    transfert, un niveau demandé ou entendu, une tension), arme une seule échéance dans son ordonnanceur en temps
    d'appareil (`Event::Pins`, au premier cycle de sa base de temps à l'échéance ou après), et à ce moment avance,
    dans l'ordre des branchements, chaque puce dont l'échéance est venue, puis recalcule ses broches (une puce a pu
-   changer une ligne, BUSY par exemple, et lever l'interruption GPIO). Cela vaut que le CPU exécute, attende une
-   interruption (`WFI`) ou attende un timer : l'image d'un écran ne prend pas de retard. Une puce n'est avancée
-   qu'une fois à un instant donné : une échéance qui n'est pas après le dernier instant d'avance attend que le temps
-   passe, si bien qu'aucune puce ne peut retenir le SoC sur un même cycle. Une puce tôt réveillée (une échéance
-   repoussée) n'est pas avancée avant la sienne.
+   changer une ligne, BUSY par exemple, et lever l'interruption GPIO). Avant tout autre appel à une puce (un niveau,
+   un transfert, une tension, un niveau entendu), le SoC avance d'abord les puces dont l'échéance est venue : une
+   puce ne répond jamais pour un instant qu'elle n'a pas atteint. Cela vaut que le CPU exécute, attende une
+   interruption (`WFI`) ou attende un timer, et pendant un sommeil profond, les puces de la carte gardant leur
+   alimentation : le sommeil va alors au plus proche de l'appel du domaine RTC et de l'échéance d'une puce, n'avance
+   à celle-ci que les puces cadencées, sans évaluer les broches (le domaine numérique n'est pas alimenté), et
+   continue ; il ne se termine faute de réveil (`NothingDue`) qu'une fois qu'aucune puce n'a plus d'échéance.
+   L'instant passé à `advance` est exactement le premier cycle de la base de temps à l'échéance ou après quand le CPU
+   attend, au plus tard la fin de l'instruction en cours quand il exécute (plus tôt si un accès de cette instruction
+   atteint une puce). Une puce n'est avancée qu'une fois à un instant donné : une échéance qui n'est pas après le
+   dernier instant d'avance est reprise au cycle suivant de la base de temps, si bien qu'aucune puce ne retient le
+   SoC sur un même cycle, et qu'une puce toujours due est avancée à chaque cycle. Une puce tôt réveillée (une
+   échéance repoussée) n'est pas avancée avant la sienne.
 
 ## Conséquences
 
