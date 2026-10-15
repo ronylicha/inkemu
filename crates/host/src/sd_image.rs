@@ -78,9 +78,13 @@ pub enum SdImageError {
     #[error("the SD image path {path} names no file; give the path of a file, like card.img")]
     NoFileName { path: String },
     #[error(
-        "there is no SD image at {path}; create one with `inkemu sd create {path} --size 1024`, or give the path of an existing image"
+        "there is no SD image at {path}; create one with `inkemu sd create {quoted} --size 1024`, or give the path of an existing image"
     )]
-    Missing { path: String },
+    Missing {
+        path: String,
+        /// The path as a shell takes it, for the command the message gives.
+        quoted: String,
+    },
     #[error(
         "the SD image {path} is not a regular file (a link is not followed: the image is written in place); give the path of the file itself"
     )]
@@ -125,10 +129,15 @@ pub enum SdImageError {
         why: String,
     },
     #[error(
-        "the journal {journal} was written for another image file than the SD image {path} (a copy, or an image moved to another filesystem, is another file); nothing of it was applied now. If the journal is truly this image's, `inkemu sd recover {path} --accept-journal` checks it, then applies it: applied to another image, it would overwrite blocks of that image. Otherwise the image may hold part of the save that wrote the journal. {partly}",
+        "the journal {journal} was written for another image file than the SD image {path} (a copy, or an image moved to another filesystem, is another file; and on FAT or exFAT, a USB drive's usual filesystem, Linux numbers files anew at each mount, so an image there looks like another file after a remount or a restart); nothing of it was applied now. If the journal is truly this image's, `inkemu sd recover {quoted} --accept-journal` checks it, then applies it: applied to another image, it would overwrite blocks of that image. Otherwise the image may hold part of the save that wrote the journal. {partly}",
         partly = PARTLY_WRITTEN
     )]
-    ForeignJournal { path: String, journal: String },
+    ForeignJournal {
+        path: String,
+        /// The path as a shell takes it, for the command the message gives.
+        quoted: String,
+        journal: String,
+    },
     #[error(
         "the journal {journal} of the SD image {path} is {len} bytes, more than any journal of this card ({max}): inkemu did not write it for this card, and nothing of it was applied; if a save of this image was interrupted, the image may hold part of it. {partly}",
         partly = PARTLY_WRITTEN
@@ -172,6 +181,46 @@ pub enum SdImageError {
 
 fn shown(path: &Path) -> String {
     sanitize(&path.display().to_string())
+}
+
+/// Refuses an image whose path, or one of whose `own` files, the run already reads or writes.
+fn refuse_claimed(
+    path: &Path,
+    own: [&PathBuf; 2],
+    claimed: &[Claimed],
+) -> Result<(), SdImageError> {
+    for claim in claimed {
+        if claim.holds(path) {
+            return Err(SdImageError::Claimed {
+                path: shown(path),
+                what: claim.what().to_owned(),
+            });
+        }
+        if let Some(file) = own.into_iter().find(|file| claim.holds(file)) {
+            return Err(SdImageError::JournalClaimed {
+                path: shown(path),
+                journal: shown(file),
+                what: claim.what().to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The path of [`shown`] as a shell takes it in a command a message gives: as it is when it holds
+/// only characters no shell reads specially, quoted otherwise (single quotes for a POSIX shell,
+/// a quote inside closed then escaped; double quotes on Windows, where a path holds none).
+fn shell_quoted(path: &Path) -> String {
+    let text = shown(path);
+    let plain = |c: char| c.is_ascii_alphanumeric() || "/._-+,:=@%".contains(c);
+    if !text.is_empty() && text.chars().all(plain) {
+        return text;
+    }
+    if cfg!(windows) {
+        format!("\"{text}\"")
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
 }
 
 /// The journal of the image at `path`.
@@ -363,23 +412,7 @@ impl SdImage {
         else {
             return Err(no_name());
         };
-        for claim in claimed {
-            if claim.holds(path) {
-                return Err(SdImageError::Claimed {
-                    path: shown_path,
-                    what: claim.what().to_owned(),
-                });
-            }
-            for own in [&journal, &temporary] {
-                if claim.holds(own) {
-                    return Err(SdImageError::JournalClaimed {
-                        path: shown_path,
-                        journal: shown(own),
-                        what: claim.what().to_owned(),
-                    });
-                }
-            }
-        }
+        refuse_claimed(path, [&journal, &temporary], claimed)?;
         let open_error = |e: &std::io::Error, remedy| SdImageError::Open {
             path: shown_path.clone(),
             detail: sanitize(&e.to_string()),
@@ -389,7 +422,10 @@ impl SdImage {
             Ok(metadata) if metadata.is_file() => {}
             Ok(_) => return Err(SdImageError::NotAFile { path: shown_path }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(SdImageError::Missing { path: shown_path });
+                return Err(SdImageError::Missing {
+                    path: shown_path,
+                    quoted: shell_quoted(path),
+                });
             }
             Err(e) => return Err(open_error(&e, "check the path and its permissions")),
         }
@@ -796,6 +832,7 @@ impl SdImage {
             WalkError::Bad(why) => image.bad_journal(why),
             WalkError::Foreign => SdImageError::ForeignJournal {
                 path: image.shown.clone(),
+                quoted: shell_quoted(&image.path),
                 journal: shown(&image.journal),
             },
             WalkError::Read(e) => read_error(image, &e),
@@ -1565,6 +1602,37 @@ mod tests {
             SdImage::recover_save(&two, JournalOrigin::ThisImage, &[], &mut Vec::new()).unwrap(),
             Recovered::Nothing
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_commands_the_messages_give_quote_the_path_for_a_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = image(dir.path(), "one.img", MIB, &[]);
+        let two = image(dir.path(), "card two.img", MIB, &[]);
+        let image = open(&one);
+        let mut overlay = Overlay::new(SparseBlocks::new(MIB / BLOCK));
+        overlay.write_block(1, &[1; BLOCK_BYTES]).unwrap();
+        std::fs::write(
+            dir.path().join(".card two.img.journal"),
+            journal_of(&image, &overlay.changes()),
+        )
+        .unwrap();
+        let error = open_error(&two, Access::ReadWrite);
+        let quoted = format!("'{}'", two.display());
+        assert!(
+            error.contains(&format!("`inkemu sd recover {quoted} --accept-journal`")),
+            "{error}"
+        );
+        let missing = open_error(&dir.path().join("no card.img"), Access::ReadWrite);
+        let quoted = format!("'{}'", dir.path().join("no card.img").display());
+        assert!(
+            missing.contains(&format!("`inkemu sd create {quoted} --size 1024`")),
+            "{missing}"
+        );
+        assert_eq!(shell_quoted(Path::new("cards/x-1.img")), "cards/x-1.img");
+        assert_eq!(shell_quoted(Path::new("it's.img")), r"'it'\''s.img'");
+        assert_eq!(shell_quoted(Path::new("$HOME.img")), "'$HOME.img'");
     }
 
     #[test]

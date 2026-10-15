@@ -135,6 +135,14 @@ démarrage, commit à chaque fin de vie ; **tâche 15** la section « Carte SD �
     périphérique n'en fait plus partie (clé USB rebranchée, NFS) ; date inconnue : l'inode seul décide. Ailleurs
     (Windows), 8 octets du SHA-256 du chemin canonique + date de création ; la tunnellisation NTFS (15 s) laisse une
     fenêtre documentée. Le format reste `inkemu-sd-journal 2` (rien n'est mergé, aucun journal n'a été livré).
+    L'identité n'est stable que sur les systèmes de fichiers à inodes persistants : sous Linux, FAT/vfat et exFAT
+    (clés USB) attribuent les numéros par `iunique()` au chargement (`fat_build_inode`, `exfat_build_inode`, vérifié
+    dans les sources du noyau le 2026-10-15), qui changent après un remontage. Là, le journal d'une sauvegarde
+    interrompue peut être refusé comme étranger ; le message `ForeignJournal` nomme ce cas, et la reprise passe par
+    `inkemu sd recover --accept-journal`. Écarté : y fonder l'identité sur la seule date de naissance (stable sur ces
+    systèmes) demanderait de reconnaître le système de fichiers (`statfs`), et une date de création à la seconde ou
+    à la centiseconde près distinguerait mal deux images créées ensemble ; le refus suivi d'une reprise explicite
+    reste le côté sûr.
 16. **Messages de refus d'un journal** : ils disent que l'image peut contenir une partie de la sauvegarde (un journal
     ne prend son nom qu'une fois complet), conseillent de le garder le temps de décider, et disent le risque de
     l'écarter. **`inkemu sd recover <image> [--accept-journal]`** finit une sauvegarde seul ; l'option applique le
@@ -180,9 +188,11 @@ démarrage, commit à chaque fin de vie ; **tâche 15** la section « Carte SD �
   (`fail_after`, toujours `None` hors d'eux), pas par un vrai disque plein.
 - Le percement de trou et le repli `SEEK_DATA` sont testés sous Linux (ext4) ; les branches macOS, FreeBSD et Windows
   (zéros) ne sont compilées et jouées que par la CI des plateformes concernées, quand elle existera.
-- L'identité par inode suppose que l'image n'est pas recopiée entre l'écriture du journal et sa reprise ; une copie
-  de l'image et de son journal ailleurs fait refuser le journal (côté sûr, dit en le nommant, repris par
-  `inkemu sd recover --accept-journal`). Un même inode né à une autre date est testé par un journal construit avec
+- L'identité par inode suppose que l'image n'est pas recopiée entre l'écriture du journal et sa reprise, et qu'elle
+  est sur un système de fichiers à inodes persistants ; une copie de l'image et de son journal ailleurs, ou une image
+  sur FAT/exFAT remontée, fait refuser le journal (côté sûr, dit en le nommant, repris par
+  `inkemu sd recover --accept-journal`). Le cas FAT/exFAT n'est pas testé sur un vrai volume (il demanderait un
+  montage) : il repose sur la lecture des sources du noyau. Un même inode né à une autre date est testé par un journal construit avec
   cette identité, pas par un vrai inode redonné ; ce test s'arrête sans rien vérifier sur un système de fichiers qui
   ne garde pas de date de naissance (ext4, tmpfs et la CI en gardent une), la règle de comparaison étant testée à
   part. Le repli Windows (chemin + date de création) n'est que compilé par lecture : aucune CI Windows.

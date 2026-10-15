@@ -51,6 +51,15 @@ pas y entrer telle quelle.
      et la date de création ; la tunnellisation de NTFS donne à un fichier créé sous le nom d'un fichier effacé moins
      de 15 s plus tôt la date de création de ce dernier : dans cette fenêtre, le journal de l'image effacée serait
      appliqué à la nouvelle. Le journal d'une autre image de même taille, laissé à ce nom, est refusé.
+     **Cette identité n'est stable que sur les systèmes de fichiers dont les inodes sont persistants** (ext4, XFS,
+     Btrfs, APFS, ZFS…). Sous Linux, FAT/vfat et exFAT, le système habituel d'une clé USB, n'ont pas de numéro
+     d'inode sur le disque : le noyau en attribue un par `iunique()` quand il charge le fichier (`fs/fat/inode.c`,
+     `fat_build_inode` ; `fs/exfat/inode.c`, `exfat_build_inode` ; `iunique` est, selon `fs/inode.c`, pour « file
+     systems that have no natural permanent inode numbering system »), donc un autre numéro après un remontage, un
+     redémarrage, ou quand le noyau a oublié le fichier entre deux ouvertures. Leur date de naissance, elle, est
+     stockée (vfat et exFAT la rapportent par `statx`). Sur ces systèmes, le journal d'une sauvegarde interrompue
+     peut donc être refusé comme étranger (`ForeignJournal`) : le côté sûr, que le message nomme, et la reprise passe
+     par `inkemu sd recover --accept-journal`.
      `inkemu sd create` refuse de créer une image là où un journal ou son temporaire existe déjà ;
    - **un refus ne prétend jamais l'image intacte** : un journal ne prend son nom qu'une fois complet, son
      application a donc pu commencer avant l'interruption. Le message d'un journal refusé dit que l'image peut
