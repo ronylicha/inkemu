@@ -15,6 +15,9 @@ interface Props {
   /** The debugger panel is open. */
   debuggerOpen: boolean;
   onDebugger(): void;
+  /** The resource monitor is open. */
+  monitorOpen: boolean;
+  onMonitor(): void;
   onPowerOn(): void;
   onCommand(command: Command): void;
   onSpeed(speed: Speed): void;
@@ -90,6 +93,14 @@ export function Toolbar(props: Props) {
         aria-controls={props.debuggerOpen ? "debugger" : undefined}
       >
         {t("toolbar.debugger")}
+      </button>
+      <button
+        type="button"
+        onClick={props.onMonitor}
+        aria-expanded={props.monitorOpen}
+        aria-controls={props.monitorOpen ? "monitor" : undefined}
+      >
+        {t("toolbar.monitor")}
       </button>
       <span className="toolbar-spacer" />
       <label>

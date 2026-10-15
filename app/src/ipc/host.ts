@@ -12,6 +12,7 @@ import type {
   DebugView,
   DeviceView,
   HostError,
+  MonitorView,
   Points,
   Setup,
   Speed,
@@ -49,6 +50,11 @@ export interface HostApi {
   command(command: Command, start: number): Promise<void>;
   /** What the debugger shows of the emulator of `start`; refused when another runs. */
   inspect(view: ViewRequest, start: number): Promise<DebugView>;
+  /**
+   * What the resource monitor shows of the emulator of `start`; refused when another runs. Each
+   * reading starts the recent window of the next one.
+   */
+  monitor(start: number): Promise<MonitorView>;
   /**
    * The image of the last refresh, `null` before the first; refused (`FrameError`) when it is not
    * an image of `panel`.
@@ -148,6 +154,7 @@ export const tauriHost: HostApi = {
     }),
   command,
   inspect: (view, start) => call<DebugView>("inspect", { start, view }),
+  monitor: (start) => call<MonitorView>("monitor", { start }),
   frame: async (start, panel) => {
     const buffer = await call<ArrayBuffer>("frame", { start });
     return buffer.byteLength === 0 ? null : decodeFrame(buffer, panel);

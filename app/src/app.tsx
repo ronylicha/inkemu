@@ -7,6 +7,7 @@ import { DeviceView } from "./components/device-view";
 import { ErrorBanner } from "./components/error-banner";
 import { JournalPanel } from "./components/journal-panel";
 import { labelOf } from "./components/labels";
+import { MonitorPanel } from "./components/monitor-panel";
 import { StartDialog } from "./components/start-dialog";
 import { StatusPanel } from "./components/status-panel";
 import { Toolbar } from "./components/toolbar";
@@ -35,6 +36,7 @@ export function App() {
   const [asking, setAsking] = useState(false);
   const [about, setAbout] = useState(false);
   const [debuggerOpen, setDebuggerOpen] = useState(false);
+  const [monitorOpen, setMonitorOpen] = useState(false);
   // Every start is numbered: the updates of an emulator carry its number (reducer.ts).
   const starts = useRef(0);
   const batcher = useMemo(
@@ -168,6 +170,8 @@ export function App() {
           theme={theme}
           debuggerOpen={debuggerOpen}
           onDebugger={() => setDebuggerOpen((open) => !open)}
+          monitorOpen={monitorOpen}
+          onMonitor={() => setMonitorOpen((open) => !open)}
           onPowerOn={() => setAsking(true)}
           onCommand={command}
           onSpeed={changeSpeed}
@@ -204,6 +208,15 @@ export function App() {
             start={state.current}
             status={state.phase === "on" ? status : null}
             onCommand={(next) => host.command(next, state.current)}
+            dispatch={dispatch}
+          />
+        ) : null}
+        {monitorOpen ? (
+          <MonitorPanel
+            // A new start shows its own machine: nothing of the panel of the one before stays.
+            key={state.current}
+            start={state.current}
+            status={state.phase === "on" ? status : null}
             dispatch={dispatch}
           />
         ) : null}

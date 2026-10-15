@@ -177,6 +177,32 @@ describe("App", () => {
     expect(screen.queryByRole("region", { name: "Debugger" })).not.toBeInTheDocument();
   });
 
+  it("asks the host for the monitor only while the monitor is open", async () => {
+    const host = fakeHost();
+    const user = userEvent.setup();
+    renderWith(<App />, { host });
+    await powerOn(user);
+    await screen.findByText(/inkemu: Xteink X4/);
+    act(() => {
+      host.send({ event: "status", data: status({ run: "paused" }) });
+    });
+    expect(host.monitor).not.toHaveBeenCalled();
+    const open = screen.getByRole("button", { name: "Monitor" });
+    await user.click(open);
+    expect(open).toHaveAttribute("aria-expanded", "true");
+    expect(open).toHaveAttribute("aria-controls", "monitor");
+    expect(await screen.findByRole("region", { name: "Resource monitor" })).toBeInTheDocument();
+    await screen.findByRole("table", { name: "Device time" });
+    expect(host.monitor).toHaveBeenCalledWith(1);
+    await user.click(open);
+    expect(screen.queryByRole("region", { name: "Resource monitor" })).not.toBeInTheDocument();
+    const asked = vi.mocked(host.monitor).mock.calls.length;
+    act(() => {
+      host.send({ event: "status", data: status({ run: "paused", machine: null }) });
+    });
+    expect(host.monitor).toHaveBeenCalledTimes(asked);
+  });
+
   it("says in the journal where a capture went, and why one was refused", async () => {
     const host = fakeHost();
     const user = userEvent.setup();

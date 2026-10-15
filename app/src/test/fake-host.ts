@@ -3,7 +3,15 @@
 
 import { vi } from "vitest";
 import type { HostApi } from "../ipc/host";
-import type { DebugView, DeviceView, Look, Started, Status, Update } from "../ipc/types";
+import type {
+  DebugView,
+  DeviceView,
+  Look,
+  MonitorView,
+  Started,
+  Status,
+  Update,
+} from "../ipc/types";
 
 export const LOOK: Look = {
   panel: {
@@ -170,6 +178,94 @@ export function debugView(overrides: Partial<DebugView> = {}): DebugView {
   };
 }
 
+/**
+ * What the monitor shows: 1 ms of device time, at 20 then 160 MHz, with a deep sleep; a RAM of four
+ * pages, one written before the last reset and one since; one source, one line, one block; a
+ * window since the reading before.
+ */
+export function monitorView(overrides: Partial<MonitorView> = {}): MonitorView {
+  return {
+    deviceTimeNanos: 1_000_000,
+    cycles: 50_000,
+    instructions: 40_000,
+    cpuHz: 160_000_000,
+    resets: 1,
+    speedRatio: 0.5,
+    time: {
+      runningNanos: 500_000,
+      waitingNanos: 300_000,
+      deepSleepNanos: 200_000,
+      loadPermille: 625,
+    },
+    recent: {
+      deviceNanos: 250_000,
+      time: {
+        runningNanos: 200_000,
+        waitingNanos: 50_000,
+        deepSleepNanos: 0,
+        loadPermille: 800,
+      },
+      instructions: 10_000,
+      interrupts: 3,
+      registerAccesses: 12,
+    },
+    clocks: [
+      { hz: 20_000_000, runningNanos: 100_000, waitingNanos: 0 },
+      { hz: 160_000_000, runningNanos: 400_000, waitingNanos: 300_000 },
+    ],
+    memories: [
+      {
+        region: "sram",
+        base: 0x3fc8_0000,
+        size: 4 * 4096,
+        pageBytes: 4096,
+        pages: ["never", "before", "never", "since"],
+        written: 2,
+        writtenSinceReset: 1,
+        lowest: 0x3fc8_1000,
+        highestEnd: 0x3fc8_4000,
+        writes: 9,
+        writesSinceReset: 5,
+      },
+    ],
+    interrupts: [{ source: 37, name: "SYSTIMER_TARGET0_INT", raised: 12, recent: 3 }],
+    lines: [{ line: 4, taken: 11 }],
+    peripherals: [
+      { base: 0x6002_3000, peripherals: ["SYSTIMER"], reads: 30, writes: 12, recent: 12 },
+    ],
+    power: {
+      source: "ESP32-C3 Series Datasheet v2.4 (2026-05-06), tables 5-8 and 5-9",
+      rows: [
+        {
+          state: "running",
+          hz: 20_000_000,
+          nanos: 100_000,
+          microamps: null,
+          microampHours: null,
+        },
+        {
+          state: "running",
+          hz: 160_000_000,
+          nanos: 400_000,
+          microamps: [23_000, 28_000],
+          microampHours: [0.002_555, 0.003_111],
+        },
+        {
+          state: "deepSleep",
+          hz: null,
+          nanos: 200_000,
+          microamps: [5, 5],
+          microampHours: [0.000_000_28, 0.000_000_28],
+        },
+      ],
+      microampHours: [0.002_555, 0.003_111],
+      unpricedNanos: 100_000,
+    },
+    panel: { refreshes: 3, last: "partial" },
+    ...overrides,
+  };
+}
+
 export interface FakeHost extends HostApi {
   /** Sends an update to the interface, as the thread of the emulator does. */
   send(update: Update): void;
@@ -195,6 +291,7 @@ export function fakeHost(overrides: Partial<HostApi> = {}): FakeHost {
     }),
     command: vi.fn(async () => undefined),
     inspect: vi.fn(async () => debugView()),
+    monitor: vi.fn(async () => monitorView()),
     frame: vi.fn(async () => null),
     saveCapture: vi.fn(async () => undefined),
     notices: vi.fn(async () => "NOTICE"),
