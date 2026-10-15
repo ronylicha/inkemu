@@ -129,11 +129,13 @@ name = "boards"
 version = "0.1.0"
 dependencies = [
  "chips",
+ "cpu-rv32",
  "emu-core",
  "firmware",
  "serde",
  "sha2",
  "soc-esp32c3",
+ "svd-regs",
  "thiserror",
  "toml",
 ]

@@ -24,3 +24,6 @@ firmware = { workspace = true, features = ["test-support"] }
 # The test on the reference firmware `soc_signals` checks the image it is given against its pinned
 # SHA-256.
 sha2.workspace = true
+# The tests of the wired machine run hand-written programs on the registers of the SoC.
+cpu-rv32.workspace = true
+svd-regs.workspace = true

@@ -1,7 +1,12 @@
 //! Device profiles: what a board is made of, as data.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 pub mod notices;
+pub mod wired;
 pub mod wiring;
+
+pub use wired::{
+    ButtonsHandle, PanelHandle, SdHandle, SdStart, Wired, WiredCard, WiredError, WiredOptions,
+};
 
 use firmware::bootloader::{ShippedBootloader, shipped};
 use firmware::device::revision;
