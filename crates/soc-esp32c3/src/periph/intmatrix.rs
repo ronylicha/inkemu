@@ -195,8 +195,10 @@ impl IntMatrix {
     /// is older than that branch and works otherwise: its matrix pulses a line and keeps a pending
     /// bit for a source that rose while the CPU could not take it, and its CPU leaves `MEIP` up
     /// after taking an interrupt until an interrupt check with `MIE` set finds nothing pending
-    /// (`hw/riscv/esp32c3_intmatrix.c`, `target/riscv/esp_cpu.c` of the tag). Where the two differ
-    /// is what row 4 of `docs/lockstep-differences.md` admits, measured (revision of 2026-10-15).
+    /// (`hw/riscv/esp32c3_intmatrix.c`, `target/riscv/esp_cpu.c` of the tag). Row 4 of
+    /// `docs/lockstep-differences.md` admits a lag of three instructions, measured; that this lag is
+    /// where the two differ is deduced from the code, not observed in QEMU (revision of
+    /// 2026-10-15).
     #[must_use]
     pub fn asserted_as_qemu(&self, sources: u64) -> bool {
         let levels = self.line_levels(sources) & self.enable & !1;

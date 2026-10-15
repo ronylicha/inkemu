@@ -30,7 +30,7 @@ const CSR: u32 = 1;
 /// (sub-project 8).
 const SYSTEM: u32 = 3;
 
-/// Datasheet-derived starting point for instruction timing. Not calibrated.
+/// Estimated starting point for instruction timing. Not calibrated.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DatasheetTiming;
 
