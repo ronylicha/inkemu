@@ -1,7 +1,7 @@
 //! The machine as a debugger drives it (design `SP4a`, ADR 0016): breakpoints and watchpoints
 //! that end a call of [`Esp32C3::run_stopping`] without changing what the machine executes, and
 //! what a debugger reads of it without effect.
-use super::Esp32C3;
+use super::{Esp32C3, Stepped};
 use crate::debug::{DebugStop, Peeked, RunStop, Watch, WatchHit};
 use cpu_rv32::Privilege;
 use emu_core::Cycles;
@@ -134,6 +134,20 @@ impl Esp32C3 {
     /// not stop on a watchpoint: it executes one instruction anyway).
     pub fn take_watch_hit(&mut self) -> Option<WatchHit> {
         self.bus.take_watch_hit()
+    }
+
+    /// [`Esp32C3::step`] for a debugger: an access to watched bytes noted and not reported yet
+    /// is reported first, as [`Esp32C3::run_stopping`] would report it, and nothing executes;
+    /// otherwise one step. The turn that made the access ended the last call for a reason of the
+    /// machine, which took precedence; [`Esp32C3::step`] alone would forget the access.
+    ///
+    /// # Errors
+    /// [`DebugStop::Watchpoint`] with the access not reported yet.
+    pub fn step_stopping(&mut self) -> Result<Stepped, DebugStop> {
+        if let Some(hit) = self.bus.take_watch_hit() {
+            return Err(DebugStop::Watchpoint(hit));
+        }
+        Ok(self.step())
     }
 
     /// The `length` bytes from `address` as they are, without the effects of a load: the mask
@@ -370,6 +384,38 @@ mod tests {
         let hit = m.take_watch_hit().unwrap();
         assert_eq!((hit.access, hit.pc), (Access::Write, at(store)));
         assert_eq!(m.take_watch_hit(), None);
+    }
+
+    /// A watchpoint met on the turn of a strict stop is pending: a step for a debugger reports it
+    /// first, executing nothing, then steps.
+    #[test]
+    fn a_step_for_a_debugger_reports_the_pending_access_before_it_executes() {
+        let register = crate::test_support::unmodeled_register().addr;
+        let mut program = stop_watchdogs();
+        program.extend(store_register(register, 7));
+        program.push(HANG);
+        let config = SocConfig {
+            strict_mmio: true,
+            ..SocConfig::default()
+        };
+        let mut m = machine(&program, &config);
+        m.set_watchpoints(&[Watch {
+            address: register,
+            length: 4,
+            on: WatchOn::Write,
+        }]);
+        assert!(matches!(
+            m.run_stopping(FAR, None),
+            RunStop::Machine(StopReason::StrictMmio(_))
+        ));
+        let instructions = m.instructions();
+        assert!(matches!(
+            m.step_stopping(),
+            Err(DebugStop::Watchpoint(WatchHit { value: 7, .. }))
+        ));
+        assert_eq!(m.instructions(), instructions, "nothing ran");
+        assert!(m.step_stopping().is_ok());
+        assert_eq!(m.instructions(), instructions + 1);
     }
 
     #[test]

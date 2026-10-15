@@ -537,7 +537,15 @@ impl Engine {
             State::Live => {}
         }
         let mut output = Output::default();
-        let stepped = self.machine.step();
+        // An access a watchpoint noted on the turn a reason of the machine ended the last pass
+        // is said first, executing nothing, as the next pass would say it.
+        let stepped = match self.machine.step_stopping() {
+            Ok(stepped) => stepped,
+            Err(stop) => {
+                output.stop = Some(stop);
+                return Ok(output);
+            }
+        };
         output.stop = self.machine.take_watch_hit().map(DebugStop::Watchpoint);
         let violation = match &stepped.stop {
             Some(StopReason::StrictMmio(diagnostic)) => Some(diagnostic.clone()),
@@ -1097,6 +1105,46 @@ mod tests {
                 pc: 0x4000_0008,
             }))
         );
+    }
+
+    /// An access noted and not said yet (here by a step of the machine alone, as a pass that a
+    /// reason of the machine ended leaves it) is said by the next step, which executes nothing.
+    #[test]
+    fn a_step_says_a_pending_watched_access_before_it_executes() {
+        let mut engine = Engine::new(
+            life(echo(), false),
+            Mode::Run { recorder: None },
+            Limits::default(),
+        );
+        engine.begin();
+        let mut points = Points::default();
+        points
+            .set_watchpoint(soc_esp32c3::Watch {
+                address: fixtures::UART0,
+                length: 4,
+                on: soc_esp32c3::WatchOn::Write,
+            })
+            .unwrap();
+        engine.set_points(&points);
+        for _ in 0..3 {
+            engine.machine.step();
+        }
+        assert_eq!(engine.status().instructions, 3);
+        let said = engine.step().unwrap();
+        assert!(
+            matches!(
+                said.stop,
+                Some(DebugStop::Watchpoint(soc_esp32c3::WatchHit {
+                    pc: 0x4000_0008,
+                    ..
+                }))
+            ),
+            "{:?}",
+            said.stop
+        );
+        assert_eq!(engine.status().instructions, 3, "nothing executed");
+        assert_eq!(engine.step().unwrap().stop, None);
+        assert_eq!(engine.status().instructions, 4);
     }
 
     /// The buttons of the pattern reach the panel and not the firmware: a press is a refresh,
