@@ -185,6 +185,9 @@ pub enum AdcRefusal {
     /// sampled, and both units say they are done at once (`INT_RAW` bits 31 and 30), their results
     /// unchanged.
     BothUnits,
+    /// A one-shot start while a conversion is under way: ignored, the conversion under way keeps
+    /// its unit, its channel and its end.
+    StartWhileConverting,
     /// `CLKM_CONF.CLK_SEL` other than 2, the APB clock ESP-IDF selects: the conversion was timed
     /// with the APB clock. `clk_sel` is the field.
     Clock { clk_sel: u32 },
@@ -471,6 +474,10 @@ impl Unsupported {
                 AdcRefusal::BothUnits => write!(
                     f,
                     "a one-shot conversion of the SAR ADC was started with both units selected (APB_SARADC.ONETIME_SAMPLE bits 30 and 31, pc {pc:#010x}), and which one converts is not documented, so nothing was sampled and both units ended at once (INT_RAW bits 31 and 30, the results unchanged); select one unit per conversion"
+                ),
+                AdcRefusal::StartWhileConverting => write!(
+                    f,
+                    "a one-shot conversion of the SAR ADC was started (APB_SARADC.ONETIME_SAMPLE.ONETIME_START, pc {pc:#010x}) while one was under way, which the TRM does not define, so the start was ignored and the conversion under way keeps its channel and its end; wait for its done bit (INT_RAW bit 31 or 30) before the next start"
                 ),
                 AdcRefusal::Clock { clk_sel } => write!(
                     f,
@@ -778,6 +785,8 @@ impl Diagnostic {
                     match refusal {
                         AdcRefusal::Scan => 0,
                         AdcRefusal::BothUnits => 1,
+                        // After the four values of `CLK_SEL` (2 + 0..=3).
+                        AdcRefusal::StartWhileConverting => 6,
                         AdcRefusal::Clock { clk_sel } => 2 + clk_sel,
                     },
                     0,
@@ -1921,6 +1930,12 @@ mod tests {
                     refusal: AdcRefusal::BothUnits,
                 },
                 "with both units selected",
+            ),
+            (
+                Unsupported::Adc {
+                    refusal: AdcRefusal::StartWhileConverting,
+                },
+                "while one was under way",
             ),
             (
                 Unsupported::Adc {

@@ -403,6 +403,14 @@ impl SarAdc {
 
     /// `ONETIME_START` rose: a conversion starts.
     fn start(&mut self, ctx: &mut Ctx, sample: u32) {
+        if self.converting.is_some() {
+            // A start while a conversion is under way: refused by name and ignored, the
+            // conversion under way keeps its unit, its channel and its end.
+            ctx.unsupported(Unsupported::Adc {
+                refusal: AdcRefusal::StartWhileConverting,
+            });
+            return;
+        }
         let (adc1, adc2) = (sample & ADC1_ONETIME != 0, sample & ADC2_ONETIME != 0);
         if adc1 && adc2 {
             // Refused by name, and ended at once as GP-SPI2 ends a refused transaction: both

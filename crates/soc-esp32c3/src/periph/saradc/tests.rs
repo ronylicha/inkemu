@@ -161,6 +161,30 @@ fn a_one_shot_conversion_of_adc1_ends_after_25_sar_clock_cycles_with_the_pin_s_r
 }
 
 #[test]
+fn a_start_during_a_conversion_is_refused_by_name_and_the_conversion_keeps_its_end() {
+    let mut b = bench();
+    b.convert(ADC1_ONETIME, 1, 3);
+    b.run_to(400);
+    // Halfway: a start of ADC2 on GPIO5 (500 mV).
+    b.convert(ADC2_ONETIME, 0, 0);
+    assert_eq!(
+        b.ctx.take_unsupported(),
+        Some(Unsupported::Adc {
+            refusal: AdcRefusal::StartWhileConverting
+        })
+    );
+    assert_eq!(b.ctx.next_wake(), Some(Cycles(800)), "the first end stands");
+    b.run_to(800);
+    assert_eq!(b.read(INT_RAW), ADC1_DONE, "the first conversion, ADC1");
+    assert_eq!(
+        b.read(SAR1DATA_STATUS),
+        b.adc.calibration.reading(3, 1650),
+        "GPIO1's 1650 mV, not GPIO5's 500"
+    );
+    assert_eq!(b.read(SAR2DATA_STATUS), 0, "ADC2 converted nothing");
+}
+
+#[test]
 fn adc2_converts_gpio5_and_an_inverted_output_is_complemented() {
     let mut b = bench();
     b.convert(ADC2_ONETIME, 0, 0);
