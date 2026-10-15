@@ -237,6 +237,39 @@ fn a_scan_both_units_and_a_foreign_clock_are_refused_by_name() {
 }
 
 #[test]
+fn the_bootloaders_scan_for_the_random_generator_is_accepted_and_a_visible_one_refused() {
+    // `bootloader_random_enable`: the samples go to GDMA, then the timer starts; then
+    // `bootloader_random_disable` stops the timer before the samples stop going there.
+    let mut b = bench();
+    b.write(DMA_CONF, 0xFF | APB_ADC_TRANS);
+    b.write(CTRL2, (100 << 12) | TIMER_EN);
+    b.write(CTRL2, 100 << 12);
+    b.write(DMA_CONF, 0xFF);
+    assert_eq!(b.ctx.take_unsupported(), None);
+    assert_eq!(b.ctx.next_wake(), None, "nothing is sampled");
+    // The same scan with a threshold interrupt: its samples would raise it.
+    b.write(DMA_CONF, 0xFF | APB_ADC_TRANS);
+    b.write(CTRL2, TIMER_EN);
+    assert_eq!(b.ctx.take_unsupported(), None);
+    b.write(INT_ENA, 1 << 29);
+    assert_eq!(
+        b.ctx.take_unsupported(),
+        Some(Unsupported::Adc {
+            refusal: AdcRefusal::Scan
+        })
+    );
+    b.write(INT_ENA, 0);
+    // Samples kept in the controller once the timer runs.
+    b.write(DMA_CONF, 0xFF);
+    assert_eq!(
+        b.ctx.take_unsupported(),
+        Some(Unsupported::Adc {
+            refusal: AdcRefusal::Scan
+        })
+    );
+}
+
+#[test]
 fn a_reset_loses_the_conversion_and_restores_the_reset_values() {
     let mut b = bench();
     b.convert(ADC1_ONETIME, 1, 3);

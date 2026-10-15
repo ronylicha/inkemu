@@ -27,6 +27,7 @@ const ONETIME_SAMPLE: u32 = reg("ONETIME_SAMPLE");
 const SAR1DATA_STATUS: u32 = reg("SAR1DATA_STATUS");
 const SAR2DATA_STATUS: u32 = reg("SAR2DATA_STATUS");
 const INT_ENA: u32 = reg("INT_ENA");
+const DMA_CONF: u32 = reg("DMA_CONF");
 const INT_RAW: u32 = reg("INT_RAW");
 const INT_ST: u32 = reg("INT_ST");
 const INT_CLR: u32 = reg("INT_CLR");
@@ -54,6 +55,10 @@ const ADC1_ONETIME: u32 = 1 << 31;
 const ADC1_DONE: u32 = 1 << 31;
 const ADC2_DONE: u32 = 1 << 30;
 const INT_BITS: u32 = 0xFC00_0000;
+/// `INT_RAW` bits 26 to 29: the thresholds of a scan's samples (`THRES0/1_HIGH/LOW`).
+const THRESHOLD_INTS: u32 = 0x3C00_0000;
+/// `DMA_CONF.APB_ADC_TRANS` `[31]`: a scan's samples go to GDMA.
+const APB_ADC_TRANS: u32 = 1 << 31;
 /// `CLKM_CONF`: `CLKM_DIV_NUM` `[7:0]`, `CLK_SEL` `[22:21]`; 2 selects the APB clock
 /// (`adc_ll_digi_clk_sel`, `adc_ll.h:315-318`).
 const DIV_NUM_MASK: u32 = 0xFF;
@@ -68,10 +73,11 @@ const FULL_SCALE: u32 = 4095;
 /// Source 43, `vDIGTAL_ADC_INTR` (TRM table 8.3-1).
 const SOURCE: Source = Source::of("APB_ADC_INT_MAP");
 
-/// The registers stored without effect: the scan's configuration (a scan is refused by name),
-/// the filters and thresholds that act on the scan's samples, the arbiter, the calibration
-/// register of the analog side, the temperature sensor, the date.
-const WHY_SCAN: &str = "multi-channel scan configuration: a scan is refused by name";
+/// The registers stored without effect: the scan's configuration (a scan software could see is
+/// refused by name, one whose samples only go to GDMA samples nothing), the filters and
+/// thresholds that act on the scan's samples, the arbiter, the calibration register of the analog
+/// side, the temperature sensor, the date.
+const WHY_SCAN: &str = "multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing";
 const ACCEPTED: [Accepted; 16] = [
     Accepted::svd("APB_SARADC", "FILTER_CTRL1", WHY_SCAN, "SP2d"),
     Accepted::svd("APB_SARADC", "FSM_WAIT", WHY_SCAN, "SP2d"),
@@ -360,6 +366,22 @@ impl SarAdc {
         ctx.irq(SOURCE, self.get(INT_RAW) & self.get(INT_ENA) != 0);
     }
 
+    /// A scan the timer runs (`CTRL2.SARADC_TIMER_EN`) is refused when software could see its
+    /// samples: they stay in the controller (`DMA_CONF.APB_ADC_TRANS` clear) or a threshold
+    /// interrupt is enabled. A scan that only sends them to GDMA is the one ESP-IDF's bootloader
+    /// runs to feed the random number generator (`bootloader_random_enable`,
+    /// `bootloader_random_esp32c3.c:16-56`): nothing in the chip changes for software, and a
+    /// firmware that links a GDMA channel to it touches GDMA, which is not modelled and says so.
+    fn refuse_a_visible_scan(&self, ctx: &mut Ctx) {
+        let to_gdma_only =
+            self.get(DMA_CONF) & APB_ADC_TRANS != 0 && self.get(INT_ENA) & THRESHOLD_INTS == 0;
+        if self.get(CTRL2) & TIMER_EN != 0 && !to_gdma_only {
+            ctx.unsupported(Unsupported::Adc {
+                refusal: AdcRefusal::Scan,
+            });
+        }
+    }
+
     /// One `SAR_CLK` cycle, in cycles of the time base: the APB clock divided by `CLKM_DIV_NUM + 1`
     /// and by `SAR_CLK_DIV`.
     ///
@@ -428,6 +450,11 @@ impl Peripheral<Ctx> for SarAdc {
             INT_ENA => {
                 self.set(INT_ENA, value & INT_BITS);
                 self.drive_source(ctx);
+                self.refuse_a_visible_scan(ctx);
+            }
+            DMA_CONF => {
+                self.set(DMA_CONF, value);
+                self.refuse_a_visible_scan(ctx);
             }
             // Read-only: the results and the interrupt state.
             INT_RAW | INT_ST | SAR1DATA_STATUS | SAR2DATA_STATUS => return false,
@@ -440,12 +467,8 @@ impl Peripheral<Ctx> for SarAdc {
                 self.set(CTRL, value);
             }
             CTRL2 => {
-                if value & TIMER_EN != 0 {
-                    ctx.unsupported(Unsupported::Adc {
-                        refusal: AdcRefusal::Scan,
-                    });
-                }
                 self.set(CTRL2, value);
+                self.refuse_a_visible_scan(ctx);
             }
             _ => return self.regs.write(offset, value),
         }

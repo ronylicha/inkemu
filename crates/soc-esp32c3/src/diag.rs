@@ -170,8 +170,11 @@ pub enum I2cRefusal {
 /// Why the SAR ADC refused an operation (2b-D10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdcRefusal {
-    /// A multi-channel scan was started (`CTRL.SARADC_START`, `SARADC_START_FORCE` or
-    /// `CTRL2.SARADC_TIMER_EN`): nothing was sampled.
+    /// A multi-channel scan was started whose samples software could see: `CTRL.SARADC_START` or
+    /// `SARADC_START_FORCE`, or `CTRL2.SARADC_TIMER_EN` with the samples kept in the controller
+    /// (`DMA_CONF.APB_ADC_TRANS` clear) or a threshold interrupt enabled. Nothing was sampled. A
+    /// timed scan that only sends its samples to GDMA, as ESP-IDF's bootloader runs it for the
+    /// random number generator, is no refusal.
     Scan,
     /// A one-shot start with both units selected (`ONETIME_SAMPLE` bits 30 and 31): nothing was
     /// sampled.
@@ -453,7 +456,7 @@ impl Unsupported {
             Unsupported::Adc { refusal } => match refusal {
                 AdcRefusal::Scan => write!(
                     f,
-                    "the SAR ADC was asked for a multi-channel scan (APB_SARADC.CTRL SARADC_START or SARADC_START_FORCE, or CTRL2.SARADC_TIMER_EN, pc {pc:#010x}), which inkemu does not model, so nothing was sampled; read the channels one at a time with ONETIME_SAMPLE (adc_oneshot_read)"
+                    "the SAR ADC was asked for a multi-channel scan whose samples software could see (APB_SARADC.CTRL SARADC_START or SARADC_START_FORCE, or CTRL2.SARADC_TIMER_EN with the samples kept in the controller or a threshold interrupt enabled, pc {pc:#010x}), which inkemu does not model, so nothing was sampled; read the channels one at a time with ONETIME_SAMPLE (adc_oneshot_read)"
                 ),
                 AdcRefusal::BothUnits => write!(
                     f,

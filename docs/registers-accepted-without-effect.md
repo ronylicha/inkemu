@@ -119,18 +119,18 @@ its first section says which plan takes what.
 | `0x60026018` | `APB_CTRL.WIFI_RST_EN` | 1 | radio resets: there is no radio | SP5a |
 | `0x6002609c` | `APB_CTRL.FRONT_END_MEM_PD` | 1 | radio front-end memory power | SP5a |
 | `0x600260ac` | `APB_CTRL.MEM_POWER_UP` | 1 | radio memory power | SP5a |
-| `0x60040008` | `APB_SARADC.FILTER_CTRL1` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
-| `0x6004000c` | `APB_SARADC.FSM_WAIT` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
-| `0x60040010` | `APB_SARADC.SAR1_STATUS` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
-| `0x60040014` | `APB_SARADC.SAR2_STATUS` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
-| `0x60040018` | `APB_SARADC.SAR_PATT_TAB1` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
-| `0x6004001c` | `APB_SARADC.SAR_PATT_TAB2` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
+| `0x60040008` | `APB_SARADC.FILTER_CTRL1` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x6004000c` | `APB_SARADC.FSM_WAIT` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040010` | `APB_SARADC.SAR1_STATUS` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040014` | `APB_SARADC.SAR2_STATUS` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040018` | `APB_SARADC.SAR_PATT_TAB1` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x6004001c` | `APB_SARADC.SAR_PATT_TAB2` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
 | `0x60040024` | `APB_SARADC.ARB_CTRL` | 1 | ADC2 arbiter: no Wi-Fi contends for ADC2 | SP5a |
-| `0x60040028` | `APB_SARADC.FILTER_CTRL0` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
-| `0x60040034` | `APB_SARADC.THRES0_CTRL` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
-| `0x60040038` | `APB_SARADC.THRES1_CTRL` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
-| `0x6004003c` | `APB_SARADC.THRES_CTRL` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
-| `0x60040050` | `APB_SARADC.DMA_CONF` | 1 | multi-channel scan configuration: a scan is refused by name | SP2d |
+| `0x60040028` | `APB_SARADC.FILTER_CTRL0` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040034` | `APB_SARADC.THRES0_CTRL` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040038` | `APB_SARADC.THRES1_CTRL` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x6004003c` | `APB_SARADC.THRES_CTRL` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
+| `0x60040050` | `APB_SARADC.DMA_CONF` | 1 | multi-channel scan configuration: a scan software could see is refused by name, one whose samples only go to GDMA samples nothing | SP2d |
 | `0x60040058` | `APB_SARADC.APB_TSENS_CTRL` | 1 | temperature sensor: no temperature is measured, TSENS_OUT reads what is stored | SP2d |
 | `0x6004005c` | `APB_SARADC.TSENS_CTRL2` | 1 | temperature sensor clock | SP2d |
 | `0x60040060` | `APB_SARADC.CALI` | 1 | analog self-calibration selection: a reading follows the eFuse calibration | SP2d |
