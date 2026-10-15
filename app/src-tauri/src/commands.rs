@@ -7,6 +7,7 @@ use host::device::{
     self, Command, CommandError, Emulator, Handle, LaunchError, SdSetup, Setup, Speed, Update,
 };
 use host::engine::{Limits, Notice};
+use monitor::MonitorView;
 use serde::{Deserialize, Serialize};
 use soc_esp32c3::{ConsoleChannel, UsbHost};
 use std::path::PathBuf;
@@ -738,6 +739,18 @@ pub async fn inspect(
         .map_err(ErrorDto::from)
 }
 
+/// What the resource monitor shows of the emulator of start `start` (design `SP4b`): where device
+/// time went, the RAM pages written, the interrupts, the register accesses, the panel's
+/// refreshes, the datasheet estimate of the consumption. Read as `inspect` is.
+#[tauri::command]
+pub async fn monitor(shell: State<'_, Shell>, start: u64) -> Result<MonitorView, ErrorDto> {
+    let shell = shell.inner();
+    let handle = shell.handle_of(start)?;
+    tauri::async_runtime::spawn_blocking(move || handle.monitor())
+        .await?
+        .map_err(ErrorDto::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,6 +1096,50 @@ mod tests {
         assert_eq!(view.points.breakpoints, [view.cpu.pc]);
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["cpu"]["registers"][1]["name"], "ra");
+        assert_eq!(shell.handle_of(0).unwrap_err().kind, "stopped");
+        assert_eq!(shell.power_off(), Ok(()));
+    }
+
+    /// The monitor reads the emulator of the start it names, in the shape the interface reads.
+    #[test]
+    fn the_monitor_reads_the_emulator_of_its_start() {
+        let shell = Shell::default();
+        let (sender, updates) = mpsc::channel();
+        let running = Emulator::start(
+            host::test_support::counting_device(),
+            Speed::Fastest,
+            Box::new(move |update| {
+                let _ = sender.send(update);
+            }),
+        )
+        .unwrap();
+        let (kept, _) = shell.keep(1, running);
+        assert!(kept);
+        let asked = Instant::now();
+        loop {
+            assert!(asked.elapsed() < WAIT, "no status");
+            if let Ok(Update::Status(status)) = updates.recv_timeout(WAIT)
+                && status
+                    .machine
+                    .is_some_and(|machine| machine.instructions > 0)
+            {
+                break;
+            }
+        }
+        let view = shell.handle_of(1).unwrap().monitor().unwrap();
+        assert!(view.instructions > 0);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["memories"][0]["region"], "sram");
+        assert_eq!(
+            json["memories"][0]["pages"][0], "since",
+            "the count is stored there"
+        );
+        assert!(
+            json["power"]["source"]
+                .as_str()
+                .unwrap()
+                .contains("Datasheet")
+        );
         assert_eq!(shell.handle_of(0).unwrap_err().kind, "stopped");
         assert_eq!(shell.power_off(), Ok(()));
     }

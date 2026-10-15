@@ -1392,6 +1392,7 @@ dependencies = [
  "etcetera",
  "firmware",
  "flate2",
+ "monitor",
  "nix",
  "serde",
  "session",
@@ -1687,6 +1688,7 @@ dependencies = [
  "ctrlc",
  "debugger",
  "host",
+ "monitor",
  "serde",
  "serde_json",
  "soc-esp32c3",
@@ -2028,6 +2030,16 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "monitor"
+version = "0.1.0"
+dependencies = [
+ "emu-core",
+ "serde",
+ "soc-esp32c3",
+ "svd-regs",
 ]
 
 [[package]]

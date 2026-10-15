@@ -31,8 +31,11 @@ then rewrites the table below, and nothing else; review the diff before committi
 
 "Count" is 1 for a single register, or the number of consecutive registers the row stands for.
 "Made real by" names the plan that gives the register its effect. Each plan inherits the rows that
-name it. The table has six heirs: SP1b-4, SP2, SP4 (the resource monitor, which needs a power
-model), SP5a, SP5b and SP8. The UART rows SP1b-3d inherited left the table when it gave them their
+name it. The table has six heirs: SP1b-4, SP2, SP4 (the sleep rows: light-sleep rejection and pad
+isolation), SP5a, SP5b and SP8. The six power rows SP4 inherited (`RTC_CNTL.OPTIONS0`, `PWC`,
+`DIG_PWC`, `BIAS_CONF`, `SDIO_CONF`, `SYSTEM.MEM_PD_MASK`) went to SP8 with plan SP4b: the
+datasheet gives no consumption per power domain, so only a model measured on the chip, the
+calibration bench, can give them an effect (ADR 0017). The UART rows SP1b-3d inherited left the table when it gave them their
 effect; the rows SP1b-3f inherited went to SP2, SP4, SP5a and SP8, with the registers the
 deep-sleep path of ESP-IDF writes that the model did not know before. A row whose register has one
 bit that acts names that bit in its description, the rest of the register being stored without
@@ -69,7 +72,7 @@ its first section says which plan takes what.
 | `0x600030e0` | `SPI0.CORE_CLK_SEL` | 1 | MSPI core clock selection: a transfer takes no time | SP8 |
 | `0x600050f0` | `FE2.FE2_TX_INTERP_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60006090` | `FE.FE_GEN_CTRL` | 1 | radio memory power: there is no radio | SP5a |
-| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing: no effect to see without a power model; CPU stall, which ESP-IDF uses on dual-core chips only (the two software reset bits act) | SP4 |
+| `0x60008000` | `RTC_CNTL.OPTIONS0` | 1 | BBPLL, crystal and I2C power forcing: no effect to see without a power model measured on the chip (the datasheet has no figure per domain); CPU stall, which ESP-IDF uses on dual-core chips only (the two software reset bits act) | SP8 |
 | `0x6000801c` | `RTC_CNTL.TIMER1` | 1 | clock and PLL wake-up delays: a wake from deep sleep takes no time | SP8 |
 | `0x60008024` | `RTC_CNTL.TIMER3` | 1 | Wi-Fi/BT power-up timing | SP5a |
 | `0x60008028` | `RTC_CNTL.TIMER4` | 1 | digital power-up timing: a wake from deep sleep takes no time | SP8 |
@@ -80,11 +83,11 @@ its first section says which plan takes what.
 | `0x60008068` | `RTC_CNTL.SLP_REJECT_CONF` | 1 | sleep rejection: no reject source (GPIO, UART) is raised; a light sleep is refused | SP4 |
 | `0x60008070` | `RTC_CNTL.CLK_CONF` | 1 | RTC fast clock source and dividers (a slow clock other than the RC oscillator is refused) | SP8 |
 | `0x60008074` | `RTC_CNTL.SLOW_CLK_CONF` | 1 | RTC slow clock divider | SP8 |
-| `0x60008078` | `RTC_CNTL.SDIO_CONF` | 1 | flash supply (VDD_SDIO) regulator and its power-down in sleep: no effect to see without a power model | SP4 |
-| `0x6000807c` | `RTC_CNTL.BIAS_CONF` | 1 | bias and regulator settings in sleep: no effect to see without a power model | SP4 |
+| `0x60008078` | `RTC_CNTL.SDIO_CONF` | 1 | flash supply (VDD_SDIO) regulator and its power-down in sleep: no effect to see without a power model measured on the chip (the datasheet has no figure per domain) | SP8 |
+| `0x6000807c` | `RTC_CNTL.BIAS_CONF` | 1 | bias and regulator settings in sleep: no effect to see without a power model measured on the chip (the datasheet has no figure per domain) | SP8 |
 | `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP8 |
-| `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control: no effect to see without a power model | SP4 |
-| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power domains in sleep (Wi-Fi, BT, CPU, peripherals) and their forced power-up: no effect to see without a power model (DG_WRAP_PD_EN acts: read at the write of SLEEP_EN, set it makes the sleep deep, clear a light sleep, which is refused) | SP4 |
+| `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control: no effect to see without a power model measured on the chip (the datasheet has no figure per domain) | SP8 |
+| `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power domains in sleep (Wi-Fi, BT, CPU, peripherals) and their forced power-up: no effect to see without a power model measured on the chip, the datasheet having no figure per domain (DG_WRAP_PD_EN acts: read at the write of SLEEP_EN, set it makes the sleep deep, clear a light sleep, which is refused) | SP8 |
 | `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation and automatic hold in sleep: a pad keeps its configuration through a deep sleep, and only its own hold bit (PAD_HOLD, DIG_PAD_HOLD) keeps its output through the reset of the wake | SP4 |
 | `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | the hold of GPIO0 to GPIO5 acts (a held pad keeps its output through a core reset and ignores its registers); bits 6 and above stored | SP2d |
 | `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | the hold of GPIO6 to GPIO21 acts (a held pad keeps its output through a core reset and ignores its registers); the other bits stored | SP2d |
@@ -137,7 +140,7 @@ its first section says which plan takes what.
 | `0x600c0000` | `SYSTEM.CPU_PERI_CLK_EN` | 1 | clock gates of the CPU peripherals: a gated module keeps answering | SP8 |
 | `0x600c0004` | `SYSTEM.CPU_PERI_RST_EN` | 1 | resets of the CPU peripherals (the debug assistant) | SP1b-4 |
 | `0x600c0008` | `SYSTEM.CPU_PER_CONF` | 1 | PLL_FREQ_SEL and the CPU wait-mode bits (CPUPERIOD_SEL is used by the clock model) | SP8 |
-| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep, which is refused by name: no effect to see without a power model | SP4 |
+| `0x600c000c` | `SYSTEM.MEM_PD_MASK` | 1 | memory power-down mask in light sleep, which is refused by name: no effect to see without a power model measured on the chip (the datasheet has no figure per domain) | SP8 |
 | `0x600c0010` | `SYSTEM.PERIP_CLK_EN0` | 1 | peripheral clock gates: a gated module keeps answering | SP8 |
 | `0x600c0014` | `SYSTEM.PERIP_CLK_EN1` | 1 | peripheral clock gates: a gated module keeps answering | SP8 |
 | `0x600c0020` | `SYSTEM.BT_LPCK_DIV_INT` | 1 | Bluetooth low-power clock divider: there is no radio | SP5b |

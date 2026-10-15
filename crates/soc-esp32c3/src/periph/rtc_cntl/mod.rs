@@ -167,8 +167,8 @@ const ACCEPTED: [Accepted; 22] = [
     Accepted::svd(
         "RTC_CNTL",
         "OPTIONS0",
-        "BBPLL, crystal and I2C power forcing: no effect to see without a power model; CPU stall, which ESP-IDF uses on dual-core chips only (the two software reset bits act)",
-        "SP4",
+        "BBPLL, crystal and I2C power forcing: no effect to see without a power model measured on the chip (the datasheet has no figure per domain); CPU stall, which ESP-IDF uses on dual-core chips only (the two software reset bits act)",
+        "SP8",
     ),
     Accepted::svd(
         "RTC_CNTL",
@@ -217,14 +217,14 @@ const ACCEPTED: [Accepted; 22] = [
     Accepted::svd(
         "RTC_CNTL",
         "SDIO_CONF",
-        "flash supply (VDD_SDIO) regulator and its power-down in sleep: no effect to see without a power model",
-        "SP4",
+        "flash supply (VDD_SDIO) regulator and its power-down in sleep: no effect to see without a power model measured on the chip (the datasheet has no figure per domain)",
+        "SP8",
     ),
     Accepted::svd(
         "RTC_CNTL",
         "BIAS_CONF",
-        "bias and regulator settings in sleep: no effect to see without a power model",
-        "SP4",
+        "bias and regulator settings in sleep: no effect to see without a power model measured on the chip (the datasheet has no figure per domain)",
+        "SP8",
     ),
     Accepted::svd(
         "RTC_CNTL",
@@ -259,14 +259,14 @@ const ACCEPTED: [Accepted; 22] = [
     Accepted::svd(
         "RTC_CNTL",
         "PWC",
-        "RTC power-domain control: no effect to see without a power model",
-        "SP4",
+        "RTC power-domain control: no effect to see without a power model measured on the chip (the datasheet has no figure per domain)",
+        "SP8",
     ),
     Accepted::svd(
         "RTC_CNTL",
         "DIG_PWC",
-        "digital power domains in sleep (Wi-Fi, BT, CPU, peripherals) and their forced power-up: no effect to see without a power model (DG_WRAP_PD_EN acts: read at the write of SLEEP_EN, set it makes the sleep deep, clear a light sleep, which is refused)",
-        "SP4",
+        "digital power domains in sleep (Wi-Fi, BT, CPU, peripherals) and their forced power-up: no effect to see without a power model measured on the chip, the datasheet having no figure per domain (DG_WRAP_PD_EN acts: read at the write of SLEEP_EN, set it makes the sleep deep, clear a light sleep, which is refused)",
+        "SP8",
     ),
     Accepted::svd(
         "RTC_CNTL",

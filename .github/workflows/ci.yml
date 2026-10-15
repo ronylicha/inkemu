@@ -30,13 +30,14 @@ jobs:
       - run: cargo test --workspace
       - run: cargo run -p svd-gen -- --check
       # The model crates, the crates a front end composes a flash with, the one it replays a
-      # session with, the one that compares the model with QEMU and the debugger must go on
-      # building for `wasm32-unknown-unknown`, the target of the web version: this step notices a
-      # crate that does not build there. It cannot notice host I/O, which std compiles there and
-      # fails at run time: the clippy step above refuses it in firmware, boards, soc-esp32c3,
-      # console-script, session, lockstep, chips and debugger (their clippy.toml).
+      # session with, the one that compares the model with QEMU, the debugger and the monitor must
+      # go on building for `wasm32-unknown-unknown`, the target of the web version: this step
+      # notices a crate that does not build there. It cannot notice host I/O, which std compiles
+      # there and fails at run time: the clippy step above refuses it in firmware, boards,
+      # soc-esp32c3, console-script, session, lockstep, chips, debugger and monitor (their
+      # clippy.toml).
       - name: Build the model for WebAssembly
-        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3 -p firmware -p boards -p console-script -p session -p lockstep -p chips -p debugger
+        run: cargo check --target wasm32-unknown-unknown -p emu-core -p svd-regs -p cpu-rv32 -p soc-esp32c3 -p firmware -p boards -p console-script -p session -p lockstep -p chips -p debugger -p monitor
       - uses: EmbarkStudios/cargo-deny-action@v2
   coverage:
     runs-on: ubuntu-24.04

@@ -12,6 +12,7 @@ function toolbar(
   current: Status | null,
   starting = false,
   onDebugger = vi.fn(),
+  onMonitor = vi.fn(),
 ) {
   const onCommand = vi.fn();
   renderWith(
@@ -24,6 +25,8 @@ function toolbar(
       theme="system"
       debuggerOpen={false}
       onDebugger={onDebugger}
+      monitorOpen={false}
+      onMonitor={onMonitor}
       onPowerOn={vi.fn()}
       onCommand={onCommand}
       onSpeed={vi.fn()}
@@ -90,5 +93,15 @@ describe("Toolbar", () => {
     expect(button).toHaveAttribute("aria-expanded", "false");
     await user.click(button);
     expect(onDebugger).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the monitor, which says whether it is open", async () => {
+    const user = userEvent.setup();
+    const onMonitor = vi.fn();
+    toolbar("off", null, false, vi.fn(), onMonitor);
+    const button = screen.getByRole("button", { name: "Monitor" });
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    await user.click(button);
+    expect(onMonitor).toHaveBeenCalledTimes(1);
   });
 });

@@ -96,6 +96,21 @@ impl Ram {
         let start = self.offset(addr, len32, AccessKind::Load)?;
         Ok(&self.data[start..start + len])
     }
+
+    /// The version the next write gives the pages it touches: 1 for a RAM never written, one
+    /// more after each write or load. A mark: a page whose version is at or above a version read
+    /// here was written after it was read.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.next_version
+    }
+
+    /// The version of each 4 KiB page the RAM covers, from its first: 0 for a page never written
+    /// since the RAM was built, else the version of the last write or load that touched it.
+    #[must_use]
+    pub fn page_versions(&self) -> &[u64] {
+        &self.page_versions
+    }
 }
 
 impl Bus for Ram {
@@ -165,6 +180,24 @@ mod tests {
                 kind: AccessKind::Fetch
             })
         );
+    }
+    #[test]
+    fn a_new_ram_has_every_page_unwritten_and_the_first_version_to_give() {
+        let ram = Ram::new(0x1000, 3 * 4096);
+        assert_eq!(ram.version(), 1);
+        assert_eq!(ram.page_versions(), &[0, 0, 0]);
+    }
+    #[test]
+    fn a_write_gives_its_pages_the_version_it_took_and_moves_the_version_on() {
+        let mut ram = Ram::new(0, 3 * 4096);
+        ram.write(4094, AccessSize::Word, 1).unwrap();
+        assert_eq!(ram.page_versions(), &[1, 1, 0]);
+        ram.write(8192, AccessSize::Byte, 1).unwrap();
+        assert_eq!(ram.page_versions(), &[1, 1, 2]);
+        assert_eq!(ram.version(), 3, "two writes since the RAM was built");
+        ram.load(0, &[1, 2]).unwrap();
+        assert_eq!(ram.page_versions(), &[3, 1, 2], "a load is a write");
+        assert_eq!(ram.version(), 4);
     }
     #[test]
     fn write_bumps_page_version_only_for_touched_page() {

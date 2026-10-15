@@ -606,6 +606,123 @@ main {
   margin: 2px 0;
 }
 
+/* The resource monitor (design SP4b): a row of its own, as the debugger's. */
+.monitor {
+  grid-column: 1 / -1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-width: 0;
+}
+
+.monitor h2 {
+  margin: 0 0 4px;
+  font-size: 1.05em;
+}
+
+.monitor h3 {
+  margin: 10px 0 6px;
+  font-size: 1em;
+}
+
+.monitor h4 {
+  margin: 8px 0 4px;
+  font-size: 0.95em;
+}
+
+.monitor-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.monitor-grid > * {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.monitor-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 12px;
+  margin: 0 0 8px;
+}
+
+.monitor-facts dt {
+  color: var(--muted);
+}
+
+.monitor-facts dd {
+  margin: 0;
+}
+
+.monitor-table {
+  border-collapse: collapse;
+  font-size: 0.85em;
+  margin-bottom: 10px;
+}
+
+.monitor-table caption {
+  text-align: left;
+  font-weight: 600;
+  padding-bottom: 4px;
+}
+
+.monitor-table tr > th,
+.monitor-table tr > td {
+  padding: 1px 10px 1px 0;
+  text-align: left;
+  font-weight: normal;
+  font-variant-numeric: tabular-nums;
+}
+
+.monitor-table thead th {
+  color: var(--muted);
+}
+
+/* A page of a RAM: its state is told by its fill and its pattern, not by its colour alone, and
+ * in words by the map's text and the legend. */
+.monitor-pages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-bottom: 6px;
+}
+
+.monitor-page {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--muted);
+  box-sizing: border-box;
+  vertical-align: middle;
+}
+
+.monitor-page-never {
+  background: transparent;
+}
+
+.monitor-page-before {
+  background: repeating-linear-gradient(45deg, var(--muted) 0 2px, transparent 2px 4px);
+}
+
+.monitor-page-since {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.monitor-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  list-style: none;
+  margin: 4px 0;
+  padding: 0;
+  font-size: 0.85em;
+}
+
 @media (max-width: 1200px) {
   .debugger-grid {
     grid-template-columns: 1fr 1fr;

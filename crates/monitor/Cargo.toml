@@ -1,0 +1,25 @@
+[package]
+name = "monitor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The resource monitor of inkemu's front ends (design SP4b, ADR 0017): what a reading of the
+# machine's counts means to a user — shares of device time, the RAM pages written, the blocks and
+# interrupt sources by name, and a datasheet estimate of the chip's consumption. No host I/O: the
+# desktop application and the web version (sub-project 6) use it.
+[lints]
+workspace = true
+
+[dependencies]
+emu-core.workspace = true
+soc-esp32c3.workspace = true
+svd-regs.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+soc-esp32c3 = { workspace = true, features = ["test-support"] }
+cpu-rv32 = { workspace = true, features = ["test-support"] }
+# The shape the interface reads the views in.
+serde_json = "1"

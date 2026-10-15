@@ -230,6 +230,113 @@ export interface ViewRequest {
   memory: { address: number; length: number } | null;
 }
 
+// The resource monitor (design SP4b): `crates/monitor/src/{view,power}.rs`. Every share, window,
+// name and current comes from there; the interface only formats numbers.
+
+/** Where device time went; the load is the share of the awake time spent executing, in ‰. */
+export interface TimeView {
+  runningNanos: number;
+  waitingNanos: number;
+  deepSleepNanos: number;
+  loadPermille: number | null;
+}
+
+/** What happened between the reading before and this one. */
+export interface RecentView {
+  deviceNanos: number;
+  time: TimeView;
+  instructions: number;
+  interrupts: number;
+  registerAccesses: number;
+}
+
+export interface ClockView {
+  hz: number;
+  runningNanos: number;
+  waitingNanos: number;
+}
+
+export type MemoryRegion = "sram" | "sram0" | "rtcFast";
+export type PageState = "never" | "before" | "since";
+
+export interface MemoryUseView {
+  region: MemoryRegion;
+  base: number;
+  size: number;
+  pageBytes: number;
+  pages: PageState[];
+  written: number;
+  writtenSinceReset: number;
+  lowest: number | null;
+  highestEnd: number | null;
+  writes: number;
+  writesSinceReset: number;
+}
+
+export interface SourceView {
+  source: number;
+  name: string | null;
+  raised: number;
+  recent: number | null;
+}
+
+export interface LineView {
+  line: number;
+  taken: number;
+}
+
+export interface BlockView {
+  base: number;
+  /** The peripherals of the SVD with a register in the block (none for an undocumented one). */
+  peripherals: string[];
+  reads: number;
+  writes: number;
+  recent: number | null;
+}
+
+export type PowerState = "running" | "idle" | "deepSleep";
+
+export interface PowerRow {
+  state: PowerState;
+  hz: number | null;
+  nanos: number;
+  /** The datasheet's typical current, low then high; `null` where it gives none. */
+  microamps: [number, number] | null;
+  microampHours: [number, number] | null;
+}
+
+export interface PowerView {
+  /** The datasheet the figures come from. */
+  source: string;
+  rows: PowerRow[];
+  microampHours: [number, number];
+  /** Time in states the datasheet has no figure for: left out of the charge. */
+  unpricedNanos: number;
+}
+
+export interface PanelUse {
+  refreshes: number;
+  last: RefreshKind;
+}
+
+export interface MonitorView {
+  deviceTimeNanos: number;
+  cycles: number;
+  instructions: number;
+  cpuHz: number;
+  resets: number;
+  speedRatio: number | null;
+  time: TimeView;
+  recent: RecentView | null;
+  clocks: ClockView[];
+  memories: MemoryUseView[];
+  interrupts: SourceView[];
+  lines: LineView[];
+  peripherals: BlockView[];
+  power: PowerView;
+  panel: PanelUse | null;
+}
+
 export type VerdictView =
   | { kind: "identical" }
   | { kind: "diverged"; detail: string }

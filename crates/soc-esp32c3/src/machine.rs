@@ -355,9 +355,15 @@ pub struct Esp32C3 {
     /// The breakpoint the last call of [`Esp32C3::run_stopping`] stopped at, until the machine
     /// leaves it: the next call goes on past it.
     breakpoint_left: Option<u32>,
+    /// What a resource monitor reads ([`Esp32C3::usage`]); nothing the run does reads it.
+    counters: usage::Counters,
 }
 
 mod debug;
+#[cfg(test)]
+mod test_programs;
+mod usage;
+use usage::Asleep;
 
 impl Esp32C3 {
     /// A machine in its power-on reset state with an erased flash, about to execute the first ROM
@@ -409,6 +415,8 @@ impl Esp32C3 {
         if config.qemu_compat.cycle_counter_on_time_base {
             hart.csr.count_cycles_on_time_base();
         }
+        let counters =
+            usage::Counters::new(bus.ctx.clock().cpu_frequency().hz(), bus.memory_versions());
         Esp32C3 {
             hart,
             bus,
@@ -428,6 +436,7 @@ impl Esp32C3 {
             cycle_counter_reads: 0,
             breakpoints: Vec::new(),
             breakpoint_left: None,
+            counters,
         }
     }
 
@@ -651,6 +660,7 @@ impl Esp32C3 {
                 };
             }
             StepOutcome::Interrupted { cause } => {
+                self.counters.interrupt_taken(cause);
                 // The CPU took the line: the controller marks the edge it had latched for it as
                 // claimed (the latch stays until the firmware writes `CPU_INT_CLEAR` with
                 // the bit of the line set), and the lines are evaluated again.
@@ -865,6 +875,7 @@ impl Esp32C3 {
     /// Asks the interrupt controller which line it selects now.
     fn select_interrupt(&mut self) {
         let sources = self.bus.ctx.sources();
+        self.counters.sources_sampled(sources);
         let line = self.bus.periph.intmatrix.resolve(sources);
         self.selected = match (line, self.selected) {
             (None, _) => None,
@@ -910,10 +921,10 @@ impl Esp32C3 {
         // A wake-up already due is delivered without moving time.
         let target = wake.max(now);
         if let Some(deadline) = deadline.filter(|deadline| target > *deadline) {
-            self.bus.ctx.sleep_until(deadline);
+            self.sleep_to(deadline, Asleep::Waiting);
             return Sleep::CutAtDeadline;
         }
-        self.bus.ctx.sleep_until(target);
+        self.sleep_to(target, Asleep::Waiting);
         Sleep::Until(target.get() - now.get())
     }
 
@@ -960,10 +971,10 @@ impl Esp32C3 {
         };
         let target = next.max(now);
         if let Some(deadline) = deadline.filter(|deadline| target > *deadline) {
-            self.bus.ctx.sleep_until(deadline);
+            self.sleep_to(deadline, Asleep::Deeply);
             return Sleep::CutAtDeadline;
         }
-        self.bus.ctx.sleep_until(target);
+        self.sleep_to(target, Asleep::Deeply);
         if board.is_some_and(|board| board <= target) {
             // The chips and the board's inputs first, then the wake pins, which they may have
             // brought to their level (ADR 0013).
@@ -1045,6 +1056,7 @@ impl Esp32C3 {
         self.selected = None;
         self.bus.ctx.interrupts_changed();
         self.resets += 1;
+        self.counters.reset(self.bus.memory_versions());
         // Every reset ends a deep sleep: `RTC_CNTL` ended it with the reset.
         self.powered_down = false;
     }
@@ -1058,6 +1070,8 @@ impl Esp32C3 {
                 // The devices that time with APB_CLK come to now at the old rate first.
                 self.bus.periph.clock_changing(&mut self.bus.ctx);
                 self.bus.ctx.set_clock(selected);
+                self.counters
+                    .clock_changed(self.bus.ctx.now(), selected.cpu_frequency().hz());
                 // The devices that count APB cycles go on at the new rate.
                 self.bus.deliver(Event::ClockChanged);
             }
