@@ -41,6 +41,9 @@ nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Reads back the FAT32 images `sd_format` makes: another implementation than ours. A test
+# dependency only; its last release is from January 2023 (design SP2e, 2e-D15).
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
 # Reads the manifests of the repository: `test-support` stays out of every normal build.
 toml.workspace = true
 # The shape the interface reads the updates in.

@@ -29,6 +29,7 @@ pub mod record;
 pub mod rom_store;
 pub mod run;
 pub mod script_file;
+pub mod sd_format;
 pub mod sd_image;
 pub mod session_file;
 pub mod term;
