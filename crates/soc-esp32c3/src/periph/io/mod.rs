@@ -169,19 +169,27 @@ struct ClockedChip {
 
 impl ClockedChip {
     /// When the chip must be advanced, seen from `at`: its deadline when it is after `at`; `at`
-    /// itself when the deadline has come and the chip was not advanced at `at` yet; `None` when it
-    /// has none, or was advanced at `at` already (time must move on first: no loop at one
-    /// instant).
+    /// itself when the deadline has come and the chip was not advanced at `at` yet; the next
+    /// instant of the time base when it was advanced at `at` already and still has work due (time
+    /// moves on first: no loop at one instant, and the chip is advanced again one cycle later);
+    /// `None` when it has no deadline.
     fn due(&mut self, at: Nanos) -> Option<Nanos> {
         let deadline = self.chip.next_deadline(at)?;
         if deadline > at {
             Some(deadline)
         } else if self.advanced_at == Some(at) {
-            None
+            Some(next_instant(at))
         } else {
             Some(at)
         }
     }
+}
+
+/// The first instant of the time base after `at` (`at` being an instant of the time base, as
+/// device time is).
+fn next_instant(at: Nanos) -> Nanos {
+    let cycle = TIME_BASE.nanos_to_cycles(u128::from(at.get()));
+    Nanos(TIME_BASE.cycles_to_nanos(Cycles(cycle.get() + 1)))
 }
 
 /// The chips attached to the pads. They survive every reset: they are the board, not the chip.
@@ -321,19 +329,43 @@ impl IoMatrix {
         self.settle(ctx);
     }
 
-    /// The wake-up an attached chip asked for has come: each clocked chip whose deadline has come
-    /// is advanced to now, in the order the chips were attached, then the pads are worked out
-    /// again (a chip may have changed a line it drives) and the next wake-up is armed.
+    /// The wake-up an attached chip asked for has come: the pads are worked out again, which
+    /// first advances each clocked chip whose deadline has come (a chip may change a line it
+    /// drives), and the next wake-up is armed.
     pub(crate) fn wake(&mut self, ctx: &mut Ctx) {
         self.wake.called(ctx.now());
-        let at = nanos(ctx);
+        self.settle(ctx);
+    }
+
+    /// Advances to `at`, in the order they were attached, the clocked chips whose deadline has
+    /// come and that were not advanced at `at` yet. Called before any other call to a chip at
+    /// `at`: a chip never answers for an instant past its deadline before it reaches it.
+    fn advance_due(&mut self, at: Nanos) {
         for clocked in &mut self.chips.clocked {
             if clocked.due(at) == Some(at) {
                 clocked.chip.advance(at);
                 clocked.advanced_at = Some(at);
             }
         }
-        self.settle(ctx);
+    }
+
+    /// The earliest instant a clocked chip must be advanced at, from the present time, in cycles
+    /// of the time base: what a deep sleep moves device time to when nothing of the RTC domain
+    /// comes earlier. The chips are the board's, powered whatever the chip does.
+    pub(crate) fn clocked_deadline(&mut self, ctx: &Ctx) -> Option<Cycles> {
+        let at = nanos(ctx);
+        self.chips
+            .clocked
+            .iter_mut()
+            .filter_map(|clocked| clocked.due(at))
+            .min()
+            .map(|instant| TIME_BASE.nanos_to_cycles(u128::from(instant.get())))
+    }
+
+    /// Advances the clocked chips whose deadline has come, and nothing else: during a deep sleep
+    /// the digital domain, the pads' interrupts with it, has no power.
+    pub(crate) fn advance_clocked(&mut self, ctx: &Ctx) {
+        self.advance_due(nanos(ctx));
     }
 
     /// Attaches a chip that is advanced in device time; its first deadline is armed at once.
@@ -373,6 +405,7 @@ impl IoMatrix {
     /// firmware (P, open question 6 for the rest level).
     pub(crate) fn spi_transfer(&mut self, ctx: &mut Ctx, mosi: &[u8]) -> Vec<u8> {
         let at = nanos(ctx);
+        self.advance_due(at);
         let clocks = self.pads_carrying(pad::FSPICLK);
         let data = self.pads_carrying(pad::FSPID);
         let (miso_pad, rest) = match self.input_of(pad::FSPIQ) {
@@ -408,6 +441,7 @@ impl IoMatrix {
     /// analog chip attached there says, else the pad's level (`PAD_SUPPLY_MV` high, 0 low).
     pub(crate) fn millivolts(&mut self, ctx: &mut Ctx, pad: usize) -> u32 {
         let at = nanos(ctx);
+        self.advance_due(at);
         if let Some((_, source)) = self.chips.analog.iter_mut().find(|(p, _)| *p == pad) {
             let millivolts = source.millivolts(at);
             // The call may have changed what a clocked chip has to do.
@@ -441,18 +475,22 @@ impl IoMatrix {
         Ok(())
     }
 
-    /// Attaches a chip that watches pin `pin`; it hears at once what the chip drives there.
+    /// Attaches a chip that watches pin `pin`; it hears at once what the chip drives there, and
+    /// the next wake-up is armed again: what it heard may have given a clocked chip a deadline.
     /// # Errors
     /// [`AttachError::NoSuchPin`].
     pub(crate) fn attach_output(
         &mut self,
-        ctx: &Ctx,
+        ctx: &mut Ctx,
         pin: u8,
         mut chip: Box<dyn GpioOutput>,
     ) -> Result<(), AttachError> {
         let pad = pad_of(pin)?;
-        chip.driven(self.driven[pad], nanos(ctx));
+        let at = nanos(ctx);
+        self.advance_due(at);
+        chip.driven(self.driven[pad], at);
         self.chips.outputs.push((pad, chip));
+        self.arm(ctx, at);
         Ok(())
     }
 
@@ -506,12 +544,14 @@ impl IoMatrix {
         Ok(())
     }
 
-    /// Works out every pad again at the present time: what the chip drives (the chips watching a
-    /// pad hear a change), what each pad reads (the chips driving one are asked), which SPI chips
-    /// are selected, the interrupts the pads trigger and the wake-up for the next change a chip
-    /// announced.
+    /// Works out every pad again at the present time: first the clocked chips whose deadline has
+    /// come are advanced to it, then what the chip drives (the chips watching a pad hear a
+    /// change), what each pad reads (the chips driving one are asked), which SPI chips are
+    /// selected, the interrupts the pads trigger and the wake-up for the next change a chip
+    /// announced or the next deadline of a clocked chip.
     pub(crate) fn settle(&mut self, ctx: &mut Ctx) {
         let at = nanos(ctx);
+        self.advance_due(at);
         let mut levels = 0;
         for pad in 0..PADS {
             let driven = self.drive_of(pad);
@@ -654,8 +694,9 @@ impl IoMatrix {
     }
 
     /// Asks to be woken at the earliest instant a chip driving a pad with an interrupt said its
-    /// level may change, or a clocked chip must be advanced (now, when its deadline has come and
-    /// it was not advanced now yet); no wake-up when there is neither.
+    /// level may change, or a clocked chip must be advanced (`ClockedChip::due`: its deadline, now,
+    /// or the next instant of the time base when it was advanced now already); no wake-up when
+    /// there is neither.
     fn arm(&mut self, ctx: &mut Ctx, at: Nanos) {
         let mut next: Option<Nanos> = None;
         for clocked in &mut self.chips.clocked {

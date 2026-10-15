@@ -848,23 +848,37 @@ impl Esp32C3 {
     /// watchdog when it is left running in sleep) ends the sleep and rebuilds the digital domain,
     /// whatever its level (`Peripherals::reset`); anything else it raises (an
     /// interrupt) waits, with the CPU, for a reset.
+    ///
+    /// The chips of the board have power whatever the chip does: a clocked chip (ADR 0012) whose
+    /// deadline comes first is advanced at it, alone, without the pads being worked out (their
+    /// interrupts belong to the digital domain), and the sleep goes on. Nothing is due only when
+    /// neither the RTC domain nor a clocked chip has anything to come.
     fn sleep_deeply(&mut self, deadline: Option<Cycles>) -> Sleep {
         let now = self.bus.ctx.now();
-        let Some(call) = self.bus.periph.rtc_cntl.next_call() else {
-            return Sleep::NothingDue;
+        let call = self.bus.periph.rtc_cntl.next_call();
+        let chips = self.bus.periph.io.clocked_deadline(&self.bus.ctx);
+        let next = match (call, chips) {
+            (None, None) => return Sleep::NothingDue,
+            (Some(a), Some(b)) => a.min(b),
+            (Some(only), None) | (None, Some(only)) => only,
         };
-        let target = call.max(now);
+        let target = next.max(now);
         if let Some(deadline) = deadline.filter(|deadline| target > *deadline) {
             self.bus.ctx.sleep_until(deadline);
             return Sleep::CutAtDeadline;
         }
         self.bus.ctx.sleep_until(target);
-        self.bus.wake_rtc_domain();
-        if let Some(cause) = self.bus.ctx.take_reset() {
-            let pc = self.hart.pc;
-            self.reset(cause);
-            // Awake: the clock of the reset, the interrupt lines, the stale wake-ups.
-            self.service(pc);
+        if chips.is_some_and(|chips| chips <= target) {
+            self.bus.periph.io.advance_clocked(&self.bus.ctx);
+        }
+        if call.is_some_and(|call| call <= target) {
+            self.bus.wake_rtc_domain();
+            if let Some(cause) = self.bus.ctx.take_reset() {
+                let pc = self.hart.pc;
+                self.reset(cause);
+                // Awake: the clock of the reset, the interrupt lines, the stale wake-ups.
+                self.service(pc);
+            }
         }
         Sleep::Until(target.get() - now.get())
     }
@@ -1151,7 +1165,10 @@ impl Esp32C3 {
     /// # Errors
     /// [`AttachError`] when the pin does not exist.
     pub fn attach_output(&mut self, pin: u8, chip: Box<dyn GpioOutput>) -> Result<(), AttachError> {
-        self.bus.periph.io.attach_output(&self.bus.ctx, pin, chip)
+        self.bus
+            .periph
+            .io
+            .attach_output(&mut self.bus.ctx, pin, chip)
     }
 
     /// Attaches a chip to GP-SPI2 by the pins of its lines: it receives each transaction while
@@ -1183,7 +1200,8 @@ impl Esp32C3 {
 
     /// Attaches a chip that does work of its own over time (a display controller running a
     /// refresh): the machine advances it to each deadline it names, in device time, whether the
-    /// CPU runs, waits for an interrupt or sleeps until a timer, and asks for its next deadline
+    /// CPU runs, waits for an interrupt, sleeps until a timer or the chip is in deep sleep (the
+    /// board keeps its chips powered), and asks for its next deadline
     /// after each call to it (ADR 0012). The same chip is usually attached by its lines too,
     /// shared through `Rc<RefCell<_>>`: whatever a call on a line changes, its deadline is asked
     /// again. A chip is advanced at most once at one instant.
@@ -5206,8 +5224,93 @@ mod tests {
         assert_eq!(m.drain_diagnostics(), []);
     }
 
+    /// A chip with one deadline at 1 ms, attached to `m`.
+    fn refresh_at_one_millisecond(m: &mut Esp32C3) -> std::rc::Rc<std::cell::RefCell<Refresh>> {
+        let chip = std::rc::Rc::new(std::cell::RefCell::new(Refresh {
+            deadlines: vec![1_000_000],
+            ..Refresh::default()
+        }));
+        m.attach_clocked(Box::new(std::rc::Rc::clone(&chip)));
+        chip
+    }
+
+    /// Code that enters a deep sleep with no wake source (what `esp_deep_sleep_start` does with
+    /// none enabled), then parks.
+    fn sleep_for_ever() -> Vec<u32> {
+        let mut program = store_register(rtc_cntl("WAKEUP_STATE"), 0).to_vec();
+        program.extend(store_register(rtc_cntl("DIG_PWC"), 1 << 31));
+        program.extend(store_register(rtc_cntl("STATE0"), 1 << 31));
+        program.push(HANG);
+        program
+    }
+
     #[test]
-    fn a_clocked_chip_always_due_is_advanced_once_per_instant_and_holds_nothing() {
+    fn a_clocked_chip_is_advanced_at_its_deadline_during_a_deep_sleep_nothing_wakes() {
+        let mut m = machine(&sleep_for_ever());
+        let chip = refresh_at_one_millisecond(&mut m);
+        let mut stop = StopReason::CycleBudget;
+        for _ in 0..100 {
+            stop = m.run_within(Cycles(u64::MAX), Some(1_000_000_000));
+            if stop == StopReason::DeepSleep {
+                break;
+            }
+        }
+        assert_eq!(stop, StopReason::DeepSleep, "the sleep ends the run");
+        assert_eq!(chip.borrow().advanced, [1_000_000], "at its deadline");
+        assert_eq!(
+            m.device_time_nanos(),
+            1_000_000,
+            "nothing is due once the chip has no deadline"
+        );
+        assert!(m.deep_sleep().is_some(), "the chip still sleeps");
+    }
+
+    #[test]
+    fn a_clocked_chip_is_advanced_at_its_deadline_during_a_deep_sleep_the_rtc_timer_ends() {
+        // 0x2000 counts of the slow clock: tens of milliseconds, far beyond the chip's 1 ms.
+        let mut m = machine(&sleep_on_the_rtc_timer(0x2000, TIMER_WAKE_STATE));
+        let chip = refresh_at_one_millisecond(&mut m);
+        for _ in 0..100 {
+            if m.device_time_nanos() >= 5_000_000 {
+                break;
+            }
+            m.run_within(Cycles(u64::MAX), Some(5_000_000));
+        }
+        assert_eq!(m.device_time_nanos(), 5_000_000);
+        assert!(m.deep_sleep().is_some(), "the RTC timer has not come yet");
+        assert_eq!(chip.borrow().advanced, [1_000_000], "at its deadline");
+        assert_eq!(m.resets(), 0);
+    }
+
+    #[test]
+    fn a_clocked_chip_is_advanced_at_its_deadline_across_a_core_reset() {
+        // The first pass marks SRAM and resets the core; the second waits in `wfi`.
+        const MARKER: u32 = SRAM_DBUS_BASE + 0x100;
+        let mut first = store_register(MARKER, 1).to_vec();
+        first.extend(store_register(
+            svd_regs::esp32c3::addr("RTC_CNTL", "OPTIONS0"),
+            1 << 31,
+        ));
+        first.push(HANG);
+        let skip = 4 * (i32::try_from(first.len()).unwrap() + 1);
+        let marker = load_register(MARKER);
+        let mut body = vec![marker[0], marker[1], bne(T1, 0, skip)];
+        body.extend(first);
+        body.extend([wfi(), HANG]);
+        let mut m = quiet_machine(&body);
+        let chip = refresh_at_one_millisecond(&mut m);
+        assert_eq!(m.run_until(Cycles(100_000)), StopReason::Idle);
+        assert_eq!(m.resets(), 1, "the core reset");
+        assert_eq!(
+            chip.borrow().advanced,
+            [1_000_000],
+            "the board's chip went on"
+        );
+        assert_eq!(m.device_time_nanos(), 1_000_000);
+    }
+
+    #[test]
+    fn a_clocked_chip_always_due_is_advanced_once_per_instant_and_again_at_the_next() {
         use std::cell::RefCell;
         use std::rc::Rc;
         let chip = Rc::new(RefCell::new(Refresh {
@@ -5216,12 +5319,22 @@ mod tests {
         }));
         let mut m = quiet_machine(&[addi(1, 0, 1), addi(1, 1, 1), wfi(), HANG]);
         m.attach_clocked(Box::new(Rc::clone(&chip)));
-        assert_eq!(m.run_until(Cycles(10_000)), StopReason::Idle);
+        // 300 ns of device time: the two `addi` take 100 ns, the `wfi` 150 (three cycles of the
+        // 20 MHz clock), then the CPU waits to the end.
+        assert_eq!(
+            m.run_within(Cycles(10_000), Some(300)),
+            StopReason::TimeBudget
+        );
         let advanced = chip.borrow().advanced.clone();
-        assert_ne!(advanced, [], "advanced at least once");
         assert!(
             advanced.windows(2).all(|pair| pair[0] < pair[1]),
             "once per instant, in order of time: {advanced:?}"
+        );
+        // While the CPU runs, at the end of each instruction at the latest; while it waits, at
+        // each cycle of the time base (6.25 ns), none skipped.
+        assert_eq!(
+            advanced,
+            [0, 50, 100, 250, 256, 262, 268, 275, 281, 287, 293, 300]
         );
         assert_eq!(m.cycles().get(), 5, "the two `addi` and the `wfi` ran");
     }

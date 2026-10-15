@@ -347,6 +347,38 @@ fn a_clocked_chip_is_asked_its_deadline_after_a_call_on_its_lines_and_advanced_t
 }
 
 #[test]
+fn a_read_of_the_pins_past_a_deadline_advances_the_chip_before_it_reads_its_line() {
+    // The instruction that reads `GPIO.IN` crosses the end of the chip's work: the read must see
+    // the chip after its advance, before the wake-up armed for the deadline is delivered.
+    let ctx = &mut Ctx::default();
+    let mut io = IoMatrix::new(0x8);
+    let chip = Rc::new(RefCell::new(Busy::default()));
+    io.attach_output(ctx, 5, Box::new(Rc::clone(&chip)))
+        .unwrap();
+    io.attach_input(ctx, 6, Box::new(Rc::clone(&chip))).unwrap();
+    io.attach_clocked(ctx, Box::new(Rc::clone(&chip)));
+    write(&mut io, ctx, pad_reg(6), GPIO_PAD);
+    output(&mut io, ctx, 5, true);
+    ctx.sleep_until(Cycles(330));
+    assert_eq!(read(&mut io, ctx, IN) & (1 << 6), 0, "no longer busy");
+    assert_eq!(chip.borrow().advanced, [2_062], "advanced at the read");
+}
+
+#[test]
+fn attaching_a_watcher_asks_the_deadline_its_first_hearing_gave_a_clocked_chip() {
+    let ctx = &mut Ctx::default();
+    let mut io = IoMatrix::new(0x8);
+    let chip = Rc::new(RefCell::new(Busy::default()));
+    io.attach_clocked(ctx, Box::new(Rc::clone(&chip)));
+    output(&mut io, ctx, 5, true);
+    assert_eq!(ctx.next_wake(), None, "no work yet");
+    // The watcher hears GPIO5 high at once, which starts the chip's 2 µs of work.
+    io.attach_output(ctx, 5, Box::new(Rc::clone(&chip)))
+        .unwrap();
+    assert_eq!(ctx.next_wake(), Some(Cycles(320)));
+}
+
+#[test]
 fn a_signal_of_a_peripheral_the_model_lacks_and_an_nmi_are_refused_by_name() {
     let ctx = &mut Ctx::default();
     let mut io = IoMatrix::new(0x8);

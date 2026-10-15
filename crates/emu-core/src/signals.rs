@@ -140,17 +140,25 @@ pub trait AnalogSource: std::fmt::Debug {
 /// the `SoC` is running, waiting for an interrupt or waiting for a timer.
 ///
 /// The `SoC` asks [`Clocked::next_deadline`] when the chip is attached and again after every call
-/// it makes to the chip (an advance, a transfer, a level asked or heard), and wakes at the instant
-/// given to call [`Clocked::advance`] there. Calls come in order of time, and a chip is advanced
-/// at most once at a given instant: a deadline that is not after the instant the chip was last
-/// advanced at waits for time to move on, so a chip cannot hold the `SoC` at one instant.
+/// it makes to a chip (an advance, a transfer, a level asked or heard), and calls
+/// [`Clocked::advance`] once the deadline has come, before any other call it makes to a chip at
+/// that instant: a chip never answers for an instant past its deadline before it has reached it.
+/// This holds while the `SoC` runs, while its CPU waits for an interrupt and during a deep sleep
+/// of the `SoC`, the chips of the board keeping their power. Calls come in order of time, and a
+/// chip is advanced at most once at a given instant: a deadline that is not after the instant the
+/// chip was last advanced at is taken up again at the next instant of the `SoC`'s time base, so
+/// a chip cannot hold the `SoC` at one instant, and one whose work is always due is advanced at
+/// each instant of that time base.
 pub trait Clocked: std::fmt::Debug {
     /// The instant the chip must be advanced at, at the latest: `at` or before when it has work
     /// due now, `None` when it has nothing to do until the `SoC` acts on it.
     fn next_deadline(&mut self, at: Nanos) -> Option<Nanos>;
 
-    /// Brings the chip to `at`, doing the work due by then. `at` is device time when the `SoC` is
-    /// woken: the deadline, or the first instant of the `SoC`'s time base at or after it.
+    /// Brings the chip to `at`, doing the work due by then. `at` is device time, at or after the
+    /// deadline: while the `SoC`'s CPU waits (an interrupt, a timer, a deep sleep), the first
+    /// instant of the `SoC`'s time base at or after the deadline, exactly; while it runs, at the
+    /// latest the end of the instruction under way when the deadline came, earlier when an access
+    /// of that instruction reaches a chip.
     fn advance(&mut self, at: Nanos);
 }
 

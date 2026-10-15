@@ -125,8 +125,11 @@ pub enum Event {
     RtcMemoryCrc,
     /// To every device that counts APB clock cycles: the clock selection changed.
     ClockChanged,
-    /// Wake-up of the IO matrix: a chip attached to a pin whose GPIO interrupt is configured said
-    /// its level may change at this instant (`GpioInput::next_change`).
+    /// Wake-up of the IO matrix, at the earliest of: the instant a chip attached to a pin whose
+    /// GPIO interrupt is configured said its level may change (`GpioInput::next_change`), and the
+    /// deadline of a clocked chip (`Clocked::next_deadline`, or the next cycle of the time base
+    /// when it was advanced at the present instant already). The matrix advances the chips whose
+    /// deadline has come, then works its pads out again.
     Pins,
     /// Wake-up of GP-SPI2: its transaction ends.
     Spi2,
