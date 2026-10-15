@@ -86,7 +86,28 @@ Conditions : `CARGO_BUILD_JOBS=3`, aucun conteneur Docker.
   - `boards` (`host_io_ban`), `debugger`, `session`, `lockstep`, `console-script`, `emu-cli` (tests non ignorés).
 - WebAssembly : `cargo check --target wasm32-unknown-unknown` de toute la liste de la CI, `monitor` compris.
 - Enveloppe Tauri : `cargo fmt`, `clippy -D warnings`, 21 tests.
-- Application : `pnpm lint`, `pnpm typecheck`, Vitest (21 fichiers, 137 tests), `pnpm build`.
+- Application : `pnpm lint`, `pnpm typecheck`, Vitest (21 fichiers, 138 tests), `pnpm build`.
+
+## Relecture
+
+Une relecture du code (`code-reviewer`) n'a trouvé aucun défaut sûr. Elle a vérifié :
+
+- que tout le temps passé hors exécution passe par `sleep_to` ;
+- l'ordre entre sommeil profond et segments d'horloge ;
+- l'indépendance aux coupures ;
+- les soustractions de la fenêtre ;
+- l'accord des formes serde avec `types.ts` ;
+- le nettoyage de l'effet.
+
+Elle a relevé quatre points de faible confiance :
+
+1. **Unité choisie avant l'arrondi** : 999,9 µs s'écrivait « 1 000 µs ». Corrigé dans `monitor-format.ts`, qui choisit
+   l'unité après l'arrondi à trois chiffres. Test Vitest.
+2. **Somme des temps par fréquence** : chacun est converti en nanosecondes à part, leur somme peut différer d'une
+   nanoseconde du total. Laissé : cosmétique.
+3. **Fenêtre récente partagée** : elle est l'état du fil. Un second client qui lirait le moniteur raccourcirait la
+   fenêtre du premier. Il n'y a qu'un panneau ; laissé, et noté ci-dessous.
+4. **Relecture à chaque changement d'état** quand l'appareil ne tourne pas : voulu, un pas change l'état.
 - Avec la vraie ROM (les trois révisions récupérées par `inkemu rom fetch --all` dans un dossier temporaire), en
   release : `soc-esp32c3` `real_rom` 19/19, `host` `real_rom` 2/2. Les empreintes figées n'ont pas bougé.
 
@@ -145,6 +166,7 @@ deux tarifs) et `a_replay_read_by_the_monitor_all_along_is_identical` (`host`).
 | Rapport du moniteur à la fin d'un scénario sans écran, depuis la CLI | SP4e |
 | Consommation par domaine d'alimentation, six registres d'alimentation | SP8 |
 | Détail par périphérique (octets SPI, transactions I2C, conversions ADC) | à la demande, hors de la zone de SP3 |
+| La fenêtre récente est celle du fil : un second lecteur du moniteur (version web, scénario) la partagerait ; lui donner une fenêtre par lecteur si l'un d'eux arrive | SP4e ou SP6 |
 | Une lecture servie par le fil (débogueur, moniteur) repousse la passe suivante d'au plus `PACE_WAIT` (5 ms) en temps réel ; un client qui lirait sans pause retiendrait l'exécution. Le panneau lit une fois par seconde. | à la demande, avec le prochain changement de la boucle du fil |
 
 ## Limites de preuve
