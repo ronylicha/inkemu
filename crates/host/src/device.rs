@@ -575,6 +575,10 @@ pub enum CommandError {
     NotRecordable,
     #[error("{0}")]
     PowerOn(String),
+    /// A command given on the emulator's own thread, by its observer: answering it would need
+    /// the thread that waits for the answer.
+    #[error("a command cannot be given from the emulator's own thread (its observer)")]
+    OnItsThread,
 }
 
 impl CommandError {
@@ -593,6 +597,7 @@ impl CommandError {
             CommandError::ReplayNotRecorded => "replayNotRecorded",
             CommandError::NotRecordable => "notRecordable",
             CommandError::PowerOn(_) => "powerOn",
+            CommandError::OnItsThread => "onItsThread",
         }
     }
 }
@@ -674,7 +679,12 @@ pub enum Update {
     Stopped,
 }
 
-/// The receiver of the updates of an emulator, called on its thread.
+/// The receiver of the updates of an emulator, called on its thread, in order.
+///
+/// It must return soon and must not wait for the emulator: the thread does nothing else while it
+/// runs. A command given from it would wait for an answer that only this thread can give, so
+/// [`Handle::command`] refuses it ([`CommandError::OnItsThread`]); an observer that needs to
+/// command the emulator hands the update to another thread, which commands it.
 pub type Observer = Box<dyn FnMut(Update) + Send>;
 
 struct Request {
@@ -692,6 +702,8 @@ pub struct Handle {
     requests: Sender<Request>,
     frame: FrameSlot,
     rotation: crate::ports::Rotation,
+    /// The emulator's thread, on which a command would wait for itself.
+    thread: std::thread::ThreadId,
 }
 
 impl std::fmt::Debug for Handle {
@@ -704,8 +716,12 @@ impl Handle {
     /// Does `command` between two passes of the machine, and gives its result.
     ///
     /// # Errors
-    /// [`CommandError`]: the command was refused, or the thread has stopped.
+    /// [`CommandError`]: the command was refused, or the thread has stopped;
+    /// [`CommandError::OnItsThread`] from the emulator's own thread (see [`Observer`]).
     pub fn command(&self, command: Command) -> Result<(), CommandError> {
+        if std::thread::current().id() == self.thread {
+            return Err(CommandError::OnItsThread);
+        }
         let (reply, answer) = mpsc::channel();
         self.requests
             .send(Request { command, reply })
@@ -793,6 +809,7 @@ impl Emulator {
                 requests,
                 frame,
                 rotation: look.panel.rotation,
+                thread: thread.thread().id(),
             },
             look,
             console,
@@ -2175,6 +2192,42 @@ mod tests {
                 if n.text.contains("a button port broke"))),
             "{seen:#?}"
         );
+        emulator.shutdown();
+    }
+
+    /// A command from the observer, on the emulator's thread, is refused instead of waiting for
+    /// ever.
+    #[test]
+    fn a_command_from_the_observer_is_refused() {
+        let handle: Arc<Mutex<Option<Handle>>> = Arc::default();
+        let (sender, answers) = mpsc::channel();
+        let shared = Arc::clone(&handle);
+        let launch = Launch::new(
+            x4(echo()),
+            FlashKeeper::without_file(None, 1 << 22),
+            Limits::default(),
+            LOOK,
+            None,
+        );
+        let emulator = Emulator::start(
+            launch,
+            Speed::RealTime,
+            Box::new(move |update| {
+                if matches!(update, Update::Status(_))
+                    && let Some(handle) = shared.lock().unwrap().as_ref()
+                {
+                    let _ = sender.send(handle.command(Command::Pause));
+                }
+            }),
+        )
+        .unwrap();
+        *handle.lock().unwrap() = Some(emulator.handle());
+        let answer = answers.recv_timeout(WAIT).unwrap();
+        assert!(
+            matches!(answer, Err(CommandError::OnItsThread)),
+            "{answer:?}"
+        );
+        drop(handle.lock().unwrap().take());
         emulator.shutdown();
     }
 
