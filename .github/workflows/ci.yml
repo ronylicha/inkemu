@@ -242,7 +242,7 @@ jobs:
         run: |
           failed=0
           tools/ci/run-ignored-tests.sh 13 --release -p soc-esp32c3 --test reference_boot -- --ignored || failed=1
-          tools/ci/run-ignored-tests.sh 15 --release -p emu-cli --test run_cli reference_firmware -- --ignored || failed=1
+          tools/ci/run-ignored-tests.sh 16 --release -p emu-cli --test run_cli reference_firmware -- --ignored || failed=1
           tools/ci/run-ignored-tests.sh 5 --release -p console-script --test reference_firmware -- --ignored || failed=1
           tools/ci/run-ignored-tests.sh 1 --release -p boards --test reference_signals -- --ignored || failed=1
           tools/ci/run-ignored-tests.sh 2 --release -p boards --test reference_panel -- --ignored || failed=1

@@ -30,7 +30,7 @@ const SQUARE_TOP: usize = 216;
 const SQUARE_SIDE: usize = 48;
 /// The trace of the first run below, measured on 2026-10-15 with every other assertion of the test
 /// passing (release build, twice, the same).
-const TRACE_HASH: u64 = 0x0ba6_93fe_ad48_96b9;
+const TRACE_HASH: u64 = 0x2d48_1100_f1dd_0a53;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut text, byte| {
@@ -287,6 +287,13 @@ fn the_x4_shows_its_frame_and_a_square_per_press_then_turns_off_on_its_power_key
         .and_then(|mv| mv.parse().ok())
         .unwrap_or_else(|| panic!("no battery line:\n{console}"));
     assert!(battery.abs_diff(3_900) <= 20, "battery {battery} mV");
+    // The firmware waits for BUSY by its falling edge only (no polling, no timeout): each fall the
+    // panel announced reached the CPU as an interrupt, after the hardware reset, the software
+    // reset and the full refresh (2d-D5).
+    assert!(
+        console.contains(", 3 falls of busy by interrupt\n"),
+        "three falls of BUSY by interrupt:\n{console}"
+    );
 
     let mut before = shown(&panel, 1, RefreshKind::Full);
     assert_eq!(

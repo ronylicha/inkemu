@@ -4630,7 +4630,7 @@ fn x4_records_the_deep_sleep_timer_reference_firmware_through_its_wakes_and_repl
 
 /// The trace of the run of `x4_panel_buttons` below, measured on 2026-10-15 on the development
 /// host with every other assertion of the test passing (twice, the same).
-const X4_PANEL_TRACE: &str = "trace-hash 5b35ac6a537bf727";
+const X4_PANEL_TRACE: &str = "trace-hash 88a64f66f1a1c1d4";
 
 /// What a user does to `x4_panel_buttons` on the wired X4: once its power key is armed, Confirm,
 /// then Down, each shown by a refresh, then the power key.
@@ -4742,6 +4742,123 @@ fn x4_runs_the_panel_and_buttons_reference_firmware_to_its_power_off_and_replays
         String::from_utf8_lossy(&replayed.stdout).replace('\r', ""),
         console,
         "the replay shows the console of the run"
+    );
+    assert!(
+        replay_log.contains("inkemu: the replay gives what the session recorded: "),
+        "{replay_log}"
+    );
+    assert_eq!(trace_hash_line(&replay_log), measured, "{replay_log}");
+}
+
+/// The trace of the run of `x4_panel_buttons` on a cable below, measured on 2026-10-15 on the
+/// development host with every other assertion of the test passing (twice, the same).
+const X4_PANEL_WAKE_TRACE: &str = "trace-hash b5891d847fa1e6f9";
+
+/// The cable in: the power key sends `x4_panel_buttons` into deep sleep woken by that key, half a
+/// second later the key wakes it, and its second life arms the key again.
+const X4_PANEL_WAKE_SCRIPT: &str = "\
+wait-for usb-serial-jtag \"x4_panel_buttons: power key released, armed\"
+press power
+wait 100ms
+release power
+wait-for usb-serial-jtag \"x4_panel_buttons: power key released, sleeping\"
+wait 500ms
+press power
+wait 100ms
+release power
+wait-for usb-serial-jtag \"x4_panel_buttons: power key released, armed\"
+";
+
+/// The wake of a deep sleep by a pin, recorded and replayed (spec §6.4, 2d-D11, 2d-D21): with
+/// `--usb-power`, `x4_panel_buttons` goes into deep sleep woken by the power key (GPIO3 low); a
+/// press of the key wakes it as a core reset of cause 5, and its next life says it was the key.
+/// The session (format 2: the gesture, the cable, the four presses and releases of the script)
+/// replays identically, the wake included.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_X4_PANEL_APP"]
+fn x4_records_the_wake_of_the_panel_reference_firmware_by_its_power_key_and_replays_it_identically()
+{
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let application = std::env::var("INKEMU_X4_PANEL_APP").expect(
+        "set INKEMU_X4_PANEL_APP to the x4_panel_buttons.bin of tools/reference-firmware/build.sh",
+    );
+    assert_eq!(
+        sha256_of(std::path::Path::new(&application)),
+        pinned_in_sums("SHA256SUMS.inputs-x4-panel-buttons", "x4_panel_buttons.bin"),
+        "{application} is not the pinned x4_panel_buttons.bin; rebuild it with tools/reference-firmware/build.sh"
+    );
+    let (_script_dir, script) = console_script(X4_PANEL_WAKE_SCRIPT);
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("wake.inkrec");
+    let run = inkemu()
+        .args(["run", "--device", "x4", "--usb-power", "--max-time", "10"])
+        .args(["--rom-dir", &rom_dir])
+        .arg("--firmware")
+        .arg(&application)
+        .arg("--console-script")
+        .arg(&script)
+        .arg("--record")
+        .arg(&session)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&run.stdout).replace('\r', "");
+    let log = String::from_utf8_lossy(&run.stderr).into_owned();
+    let mut from = 0;
+    for expected in [
+        "x4_panel_buttons: start, latch held\n",
+        "x4_panel_buttons: usb cable plugged\n",
+        "x4_panel_buttons: power key released, armed\n",
+        "x4_panel_buttons: power key pressed, cable in: deep sleep until the power key\n",
+        "x4_panel_buttons: power key released, sleeping\n",
+        "rst:0x5 (DSLEEP),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        "x4_panel_buttons: start, woken by the power key, latch held\n",
+        "x4_panel_buttons: usb cable plugged\n",
+        "x4_panel_buttons: full refresh, busy ",
+        "x4_panel_buttons: power key released, armed\n",
+    ] {
+        let at = console[from..].find(expected).unwrap_or_else(|| {
+            panic!("`{expected}` is missing, or out of order:\n{console}\n{log}")
+        });
+        from += at + expected.len();
+    }
+    for expected in [
+        // The wake names the pin that woke the chip, not the RTC timer.
+        "\ninkemu: woken from deep sleep by GPIO3 (rst:0x5), a core reset at ",
+        "inkemu: console script through (10 steps)\n",
+        // The press and release of the gesture, the cable, and the four of the script.
+        "inkemu: session recorded in wake.inkrec (7 inputs); `inkemu replay` replays it\n",
+    ] {
+        assert!(log.contains(expected), "`{expected}` is missing:\n{log}");
+    }
+    assert!(!log.contains("warning:"), "{log}");
+    assert!(
+        !log.contains("powered off"),
+        "the cable keeps it on:\n{log}"
+    );
+    let measured = trace_hash_line(&log);
+    assert_eq!(
+        measured,
+        Some(X4_PANEL_WAKE_TRACE),
+        "the trace hash of this run is {measured:?}: when the run above is the one intended, pin it in X4_PANEL_WAKE_TRACE\n{log}"
+    );
+    let replayed = inkemu()
+        .arg("replay")
+        .arg(&session)
+        .args(["--rom-dir", &rom_dir])
+        .timeout(HANG_LIMIT)
+        .output()
+        .unwrap();
+    let replay_log = String::from_utf8_lossy(&replayed.stderr).into_owned();
+    assert_eq!(replayed.status.code(), Some(0), "{replay_log}");
+    assert_eq!(
+        String::from_utf8_lossy(&replayed.stdout).replace('\r', ""),
+        console,
+        "the replay shows the console of the run, the wake included"
     );
     assert!(
         replay_log.contains("inkemu: the replay gives what the session recorded: "),

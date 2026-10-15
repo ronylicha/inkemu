@@ -13,7 +13,9 @@
  *    software reset, the internal temperature sensor, 480 gates scanned with SM = 1, the top row of
  *    the glass written to the last RAM row (data entry 01h), then a full refresh (22h F7h) of a
  *    white image with a black frame and a black square in its top-left corner. Both planes hold the
- *    image after it: the red plane is the previous frame of the differential refresh.
+ *    image after it: the red plane is the previous frame of the differential refresh. It waits for
+ *    BUSY by the interrupt of its falling edge, a semaphore given by the handler, as FreeInk does
+ *    (2d-D5, 2d-D21): the fall the panel announces reaches the CPU as an interrupt.
  * 3. The buttons: the two resistor ladders (GPIO1, GPIO2, ADC1 channels 1 and 2, 12 dB, curve
  *    fitting) read every 20 ms; a button seen pressed on two readings in a row is a press, which it
  *    prints, then draws a black square in the row of squares at the place of that button and shows
@@ -27,6 +29,7 @@
  *
  * Every line it prints starts with "x4_panel_buttons: ".
  */
+#include <assert.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -36,10 +39,12 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #define PIN_BATTERY 0 /* ADC1 channel 0 */
@@ -105,10 +110,30 @@ static void paint_black(int x0, int y0, int x1, int y1)
     }
 }
 
+/* Given by the interrupt of BUSY's falling edge; the falls it saw. */
+static SemaphoreHandle_t busy_fell;
+static volatile uint32_t busy_falls;
+
+static void IRAM_ATTR on_busy_fall(void *arg)
+{
+    (void)arg;
+    busy_falls++;
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(busy_fell, &woken);
+    if (woken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+/*
+ * Waits for BUSY to fall, by its interrupt as FreeInk does, never by polling: the task sleeps on
+ * the semaphore with no timeout, so a fall the interrupt does not report hangs the firmware and
+ * fails its tests. A give left from an earlier fall only makes the loop read the level again.
+ */
 static void wait_while_busy(void)
 {
     while (gpio_get_level(PIN_PANEL_BUSY) == 1) {
-        vTaskDelay(pdMS_TO_TICKS(10));
+        xSemaphoreTake(busy_fell, portMAX_DELAY);
     }
 }
 
@@ -177,11 +202,16 @@ static void panel_part(void)
         .mode = GPIO_MODE_OUTPUT,
     };
     ESP_ERROR_CHECK(gpio_config(&outputs));
+    busy_fell = xSemaphoreCreateBinary();
+    assert(busy_fell != NULL);
     const gpio_config_t busy = {
         .pin_bit_mask = BIT64(PIN_PANEL_BUSY),
         .mode = GPIO_MODE_INPUT,
+        .intr_type = GPIO_INTR_NEGEDGE,
     };
     ESP_ERROR_CHECK(gpio_config(&busy));
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_PANEL_BUSY, on_busy_fall, NULL));
     const spi_bus_config_t bus = {
         .mosi_io_num = PIN_MOSI,
         .miso_io_num = -1,
@@ -222,7 +252,9 @@ static void panel_part(void)
     write_plane(0x24);
     write_plane(0x26);
     int64_t ms = refresh(0xF7);
-    printf("x4_panel_buttons: full refresh, busy %" PRId64 " ms\n", ms);
+    printf("x4_panel_buttons: full refresh, busy %" PRId64 " ms, %" PRIu32
+           " falls of busy by interrupt\n",
+           ms, busy_falls);
 }
 
 static adc_cali_handle_t calibrated(adc_channel_t channel)
