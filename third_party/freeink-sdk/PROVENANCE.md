@@ -19,7 +19,7 @@ which FreeInk says its SSD1677 initialisation sequences and waveform LUTs derive
 
 One table of data, in test code only:
 
-| Copy | Source | Lines |
+| Copy | Source | Size and revisions where the source is identical |
 |---|---|---|
 | `FACTORY_GREY` in `crates/chips/src/ssd1677/tests.rs` | `lut_factory_quality` in `libs/display/FreeInkDisplay/src/lut/Ssd1677Luts.h` | 110 bytes, the same at `111fdcc7`, `7fcd3b34` and `32a265fa` |
 | `FACTORY_GREY` in `crates/chips/tests/x4_driver.rs` | the same table | the same |

@@ -14,6 +14,7 @@ contradiction on BUSY). The design that rules on what follows is
 | **DS** | Solomon Systech, *SSD1677 Advance Information*, Rev 1.0, Nov 2018, 47 pages (the PDF holds 46) | Good Display's page "IC Driver SSD1677" (`https://www.good-display.com/companyfile/170.html`), which serves `https://v4.cecdn.yun300.cn/100001_1909185148/SSD1677.pdf`; SHA-256 `4b5cc241f410722e54c4d756424907b90ed988502216ed5ed864dd0df78b7e0c`. Not stored in this repository. Solomon Systech's own page gives the document on request only. |
 | **FI** | FreeInk SDK, the hardware layer of CrossPoint | Read at `Free-Ink/freeink-sdk` `7fcd3b34c108f28c086ade3b433924022dbc0998`, the commit the submodule `freeink-sdk` of CrossPoint's `main` points to (read through the GitHub API on 2026-10-15; CrossPoint's `main` at `bb855ef935826e86c65574b5abbd4eab974d53e0`). The release CrossPoint 1.6.5 (tag `1.6.5`, commit `93e98bb78702e29868a16a13b80c40e6b36ccdff`, 2026-09-27) builds on FreeInk `111fdcc7f0176c3ee38391a160ee296bf492dbd8`: its X4 path sends the same bytes (below). Line numbers cited in this report are those of `7fcd3b34`. The SSD1677 driver, its bus and the X4 LUTs are identical at FreeInk's head `e91e34e3da3bf87b6c3c896fe1b3d6dda1a8c7c2`; only a LUT of another board differs. |
 | **CP** | CrossPoint Reader | `crosspoint-reader/crosspoint-reader` at `bb855ef935826e86c65574b5abbd4eab974d53e0` (`main`) and at the tag `1.6.5` |
+| **PX** | Papyrix Reader, its `docs/ssd1677-driver.md` | `bigbag/papyrix-reader` at `ee071b173e29b1e81fc7e259260077d5ba981b38` |
 
 **The release and the commit read.** Checked on 2026-10-15, file by file, after a review asked
 whether the FreeInk read is the one CrossPoint 1.6.5 runs:
@@ -36,7 +37,6 @@ whether the FreeInk read is the one CrossPoint 1.6.5 runs:
 
 So §4 and §7–8 hold for the release 1.6.5 as for `main`; `LICENSE` and `NOTICE` are the same at
 the three commits (§9).
-| **PX** | Papyrix Reader, its `docs/ssd1677-driver.md` | `bigbag/papyrix-reader` at `ee071b173e29b1e81fc7e259260077d5ba981b38` |
 
 File paths below are relative to each repository; `FI:Ssd1677Driver.cpp:337` reads "line 337 of
 `libs/display/FreeInkDisplay/src/driver/Ssd1677Driver.cpp` in FI".

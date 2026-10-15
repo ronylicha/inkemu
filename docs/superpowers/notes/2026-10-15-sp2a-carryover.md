@@ -20,7 +20,7 @@ Une crate `crates/chips` (dépend d'`emu-core` et de `thiserror`, aucune E/S hô
 
 Vérifié sur le poste de développement (partagé, `CARGO_BUILD_JOBS=3`) : `cargo fmt --all --check` ;
 `tools/ci/clippy.sh -p chips --all-targets --all-features -- -D warnings` ; `cargo doc -p chips` avec
-`RUSTDOCFLAGS=-D warnings` ; `cargo test -p chips` (89 tests unitaires, 10 d'intégration) ;
+`RUSTDOCFLAGS=-D warnings` ; `cargo test -p chips` (90 tests unitaires, 10 d'intégration) ;
 `cargo check --target wasm32-unknown-unknown -p chips` ; `cargo test -p boards --test host_io_ban` (3) ;
 `cargo test -p inkemu-lockstep --test readme` (2). **Non lancés**, laissés à la CI : la suite complète du workspace,
 clippy et rustdoc sur tout le workspace, la couverture.
@@ -210,7 +210,7 @@ agents travaillent en parallèle) :
   validation), `ram.rs` (plans, fenêtre, compteur, écriture automatique), `waveform.rs` (tables de tensions, LUT,
   translations bornées), `panel.rs` (grilles → lignes, état optique, `PanelImage`), `reference.rs` (OTP de
   référence du GDEQ0426T82), `diagnostic.rs`.
-- **`api_routes.md`** : tests de `chips` — 89 unitaires (`src/**`, dont le test à graine fixe de 100 000
+- **`api_routes.md`** : tests de `chips` — 90 unitaires (`src/**`, dont le test à graine fixe de 100 000
   opérations), 10 d'intégration (`tests/x4_driver.rs`, séquences FreeInk, MUX au-delà de la RAM, présence de la
   licence et de l'avis de FreeInk) ; `host_io_ban` couvre sept crates ; l'étape « Build the model for WebAssembly » de la CI
   inclut `-p chips`.

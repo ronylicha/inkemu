@@ -588,3 +588,14 @@ Licence hygiene: QEMU source was read for behaviour only (one file, cited by nam
 ## Correction of 2026-10-14, to §K (SP1b-3e)
 
 §K.2 says that after the first panic every later boot goes "directly" to the same Guru Meditation, and the hand-over note of SP1b-3c called the second life inkemu showed (a boot that reaches `SPI2.CMD`) "not explained". It is explained (`docs/superpowers/specs/2026-10-14-sp1b-3e-design.md`, §2): the first life stores its verdict `X4` in NVS (§K.3, +1,211,363, `cphw/dev_det`); that write stays in the flash of the device across the CPU reset of the panic, within the same run; the second life reads the cached verdict, skips the I2C probe, and reaches the SD card (SPI2) and the panel before the same wait for the SAR ADC. Its own log lines (`[SD] SD card not detected`, the commands of the SSD1677) go to USB-Serial-JTAG only (§K.2): a UART0 capture cannot show them, and the trace X1 stops at the first reboot (§K.3), so nothing measured under QEMU contradicts this. **R** from the spec's measurement under inkemu (2026-10-14), **M** for the inkemu console. The sections above are left as they were.
+
+## Correction of 2026-10-15, to §0 and §N (SP2a)
+
+The clone `cr/` at `e54c0087` (§0) declares `version = 1.6.5`, but it is not the release: the tag `1.6.5`
+of `crosspoint-reader/crosspoint-reader` is on `93e98bb78702e29868a16a13b80c40e6b36ccdff` (2026-09-27), and
+`e54c0087` is a later commit of `main`, 56 commits after it. Its submodule `freeink-sdk` at `32a265fa` (§0, §N)
+is therefore not the FreeInk of the release either: the tag pins `111fdcc7f0176c3ee38391a160ee296bf492dbd8`.
+Where this report reads the source "at HEAD" it read `e54c0087`, not the 1.6.5 sources; its measurements of the
+release binary `crosspoint-1.6.5-x3-x4.bin` (§H, §K) are unaffected. FreeInk's `LICENSE` and `NOTICE`
+(§N) are byte-identical at `111fdcc7` and `32a265fa`. Checked through the GitHub API while reviewing SP2a
+(`docs/research/sp2a-external-chips.md` §0). The sections above are left as they were.
