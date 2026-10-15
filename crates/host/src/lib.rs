@@ -6,9 +6,11 @@
 //! The modules `term` to `rom_store` came from `emu-cli` unchanged; `emu-cli` re-exports them.
 //! [`launch`] holds how a run starts, which the binary of the command line decided before.
 //!
-//! The rest serves the interface: [`ports`] are where the panel image and the buttons of a device
-//! plug in, with a test pattern ([`pattern`]) until the display is wired, and [`catalog`] chooses
-//! them per device.
+//! The rest serves the interface: [`engine`] makes one machine live without host I/O,
+//! [`device`] runs it on a thread of its own and takes commands, [`ports`] are where the panel
+//! image and the buttons of a device plug in, with a test pattern ([`pattern`]) until the display
+//! is wired, and [`catalog`] chooses them per device. [`utf8`] decodes the consoles as they speak
+//! and [`capture`] makes a PNG of the panel.
 pub mod capture;
 pub mod catalog;
 pub mod device;

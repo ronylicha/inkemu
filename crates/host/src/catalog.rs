@@ -77,6 +77,49 @@ pub fn look(id: &str) -> Look {
     }
 }
 
+/// A built-in device, as an interface lists it before anything runs.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceView {
+    pub id: String,
+    pub name: String,
+    /// The console shown first: `uart0`, `uart1` or `usb-serial-jtag`.
+    pub console: &'static str,
+    pub flash_mib: u32,
+    pub look: Look,
+    /// The bootloader inkemu ships for the device (`esp-idf-v5.5.2-esp32c3-dio`…), when one
+    /// starts it.
+    pub shipped_bootloader: Option<&'static str>,
+    /// Why no bootloader inkemu ships starts it, when none does: a bootloader must be given.
+    pub no_bootloader: Option<String>,
+}
+
+/// The built-in devices, in the order of their profiles.
+///
+/// # Errors
+/// [`boards::ProfileError`] when a built-in profile does not load, which its tests forbid.
+pub fn devices() -> Result<Vec<DeviceView>, boards::ProfileError> {
+    boards::builtin_ids()
+        .iter()
+        .map(|id| {
+            let profile = boards::builtin(id)?;
+            let (shipped_bootloader, no_bootloader) = match profile.bootloader {
+                Ok(shipped) => (Some(shipped.id), None),
+                Err(none) => (None, Some(none.to_string())),
+            };
+            Ok(DeviceView {
+                look: look(&profile.id),
+                console: profile.console.name(),
+                flash_mib: profile.flash.size() >> 20,
+                id: profile.id,
+                name: profile.name,
+                shipped_bootloader,
+                no_bootloader,
+            })
+        })
+        .collect()
+}
+
 /// The ports of a device whose profile is `profile`, for one life.
 #[must_use]
 pub fn ports_for(profile: &DeviceProfile) -> (Box<dyn PanelSource>, Box<dyn ButtonPort>) {
@@ -132,6 +175,25 @@ mod tests {
         );
         assert_eq!((x4.panel.width, x4.panel.height), (800, 480));
         assert_eq!(look("unknown").buttons.len(), 0);
+    }
+
+    /// The list an interface shows: every built-in device, the X4 with its console and flash.
+    #[test]
+    fn the_devices_are_the_built_in_profiles() {
+        let devices = devices().unwrap();
+        let ids: Vec<&str> = devices.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, boards::builtin_ids());
+        let x4 = devices.iter().find(|d| d.id == "x4").unwrap();
+        assert_eq!(
+            (x4.name.as_str(), x4.console, x4.flash_mib),
+            ("Xteink X4", "usb-serial-jtag", 16)
+        );
+        assert_eq!(x4.look, look("x4"));
+        assert_ne!(
+            x4.shipped_bootloader.is_some(),
+            x4.no_bootloader.is_some(),
+            "one or the other"
+        );
     }
 
     /// Every button sits at its own place along its edge.
