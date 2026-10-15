@@ -5,12 +5,12 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 
-# firmware, boards, soc-esp32c3, console-script, session and lockstep do no host I/O: a graphical
-# front end and the WebAssembly build use them, and std on wasm32-unknown-unknown compiles these
-# calls only to fail at run time. Files, the environment, the clock, processes, threads, the console
-# and the network belong to the front ends (emu-cli, inkemu-lockstep). Test code that reads a fixture
-# allows it on the item that does (`#[allow(clippy::disallowed_methods)]`).
-# `crates/boards/tests/host_io_ban.rs` holds the six copies of this file equal and the list below
+# firmware, boards, soc-esp32c3, console-script, session, lockstep and chips do no host I/O: a
+# graphical front end and the WebAssembly build use them, and std on wasm32-unknown-unknown compiles
+# these calls only to fail at run time. Files, the environment, the clock, processes, threads, the
+# console and the network belong to the front ends (emu-cli, inkemu-lockstep). Test code that reads a
+# fixture allows it on the item that does (`#[allow(clippy::disallowed_methods)]`).
+# `crates/boards/tests/host_io_ban.rs` holds the seven copies of this file equal and the list below
 # complete: change them together.
 disallowed-methods = [
     { path = "std::fs::read", reason = "no host I/O in this crate: take bytes, let the front end read files" },
