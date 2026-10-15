@@ -83,8 +83,10 @@ MOSI, so a panel that does not answer reads `0xFF`.
 `MCU_SEL` [14:12], `FILTER_EN` [15]. Function 1 is GPIO on every pad (M `IOM:120` `PIN_FUNC_GPIO 1`; TRM §5.5.2).
 Function 0 is GPIO too on GPIO0–3 and GPIO8–11, and on GPIO18–19 (USB pins); it is JTAG on GPIO4–7, the flash SPI
 on GPIO12–17 and UART0 on GPIO20 (U0RXD) and GPIO21 (U0TXD). Function 2 is FSPI on GPIO2 (FSPIQ), GPIO4 (FSPIHD),
-GPIO5 (FSPIWP), GPIO6 (FSPICLK), GPIO7 (FSPID), GPIO10 (FSPICS0) (M TRM table 5.12-1). The SVD reset values carry
-table 5.12-1's reset column (IE, WPU, DRV; `0xB00` for most pads).
+GPIO5 (FSPIWP), GPIO6 (FSPICLK), GPIO7 (FSPID), GPIO10 (FSPICS0) (M TRM table 5.12-1). The SVD gives every pad the
+reset value `0xB00`: input enabled, pull-up on, drive strength 2 (M `svd-regs`); table 5.12-1 lists other reset
+states for some pads (no pull-up on GPIO2–8 and GPIO10, no input on GPIO0, 1, 11, 18, 19). The model keeps the SVD's
+value, which the lockstep's row 11 already compares (an `ASSUMPTION:`, 2b-D4).
 
 **Output path** (M TRM §5.5.2): pad n is driven when its IO MUX function is GPIO and the matrix output is enabled:
 `OEN_SEL = 1` takes `ENABLE[n]`, `OEN_SEL = 0` the peripheral's own output enable; `OUT_SEL` picks the level
