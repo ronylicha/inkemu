@@ -165,6 +165,15 @@ fn inputs_are_refused_before_now_unknown_without_a_board_or_past_their_bound() {
         m.send_board_input(Cycles(0), key(true)),
         Err(InputError::InThePast { .. })
     ));
+    // So late it would act at the last instant of the time base, where a deep sleep would jump.
+    for last in [u64::MAX, u64::MAX - 1] {
+        assert!(matches!(
+            m.send_board_input(Cycles(last), key(true)),
+            Err(InputError::BeyondTime { .. })
+        ));
+    }
+    assert_eq!(m.input_journal().inputs(), []);
+    assert_eq!(m.board_inputs_pending(), 0);
     let now = m.device_time();
     assert_eq!(
         m.send_board_input(

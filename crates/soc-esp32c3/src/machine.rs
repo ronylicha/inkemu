@@ -114,6 +114,13 @@ pub enum InputError {
         "{MAX_PENDING_BOARD_INPUTS} inputs of the board are still to come; give the next ones once the run has reached some"
     )]
     TooManyBoardInputs,
+    /// An input of the board dated so late that the instant it acts at, one past its date, would
+    /// be the last instant of the time base or past it: no run reaches it, and a deep sleep would
+    /// jump there.
+    #[error(
+        "the input of the board is dated {at_nanos} ns of device time, too late for the device ever to reach the instant it acts at; date it earlier"
+    )]
+    BeyondTime { at_nanos: u64 },
     /// The device has no power any more: it takes no input.
     #[error("the device is off: its supply failed; power it on again")]
     PoweredOff,
@@ -1305,10 +1312,17 @@ impl Esp32C3 {
     /// [`InputError::InThePast`] for an input dated before the present time;
     /// [`InputError::PoweredOff`] once the supply failed; [`InputError::NoBoard`] with no board
     /// inputs attached; [`InputError::Board`] when the board refuses it;
-    /// [`InputError::TooManyBoardInputs`] when [`MAX_PENDING_BOARD_INPUTS`] wait already. Nothing
-    /// is taken then.
+    /// [`InputError::TooManyBoardInputs`] when [`MAX_PENDING_BOARD_INPUTS`] wait already;
+    /// [`InputError::BeyondTime`] for an input dated so late it would act at the last instant of
+    /// the time base. Nothing is taken then.
     pub fn send_board_input(&mut self, at: Cycles, input: BoardInput) -> Result<(), InputError> {
         self.check_date(at)?;
+        // It acts at `at + 1`, which must stay below the last instant of the time base.
+        if at.get() >= u64::MAX - 1 {
+            return Err(InputError::BeyondTime {
+                at_nanos: clock::TIME_BASE.cycles_to_nanos(at),
+            });
+        }
         self.bus
             .periph
             .io
