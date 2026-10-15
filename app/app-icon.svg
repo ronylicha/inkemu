@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- The source of every icon of the desktop application (`pnpm tauri icon app-icon.svg`). -->
+  <title>inkemu</title>
+  <rect x="192" y="64" width="640" height="896" rx="80" fill="#2b2b2e"/>
+  <rect x="256" y="144" width="512" height="640" rx="12" fill="#e9e7e0"/>
+  <rect x="304" y="208" width="416" height="40" fill="#555555"/>
+  <rect x="304" y="288" width="352" height="24" fill="#999999"/>
+  <rect x="304" y="336" width="392" height="24" fill="#999999"/>
+  <rect x="304" y="384" width="320" height="24" fill="#999999"/>
+  <rect x="304" y="432" width="376" height="24" fill="#999999"/>
+  <rect x="304" y="480" width="256" height="24" fill="#999999"/>
+  <rect x="304" y="560" width="416" height="160" fill="#1c1c1a"/>
+  <circle cx="400" cy="864" r="36" fill="#46464b"/>
+  <circle cx="512" cy="864" r="36" fill="#46464b"/>
+  <circle cx="624" cy="864" r="36" fill="#46464b"/>
+</svg>

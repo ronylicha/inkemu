@@ -1,0 +1,55 @@
+[package]
+name = "inkemu-app"
+version = "0.1.0"
+description = "The desktop application of inkemu: the interface over the host crate"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/ronylicha/inkemu"
+publish = false
+
+# A workspace of its own (design of sub-project 2c, C17): built with WebKitGTK on Linux, it stays out
+# of the root workspace, whose tests, lints and coverage run where those libraries are not installed.
+[workspace]
+
+[lib]
+name = "inkemu_app_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "inkemu-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7.3", features = [] }
+
+[dependencies]
+tauri = { version = "2.12.4", features = [] }
+tauri-plugin-dialog = "2.8.3"
+serde = { version = "1", features = ["derive"] }
+# SIGINT and SIGTERM power the device off before the application exits, as in the command line.
+ctrlc = { version = "3.5", features = ["termination"] }
+host = { path = "../../crates/host" }
+boards = { path = "../../crates/boards" }
+soc-esp32c3 = { path = "../../crates/soc-esp32c3" }
+
+[dev-dependencies]
+serde_json = "1"
+# The looping test device of `host`, to drive the shell with real emulators.
+host = { path = "../../crates/host", features = ["test-support"] }
+
+# The lints of the root workspace, which this one does not inherit.
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+module_name_repetitions = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

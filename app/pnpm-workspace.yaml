@@ -1,0 +1,4 @@
+# pnpm refuses a package published less than a day ago (supply-chain policy), with no exception: every
+# package, direct or not, is a release at least a day old. The versions in package.json are the latest
+# stable ones that pass it (docs/research/sp2c-app-stack.md); a newer release waits its day.
+minimumReleaseAge: 1440

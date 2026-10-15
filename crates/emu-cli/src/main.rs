@@ -1,5 +1,5 @@
 //! inkemu command-line interface.
-use boards::{DeviceProfile, MachineOptions};
+use boards::MachineOptions;
 use clap::{Parser, Subcommand};
 use console_script::ScriptRun;
 use cpu_rv32::MisalignedPolicy;
@@ -7,25 +7,22 @@ use emu_cli::exit::{
     EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, REPLAY_EXIT_CODES_HELP,
     RUN_EXIT_CODES_HELP,
 };
-use emu_cli::firmware_file;
-use emu_cli::flash_file;
-use emu_cli::flash_state::{self, Input, RunFlash, Seed};
+use emu_cli::flash_state::RunFlash;
 use emu_cli::record::{Recorder, record_session, replay_options, report_replay, start_replay};
 use emu_cli::rom_store::{
     self, AnnouncingFetch, ESP_ROM_ELFS, ESP32C3_ROMS, HttpFetch, RomEntry, RomSource,
 };
 use emu_cli::run::{
-    Interrupt, RunExtras, RunOptions, execute_with_script, exit_code_of_run, parse_device_seconds,
-    relay,
+    Interrupt, RunExtras, execute_with_script, exit_code_of_run, parse_device_seconds, relay,
 };
 use emu_cli::rvtest::{RunResult, TestMachine};
 use emu_cli::script_file;
-use emu_cli::session_file::{self, Claimed};
+use emu_cli::session_file;
 use emu_cli::term::sanitize;
-use firmware::BootloaderWarning;
-use session::{ConsoleDigests, Limits, ProfileText, RomIdentity};
+use host::launch::{self, FlashRequest, RunRequest};
+use session::{ConsoleDigests, ProfileText, RomIdentity};
 use sha2::{Digest as _, Sha256};
-use soc_esp32c3::{ConsoleChannel, RomImage, UsbHost};
+use soc_esp32c3::{ConsoleChannel, UsbHost};
 use std::fmt::Write as _;
 use std::io;
 use std::ops::ControlFlow;
@@ -284,7 +281,7 @@ fn main() -> ExitCode {
             record,
         } => run_device(
             &device,
-            &FlashOptions {
+            &FlashRequest {
                 image: flash.as_deref(),
                 firmware: firmware.as_deref(),
                 bootloader: bootloader.as_deref(),
@@ -352,132 +349,16 @@ fn print_stdout(text: &str) -> ControlFlow<ExitCode> {
     }
 }
 
-/// The built-in profile named `id`; an unknown name is echoed with control characters escaped, since
-/// it comes straight from the command line.
-fn profile_for(id: &str) -> Result<DeviceProfile, boards::ProfileError> {
-    boards::builtin(id).map_err(|e| match e {
-        boards::ProfileError::UnknownDevice { id, known } => boards::ProfileError::UnknownDevice {
-            id: sanitize(&id),
-            known,
-        },
-        other @ (boards::ProfileError::Parse { .. }
-        | boards::ProfileError::MissingFlash { .. }
-        | boards::ProfileError::MissingConsole { .. }
-        | boards::ProfileError::IdMismatch { .. }
-        | boards::ProfileError::Partitions { .. }
-        | boards::ProfileError::NoBootloader { .. }) => other,
-    })
-}
-
-/// What `inkemu run` was told about the flash of the device.
-struct FlashOptions<'a> {
-    /// `--flash`: the image a run starts from, never written.
-    image: Option<&'a Path>,
-    /// `--firmware`: the application a flash is composed around, never written.
-    firmware: Option<&'a Path>,
-    /// `--bootloader`: the bootloader of that flash, never written.
-    bootloader: Option<&'a Path>,
-    /// `--flash-file`: where the flash is kept from one run to the next.
-    file: Option<&'a Path>,
-    /// `--reset-flash`: start again from the image and replace the file.
-    reset: bool,
-}
-
-/// What `inkemu run` was told about how to run: its limits, and the console to show if one was
-/// named. The console becomes that of the device profile otherwise ([`shown_console`]).
-struct RunRequest {
-    max_cycles: Option<u64>,
-    max_device_nanos: Option<u64>,
-    /// `--console`, when it was given.
-    console: Option<ConsoleChannel>,
-}
-
-impl RunRequest {
-    /// The limits of the session of a run (G3), `--strict-mmio` given as `strict_mmio`.
-    const fn limits(&self, strict_mmio: bool) -> Limits {
-        Limits {
-            strict_mmio,
-            max_cycles: self.max_cycles,
-            max_time_nanos: self.max_device_nanos,
-            cut: None,
-        }
-    }
-
-    /// The options of a run of `profile` whose USB host starts as `usb_host`, and the part of its
-    /// first line that names the console shown ([`console_note`]).
-    fn resolve(&self, profile: &DeviceProfile, usb_host: UsbHost) -> (RunOptions, String) {
-        let (console, origin) = shown_console(profile, self.console);
-        let options = RunOptions {
-            max_cycles: self.max_cycles,
-            max_device_nanos: self.max_device_nanos,
-            console,
-        };
-        (options, console_note(console, origin, usb_host))
-    }
-}
-
-/// Where the console a run shows comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConsoleOrigin {
-    /// `--console` named it.
-    Option,
-    /// The device profile names it, and `--console` was not given.
-    Profile,
-}
-
-/// The console a run of `profile` shows: the one `--console` asked for, else the one the profile
-/// names, and where it came from.
-fn shown_console(
-    profile: &DeviceProfile,
-    asked: Option<ConsoleChannel>,
-) -> (ConsoleChannel, ConsoleOrigin) {
-    asked.map_or((profile.console, ConsoleOrigin::Profile), |channel| {
-        (channel, ConsoleOrigin::Option)
-    })
-}
-
-/// The part of the first line of a run that names the console shown and where the choice came
-/// from: a user who sees nothing knows which console to ask for instead. When the console is
-/// USB-Serial-JTAG and the USB host does not start open, the device sends nothing there until a
-/// host opens the port, and the note says so and how to see the output.
-fn console_note(channel: ConsoleChannel, origin: ConsoleOrigin, usb_host: UsbHost) -> String {
-    let mut note = match origin {
-        ConsoleOrigin::Option => format!("console: {} (--console)", channel.name()),
-        ConsoleOrigin::Profile => format!(
-            "console: {} (the default of the device profile; --console shows another)",
-            channel.name()
-        ),
-    };
-    if channel == ConsoleChannel::UsbSerialJtag && usb_host != UsbHost::Open {
-        // Writing to a `String` cannot fail.
-        let _ = write!(
-            note,
-            "; the USB host starts {}: nothing reaches this console until a host opens the port, so --usb-host open or --console uart0 shows the output",
-            usb_host.name()
-        );
-    }
-    note
-}
-
-/// The last component of `path`, for a line that names a file the user gave: escaped, since it
-/// comes straight from the command line.
-fn file_name(path: &Path) -> String {
-    sanitize(&path.file_name().map_or_else(
-        || path.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    ))
-}
-
 fn run_device(
     device: &str,
-    flash: &FlashOptions<'_>,
+    flash: &FlashRequest<'_>,
     rom_dir: Option<PathBuf>,
     console_script: Option<&Path>,
     machine_options: MachineOptions,
     request: &RunRequest,
     record: Option<&Path>,
 ) -> ExitCode {
-    let profile = match profile_for(device) {
+    let profile = match launch::profile(device) {
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
@@ -489,19 +370,20 @@ fn run_device(
     };
     let entry = rom_store::rom_entry_for(profile.chip_revision);
     let rom = (rom_dir.as_deref(), entry);
-    let profile_text = match refuse_record_path(record, flash, console_script, rom, device) {
+    let profile_text = match launch::refuse_record_path(record, flash, console_script, rom, device)
+    {
         Ok(text) => text,
-        Err(code) => return code,
+        Err(e) => return fail(&e),
     };
     let flash_size = profile.flash.size();
     // The files a run only reads and the flash file are checked first: refusing them needs no
     // ROM, and no download should start for a run that cannot happen.
-    if let Err(code) = refuse_the_images_as_flash_file(flash) {
-        return code;
+    if let Err(e) = launch::refuse_the_images_as_flash_file(flash) {
+        return fail(&e);
     }
-    let fresh = match starting_flash(&profile, flash) {
+    let fresh = match launch::starting_flash(&profile, flash) {
         Ok(started) => started,
-        Err(code) => return code,
+        Err(e) => return fail(&e),
     };
     // From here on the flash file is locked, until the process ends.
     let (run_flash, content) =
@@ -513,10 +395,10 @@ fn run_device(
     for warning in &fresh.warnings {
         write_line(io::stderr(), &format_args!("warning: {warning}"));
     }
-    let flash_note = flash_note(flash.file, &run_flash, &fresh.note, flash_size);
-    let rom = match load_rom(rom_dir, entry) {
+    let flash_note = launch::flash_note(flash.file, &run_flash, &fresh.note, flash_size);
+    let rom = match launch::load_rom(rom_dir, entry, &mut io::stderr()) {
         Ok(rom) => rom,
-        Err(code) => return code,
+        Err(e) => return fail(&e),
     };
     let rom_identity = RomIdentity::of(entry.rom_revision, &rom);
     let mut machine = match content {
@@ -535,7 +417,7 @@ fn run_device(
         io::stderr(),
         &format_args!(
             "{}; {flash_note}",
-            header(&profile, entry, &machine, &console_note)
+            launch::header(&profile, entry, &machine, &console_note)
         ),
     );
     // What the session of the run keeps beside the machine, taken at power-on.
@@ -590,81 +472,6 @@ fn run_device(
     ))
 }
 
-/// Refuses a file the run only reads (`--flash`, `--firmware`, `--bootloader`) that is the flash
-/// file, or a file the flash file owns ([`flash_state::refuse_the_image_as_flash_file`]).
-fn refuse_the_images_as_flash_file(flash: &FlashOptions<'_>) -> Result<(), ExitCode> {
-    let Some(file) = flash.file else {
-        return Ok(());
-    };
-    for (input, path) in [
-        (Input::Flash, flash.image),
-        (Input::Firmware, flash.firmware),
-        (Input::Bootloader, flash.bootloader),
-    ] {
-        if let Some(path) = path {
-            flash_state::refuse_the_image_as_flash_file(input, path, file).map_err(|e| fail(&e))?;
-        }
-    }
-    Ok(())
-}
-
-/// Refuses, before anything of the run, a `--record` path a session must not be written to: a
-/// path the run reads or writes, existing or not (a session is written over what is at its
-/// path): the files given to the run, the flash file and the files beside it, the ROM file of
-/// `rom_dir` or, without it, the ROM cache. Gives the text of the profile of `device` that a
-/// session carries, when the run is recorded.
-fn refuse_record_path(
-    record: Option<&Path>,
-    flash: &FlashOptions<'_>,
-    console_script: Option<&Path>,
-    rom: (Option<&Path>, &RomEntry),
-    device: &str,
-) -> Result<Option<&'static str>, ExitCode> {
-    let Some(path) = record else {
-        return Ok(None);
-    };
-    let mut claimed = Vec::new();
-    for (option, input) in [
-        ("--flash", flash.image),
-        ("--firmware", flash.firmware),
-        ("--bootloader", flash.bootloader),
-        ("--console-script", console_script),
-    ] {
-        if let Some(input) = input {
-            claimed.push(Claimed::File {
-                path: input.to_path_buf(),
-                what: format!("the file of {option}, which the run reads"),
-            });
-        }
-    }
-    if let Some(file) = flash.file {
-        claimed.extend(flash_state::files_of_the_flash_file(file).into_iter().map(
-            |(path, what)| Claimed::File {
-                path,
-                what: what.to_owned(),
-            },
-        ));
-    }
-    let (rom_dir, entry) = rom;
-    match rom_dir {
-        Some(dir) => claimed.push(Claimed::File {
-            path: dir.join(entry.elf_name),
-            what: "the ROM file of --rom-dir, which the run reads".to_owned(),
-        }),
-        // Without a home directory there is no cache: loading the ROM says so.
-        None => {
-            if let Ok(dir) = rom_store::default_cache_dir() {
-                claimed.push(Claimed::Directory {
-                    path: dir,
-                    what: "in the ROM cache, whose files the run reads and downloads".to_owned(),
-                });
-            }
-        }
-    }
-    session_file::refuse_record_path(path, &claimed).map_err(|e| fail(&e))?;
-    boards::builtin_toml(device).map(Some).map_err(|e| fail(&e))
-}
-
 /// `inkemu replay`: replays the session in `path` as a run shows its console, then compares what
 /// it gives with what the session recorded (G6). It reads no path of the recording and writes
 /// nothing of the run, not even the flash; without `rom_dir`, the ROM cache downloads the ROM on
@@ -681,28 +488,28 @@ fn run_replay(path: &Path, console: Option<ConsoleChannel>, rom_dir: Option<Path
         Err(e) => return fail(&sanitize(&e.to_string())),
     };
     let entry = rom_store::rom_entry_for(profile.chip_revision);
-    let rom = match load_rom(rom_dir, entry) {
+    let rom = match launch::load_rom(rom_dir, entry, &mut io::stderr()) {
         Ok(rom) => rom,
-        Err(code) => return code,
+        Err(e) => return fail(&e),
     };
     let mut machine = match start_replay(&session, rom, entry.rom_revision) {
         Ok(machine) => machine,
         Err(message) => return fail(&message),
     };
-    let (shown, origin) = shown_console(&profile, console);
+    let (shown, origin) = launch::shown_console(&profile, console);
     let options = replay_options(&session, shown);
     let flash_sha256 = emu_cli::term::hex(&Sha256::digest(&session.flash));
     write_line(
         io::stderr(),
         &format_args!(
             "{}; replaying {}: {} inputs, flash at start sha256 {flash_sha256}",
-            header(
+            launch::header(
                 &profile,
                 entry,
                 &machine,
-                &console_note(shown, origin, session.usb_host)
+                &launch::console_note(shown, origin, session.usb_host)
             ),
-            file_name(path),
+            launch::file_name(path),
             session.inputs.len()
         ),
     );
@@ -729,111 +536,6 @@ fn run_replay(path: &Path, console: Option<ConsoleChannel>, rom_dir: Option<Path
         digests,
         &mut io::stderr().lock(),
     ))
-}
-
-/// The part of the first line of a run that names its flash: the flash file it starts from, or
-/// the starting flash (`fresh`) and the flash file it is kept in, if any.
-fn flash_note(file: Option<&Path>, run_flash: &RunFlash, fresh: &str, flash_size: u32) -> String {
-    match file {
-        Some(path) if run_flash.starts_from_the_file() => format!(
-            "flash: {} (flash file, {} MiB)",
-            file_name(path),
-            flash_size >> 20
-        ),
-        Some(path) => format!("flash: {fresh}, kept in {}", file_name(path)),
-        None => format!("flash: {fresh}"),
-    }
-}
-
-/// The mask ROM of `entry`, from `rom_dir`, read only, or from the cache, which downloads it on
-/// first use. A refusal is printed, and its exit code given back.
-fn load_rom(rom_dir: Option<PathBuf>, entry: &RomEntry) -> Result<RomImage, ExitCode> {
-    let http = HttpFetch;
-    let mut stderr = io::stderr();
-    let announcing;
-    // An explicit directory is read only; without one the cache downloads on first use.
-    let source = match rom_dir {
-        Some(dir) => RomSource::Directory(dir),
-        None => match rom_store::default_cache_dir() {
-            Ok(dir) => {
-                announcing = AnnouncingFetch::new(&http, &mut stderr, &ESP_ROM_ELFS, &dir);
-                RomSource::Cache {
-                    dir,
-                    fetch: &announcing,
-                    user_named: false,
-                }
-            }
-            Err(e) => return Err(fail(&e)),
-        },
-    };
-    rom_store::load_rom(&source, &ESP_ROM_ELFS, entry).map_err(|e| fail(&e))
-}
-
-/// The flash a run starts from when nothing is kept from an earlier run.
-struct Starting {
-    /// What the flash holds (`None`: erased).
-    seed: Option<Seed>,
-    /// How the header line of the run names it.
-    note: String,
-    /// What the check of a given bootloader found that does not stop the run, printed only once
-    /// the flash file accepts the seed.
-    warnings: Vec<BootloaderWarning>,
-}
-
-/// The flash a run starts from when nothing is kept from an earlier run. A refusal is printed,
-/// and its exit code given back.
-fn starting_flash(profile: &DeviceProfile, flash: &FlashOptions<'_>) -> Result<Starting, ExitCode> {
-    let flash_size = profile.flash.size();
-    let (seed, note, warnings) = match (flash.image, flash.firmware) {
-        (Some(path), _) => match flash_file::load(path, profile.soc.chip_id(), flash_size) {
-            Ok(bytes) => {
-                let note = format!(
-                    "{} ({} bytes in {} MiB)",
-                    file_name(path),
-                    bytes.len(),
-                    flash_size >> 20
-                );
-                let seed = Seed {
-                    input: Input::Flash,
-                    content: bytes,
-                };
-                (Some(seed), note, Vec::new())
-            }
-            Err(e) => return Err(fail(&e)),
-        },
-        (None, Some(path)) => match firmware_file::compose(profile, path, flash.bootloader) {
-            Ok(composed) => {
-                let app = &composed.application;
-                let note = format!(
-                    "{} ({} {}, ESP-IDF {}) in {} at {:#x}, behind {}, under the partition table of the profile ({} MiB)",
-                    file_name(path),
-                    sanitize(&app.project_name),
-                    sanitize(&app.version),
-                    sanitize(&app.idf_ver),
-                    composed.slot.name,
-                    composed.slot.offset,
-                    sanitize(&composed.bootloader.to_string()),
-                    flash_size >> 20
-                );
-                let seed = Seed {
-                    input: Input::Firmware,
-                    content: composed.bytes,
-                };
-                (Some(seed), note, composed.warnings)
-            }
-            Err(e) => return Err(fail(&e)),
-        },
-        (None, None) => (
-            None,
-            format!("erased ({} MiB)", flash_size >> 20),
-            Vec::new(),
-        ),
-    };
-    Ok(Starting {
-        seed,
-        note,
-        warnings,
-    })
 }
 
 /// Whether whoever was reading standard output went away (`inkemu run | head`, once `head` has
@@ -881,35 +583,11 @@ fn watch_ctrl_c(interrupt: &Arc<Interrupt>) -> Result<(), ctrlc::Error> {
     })
 }
 
-/// The one line that says what is being emulated, how much to trust its timing and which console
-/// is shown (`console_note`). The name of the profile is escaped: a replay takes it from a
-/// session, which comes from anywhere.
-fn header(
-    profile: &DeviceProfile,
-    entry: &RomEntry,
-    machine: &soc_esp32c3::Esp32C3,
-    console_note: &str,
-) -> String {
-    let timing = machine.timing_model();
-    format!(
-        "inkemu: {} (ESP32-C3 {}, mask ROM rev{}); timing model {} ({}); {console_note}",
-        sanitize(&profile.name),
-        profile.chip_revision,
-        entry.rom_revision,
-        timing.name(),
-        if timing.is_calibrated() {
-            "calibrated"
-        } else {
-            "not calibrated"
-        }
-    )
-}
-
 /// The ROM entries a `rom fetch` invocation asks for. clap already refuses the two invalid
 /// combinations; refusing again keeps `--all`'s download from ever being the default.
 fn select_roms(device: Option<&str>, all: bool) -> Result<Vec<&'static RomEntry>, String> {
     match (device, all) {
-        (Some(id), false) => profile_for(id)
+        (Some(id), false) => launch::profile(id)
             .map(|profile| vec![rom_store::rom_entry_for(profile.chip_revision)])
             .map_err(|e| e.to_string()),
         (None, true) => Ok(ESP32C3_ROMS.iter().collect()),
@@ -1090,143 +768,6 @@ mod tests {
                 "no value of --console selects {channel:?}"
             );
         }
-    }
-
-    /// Without `--console` a run shows the console of its profile, and says so; with it, the one
-    /// asked for, and says that instead.
-    #[test]
-    fn the_console_shown_is_the_profile_s_unless_one_is_asked_for() {
-        for id in ["x3", "x4"] {
-            let profile = profile_for(id).unwrap();
-            let (channel, origin) = shown_console(&profile, None);
-            assert_eq!(
-                (channel, origin),
-                (ConsoleChannel::UsbSerialJtag, ConsoleOrigin::Profile),
-                "{id}"
-            );
-            assert_eq!(
-                console_note(channel, origin, UsbHost::Open),
-                "console: usb-serial-jtag (the default of the device profile; --console shows another)"
-            );
-            for asked in ConsoleChannel::ALL {
-                let (channel, origin) = shown_console(&profile, Some(asked));
-                assert_eq!((channel, origin), (asked, ConsoleOrigin::Option), "{id}");
-                assert_eq!(
-                    console_note(channel, origin, UsbHost::Open),
-                    format!("console: {} (--console)", asked.name())
-                );
-            }
-        }
-    }
-
-    /// `resolve` is what a run calls: the console it gives the run and the one its note names are
-    /// the profile's without `--console` and the option's with it, and the limits pass through.
-    #[test]
-    fn resolve_gives_the_run_the_console_its_note_names() {
-        let profile = profile_for("x4").unwrap();
-        for (asked, shown, note) in [
-            (
-                None,
-                ConsoleChannel::UsbSerialJtag,
-                "console: usb-serial-jtag (the default of the device profile; --console shows another)",
-            ),
-            (
-                Some(ConsoleChannel::Uart0),
-                ConsoleChannel::Uart0,
-                "console: uart0 (--console)",
-            ),
-        ] {
-            let request = RunRequest {
-                max_cycles: Some(7),
-                max_device_nanos: Some(11),
-                console: asked,
-            };
-            let (options, resolved_note) = request.resolve(&profile, UsbHost::Open);
-            assert_eq!(options.console, shown, "{asked:?}");
-            assert_eq!(resolved_note, note, "{asked:?}");
-            assert_eq!(
-                (options.max_cycles, options.max_device_nanos),
-                (Some(7), Some(11))
-            );
-        }
-    }
-
-    /// The first line of a run carries the console note between the timing model and what
-    /// follows it.
-    #[test]
-    fn the_first_line_names_the_console_of_the_profile() {
-        use soc_esp32c3::test_support::{HANG, flat_rom};
-        let profile = profile_for("x4").unwrap();
-        let entry = rom_store::rom_entry_for(profile.chip_revision);
-        let machine = profile.instantiate(flat_rom(&[HANG]), MachineOptions::default());
-        let request = RunRequest {
-            max_cycles: None,
-            max_device_nanos: None,
-            console: None,
-        };
-        let (_, note) = request.resolve(&profile, UsbHost::Open);
-        let line = header(&profile, entry, &machine, &note);
-        assert!(line.starts_with("inkemu: Xteink X4 (ESP32-C3 "), "{line}");
-        assert!(
-            line.ends_with(
-                "; console: usb-serial-jtag (the default of the device profile; --console shows another)"
-            ),
-            "{line}"
-        );
-    }
-
-    /// A replay takes its profile from a session, which comes from anywhere: a name that would
-    /// drive the terminal reaches it escaped.
-    #[test]
-    fn the_first_line_escapes_the_name_of_the_profile() {
-        use soc_esp32c3::test_support::{HANG, flat_rom};
-        let text = boards::builtin_toml("x4").unwrap().replacen(
-            "name = \"Xteink X4\"",
-            "name = \"\\u001b]0;title\\u0007X4\"",
-            1,
-        );
-        let profile = DeviceProfile::from_named_toml("x4", "the profile of the session", &text)
-            .expect("a name may hold any character");
-        let entry = rom_store::rom_entry_for(profile.chip_revision);
-        let machine = profile.instantiate(flat_rom(&[HANG]), MachineOptions::default());
-        let line = header(&profile, entry, &machine, "console: uart0 (--console)");
-        assert!(
-            line.starts_with("inkemu: \\u{1b}]0;title\\u{7}X4 (ESP32-C3 "),
-            "{line:?}"
-        );
-    }
-
-    /// A USB-Serial-JTAG console whose host does not start open shows nothing until a host opens
-    /// the port: the note says so and how to see the output. Another console, or an open host,
-    /// gets no such clause.
-    #[test]
-    fn the_console_note_says_when_the_usb_host_keeps_the_console_silent() {
-        for host in [UsbHost::Absent, UsbHost::Attached] {
-            for origin in [ConsoleOrigin::Profile, ConsoleOrigin::Option] {
-                let note = console_note(ConsoleChannel::UsbSerialJtag, origin, host);
-                assert!(
-                    note.ends_with(&format!(
-                        "; the USB host starts {}: nothing reaches this console until a host opens the port, so --usb-host open or --console uart0 shows the output",
-                        host.name()
-                    )),
-                    "{note}"
-                );
-            }
-        }
-        for host in UsbHost::ALL {
-            for channel in [ConsoleChannel::Uart0, ConsoleChannel::Uart1] {
-                let note = console_note(channel, ConsoleOrigin::Option, host);
-                assert_eq!(note, format!("console: {} (--console)", channel.name()));
-            }
-        }
-        assert!(
-            !console_note(
-                ConsoleChannel::UsbSerialJtag,
-                ConsoleOrigin::Profile,
-                UsbHost::Open
-            )
-            .contains("USB host")
-        );
     }
 
     /// `--console` is optional, and nothing but the profile picks the console when it is absent.

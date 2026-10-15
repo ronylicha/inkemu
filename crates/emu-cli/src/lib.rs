@@ -1,14 +1,11 @@
 //! Library side of the inkemu CLI, so integration tests can drive the same code as the binary.
-pub mod exit;
-pub mod firmware_file;
-pub mod flash_file;
-pub mod flash_state;
+//!
+//! The host policy of a run (files, ROM, sessions, the run loop) lives in the `host` crate, shared
+//! with the desktop application; it is re-exported here under the paths it always had.
+pub use host::{
+    exit, firmware_file, flash_file, flash_state, record, rom_store, run, script_file,
+    session_file, term,
+};
 pub mod inspect;
 pub mod reader;
-pub mod record;
-pub mod rom_store;
-pub mod run;
 pub mod rvtest;
-pub mod script_file;
-pub mod session_file;
-pub mod term;
