@@ -155,9 +155,10 @@ global `-Og`), with jump tables, code in IRAM.
 
 Standard error: no warning; `stopped … after 2792650730 cycles (2208654520 instructions)`, 20 s of
 device time, `CPU clock at 160 MHz`, `trace-hash bfb20978732b673f`. The same run to 40 s gave the
-same score (M). Durations, measured: the run alone 110 s of wall time on the development host
-(about 20 M instructions/s); the test that runs it 87 s and 102 s on that host (two runs, load
-differing), and **68 s in the CI** (job `reference-boot` of PR #14, "finished in 68.26s").
+same score (M). Durations, measured: the test that runs it 87 s, 102 s and 328 s on the development
+host, a machine shared with other work (three runs; the last under a load average of about 17 on
+16 cores), and **68 s in the CI** (job `reference-boot` of PR #14, "finished in
+68.26s").
 
 The CRCs are those Espressif's example prints (P2), and `crcfinal` 0xa14c is that of 6000
 iterations. CoreMark chooses its iterations from its own timing (`core_main.c`: 1, 10, 100, 1000
@@ -199,11 +200,15 @@ calibration bench (sub-project 8), with a device (R; ADR 0009).
 
 `crates/emu-cli/tests/run_cli.rs`,
 `x4_runs_the_coremark_reference_firmware_within_15_percent_of_the_published_score` (ignored; job
-`reference-boot`): the pinned SHA-256; exit 0; in order the run's header, size 666, IRAM, the four
-CRCs that do not depend on the iterations, "Correct operation validated", 160 MHz, the return of
-`app_main`; no `ERROR!`; `crcfinal` 0xa14c when the run has 6000 iterations; at least 10 s; the
-score of the `CoreMark 1.0` line equal to `Iterations/Sec` and to iterations × 1000 / ticks; the
-score within 15 % of 483.27 (the message gives both gaps); no warning; the trace hash.
+`reference-boot`; as revised at the review, spec K5): the pinned SHA-256; exit 0; **first**, as soon
+as the `CoreMark 1.0` line is read, its score within 15 % of 483.27, both bounds (the message gives
+both gaps), the score then appearing in every later failure message; in order the run's header,
+size 666, IRAM, the four CRCs that do not depend on the iterations, "Correct operation validated",
+the firmware's `CPU frequency: 160 MHz`, the return of `app_main`; no `ERROR!`; inkemu's own clock,
+read in its summary (`CPU clock at 160 MHz`, the clock at the end of the run); an explicit table
+iterations → `crcfinal` whose entries come from sources other than inkemu (6000 → 0xa14c), any other
+number of iterations failing; at least 10 s; the score equal to `Iterations/Sec` and to
+iterations × 1000 / ticks; no warning; the trace hash.
 
 ## 6. The two hand-overs of SP1b-4d, read in the pinned QEMU
 

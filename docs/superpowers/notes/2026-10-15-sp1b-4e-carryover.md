@@ -17,7 +17,7 @@ Critère 5 de la spec (§10.3), mesuré le 2026-10-15 sur le poste de développe
 | Autre chiffre publié | 409,25 (exemple, GCC 12.2) : +3,8 %, rapporté, pas testé |
 | Validité CoreMark | CRC de la course de performance 2K (seedcrc 0xe9f5, list 0xe714, matrix 0x1fd7, state 0x8e3a, final 0xa14c), « Correct operation validated », plus de 10 s |
 | Exécution | `--max-time 20` : 2 792 650 730 cycles, 2 208 654 520 instructions (1,264 cycle par instruction), aucun avertissement, `CPU clock at 160 MHz`, `trace-hash bfb20978732b673f` |
-| Durées mesurées | test : **68 s en CI** (job `reference-boot` de la PR #14, « finished in 68.26s »), 87 s et 102 s sur le poste de développement (deux passages, charge différente) ; exécution seule : 110 s sur le poste |
+| Durées mesurées | test : **68 s en CI** (job `reference-boot` de la PR #14, « finished in 68.26s »), 87 s, 102 s et 328 s sur le poste de développement, partagé avec d'autres travaux (trois passages ; le dernier sous une charge moyenne d'environ 17 sur 16 cœurs) |
 
 - Aucun coût du modèle de temps n'a été touché ; `is_calibrated()` reste `false` (ADR 0009). La bande borne le coût
   moyen des instructions de CoreMark entre 0,966 et 1,307 cycle. Le test vérifie les deux bornes, mais la haute est
@@ -90,7 +90,7 @@ sources de CoreMark copiées dans le dépôt plutôt que téléchargées par la 
 | M2 `crcfinal` seulement pour 6000 | Table `COREMARK_FINAL_CRCS` (6000 → 0xa14c, de sources autres qu'inkemu) ; tout autre nombre échoue, sans inviter à ré-épingler. Vérifié par mutation (6000 → 6001 : échec avec ce message ; défaite). |
 | M3 160 MHz seulement du firmware | La ligne `CPU clock at 160 MHz` du résumé d'inkemu est vérifiée aussi. |
 | M4 fichier ajouté non détecté | `in-container.sh` compare la liste des fichiers de `coremark_example/` à `SHA256SUMS.coremark-sources` (plus `PROVENANCE.md`) ; vérifié dans l'image épinglée : un fichier ajouté ou un fichier épinglé retiré arrête la construction. |
-| M5 durées incohérentes | Durées mesurées partout : test 68 s en CI, 87 et 102 s sur le poste ; exécution seule 110 s sur le poste. |
+| M5 durées incohérentes | Durées mesurées partout : test 68 s en CI, 87 et 102 s sur le poste. Le chiffre d'une exécution seule (110 s, une mesure à l'horloge murale prise à un autre moment, sous une autre charge du poste) est retiré à la seconde relecture (N6) : plus long que le test qui la contient, il ne disait rien de comparable. |
 | M6 extrait sans `Compiler flags` ni `CoreMark 1.0` | Les deux lignes ajoutées au rapport, les 35 options `-fdebug-prefix-map` abrégées et l'abréviation dite. |
 | M7 « ne voit que la borne basse » | Le test vérifie les deux bornes ; la haute est hors d'atteinte d'un modèle à au moins un cycle par instruction (environ 537) : ADR 0009, rapport, ce document, commentaire du test. |
 | M8 « une instruction sur deux sourcée » | « expliquée par un raisonnement sur le code, non mesuré » (ADR 0008, K8 a, tableau, rapport, plan R61). |
@@ -100,3 +100,19 @@ Vérifié en local à la relecture : `cargo fmt --all --check` ; clippy (`-D war
 rustdoc sur `cpu-rv32` ; `cargo test -p cpu-rv32 --lib timing` ; `cargo test -p lockstep --test table` ; le test
 CoreMark (passé en 102 s) et la mutation de M2 ; la vérification de liste de M4 dans `espressif/idf:v5.5.2` ; la
 version du QEMU de l'image. Aucune mesure, aucune empreinte, aucune épingle ne change.
+
+## Seconde relecture (2026-10-15, à `d464635` ; N1–N6, plan R73–R78)
+
+| Constat | Correction |
+|---|---|
+| N1 le motif `; CPU clock at 160 MHz;` exigeait que le CPU dorme | Le test lit le résumé ligne à ligne : `; CPU clock at 160 MHz` suivi de `;` ou de la fin de la ligne ; le commentaire dit « horloge à la fin de l'exécution ». |
+| N2 « admits, measured » dans `IntMatrix::asserted_as_qemu` | Le retard de trois instructions est mesuré ; qu'il soit là où les deux modèles diffèrent est déduit du code, non observé dans QEMU. |
+| N3 « Datasheet-derived », « vient de documents » | « Estimated starting point » (`timing.rs`), « estimé, pas mesuré » (README EN, FR). Le nom `DatasheetTiming` et la ligne `datasheet-uncalibrated`, identifiants imprimés et épinglés, restent. Aucune valeur ne change. |
+| N4 §5 du rapport | Aligné sur K5 : score d'abord, table itérations → `crcfinal`, horloge lue dans le résumé d'inkemu. |
+| N5 `sha256sum` « s'arrête à la première différence » ; `find -type f` aveugle aux liens | Phrase corrigée (`sha256sum --quiet -c` rapporte toutes les différences) ; la liste est faite de chaque entrée avec son type (`find . ! -type d -printf '%y %P\n'`). Vérifié dans l'image : fichier ajouté, fichier épinglé retiré, lien ajouté, fichier épinglé remplacé par un lien vers une copie identique, tous arrêtent la construction ; deux fichiers modifiés sont tous deux rapportés. |
+| N6 « exécution seule 110 s » plus longue que le test | Retiré (mesure prise à un autre moment, sous une autre charge). Les durées locales sont données avec leur dispersion : 87, 102 et 328 s (ce dernier sous une charge moyenne d'environ 17 sur 16 cœurs) ; celle de la CI, 68 s, sert de référence. |
+
+Vérifié en local : `cargo fmt --all --check` ; clippy (`-D warnings`) sur `emu-cli`, `soc-esp32c3` et `cpu-rv32` ;
+rustdoc sur `soc-esp32c3` et `cpu-rv32` ; le test CoreMark (passé, 328 s sous charge) ; les contrôles de liste et
+d'empreintes de `in-container.sh` dans `espressif/idf:v5.5.2`. Aucune mesure, aucune empreinte, aucune épingle ne
+change.

@@ -95,8 +95,8 @@ bytes from 65,536 of `flash_hello.bin`, `nvs_rw_value_cxx.bin` the 161,312 bytes
     cargo run --release -p emu-cli -- run --device x4 --firmware hello_world.bin --max-time 12
 
 CoreMark is an application already; it prints its score after about 17.5 s of device time
-(about 2.2 billion instructions; the test that runs it took 68 s in the CI on 2026-10-15, and 87 to
-102 s on the development host):
+(about 2.2 billion instructions; the test that runs it took 68 s in the CI on 2026-10-15, and from 87
+to 328 s on a shared development host, depending on its load):
 
     cargo run --release -p emu-cli -- run --device x4 --console uart0 --max-time 20 \
       --firmware target/reference-firmware/coremark_example.bin
