@@ -38,7 +38,8 @@ Aucune empreinte figée n'a bougé.
 | `aab9dda` | enveloppe Tauri : commande `monitor` |
 | `a522ff4` | `app` : `MonitorPanel`, `monitor-format.ts`, bouton de la barre, FR et EN |
 | `5ff1d7d` | `app` : la légende de la carte des pages a son nom |
-| ce commit et le suivant | README (anglais et français), cette note |
+| `b5615c4`, `26b87f4` et le dernier | README (anglais et français), cette note |
+| `38d5003` | `app` : l'unité est choisie après l'arrondi (relecture) |
 
 ## Coût mesuré
 
