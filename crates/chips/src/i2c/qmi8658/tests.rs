@@ -214,6 +214,34 @@ fn a_disabled_sensor_keeps_its_last_output_and_its_read_is_reported_once() {
     assert_eq!(kinds(&mut chip).len(), 1, "once for the gyroscope too");
 }
 
+/// `SPI_BE`, set at power-on, is not taken over I2C: the outputs read little endian, and the
+/// first read of an output with the bit set is reported once; with the bit cleared, as every X3
+/// firmware clears it, nothing is.
+#[test]
+fn an_output_read_with_the_big_endian_bit_set_is_little_endian_and_reported_once() {
+    let mut chip = sensor_moving([0, 0, 1000], [0; 3]);
+    set(&mut chip, CTRL2, 0x06, at(0));
+    set(&mut chip, CTRL7, 0x01, at(0));
+    assert_eq!(chip.register(CTRL1, at(0)) & 0x20, 0x20, "power-on value");
+    // Z, 1 g at ±2 g: 16384, its low byte at `ACCEL_FIRST + 4`, its high byte after it.
+    let low = read_register(&mut chip, ADDRESS, ACCEL_FIRST + 4, 1, at(S)).unwrap();
+    let high = read_register(&mut chip, ADDRESS, ACCEL_FIRST + 5, 1, at(S)).unwrap();
+    assert_eq!([low[0], high[0]], [0x00, 0x40], "low byte first");
+    assert_eq!(
+        kinds(&mut chip),
+        [I2cDiagnosticKind::NotModelled {
+            what: "an output read with CTRL1's big-endian bit (SPI_BE) set, read little endian over I2C; CTRL1",
+            value: 0x20,
+        }]
+    );
+    let _ = read_register(&mut chip, ADDRESS, TEMP_L, 2, at(S));
+    assert_eq!(chip.take_diagnostics(), NONE, "once");
+    let mut cleared = sensor();
+    begin_like_crosspoint(&mut cleared, at(0));
+    let _ = read_register(&mut cleared, ADDRESS, ACCEL_FIRST, 6, at(S));
+    assert_eq!(cleared.take_diagnostics(), NONE);
+}
+
 #[test]
 fn a_soft_reset_brings_every_register_back_and_reports_completion() {
     let mut chip = sensor();

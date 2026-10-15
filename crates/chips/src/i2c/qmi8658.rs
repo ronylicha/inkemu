@@ -59,6 +59,8 @@ const WHO_AM_I_VALUE: u8 = 0x05;
 const CTRL1_POWER_ON: u8 = 0x20;
 /// CTRL1: address auto-increment, and the sensors' oscillator off.
 const AUTO_INCREMENT: u8 = 0x40;
+/// CTRL1 bit 5, `SPI_BE`: big-endian reads of the outputs; set at power-on (research §5.2).
+const BIG_ENDIAN: u8 = 0x20;
 const SENSOR_DISABLE: u8 = 0x01;
 /// CTRL2 and CTRL3: the self-test bit, the full scale (bits 6:4) and the output data rate.
 const SELF_TEST: u8 = 0x80;
@@ -358,6 +360,20 @@ impl Qmi8658 {
                 self.report_disabled_read(GYRO_FIRST, at);
             }
             _ => {}
+        }
+        if (TIMESTAMP_L..=GYRO_LAST).contains(&register) && self.stored(CTRL1) & BIG_ENDIAN != 0 {
+            // ASSUMPTION: `SPI_BE` orders the bytes of SPI reads only; over I2C the outputs read
+            // little endian, low byte first, whatever the bit says. The datasheet names the bit
+            // for SPI and does not say what it does to I2C (research §5.2); every X3 firmware
+            // clears it first. A read with it set is reported once, so that a firmware relying
+            // on it is seen.
+            self.diagnostics.report_once(
+                at,
+                I2cDiagnosticKind::NotModelled {
+                    what: "an output read with CTRL1's big-endian bit (SPI_BE) set, read little endian over I2C; CTRL1",
+                    value: u32::from(BIG_ENDIAN),
+                },
+            );
         }
         value
     }

@@ -1,8 +1,9 @@
 //! The signals between a system-on-chip and the chips around it (spec §3.2, ADR 0012).
 //!
 //! A chip outside the `SoC` (a display controller, a memory card, a button ladder) never sees the
-//! `SoC`: it sees lines. Four traits say what a chip does on them, a fifth when it lives in time,
-//! and nothing here knows which `SoC` drives the other end:
+//! `SoC`: it sees lines. Five traits say what a chip does on them (the fifth, [`I2cTarget`], added
+//! with the X3's bus, ADR 0015), a sixth when it lives in time, and nothing here knows which `SoC`
+//! drives the other end:
 //!
 //! - [`GpioInput`]: the chip drives a line the `SoC` reads (a button, a BUSY line);
 //! - [`GpioOutput`]: the chip watches a line the `SoC` drives (a reset, a power latch);
@@ -23,9 +24,9 @@
 //! time gives a deterministic run.
 //!
 //! A chip that has several lines (the BUSY output and the SPI interface of a display controller)
-//! is attached once per line; `Rc<RefCell<T>>` implements the five traits for `T`, so the same chip
-//! can be shared between its attachments. The `SoC` never calls a chip from within a call to that
-//! chip, so the `RefCell` is never borrowed twice.
+//! is attached once per line; `Rc<RefCell<T>>` implements every trait of this module for `T`, so
+//! the same chip can be shared between its attachments. The `SoC` never calls a chip from within a
+//! call to that chip, so the `RefCell` is never borrowed twice.
 use std::cell::RefCell;
 use std::rc::Rc;
 
