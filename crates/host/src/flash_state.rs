@@ -260,7 +260,7 @@ fn creation_remedy(error: &std::io::Error) -> &'static str {
 
 /// The file beside `path` named after it: `prefix`, the name of `path`, then `suffix`. `None`
 /// when `path` names no file, which [`FlashState::open`] refuses.
-fn sibling(path: &Path, prefix: &str, suffix: &str) -> Option<PathBuf> {
+pub(crate) fn sibling(path: &Path, prefix: &str, suffix: &str) -> Option<PathBuf> {
     let name = path.file_name()?;
     let mut sibling = OsString::from(prefix);
     sibling.push(name);
@@ -383,7 +383,7 @@ pub(crate) fn same_file(one: &Path, other: &Path) -> bool {
 /// process wait for its other end (`O_NONBLOCK`, which changes nothing for a regular file).
 /// Elsewhere the standard library has no such request: the open is the plain one, and what was
 /// opened is judged by its caller, as everywhere.
-fn open_in_place(options: &mut OpenOptions, path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_in_place(options: &mut OpenOptions, path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;

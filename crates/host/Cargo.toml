@@ -17,6 +17,7 @@ test-support = ["soc-esp32c3/test-support"]
 
 [dependencies]
 emu-core.workspace = true
+chips.workspace = true
 firmware.workspace = true
 soc-esp32c3.workspace = true
 boards.workspace = true

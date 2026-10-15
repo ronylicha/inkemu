@@ -474,6 +474,7 @@ name = "host"
 version = "0.1.0"
 dependencies = [
  "boards",
+ "chips",
  "console-script",
  "cpu-rv32",
  "emu-core",
