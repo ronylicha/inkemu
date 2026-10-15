@@ -1,6 +1,7 @@
 //! The ESP32-C3 address space. Memory map: `docs/research/esp32c3-boot-chain.md`, §A.1.
 use crate::config::SocConfig;
 use crate::ctx::{Ctx, Event};
+use crate::debug::{Access, Watch, WatchHit};
 use crate::diag::{Diagnostic, Direction, MappingFault};
 use crate::flash::FlashDevice;
 use crate::memmap::{
@@ -27,6 +28,22 @@ pub struct SocBus {
     pub(crate) periph: Peripherals,
     /// The context handed to every peripheral access; it holds the diagnostics of the run.
     pub(crate) ctx: Ctx,
+    /// The watchpoints of a debugger, the SRAM by its data-bus addresses ([`debug`]).
+    watches: Vec<Watch>,
+    /// The first access to watched bytes since a debugger last took one ([`debug`]).
+    watch_hit: Option<WatchHit>,
+}
+
+mod debug;
+
+/// The address a watchpoint compares: an SRAM address of the instruction bus as its data-bus
+/// twin (the same cell), every other address as it is.
+#[must_use]
+pub(crate) fn canonical(addr: u32) -> u32 {
+    match offset_in(addr, 1, SRAM_IBUS_BASE, SRAM_SIZE) {
+        Some(offset) => SRAM_DBUS_BASE + offset,
+        None => addr,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -125,6 +142,8 @@ impl SocBus {
             rtc: Ram::new(RTC_RAM_BASE, RTC_RAM_SIZE as usize),
             periph,
             ctx,
+            watches: Vec::new(),
+            watch_hit: None,
         }
     }
 
@@ -368,7 +387,7 @@ impl Bus for SocBus {
         // ASSUMPTION: an instruction fetch through a data-bus address (the DROM window, the SRAM D-bus
         // view) is served like a load. The silicon behaviour is not established; the SP1b-4 lockstep
         // against a reference trace settles it.
-        match locate(addr, size.bytes()) {
+        let outcome = match locate(addr, size.bytes()) {
             Some(Region::Rom(offset)) => Ok(ReadOutcome {
                 value: self.rom_read(offset, size),
                 stall: 0,
@@ -379,11 +398,15 @@ impl Bus for SocBus {
             Some(Region::Flash { offset, .. }) => Ok(self.flash_read(addr, offset, size)),
             Some(Region::Periph) if kind != AccessKind::Fetch => self.mmio_read(addr, size),
             Some(Region::Periph) | None => Err(BusError::Unmapped { addr, kind }),
+        }?;
+        if kind == AccessKind::Load {
+            self.note_access(addr, size, Access::Read, outcome.value);
         }
+        Ok(outcome)
     }
 
     fn write(&mut self, addr: u32, size: AccessSize, value: u32) -> Result<u32, BusError> {
-        match locate(addr, size.bytes()) {
+        let stall = match locate(addr, size.bytes()) {
             Some(Region::Sram(dbus_addr)) => self.sram.write(dbus_addr, size, value),
             Some(Region::Sram0) => self.sram0.write(addr, size, value),
             Some(Region::Rtc) => self.rtc.write(addr, size, value),
@@ -404,7 +427,9 @@ impl Bus for SocBus {
                 addr,
                 kind: AccessKind::Store,
             }),
-        }
+        }?;
+        self.note_access(addr, size, Access::Write, value);
+        Ok(stall)
     }
 
     fn fetch_is_memory(&self, addr: u32, len: u32) -> bool {
