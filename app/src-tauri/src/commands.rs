@@ -539,8 +539,9 @@ pub fn devices() -> Result<Vec<DeviceView>, ErrorDto> {
 /// off the interface's thread.
 ///
 /// The device that runs goes on running until the new one has passed every check: a refused
-/// start leaves it as it was. Only a start on the flash file it holds powers it off first, since
-/// its power-off writes that file and releases its lock.
+/// start leaves it as it was. Only a start on a file it holds, its flash file or its SD image,
+/// powers it off first, since its power-off writes that file and releases its lock; and every
+/// start waits for the power-offs under way, whose emulators may still hold such a file (R4).
 #[tauri::command]
 pub async fn power_on(
     shell: State<'_, Shell>,
@@ -554,8 +555,21 @@ pub async fn power_on(
     if shell.holds_a_file_of(&setup) {
         off_the_main_thread(shell).await?;
     }
-    let launch = tauri::async_runtime::spawn_blocking(move || device::power_on(&setup)).await??;
+    let stopping = shell.stopping.clone();
+    let launch = tauri::async_runtime::spawn_blocking(move || {
+        after_the_power_offs(&stopping, || device::power_on(&setup))
+    })
+    .await??;
     self::start(shell, launch, speed, start, on_update).await
+}
+
+/// Does `start` once no power-off is under way: an emulator a start replaced, or one powered
+/// off for this start, writes its files and holds their locks until its thread ends, and a lock
+/// held by this process refuses a run as one held by another would (R4). Blocks: never on the
+/// interface's thread.
+fn after_the_power_offs<T>(stopping: &Stopping, start: impl FnOnce() -> T) -> T {
+    stopping.wait();
+    start()
 }
 
 /// Opens a session and replays it as `inkemu replay` does.
@@ -709,8 +723,31 @@ mod tests {
     /// open it.
     #[test]
     fn a_start_on_the_card_the_running_device_holds_powers_that_device_off_first() {
-        let dir = std::env::temp_dir().join(format!("inkemu-shell-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Removed however the test ends.
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let (shell, card) = shell_on_a_card(dir);
+        let on_card = |path: PathBuf| Setup {
+            device: "x4".into(),
+            sd: Some(device::SdSetup {
+                path,
+                read_only: false,
+                create_mib: None,
+            }),
+            ..Setup::default()
+        };
+        assert!(shell.holds_a_file_of(&on_card(card.clone())));
+        // The same file by another spelling of its path is the same card.
+        assert!(shell.holds_a_file_of(&on_card(dir.join(".").join("card.img"))));
+        assert!(!shell.holds_a_file_of(&on_card(dir.join("other.img"))));
+        assert!(!shell.holds_a_file_of(&Setup::default()));
+        assert_eq!(shell.power_off(), Ok(()));
+        assert!(!shell.holds_a_file_of(&on_card(card)));
+    }
+
+    /// A shell whose emulator runs the looping test device with a blank image of 64 MiB in
+    /// `dir` in its slot, as start 1; and the path of that image.
+    fn shell_on_a_card(dir: &std::path::Path) -> (Shell, PathBuf) {
         let card = dir.join("card.img");
         std::fs::File::create(&card)
             .unwrap()
@@ -728,23 +765,38 @@ mod tests {
         .unwrap();
         let (kept, _) = shell.keep(1, running);
         assert!(kept);
-        let on_card = |path: PathBuf| Setup {
-            device: "x4".into(),
+        (shell, card)
+    }
+
+    /// R4: an emulator powering off holds its card until its thread ends, out of the shell's
+    /// sight: a start on that card waits for the power-off, where opening the card at once is
+    /// refused as in use.
+    #[test]
+    fn a_start_waits_for_a_power_off_that_still_holds_its_card() {
+        use host::sd_image::{Access, SdImage, SdImageError};
+        let dir = tempfile::tempdir().unwrap();
+        let (shell, card) = shell_on_a_card(dir.path());
+        let (emulator, under_way) = shell.take().unwrap();
+        assert!(!shell.holds_a_file_of(&Setup {
             sd: Some(device::SdSetup {
-                path,
+                path: card.clone(),
                 read_only: false,
                 create_mib: None,
             }),
             ..Setup::default()
-        };
-        assert!(shell.holds_a_file_of(&on_card(card.clone())));
-        // The same file by another spelling of its path is the same card.
-        assert!(shell.holds_a_file_of(&on_card(dir.join(".").join("card.img"))));
-        assert!(!shell.holds_a_file_of(&on_card(dir.join("other.img"))));
-        assert!(!shell.holds_a_file_of(&Setup::default()));
-        assert_eq!(shell.power_off(), Ok(()));
-        assert!(!shell.holds_a_file_of(&on_card(card)));
-        std::fs::remove_dir_all(&dir).unwrap();
+        }));
+        let open = || SdImage::open(&card, Access::ReadWrite, &[], &mut Vec::new());
+        assert!(matches!(open(), Err(SdImageError::InUse { .. })));
+        let slow = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let ended = emulator.shutdown();
+            drop(under_way);
+            ended
+        });
+        if let Err(e) = after_the_power_offs(&shell.stopping, open) {
+            panic!("{e}");
+        }
+        assert!(slow.join().unwrap().is_ok());
     }
 
     /// The first request to close powers off; those that follow only wait for it.
