@@ -164,6 +164,12 @@ fn slave_mode_non_fifo_mode_and_a_foreign_clock_are_refused_by_name() {
         })
     );
     assert_eq!(ctx.next_wake(), None);
+    // Refused, and ended at once: a firmware waiting for the end is not stuck.
+    assert_eq!(
+        read(&mut i2c, ctx, INT_RAW) & TRANS_COMPLETE,
+        TRANS_COMPLETE
+    );
+    assert_eq!(read(&mut i2c, ctx, SR) & BUS_BUSY, 0);
     let mut i2c = master(ctx);
     assert!(i2c.write(ctx, FIFO_CONF, NONFIFO_EN));
     assert!(i2c.write(ctx, CTR, MS_MODE | TRANS_START));
@@ -173,6 +179,12 @@ fn slave_mode_non_fifo_mode_and_a_foreign_clock_are_refused_by_name() {
             refusal: I2cRefusal::NonFifo
         })
     );
+    assert_eq!(ctx.next_wake(), None);
+    assert_eq!(
+        read(&mut i2c, ctx, INT_RAW) & TRANS_COMPLETE,
+        TRANS_COMPLETE
+    );
+    assert!(i2c.write(ctx, INT_CLR, TRANS_COMPLETE));
     assert!(i2c.write(ctx, FIFO_CONF, 0));
     assert!(i2c.write(ctx, CLK_CONF, 1 << 20));
     assert!(i2c.write(ctx, COMD0, command(OP_STOP, 0, false)));
@@ -183,6 +195,53 @@ fn slave_mode_non_fifo_mode_and_a_foreign_clock_are_refused_by_name() {
             refusal: I2cRefusal::Clock { clk_conf: 1 << 20 }
         })
     );
+}
+
+/// A probe of address 0x68 (START, the address byte with its acknowledge checked) started.
+fn start_a_probe(i2c: &mut I2c0, ctx: &mut Ctx) {
+    assert!(i2c.write(ctx, DATA, 0x68 << 1));
+    assert!(i2c.write(ctx, COMD0, command(OP_RSTART, 0, false)));
+    assert!(i2c.write(ctx, COMD1, command(OP_WRITE, 1, true)));
+    assert!(i2c.write(ctx, COMD2, command(OP_END, 0, false)));
+    assert!(i2c.write(ctx, CTR, MS_MODE | TRANS_START));
+}
+
+#[test]
+fn a_start_during_a_sequence_is_refused_by_name_and_the_sequence_goes_on() {
+    let ctx = &mut Ctx::default();
+    let mut i2c = master(ctx);
+    start_a_probe(&mut i2c, ctx);
+    let end = ctx.next_wake();
+    assert!(i2c.write(ctx, CTR, MS_MODE | TRANS_START));
+    assert_eq!(
+        ctx.take_unsupported(),
+        Some(Unsupported::I2c {
+            refusal: I2cRefusal::StartWhileRunning
+        })
+    );
+    assert_eq!(ctx.next_wake(), end, "the sequence under way keeps its end");
+    run(&mut i2c, ctx);
+    assert_eq!(read(&mut i2c, ctx, INT_RAW) & NACK, NACK, "and its outcome");
+}
+
+#[test]
+fn a_reset_of_the_state_machine_abandons_the_sequence_under_way() {
+    let ctx = &mut Ctx::default();
+    let mut i2c = master(ctx);
+    start_a_probe(&mut i2c, ctx);
+    assert_eq!(read(&mut i2c, ctx, SR) & BUS_BUSY, BUS_BUSY);
+    assert!(i2c.write(ctx, CTR, MS_MODE | FSM_RST));
+    assert_eq!(ctx.next_wake(), None, "no end is coming");
+    assert_eq!(read(&mut i2c, ctx, SR) & BUS_BUSY, 0, "the bus is idle");
+    assert_eq!(read(&mut i2c, ctx, INT_RAW) & (NACK | END_DETECT), 0);
+    assert_eq!(read(&mut i2c, ctx, COMD0) & DONE, 0, "nothing was done");
+    assert_eq!(read(&mut i2c, ctx, CTR) & FSM_RST, 0, "a strobe");
+    assert_eq!(ctx.take_unsupported(), None);
+    // A new sequence starts as from idle.
+    assert!(i2c.write(ctx, CTR, MS_MODE | TRANS_START));
+    assert_eq!(ctx.take_unsupported(), None);
+    run(&mut i2c, ctx);
+    assert_eq!(read(&mut i2c, ctx, INT_RAW) & NACK, NACK);
 }
 
 #[test]

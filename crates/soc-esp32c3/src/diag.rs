@@ -157,10 +157,15 @@ pub enum Spi2Refusal {
 /// Why I2C0 refused an operation (2b-D9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum I2cRefusal {
-    /// `CTR.TRANS_START` in slave mode (`CTR.MS_MODE` clear): the sequence did not run.
+    /// `CTR.TRANS_START` in slave mode (`CTR.MS_MODE` clear): the sequence did not run, and ended
+    /// at once (`TRANS_COMPLETE`, the bus idle).
     Slave,
-    /// `CTR.TRANS_START` with `FIFO_CONF.NONFIFO_EN` set: the sequence did not run.
+    /// `CTR.TRANS_START` with `FIFO_CONF.NONFIFO_EN` set: the sequence did not run, and ended at
+    /// once (`TRANS_COMPLETE`, the bus idle).
     NonFifo,
+    /// `CTR.TRANS_START` while a sequence is under way: the start is ignored, the sequence under
+    /// way goes on to its end.
+    StartWhileRunning,
     /// `CLK_CONF.SCLK_SEL` selects `RC_FAST`, or `SCLK_DIV_A`/`SCLK_DIV_B` a fractional divider: the
     /// sequence ran, timed with the crystal divided by `SCLK_DIV_NUM + 1`. `clk_conf` is the
     /// register.
@@ -177,7 +182,8 @@ pub enum AdcRefusal {
     /// random number generator, is no refusal.
     Scan,
     /// A one-shot start with both units selected (`ONETIME_SAMPLE` bits 30 and 31): nothing was
-    /// sampled.
+    /// sampled, and both units say they are done at once (`INT_RAW` bits 31 and 30), their results
+    /// unchanged.
     BothUnits,
     /// `CLKM_CONF.CLK_SEL` other than 2, the APB clock ESP-IDF selects: the conversion was timed
     /// with the APB clock. `clk_sel` is the field.
@@ -442,11 +448,15 @@ impl Unsupported {
             Unsupported::I2c { refusal } => match refusal {
                 I2cRefusal::Slave => write!(
                     f,
-                    "I2C0 was started (CTR.TRANS_START) in slave mode (pc {pc:#010x}), which inkemu does not model, so nothing ran; set CTR.MS_MODE for a master"
+                    "I2C0 was started (CTR.TRANS_START) in slave mode (pc {pc:#010x}), which inkemu does not model, so nothing ran and the sequence ended at once (TRANS_COMPLETE, the bus idle); set CTR.MS_MODE for a master"
                 ),
                 I2cRefusal::NonFifo => write!(
                     f,
-                    "I2C0 was started (CTR.TRANS_START) with FIFO_CONF.NONFIFO_EN set (pc {pc:#010x}), whose RAM addressing inkemu does not model, so nothing ran; clear NONFIFO_EN and write the bytes to I2C0.DATA"
+                    "I2C0 was started (CTR.TRANS_START) with FIFO_CONF.NONFIFO_EN set (pc {pc:#010x}), whose RAM addressing inkemu does not model, so nothing ran and the sequence ended at once (TRANS_COMPLETE, the bus idle); clear NONFIFO_EN and write the bytes to I2C0.DATA"
+                ),
+                I2cRefusal::StartWhileRunning => write!(
+                    f,
+                    "I2C0 was started again (CTR.TRANS_START, pc {pc:#010x}) while a sequence was under way, which the TRM does not define, so the start was ignored and the sequence under way goes on to its end; wait for its end (TRANS_COMPLETE, END_DETECT or NACK), or reset the state machine (CTR.FSM_RST) first"
                 ),
                 I2cRefusal::Clock { clk_conf } => write!(
                     f,
@@ -460,7 +470,7 @@ impl Unsupported {
                 ),
                 AdcRefusal::BothUnits => write!(
                     f,
-                    "a one-shot conversion of the SAR ADC was started with both units selected (APB_SARADC.ONETIME_SAMPLE bits 30 and 31, pc {pc:#010x}), and which one converts is not documented, so nothing was sampled; select one unit per conversion"
+                    "a one-shot conversion of the SAR ADC was started with both units selected (APB_SARADC.ONETIME_SAMPLE bits 30 and 31, pc {pc:#010x}), and which one converts is not documented, so nothing was sampled and both units ended at once (INT_RAW bits 31 and 30, the results unchanged); select one unit per conversion"
                 ),
                 AdcRefusal::Clock { clk_sel } => write!(
                     f,
@@ -759,6 +769,7 @@ impl Diagnostic {
                         I2cRefusal::Slave => 0,
                         I2cRefusal::NonFifo => 1,
                         I2cRefusal::Clock { .. } => 2,
+                        I2cRefusal::StartWhileRunning => 3,
                     },
                     0,
                 ),
@@ -1887,6 +1898,12 @@ mod tests {
             ),
             (
                 Unsupported::I2c {
+                    refusal: I2cRefusal::StartWhileRunning,
+                },
+                "I2C0 was started again (CTR.TRANS_START, pc 0x40381000) while a sequence was under way",
+            ),
+            (
+                Unsupported::I2c {
                     refusal: I2cRefusal::Clock {
                         clk_conf: 0x10_0000,
                     },
@@ -1915,7 +1932,10 @@ mod tests {
         for (what, needle) in texts {
             assert_cause_then_remedy(&unsupported(what), needle);
         }
-        // Every kind of refusal of GP-SPI2 has a text and a key of its own.
+    }
+
+    #[test]
+    fn every_refusal_of_spi2_has_its_own_key_and_says_the_transaction_ended() {
         let all = [
             Spi2Refusal::Dma,
             Spi2Refusal::MultiLine,

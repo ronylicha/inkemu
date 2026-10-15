@@ -217,6 +217,7 @@ fn a_scan_both_units_and_a_foreign_clock_are_refused_by_name() {
             refusal: AdcRefusal::Scan
         })
     );
+    let data_before = (b.read(SAR1DATA_STATUS), b.read(SAR2DATA_STATUS));
     b.convert(ADC1_ONETIME | ADC2_ONETIME, 1, 3);
     assert_eq!(
         b.ctx.take_unsupported(),
@@ -224,7 +225,17 @@ fn a_scan_both_units_and_a_foreign_clock_are_refused_by_name() {
             refusal: AdcRefusal::BothUnits
         })
     );
-    assert_eq!(b.ctx.next_wake(), None);
+    assert_eq!(b.ctx.next_wake(), None, "nothing is sampled");
+    // The refused conversion ends at once: a firmware waiting for either unit is not stuck.
+    assert_eq!(
+        b.read(INT_RAW) & (ADC1_DONE | ADC2_DONE),
+        ADC1_DONE | ADC2_DONE
+    );
+    assert_eq!(
+        (b.read(SAR1DATA_STATUS), b.read(SAR2DATA_STATUS)),
+        data_before
+    );
+    b.write(INT_CLR, ADC1_DONE | ADC2_DONE);
     b.write(CLKM_CONF, 15 | (1 << CLK_SEL_SHIFT));
     b.convert(ADC1_ONETIME, 1, 3);
     assert_eq!(

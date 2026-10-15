@@ -405,9 +405,14 @@ impl SarAdc {
     fn start(&mut self, ctx: &mut Ctx, sample: u32) {
         let (adc1, adc2) = (sample & ADC1_ONETIME != 0, sample & ADC2_ONETIME != 0);
         if adc1 && adc2 {
+            // Refused by name, and ended at once as GP-SPI2 ends a refused transaction: both
+            // units say they are done, their results unchanged, so that no firmware waits for
+            // ever on a bit that never rises.
             ctx.unsupported(Unsupported::Adc {
                 refusal: AdcRefusal::BothUnits,
             });
+            self.set(INT_RAW, self.get(INT_RAW) | ADC1_DONE | ADC2_DONE);
+            self.drive_source(ctx);
             return;
         }
         if !adc1 && !adc2 {

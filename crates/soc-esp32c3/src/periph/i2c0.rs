@@ -51,6 +51,7 @@ const FIFO_BYTES: usize = 32;
 /// and `CONF_UPGATE` `[11]` read 0.
 const MS_MODE: u32 = 1 << 4;
 const TRANS_START: u32 = 1 << 5;
+const FSM_RST: u32 = 1 << 10;
 const CTR_STROBES: u32 = (1 << 5) | (1 << 10) | (1 << 11);
 /// `FIFO_CONF` (`SVD`): `RXFIFO_WM_THRHD` `[4:0]`, `TXFIFO_WM_THRHD` `[9:5]`, `NONFIFO_EN`
 /// `[10]`, `RX_FIFO_RST` `[12]`, `TX_FIFO_RST` `[13]`.
@@ -365,18 +366,21 @@ impl I2c0 {
         (outcome, cycles)
     }
 
-    /// `CTR.TRANS_START`: the command list runs.
+    /// `CTR.TRANS_START`: the command list runs. A start while a sequence is under way is refused
+    /// by name and ignored; a start the model refuses ends at once (`refuse`).
     fn start(&mut self, ctx: &mut Ctx) {
-        if self.get(CTR) & MS_MODE == 0 {
+        if self.running.is_some() {
             ctx.unsupported(Unsupported::I2c {
-                refusal: I2cRefusal::Slave,
+                refusal: I2cRefusal::StartWhileRunning,
             });
             return;
         }
+        if self.get(CTR) & MS_MODE == 0 {
+            self.refuse(ctx, I2cRefusal::Slave);
+            return;
+        }
         if self.get(FIFO_CONF) & NONFIFO_EN != 0 {
-            ctx.unsupported(Unsupported::I2c {
-                refusal: I2cRefusal::NonFifo,
-            });
+            self.refuse(ctx, I2cRefusal::NonFifo);
             return;
         }
         let period = self.sclk_period(ctx);
@@ -385,6 +389,24 @@ impl I2c0 {
         self.running = Some(outcome);
         self.wake
             .arm(ctx, ctx.now() + cycles.saturating_mul(period), Event::I2c0);
+    }
+
+    /// A start the model refuses: named, and ended at once as GP-SPI2 ends a refused transaction:
+    /// nothing goes on the bus, the bus is idle and `TRANS_COMPLETE` rises, so that no firmware
+    /// waits for ever on an end that never comes.
+    fn refuse(&mut self, ctx: &mut Ctx, refusal: I2cRefusal) {
+        ctx.unsupported(Unsupported::I2c { refusal });
+        self.busy = false;
+        self.raise(ctx, TRANS_COMPLETE);
+    }
+
+    /// `CTR.FSM_RST`: the state machine returns to idle; a sequence under way is abandoned, its
+    /// effects never appear, and the bus is idle (the driver resets it so after a timeout,
+    /// `s_i2c_hw_fsm_reset`). The FIFOs and the interrupt bits stay.
+    fn reset_fsm(&mut self, ctx: &mut Ctx) {
+        self.wake.cancel(ctx);
+        self.running = None;
+        self.busy = false;
     }
 
     fn status(&self) -> u32 {
@@ -436,6 +458,9 @@ impl Peripheral<Ctx> for I2c0 {
         match offset {
             CTR => {
                 self.set(CTR, value & !CTR_STROBES);
+                if value & FSM_RST != 0 {
+                    self.reset_fsm(ctx);
+                }
                 if value & TRANS_START != 0 {
                     self.start(ctx);
                 }
