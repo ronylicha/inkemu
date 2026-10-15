@@ -26,6 +26,8 @@ use crate::term::sanitize;
 use boards::{DeviceProfile, MachineOptions, ProfileError};
 use session::{ProfileText, RomIdentity, Session};
 use soc_esp32c3::{ConsoleChannel, RomImage, UsbHost};
+use std::io::Write as _;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -222,6 +224,17 @@ impl FlashKeeper {
     fn abandon(&mut self, content: Option<Vec<u8>>) {
         self.run_flash = None;
         self.next = content;
+    }
+
+    /// Keeps `content`, the flash of a life that stopped on an internal error: writes it to the
+    /// flash file, if the run has one. `false` when the file could not be written.
+    fn rescue(&mut self, content: Vec<u8>, log: &mut dyn std::io::Write) -> bool {
+        let saved = self
+            .run_flash
+            .take()
+            .is_none_or(|run_flash| run_flash.save_content(&content, log));
+        self.next = Some(content);
+        saved
     }
 
     /// Ends a life for its flash: says what it started from and what became of it, writes the
@@ -880,10 +893,19 @@ impl Worker {
             Plan::Run { record, .. } => record.take(),
             Plan::Replay { .. } => None,
         };
-        if let Err(e) = self.begin_life(first) {
-            self.notice(Level::Error, format!("error: {e}"));
+        // A panic on the thread (a fault of the emulator, of a port, of the observer) must not
+        // lose the flash nor leave the interface waiting: every pass and every command runs
+        // under a guard, and a panic ends the run by its rescue.
+        let begun = catch_unwind(AssertUnwindSafe(|| {
+            if let Err(e) = self.begin_life(first) {
+                self.notice(Level::Error, format!("error: {e}"));
+            }
+            self.send_status(true);
+        }));
+        if let Err(panic) = begun {
+            self.rescue(&*panic);
+            return;
         }
-        self.send_status(true);
         loop {
             let live = self.wants_to_run();
             let request = if live && !self.caught_up {
@@ -906,21 +928,82 @@ impl Worker {
             };
             if let Some(Request { command, reply }) = request {
                 let stop = command == Command::Stop;
-                let result = self.handle(command);
-                self.send_status(true);
-                let _ = reply.send(result);
+                let done = catch_unwind(AssertUnwindSafe(|| {
+                    let result = self.handle(command);
+                    self.send_status(true);
+                    result
+                }));
+                match done {
+                    Ok(result) => {
+                        let _ = reply.send(result);
+                    }
+                    Err(panic) => {
+                        self.rescue(&*panic);
+                        let _ = reply.send(Err(CommandError::Stopped));
+                        return;
+                    }
+                }
                 if stop {
                     (self.observer)(Update::Stopped);
                     return;
                 }
                 continue;
             }
-            if self.wants_to_run() {
-                self.run_pass();
+            if self.wants_to_run()
+                && let Err(panic) = catch_unwind(AssertUnwindSafe(|| self.run_pass()))
+            {
+                self.rescue(&*panic);
+                return;
             }
         }
-        self.end_life();
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| self.end_life())) {
+            self.rescue(&*panic);
+            return;
+        }
         (self.observer)(Update::Stopped);
+    }
+
+    /// Ends a run that panicked: writes the flash the device left, says why the emulator
+    /// stopped, and sends [`Update::Stopped`]. Whatever else the life held (its session, its
+    /// last console text) is not trusted after a panic and is dropped.
+    fn rescue(&mut self, panic: &(dyn std::any::Any + Send)) {
+        let mut log = Vec::new();
+        // The flash first: telling the observer may panic again.
+        if let Some(engine) = self.engine.take() {
+            let content = catch_unwind(AssertUnwindSafe(|| engine.machine().flash_contents()));
+            match (content, &mut self.plan) {
+                (Ok(content), Plan::Run { flash, .. }) => {
+                    let _ = catch_unwind(AssertUnwindSafe(|| flash.rescue(content, &mut log)));
+                }
+                (Err(_), Plan::Run { .. }) => {
+                    let _ = writeln!(
+                        log,
+                        "error: the flash of the device could not be read after the internal error: what the last life wrote to it is lost"
+                    );
+                }
+                (_, Plan::Replay { .. }) => {}
+            }
+            // A machine whose drop panics must not keep the interface from hearing of it.
+            let _ = catch_unwind(AssertUnwindSafe(move || drop(engine)));
+        }
+        let text = panic
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "no message".to_owned());
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            self.notice(
+                Level::Error,
+                format!(
+                    "error: the emulator stopped on an internal error: {}",
+                    sanitize(&text)
+                ),
+            );
+            for notice in Notice::from_log(&log) {
+                (self.observer)(Update::Notice(notice));
+            }
+            (self.observer)(Update::Stopped);
+        }));
     }
 
     fn wants_to_run(&self) -> bool {
@@ -1991,6 +2074,108 @@ mod tests {
         emulator.shutdown();
         assert_eq!(*powered.lock().unwrap(), [None, Some(vec![0x00])]);
         assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
+    }
+
+    /// A panel that panics once the firmware has written its flash.
+    struct PanickingPanel(Box<dyn crate::ports::PanelSource>);
+
+    impl crate::ports::PanelSource for PanickingPanel {
+        fn describe(&self) -> crate::ports::PanelDescription {
+            self.0.describe()
+        }
+
+        fn poll(&mut self, machine: &mut Esp32C3) -> Option<PanelFrame> {
+            assert!(machine.flash_modified_sectors() == 0, "a panel port broke");
+            self.0.poll(machine)
+        }
+    }
+
+    /// Buttons that panic when one is pressed.
+    struct PanickingButtons(Box<dyn crate::ports::ButtonPort>);
+
+    impl crate::ports::ButtonPort for PanickingButtons {
+        fn buttons(&self) -> &[crate::ports::ButtonSpec] {
+            self.0.buttons()
+        }
+
+        fn reaches_firmware(&self) -> bool {
+            false
+        }
+
+        fn set(
+            &mut self,
+            _: &mut Esp32C3,
+            _: &str,
+            _: bool,
+        ) -> Result<(), crate::ports::ButtonError> {
+            panic!("a button port broke")
+        }
+    }
+
+    /// [`writing_device`] whose buttons panic, and its panel too when `panel` breaks.
+    fn breaking_device(panel_breaks: bool) -> Box<dyn Recipe> {
+        let mut inner = writing_device(0x00, Arc::default());
+        Box::new(FnRecipe(move |flash: Option<Vec<u8>>, recorded: bool| {
+            let life = inner.power_on(flash, recorded).unwrap();
+            Life {
+                machine: life.machine,
+                panel: if panel_breaks {
+                    Box::new(PanickingPanel(life.panel))
+                } else {
+                    life.panel
+                },
+                buttons: Box::new(PanickingButtons(life.buttons)),
+            }
+        }))
+    }
+
+    /// A port that panics during a pass stops the emulator: the flash the device wrote is in
+    /// its file, the panic is said, and the thread says it stopped.
+    #[test]
+    fn a_panic_during_a_pass_keeps_the_flash_and_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("flash.bin");
+        let keeper = FlashKeeper::begin(Some(file.clone()), false, None, 1 << 20).unwrap();
+        let launch = Launch::new(breaking_device(true), keeper, Limits::default(), LOOK, None);
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        let seen = until(&updates, |u| matches!(u, Update::Stopped));
+        assert!(
+            seen.iter().any(|u| matches!(u, Update::Notice(n)
+                if n.level == Level::Error && n.text.contains("a panel port broke"))),
+            "{seen:#?}"
+        );
+        assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
+        assert!(matches!(
+            emulator.command(Command::Run),
+            Err(CommandError::Stopped)
+        ));
+        emulator.shutdown();
+    }
+
+    /// A port that panics during a command answers it as stopped, and the thread says so.
+    #[test]
+    fn a_panic_during_a_command_answers_and_stops() {
+        let launch = Launch::new(
+            breaking_device(false),
+            FlashKeeper::without_file(None, 1 << 20),
+            Limits::default(),
+            LOOK,
+            None,
+        );
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        emulator.command(Command::Pause).unwrap();
+        let pressed = emulator.command(Command::Button {
+            id: BUTTONS[0].id.to_owned(),
+            pressed: true,
+        });
+        assert!(matches!(pressed, Err(CommandError::Stopped)), "{pressed:?}");
+        let seen = until(&updates, |u| matches!(u, Update::Stopped));
+        assert!(
+            seen.iter().any(|u| matches!(u, Update::Notice(n)
+                if n.text.contains("a button port broke"))),
+            "{seen:#?}"
+        );
+        emulator.shutdown();
     }
 
     /// A machine powered on with the recorder's options keeps its trace hash.

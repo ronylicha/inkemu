@@ -1042,6 +1042,31 @@ impl RunFlash {
             }
         }
     }
+
+    /// Writes `content` to the flash file, if the run has one, without a machine to ask what
+    /// changed: the rescue of a flash whose life stopped on an internal error. `false` when the
+    /// file could not be written; the error is in `log`.
+    pub fn save_content(&self, content: &[u8], log: &mut dyn Write) -> bool {
+        let _ = writeln!(log, "inkemu: flash at start: sha256 {}", self.start_sha256);
+        let Some(state) = &self.state else {
+            return true;
+        };
+        match state.save(content, log) {
+            Ok(()) => {
+                let _ = writeln!(
+                    log,
+                    "inkemu: flash at end: sha256 {}; saved to {} as the device left it when the emulator stopped",
+                    content_sha256(content, self.size),
+                    state.shown()
+                );
+                true
+            }
+            Err(e) => {
+                let _ = writeln!(log, "error: {e}");
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
