@@ -1,7 +1,8 @@
 # SP3 — Note de passation
 
-Branche de SP3, partie de `main` à `6691a7d` (SP2 terminé). Rien n'est poussé. Spec :
-`docs/superpowers/specs/2026-10-15-sp3-x3-design.md` (décisions 3-D1 à 3-D15) ; plan :
+Branche de SP3, partie de `main` à `6691a7d` (SP2 terminé). PR #22 ouverte ; les corrections de sa relecture sont
+sur la branche, non poussées par l'architecte. Spec :
+`docs/superpowers/specs/2026-10-15-sp3-x3-design.md` (décisions 3-D1 à 3-D17) ; plan :
 `docs/superpowers/plans/2026-10-15-sp3-x3.md` (règles 3-R1 à 3-R8, tâches 1 à 7) ; recherche :
 `docs/research/sp3-x3-firmware.md` et `docs/research/sp3-x3-chips.md` ; ADR 0015.
 
@@ -21,7 +22,10 @@ dessine son écran d'accueil.
 | `6093294` | `host`, `app` : le X3 au catalogue et dans les ports ; CrossPoint sur le X3 en test local |
 | `c319996` | `chips` : flux pseudo-aléatoires sans panique (UC8253, puces I2C) ; copie `N2OCP` par octets |
 | `7f5140e` | firmware de référence `x3_panel_sensors`, son test `reference_x3`, le job CI `reference-boot` |
-| (dernier) | spec, plan, ADR 0015, README (EN et FR), cette note |
+| `7003ee5` | spec, plan, ADR 0015, README (EN et FR), cette note |
+| `d3362c4`, `5ec2ba8` | analyse de cause racine du premier démarrage de CrossPoint : test local, recherche, documents |
+| `7d41f9f`, `0aa98d6` | relecture de la PR #22 : tirages de la carte, chemins d'I2C0 alignés, bit `SPI_BE`, `signals.rs` |
+| (suivant) | relecture de la PR #22 : documents |
 
 ## Vérifié en local
 
@@ -66,6 +70,10 @@ trace.
    cette conclusion sans preuve ; l'analyse de cause racine (section suivante) l'établit : faute du firmware, le
    modèle n'a rien à corriger et n'essaie pas de la contourner (pas de NVS pré-rempli). Le test local vérifie la
    signature des deux états du mutex ; le README dit de garder la flash et de démarrer deux fois.
+9. **Un flux pseudo-aléatoire par puce** ajouté après coup (règle 3-R2), qui a montré que la copie `N2OCP` pixel par
+   pixel coûtait trop : elle copie désormais un octet de huit pixels à la fois.
+10. **Les tirages de la carte** (3-D16, relecture X1 et X3) : un mécanisme général du SoC plutôt qu'un réglage du
+    bus I2C, parce que la ligne de données de l'écran en a besoin aussi.
 
 ## Analyse de cause racine : le premier démarrage de CrossPoint sur le X3
 
@@ -97,13 +105,30 @@ Détail et références de ligne : `docs/research/sp3-x3-firmware.md` §7.
    battery current USB detection for X3 » (PR #3809), qui retire exactement cette lecture brute ; son essai sur un X3
    physique relève les mêmes lignes `could not acquire lock` et `NULL TX buffer pointer` au démarrage. Le ticket
    #3498 (2026-09-11) signale un X3 « frozen after flashing ». Un X3 mis à jour depuis un CrossPoint antérieur garde
-   `cphw/dev_det` en NVS et ne prend jamais ce chemin ; le blocage n'arrive qu'une fois, à la première installation,
-   et le verdict est écrit avant lui.
-6. **Conclusion.** Faute du firmware, sans rapport avec un timing ; un vrai X3 neuf la rencontre aussi. Aucun
-   changement du modèle. Premier démarrage de CrossPoint 1.6.5 sous inkemu : sonde 3/3, verdict écrit, blocage ;
-   second : écran d'accueil.
-9. **Un flux pseudo-aléatoire par puce** ajouté après coup (règle 3-R2), qui a montré que la copie `N2OCP` pixel par
-   pixel coûtait trop : elle copie désormais un octet de huit pixels à la fois.
+   `cphw/dev_det` en NVS et ne prend jamais ce chemin ; par la source, le blocage n'arriverait qu'une fois, à la
+   première installation, et le verdict est écrit avant lui. Ni le ticket (sans version ni journal) ni la PR (essai de
+   démarrages avec le verdict en cache) ne montrent le blocage sur un appareil.
+6. **Conclusion.** Faute du firmware, sans rapport avec un timing, **déduite de l'exécution sous inkemu et de la
+   source, non observée sur un X3 neuf** : par la source, un vrai X3 neuf la rencontrerait aussi. Aucun changement du
+   modèle pour elle. Premier démarrage de CrossPoint 1.6.5 sous inkemu : sonde 3/3, `VER=FF FF FF` (depuis 3-D16),
+   verdict écrit, blocage ; second : écran d'accueil.
+
+## Relecture de la PR #22
+
+0 bloquant, 2 importants, 7 mineurs ; tous corrigés, chaque correction de code avec un test qui échoue sans elle
+(vérifié en retirant la correction).
+
+| # | Constat | Correction |
+|---|---|---|
+| X1 (I) | une ligne I2C relâchée se lisait basse sans tirage interne : ACK fantôme, `0x00` | tirages de la carte (3-D16) : `Esp32C3::pull_up_on_board`, `[wiring.i2c] pull_up` obligatoire, `true` sur le X3 (hypothèse sourcée en RC §1 point 5) ; tests I2C0 tirages internes éteints, câblage du X3, refus d'un bus sans `pull_up` |
+| X2 (I) | « un vrai X3 neuf se bloque aussi » affirmé, déduit seulement | « déduit de l'exécution sous inkemu et de la source, non observé sur un X3 neuf » dans la spec, les README, cette note et la recherche (§7 et §11 point 3 concordent) |
+| X3 | `VER=00 00 00` sous inkemu, `FF FF FF` relevé sur le terrain | tirage de la ligne de données de l'écran du X3 (`mosi_pull_up`) ; CrossPoint lit `FF FF FF` et garde l'UC8253 (test local) |
+| X4 | chemins d'I2C0 divergents (`READ` vide, liste vide) | alignés (3-D17) ; test croisé ; empreintes du X4 et des firmwares de référence inchangées |
+| X5 | doc de `signals.rs` périmée | comptes de traits corrigés |
+| X6 | bit BE de CTRL1 du QMI8658 ignoré sans hypothèse | `ASSUMPTION` et `report_once` sur une lecture de sortie avec le bit mis ; test |
+| X7 | §7 de la spec incomplète | hypothèses de la jauge, de l'horloge, du capteur et des tirages ajoutées |
+| X8 | « counter-clockwise » dans la recherche §9 | « clockwise », justifié |
+| X9 | numérotation de cette note, état de la branche | corrigés ; Cartographie laissée au coordinateur |
 
 ## Laissé aux héritiers
 
@@ -123,6 +148,10 @@ Détail et références de ligne : `docs/research/sp3-x3-firmware.md` §7.
 - Le sens du balayage du verre et la place des touches de face sont supposés ; une photo d'un X3 qui affiche une mire
   connue les tranche.
 - CrossPoint sur le X3 n'est vérifié qu'en local (aucun binaire tiers en CI).
+- Le blocage de CrossPoint 1.6.5 au premier démarrage est **déduit de l'exécution sous inkemu et de la source, non
+  observé sur un X3 neuf** ; le ticket #3498 et la PR #3809 de l'amont s'accordent avec lui sans le montrer.
+- Les tirages de la carte sont supposés (I2C) ou déduits d'un relevé de terrain (ligne de données de l'écran) ; leurs
+  valeurs ne sont pas connues.
 
 ## Cartographie
 

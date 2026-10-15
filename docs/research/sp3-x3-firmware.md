@@ -289,7 +289,8 @@ reader, 20 Hz poll, 300 ms after wake ignored; gyro X (portrait) or Y (landscape
   `getWakeupReason()` (`CP:main.cpp:382`) — at that moment **`Wire` is not begun** (the probe ended
   with `Wire.end()`, nothing else begins it before `halTiltSensor.begin()`), so `endTransmission`
   fails on its NULL buffer (`Wire.cpp:452-455`) and the X3 boots as "no USB" [INF from SRC].
-- [SRC + RUN, verified 2026-10-15] On the **uncached first boot** that same failed call leaves
+- [SRC + RUN under inkemu, 2026-10-15; deduced from the run under inkemu and from the source, not
+  observed on a new X3, §11 point 3] On the **uncached first boot** that same failed call leaves
   Wire's HAL mutex taken, and the next `Wire.begin()` blocks on it for ever. The sequence, in AE
   3.3.11 (line numbers identical to 3.3.1 here):
   1. `runProbePass()` (`FI:XteinkDetect.cpp:644-653`) calls `Wire.begin()`, which **creates**
@@ -328,10 +329,12 @@ reader, 20 Hz poll, 300 ms after wake ignored; gyro X (portrait) or Y (landscape
   `X3GPIO::readI2CReg16LE` and reads the current through `BatteryMonitor`, which begins the bus
   first. Its test on a physical X3 reports the same `could not acquire lock` and `NULL TX buffer
   pointer` lines on every boot of the baseline (those were reset boots of a unit with its cache
-  set). Issue #3498 (2026-09-11) reports an X3 "frozen after flashing". A unit that already ran
-  CrossPoint keeps `cphw/dev_det` in NVS through an update, so it never takes the first-boot path
-  again; the hang is met once, on a unit whose NVS has never held the cache (a first install), and
-  `dev_det` is written before it (`CP:HalGPIO.cpp:100-102`), so the next boot is a cached one.
+  set). Issue #3498 (2026-09-11) reports an X3 "frozen after flashing", without a version or a
+  log. Both agree with the hang; neither shows it on a unit. By the source, a unit that already
+  ran CrossPoint keeps `cphw/dev_det` in NVS through an update, so it never takes the first-boot
+  path again; the hang would be met once, on a unit whose NVS has never held the cache (a first
+  install), and `dev_det` is written before it (`CP:HalGPIO.cpp:100-102`), so the next boot is a
+  cached one.
 
 ## 8. Boot sequence on an X3 (CP 1.6.5)
 
@@ -400,8 +403,10 @@ X3 SD rail — the code path is the same either way); `powerDownRailsForSleep` h
   CCW is the identity, Landscape CW is 180°, Portrait-inverted is `(791 − y, x)`. Combined with the
   row reversal of §3.4, controller RAM row *r* = framebuffer row 527 − *r* = logical portrait column
   *r* [INF]. To show the glass upright in portrait, an emulator rotates the framebuffer image
-  90° counter-clockwise (framebuffer column → screen row top-down, framebuffer row 527 → screen
-  left) [INF]; how the glass's gate/source scan maps controller RAM to physical position (PSR
+  90° clockwise (framebuffer column → screen row top-down, framebuffer row 527 → screen left: the
+  logical top-left, at framebuffer column 0, row 527, the image's bottom-left corner, comes to the
+  screen's top-left) [INF; corrected 2026-10-15 from "counter-clockwise", which put it at the
+  bottom-right; the profile's `rotation = 90` and the capture of CrossPoint's home screen agree]; how the glass's gate/source scan maps controller RAM to physical position (PSR
   `UD`/`SHL` bits of `3F`) is [?].
 
 ## 10. What this confirms or corrects in `xteink-hardware.md`
@@ -426,9 +431,12 @@ X3 SD rail — the code path is the same either way); `powerDownRailsForSleep` h
    sources.
 2. TRES `792 × 600` with 528 streamed rows: where the 528 rows land in UC8253 RAM, and the meaning
    of PSR's second byte (`0A`, UC8279 `4A`); the scan direction of the X3 glass.
-3. The first-boot Wire mutex hang of §7 depends on the lib-builder `sdkconfig`
-   (`CONFIG_DISABLE_HAL_LOCKS`) and is unverified; check by running the image or reading the
-   pioarduino framework's `sdkconfig` for the C3.
+3. The first-boot Wire mutex hang of §7: its mechanism is established from the source and from the
+   run of the shipped image under inkemu (HAL locks are compiled in, the sequence is reproduced, no
+   hardware access on its path), **not observed on a new X3**. Issue #3498 ("frozen after
+   flashing") and the fix of PR #3809 agree with it but do not show it: the issue names no version
+   and gives no log, and the PR's test on a unit ran cached boots only. A unit with an empty `cphw`
+   namespace booted on CrossPoint 1.6.5 with its log read on USB would settle it.
 4. X3 power topology: is there a hardware self-latch, and what GPIO13 LOW cuts (SD rail per
    BoardConfig, battery per the HalPowerManager comment). Behaviour of POWERON with USB present
    (classified PowerButton per §8 step 5, [INF]).

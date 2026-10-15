@@ -47,6 +47,17 @@ controller batches) and `docs/research/sp2a-external-chips.md` (conventions, the
    QMI8658 `0x6B` (alternate `0x6A`) (`FI:hardware/BoardConfig/include/BoardConfig.h:989-991`) [SRC]. The
    X3/X4 decision at boot reads one plausible value from each and wants at least two of three on two
    passes (§3.4, §4.4, §5.4).
+5. **Pull-ups of the board** (added 2026-10-15, review of PR #22). *I2C:* no schematic, board
+   photograph or firmware source found gives the resistors on SCL and SDA [?]. Every firmware also
+   turns the pads' own pull-ups on (Arduino `Wire`, `esp32-hal-i2c-ng.c:131`
+   `enable_internal_pullup = 1`; the stock firmware is not readable), which proves nothing about the
+   board. An I2C bus at 400 kHz needs pull-ups of a few kΩ to rise within the I2C specification's
+   300 ns, which the pads' ~45 kΩ do not give (ESP32-C3 datasheet, DC characteristics) [INF]: the
+   profile models board pull-ups on both lines as an **ASSUMPTION** (`[wiring.i2c] pull_up`).
+   *Display data line:* the field note of point 3 ("uniform `0xFF` through the pull-up") is read as a
+   pull-up on the board: FreeInk's probe turns the pin into an input without a pull of its own
+   (`FI:XteinkDetect.cpp:221-225`), and a line that floats low would read `00` [INF from SRC]; the
+   resistor's value is not known (`[wiring.display] mosi_pull_up`).
 
 ## 2. UC8253 (X3, first batch) and UC8279d (X3, later batch)
 

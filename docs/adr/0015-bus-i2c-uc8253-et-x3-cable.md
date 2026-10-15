@@ -22,8 +22,10 @@ pas l'I2C. Le catalogue de `host` dessinait une mire à la place de l'écran du 
    (CrossPoint) s'exprime par conditions, et un pas par front d'horloge ne donnerait aucun comportement de plus.
 2. **I2C0 atteint les puces par la matrice GPIO**, comme GP-SPI2 (ADR 0012) : une puce est jointe à une paire de pads ;
    elle n'est atteinte que si les sorties SCL et SDA d'I2C0 sont routées vers ces pads, et le maître entend l'entrée
-   SDA que la matrice lui donne, le ET câblé des puces qui tirent la ligne. Un firmware qui route ailleurs ne parle à
-   personne et lit un NACK.
+   SDA que la matrice lui donne, le ET câblé des puces qui tirent la ligne. Une ligne que personne ne tire se lit au
+   niveau de son pad : haut grâce aux résistances de la carte que le profil déclare (`[wiring.i2c] pull_up`, aussi
+   `[wiring.display] mosi_pull_up` pour la ligne de données de l'écran du X3), quels que soient les tirages internes
+   que le firmware choisit. Un firmware qui route ailleurs ne parle à personne et lit un NACK.
 3. **Une condition à la fois, à l'instant où elle se termine** : avec des puces jointes, I2C0 s'arrête à chaque START,
    octet et STOP et appelle la puce à cet instant ; les effets visibles du firmware (FIFO, interruptions, état) restent
    publiés à la fin de la commande. Une puce dont la réponse dépend du temps (l'horloge, le compteur d'échantillons)
@@ -59,7 +61,10 @@ pas l'I2C. Le catalogue de `host` dessinait une mire à la place de l'écran du 
 ### Négatives
 
 - I2C0 a deux chemins (avec et sans puce) ; ils partagent le calcul des durées, mais un changement de l'un doit être
-  porté à l'autre. Le chemin sans puce disparaîtra quand une raison écrite permettra de déplacer les empreintes.
+  porté à l'autre. Un test croisé (`the_same_list_leaves_the_same_on_a_bus_with_and_without_chips`) passe les mêmes
+  listes sur les deux et exige les mêmes interruptions, au même instant, avec les mêmes bits `DONE`, état du bus et
+  octets ; il a fait aligner le `READ` de zéro octet et la liste qui ne dure rien. Le chemin sans puce disparaîtra
+  quand une raison écrite permettra de déplacer les empreintes.
 - La géométrie réelle du verre du X3 et ses durées sont supposées jusqu'à une mesure sur un appareil (SP8).
 - Donner l'heure de l'hôte à l'appareil, ou une batterie qui se vide, demandera un format de session 3 (SP4).
 
