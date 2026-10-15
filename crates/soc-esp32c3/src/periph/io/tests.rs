@@ -471,6 +471,55 @@ fn a_transfer_reaches_the_selected_chip_with_its_dc_and_its_answer_comes_back() 
     );
 }
 
+/// A key of the board (input 0) that the chip on the bus answers with: 1 pressed, 0 released.
+#[derive(Debug, Default)]
+struct KeyOnTheBus {
+    pressed: bool,
+}
+
+impl BoardInputs for KeyOnTheBus {
+    fn check(&self, _input: BoardInput) -> Result<(), emu_core::BoardInputError> {
+        Ok(())
+    }
+
+    fn apply(&mut self, input: BoardInput, _at: Nanos) {
+        self.pressed = input.value == 1;
+    }
+}
+
+impl SpiTarget for KeyOnTheBus {
+    fn select(&mut self, _selected: bool, _at: Nanos) {}
+
+    fn transfer(&mut self, _dc: Option<Level>, _mosi: &[u8], miso: &mut [u8], _at: Nanos) {
+        miso.fill(u8::from(self.pressed));
+    }
+}
+
+/// E1, its branch of the bus: an input of the board that acts at the very instant a transfer
+/// ends is seen by the chip, though its own event has not run yet (a live run arms the two in
+/// another order than its replay).
+#[test]
+fn a_transfer_at_the_instant_a_board_input_acts_sees_it() {
+    let ctx = &mut Ctx::default();
+    let mut io = IoMatrix::new(0x8);
+    x4_bus(&mut io, ctx);
+    let key = Rc::new(RefCell::new(KeyOnTheBus::default()));
+    io.attach_board_inputs(Box::new(Rc::clone(&key)));
+    io.attach_spi(ctx, DISPLAY, Box::new(Rc::clone(&key)))
+        .unwrap();
+    write(&mut io, ctx, OUT_W1TC, 1 << 21);
+    let pressed = BoardInput {
+        target: 0,
+        value: 1,
+    };
+    io.queue_board_input(ctx, ctx.now(), pressed).unwrap();
+    // The instant it acts at: its event is armed, not run.
+    ctx.advance_time_base(1);
+    assert_eq!(io.board_inputs_pending(), 1);
+    assert_eq!(io.spi_transfer(ctx, &[0]), [1]);
+    assert_eq!(io.board_inputs_pending(), 0);
+}
+
 #[test]
 fn a_chip_whose_clock_or_mosi_pin_carries_no_spi_signal_hears_nothing() {
     let ctx = &mut Ctx::default();
@@ -571,4 +620,58 @@ fn a_reset_returns_the_registers_to_their_values_and_keeps_the_chips_which_hear_
         Some(&Some(Level::Low)),
         "still attached"
     );
+}
+
+/// A held pad keeps its output and its pulls through a reset of the digital domain and ignores its
+/// registers until released (`gpio_hold_en`, ADR 0013).
+#[test]
+fn a_held_pad_keeps_its_output_through_a_reset_and_follows_its_registers_once_released() {
+    let ctx = &mut Ctx::default();
+    let mut io = IoMatrix::new(0x8);
+    let watcher = Rc::new(RefCell::new(Watcher::default()));
+    io.attach_output(ctx, 13, Box::new(Rc::clone(&watcher)))
+        .unwrap();
+    output(&mut io, ctx, 13, false);
+    assert_eq!(watcher.borrow().heard.last(), Some(&Some(Level::Low)));
+    io.set_hold(ctx, 1 << 13);
+    write(&mut io, ctx, OUT_W1TS, 1 << 13);
+    assert_eq!(
+        watcher.borrow().heard.last(),
+        Some(&Some(Level::Low)),
+        "a held pad ignores its registers"
+    );
+    io.reset(ctx);
+    assert_eq!(
+        watcher.borrow().heard.last(),
+        Some(&Some(Level::Low)),
+        "and keeps its output through a reset"
+    );
+    io.set_hold(ctx, 0);
+    assert_eq!(
+        watcher.borrow().heard.last(),
+        Some(&None),
+        "released, it follows its registers, reset: not an output"
+    );
+}
+
+/// The levels of the wake pins of a deep sleep: a chip's, else the pad's pull, read without the
+/// pads being worked out.
+#[test]
+fn the_wake_pins_read_their_chip_or_their_pull() {
+    let ctx = &mut Ctx::default();
+    let mut io = IoMatrix::new(0x8);
+    let key = driver(None);
+    io.attach_input(ctx, 3, Box::new(Rc::clone(&key))).unwrap();
+    write(&mut io, ctx, pad_reg(3), GPIO_PAD | (1 << 8));
+    let low_on_3 = [None, None, None, Some(Level::Low), None, None];
+    assert_eq!(io.wake_levels(ctx, &low_on_3), 0, "released: the pull-up");
+    key.borrow_mut().level = Some(Level::Low);
+    assert_eq!(io.wake_levels(ctx, &low_on_3), 1 << 3);
+    assert_eq!(io.wake_pins_change(ctx, &low_on_3), None);
+    key.borrow_mut().later = Some((Nanos(5_000), None));
+    let change = io.wake_pins_change(ctx, &low_on_3).unwrap();
+    assert_eq!(change, crate::clock::TIME_BASE.nanos_to_cycles(5_000));
+    let high_on_2 = [None, None, Some(Level::High), None, None, None];
+    write(&mut io, ctx, pad_reg(2), GPIO_PAD);
+    assert_eq!(io.wake_levels(ctx, &high_on_2), 0, "no chip, no pull: low");
 }

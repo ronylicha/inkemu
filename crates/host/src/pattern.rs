@@ -15,7 +15,7 @@
 //! ghosting.
 use crate::ports::{
     ButtonError, ButtonPort, ButtonSpec, FrameError, FrameParts, PanelDescription, PanelFrame,
-    PanelOrigin, PanelSource, RefreshKind, Region,
+    PanelOrigin, PanelSource, RefreshKind, Region, Shades,
 };
 use soc_esp32c3::Esp32C3;
 use std::cell::RefCell;
@@ -54,19 +54,27 @@ struct Shared {
 #[must_use]
 pub fn ports(
     panel: PanelDescription,
-    buttons: &'static [ButtonSpec],
+    buttons: &[ButtonSpec],
 ) -> (Box<dyn PanelSource>, Box<dyn ButtonPort>) {
     let (panel, buttons) = pattern(panel, buttons);
     (Box::new(panel), Box::new(buttons))
 }
 
-fn pattern(
-    panel: PanelDescription,
-    buttons: &'static [ButtonSpec],
-) -> (PatternPanel, PatternButtons) {
+/// The levels a pattern draws with: those of its panel, four for a panel of continuous shades.
+const fn pattern_levels(shades: Shades) -> u8 {
+    match shades {
+        Shades::Levels(levels) => levels,
+        Shades::Continuous => 4,
+    }
+}
+
+fn pattern(panel: PanelDescription, buttons: &[ButtonSpec]) -> (PatternPanel, PatternButtons) {
     let shared = Rc::new(RefCell::new(Shared::default()));
+    // A pattern is drawn in levels and is no device's rendering: nothing in it is approximate.
     let description = PanelDescription {
         origin: PanelOrigin::TestPattern,
+        shades: Shades::Levels(pattern_levels(panel.shades)),
+        approximate: false,
         ..panel
     };
     let pixels = vec![WHITE; pixel_count(&description)];
@@ -80,7 +88,7 @@ fn pattern(
             second: None,
         },
         PatternButtons {
-            specs: buttons,
+            specs: buttons.to_vec(),
             shared,
         },
     )
@@ -126,8 +134,12 @@ impl PatternPanel {
         }
     }
 
+    fn levels(&self) -> u8 {
+        pattern_levels(self.description.shades)
+    }
+
     fn level(&self, level: u8) -> u8 {
-        PanelFrame::level_value(level, self.description.gray_levels)
+        PanelFrame::level_value(level, self.levels())
     }
 
     fn draw_background(&mut self) {
@@ -150,7 +162,7 @@ impl PatternPanel {
             WHITE,
         );
         // Four bands, one per level, black to white, across the top half.
-        let levels = self.description.gray_levels.max(2);
+        let levels = self.levels().max(2);
         let inner = width.saturating_sub(2 * MARGIN);
         let band = inner / u32::from(levels);
         for level in 0..levels {
@@ -263,7 +275,7 @@ impl PatternPanel {
         PanelFrame::new(FrameParts {
             width: self.width(),
             height: self.height(),
-            gray_levels: self.description.gray_levels,
+            shades: self.description.shades,
             generation: self.generation,
             refresh: if full {
                 RefreshKind::Full
@@ -343,13 +355,13 @@ impl PatternPanel {
 
 /// The buttons of the pattern: they reach the pattern, not the firmware.
 struct PatternButtons {
-    specs: &'static [ButtonSpec],
+    specs: Vec<ButtonSpec>,
     shared: Rc<RefCell<Shared>>,
 }
 
 impl ButtonPort for PatternButtons {
     fn buttons(&self) -> &[ButtonSpec] {
-        self.specs
+        &self.specs
     }
 
     fn reaches_firmware(&self) -> bool {
@@ -381,31 +393,34 @@ pub(crate) mod fixtures {
     use super::*;
     use crate::ports::{Edge, Rotation};
 
-    pub(crate) const BUTTONS: [ButtonSpec; 2] = [
-        ButtonSpec {
-            id: "power",
-            edge: Edge::Top,
-            order: 0,
-        },
-        ButtonSpec {
-            id: "confirm",
-            edge: Edge::Bottom,
-            order: 0,
-        },
-    ];
+    pub(crate) fn buttons() -> Vec<ButtonSpec> {
+        vec![
+            ButtonSpec {
+                id: "power".to_owned(),
+                edge: Edge::Top,
+                order: 0,
+            },
+            ButtonSpec {
+                id: "confirm".to_owned(),
+                edge: Edge::Bottom,
+                order: 0,
+            },
+        ]
+    }
 
     pub(crate) const PANEL: PanelDescription = PanelDescription {
         width: 200,
         height: 120,
-        gray_levels: 4,
+        shades: Shades::Levels(4),
         rotation: Rotation::Deg90,
         origin: PanelOrigin::Device,
+        approximate: false,
     };
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{BUTTONS, PANEL};
+    use super::fixtures::{PANEL, buttons as fixture_buttons};
     use super::*;
     use crate::ports::Rotation;
     use soc_esp32c3::SocConfig;
@@ -417,11 +432,12 @@ mod tests {
 
     #[test]
     fn the_pattern_says_it_is_a_pattern() {
-        let (panel, buttons) = ports(PANEL, &BUTTONS);
+        let (panel, buttons) = ports(PANEL, &fixture_buttons());
         assert_eq!(panel.describe().origin, PanelOrigin::TestPattern);
         assert_eq!(panel.describe().rotation, Rotation::Deg90);
+        assert!(!panel.describe().approximate, "a pattern is no rendering");
         assert!(!buttons.reaches_firmware());
-        assert_eq!(buttons.buttons(), BUTTONS);
+        assert_eq!(buttons.buttons(), fixture_buttons());
     }
 
     /// The first poll is a full refresh of generation 1 holding every level; then nothing until
@@ -429,7 +445,7 @@ mod tests {
     #[test]
     fn the_first_image_is_a_full_refresh_with_every_level() {
         let mut machine = machine();
-        let (mut panel, _) = ports(PANEL, &BUTTONS);
+        let (mut panel, _) = ports(PANEL, &fixture_buttons());
         let frame = panel.poll(&mut machine).unwrap().expect("a first image");
         assert_eq!(frame.generation(), 1);
         assert_eq!(frame.refresh(), RefreshKind::Full);
@@ -451,7 +467,7 @@ mod tests {
     #[test]
     fn a_button_is_a_partial_refresh_of_its_square() {
         let mut machine = machine();
-        let (mut panel, mut buttons) = ports(PANEL, &BUTTONS);
+        let (mut panel, mut buttons) = ports(PANEL, &fixture_buttons());
         let first = panel.poll(&mut machine).unwrap().unwrap();
         buttons.set(&mut machine, "confirm", true).unwrap();
         let pressed = panel.poll(&mut machine).unwrap().expect("the press shows");
@@ -481,7 +497,7 @@ mod tests {
     /// Each second of device time is a refresh of the bar, and every tenth refresh is full.
     #[test]
     fn device_time_fills_the_bar_and_every_tenth_refresh_is_full() {
-        let (mut panel, _) = pattern(PANEL, &BUTTONS);
+        let (mut panel, _) = pattern(PANEL, &fixture_buttons());
         panel.poll_at(0).unwrap().unwrap();
         assert_eq!(panel.poll_at(NANOS_PER_SECOND - 1), Ok(None));
         let mut kinds = Vec::new();

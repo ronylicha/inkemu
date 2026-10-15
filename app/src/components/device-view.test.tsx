@@ -1,23 +1,86 @@
 import { fireEvent, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { LOOK, status } from "../test/fake-host";
+import type { Look, Status } from "../ipc/types";
+import { LOOK, status, WIRED_LOOK } from "../test/fake-host";
 import { renderWith } from "../test/render";
 import { DeviceView } from "./device-view";
 
-function device(onButton = vi.fn()) {
+function device(onButton = vi.fn(), look: Look = LOOK, shown: Status = status()) {
   renderWith(
     <DeviceView
-      look={LOOK}
+      look={look}
       deviceName="Xteink X4"
       signal={null}
-      status={status()}
+      status={shown}
       onButton={onButton}
       onFrameError={vi.fn()}
     />,
   );
   return onButton;
 }
+
+describe("DeviceView of a wired device", () => {
+  it("says its rendering is approximate, and shows no test-pattern banner", () => {
+    device(vi.fn(), WIRED_LOOK);
+    expect(
+      screen.getByText("Approximate rendering: optical parameters not measured"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Test pattern/)).toBeNull();
+  });
+
+  it("says nothing of an approximation for a test pattern", () => {
+    device();
+    expect(screen.queryByText(/Approximate rendering/)).toBeNull();
+    expect(screen.getByText(/Test pattern/)).toBeInTheDocument();
+  });
+
+  it("shows the device off once its board cut the supply, and its power key still presses", () => {
+    const onButton = device(
+      vi.fn(),
+      WIRED_LOOK,
+      status({ run: "ended", end: "powerOff", machine: null }),
+    );
+    // The gesture that turns it on is a hold, not a click (2d-D14).
+    expect(screen.getByText("Hold the power button to turn it on")).toBeInTheDocument();
+    const power = screen.getByRole("button", { name: "Power" });
+    fireEvent.pointerDown(power);
+    fireEvent.pointerUp(power);
+    expect(onButton.mock.calls).toEqual([
+      ["power", true],
+      ["power", false],
+    ]);
+  });
+});
+
+describe("DeviceView of a replay", () => {
+  it("shows a device the session turned off as off, without asking for a hold it cannot take", () => {
+    const off = status({ run: "ended", end: "powerOff", machine: null, replay: "life.inkrec" });
+    device(vi.fn(), WIRED_LOOK, off);
+    expect(
+      screen.getByText("Off, as in the session: a replay cannot turn the device on again"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Hold the power button/)).toBeNull();
+  });
+
+  it("says it in French", () => {
+    renderWith(
+      <DeviceView
+        look={WIRED_LOOK}
+        deviceName="Xteink X4"
+        signal={null}
+        status={status({ run: "ended", end: "powerOff", machine: null, replay: "life.inkrec" })}
+        onButton={vi.fn()}
+        onFrameError={vi.fn()}
+      />,
+      { language: "fr" },
+    );
+    expect(
+      screen.getByText("Éteint, comme dans la session : un rejeu ne peut pas rallumer l’appareil"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Maintenez/)).toBeNull();
+  });
+});
 
 describe("DeviceView", () => {
   it("releases a key held on the device when the window loses the focus", () => {

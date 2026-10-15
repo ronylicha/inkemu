@@ -13,10 +13,16 @@
 pub mod analog;
 pub mod sdcard;
 pub mod ssd1677;
+pub mod switch;
 
 pub use analog::{Battery, BatteryError, ButtonLadder, LadderButton, LadderError, Millivolts};
+pub use sdcard::lines::SdLines;
+pub use ssd1677::lines::{
+    LineFault, Ssd1677Input, Ssd1677Inputs, Ssd1677Lines, Ssd1677Output, Ssd1677Outputs,
+};
 pub use ssd1677::{
     ConfigError, Diagnostic, DiagnosticKind, DisplayMode, GateScan, Optics, OtpWaveform,
     PanelGeometry, PanelImage, Plane, Provenance, RefreshKind, Ssd1677, Ssd1677Config,
     Ssd1677Timing, Stage, Temperature,
 };
+pub use switch::PushButton;

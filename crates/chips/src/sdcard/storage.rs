@@ -49,6 +49,18 @@ pub trait BlockSource: fmt::Debug {
     fn read_block(&mut self, lba: u64, into: &mut Block) -> Result<(), StorageError>;
 }
 
+/// A boxed source reads as the source it holds: a board that takes its card's content from a file
+/// or from a session holds either behind one type (`Overlay<Box<dyn BlockSource>>`).
+impl<S: BlockSource + ?Sized> BlockSource for Box<S> {
+    fn block_count(&self) -> u64 {
+        (**self).block_count()
+    }
+
+    fn read_block(&mut self, lba: u64, into: &mut Block) -> Result<(), StorageError> {
+        (**self).read_block(lba, into)
+    }
+}
+
 /// A store of blocks a card reads, writes and erases.
 pub trait BlockStorage: BlockSource {
     /// Replaces block `lba` with `data`.
@@ -552,6 +564,18 @@ mod tests {
         overlay.write_block(4, &filled(4)).unwrap();
         assert_eq!(read(&mut overlay, 3), filled(0x33));
         assert_eq!(overlay.into_base().inserted(), 1);
+    }
+
+    #[test]
+    fn a_boxed_source_reads_as_the_source_it_holds() {
+        let mut sparse = SparseBlocks::new(8);
+        sparse.insert(2, filled(0x22)).unwrap();
+        let boxed: Box<dyn BlockSource> = Box::new(sparse);
+        let mut overlay = Overlay::new(boxed);
+        assert_eq!(overlay.block_count(), 8);
+        assert_eq!(read(&mut overlay, 2), filled(0x22));
+        overlay.write_block(5, &filled(5)).unwrap();
+        assert_eq!(overlay.changes().written_count(), 1);
     }
 
     #[test]

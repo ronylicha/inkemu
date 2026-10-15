@@ -13,12 +13,14 @@
 //! the inputs are in memory twice at most, never three times.
 use crate::format::Session;
 use crate::outcome::{ConsoleDigests, End, Limits, NoTraceHash, Outcome, Reached, hex};
-use boards::{MachineOptions, ProfileError};
+use boards::{
+    ButtonsHandle, MachineOptions, PanelHandle, ProfileError, SdHandle, SdStart, Wired, WiredError,
+    WiredOptions,
+};
+use chips::sdcard::{Overlay, SdCard, SdCardConfig};
 use emu_core::Cycles;
 use sha2::{Digest as _, Sha256};
-use soc_esp32c3::{
-    AcceptedInput, ConsoleChannel, Esp32C3, FlashImageError, InputError, RomImage, StopReason,
-};
+use soc_esp32c3::{AcceptedInput, ConsoleChannel, Esp32C3, InputError, RomImage, StopReason};
 
 /// Why a session cannot be replayed, before its first instruction.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -34,8 +36,9 @@ pub enum ReplayError {
     },
     #[error("{source}")]
     Profile { source: ProfileError },
+    /// The device of the session cannot be powered on with its flash, its wiring and its card.
     #[error("{source}")]
-    Flash { source: FlashImageError },
+    Device { source: WiredError },
     /// The machine refused an input of the session, which the recorded machine had accepted:
     /// the file was not written by inkemu, or was changed.
     #[error("the machine refuses input {index} of the session: {source}")]
@@ -59,18 +62,24 @@ pub struct Step {
 #[derive(Debug)]
 pub struct Replay {
     machine: Esp32C3,
+    /// The handles of the wired device: its panel and buttons for a front end that shows the
+    /// replay, its slot for the outcome.
+    panel: Option<PanelHandle>,
+    buttons: Option<ButtonsHandle>,
+    sd: Option<SdHandle>,
     limits: Limits,
     consoles: ConsoleDigests,
     end: Option<End>,
 }
 
 impl Replay {
-    /// The machine of `session` on `rom`, at power-on, every input handed over, keeping no
-    /// journal of them.
+    /// The machine of `session` on `rom`, at power-on, wired as its profile says with the card
+    /// of the session in its slot, every input handed over, keeping no journal of them. The
+    /// power-on gesture is not given again: the session holds it among its inputs.
     ///
     /// # Errors
     /// [`ReplayError::Rom`] when `rom` is not the ROM of the session, [`ReplayError::Profile`]
-    /// or [`ReplayError::Flash`] when the device cannot be rebuilt, [`ReplayError::Input`] when
+    /// or [`ReplayError::Device`] when the device cannot be rebuilt, [`ReplayError::Input`] when
     /// the machine refuses an input.
     pub fn start(session: &Session, rom: RomImage) -> Result<Replay, ReplayError> {
         let found: [u8; 32] = Sha256::digest(rom.bytes()).into();
@@ -91,9 +100,24 @@ impl Replay {
             trace_hash: true,
             usb_host: session.usb_host,
         };
-        let mut machine = device
-            .instantiate_with_flash(rom, session.flash.clone(), options)
-            .map_err(|source| ReplayError::Flash { source })?;
+        let wired = WiredOptions {
+            power_hold_ms: Some(0),
+            usb_power: false,
+            sd: session.sd.as_ref().map(|card| SdStart {
+                source: Box::new(card.source()),
+                config: SdCardConfig {
+                    write_protected: card.write_protected(),
+                    ..SdCardConfig::default()
+                },
+            }),
+        };
+        let Wired {
+            mut machine,
+            panel,
+            buttons,
+            sd,
+        } = Wired::power_on(&device, rom, Some(session.flash.clone()), options, wired)
+            .map_err(|source| ReplayError::Device { source })?;
         machine.forgo_input_journal();
         for (index, input) in session.inputs.iter().enumerate() {
             let handed = match input {
@@ -101,11 +125,15 @@ impl Replay {
                     machine.send_console(*channel, *at, bytes)
                 }
                 AcceptedInput::UsbHost { at, state } => machine.set_usb_host(*at, *state),
+                AcceptedInput::Board { at, input } => machine.send_board_input(*at, *input),
             };
             handed.map_err(|source| ReplayError::Input { index, source })?;
         }
         Ok(Replay {
             machine,
+            panel,
+            buttons,
+            sd,
             limits: session.limits,
             consoles: ConsoleDigests::default(),
             end: None,
@@ -124,12 +152,25 @@ impl Replay {
         &mut self.machine
     }
 
-    /// The machine, for a front end that drives it with its own loop (the command line, which
-    /// shows the replay as it shows a run): it runs with [`Limits::run_limits`], tells the end
-    /// with [`Limits::end_of`] and gives the outcome with [`Outcome::of`].
+    /// The machine, for a front end that drives it with its own loop and has no use of the
+    /// device's handles.
     #[must_use]
     pub fn into_machine(self) -> Esp32C3 {
         self.machine
+    }
+
+    /// The machine and the handles of its device, for a front end that drives it with its own
+    /// loop (the command line, which shows the replay as it shows a run): it runs with
+    /// [`Limits::run_limits`], tells the end with [`Limits::end_of`] and gives the outcome with
+    /// [`Outcome::of`], the changes of the card in its slot included.
+    #[must_use]
+    pub fn into_wired(self) -> Wired {
+        Wired {
+            machine: self.machine,
+            panel: self.panel,
+            buttons: self.buttons,
+            sd: self.sd,
+        }
     }
 
     /// The end the replay reached, if it has.
@@ -170,6 +211,7 @@ impl Replay {
             StopReason::Idle => Some(Reached::Idle),
             StopReason::DeepSleep => Some(Reached::DeepSleep),
             StopReason::StrictMmio(_) => Some(Reached::StrictMmio),
+            StopReason::PowerOff => Some(Reached::PowerOff),
             StopReason::CycleBudget | StopReason::Asleep | StopReason::ConsoleOutput => None,
         };
         self.end = reached.map(|reached| self.limits.end_of(reached, self.machine.device_time()));
@@ -190,6 +232,14 @@ impl Replay {
             let flushed = self.machine.flush_console(channel);
             self.consoles.add(channel, &flushed);
         }
-        Ok(Outcome::of(&self.machine, end, self.consoles)?)
+        let card = self.sd.as_ref().and_then(SdHandle::take_card);
+        let storage = card.map(SdCard::into_storage);
+        let changes = storage.as_ref().map(Overlay::changes);
+        Ok(Outcome::of(
+            &self.machine,
+            end,
+            self.consoles,
+            changes.as_ref(),
+        )?)
     }
 }

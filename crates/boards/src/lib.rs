@@ -1,6 +1,13 @@
 //! Device profiles: what a board is made of, as data.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 pub mod notices;
+pub mod wired;
+pub mod wiring;
+
+pub use wired::{
+    BoardRequest, ButtonsHandle, PanelHandle, SdHandle, SdStart, Wired, WiredCard, WiredError,
+    WiredOptions, check_board_request,
+};
 
 use firmware::bootloader::{ShippedBootloader, shipped};
 use firmware::device::revision;
@@ -77,6 +84,10 @@ pub struct DeviceProfile {
     /// the chip revision of the device; otherwise why no bootloader inkemu ships starts it. Such
     /// a device is still described: it boots behind a bootloader its user gives (ADR 0005).
     pub bootloader: Result<&'static ShippedBootloader, NoShippedBootloader>,
+    /// The chips around the `SoC`, the keys and the panel of the device (`[wiring]`, `[power]`),
+    /// checked when the profile is loaded; `None` for a device described by its `SoC` alone, which
+    /// runs bare and shows the test pattern (2d-D15).
+    pub wiring: Option<wiring::Wiring>,
 }
 
 /// Why no bootloader inkemu ships can start a device: the one it ships for the chip family
@@ -138,6 +149,9 @@ pub enum ProfileError {
         "{origin}: inkemu ships no bootloader for {chip} with a flash driven in DIO; choose a chip family inkemu ships a bootloader for"
     )]
     NoBootloader { origin: String, chip: ChipId },
+    /// `detail` names the key of `[wiring]` or `[power]`, the cause, then the remedy.
+    #[error("{origin}: {detail}")]
+    Wiring { origin: String, detail: String },
 }
 
 #[derive(Deserialize)]
@@ -156,6 +170,10 @@ struct RawProfile {
     /// table, with the remedy of [`PartitionError::Empty`].
     #[serde(default)]
     partition: Vec<RawPartition>,
+    /// The chips, keys and panel of a wired device; absent for a bare `SoC`.
+    wiring: Option<wiring::RawWiring>,
+    /// The power-on gesture of a wired device.
+    power: Option<wiring::RawPower>,
 }
 
 /// One `[[partition]]` row as written: `name`, `type`, `subtype`, `offset`, `size`, and the two
@@ -480,8 +498,9 @@ impl DeviceProfile {
     /// [`ProfileError::Parse`] with the line of the first problem,
     /// [`ProfileError::MissingFlash`] when the profile has no `[flash]` table,
     /// [`ProfileError::MissingConsole`] when it has no `console` key,
-    /// [`ProfileError::Partitions`] when its table is refused, or [`ProfileError::NoBootloader`]
-    /// when inkemu ships no bootloader for its chip. A chip revision below the minimum of that
+    /// [`ProfileError::Partitions`] when its table is refused, [`ProfileError::NoBootloader`]
+    /// when inkemu ships no bootloader for its chip, or [`ProfileError::Wiring`] when its
+    /// `[wiring]` or `[power]` cannot be wired. A chip revision below the minimum of that
     /// bootloader is no refusal: [`DeviceProfile::bootloader`] says so.
     pub fn from_toml(origin: &str, text: &str) -> Result<DeviceProfile, ProfileError> {
         let raw: RawProfile = toml::from_str(text).map_err(|e| ProfileError::Parse {
@@ -528,6 +547,11 @@ impl DeviceProfile {
         } else {
             Ok(shipped)
         };
+        let wiring =
+            wiring::check(raw.wiring, raw.power).map_err(|detail| ProfileError::Wiring {
+                origin: origin.to_owned(),
+                detail,
+            })?;
         Ok(DeviceProfile {
             id: raw.id,
             name: raw.name,
@@ -537,6 +561,7 @@ impl DeviceProfile {
             flash,
             partitions,
             bootloader,
+            wiring,
         })
     }
 

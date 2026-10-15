@@ -41,6 +41,12 @@ pas y entrer telle quelle.
      reste et l'image s'en souvient ; avant que la vie suivante lise (`source`) ou sauve (`commit`), il est
      réappliqué, et s'il ne peut toujours pas l'être la vie est refusée (`UnfinishedSave`). Une sauvegarde n'écrit
      jamais par-dessus un journal non appliqué ;
+   - **dans l'application, une carte non écrite suit la règle de la flash** (SP2d, R1) : ce que les vies ont écrit
+     et que l'image n'a pas pris reste en mémoire, en surcouche posée sur l'image (`host::sd_run::CardKeeper`) ; la
+     vie suivante démarre dessus sans relire l'image (la surcouche couvre chaque bloc qu'une sauvegarde interrompue
+     aurait changé, donc un `UnfinishedSave` ne la refuse pas), chaque fin de vie et l'extinction réessaient
+     d'écrire le tout, et ce qui n'est toujours pas écrit à l'extinction est dit (`NotKept`), avec son remède :
+     libérer de la place sur le disque de l'image, ou rendre son dossier inscriptible ;
    - **un journal est lié à son image** : son en-tête (format `inkemu-sd-journal 2`) porte l'identité du fichier
      image, que le condensat couvre : 8 octets qui nomment le fichier, puis sa date de naissance en nanosecondes
      (0 si le système de fichiers n'en garde pas). Sous Unix, l'inode et la date de naissance (`statx`) ; le
@@ -103,8 +109,15 @@ pas y entrer telle quelle.
   il coûte l'écriture de zéros sur ce que l'image contenait (jusqu'à sa taille pleine pour une image remplie), sans
   la faire grossir ; sous Windows, l'écriture de zéros sur toute la plage, dans un fichier qui y occupe déjà toute sa taille.
 - Une fin de vie écrit ce qui a changé deux fois (journal, puis en place) ; c'est le prix de l'atomicité.
-- Une vie qui suit une sauvegarde inachevée commence par la finir ; tant qu'elle ne le peut pas, la carte ne sert
-  pas, plutôt que de lire une image à moitié écrite.
+- En ligne de commande, une vie qui suit une sauvegarde inachevée commence par la finir ; tant qu'elle ne le peut
+  pas, la carte ne sert pas, plutôt que de lire une image à moitié écrite. Dans l'application, la vie suivante démarre
+  sur les changements gardés en mémoire (point 4), qui couvrent chaque bloc de cette sauvegarde.
+- Dans l'application, les changements non écrits de plusieurs vies restent en mémoire : bornés par la capacité de la
+  carte, et jusqu'à environ deux fois cette capacité pendant une vie (la surcouche de la vie, posée sur celle des
+  changements en attente). Ce n'est pas le compromis de la flash, gardée entière en mémoire (16 Mio au plus) : une
+  carte se réécrit rarement en entier, et le format en surcouche impose de garder le contenu de chaque bloc écrit, pas
+  seulement sa trace. Une borne de cette mémoire (vider la surcouche dans un fichier de reprise, ou refuser une vie au
+  delà d'un plafond) revient au sous-projet 4, qui fait vivre la carte pendant une vie (insertion, retrait).
 - Copier une image avec son journal, ou la déplacer sur un autre système de fichiers, rend le journal étranger :
   l'utilisateur le fait appliquer par `inkemu sd recover --accept-journal`, à sa parole.
 - Un tiers qui écrit l'image pendant une exécution (le verrou est consultatif) rend l'exécution non reproductible ;

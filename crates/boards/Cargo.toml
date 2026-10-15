@@ -14,11 +14,16 @@ firmware.workspace = true
 serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
+# The chips of a wired device (`[wiring]`) and the signal traits that attach them to its SoC.
+chips.workspace = true
+emu-core.workspace = true
 
 [dev-dependencies]
 soc-esp32c3 = { workspace = true, features = ["test-support"] }
 firmware = { workspace = true, features = ["test-support"] }
-# The test on the reference firmware `soc_signals` attaches chips to the pins of the X4 through the
-# signal traits, and checks the image it is given against its pinned SHA-256.
-emu-core.workspace = true
+# The test on the reference firmware `soc_signals` checks the image it is given against its pinned
+# SHA-256.
 sha2.workspace = true
+# The tests of the wired machine run hand-written programs on the registers of the SoC.
+cpu-rv32.workspace = true
+svd-regs.workspace = true

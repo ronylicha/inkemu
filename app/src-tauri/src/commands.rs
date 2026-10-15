@@ -3,7 +3,7 @@
 //! refusal is an [`ErrorDto`] whose `kind` the interface translates.
 use host::catalog::{self, DeviceView, Look};
 use host::device::{
-    self, Command, CommandError, Emulator, Handle, LaunchError, Setup, Speed, Update,
+    self, Command, CommandError, Emulator, Handle, LaunchError, SdSetup, Setup, Speed, Update,
 };
 use host::engine::{Limits, Notice};
 use serde::{Deserialize, Serialize};
@@ -177,6 +177,29 @@ impl Shell {
             .is_some_and(|running| running.emulator.holds_flash_file(path))
     }
 
+    /// Whether the running emulator holds the SD image at `path`.
+    fn holds_sd_image(&self, path: &std::path::Path) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|running| running.emulator.holds_sd_image(path))
+    }
+
+    /// Whether the running emulator holds a file `setup` would take, locked: its flash file or
+    /// its SD image. That emulator is powered off first, as the user asked for the new run
+    /// (H3): a lock held by the same process would refuse the new run otherwise.
+    fn holds_a_file_of(&self, setup: &Setup) -> bool {
+        setup
+            .flash_file
+            .as_deref()
+            .is_some_and(|file| self.holds_flash_file(file))
+            || setup
+                .sd
+                .as_ref()
+                .is_some_and(|sd| self.holds_sd_image(&sd.path))
+    }
+
     /// A handle to the emulator of start `start`, refused when another runs ([`same_start`]).
     fn handle_of(&self, start: u64) -> Result<Handle, ErrorDto> {
         let running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
@@ -319,6 +342,30 @@ pub struct SetupDto {
     max_time: String,
     max_cycles: String,
     console: Option<String>,
+    /// A USB cable powers the device from the start (`--usb-power`).
+    usb_power: bool,
+    /// The SD card in the slot, when the device has one and the form gives a card.
+    sd: Option<SdDto>,
+}
+
+/// The SD card of the form (`--sd-image`, `--sd-read-only`, or a blank image made first).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SdDto {
+    path: PathBuf,
+    read_only: bool,
+    /// Make a blank card of this many MiB at `path` first; `null` for an existing image.
+    create_mib: Option<u64>,
+}
+
+impl From<SdDto> for SdSetup {
+    fn from(card: SdDto) -> SdSetup {
+        SdSetup {
+            path: card.path,
+            read_only: card.read_only,
+            create_mib: card.create_mib,
+        }
+    }
 }
 
 fn usb_host(name: &str) -> Result<UsbHost, ErrorDto> {
@@ -370,6 +417,8 @@ impl SetupDto {
                 max_device_nanos,
             },
             console: self.console.as_deref().map(console_channel).transpose()?,
+            usb_power: self.usb_power,
+            sd: self.sd.map(SdSetup::from),
         })
     }
 }
@@ -433,7 +482,7 @@ async fn start(
 ) -> Result<StartedDto, ErrorDto> {
     let started = StartedDto {
         notices: launch.notices.clone(),
-        look: launch.look,
+        look: launch.look.clone(),
         console: launch.console.name(),
         device_name: launch.device_name.clone(),
     };
@@ -490,8 +539,9 @@ pub fn devices() -> Result<Vec<DeviceView>, ErrorDto> {
 /// off the interface's thread.
 ///
 /// The device that runs goes on running until the new one has passed every check: a refused
-/// start leaves it as it was. Only a start on the flash file it holds powers it off first, since
-/// its power-off writes that file and releases its lock.
+/// start leaves it as it was. Only a start on a file it holds, its flash file or its SD image,
+/// powers it off first, since its power-off writes that file and releases its lock; and every
+/// start waits for the power-offs under way, whose emulators may still hold such a file (R4).
 #[tauri::command]
 pub async fn power_on(
     shell: State<'_, Shell>,
@@ -502,15 +552,24 @@ pub async fn power_on(
 ) -> Result<StartedDto, ErrorDto> {
     let setup = setup.into_setup()?;
     let shell = shell.inner();
-    if setup
-        .flash_file
-        .as_deref()
-        .is_some_and(|file| shell.holds_flash_file(file))
-    {
+    if shell.holds_a_file_of(&setup) {
         off_the_main_thread(shell).await?;
     }
-    let launch = tauri::async_runtime::spawn_blocking(move || device::power_on(&setup)).await??;
+    let stopping = shell.stopping.clone();
+    let launch = tauri::async_runtime::spawn_blocking(move || {
+        after_the_power_offs(&stopping, || device::power_on(&setup))
+    })
+    .await??;
     self::start(shell, launch, speed, start, on_update).await
+}
+
+/// Does `start` once no power-off is under way: an emulator a start replaced, or one powered
+/// off for this start, writes its files and holds their locks until its thread ends, and a lock
+/// held by this process refuses a run as one held by another would (R4). Blocks: never on the
+/// interface's thread.
+fn after_the_power_offs<T>(stopping: &Stopping, start: impl FnOnce() -> T) -> T {
+    stopping.wait();
+    start()
 }
 
 /// Opens a session and replays it as `inkemu replay` does.
@@ -659,6 +718,87 @@ mod tests {
         assert_eq!(shell.power_off(), Ok(()));
     }
 
+    /// H3: a run that holds the SD image a new start asks for is powered off first, as one
+    /// holding its flash file is: the image is locked by the run, and the new one could not
+    /// open it.
+    #[test]
+    fn a_start_on_the_card_the_running_device_holds_powers_that_device_off_first() {
+        // Removed however the test ends.
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let (shell, card) = shell_on_a_card(dir);
+        let on_card = |path: PathBuf| Setup {
+            device: "x4".into(),
+            sd: Some(device::SdSetup {
+                path,
+                read_only: false,
+                create_mib: None,
+            }),
+            ..Setup::default()
+        };
+        assert!(shell.holds_a_file_of(&on_card(card.clone())));
+        // The same file by another spelling of its path is the same card.
+        assert!(shell.holds_a_file_of(&on_card(dir.join(".").join("card.img"))));
+        assert!(!shell.holds_a_file_of(&on_card(dir.join("other.img"))));
+        assert!(!shell.holds_a_file_of(&Setup::default()));
+        assert_eq!(shell.power_off(), Ok(()));
+        assert!(!shell.holds_a_file_of(&on_card(card)));
+    }
+
+    /// A shell whose emulator runs the looping test device with a blank image of 64 MiB in
+    /// `dir` in its slot, as start 1; and the path of that image.
+    fn shell_on_a_card(dir: &std::path::Path) -> (Shell, PathBuf) {
+        let card = dir.join("card.img");
+        std::fs::File::create(&card)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let shell = Shell::default();
+        let (sender, _updates) = mpsc::channel();
+        let running = Emulator::start(
+            host::test_support::looping_device_with_sd(&card),
+            Speed::Fastest,
+            Box::new(move |update| {
+                let _ = sender.send(update);
+            }),
+        )
+        .unwrap();
+        let (kept, _) = shell.keep(1, running);
+        assert!(kept);
+        (shell, card)
+    }
+
+    /// R4: an emulator powering off holds its card until its thread ends, out of the shell's
+    /// sight: a start on that card waits for the power-off, where opening the card at once is
+    /// refused as in use.
+    #[test]
+    fn a_start_waits_for_a_power_off_that_still_holds_its_card() {
+        use host::sd_image::{Access, SdImage, SdImageError};
+        let dir = tempfile::tempdir().unwrap();
+        let (shell, card) = shell_on_a_card(dir.path());
+        let (emulator, under_way) = shell.take().unwrap();
+        assert!(!shell.holds_a_file_of(&Setup {
+            sd: Some(device::SdSetup {
+                path: card.clone(),
+                read_only: false,
+                create_mib: None,
+            }),
+            ..Setup::default()
+        }));
+        let open = || SdImage::open(&card, Access::ReadWrite, &[], &mut Vec::new());
+        assert!(matches!(open(), Err(SdImageError::InUse { .. })));
+        let slow = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let ended = emulator.shutdown();
+            drop(under_way);
+            ended
+        });
+        if let Err(e) = after_the_power_offs(&shell.stopping, open) {
+            panic!("{e}");
+        }
+        assert!(slow.join().unwrap().is_ok());
+    }
+
     /// The first request to close powers off; those that follow only wait for it.
     #[test]
     fn a_second_request_to_close_waits_for_the_first() {
@@ -759,6 +899,8 @@ mod tests {
             "maxTime": max_time,
             "maxCycles": max_cycles,
             "console": "uart0",
+            "usbPower": true,
+            "sd": { "path": "/tmp/card.img", "readOnly": false, "createMib": 1024 },
         }))
         .unwrap()
     }
@@ -770,6 +912,15 @@ mod tests {
         assert_eq!(setup.limits.max_cycles, Some(1000));
         assert_eq!(setup.console, Some(ConsoleChannel::Uart0));
         assert_eq!(setup.firmware, Some(PathBuf::from("/tmp/app.bin")));
+        assert!(setup.usb_power);
+        assert_eq!(
+            setup.sd,
+            Some(SdSetup {
+                path: PathBuf::from("/tmp/card.img"),
+                read_only: false,
+                create_mib: Some(1024),
+            })
+        );
         let none = form(" ", "").into_setup().unwrap();
         assert_eq!(none.limits, Limits::default());
         assert_eq!(form("-1", "").into_setup().unwrap_err().kind, "maxTime");

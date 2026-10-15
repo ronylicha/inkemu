@@ -2,9 +2,10 @@
 //! 2c, §4; ADR 0011).
 //!
 //! A front end shows what a [`PanelSource`] gives and presses what a [`ButtonPort`] offers; it
-//! knows nothing of the chips behind them. Until the display controller and the button ladder are
-//! wired to the machine (sub-project 2d), [`crate::pattern`] implements both with a test pattern,
-//! and [`crate::catalog::ports_for`] is the one place that chooses, per device.
+//! knows nothing of the chips behind them. A wired device (the X4, sub-project 2d) implements
+//! both with its display controller and its board ([`crate::ports_wired`]); a device not wired
+//! yet with a test pattern ([`crate::pattern`]); [`crate::catalog::ports_of`] is the one place
+//! that chooses, per device.
 //!
 //! **Threads.** The ports of a life are made with its machine by a [`Recipe`], on the thread of the
 //! emulator, and die there: they need not be `Send`, so a chip may share an `Rc` with the chip
@@ -62,6 +63,17 @@ pub enum PanelOrigin {
     Device,
 }
 
+/// The greys a panel shows (design of sub-project 2d, 2d-D17).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Shades {
+    /// This many levels, evenly spaced from black to white (2 at least): a test pattern.
+    Levels(u8),
+    /// Any value from 0 (black) to 255 (white): the optics of a controller's model, whose greys
+    /// rounding to a few levels would merge.
+    Continuous,
+}
+
 /// What a panel is, constant for a life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,10 +82,12 @@ pub struct PanelDescription {
     pub width: u32,
     /// Lines, in the controller's native scan order.
     pub height: u32,
-    /// How many grey levels the panel shows, evenly spaced from black to white (2 or 4).
-    pub gray_levels: u8,
+    pub shades: Shades,
     pub rotation: Rotation,
     pub origin: PanelOrigin,
+    /// The image rests on optical or timing parameters nobody measured on a device: an interface
+    /// says so under the panel (2d-D18).
+    pub approximate: bool,
 }
 
 /// How a refresh changed the panel.
@@ -100,13 +114,13 @@ pub struct Region {
 /// What a [`PanelSource`] says a refresh shows, before [`PanelFrame::new`] checks it.
 ///
 /// `pixels` holds `width × height` bytes in native scan order, line after line: 0 is black, 255
-/// white, and every value lies on one of the `gray_levels` evenly spaced levels (four levels: 0,
-/// 85, 170, 255).
+/// white; with [`Shades::Levels`] every value lies on one of the evenly spaced levels (four
+/// levels: 0, 85, 170, 255).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameParts {
     pub width: u32,
     pub height: u32,
-    pub gray_levels: u8,
+    pub shades: Shades,
     /// Strictly increasing from 1 over a life: one per completed refresh.
     pub generation: u64,
     pub refresh: RefreshKind,
@@ -152,14 +166,16 @@ pub struct PanelFrame {
 
 /// The first bytes of an encoded [`PanelFrame`].
 pub const FRAME_MAGIC: [u8; 4] = *b"IKPF";
-/// The version of the encoding that follows [`FRAME_MAGIC`].
-pub const FRAME_VERSION: u8 = 1;
+/// The version of the encoding that follows [`FRAME_MAGIC`]: 2 says continuous shades by a 0 at
+/// byte 6 (design of sub-project 2d, 2d-D17).
+pub const FRAME_VERSION: u8 = 2;
 /// The bytes before the pixels of an encoded frame.
 pub const FRAME_HEADER_LEN: usize = 48;
 
 impl PanelFrame {
     /// Checks `parts`: a panel of at least one pixel, exactly `width × height` pixels, two grey
-    /// levels at least, a generation counted from 1, and a region within the panel, not empty.
+    /// levels at least when they are levels, a generation counted from 1, and a region within the
+    /// panel, not empty.
     ///
     /// # Errors
     /// [`FrameError`] naming the first part that is not consistent.
@@ -176,8 +192,10 @@ impl PanelFrame {
                 len: parts.pixels.len(),
             });
         }
-        if parts.gray_levels < 2 {
-            return Err(FrameError::Levels(parts.gray_levels));
+        if let Shades::Levels(levels) = parts.shades
+            && levels < 2
+        {
+            return Err(FrameError::Levels(levels));
         }
         if parts.generation == 0 {
             return Err(FrameError::Generation);
@@ -213,8 +231,8 @@ impl PanelFrame {
     }
 
     #[must_use]
-    pub const fn gray_levels(&self) -> u8 {
-        self.parts.gray_levels
+    pub const fn shades(&self) -> Shades {
+        self.parts.shades
     }
 
     /// Strictly increasing from 1 over a life: one per completed refresh.
@@ -263,7 +281,7 @@ impl PanelFrame {
     /// | 0 | 4 | [`FRAME_MAGIC`] |
     /// | 4 | 1 | [`FRAME_VERSION`] |
     /// | 5 | 1 | refresh: 0 full, 1 partial |
-    /// | 6 | 1 | grey levels |
+    /// | 6 | 1 | grey levels, 0 for continuous shades |
     /// | 7 | 1 | 1 when a region follows, else 0 |
     /// | 8 | 4 | width |
     /// | 12 | 4 | height |
@@ -280,7 +298,10 @@ impl PanelFrame {
             RefreshKind::Full => 0,
             RefreshKind::Partial => 1,
         });
-        bytes.push(parts.gray_levels);
+        bytes.push(match parts.shades {
+            Shades::Levels(levels) => levels,
+            Shades::Continuous => 0,
+        });
         bytes.push(u8::from(parts.region.is_some()));
         bytes.extend_from_slice(&parts.width.to_le_bytes());
         bytes.extend_from_slice(&parts.height.to_le_bytes());
@@ -325,12 +346,12 @@ pub enum Edge {
 }
 
 /// One button of a device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ButtonSpec {
-    /// A stable name: `power`, `back`, `confirm`, `left`, `right`, `up`, `down`, … An interface
-    /// uses it as the key of its label.
-    pub id: &'static str,
+    /// A stable name, the profile's: `power`, `back`, `confirm`, `left`, `right`, `up`, `down`,
+    /// … An interface uses it as the key of its label.
+    pub id: String,
     pub edge: Edge,
     /// The place of the button along its edge, from left to right or from top to bottom.
     pub order: u8,
@@ -341,12 +362,9 @@ pub struct ButtonSpec {
 pub enum ButtonError {
     #[error("the device has no button named `{id}`")]
     Unknown { id: String },
-    /// A button that reaches the firmware cannot enter a session before its format holds buttons
-    /// (format 2, sub-project 2d): pressing it would make the session replay something else.
-    #[error(
-        "the button `{id}` reaches the firmware and a session cannot hold it yet: stop recording to press it"
-    )]
-    NotInSession { id: String },
+    /// The machine refused the input of the board (the device is off, too many inputs wait).
+    #[error("the button `{id}` cannot be pressed now: {detail}")]
+    Refused { id: String, detail: String },
     /// A replay takes no input: it gives back what the session recorded.
     #[error("a replay takes no input")]
     Replaying,
@@ -357,15 +375,16 @@ pub trait ButtonPort {
     /// The buttons, in a fixed order.
     fn buttons(&self) -> &[ButtonSpec];
 
-    /// Whether pressing a button changes what the firmware sees. A port that does must journal
-    /// its inputs in the machine; until sessions hold buttons, the engine refuses them while it
-    /// records ([`ButtonError::NotInSession`]).
+    /// Whether pressing a button changes what the firmware sees. A port that does gives the
+    /// machine a board input ([`Esp32C3::send_board_input`]), which its journal keeps: a session
+    /// holds it (format 2, design of sub-project 2d, 2d-D19).
     fn reaches_firmware(&self) -> bool;
 
     /// Presses (`pressed`) or releases the button `id` at the present instant of `machine`.
     ///
     /// # Errors
-    /// [`ButtonError::Unknown`] for a name not in [`ButtonPort::buttons`].
+    /// [`ButtonError::Unknown`] for a name not in [`ButtonPort::buttons`],
+    /// [`ButtonError::Refused`] when the machine refuses the input.
     fn set(&mut self, machine: &mut Esp32C3, id: &str, pressed: bool) -> Result<(), ButtonError>;
 }
 
@@ -374,6 +393,9 @@ pub struct Life {
     pub machine: Esp32C3,
     pub panel: Box<dyn PanelSource>,
     pub buttons: Box<dyn ButtonPort>,
+    /// The SD card slot of the device, from which the card is taken back when the life ends;
+    /// `None` for a device without one.
+    pub sd: Option<boards::SdHandle>,
 }
 
 impl std::fmt::Debug for Life {
@@ -388,9 +410,10 @@ impl std::fmt::Debug for Life {
 /// Why a life could not begin.
 #[derive(Debug, thiserror::Error)]
 pub enum PowerOnError {
-    /// The flash content is longer than the flash of the device.
+    /// The device cannot be powered on with its wiring: a flash content longer than its flash, a
+    /// card its slot cannot take, an option it has no line for.
     #[error("{0}")]
-    Flash(#[from] soc_esp32c3::FlashImageError),
+    Device(#[from] boards::WiredError),
     /// A session cannot be replayed on this ROM or this device; the message says why and what to
     /// do.
     #[error("{0}")]
@@ -399,12 +422,34 @@ pub enum PowerOnError {
 
 /// How the emulator powers a device on, on its own thread: given once, used at every power-on.
 pub trait Recipe: Send {
-    /// A machine in its power-on state with `flash` from offset 0 (`None`: erased), and its ports.
-    /// `recorded`: the life is recorded, and the machine keeps the trace hash a session holds.
+    /// A machine in its power-on state with `flash` from offset 0 (`None`: erased), `sd` the
+    /// card in its slot (`None`: empty), and its ports. `recorded`: the life is recorded, and the
+    /// machine keeps the trace hash a session holds.
     ///
     /// # Errors
-    /// [`PowerOnError`] when the flash content does not fit the device.
-    fn power_on(&mut self, flash: Option<Vec<u8>>, recorded: bool) -> Result<Life, PowerOnError>;
+    /// [`PowerOnError`] when the flash content or the card does not fit the device.
+    fn power_on(
+        &mut self,
+        flash: Option<Vec<u8>>,
+        recorded: bool,
+        sd: Option<boards::SdStart>,
+    ) -> Result<Life, PowerOnError>;
+
+    /// [`Recipe::power_on`] for a power-on by the user's own press of the power key (H4): the
+    /// device gets no power-on gesture, since the caller presses the key at power-on and the
+    /// user's release ends the hold, as on the device. A device without a gesture powers on as
+    /// [`Recipe::power_on`] does.
+    ///
+    /// # Errors
+    /// Those of [`Recipe::power_on`].
+    fn power_on_by_key(
+        &mut self,
+        flash: Option<Vec<u8>>,
+        recorded: bool,
+        sd: Option<boards::SdStart>,
+    ) -> Result<Life, PowerOnError> {
+        self.power_on(flash, recorded, sd)
+    }
 }
 
 #[cfg(test)]
@@ -443,7 +488,7 @@ mod tests {
         let frame = PanelFrame::new(FrameParts {
             width: 3,
             height: 2,
-            gray_levels: 4,
+            shades: Shades::Levels(4),
             generation: 0x0102_0304_0506_0708,
             refresh: RefreshKind::Partial,
             region: Some(Region {
@@ -459,7 +504,7 @@ mod tests {
         let bytes = frame.encode();
         assert_eq!(bytes.len(), FRAME_HEADER_LEN + 6);
         assert_eq!(&bytes[..4], b"IKPF");
-        assert_eq!(bytes[4..8], [1, 1, 4, 1]);
+        assert_eq!(bytes[4..8], [2, 1, 4, 1]);
         assert_eq!(bytes[8..12], 3u32.to_le_bytes());
         assert_eq!(bytes[12..16], 2u32.to_le_bytes());
         assert_eq!(bytes[16..24], 0x0102_0304_0506_0708u64.to_le_bytes());
@@ -475,7 +520,7 @@ mod tests {
         let frame = PanelFrame::new(FrameParts {
             width: 1,
             height: 1,
-            gray_levels: 2,
+            shades: Shades::Levels(2),
             generation: 1,
             refresh: RefreshKind::Full,
             region: None,
@@ -489,6 +534,27 @@ mod tests {
         assert_eq!(bytes[32..48], [0; 16]);
     }
 
+    /// 2d-D17: the greys of a controller's optics are any byte, which version 2 says by a 0 for
+    /// the levels; the pixels go as they are.
+    #[test]
+    fn a_frame_of_continuous_shades_encodes_0_levels_and_its_bytes_as_they_are() {
+        let frame = PanelFrame::new(FrameParts {
+            width: 2,
+            height: 1,
+            shades: Shades::Continuous,
+            generation: 3,
+            refresh: RefreshKind::Full,
+            region: None,
+            duration_nanos: None,
+            pixels: Arc::from([153u8, 128].as_slice()),
+        })
+        .unwrap();
+        assert_eq!(frame.shades(), Shades::Continuous);
+        let bytes = frame.encode();
+        assert_eq!(bytes[4..7], [2, 0, 0]);
+        assert_eq!(&bytes[48..], [153, 128]);
+    }
+
     /// Parts that are not an image are refused, each for its first fault: an interface never
     /// receives a frame whose pixels do not fill its sides.
     #[test]
@@ -496,7 +562,7 @@ mod tests {
         let good = FrameParts {
             width: 3,
             height: 2,
-            gray_levels: 2,
+            shades: Shades::Levels(2),
             generation: 1,
             refresh: RefreshKind::Partial,
             region: Some(Region {
@@ -529,7 +595,10 @@ mod tests {
                 len: 5
             }
         );
-        assert_eq!(refused(|p| p.gray_levels = 1), FrameError::Levels(1));
+        assert_eq!(
+            refused(|p| p.shades = Shades::Levels(1)),
+            FrameError::Levels(1)
+        );
         assert_eq!(refused(|p| p.generation = 0), FrameError::Generation);
         for region in [
             Region {

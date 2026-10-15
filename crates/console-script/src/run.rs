@@ -13,17 +13,31 @@
 //! sum is rounded up to a cycle of the time base once: a hundred and sixty `wait 1ns` are 160 ns,
 //! 26 cycles, as one `wait 160ns` is. A step is never dated before the one before it.
 use crate::parse::{Action, Script, Step};
-use emu_core::Cycles;
+use emu_core::{BoardInput, Cycles};
 use soc_esp32c3::clock::TIME_BASE;
 use soc_esp32c3::{ConsoleChannel, Esp32C3, InputError};
 
-/// An input the machine refused, and the line of the step that gave it.
+/// A step refused, and the line it was written on.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("console script, line {line}: {source}")]
 pub struct RunError {
     pub line: usize,
     #[source]
-    pub source: InputError,
+    pub source: Refusal,
+}
+
+/// Why a step of a script cannot be given to the device.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    /// The machine refused the input.
+    #[error(transparent)]
+    Input(#[from] InputError),
+    /// The device has no button of that id: nothing of the script is handed over.
+    #[error(
+        "the device has no button `{button}`; {}",
+        if known.is_empty() { "it has no button at all".to_owned() } else { format!("name one of: {}", known.join(", ")) }
+    )]
+    UnknownButton { button: String, known: Vec<String> },
 }
 
 /// How far a script got.
@@ -58,6 +72,8 @@ pub struct ScriptRun {
     /// The channels the script still watches, each with the index of the last `wait-for` that
     /// names it: a channel no `wait-for` to come names goes back to its pace.
     watched: Vec<(ConsoleChannel, usize)>,
+    /// The buttons of the device, in the order of their targets on its board.
+    buttons: Vec<String>,
 }
 
 impl ScriptRun {
@@ -71,6 +87,34 @@ impl ScriptRun {
     /// 114 years of device time is refused ([`InputError::BeyondTheLine`]). The machine then
     /// watches no channel for the script: the steps before the refused one stay handed over.
     pub fn start(script: &Script, machine: &mut Esp32C3) -> Result<ScriptRun, RunError> {
+        Self::start_on_board(script, machine, &[])
+    }
+
+    /// As [`ScriptRun::start`], on a device whose board has `buttons`, in the order of their
+    /// targets (`boards::ButtonsHandle::buttons`): a `press` or a `release` is the input of the
+    /// board that presses or lets go of that button (ADR 0013).
+    ///
+    /// # Errors
+    /// [`Refusal::UnknownButton`] for a step that names a button the device does not have,
+    /// before anything is handed over; then as [`ScriptRun::start`].
+    pub fn start_on_board(
+        script: &Script,
+        machine: &mut Esp32C3,
+        buttons: &[String],
+    ) -> Result<ScriptRun, RunError> {
+        for step in script.steps() {
+            if let Action::Press { button } | Action::Release { button } = &step.action
+                && !buttons.contains(button)
+            {
+                return Err(RunError {
+                    line: step.line,
+                    source: Refusal::UnknownButton {
+                        button: button.clone(),
+                        known: buttons.to_vec(),
+                    },
+                });
+            }
+        }
         let mut watched: Vec<(ConsoleChannel, usize)> = Vec::new();
         for (index, step) in script.steps().iter().enumerate() {
             if let Action::WaitFor { channel, .. } = step.action {
@@ -90,6 +134,7 @@ impl ScriptRun {
             seen: Vec::new(),
             last_dated: None,
             watched,
+            buttons: buttons.to_vec(),
         };
         // A refused step hands back no run to stop: the channels watched above are let go here.
         if let Err(error) = run.advance(machine) {
@@ -192,15 +237,31 @@ impl ScriptRun {
     fn advance(&mut self, machine: &mut Esp32C3) -> Result<(), RunError> {
         while let Some(step) = self.steps.get(self.next) {
             let at = self.step_time();
-            let refused = |source| RunError {
+            let refused = |source: InputError| RunError {
                 line: step.line,
-                source,
+                source: source.into(),
+            };
+            let board = |button: &String, pressed: bool| BoardInput {
+                // Checked at the start: every button a step names is one of the board's.
+                target: self
+                    .buttons
+                    .iter()
+                    .position(|known| known == button)
+                    .and_then(|target| u16::try_from(target).ok())
+                    .unwrap_or(u16::MAX),
+                value: u32::from(pressed),
             };
             match &step.action {
                 Action::Send { channel, bytes } => {
                     machine.send_console(*channel, at, bytes).map_err(refused)?;
                 }
                 Action::UsbHost(state) => machine.set_usb_host(at, *state).map_err(refused)?,
+                Action::Press { button } => machine
+                    .send_board_input(at, board(button, true))
+                    .map_err(refused)?,
+                Action::Release { button } => machine
+                    .send_board_input(at, board(button, false))
+                    .map_err(refused)?,
                 Action::Wait { nanos } => {
                     self.waited = self.waited.saturating_add(u128::from(*nanos));
                 }
@@ -293,7 +354,10 @@ mod tests {
             uart0.extend(&taken[0].1);
             run.observe(machine, &taken).unwrap();
             match stop {
-                StopReason::TimeBudget | StopReason::Idle | StopReason::DeepSleep => break,
+                StopReason::TimeBudget
+                | StopReason::Idle
+                | StopReason::DeepSleep
+                | StopReason::PowerOff => break,
                 StopReason::CycleBudget | StopReason::Asleep | StopReason::ConsoleOutput => {}
                 StopReason::StrictMmio(diagnostic) => panic!("{diagnostic}"),
             }
@@ -576,7 +640,73 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.line, 4);
-        assert!(matches!(error.source, InputError::BeyondTheLine { .. }));
+        assert!(matches!(
+            error.source,
+            Refusal::Input(InputError::BeyondTheLine { .. })
+        ));
+    }
+
+    /// A board of three buttons: target 1, `confirm`, holds what it was last given.
+    #[derive(Debug, Default)]
+    struct Keys {
+        applied: Vec<(BoardInput, u64)>,
+    }
+
+    impl emu_core::BoardInputs for Keys {
+        fn check(&self, _input: BoardInput) -> Result<(), emu_core::BoardInputError> {
+            Ok(())
+        }
+        fn apply(&mut self, input: BoardInput, at: emu_core::Nanos) {
+            self.applied.push((input, at.get()));
+        }
+    }
+
+    #[test]
+    fn press_and_release_are_inputs_of_the_board_at_the_time_of_their_step() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let keys = Rc::new(RefCell::new(Keys::default()));
+        let mut m = machine(&[HANG]);
+        m.attach_board_inputs(Box::new(Rc::clone(&keys)));
+        let buttons: Vec<String> = ["power", "confirm", "back"].map(str::to_owned).to_vec();
+        let run = ScriptRun::start_on_board(
+            &script("press confirm\nwait 1ms\nrelease confirm\npress back\n"),
+            &mut m,
+            &buttons,
+        )
+        .unwrap();
+        m.run_within(Cycles(u64::MAX), Some(2_000_000));
+        assert_eq!(run.status(m.device_time()), ScriptStatus::Complete);
+        let input = |target, value| BoardInput { target, value };
+        assert_eq!(
+            keys.borrow().applied,
+            [
+                (input(1, 1), 6),
+                (input(1, 0), 1_000_006),
+                (input(2, 1), 1_000_006)
+            ],
+            "each acts one cycle of the time base after its date"
+        );
+    }
+
+    #[test]
+    fn a_button_the_device_does_not_have_refuses_the_script_before_anything_is_handed_over() {
+        let mut m = machine(&[HANG]);
+        let buttons = vec!["power".to_owned()];
+        let error =
+            ScriptRun::start_on_board(&script("send uart0 \"a\"\npress menu\n"), &mut m, &buttons)
+                .unwrap_err();
+        assert_eq!(error.line, 3);
+        assert_eq!(
+            error.to_string(),
+            "console script, line 3: the device has no button `menu`; name one of: power"
+        );
+        assert_eq!(m.input_pending(ConsoleChannel::Uart0), 0, "nothing sent");
+        let bare = ScriptRun::start(&script("release power\n"), &mut m).unwrap_err();
+        assert!(
+            bare.to_string().ends_with("it has no button at all"),
+            "{bare}"
+        );
     }
 
     #[test]
@@ -592,7 +722,10 @@ mod tests {
             &mut m,
         )
         .unwrap_err();
-        assert!(matches!(error.source, InputError::BeyondTheLine { .. }));
+        assert!(matches!(
+            error.source,
+            Refusal::Input(InputError::BeyondTheLine { .. })
+        ));
         assert_ne!(m.run_until(Cycles(1_000_000)), StopReason::ConsoleOutput);
         assert_eq!(m.take_console(ConsoleChannel::Uart0), b"abc");
     }
@@ -712,6 +845,7 @@ mod tests {
             seen: Vec::new(),
             last_dated: None,
             watched: Vec::new(),
+            buttons: Vec::new(),
         };
         let error = run.advance(&mut m).unwrap_err();
         assert_eq!(error.line, 2);

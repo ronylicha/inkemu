@@ -12,6 +12,10 @@
 //! - [`Clocked`]: the chip does work of its own over time (a display refresh) and is advanced to
 //!   the instants it names, whatever the `SoC` is doing meanwhile.
 //!
+//! Two more say what the board around the chips does (ADR 0013): [`BoardInputs`], the elements a
+//! user acts on, whose inputs the `SoC` dates, journals and applies; [`Supply`], whether the `SoC`
+//! has power.
+//!
 //! The `SoC` calls them; a chip never calls the `SoC`. Time is device time in nanoseconds since
 //! power-on ([`Nanos`]), not cycles of a clock of the `SoC`: a chip counts its own durations (a
 //! refresh, a reset pulse) in real time. A chip whose lines depend only on its state and on that
@@ -162,6 +166,52 @@ pub trait Clocked: std::fmt::Debug {
     fn advance(&mut self, at: Nanos);
 }
 
+/// An input of the user to the board (a key pressed, a cable plugged in), as the `SoC` receives,
+/// dates and journals it: a target the board numbers and a value the board interprets. The `SoC`
+/// learns nothing else of it (ADR 0013).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BoardInput {
+    /// What the input acts on, numbered by the board (a key, the power cable).
+    pub target: u16,
+    /// What it does there (for a key: 1 pressed, 0 released).
+    pub value: u32,
+}
+
+/// Why a board refuses an input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BoardInputError {
+    #[error("the board has no input numbered {target}")]
+    UnknownTarget { target: u16 },
+    #[error("input {target} of the board takes no value {value}")]
+    Value { target: u16, value: u32 },
+}
+
+/// The inputs of a board: the elements a user acts on (keys, a cable), which change what chips
+/// attached to the `SoC` drive.
+///
+/// The `SoC` asks [`BoardInputs::check`] when it accepts an input, and calls
+/// [`BoardInputs::apply`] at the input's date, before it works its pads out again: a front end that
+/// presses a key now and a replay that hands every input over at power-on are the same run.
+pub trait BoardInputs: std::fmt::Debug {
+    /// Whether the board takes `input`.
+    ///
+    /// # Errors
+    /// [`BoardInputError`] when it names no element of the board or a value the element cannot
+    /// take.
+    fn check(&self, input: BoardInput) -> Result<(), BoardInputError>;
+
+    /// Applies `input`, which [`BoardInputs::check`] accepted, at device time `at`.
+    fn apply(&mut self, input: BoardInput, at: Nanos);
+}
+
+/// The power supply of a board: whether the `SoC` has power. The `SoC` asks after each change of
+/// what it drives on a pin, after each board input it applies and at power-on; once the answer is
+/// `false` the `SoC` stops for good at that instant (ADR 0013).
+pub trait Supply: std::fmt::Debug {
+    /// Whether the `SoC` has power at `at`.
+    fn powered(&mut self, at: Nanos) -> bool;
+}
+
 impl<T: GpioInput + ?Sized> GpioInput for Rc<RefCell<T>> {
     fn level(&mut self, at: Nanos) -> Option<Level> {
         self.borrow_mut().level(at)
@@ -201,6 +251,22 @@ impl<T: Clocked + ?Sized> Clocked for Rc<RefCell<T>> {
 
     fn advance(&mut self, at: Nanos) {
         self.borrow_mut().advance(at);
+    }
+}
+
+impl<T: BoardInputs + ?Sized> BoardInputs for Rc<RefCell<T>> {
+    fn check(&self, input: BoardInput) -> Result<(), BoardInputError> {
+        self.borrow().check(input)
+    }
+
+    fn apply(&mut self, input: BoardInput, at: Nanos) {
+        self.borrow_mut().apply(input, at);
+    }
+}
+
+impl<T: Supply + ?Sized> Supply for Rc<RefCell<T>> {
+    fn powered(&mut self, at: Nanos) -> bool {
+        self.borrow_mut().powered(at)
     }
 }
 
@@ -301,5 +367,66 @@ mod tests {
                 "advance 16",
             ]
         );
+    }
+
+    /// A board with one key (target 0, values 0 and 1) and a supply that follows it.
+    #[derive(Debug, Default)]
+    struct OneKey {
+        pressed: bool,
+        applied: Vec<(BoardInput, Nanos)>,
+    }
+
+    impl BoardInputs for OneKey {
+        fn check(&self, input: BoardInput) -> Result<(), BoardInputError> {
+            match input {
+                BoardInput { target: 0, value } if value <= 1 => Ok(()),
+                BoardInput { target: 0, value } => Err(BoardInputError::Value { target: 0, value }),
+                BoardInput { target, .. } => Err(BoardInputError::UnknownTarget { target }),
+            }
+        }
+
+        fn apply(&mut self, input: BoardInput, at: Nanos) {
+            self.pressed = input.value == 1;
+            self.applied.push((input, at));
+        }
+    }
+
+    impl Supply for OneKey {
+        fn powered(&mut self, _at: Nanos) -> bool {
+            self.pressed
+        }
+    }
+
+    #[test]
+    fn a_shared_board_takes_its_inputs_and_answers_for_its_supply() {
+        let board = Rc::new(RefCell::new(OneKey::default()));
+        let mut inputs: Box<dyn BoardInputs> = Box::new(Rc::clone(&board));
+        let mut supply: Box<dyn Supply> = Box::new(Rc::clone(&board));
+        let press = BoardInput {
+            target: 0,
+            value: 1,
+        };
+        assert_eq!(inputs.check(press), Ok(()));
+        assert_eq!(
+            inputs.check(BoardInput {
+                target: 3,
+                value: 1
+            }),
+            Err(BoardInputError::UnknownTarget { target: 3 })
+        );
+        assert_eq!(
+            inputs
+                .check(BoardInput {
+                    target: 0,
+                    value: 2
+                })
+                .unwrap_err()
+                .to_string(),
+            "input 0 of the board takes no value 2"
+        );
+        assert!(!supply.powered(Nanos(0)));
+        inputs.apply(press, Nanos(9));
+        assert!(supply.powered(Nanos(9)));
+        assert_eq!(board.borrow().applied, [(press, Nanos(9))]);
     }
 }

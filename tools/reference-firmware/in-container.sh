@@ -112,7 +112,8 @@ symbols nvs_rw_value_cxx
 # life finds the core dump the panic wrote; deep_sleep_timer counts its lives in RTC memory through
 # three deep sleeps on the RTC timer and a fourth with no wake source; soc_signals drives GPIO,
 # GP-SPI2, the SAR ADC and I2C0 through the ESP-IDF drivers on the pins of the X4, for a test that
-# attaches chips to them. Before it, coremark_example is Espressif's CoreMark example and
+# attaches chips to them; x4_panel_buttons uses the wired board of the X4 as a firmware does (its
+# latch, its panel, its ladders and its power key), for the tests of the wired X4. Before them, coremark_example is Espressif's CoreMark example and
 # component, copied unmodified into this directory (coremark_example/PROVENANCE.md): the build has no
 # network and no component manager. Its copied files are checked first, against their pinned hashes;
 # the CoreMark run rules ask for the benchmark's files unmodified. The directory must hold exactly
@@ -143,7 +144,8 @@ for project in \
   "/ref/adc_wait_panic:SHA256SUMS.inputs-adc-wait-panic" \
   "/ref/deep_sleep_timer:SHA256SUMS.inputs-deep-sleep-timer" \
   "/ref/coremark_example:SHA256SUMS.inputs-coremark" \
-  "/ref/soc_signals:SHA256SUMS.inputs-soc-signals"; do
+  "/ref/soc_signals:SHA256SUMS.inputs-soc-signals" \
+  "/ref/x4_panel_buttons:SHA256SUMS.inputs-x4-panel-buttons"; do
   source="${project%%:*}"
   name="$(basename "$source")"
   build_example "$source" "/ref/${project##*:}"

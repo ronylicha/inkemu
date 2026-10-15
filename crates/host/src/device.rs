@@ -11,7 +11,7 @@
 //! **Lives.** A reset is a new power-on with the flash where the last life left it, as the reset
 //! button of a device does. Every life ends the same way: the flash file is written and read
 //! again for the next life, a recorded session is written, a replay gives its verdict.
-use crate::catalog::{self, Look, ProfileRecipe};
+use crate::catalog::{self, BoardStart, Look, ProfileRecipe};
 use crate::engine::{
     Engine, EngineError, Halt, Level, Limits, MachineStatus, Mode, Notice, Output, State,
 };
@@ -21,6 +21,8 @@ use crate::ports::{Life, PanelFrame, PowerOnError, Recipe, RefreshKind};
 use crate::record::{self, Recorder, Verdict};
 use crate::rom_store::{self, RomStoreError};
 use crate::run::RunEnd;
+use crate::sd_image::{Access, SdImage};
+use crate::sd_run::{self, CardKeeper};
 use crate::session_file::{self, Claimed, SessionFileError};
 use crate::term::sanitize;
 use boards::{DeviceProfile, MachineOptions, ProfileError};
@@ -109,12 +111,28 @@ pub struct Setup {
     pub rom_dir: Option<PathBuf>,
     /// The USB host at every power-on.
     pub usb_host: UsbHost,
+    /// A cable powers the device at every power-on (`--usb-power`, 2d-D14).
+    pub usb_power: bool,
+    /// The SD card in the slot (`--sd-image`, design of sub-project 2e, §8).
+    pub sd: Option<SdSetup>,
     pub strict_mmio: bool,
     /// Record the first life into this file (`--record`).
     pub record: Option<PathBuf>,
     pub limits: Limits,
     /// The console to show first; the profile's otherwise.
     pub console: Option<ConsoleChannel>,
+}
+
+/// The SD card a run starts with: an image, existing or made blank first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SdSetup {
+    /// The image file.
+    pub path: PathBuf,
+    /// The card is write-protected: the image is never written.
+    pub read_only: bool,
+    /// Make a blank FAT32 image of this many MiB at `path` first (`inkemu sd create`); an
+    /// existing file is never replaced.
+    pub create_mib: Option<u64>,
 }
 
 /// Why a run or a replay could not start. The messages are those of the command line; the
@@ -137,13 +155,27 @@ pub enum LaunchError {
     Replay(String),
     #[error("{0}")]
     PowerOn(#[from] PowerOnError),
+    /// The SD image cannot be made, opened or recorded.
+    #[error("{0}")]
+    SdImage(String),
+    /// The setup asks the board for a line the device has not: a card, the cable (H6).
+    #[error("{0}")]
+    Board(#[from] boards::WiredError),
+    /// `refusal`, after which the blank SD image the start made could not be removed: `notice`
+    /// gives its path, why, and that the user may delete it (R2).
+    #[error("{refusal}\n{notice}")]
+    BlankImageLeft {
+        refusal: Box<LaunchError>,
+        notice: String,
+    },
 }
 
 impl LaunchError {
-    /// A stable name of what was refused.
+    /// A stable name of what was refused: that of the refusal, whatever it left behind.
     #[must_use]
-    pub const fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
+            LaunchError::BlankImageLeft { refusal, .. } => refusal.kind(),
             LaunchError::Profile(_) => "profile",
             LaunchError::RecordPath(_) => "recordPath",
             LaunchError::FlashFile(_) => "flashFile",
@@ -153,6 +185,8 @@ impl LaunchError {
             LaunchError::Session(_) => "session",
             LaunchError::Replay(_) => "replay",
             LaunchError::PowerOn(_) => "powerOn",
+            LaunchError::SdImage(_) => "sdImage",
+            LaunchError::Board(_) => "board",
         }
     }
 }
@@ -169,6 +203,17 @@ struct RunPaths {
 }
 
 impl RunPaths {
+    /// The paths of `setup`.
+    fn of(setup: &Setup) -> RunPaths {
+        RunPaths {
+            device: setup.device.clone(),
+            image: setup.image.clone(),
+            firmware: setup.firmware.clone(),
+            bootloader: setup.bootloader.clone(),
+            rom_dir: setup.rom_dir.clone(),
+        }
+    }
+
     /// The request of the run, whose flash file is `file`.
     fn request<'a>(&'a self, file: Option<&'a Path>) -> FlashRequest<'a> {
         FlashRequest {
@@ -329,6 +374,15 @@ impl FlashKeeper {
 enum Plan {
     Run {
         flash: FlashKeeper,
+        /// The SD image of the run, locked while it lives: each life reads its card from it, and
+        /// what a life changed is written to it when the life ends.
+        sd: Option<SdImage>,
+        /// The card as the session of the first life keeps it, read at the start of a recorded
+        /// run (N1), taken by the first life that is recorded.
+        first_card: Option<session::SdCardStart>,
+        /// The button that powers the device on: pressed once the device turned itself off, it
+        /// powers a new life on with the flash where the last one left it (2d-D14).
+        power_key: Option<String>,
         /// The recording of the first life, then of the life a record command asks for.
         record: Option<PathBuf>,
         recording: Option<Recording>,
@@ -354,6 +408,21 @@ pub struct Launch {
     /// The console to show first, and the name of the device.
     pub console: ConsoleChannel,
     pub device_name: String,
+    /// Faults the tests inject on the thread, where nothing else can make it fail there.
+    #[cfg(test)]
+    faults: Faults,
+}
+
+/// Faults the tests inject on the thread of a run.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Faults {
+    /// Panic at the end of a life, once its engine is finished and before its card is
+    /// committed: what a fault of the recorder or of the flash file would do there.
+    panic_after_finish: bool,
+    /// The card of every life from this one on cannot be read from its image: what an image
+    /// whose last save cannot be finished does.
+    card_refused_from_life: Option<u32>,
 }
 
 impl std::fmt::Debug for Launch {
@@ -389,6 +458,9 @@ impl Launch {
             recipe,
             plan: Plan::Run {
                 flash,
+                sd: None,
+                first_card: None,
+                power_key: None,
                 record: None,
                 recording,
                 paths,
@@ -398,7 +470,19 @@ impl Launch {
             look,
             console: ConsoleChannel::Uart0,
             device_name: String::new(),
+            #[cfg(test)]
+            faults: Faults::default(),
         }
+    }
+
+    /// The run, whose device the button `key` powers on again once it turned itself off
+    /// ([`power_on`] names the power key of the profile).
+    #[must_use]
+    pub fn powered_on_by(mut self, key: &str) -> Launch {
+        if let Plan::Run { power_key, .. } = &mut self.plan {
+            *power_key = Some(key.to_owned());
+        }
+        self
     }
 
     /// The replay of `session`, named `name`, whose machine `recipe` builds.
@@ -415,8 +499,187 @@ impl Launch {
             look,
             console: ConsoleChannel::Uart0,
             device_name: String::new(),
+            #[cfg(test)]
+            faults: Faults::default(),
         }
     }
+
+    /// The run with `image` in the slot of its device, as [`power_on`] opens it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_sd(mut self, image: SdImage) -> Launch {
+        if let Plan::Run { sd, .. } = &mut self.plan {
+            *sd = Some(image);
+        }
+        self
+    }
+}
+
+/// The SD image a start opened. A blank image the start made is removed when the start is refused
+/// before the run holds it ([`OpenedSd::refused`]), and only that one: an image the user gave is
+/// never removed; one that cannot be removed is said with the refusal (R2).
+#[derive(Default)]
+struct OpenedSd {
+    image: Option<SdImage>,
+    /// The path of the blank image this start made, until the run holds it.
+    made: Option<PathBuf>,
+    /// The card as the session of a recorded start keeps it, read at the start (N1).
+    recorded: Option<session::SdCardStart>,
+}
+
+impl OpenedSd {
+    /// The image and the card as the first life's session keeps it, for the run that holds
+    /// them from now on: nothing is removed.
+    fn into_parts(self) -> (Option<SdImage>, Option<session::SdCardStart>) {
+        (self.image, self.recorded)
+    }
+
+    /// `refusal`, the refusal of the start, once the image is closed and the blank image the
+    /// start made removed. A removal that fails is said with the refusal, by the path of the
+    /// image and its cause: the user may delete it.
+    fn refused(self, refusal: LaunchError) -> LaunchError {
+        // Closed and unlocked first: a file still open cannot be removed on every system.
+        drop(self.image);
+        let Some(path) = self.made else {
+            return refusal;
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => refusal,
+            Err(e) => LaunchError::BlankImageLeft {
+                refusal: Box::new(refusal),
+                notice: format!(
+                    "warning: the blank SD image {} this start made could not be removed: {}; nothing of yours is in it, so you may delete it",
+                    sanitize(&path.display().to_string()),
+                    sanitize(&e.to_string())
+                ),
+            },
+        }
+    }
+}
+
+/// The last steps of a start: the SD image of `setup` opened ([`open_sd`]), then the flash file
+/// of the run accepted. A blank image this start made is removed when either refuses the run.
+/// Gives the image, and the card as the first life's session keeps it for a recorded start.
+fn open_the_card_and_accept_the_flash(
+    setup: &Setup,
+    flash: &FlashRequest<'_>,
+    rom: (Option<&Path>, &rom_store::RomEntry),
+    run_flash: Option<&RunFlash>,
+    log: &mut Vec<u8>,
+) -> Result<(Option<SdImage>, Option<session::SdCardStart>), LaunchError> {
+    let opened = open_sd(setup, flash, rom, log)?;
+    if let Some(run_flash) = run_flash
+        && let Err(e) = run_flash.accept(log)
+    {
+        return Err(opened.refused(e.into()));
+    }
+    Ok(opened.into_parts())
+}
+
+/// The files of the run the SD image of `setup` may not be, nor have its journals among: its
+/// inputs, its flash file and the files beside it, its ROM file, the session it records.
+fn sd_claims(
+    setup: &Setup,
+    flash: &FlashRequest<'_>,
+    rom: (Option<&Path>, &rom_store::RomEntry),
+) -> Vec<Claimed> {
+    let mut claimed = launch::claimed_paths(flash, None, Some(rom));
+    claimed.extend(setup.record.iter().map(|record| Claimed::File {
+        path: record.clone(),
+        what: "the session the run records".to_owned(),
+    }));
+    claimed
+}
+
+/// Refuses an SD image that is a file of the run, or has its journals among them, before the ROM
+/// is read, as `inkemu run` refuses it; the image itself is opened last (R3).
+fn refuse_an_sd_image_of_the_run(
+    setup: &Setup,
+    flash: &FlashRequest<'_>,
+    rom: (Option<&Path>, &rom_store::RomEntry),
+) -> Result<(), LaunchError> {
+    let Some(sd) = &setup.sd else {
+        return Ok(());
+    };
+    SdImage::refuse_the_files_of_the_run(&sd.path, &sd_claims(setup, flash, rom))
+        .map(drop)
+        .map_err(|e| LaunchError::SdImage(e.to_string()))
+}
+
+/// The SD image of `setup`, made blank first when asked, then opened and locked: it may be none
+/// of the other files of the run (`flash`, the ROM of `rom`, the session), nor have its journals
+/// among them (design of sub-project 2e, §8). A blank image it made and could not open is removed.
+fn open_sd(
+    setup: &Setup,
+    flash: &FlashRequest<'_>,
+    rom: (Option<&Path>, &rom_store::RomEntry),
+    log: &mut Vec<u8>,
+) -> Result<OpenedSd, LaunchError> {
+    let mut opened = OpenedSd::default();
+    let Some(sd) = &setup.sd else {
+        return Ok(opened);
+    };
+    let claimed = sd_claims(setup, flash, rom);
+    if let Some(mib) = sd.create_mib {
+        crate::sd_format::create_blank(
+            &sd.path,
+            mib,
+            crate::sd_format::DEFAULT_LABEL,
+            &claimed,
+            log,
+        )
+        .map_err(|e| LaunchError::SdImage(e.to_string()))?;
+        opened.made = Some(sd.path.clone());
+    }
+    let access = if sd.read_only {
+        Access::ReadOnly
+    } else {
+        Access::ReadWrite
+    };
+    match SdImage::open(&sd.path, access, &claimed, log) {
+        Ok(image) => opened.image = Some(image),
+        Err(e) => return Err(opened.refused(LaunchError::SdImage(e.to_string()))),
+    }
+    // A recorded run reads the card as its session keeps it now, as `inkemu run` does: a card a
+    // session cannot hold refuses the start at the same rank, before the flash file is accepted
+    // (N1). The first life takes it from here rather than reading the image again.
+    if setup.record.is_some()
+        && let Some(image) = opened.image.as_mut()
+    {
+        match sd_run::recorded_card(image) {
+            Ok(card) => opened.recorded = Some(card),
+            Err(e) => return Err(opened.refused(LaunchError::SdImage(e))),
+        }
+    }
+    Ok(opened)
+}
+
+/// The card of a life over `image` with the changes `keeper` holds and, for a `recorded` life,
+/// the card as its session keeps it, read whole before the life (a card a session cannot hold
+/// refuses the life, not its end): `read` when the start read it already and no change waits.
+fn life_card(
+    image: &mut SdImage,
+    keeper: &CardKeeper,
+    recorded: bool,
+    read: Option<session::SdCardStart>,
+) -> Result<(boards::SdStart, Option<session::SdCardStart>), CommandError> {
+    let kept = match read.filter(|_| !keeper.is_unwritten()) {
+        _ if !recorded => None,
+        Some(card) => Some(card),
+        None => Some(keeper.recorded_card(image).map_err(CommandError::SdCard)?),
+    };
+    let start = keeper
+        .card_of_a_life(image)
+        .map_err(|e| CommandError::SdCard(e.to_string()))?;
+    Ok((start, kept))
+}
+
+/// The button that powers the device of `profile` on, when its wiring has a power-on gesture.
+fn power_key_of(profile: &DeviceProfile) -> Option<String> {
+    profile
+        .wiring
+        .as_ref()
+        .and_then(|wiring| wiring.gesture.as_ref())
+        .map(|gesture| gesture.key.clone())
 }
 
 /// Starts a run as `inkemu run` does: the same refusals in the same order, the same lines.
@@ -426,6 +689,16 @@ impl Launch {
 pub fn power_on(setup: &Setup) -> Result<Launch, LaunchError> {
     let mut log = Vec::new();
     let profile = launch::profile(&setup.device)?;
+    // A card or the cable on a device that has no line for it is refused before anything of the
+    // run is opened, as `inkemu run` refuses it (H6).
+    boards::check_board_request(
+        &profile,
+        boards::BoardRequest {
+            sd: setup.sd.is_some(),
+            usb_power: setup.usb_power,
+            power_hold_ms: None,
+        },
+    )?;
     let request = RunRequest {
         max_cycles: setup.limits.max_cycles,
         max_device_nanos: setup.limits.max_device_nanos,
@@ -433,25 +706,22 @@ pub fn power_on(setup: &Setup) -> Result<Launch, LaunchError> {
     };
     let (options, console_note) = request.resolve(&profile, setup.usb_host);
     let entry = rom_store::rom_entry_for(profile.chip_revision);
-    let paths = RunPaths {
-        device: setup.device.clone(),
-        image: setup.image.clone(),
-        firmware: setup.firmware.clone(),
-        bootloader: setup.bootloader.clone(),
-        rom_dir: setup.rom_dir.clone(),
-    };
+    let paths = RunPaths::of(setup);
     let flash = FlashRequest {
         reset: setup.reset_flash,
         ..paths.request(setup.flash_file.as_deref())
     };
+    let sd_path = setup.sd.as_ref().map(|sd| sd.path.as_path());
     // The text of the profile it gives is the one every recorded life carries (below).
     launch::refuse_record_path(
         setup.record.as_deref(),
         &flash,
         None,
+        sd_path,
         (setup.rom_dir.as_deref(), entry),
         &setup.device,
     )?;
+    refuse_an_sd_image_of_the_run(setup, &flash, (setup.rom_dir.as_deref(), entry))?;
     launch::refuse_the_images_as_flash_file(&flash)?;
     let fresh = launch::starting_flash(&profile, &flash)?;
     let size = profile.flash.size();
@@ -476,40 +746,80 @@ pub fn power_on(setup: &Setup) -> Result<Launch, LaunchError> {
     };
     // The first line names the timing model of a machine of this device.
     let probe = profile.instantiate(rom.clone(), machine_options);
-    if let Some(run_flash) = &keeper.run_flash {
-        run_flash.accept(&mut log)?;
-    }
     let header = launch::header(&profile, entry, &probe, &console_note);
     drop(probe);
+    let text = boards::builtin_toml(&profile.id)?;
+    // The image last, made blank or opened only once nothing but it and the flash file can
+    // refuse the run: a run refused for its ROM, its flash or its profile leaves no new image
+    // behind (H5).
+    let (sd, first_card) = open_the_card_and_accept_the_flash(
+        setup,
+        &flash,
+        (setup.rom_dir.as_deref(), entry),
+        keeper.run_flash.as_ref(),
+        &mut log,
+    )?;
     log.extend_from_slice(format!("{header}; {flash_note}\n").as_bytes());
     let recording = Recording {
         rom: RomIdentity::of(entry.rom_revision, &rom),
         profile: ProfileText {
             id: profile.id.clone(),
-            text: boards::builtin_toml(&profile.id)?.to_owned(),
+            text: text.to_owned(),
         },
         strict_mmio: setup.strict_mmio,
     };
-    let look = catalog::look(&profile.id);
+    let plan = Plan::Run {
+        flash: keeper,
+        sd,
+        first_card,
+        power_key: power_key_of(&profile),
+        record: setup.record.clone(),
+        recording: Some(recording),
+        paths,
+        limits: setup.limits,
+    };
+    let board = BoardStart {
+        power_hold_ms: None,
+        usb_power: setup.usb_power,
+    };
+    Ok(launch_of(
+        profile,
+        rom,
+        machine_options,
+        board,
+        plan,
+        &log,
+        options.console,
+    ))
+}
+
+/// The launch of a run of `profile` that [`power_on`] prepared.
+fn launch_of(
+    profile: DeviceProfile,
+    rom: RomImage,
+    options: MachineOptions,
+    board: BoardStart,
+    plan: Plan,
+    log: &[u8],
+    console: ConsoleChannel,
+) -> Launch {
+    let look = catalog::look(&profile);
     let device_name = sanitize(&profile.name);
-    Ok(Launch {
+    Launch {
         recipe: Box::new(ProfileRecipe {
             profile,
             rom,
-            options: machine_options,
+            options,
+            board,
         }),
-        plan: Plan::Run {
-            flash: keeper,
-            record: setup.record.clone(),
-            recording: Some(recording),
-            paths,
-            limits: setup.limits,
-        },
-        notices: Notice::from_log(&log),
+        plan,
+        notices: Notice::from_log(log),
         look,
-        console: options.console,
+        console,
         device_name,
-    })
+        #[cfg(test)]
+        faults: Faults::default(),
+    }
 }
 
 /// Powers on the machine of a replay, on the emulator's thread.
@@ -521,15 +831,17 @@ struct ReplayRecipe {
 }
 
 impl Recipe for ReplayRecipe {
-    fn power_on(&mut self, _flash: Option<Vec<u8>>, _recorded: bool) -> Result<Life, PowerOnError> {
-        let machine = record::start_replay(&self.session, self.rom.clone(), self.rom_revision)
+    /// The wired device of the session, its card the session's: the flash and the card a run
+    /// would give are not the replay's.
+    fn power_on(
+        &mut self,
+        _flash: Option<Vec<u8>>,
+        _recorded: bool,
+        _sd: Option<boards::SdStart>,
+    ) -> Result<Life, PowerOnError> {
+        let wired = record::start_replay(&self.session, self.rom.clone(), self.rom_revision)
             .map_err(PowerOnError::Replay)?;
-        let (panel, buttons) = catalog::ports_for(&self.profile);
-        Ok(Life {
-            machine,
-            panel,
-            buttons,
-        })
+        Ok(catalog::life_of(&self.profile, wired))
     }
 }
 
@@ -560,7 +872,8 @@ pub fn open_replay(
     let rom = launch::load_rom(rom_dir, entry, &mut log)?;
     // Refused here, before the thread, for what a replay cannot start on.
     let probe = record::start_replay(&session, rom.clone(), entry.rom_revision)
-        .map_err(LaunchError::Replay)?;
+        .map_err(LaunchError::Replay)?
+        .machine;
     let (shown, origin) = launch::shown_console(&profile, console);
     let header = launch::header(
         &profile,
@@ -587,7 +900,7 @@ pub fn open_replay(
             .as_bytes(),
         );
     }
-    let look = catalog::look(&profile.id);
+    let look = catalog::look(&profile);
     let device_name = sanitize(&profile.name);
     let session = Box::new(session);
     Ok(Launch {
@@ -606,6 +919,8 @@ pub fn open_replay(
         look,
         console: shown,
         device_name,
+        #[cfg(test)]
+        faults: Faults::default(),
     })
 }
 
@@ -649,6 +964,12 @@ pub enum CommandError {
     Stopped,
     #[error("the run has ended; reset the device to power it on again")]
     NoLife,
+    /// A command for a life, once the replay has ended: a replay takes no input, and its device
+    /// powers on only by replaying the session again (R5).
+    #[error(
+        "the replay has ended, and a replay takes no input; reset it to replay the session from its start"
+    )]
+    ReplayEnded,
     #[error("{0}")]
     Engine(#[from] EngineError),
     #[error("{0}")]
@@ -669,6 +990,15 @@ pub enum CommandError {
     /// errors, one per line, as the journal said them.
     #[error("{0}")]
     NotKept(String),
+    /// A record command that could not record the next life: refused before the life that
+    /// runs ends when that can be known (the device goes on as it was), else the device is
+    /// powered on again without a recording, and the message says so (H7).
+    #[error("{0}")]
+    NotRecorded(String),
+    /// The card of the next life could not be read from its image: the message says why and
+    /// what frees it. A reset would meet the same card: it is not the remedy (R1).
+    #[error("{0}")]
+    SdCard(String),
 }
 
 impl CommandError {
@@ -678,6 +1008,7 @@ impl CommandError {
         match self {
             CommandError::Stopped => "stopped",
             CommandError::NoLife => "noLife",
+            CommandError::ReplayEnded => "replayEnded",
             CommandError::Engine(EngineError::Replaying) => "replaying",
             CommandError::Engine(EngineError::Ended) => "ended",
             CommandError::Engine(EngineError::NothingToStep) => "nothingToStep",
@@ -691,6 +1022,8 @@ impl CommandError {
             CommandError::Capture(crate::capture::CaptureError::NoImage) => "noImage",
             CommandError::Capture(_) => "capture",
             CommandError::NotKept(_) => "notKept",
+            CommandError::NotRecorded(_) => "notRecorded",
+            CommandError::SdCard(_) => "sdCard",
         }
     }
 }
@@ -867,6 +1200,8 @@ pub struct Emulator {
     device_name: String,
     /// The flash file the run holds, locked, until its thread ends.
     flash_file: Option<PathBuf>,
+    /// The SD image the run holds, locked, until its thread ends.
+    sd_image: Option<PathBuf>,
     /// Why the thread stopped on an internal error, if it did ([`Worker::rescue`]).
     fault: Fault,
     thread: Option<JoinHandle<()>>,
@@ -898,11 +1233,19 @@ impl Emulator {
             look,
             console,
             device_name,
+            #[cfg(test)]
+            faults,
             ..
         } = launch;
         let flash_file = match &plan {
             Plan::Run { flash, .. } => flash.file.clone(),
             Plan::Replay { .. } => None,
+        };
+        let sd_image = match &plan {
+            Plan::Run {
+                sd: Some(image), ..
+            } => Some(image.path().to_path_buf()),
+            Plan::Run { sd: None, .. } | Plan::Replay { .. } => None,
         };
         let slot = Arc::clone(&frame);
         let rotation = look.panel.rotation;
@@ -931,7 +1274,10 @@ impl Emulator {
                     console: ConsoleBatch::default(),
                     rotation,
                     powering: None,
+                    card: CardKeeper::default(),
                     fault: rescued,
+                    #[cfg(test)]
+                    faults,
                 }
                 .serve(&receiver);
             })?;
@@ -945,9 +1291,20 @@ impl Emulator {
             console,
             device_name,
             flash_file,
+            sd_image,
             fault,
             thread: Some(thread),
         })
+    }
+
+    /// Whether the run holds the SD image at `path`, by whatever route the path leads there: the
+    /// image is locked while the run lives, so a run that starts on it must wait until this one
+    /// is powered off, which releases it.
+    #[must_use]
+    pub fn holds_sd_image(&self, path: &Path) -> bool {
+        self.sd_image
+            .as_deref()
+            .is_some_and(|image| session_file::same_place(image, path))
     }
 
     /// Whether the run holds the flash file at `path`, by whatever route the path leads there:
@@ -1061,7 +1418,14 @@ struct Worker {
     /// The content of a power-on under way, until its machine holds it: a panic meanwhile
     /// leaves it to the rescue.
     powering: Option<Vec<u8>>,
+    /// What the lives wrote on their card and its image does not hold yet: taken out of the
+    /// slot once a life is finished, kept here when its commit fails, read by the next life and
+    /// written again at the end of each life, at the power-off or by the rescue, as the flash is
+    /// (H2, R1).
+    card: CardKeeper,
     fault: Fault,
+    #[cfg(test)]
+    faults: Faults,
 }
 
 impl Worker {
@@ -1143,17 +1507,35 @@ impl Worker {
         self.tell(Update::Stopped);
     }
 
+    /// Writes what the lives left on the card ([`Worker::card`]) to the image of the run, saying
+    /// it in `log`. Changes whose commit fails stay waiting, for the next life to read and the
+    /// next attempt to write: they are never dropped while the run lives. `false` when changes
+    /// are left unwritten.
+    fn keep_card(&mut self, log: &mut dyn std::io::Write) -> bool {
+        let Plan::Run {
+            sd: Some(image), ..
+        } = &mut self.plan
+        else {
+            // A replay's card is the session's: nothing of it is written anywhere.
+            self.card = CardKeeper::default();
+            return true;
+        };
+        self.card.commit_and_say(image, log)
+    }
+
     /// The end of the run: the life that runs ends ([`Worker::end_life`]); with none, a flash a
     /// life left in memory (its file could not be written when it ended on its own) is written
-    /// now, since no next life will. Gives what could not be kept.
+    /// now, since no next life will, and so is a card whose changes its image could not take.
+    /// Gives what could not be kept.
     fn power_off(&mut self) -> Vec<String> {
         if self.engine.is_some() {
             return self.end_life();
         }
+        let mut log = Vec::new();
+        self.keep_card(&mut log);
         let Plan::Run { flash, .. } = &mut self.plan else {
             return Vec::new();
         };
-        let mut log = Vec::new();
         flash.keep_now(None, &mut log);
         let notices = Notice::from_log(&log);
         let errors = notices
@@ -1167,8 +1549,9 @@ impl Worker {
         errors
     }
 
-    /// Ends a run that panicked: writes the flash the device left, says why the emulator
-    /// stopped, and sends [`Update::Stopped`]. The console text of the passes that completed is
+    /// Ends a run that panicked: writes the flash the device left, then what it wrote on its
+    /// card, says why the emulator stopped, and sends [`Update::Stopped`]. The console text of
+    /// the passes that completed is
     /// sent; what else the life held (its session, its end) is not trusted after a panic and is
     /// dropped.
     fn rescue(&mut self, panic: &(dyn std::any::Any + Send)) {
@@ -1180,6 +1563,12 @@ impl Worker {
             Some(engine) => {
                 let content = catch_unwind(AssertUnwindSafe(|| engine.machine().flash_contents()))
                     .map_err(drop);
+                // The card too, while the slot holds it (an end of life that panicked before its
+                // commit left it there): what the life wrote on it is kept. A card the end of
+                // the life already took out is in `card`, and the slot is empty.
+                if let Ok(card) = catch_unwind(AssertUnwindSafe(|| engine.take_card())) {
+                    self.card.take_in(card);
+                }
                 // A machine whose drop panics must not keep the interface from hearing of it.
                 let _ = catch_unwind(AssertUnwindSafe(move || drop(engine)));
                 Some(content)
@@ -1203,6 +1592,9 @@ impl Worker {
             }
             (_, Plan::Replay { .. }) => {}
         }
+        // The card after the flash: a slow commit of a large card does not keep the flash waiting
+        // (N3). What the lives wrote on it is in `card` already.
+        let _ = catch_unwind(AssertUnwindSafe(|| self.keep_card(&mut log)));
         let text = panic
             .downcast_ref::<&str>()
             .map(|text| (*text).to_owned())
@@ -1346,14 +1738,18 @@ impl Worker {
             Command::Run => {
                 self.running = true;
                 self.rebase();
-                self.engine.as_ref().map(|_| ()).ok_or(CommandError::NoLife)
+                self.engine
+                    .as_ref()
+                    .map(|_| ())
+                    .ok_or_else(|| self.no_life())
             }
             Command::Pause => {
                 self.running = false;
                 Ok(())
             }
             Command::Step => {
-                let engine = self.engine.as_mut().ok_or(CommandError::NoLife)?;
+                let refused = self.no_life();
+                let engine = self.engine.as_mut().ok_or(refused)?;
                 let output = engine.step()?;
                 // A step pauses the run; a refused one changes nothing.
                 self.running = false;
@@ -1392,6 +1788,12 @@ impl Worker {
                 Ok(())
             }
             Command::Button { id, pressed } => {
+                if pressed && self.is_off() && self.is_power_key(&id) {
+                    // The device turned itself off: its power key turns it on again, a new life
+                    // with the flash where the last one left it. The user's press is the gesture:
+                    // held at the first instant, released when the user lets go (H4).
+                    return self.begin_life_as(None, Some(&id));
+                }
                 let output = self.live_engine()?.button(&id, pressed)?;
                 self.after_input(output);
                 Ok(())
@@ -1426,6 +1828,12 @@ impl Worker {
             ),
             Plan::Replay { claimed, .. } => claimed.clone(),
         };
+        if let Plan::Run {
+            sd: Some(image), ..
+        } = &self.plan
+        {
+            claimed.extend(sd_run::claims(Some(image.path())));
+        }
         if let Some(path) = &self.recording {
             claimed.push(Claimed::File {
                 path: path.clone(),
@@ -1436,7 +1844,27 @@ impl Worker {
     }
 
     fn live_engine(&mut self) -> Result<&mut Engine, CommandError> {
-        self.engine.as_mut().ok_or(CommandError::NoLife)
+        let refused = self.no_life();
+        self.engine.as_mut().ok_or(refused)
+    }
+
+    /// Why a command for a life finds none: the run ended, or the replay did, which takes no
+    /// input and powers its device on only by replaying again (R5).
+    fn no_life(&self) -> CommandError {
+        match self.plan {
+            Plan::Run { .. } => CommandError::NoLife,
+            Plan::Replay { .. } => CommandError::ReplayEnded,
+        }
+    }
+
+    /// The last life ended because the device turned its supply off, and none began since.
+    fn is_off(&self) -> bool {
+        self.engine.is_none() && self.last_end == Some(RunEnd::PowerOff)
+    }
+
+    /// `id` is the button that powers the device of the run on.
+    fn is_power_key(&self, id: &str) -> bool {
+        matches!(&self.plan, Plan::Run { power_key: Some(key), .. } if key == id)
     }
 
     fn after_input(&mut self, output: Output) {
@@ -1450,6 +1878,7 @@ impl Worker {
             paths,
             recording,
             flash,
+            sd,
             ..
         } = &self.plan
         else {
@@ -1466,11 +1895,55 @@ impl Worker {
             Some(&path),
             &paths.request(flash.file.as_deref()),
             None,
+            sd.as_ref().map(SdImage::path),
             rom,
             &paths.device,
         )?;
+        // A card a session cannot hold is refused now, while the life that runs goes on: the
+        // card as its image holds it with what this life wrote so far (H7).
+        self.refuse_an_unrecordable_card()?;
         self.end_life();
-        self.begin_life(Some(path))
+        match self.begin_life(Some(path)) {
+            Ok(()) => Ok(()),
+            Err(refused) => {
+                // Never off without a word: powered on again, unrecorded, and said.
+                let again = self.begin_life(None);
+                let said = match again {
+                    Ok(()) => "the device is powered on again without a recording".to_owned(),
+                    // The card refused it: a reset would meet the same card; its message says
+                    // what frees it (R1).
+                    Err(CommandError::SdCard(e)) => {
+                        format!("the device could not be powered on again: {e}")
+                    }
+                    Err(_) => "the device could not be powered on again; reset it".to_owned(),
+                };
+                Err(CommandError::NotRecorded(format!(
+                    "the life is not recorded: {refused}; {said}"
+                )))
+            }
+        }
+    }
+
+    /// Refuses a record command whose session could not hold the card of the run: the card in
+    /// the slot read as the running life sees it (its image with what the life wrote), past the
+    /// bound of a session. Nothing changes: the life goes on.
+    fn refuse_an_unrecordable_card(&mut self) -> Result<(), CommandError> {
+        let Plan::Run {
+            sd: Some(image), ..
+        } = &mut self.plan
+        else {
+            return Ok(());
+        };
+        let protected = image.write_protected();
+        let checked = match self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.card_as_recorded(protected))
+        {
+            Some(read) => read.map(drop).map_err(|e| e.to_string()),
+            None => self.card.recorded_card(image).map(drop),
+        };
+        checked.map_err(|e| CommandError::NotRecorded(format!("the life is not recorded: {e}")))
     }
 
     /// The ROM entry of the device of the run, to name the ROM file a session must not replace.
@@ -1484,18 +1957,52 @@ impl Worker {
 
     /// Powers the device on: a new life, recorded into `record` when given.
     fn begin_life(&mut self, record: Option<PathBuf>) -> Result<(), CommandError> {
-        let (content, mode_of, limits) = match &mut self.plan {
+        self.begin_life_as(record, None)
+    }
+
+    /// [`Worker::begin_life`]; with `by_key`, the life is powered on by the user's press of
+    /// that key (H4): no power-on gesture, the key pressed at the first instant of the life, and
+    /// the user's release, when it comes, ends the hold as on the device.
+    fn begin_life_as(
+        &mut self,
+        record: Option<PathBuf>,
+        by_key: Option<&str>,
+    ) -> Result<(), CommandError> {
+        // What the last lives wrote on the card and its image could not take is read by this
+        // one from memory, as a flash its file could not take (R1): a life never starts on a
+        // card that misses it, and never waits for the image.
+        let (content, mode_of, limits, card) = match &mut self.plan {
             Plan::Run {
                 flash,
+                sd,
+                first_card,
                 recording,
                 limits,
                 ..
             } => {
+                let recording = record.as_ref().and(recording.clone());
+                // The card is read before the flash is taken: a card that cannot be read or
+                // recorded refuses the life with the flash left where it was.
+                #[cfg(test)]
+                if sd.is_some()
+                    && self
+                        .faults
+                        .card_refused_from_life
+                        .is_some_and(|from| self.life + 1 >= from)
+                {
+                    return Err(CommandError::SdCard(
+                        "the SD card of the test cannot be read; let the test read it".to_owned(),
+                    ));
+                }
+                let read = recording.as_ref().and_then(|_| first_card.take());
+                let card = match sd.as_mut() {
+                    Some(image) => Some(life_card(image, &self.card, recording.is_some(), read)?),
+                    None => None,
+                };
                 let content = flash
                     .take_next()
                     .map_err(|e| CommandError::PowerOn(e.to_string()))?;
-                let recording = record.as_ref().and(recording.clone());
-                (content, Some(recording), *limits)
+                (content, Some(recording), *limits, card)
             }
             Plan::Replay { session, .. } => {
                 let (max_cycles, max_device_nanos) = session.limits.run_limits();
@@ -1506,14 +2013,22 @@ impl Worker {
                         max_cycles,
                         max_device_nanos,
                     },
+                    None,
                 )
             }
         };
         let recorded = matches!(mode_of, Some(Some(_)));
+        let (sd, recorded_card) =
+            card.map_or((None, None), |(start, recorded)| (Some(start), recorded));
         // A power-on that fails must not lose the content: the next one starts from it. Until a
         // machine holds it, it stays here, where a panic leaves it to the rescue.
         self.powering.clone_from(&content);
-        let life = match self.recipe.power_on(content, recorded) {
+        let powered = if by_key.is_some() {
+            self.recipe.power_on_by_key(content, recorded, sd)
+        } else {
+            self.recipe.power_on(content, recorded, sd)
+        };
+        let life = match powered {
             Ok(life) => life,
             Err(e) => {
                 let kept = self.powering.take();
@@ -1536,6 +2051,7 @@ impl Worker {
                         recording.rom,
                         recording.profile,
                         &life.machine,
+                        recorded_card,
                         session_limits,
                     )),
                 }
@@ -1553,7 +2069,13 @@ impl Worker {
         let engine = self.engine.insert(Engine::new(life, mode, limits));
         self.powering = None;
         let output = engine.begin();
+        // The user's press, at the first instant: the input that holds the supply until the
+        // release, journaled as any press.
+        let pressed = by_key.map(|key| engine.button(key, true)).transpose()?;
         self.emit(output);
+        if let Some(output) = pressed {
+            self.emit(output);
+        }
         self.rebase();
         Ok(())
     }
@@ -1573,10 +2095,23 @@ impl Worker {
             return Vec::new();
         };
         let mut finished = engine.finish();
+        #[cfg(test)]
+        assert!(
+            !self.faults.panic_after_finish,
+            "the end of a life broke after its engine finished"
+        );
         let mut flash_log = Vec::new();
         if let (Plan::Run { flash, .. }, Some(engine)) = (&mut self.plan, self.engine.as_ref()) {
             flash.finish(engine.machine(), &mut flash_log);
         }
+        // What the life wrote on its card goes to the image through its journal, before the
+        // observer hears of the end. Out of the slot only now, after everything that may fail
+        // before it: the rescue finds the card in the slot or in `card`. A commit that fails is
+        // said with the flash's, and the changes stay for the next life and attempt (H1, R1).
+        if let Some(engine) = &self.engine {
+            self.card.take_in(engine.take_card());
+        }
+        self.keep_card(&mut flash_log);
         let mut session_log = Vec::new();
         if let (Some(result), Some(path)) = (finished.session.take(), self.recording.take()) {
             write_session(result, &path, &mut session_log);
@@ -1735,7 +2270,7 @@ fn verdict_view(
         Ok(Verdict::Identical) => {
             let _ = writeln!(
                 log,
-                "inkemu: the replay gives what the session recorded: the same end, device time, cycles, instructions, trace hash, final flash and consoles"
+                "inkemu: the replay gives what the session recorded: the same end, device time, cycles, instructions, trace hash, final flash, SD card and consoles"
             );
             VerdictView::Identical
         }
@@ -1763,7 +2298,7 @@ fn verdict_view(
 mod tests {
     use super::*;
     use crate::engine::fixtures::{echo, idle, life, options};
-    use crate::pattern::{self, fixtures::BUTTONS, fixtures::PANEL};
+    use crate::pattern::{self, fixtures::PANEL, fixtures::buttons as fixture_buttons};
     use soc_esp32c3::test_support::{HANG, flash_program, flat_rom, stop_watchdogs};
     use soc_esp32c3::{Esp32C3, FlashConfig, JedecId, SocConfig};
     use std::sync::mpsc::Receiver;
@@ -1781,15 +2316,18 @@ mod tests {
             &mut self,
             flash: Option<Vec<u8>>,
             recorded: bool,
+            _sd: Option<boards::SdStart>,
         ) -> Result<Life, PowerOnError> {
             Ok((self.0)(flash, recorded))
         }
     }
 
-    const LOOK: Look = Look {
-        panel: PANEL,
-        buttons: &BUTTONS,
-    };
+    fn look() -> Look {
+        Look {
+            panel: PANEL,
+            buttons: fixture_buttons(),
+        }
+    }
 
     /// The X4 on `rom`, with the pattern.
     fn x4(rom: RomImage) -> Box<dyn Recipe> {
@@ -1874,7 +2412,7 @@ mod tests {
             x4(echo()),
             FlashKeeper::without_file(None, 16 << 20),
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
@@ -1954,7 +2492,7 @@ mod tests {
             x4(idle()),
             FlashKeeper::without_file(None, 16 << 20),
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
@@ -1987,7 +2525,7 @@ mod tests {
                 max_cycles: Some(5_000),
                 max_device_nanos: None,
             },
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
@@ -2022,7 +2560,7 @@ mod tests {
             x4(echo()),
             FlashKeeper::without_file(None, 16 << 20),
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::RealTime);
@@ -2053,7 +2591,7 @@ mod tests {
                 max_cycles: None,
                 max_device_nanos: Some(20_000_000),
             },
-            LOOK,
+            look(),
             Some(x4_recording()),
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
@@ -2077,15 +2615,16 @@ mod tests {
             let machine = session::Replay::start(&replay_of, echo())
                 .unwrap()
                 .into_machine();
-            let (panel, buttons) = pattern::ports(PANEL, &BUTTONS);
+            let (panel, buttons) = pattern::ports(PANEL, &fixture_buttons());
             Life {
                 machine,
                 panel,
                 buttons,
+                sd: None,
             }
         }));
         let (replay, updates) = started(
-            Launch::replay(recipe, session, "run.inkrec".to_owned(), LOOK),
+            Launch::replay(recipe, session, "run.inkrec".to_owned(), look()),
             Speed::Fastest,
         );
         let replayed = until(&updates, |u| matches!(u, Update::LifeEnded { .. }));
@@ -2103,6 +2642,21 @@ mod tests {
             replay.command(Command::Record { path }),
             Err(CommandError::ReplayNotRecorded)
         ));
+        // Its life ended: the power key, or a step, does not ask for a reset of a run (R5).
+        for command in [
+            Command::Button {
+                id: "power".into(),
+                pressed: true,
+            },
+            Command::Step,
+        ] {
+            let refused = replay.command(command).unwrap_err();
+            assert_eq!(refused.kind(), "replayEnded", "{refused}");
+            assert!(
+                refused.to_string().contains("a replay takes no input"),
+                "{refused}"
+            );
+        }
     }
 
     /// A session path that is a file the run uses is refused, and the life goes on.
@@ -2112,7 +2666,7 @@ mod tests {
             x4(echo()),
             FlashKeeper::without_file(None, 16 << 20),
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, _updates) = started(launch, Speed::Fastest);
@@ -2127,7 +2681,7 @@ mod tests {
             x4(echo()),
             FlashKeeper::without_file(None, 16 << 20),
             Limits::default(),
-            LOOK,
+            look(),
             Some(x4_recording()),
         );
         let (emulator, _updates) = started(launch, Speed::Fastest);
@@ -2159,13 +2713,188 @@ mod tests {
                 Some(content) => Esp32C3::with_flash(rom, content, &config).unwrap(),
                 None => Esp32C3::new(rom, &config),
             };
-            let (panel, buttons) = pattern::ports(PANEL, &BUTTONS);
+            let (panel, buttons) = pattern::ports(PANEL, &fixture_buttons());
             Life {
                 machine,
                 panel,
                 buttons,
+                sd: None,
             }
         }))
+    }
+
+    /// 2d-D14, 2d-R8: the wired X4 cuts its latch and turns itself off; that life is over, its
+    /// other buttons press nothing, and its power key powers a new life on.
+    #[test]
+    fn a_device_that_turned_itself_off_is_powered_on_again_by_its_power_key() {
+        let reg = svd_regs::esp32c3::addr;
+        let mut program = stop_watchdogs();
+        program.extend(soc_esp32c3::test_support::store_register(
+            reg("IO_MUX", "GPIO13"),
+            1 << 12,
+        ));
+        program.extend(soc_esp32c3::test_support::store_register(
+            reg("GPIO", "ENABLE_W1TS"),
+            1 << 13,
+        ));
+        program.push(HANG);
+        let profile = boards::builtin("x4").unwrap();
+        let look = catalog::look(&profile);
+        let recipe = Box::new(ProfileRecipe {
+            profile,
+            rom: flat_rom(&program),
+            options: options(false),
+            board: BoardStart {
+                power_hold_ms: Some(0),
+                usb_power: false,
+            },
+        });
+        let launch = Launch::new(
+            recipe,
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits::default(),
+            look,
+            None,
+        )
+        .powered_on_by("power");
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| {
+            matches!(
+                u,
+                Update::LifeEnded {
+                    life: 1,
+                    end: RunEnd::PowerOff,
+                    ..
+                }
+            )
+        });
+        let other = emulator.command(Command::Button {
+            id: "confirm".to_owned(),
+            pressed: true,
+        });
+        assert!(matches!(other, Err(CommandError::NoLife)), "{other:?}");
+        emulator
+            .command(Command::Button {
+                id: "power".to_owned(),
+                pressed: true,
+            })
+            .unwrap();
+        // The firmware cut its latch at once, but the user's press holds the supply (H4).
+        status(&updates, |s| {
+            s.life == 2 && s.machine.as_ref().is_some_and(|m| m.device_time_nanos > 0)
+        });
+        emulator
+            .command(Command::Button {
+                id: "power".to_owned(),
+                pressed: false,
+            })
+            .unwrap();
+        until(&updates, |u| {
+            matches!(
+                u,
+                Update::LifeEnded {
+                    life: 2,
+                    end: RunEnd::PowerOff,
+                    ..
+                }
+            )
+        });
+        emulator.shutdown().unwrap();
+    }
+
+    /// A firmware that behaves as the X4's stock one at power-on: it waits a while (about a
+    /// million turns of a loop), then reads the power key (GPIO3, low pressed): held, it holds
+    /// its latch (GPIO13 high) and stays on; released, it drives the latch low and the X4 goes
+    /// off.
+    fn latching_if_held() -> Vec<u32> {
+        use cpu_rv32::asm::{addi, bne, divu, lui, remu};
+        use soc_esp32c3::test_support::{T1, T2, load_register, store_register};
+        let reg = svd_regs::esp32c3::addr;
+        let mut program = stop_watchdogs();
+        program.extend(store_register(
+            reg("IO_MUX", "GPIO3"),
+            (1 << 12) | (1 << 9) | (1 << 8),
+        ));
+        program.extend(store_register(reg("IO_MUX", "GPIO13"), 1 << 12));
+        program.extend([lui(T2, 0x0010_0000), addi(T2, T2, -1), bne(T2, 0, -4)]);
+        program.extend(load_register(reg("GPIO", "IN")));
+        // Bit 3 of `GPIO.IN`: (IN / 8) % 2.
+        program.extend([
+            addi(T2, 0, 8),
+            divu(T1, T1, T2),
+            addi(T2, 0, 2),
+            remu(T1, T1, T2),
+        ]);
+        // Released (1): to the cut, past the nine words of the latch.
+        program.push(bne(T1, 0, 4 * 10));
+        program.extend(store_register(reg("GPIO", "OUT_W1TS"), 1 << 13));
+        program.extend(store_register(reg("GPIO", "ENABLE_W1TS"), 1 << 13));
+        program.push(HANG);
+        program.extend(store_register(reg("GPIO", "ENABLE_W1TS"), 1 << 13));
+        program.push(HANG);
+        program
+    }
+
+    /// H4: a device the firmware turned off is powered on by the user's own press of its power
+    /// key, with no gesture of the profile: a press let go at once leaves a firmware that latches
+    /// only if the key is still held to turn the device off again; a press held past the
+    /// firmware's wait keeps it on, as on the X4.
+    #[test]
+    fn the_users_hold_of_the_power_key_is_the_gesture_that_powers_the_device_on() {
+        let profile = boards::builtin("x4").unwrap();
+        let look = catalog::look(&profile);
+        let recipe = Box::new(ProfileRecipe {
+            profile,
+            rom: flat_rom(&latching_if_held()),
+            options: options(false),
+            board: BoardStart {
+                power_hold_ms: Some(0),
+                usb_power: false,
+            },
+        });
+        let launch = Launch::new(
+            recipe,
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits::default(),
+            look,
+            None,
+        )
+        .powered_on_by("power");
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        let off = |life: u32| move |u: &Update| matches!(u, Update::LifeEnded { life: l, end: RunEnd::PowerOff, .. } if *l == life);
+        // Life 1, no press at all: the firmware finds the key released and turns off.
+        until(&updates, off(1));
+        let key = |pressed: bool| Command::Button {
+            id: "power".to_owned(),
+            pressed,
+        };
+        // Life 2: pressed and let go at its first instant, before the firmware looks.
+        emulator.command(Command::Pause).unwrap();
+        emulator.command(key(true)).unwrap();
+        emulator.command(key(false)).unwrap();
+        emulator.command(Command::Run).unwrap();
+        until(&updates, off(2));
+        // Life 3: held a second of device time, far past the firmware's wait, then let go.
+        emulator.command(Command::Pause).unwrap();
+        emulator.command(key(true)).unwrap();
+        emulator.command(Command::Run).unwrap();
+        status(&updates, |s| {
+            s.life == 3
+                && s.machine
+                    .as_ref()
+                    .is_some_and(|m| m.device_time_nanos > 1_000_000_000)
+        });
+        emulator.command(key(false)).unwrap();
+        let seen = until(&updates, |u| {
+            matches!(u, Update::Status(s) if s.life == 3
+                && s.machine.as_ref().is_some_and(|m| m.device_time_nanos > 2_000_000_000))
+                || off(3)(u)
+        });
+        assert!(
+            !seen.iter().any(off(3)),
+            "a hold past the firmware's wait keeps the device on: {seen:#?}"
+        );
+        emulator.shutdown().unwrap();
     }
 
     /// The flash file is written at the end of each life and read again for the next one.
@@ -2182,7 +2911,7 @@ mod tests {
                 max_cycles: Some(50_000),
                 max_device_nanos: None,
             },
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
@@ -2254,6 +2983,206 @@ mod tests {
         assert_eq!(record.kind(), "recordPath", "{record}");
     }
 
+    /// H5: a start refused for its ROM (or its flash) makes no blank card: the image is made
+    /// last, once nothing but it can refuse the run.
+    #[test]
+    fn a_start_refused_for_its_rom_leaves_no_new_card_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = dir.path().join("new.img");
+        let blank = |image: Option<PathBuf>| Setup {
+            device: "x4".into(),
+            image,
+            rom_dir: Some(dir.path().to_path_buf()),
+            sd: Some(SdSetup {
+                path: card.clone(),
+                read_only: false,
+                create_mib: Some(64),
+            }),
+            ..Setup::default()
+        };
+        assert_eq!(power_on(&blank(None)).unwrap_err().kind(), "rom");
+        let absent = Some(dir.path().join("absent.bin"));
+        assert_eq!(power_on(&blank(absent)).unwrap_err().kind(), "flashImage");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// R3: a card that is the flash file of the run is refused before the ROM is looked for, in
+    /// the order `inkemu run` refuses it; nothing is made.
+    #[test]
+    fn a_card_that_is_the_flash_file_is_refused_before_the_rom_as_inkemu_run_refuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = dir.path().join("card.img");
+        let setup = Setup {
+            device: "x4".into(),
+            rom_dir: Some(dir.path().to_path_buf()),
+            flash_file: Some(card.clone()),
+            sd: Some(SdSetup {
+                path: card.clone(),
+                read_only: false,
+                create_mib: Some(64),
+            }),
+            ..Setup::default()
+        };
+        let refused = power_on(&setup).unwrap_err();
+        assert_eq!(refused.kind(), "sdImage", "{refused}");
+        assert!(refused.to_string().contains("card.img"), "{refused}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// R2: a start its flash file refuses after the image is opened (what sits at the file's
+    /// temporary name cannot be removed) removes the blank image it made, and only that one: an
+    /// image the user gave stays.
+    #[test]
+    fn a_start_refused_after_its_card_removes_the_blank_image_it_made_and_only_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let flash_file = dir.path().join("x4.bin");
+        std::fs::create_dir(dir.path().join(".x4.bin.tmp")).unwrap();
+        let (run_flash, _) = RunFlash::begin(Some(&flash_file), false, None, 16 << 20).unwrap();
+        let entry = rom_store::rom_entry_for(boards::builtin("x4").unwrap().chip_revision);
+        let given = dir.path().join("given.img");
+        std::fs::File::create(&given)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        for (card, create_mib) in [(dir.path().join("new.img"), Some(64)), (given, None)] {
+            let setup = Setup {
+                device: "x4".into(),
+                flash_file: Some(flash_file.clone()),
+                sd: Some(SdSetup {
+                    path: card.clone(),
+                    read_only: false,
+                    create_mib,
+                }),
+                ..Setup::default()
+            };
+            let paths = RunPaths::of(&setup);
+            let refused = open_the_card_and_accept_the_flash(
+                &setup,
+                &paths.request(setup.flash_file.as_deref()),
+                (None, entry),
+                Some(&run_flash),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert_eq!(refused.kind(), "flashFile", "{refused}");
+            assert_eq!(card.exists(), create_mib.is_none(), "{}", card.display());
+        }
+    }
+
+    /// N1: a recorded start whose card a session cannot hold is refused for its card when the
+    /// image is opened, before the flash file is accepted, at the rank `inkemu run` refuses it;
+    /// unrecorded, the same start goes on to its flash file, which refuses it.
+    #[test]
+    fn a_recorded_start_with_a_card_too_full_is_refused_before_its_flash_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = too_full_for_a_session(dir.path());
+        let flash_file = dir.path().join("x4.bin");
+        std::fs::create_dir(dir.path().join(".x4.bin.tmp")).unwrap();
+        let (run_flash, _) = RunFlash::begin(Some(&flash_file), false, None, 16 << 20).unwrap();
+        let entry = rom_store::rom_entry_for(boards::builtin("x4").unwrap().chip_revision);
+        let start = |record: Option<PathBuf>| {
+            let setup = Setup {
+                device: "x4".into(),
+                flash_file: Some(flash_file.clone()),
+                record,
+                sd: Some(SdSetup {
+                    path: card.clone(),
+                    read_only: false,
+                    create_mib: None,
+                }),
+                ..Setup::default()
+            };
+            let paths = RunPaths::of(&setup);
+            open_the_card_and_accept_the_flash(
+                &setup,
+                &paths.request(setup.flash_file.as_deref()),
+                (None, entry),
+                Some(&run_flash),
+                &mut Vec::new(),
+            )
+            .unwrap_err()
+        };
+        let recorded = start(Some(dir.path().join("life.inkrec")));
+        assert_eq!(recorded.kind(), "sdImage", "{recorded}");
+        assert!(
+            recorded
+                .to_string()
+                .starts_with("the run is not recorded: "),
+            "{recorded}"
+        );
+        assert_eq!(start(None).kind(), "flashFile");
+    }
+
+    /// R2: a blank image a refused start cannot remove (its directory takes no change at the
+    /// cleanup) is said with the refusal: its path, why, and that the user may delete it. The
+    /// refusal keeps its kind.
+    #[cfg(unix)]
+    #[test]
+    fn a_blank_image_a_refused_start_cannot_remove_is_said_with_the_refusal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("cards");
+        std::fs::create_dir(&place).unwrap();
+        let card = place.join("new.img");
+        std::fs::File::create(&card).unwrap();
+        let made = || OpenedSd {
+            made: Some(card.clone()),
+            ..OpenedSd::default()
+        };
+        let refusal = || LaunchError::SdImage("the start is refused".to_owned());
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = made().refused(refusal());
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(refused.kind(), "sdImage");
+        let text = refused.to_string();
+        assert!(
+            text.starts_with("the start is refused\nwarning: the blank SD image ")
+                && text.contains(&card.display().to_string())
+                && text.contains("this start made could not be removed: ")
+                && text.ends_with("nothing of yours is in it, so you may delete it"),
+            "{text}"
+        );
+        assert!(card.exists());
+        // Removable, the refusal alone is said, and the image is gone.
+        assert_eq!(
+            made().refused(refusal()).to_string(),
+            "the start is refused"
+        );
+        assert!(!card.exists());
+    }
+
+    /// H6: a card or the cable asked of a device without the line is refused first, before the
+    /// image is made or opened and before the ROM is looked for.
+    #[test]
+    fn a_card_or_a_cable_the_device_has_no_line_for_is_refused_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = dir.path().join("x3.img");
+        let x3 = |sd: bool, usb_power: bool| Setup {
+            device: "x3".into(),
+            rom_dir: Some(dir.path().to_path_buf()),
+            usb_power,
+            sd: sd.then(|| SdSetup {
+                path: card.clone(),
+                read_only: false,
+                create_mib: Some(64),
+            }),
+            ..Setup::default()
+        };
+        for (setup, said) in [
+            (x3(true, false), "no SD card slot"),
+            (x3(false, true), "no USB detect line"),
+        ] {
+            let refused = power_on(&setup).unwrap_err();
+            assert_eq!(refused.kind(), "board", "{refused}");
+            assert!(refused.to_string().contains(said), "{refused}");
+        }
+        assert!(!card.exists());
+    }
+
     /// A replay of a file that is no session is refused before any ROM is looked for.
     #[test]
     fn a_replay_of_what_is_no_session_is_refused() {
@@ -2276,12 +3205,13 @@ mod tests {
             &mut self,
             flash: Option<Vec<u8>>,
             recorded: bool,
+            sd: Option<boards::SdStart>,
         ) -> Result<Life, PowerOnError> {
             self.calls += 1;
             if self.calls == self.fail_at {
                 return Err(PowerOnError::Replay("this power-on fails".into()));
             }
-            self.inner.power_on(flash, recorded)
+            self.inner.power_on(flash, recorded, sd)
         }
     }
 
@@ -2310,7 +3240,7 @@ mod tests {
                     max_cycles: Some(50_000),
                     max_device_nanos: None,
                 },
-                LOOK,
+                look(),
                 None,
             );
             let (emulator, updates) = started(launch, Speed::Fastest);
@@ -2350,7 +3280,7 @@ mod tests {
                 max_cycles: Some(50_000),
                 max_device_nanos: None,
             },
-            LOOK,
+            look(),
             None,
         );
         // The directory takes no new file: the save of the first life fails.
@@ -2387,7 +3317,7 @@ mod tests {
             writing_device(0x00, Arc::default()),
             keeper,
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
@@ -2420,7 +3350,7 @@ mod tests {
                 max_cycles: Some(50_000),
                 max_device_nanos: None,
             },
-            LOOK,
+            look(),
             None,
         );
         std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -2483,8 +3413,9 @@ mod tests {
     fn breaking_device(panel_breaks: bool) -> Box<dyn Recipe> {
         let mut inner = writing_device(0x00, Arc::default());
         Box::new(FnRecipe(move |flash: Option<Vec<u8>>, recorded: bool| {
-            let life = inner.power_on(flash, recorded).unwrap();
+            let life = inner.power_on(flash, recorded, None).unwrap();
             Life {
+                sd: None,
                 machine: life.machine,
                 panel: if panel_breaks {
                     Box::new(PanickingPanel(life.panel))
@@ -2496,6 +3427,313 @@ mod tests {
         }))
     }
 
+    /// The block every life of [`card_device`] writes, and what it writes there.
+    const CARD_BLOCK: u64 = 7;
+    const CARD_BYTE: u8 = 0xA5;
+
+    /// The X4 with the card of the run in its slot, and a program that parks; life `n` reads
+    /// [`CARD_BLOCK`] into `seen`, then writes [`CARD_BYTE`] to it and to block
+    /// `CARD_BLOCK + n` on its card, as a firmware would, before it runs.
+    #[derive(Default)]
+    struct CardDevice {
+        seen: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Recipe for CardDevice {
+        fn power_on(
+            &mut self,
+            _: Option<Vec<u8>>,
+            _: bool,
+            sd: Option<boards::SdStart>,
+        ) -> Result<Life, PowerOnError> {
+            let mut program = stop_watchdogs();
+            program.push(HANG);
+            let profile = boards::builtin("x4").unwrap();
+            let wired = boards::Wired::power_on(
+                &profile,
+                flat_rom(&program),
+                None,
+                MachineOptions::default(),
+                boards::WiredOptions {
+                    power_hold_ms: Some(0),
+                    usb_power: false,
+                    sd,
+                },
+            )
+            .unwrap();
+            let slot = wired.sd.unwrap();
+            {
+                use chips::sdcard::{BlockSource as _, BlockStorage as _};
+                let mut lines = slot.lines();
+                let card = lines.slot_mut().card_mut().expect("a card in the slot");
+                let mut block = [0; chips::sdcard::BLOCK_BYTES];
+                card.storage_mut()
+                    .read_block(CARD_BLOCK, &mut block)
+                    .unwrap();
+                let mut seen = self.seen.lock().unwrap();
+                seen.push(block[0]);
+                let own = CARD_BLOCK + u64::try_from(seen.len()).unwrap();
+                for lba in [CARD_BLOCK, own] {
+                    card.storage_mut()
+                        .write_block(lba, &[CARD_BYTE; chips::sdcard::BLOCK_BYTES])
+                        .unwrap();
+                }
+            }
+            let (panel, buttons) = pattern::ports(PANEL, &fixture_buttons());
+            Ok(Life {
+                machine: wired.machine,
+                panel,
+                buttons,
+                sd: Some(slot),
+            })
+        }
+    }
+
+    /// A blank image of 64 MiB in `dir`, opened as a run opens it.
+    fn card_image(dir: &Path) -> (PathBuf, SdImage) {
+        let path = dir.join("card.img");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let image = SdImage::open(&path, Access::ReadWrite, &[], &mut Vec::new()).unwrap();
+        (path, image)
+    }
+
+    /// The byte at the start of [`CARD_BLOCK`] of the image at `path`.
+    fn card_byte(path: &Path) -> u8 {
+        block_byte(path, CARD_BLOCK)
+    }
+
+    /// The byte at the start of block `lba` of the image at `path`.
+    fn block_byte(path: &Path, lba: u64) -> u8 {
+        let bytes = std::fs::read(path).unwrap();
+        bytes[usize::try_from(lba).unwrap() * chips::sdcard::BLOCK_BYTES]
+    }
+
+    /// A run of [`CardDevice`] over the image, each life ending on its own.
+    fn card_launch(image: SdImage) -> Launch {
+        card_launch_seen(image, Arc::default())
+    }
+
+    /// [`card_launch`], what each life reads of its card in `seen`.
+    fn card_launch_seen(image: SdImage, seen: Arc<Mutex<Vec<u8>>>) -> Launch {
+        Launch::new(
+            Box::new(CardDevice { seen }),
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits {
+                max_cycles: Some(50_000),
+                max_device_nanos: None,
+            },
+            look(),
+            None,
+        )
+        .with_sd(image)
+    }
+
+    /// H7: a record command whose session could not hold the card (more blocks that are not
+    /// zeros than a session keeps) is refused before the life that runs ends: the device goes
+    /// on, it is never left off.
+    /// An image of 128 MiB in `dir` with more blocks that are not zeros than a session keeps.
+    fn too_full_for_a_session(dir: &Path) -> PathBuf {
+        use std::io::Write as _;
+        let path = dir.join("full.img");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let chunk = vec![0x11u8; 1 << 20];
+        for _ in 0..=(session::MAX_SD_NONZERO_BYTES >> 20) {
+            file.write_all(&chunk).unwrap();
+        }
+        file.set_len(128 << 20).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_record_the_card_forbids_is_refused_and_the_life_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = too_full_for_a_session(dir.path());
+        let image = SdImage::open(&path, Access::ReadWrite, &[], &mut Vec::new()).unwrap();
+        let launch = Launch::new(
+            Box::new(CardDevice::default()),
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits::default(),
+            look(),
+            Some(x4_recording()),
+        )
+        .with_sd(image);
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::Status(_)));
+        let session = dir.path().join("life.inkrec");
+        let refused = emulator.command(Command::Record {
+            path: session.clone(),
+        });
+        assert!(
+            matches!(&refused, Err(CommandError::NotRecorded(text)) if text.starts_with("the life is not recorded: ")),
+            "{refused:?}"
+        );
+        assert_eq!(refused.unwrap_err().kind(), "notRecorded");
+        // The life that ran goes on: it takes a step, and nothing was recorded.
+        emulator.command(Command::Step).unwrap();
+        assert!(!session.exists());
+        assert!(emulator.shutdown().is_ok());
+    }
+
+    /// R1: a record command whose next life the card refuses says why, with the card's remedy:
+    /// a reset would meet the same card, so it is not offered.
+    #[test]
+    fn a_record_the_card_refuses_gives_the_card_s_remedy_not_a_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, image) = card_image(dir.path());
+        let mut launch = Launch::new(
+            Box::new(CardDevice::default()),
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits::default(),
+            look(),
+            Some(x4_recording()),
+        )
+        .with_sd(image);
+        launch.faults.card_refused_from_life = Some(2);
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::Status(_)));
+        let refused = emulator.command(Command::Record {
+            path: dir.path().join("life.inkrec"),
+        });
+        let Err(CommandError::NotRecorded(text)) = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(
+            text.ends_with(
+                "the device could not be powered on again: the SD card of the test cannot be read; let the test read it"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("reset it"), "{text}");
+        assert!(emulator.shutdown().is_ok());
+    }
+
+    /// H1: a panic at the end of a life, once its engine is finished and before its card is
+    /// written, loses nothing of the card: the rescue finds it and writes it to the image.
+    #[test]
+    fn a_panic_at_the_end_of_a_life_keeps_what_it_wrote_on_its_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, image) = card_image(dir.path());
+        let mut launch = card_launch(image);
+        launch.faults.panic_after_finish = true;
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::Stopped));
+        let ended = emulator.shutdown();
+        assert!(
+            matches!(&ended, Err(CommandError::NotKept(text)) if text.contains("broke after its engine finished")),
+            "{ended:?}"
+        );
+        assert_eq!(
+            card_byte(&path),
+            CARD_BYTE,
+            "the card's block is on the image"
+        );
+    }
+
+    /// R1: a card its image cannot take (its journal cannot be written) is kept in memory, as a
+    /// flash its file cannot take: the next life starts on it and reads what the last one wrote,
+    /// the end of that life tries again, and the power-off writes it all once the image takes
+    /// it, or says, with its remedy, that it could not.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritten_card_is_read_by_the_next_life_then_written_or_said_not_kept() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for writable_at_the_end in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let place = dir.path().join("cards");
+            std::fs::create_dir(&place).unwrap();
+            let (path, image) = card_image(&place);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (emulator, updates) =
+                started(card_launch_seen(image, Arc::clone(&seen)), Speed::Fastest);
+            // No journal beside the image: the commit of the end of the life fails.
+            std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let told = until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+            assert!(
+                told.iter().any(|u| matches!(u, Update::Notice(n)
+                    if n.level == Level::Error
+                        && n.text.contains("the next life of the device starts from it")
+                        && n.text.ends_with("free some room on the disk of the image, or make its directory writable"))),
+                "{told:#?}"
+            );
+            assert_eq!(card_byte(&path), 0, "not written yet");
+            // The next life is not refused, and reads the last one's changes from memory.
+            emulator.command(Command::Reset).unwrap();
+            until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
+            assert_eq!(*seen.lock().unwrap(), [0, CARD_BYTE]);
+            assert_eq!(card_byte(&path), 0, "its end could not write either");
+            if writable_at_the_end {
+                std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let ended = emulator.shutdown();
+            std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let blocks =
+                [CARD_BLOCK, CARD_BLOCK + 1, CARD_BLOCK + 2].map(|lba| block_byte(&path, lba));
+            if writable_at_the_end {
+                assert!(ended.is_ok(), "{ended:?}");
+                assert_eq!(blocks, [CARD_BYTE; 3], "both lives' blocks");
+            } else {
+                assert!(
+                    matches!(&ended, Err(CommandError::NotKept(text))
+                        if text.contains("SD card") && text.contains("make its directory writable")),
+                    "{ended:?}"
+                );
+                assert_eq!(blocks, [0; 3]);
+            }
+        }
+    }
+
+    /// N4: a card the image holds whole, of which only the journal stays, is said as that by the
+    /// power-off (`NotKept`), with the remedy of the directory, never as changes not written.
+    #[test]
+    fn a_power_off_says_a_journal_left_beside_a_written_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut image) = card_image(dir.path());
+        image.leave_the_journal();
+        let (emulator, updates) = started(card_launch(image), Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+        let ended = emulator.shutdown();
+        let Err(CommandError::NotKept(text)) = &ended else {
+            panic!("{ended:?}");
+        };
+        assert!(
+            text.contains("holds what the device wrote, but its journal ")
+                && text.contains("make the directory of the image writable")
+                && !text.contains("not in"),
+            "{text}"
+        );
+        assert_eq!(card_byte(&path), CARD_BYTE);
+    }
+
+    /// R1: once the image takes the card again, the end of the next life writes what both lives
+    /// wrote; that life did not wait for it, and started on the last one's changes.
+    #[cfg(unix)]
+    #[test]
+    fn the_end_of_the_next_life_writes_the_card_the_last_one_could_not() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("cards");
+        std::fs::create_dir(&place).unwrap();
+        let (path, image) = card_image(&place);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (emulator, updates) =
+            started(card_launch_seen(image, Arc::clone(&seen)), Speed::Fastest);
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+        emulator.command(Command::Reset).unwrap();
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
+        assert_eq!(*seen.lock().unwrap(), [0, CARD_BYTE]);
+        assert_eq!(
+            [CARD_BLOCK, CARD_BLOCK + 1, CARD_BLOCK + 2].map(|lba| block_byte(&path, lba)),
+            [CARD_BYTE; 3],
+            "written at the end of life 2"
+        );
+        assert!(emulator.shutdown().is_ok());
+    }
+
     /// A port that panics during a pass stops the emulator: the flash the device wrote is in
     /// its file, the panic is said, and the thread says it stopped.
     #[test]
@@ -2503,7 +3741,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("flash.bin");
         let keeper = FlashKeeper::begin(Some(file.clone()), false, None, 1 << 20).unwrap();
-        let launch = Launch::new(breaking_device(true), keeper, Limits::default(), LOOK, None);
+        let launch = Launch::new(
+            breaking_device(true),
+            keeper,
+            Limits::default(),
+            look(),
+            None,
+        );
         let (emulator, updates) = started(launch, Speed::Fastest);
         let seen = until(&updates, |u| matches!(u, Update::Stopped));
         assert!(
@@ -2556,7 +3800,7 @@ mod tests {
             writing_device(0x00, Arc::default()),
             keeper,
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started_breaking(
@@ -2595,7 +3839,7 @@ mod tests {
                     max_cycles: Some(50_000),
                     max_device_nanos: None,
                 },
-                LOOK,
+                look(),
                 None,
             );
             std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -2638,7 +3882,7 @@ mod tests {
                 max_cycles: Some(50_000),
                 max_device_nanos: None,
             },
-            LOOK,
+            look(),
             None,
         );
         std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -2663,7 +3907,7 @@ mod tests {
             breaking_device(true),
             FlashKeeper::without_file(None, 1 << 20),
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started_breaking(launch, |u| matches!(u, Update::Notice(_)));
@@ -2687,7 +3931,7 @@ mod tests {
         let recipe = Box::new(FnRecipe(move |flash: Option<Vec<u8>>, recorded: bool| {
             calls += 1;
             assert!(calls < 2, "a power-on broke");
-            inner.power_on(flash, recorded).unwrap()
+            inner.power_on(flash, recorded, None).unwrap()
         }));
         let launch = Launch::new(
             recipe,
@@ -2696,7 +3940,7 @@ mod tests {
                 max_cycles: Some(50_000),
                 max_device_nanos: None,
             },
-            LOOK,
+            look(),
             None,
         );
         // The directory takes no new file: the save of the first life fails, its flash stays in
@@ -2721,13 +3965,13 @@ mod tests {
             breaking_device(false),
             FlashKeeper::without_file(None, 1 << 20),
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
         emulator.command(Command::Pause).unwrap();
         let pressed = emulator.command(Command::Button {
-            id: BUTTONS[0].id.to_owned(),
+            id: fixture_buttons()[0].id.clone(),
             pressed: true,
         });
         assert!(matches!(pressed, Err(CommandError::Stopped)), "{pressed:?}");
@@ -2751,7 +3995,7 @@ mod tests {
             writing_device(0x00, Arc::default()),
             keeper,
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
@@ -2820,7 +4064,7 @@ mod tests {
             x4(flat_rom(&program)),
             FlashKeeper::without_file(None, 16 << 20),
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
@@ -2848,7 +4092,7 @@ mod tests {
             x4(echo()),
             FlashKeeper::without_file(None, 16 << 20),
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
@@ -2881,7 +4125,7 @@ mod tests {
             writing_device(0x00, Arc::default()),
             FlashKeeper::without_file(None, 1 << 20),
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let (emulator, updates) = started(launch, Speed::Fastest);
@@ -2915,7 +4159,7 @@ mod tests {
             x4(echo()),
             FlashKeeper::without_file(None, 1 << 22),
             Limits::default(),
-            LOOK,
+            look(),
             None,
         );
         let emulator = Emulator::start(

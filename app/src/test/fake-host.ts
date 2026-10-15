@@ -6,7 +6,14 @@ import type { HostApi } from "../ipc/host";
 import type { DeviceView, Look, Started, Status, Update } from "../ipc/types";
 
 export const LOOK: Look = {
-  panel: { width: 8, height: 4, grayLevels: 4, rotation: 90, origin: "testPattern" },
+  panel: {
+    width: 8,
+    height: 4,
+    shades: { levels: 4 },
+    rotation: 90,
+    origin: "testPattern",
+    approximate: false,
+  },
   buttons: [
     { id: "power", edge: "top", order: 0 },
     { id: "up", edge: "right", order: 0 },
@@ -22,6 +29,15 @@ export const X4: DeviceView = {
   look: LOOK,
   shippedBootloader: "esp-idf-v5.5.2-esp32c3-dio",
   noBootloader: null,
+  // The sizes host::catalog gives for a new card.
+  sdSlot: { minMib: 64, maxMib: 2_097_024, defaultMib: 1024 },
+  usbPower: true,
+};
+
+/** The look of a wired device: its own panel, approximate while its optics are unmeasured. */
+export const WIRED_LOOK: Look = {
+  ...LOOK,
+  panel: { ...LOOK.panel, shades: "continuous", origin: "device", approximate: true },
 };
 
 export function status(overrides: Partial<Status> = {}): Status {

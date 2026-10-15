@@ -12,7 +12,10 @@ pub use bus::{AccessKind, AccessSize, Bus, BusError, ReadOutcome};
 pub use memory::{PAGE_SHIFT, Ram};
 pub use peripheral::Peripheral;
 pub use scheduler::{EventId, Scheduler};
-pub use signals::{AnalogSource, Clocked, GpioInput, GpioOutput, Level, Nanos, SpiTarget};
+pub use signals::{
+    AnalogSource, BoardInput, BoardInputError, BoardInputs, Clocked, GpioInput, GpioOutput, Level,
+    Nanos, SpiTarget, Supply,
+};
 pub use time::{Cycles, Frequency};
 pub use timing::{InstrClass, TimingModel};
 pub use trace::TraceHash;

@@ -158,7 +158,7 @@ mod tests {
         PanelFrame::new(FrameParts {
             width: 3,
             height: 2,
-            gray_levels: 4,
+            shades: crate::ports::Shades::Levels(4),
             generation: 1,
             refresh: RefreshKind::Full,
             region: None,

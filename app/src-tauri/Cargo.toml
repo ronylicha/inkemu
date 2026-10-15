@@ -35,6 +35,8 @@ soc-esp32c3 = { path = "../../crates/soc-esp32c3" }
 
 [dev-dependencies]
 serde_json = "1"
+# Directories of the tests, removed however a test ends.
+tempfile = "3"
 # The looping test device of `host`, to drive the shell with real emulators.
 host = { path = "../../crates/host", features = ["test-support"] }
 

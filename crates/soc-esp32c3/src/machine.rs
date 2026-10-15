@@ -8,6 +8,7 @@ use crate::diag::{Diagnostic, Unsupported};
 use crate::flash::{FlashDevice, FlashImageError, FlashWrite, NorFlash};
 use crate::inputs::InputJournal;
 use crate::memmap::RESET_PC;
+use crate::periph::io::{BoardRefusal, MAX_PENDING_BOARD_INPUTS};
 use crate::periph::{AttachError, SpiWires, UsbHost};
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
@@ -16,8 +17,8 @@ use cpu_rv32::{
     MisalignedPolicy, QemuIcountTiming, StepOutcome, Trap,
 };
 use emu_core::{
-    AnalogSource, Clocked, Cycles, Frequency, GpioInput, GpioOutput, SpiTarget, TimingModel,
-    TraceHash,
+    AnalogSource, BoardInput, BoardInputError, BoardInputs, Clocked, Cycles, Frequency, GpioInput,
+    GpioOutput, SpiTarget, Supply, TimingModel, TraceHash,
 };
 
 /// `x2`, the stack pointer of the RISC-V calling convention.
@@ -102,6 +103,27 @@ pub enum InputError {
         "{MAX_PENDING_HOST_CHANGES} changes of the USB host are still to come; give the next ones once the run has reached some"
     )]
     TooManyHostChanges,
+    /// An input of the board, on a machine no board inputs were attached to.
+    #[error("the device has no input of its board: nothing was wired to take it")]
+    NoBoard,
+    /// The board refused the input.
+    #[error("{0}")]
+    Board(#[from] BoardInputError),
+    /// The inputs of the board still to act are as many as they may be.
+    #[error(
+        "{MAX_PENDING_BOARD_INPUTS} inputs of the board are still to come; give the next ones once the run has reached some"
+    )]
+    TooManyBoardInputs,
+    /// An input of the board dated so late that the instant it acts at, one past its date, would
+    /// be the last instant of the time base or past it: no run reaches it, and a deep sleep would
+    /// jump there.
+    #[error(
+        "the input of the board is dated {at_nanos} ns of device time, too late for the device ever to reach the instant it acts at; date it earlier"
+    )]
+    BeyondTime { at_nanos: u64 },
+    /// The device has no power any more: it takes no input.
+    #[error("the device is off: its supply failed; power it on again")]
+    PoweredOff,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,6 +163,9 @@ pub enum StopReason {
     /// (F5). As with [`StopReason::Idle`], device time stands still from here on and is not moved
     /// to a limit; [`Esp32C3::deep_sleep`] says since when and on which sources it waits.
     DeepSleep,
+    /// The board's supply failed (ADR 0013): the chip has no power and runs no further, whatever
+    /// a caller does; [`Esp32C3::power_lost_nanos`] says when.
+    PowerOff,
 }
 
 /// A chip in deep sleep, as a front end shows it (F9): read with [`Esp32C3::deep_sleep`].
@@ -159,7 +184,7 @@ pub struct DeepSleep {
 impl DeepSleep {
     /// `WAKEUP_ENA` bit 3: the RTC timer.
     pub const TIMER: u32 = 1 << 3;
-    /// `WAKEUP_ENA` bit 2: GPIO, a function of sub-project 2.
+    /// `WAKEUP_ENA` bit 2: the wake pins, GPIO0 to GPIO5 (ADR 0013).
     pub const GPIO: u32 = 1 << 2;
 }
 
@@ -557,6 +582,12 @@ impl Esp32C3 {
     /// next instruction ([`Hart::take_boundary`]) and the turn is [`Turn::Ready`] when nothing
     /// does.
     fn turn(&mut self, deadline: Option<Cycles>, slept: &mut Slept, boundary_only: bool) -> Turn {
+        // The board's supply failed: nothing runs any more (ADR 0013).
+        if self.bus.periph.io.power_lost().is_some() {
+            return Turn::DeepSlept {
+                stop: Some(StopReason::PowerOff),
+            };
+        }
         if self.powered_down {
             return self.deep_sleep_turn(deadline, slept);
         }
@@ -763,6 +794,10 @@ impl Esp32C3 {
         if let Some(cause) = self.bus.ctx.take_reset() {
             self.reset(cause);
         }
+        if self.bus.ctx.take_pad_hold_written() {
+            let held = self.bus.periph.rtc_cntl.pad_hold_mask();
+            self.bus.periph.io.set_hold(&mut self.bus.ctx, held);
+        }
         // After the reset: a reset asked for by the same instruction ends the sleep at once.
         if self.bus.ctx.take_deep_sleep_entered() {
             self.powered_down = self.bus.periph.rtc_cntl.is_in_deep_sleep();
@@ -770,6 +805,11 @@ impl Esp32C3 {
                 // The console channels go no further than this instant whatever a front end
                 // calls during the sleep: where a run is cut changes nothing (F10).
                 self.bus.periph.power_down(&self.bus.ctx);
+                // A wake pin already at its level wakes the chip at once (ADR 0013).
+                self.check_gpio_wake();
+                if let Some(cause) = self.bus.ctx.take_reset() {
+                    self.reset(cause);
+                }
             }
         }
         if self.bus.ctx.take_clock_written() {
@@ -865,7 +905,14 @@ impl Esp32C3 {
         let now = self.bus.ctx.now();
         let call = self.bus.periph.rtc_cntl.next_call();
         let chips = self.bus.periph.io.clocked_deadline(&self.bus.ctx);
-        let next = match (call, chips) {
+        let pins = self
+            .bus
+            .periph
+            .rtc_cntl
+            .gpio_wake_levels()
+            .and_then(|wanted| self.bus.periph.io.wake_pins_change(&self.bus.ctx, &wanted));
+        let board = [chips, pins].into_iter().flatten().min();
+        let next = match (call, board) {
             (None, None) => return Sleep::NothingDue,
             (Some(a), Some(b)) => a.min(b),
             (Some(only), None) | (None, Some(only)) => only,
@@ -876,8 +923,17 @@ impl Esp32C3 {
             return Sleep::CutAtDeadline;
         }
         self.bus.ctx.sleep_until(target);
-        if chips.is_some_and(|chips| chips <= target) {
+        if board.is_some_and(|board| board <= target) {
+            // The chips and the board's inputs first, then the wake pins, which they may have
+            // brought to their level (ADR 0013).
             self.bus.periph.io.advance_clocked(&mut self.bus.ctx);
+            self.check_gpio_wake();
+            if let Some(cause) = self.bus.ctx.take_reset() {
+                let pc = self.hart.pc;
+                self.reset(cause);
+                self.service(pc);
+                return Sleep::Until(target.get() - now.get());
+            }
         }
         if call.is_some_and(|call| call <= target) {
             self.bus.wake_rtc_domain();
@@ -889,6 +945,19 @@ impl Esp32C3 {
             }
         }
         Sleep::Until(target.get() - now.get())
+    }
+
+    /// The pins that wake a sleeping chip and are at their wake level now wake it: `RTC_CNTL`
+    /// latches the cause and asks for the reset of cause 5 (ADR 0013).
+    fn check_gpio_wake(&mut self) {
+        let Some(wanted) = self.bus.periph.rtc_cntl.gpio_wake_levels() else {
+            return;
+        };
+        let pins = self.bus.periph.io.wake_levels(&self.bus.ctx, &wanted);
+        self.bus
+            .periph
+            .rtc_cntl
+            .wake_on_pins(&mut self.bus.ctx, pins);
     }
 
     /// Applies a reset (TRM §6.1): the peripherals of its level return to their reset state, the
@@ -903,13 +972,23 @@ impl Esp32C3 {
         // Spec §7: a reset leaves an entry in the journal, with the PC and the stack it found,
         // and the device time that sets it apart from the other resets at the same PC.
         let at_us = self.device_time_nanos() / 1_000;
+        let woken_by = if cause == ResetCause::DeepSleep {
+            self.bus.periph.rtc_cntl.latched_wake()
+        } else {
+            None
+        };
         self.bus.ctx.diag.record(Diagnostic::Reset {
             cause,
             pc,
             sp,
             at_us,
+            woken_by,
         });
         self.bus.reset(cause, pc, sp);
+        // A system reset clears the holds of `RTC_CNTL`; a core reset keeps them, and the held
+        // pads keep their output through it.
+        let held = self.bus.periph.rtc_cntl.pad_hold_mask();
+        self.bus.periph.io.set_hold(&mut self.bus.ctx, held);
         // The flash-window page versions (`SocBus::page_version`) restart at 0 with the MMU and
         // the cache registers: a version can repeat with another mapping. That is safe only
         // because `Hart::reset` builds a new decode cache, at every level.
@@ -1217,6 +1296,68 @@ impl Esp32C3 {
         self.bus.periph.io.attach_clocked(&mut self.bus.ctx, chip);
     }
 
+    /// Attaches the inputs of the board's user (the keys, the power cable: ADR 0013), which
+    /// [`Esp32C3::send_board_input`] then takes. A second call replaces the first.
+    pub fn attach_board_inputs(&mut self, inputs: Box<dyn BoardInputs>) {
+        self.bus.periph.io.attach_board_inputs(inputs);
+    }
+
+    /// Attaches the supply of the board (ADR 0013): it is asked at once, then after each change of
+    /// what the chip drives on a pin and each input of the board that acts. Once it says the chip
+    /// has no power, the run stops for good ([`StopReason::PowerOff`]).
+    pub fn attach_supply(&mut self, supply: Box<dyn Supply>) {
+        self.bus.periph.io.attach_supply(&mut self.bus.ctx, supply);
+    }
+
+    /// The user acts on the board at device time `at` (a key, the power cable): the input is
+    /// journaled and acts at the next instant of the time base after `at`, the instruction under
+    /// way then ended (ADR 0013). A front end gives the present time; a replay gives every input
+    /// at power-on with its date.
+    ///
+    /// # Errors
+    /// [`InputError::InThePast`] for an input dated before the present time;
+    /// [`InputError::PoweredOff`] once the supply failed; [`InputError::NoBoard`] with no board
+    /// inputs attached; [`InputError::Board`] when the board refuses it;
+    /// [`InputError::TooManyBoardInputs`] when [`MAX_PENDING_BOARD_INPUTS`] wait already;
+    /// [`InputError::BeyondTime`] for an input dated so late it would act at the last instant of
+    /// the time base. Nothing is taken then.
+    pub fn send_board_input(&mut self, at: Cycles, input: BoardInput) -> Result<(), InputError> {
+        self.check_date(at)?;
+        // It acts at `at + 1`, which must stay below the last instant of the time base.
+        if at.get() >= u64::MAX - 1 {
+            return Err(InputError::BeyondTime {
+                at_nanos: clock::TIME_BASE.cycles_to_nanos(at),
+            });
+        }
+        self.bus
+            .periph
+            .io
+            .queue_board_input(&mut self.bus.ctx, at, input)
+            .map_err(|refusal| match refusal {
+                BoardRefusal::NoBoard => InputError::NoBoard,
+                BoardRefusal::Board(error) => InputError::Board(error),
+                BoardRefusal::TooMany => InputError::TooManyBoardInputs,
+            })?;
+        self.journal.record_board(at, input);
+        Ok(())
+    }
+
+    /// The inputs of the board that have not acted yet.
+    #[must_use]
+    pub fn board_inputs_pending(&self) -> usize {
+        self.bus.periph.io.board_inputs_pending()
+    }
+
+    /// Device time at which the board's supply failed, in nanoseconds since power-on, once it has.
+    #[must_use]
+    pub fn power_lost_nanos(&self) -> Option<u64> {
+        self.bus
+            .periph
+            .io
+            .power_lost()
+            .map(|at| clock::TIME_BASE.cycles_to_nanos(at))
+    }
+
     /// An attached chip changed what it drives from outside the run (a button the user pressed):
     /// the pins are read again at the present device time, and a GPIO interrupt it triggers is
     /// raised. Recording such a change in a session is the caller's (ADR 0012).
@@ -1255,6 +1396,9 @@ impl Esp32C3 {
     }
 
     fn check_date(&self, at: Cycles) -> Result<(), InputError> {
+        if self.bus.periph.io.power_lost().is_some() {
+            return Err(InputError::PoweredOff);
+        }
         let now = self.device_time();
         if at < now {
             return Err(InputError::InThePast {
@@ -1417,6 +1561,9 @@ impl Esp32C3 {
         self.trace.as_ref().map(TraceHash::finish)
     }
 }
+
+#[cfg(test)]
+mod board_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4534,6 +4681,7 @@ mod tests {
                 sp: 0x3FC9_0000,
                 // The few dozen cycles of 20 MHz before the store: a microsecond, rounded down.
                 at_us: 1,
+                woken_by: None,
             }],
             "the reset is in the journal, with the PC and the stack it found, and nothing else is"
         );
@@ -4551,6 +4699,7 @@ mod tests {
             pc: ROM_BASE + 4,
             sp: 0,
             at_us,
+            woken_by: None,
         };
         // 2 941 176 us: 400 000 cycles of the 136 kHz slow clock, rounded down.
         assert_eq!(

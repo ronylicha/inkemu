@@ -71,6 +71,7 @@ fn pass_end(
         (Err(_), _) => Some(RunEnd::ConsoleError),
         (Ok(true), StopReason::Idle) => Some(RunEnd::Idle),
         (Ok(true), StopReason::DeepSleep) => Some(RunEnd::DeepSleep),
+        (Ok(true), StopReason::PowerOff) => Some(RunEnd::PowerOff),
         (Ok(true), StopReason::CycleBudget) if cycle_limit_reached => Some(RunEnd::Budget),
         (Ok(true), StopReason::TimeBudget) => Some(RunEnd::TimeLimit),
         // The end of a slice, or a CPU that sleeps while device time goes on: the next pass
@@ -107,6 +108,10 @@ pub fn say_why(log: &mut dyn Write, end: RunEnd, stop: Option<&StopReason>) {
         RunEnd::DeepSleep => writeln!(
             log,
             "inkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here"
+        ),
+        RunEnd::PowerOff => writeln!(
+            log,
+            "inkemu: the device powered off: its board cut its supply, so the run ends here; power it on again to go on"
         ),
         RunEnd::Budget => writeln!(
             log,
@@ -260,12 +265,15 @@ pub enum RunEnd {
     /// cut, and is not reproducible from one run to the next. The hash of a run ended by a limit
     /// is.
     Interrupted,
+    /// The board's supply failed: the device powered off (ADR 0013), what a firmware does when it
+    /// turns a battery device off, so the run ended normally.
+    PowerOff,
 }
 
 impl RunEnd {
     /// Every way a run can end, for what must hold for each of them: a variant added to the enum
     /// is added here.
-    pub const ALL: [RunEnd; 8] = [
+    pub const ALL: [RunEnd; 9] = [
         RunEnd::Budget,
         RunEnd::TimeLimit,
         RunEnd::ConsoleClosed,
@@ -274,6 +282,7 @@ impl RunEnd {
         RunEnd::Idle,
         RunEnd::Interrupted,
         RunEnd::DeepSleep,
+        RunEnd::PowerOff,
     ];
 
     /// The process exit code of a run that ended this way.
@@ -284,7 +293,8 @@ impl RunEnd {
             | RunEnd::TimeLimit
             | RunEnd::ConsoleClosed
             | RunEnd::Interrupted
-            | RunEnd::DeepSleep => EXIT_OK,
+            | RunEnd::DeepSleep
+            | RunEnd::PowerOff => EXIT_OK,
             RunEnd::ConsoleError => EXIT_ERROR,
             RunEnd::StrictMmio => EXIT_STRICT_MMIO,
             RunEnd::Idle => EXIT_IDLE,
@@ -307,7 +317,8 @@ impl RunEnd {
             | RunEnd::ConsoleError
             | RunEnd::Idle
             | RunEnd::Interrupted
-            | RunEnd::DeepSleep => EXIT_ERROR,
+            | RunEnd::DeepSleep
+            | RunEnd::PowerOff => EXIT_ERROR,
         }
     }
 }
@@ -551,6 +562,7 @@ pub const fn session_end(end: RunEnd) -> Result<Reached, CutReason> {
         RunEnd::TimeLimit => Ok(Reached::TimeLimit),
         RunEnd::Idle => Ok(Reached::Idle),
         RunEnd::DeepSleep => Ok(Reached::DeepSleep),
+        RunEnd::PowerOff => Ok(Reached::PowerOff),
         RunEnd::StrictMmio => Ok(Reached::StrictMmio),
         RunEnd::Interrupted => Err(CutReason::Interrupted),
         RunEnd::ConsoleClosed => Err(CutReason::ReaderGone),
@@ -757,24 +769,29 @@ fn flush_the_other_consoles(
 #[must_use]
 pub fn deep_sleep_line(sleep: &DeepSleep) -> String {
     let since = sleep.since_nanos / 1_000;
+    let pins = sleep.wake_sources & DeepSleep::GPIO != 0;
     let waits = match sleep.timer_wake_nanos {
-        Some(wake) => format!("the RTC timer wakes it at {} us", wake / 1_000),
+        Some(wake) => {
+            let or_pins = if pins {
+                ", or a wake pin before then"
+            } else {
+                ""
+            };
+            format!("the RTC timer wakes it at {} us{or_pins}", wake / 1_000)
+        }
         None if sleep.wake_sources == 0 => {
             "it waits for nothing: the firmware enabled no wake source".to_owned()
         }
         None => {
-            // The RTC timer is modelled: enabled as a source without its alarm, it wakes
-            // nothing, which is not the same as a source inkemu lacks.
-            let unmodelled = sleep.wake_sources & !DeepSleep::TIMER;
-            let waits = if unmodelled == 0 {
-                "it waits for nothing".to_owned()
+            // The RTC timer and the pins are modelled: the timer enabled as a source without its
+            // alarm wakes nothing, which is not the same as a source inkemu lacks.
+            let unmodelled = sleep.wake_sources & !(DeepSleep::TIMER | DeepSleep::GPIO);
+            let waits = if unmodelled != 0 {
+                "it waits for a wake source inkemu does not model"
+            } else if pins {
+                "it waits for a wake pin (GPIO, bit 2): a button of the device wakes it"
             } else {
-                let gpio = if unmodelled & DeepSleep::GPIO != 0 {
-                    " (GPIO, bit 2, belongs to sub-project 2d)"
-                } else {
-                    ""
-                };
-                format!("it waits for a wake source inkemu does not model{gpio}")
+                "it waits for nothing"
             };
             let timer = if sleep.wake_sources & DeepSleep::TIMER != 0 {
                 "; the RTC timer is a wake source but its alarm is not enabled \
@@ -1706,16 +1723,19 @@ mod tests {
     }
 
     #[test]
-    fn a_gpio_wake_is_named_and_the_run_ends_asleep() {
-        // F5: what CrossPoint arms before it sleeps, GPIO alone.
+    fn a_sleep_on_the_pins_alone_with_nothing_to_press_them_ends_the_run_asleep() {
+        // F5: what CrossPoint arms before it sleeps, GPIO alone; a machine with no board has
+        // nothing to bring a pin to its level, and the run ends there, without a warning.
         let run = run_bounded(deep_sleeping(1 << 2 << 15, 0), UNLIMITED);
         assert_eq!(run.end, RunEnd::DeepSleep);
-        for line in [
-            "warning: the chip went into deep sleep with wake sources inkemu does not model (WAKEUP_ENA 0x00004, pc ",
-            "it waits for a wake source inkemu does not model (GPIO, bit 2, belongs to sub-project 2d): WAKEUP_ENA 0x00004\n",
-        ] {
-            assert!(run.log.contains(line), "`{line}` is missing:\n{}", run.log);
-        }
+        assert!(
+            run.log.contains(
+                "it waits for a wake pin (GPIO, bit 2): a button of the device wakes it: WAKEUP_ENA 0x00004\n"
+            ),
+            "{}",
+            run.log
+        );
+        assert!(!run.log.contains("warning:"), "{}", run.log);
     }
 
     #[test]
@@ -1791,7 +1811,11 @@ mod tests {
         );
         assert_eq!(
             line(None, DeepSleep::TIMER | DeepSleep::GPIO),
-            "inkemu: the device is in deep sleep since 1500 us of device time; it waits for a wake source inkemu does not model (GPIO, bit 2, belongs to sub-project 2d): WAKEUP_ENA 0x0000c; the RTC timer is a wake source but its alarm is not enabled (SLP_TIMER1.MAIN_TIMER_ALARM_EN)"
+            "inkemu: the device is in deep sleep since 1500 us of device time; it waits for a wake pin (GPIO, bit 2): a button of the device wakes it: WAKEUP_ENA 0x0000c; the RTC timer is a wake source but its alarm is not enabled (SLP_TIMER1.MAIN_TIMER_ALARM_EN)"
+        );
+        assert_eq!(
+            line(Some(3_500_000), DeepSleep::TIMER | DeepSleep::GPIO),
+            "inkemu: the device is in deep sleep since 1500 us of device time; the RTC timer wakes it at 3500 us, or a wake pin before then"
         );
     }
 

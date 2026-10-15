@@ -195,6 +195,15 @@ impl Deadline {
     }
 }
 
+/// What `RTC_CNTL` left for the machine since it last looked.
+#[derive(Clone, Copy, Debug, Default)]
+struct RtcNotes {
+    /// The chip went into deep sleep.
+    deep_sleep_entered: bool,
+    /// `PAD_HOLD` or `DIG_PAD_HOLD` was written.
+    pad_hold_written: bool,
+}
+
 /// The context of a peripheral access. The bus owns it and hands it to every register read and
 /// write; the machine reads what the peripherals left in it after each instruction.
 #[derive(Debug)]
@@ -223,8 +232,8 @@ pub struct Ctx {
     interrupts_changed: bool,
     /// The reset a device asked for, if any: see [`Ctx::request_reset`] for which request is kept.
     reset: Option<ResetCause>,
-    /// `RTC_CNTL` put the chip in deep sleep since the machine last looked.
-    deep_sleep_entered: bool,
+    /// What `RTC_CNTL` left for the machine.
+    rtc: RtcNotes,
     /// Every refusal in the order it was reported, for the tests of the device models: the
     /// diagnostics list a repeated refusal once, and a device test wants to see each one.
     #[cfg(test)]
@@ -246,7 +255,7 @@ impl Ctx {
             sources: 0,
             interrupts_changed: false,
             reset: None,
-            deep_sleep_entered: false,
+            rtc: RtcNotes::default(),
             #[cfg(test)]
             refused: VecDeque::new(),
         }
@@ -451,24 +460,36 @@ impl Ctx {
     }
 
     /// Whether a device left something for the machine: a reset request, a clock selection write,
-    /// a change of the interrupt lines or the entry into deep sleep.
+    /// a change of the interrupt lines, the entry into deep sleep or a change of the pads held.
     #[must_use]
     pub const fn is_flagged(&self) -> bool {
         self.clock_written
             || self.interrupts_changed
             || self.reset.is_some()
-            || self.deep_sleep_entered
+            || self.rtc.deep_sleep_entered
+            || self.rtc.pad_hold_written
+    }
+
+    /// `RTC_CNTL` tells that software changed which pads are held: the IO matrix learns it from
+    /// the machine (ADR 0003).
+    pub fn note_pad_hold(&mut self) {
+        self.rtc.pad_hold_written = true;
+    }
+
+    /// Whether the pads held changed since the last call.
+    pub(crate) fn take_pad_hold_written(&mut self) -> bool {
+        std::mem::take(&mut self.rtc.pad_hold_written)
     }
 
     /// `RTC_CNTL` tells that the chip went into deep sleep (F1): the CPU executes nothing from the
     /// end of the current instruction until a reset.
     pub fn enter_deep_sleep(&mut self) {
-        self.deep_sleep_entered = true;
+        self.rtc.deep_sleep_entered = true;
     }
 
     /// Whether the chip went into deep sleep since the last call.
     pub(crate) fn take_deep_sleep_entered(&mut self) -> bool {
-        std::mem::take(&mut self.deep_sleep_entered)
+        std::mem::take(&mut self.rtc.deep_sleep_entered)
     }
 
     /// Every source is released at once: what a reset of the digital peripherals does.

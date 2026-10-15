@@ -13,10 +13,10 @@
 //! this module reads `DG_WRAP_PD_EN` from it at the write of `SLEEP_EN`.
 use super::{INT_SLP_REJECT, INT_SLP_WAKEUP, INT_TIMER_ALARM, RtcCntl, reg};
 use crate::ctx::Ctx;
-use crate::diag::Unsupported;
+use crate::diag::{Unsupported, Wake};
 use crate::periph::RTC_CNTL_BASE;
 use crate::reset::ResetCause;
-use emu_core::Cycles;
+use emu_core::{Cycles, Level};
 
 const SLP_TIMER0: u32 = reg("SLP_TIMER0");
 const SLP_TIMER1: u32 = reg("SLP_TIMER1");
@@ -47,8 +47,22 @@ const STATE0_SIGNALS: u32 = SLP_REJECT | SLP_WAKEUP | SW_CPU_INT;
 const WAKEUP_ENA_SHIFT: u32 = 15;
 const WAKEUP_STATE_STORED: u32 = 0xFFFF_8000;
 /// Bit 3 of `WAKEUP_ENA` and of `SLP_WAKEUP_CAUSE`, the RTC timer (`RTC_TIMER_TRIG_EN`,
-/// `IDF:esp_hw_support/port/esp32c3/include/soc/rtc.h:665`): the one wake source the model raises.
+/// `IDF:esp_hw_support/port/esp32c3/include/soc/rtc.h:665`).
 const TIMER_WAKE: u32 = 1 << 3;
+/// Bit 2 of `WAKEUP_ENA` and of `SLP_WAKEUP_CAUSE`, the pins (`RTC_GPIO_TRIG_EN`, `rtc.h:664`;
+/// `sleep_modes.c:2289` reads it as `ESP_SLEEP_WAKEUP_GPIO`).
+const GPIO_WAKE: u32 = 1 << 2;
+/// `GPIO_WAKEUP` (`rtc_cntl_reg.h:2343-2433`): bit `31 - n` the wake of GPIO`n` (n = 0 to 5),
+/// bits `[25 - 3n : 23 - 3n]` its type (4 low level, 5 high level, as `GPIO_PINn.INT_TYPE`), bit 7
+/// the clock gate, bit 6 `GPIO_WAKEUP_STATUS_CLR` (R/W), bits `[5:0]` `GPIO_WAKEUP_STATUS`
+/// (read-only: the pins that woke the chip).
+const GPIO_WAKEUP: u32 = reg("GPIO_WAKEUP");
+const GPIO_WAKEUP_STATUS: u32 = 0x3F;
+const GPIO_WAKEUP_STATUS_CLR: u32 = 1 << 6;
+/// The pins that can wake the chip from a deep sleep (`SOC_GPIO_DEEP_SLEEP_WAKE_VALID_GPIO_MASK`).
+pub(crate) const WAKE_PINS: usize = 6;
+const LOW_LEVEL: u32 = 4;
+const HIGH_LEVEL: u32 = 5;
 /// `DIG_PWC` bit 31, `DG_WRAP_PD_EN` (`rtc_cntl_reg.h:1330`): `rtc_sleep_init` sets it for a deep
 /// sleep and clears it for a light one (`rtc_sleep.c:211-224`; DS §A.4), and the TRM makes it the
 /// switch of the digital regulator in sleep (§9.3).
@@ -86,6 +100,10 @@ pub(super) struct Sleep {
     wakeup_state: u32,
     /// `SLP_WAKEUP_CAUSE`: the source of the last wake, as `WAKEUP_ENA` numbers it.
     wakeup_cause: u32,
+    /// `GPIO_WAKEUP` as written, its status bits aside.
+    gpio_wakeup: u32,
+    /// `GPIO_WAKEUP_STATUS`: the pins that woke the chip, until software clears them.
+    gpio_status: u32,
     /// Device time of the entry into deep sleep, while the chip sleeps.
     asleep: Option<Cycles>,
 }
@@ -104,6 +122,8 @@ impl Sleep {
             state0: 0,
             wakeup_state: documented(WAKEUP_STATE) & WAKEUP_STATE_STORED,
             wakeup_cause: 0,
+            gpio_wakeup: 0,
+            gpio_status: 0,
             asleep: None,
         }
     }
@@ -141,6 +161,7 @@ impl RtcCntl {
             STATE0 => sleep.state0,
             WAKEUP_STATE => sleep.wakeup_state,
             SLP_WAKEUP_CAUSE => sleep.wakeup_cause,
+            GPIO_WAKEUP => sleep.gpio_wakeup | sleep.gpio_status,
             // No reject source is modelled: the light sleep the model refuses is rejected without
             // one, and the cause reads 0.
             SLP_REJECT_CAUSE => 0,
@@ -164,6 +185,14 @@ impl RtcCntl {
             }
             STATE0 => self.write_state0(ctx, value),
             WAKEUP_STATE => self.sleep.wakeup_state = value & WAKEUP_STATE_STORED,
+            GPIO_WAKEUP => {
+                // `rtc_cntl_ll_gpio_clear_wakeup_status` sets then clears the clear bit
+                // (`rtc_cntl_ll.h:32-36`): while it is set, the status reads 0.
+                if value & GPIO_WAKEUP_STATUS_CLR != 0 {
+                    self.sleep.gpio_status = 0;
+                }
+                self.sleep.gpio_wakeup = value & !GPIO_WAKEUP_STATUS;
+            }
             // Read-only: the write is reported as unmodelled.
             SLP_WAKEUP_CAUSE | SLP_REJECT_CAUSE => return Some(false),
             _ => return None,
@@ -203,7 +232,7 @@ impl RtcCntl {
             return;
         }
         let sources = self.sleep.wake_sources();
-        if sources & !TIMER_WAKE != 0 {
+        if sources & !(TIMER_WAKE | GPIO_WAKE) != 0 {
             ctx.unsupported(Unsupported::SleepWakeSource {
                 wakeup_ena: sources,
             });
@@ -242,6 +271,55 @@ impl RtcCntl {
             ctx.request_reset(ResetCause::DeepSleep);
         }
         None
+    }
+
+    /// The level each of GPIO0 to GPIO5 wakes the sleeping chip at, `None` for a pin that does
+    /// not: `None` altogether while the chip is awake or when the pins are no wake source
+    /// (`WAKEUP_ENA` bit 2).
+    ///
+    /// ASSUMPTION: a type other than the two levels ESP-IDF writes (4 and 5) wakes nothing; the
+    /// TRM gives the field the meaning of `GPIO_PINn.INT_TYPE` and ESP-IDF refuses the edges
+    /// (`gpio.c:1029-1049`, report DS §5).
+    pub(crate) fn gpio_wake_levels(&self) -> Option<[Option<Level>; WAKE_PINS]> {
+        if !self.sleep.is_asleep() || self.sleep.wake_sources() & GPIO_WAKE == 0 {
+            return None;
+        }
+        let wakeup = self.sleep.gpio_wakeup;
+        Some(std::array::from_fn(|pin| {
+            let pin = u32::try_from(pin).unwrap_or(0);
+            if wakeup & (1 << (31 - pin)) == 0 {
+                return None;
+            }
+            match (wakeup >> (23 - 3 * pin)) & 0x7 {
+                LOW_LEVEL => Some(Level::Low),
+                HIGH_LEVEL => Some(Level::High),
+                _ => None,
+            }
+        }))
+    }
+
+    /// The pins of `pins` (bit `n` for GPIO`n`) are at their wake level: the chip wakes, with the
+    /// cause and the status ESP-IDF reads after the reset of cause 5 (`sleep_modes.c:2289`,
+    /// `esp_sleep_get_gpio_wakeup_status`).
+    pub(crate) fn wake_on_pins(&mut self, ctx: &mut Ctx, pins: u32) {
+        if pins == 0 || !self.sleep.is_asleep() {
+            return;
+        }
+        self.sleep.wakeup_cause = GPIO_WAKE;
+        self.sleep.gpio_status |= pins & GPIO_WAKEUP_STATUS;
+        self.int_raw |= INT_SLP_WAKEUP;
+        self.sleep.state0 &= !SLEEP_EN;
+        ctx.request_reset(ResetCause::DeepSleep);
+    }
+
+    /// What the latched wake cause says woke the chip, the cause ESP-IDF reads after the reset of
+    /// cause 5: `None` when neither the timer nor a pin is latched.
+    pub(crate) fn latched_wake(&self) -> Option<Wake> {
+        match self.sleep.wakeup_cause {
+            TIMER_WAKE => Some(Wake::RtcTimer),
+            GPIO_WAKE => Some(Wake::Pins(self.sleep.gpio_status & GPIO_WAKEUP_STATUS)),
+            _ => None,
+        }
     }
 
     /// The sleep, for the machine and a front end: `None` while the chip is awake.
@@ -429,21 +507,42 @@ mod tests {
     }
 
     #[test]
-    fn a_gpio_wake_is_named_and_the_chip_sleeps_on_the_timer_alone() {
+    fn a_gpio_wake_names_its_pins_and_their_levels_and_wakes_with_its_cause_and_status() {
         let ctx = &mut Ctx::default();
         let mut rtc = rtc(ctx);
         rtc.write(ctx, DIG_PWC, DEEP);
-        // GPIO alone: what CrossPoint arms to be woken by its power button.
-        rtc.write(ctx, WAKEUP_STATE, 1 << 2 << WAKEUP_ENA_SHIFT);
-        rtc.write(ctx, STATE0, SLEEP_EN);
-        assert_eq!(
-            ctx.take_unsupported(),
-            Some(Unsupported::SleepWakeSource { wakeup_ena: 1 << 2 })
+        // What `gpio_deep_sleep_wakeup_enable` writes for GPIO3 low and GPIO1 high (DS §5).
+        let gpio3_low = 1 << (31 - 3) | LOW_LEVEL << (23 - 9);
+        let gpio1_high = 1 << (31 - 1) | HIGH_LEVEL << (23 - 3);
+        // GPIO5 enabled with an edge type: wakes nothing.
+        let gpio5_edge = 1 << (31 - 5) | 1 << (23 - 15);
+        rtc.write(
+            ctx,
+            GPIO_WAKEUP,
+            gpio3_low | gpio1_high | gpio5_edge | 1 << 7,
         );
+        assert_eq!(rtc.gpio_wake_levels(), None, "awake");
+        // GPIO alone: what CrossPoint arms to be woken by its power button.
+        rtc.write(ctx, WAKEUP_STATE, GPIO_WAKE << WAKEUP_ENA_SHIFT);
+        rtc.write(ctx, STATE0, SLEEP_EN);
+        assert_eq!(ctx.take_unsupported(), None, "the pins are a wake source");
         assert!(rtc.is_in_deep_sleep());
         let state = rtc.deep_sleep(ctx.now()).unwrap();
-        assert_eq!((state.timer_wake, state.wake_sources), (None, 1 << 2));
-        assert_eq!(rtc.next_call(), None, "nothing the model has can wake it");
+        assert_eq!((state.timer_wake, state.wake_sources), (None, GPIO_WAKE));
+        assert_eq!(
+            rtc.gpio_wake_levels(),
+            Some([None, Some(Level::High), None, Some(Level::Low), None, None])
+        );
+        rtc.wake_on_pins(ctx, 1 << 3);
+        assert_eq!(ctx.take_reset(), Some(ResetCause::DeepSleep));
+        rtc.reset(ctx, ResetCause::DeepSleep, false);
+        assert_eq!(rtc.read(ctx, SLP_WAKEUP_CAUSE), Some(GPIO_WAKE));
+        let wakeup = rtc.read(ctx, GPIO_WAKEUP).unwrap();
+        assert_eq!(wakeup & GPIO_WAKEUP_STATUS, 1 << 3, "the pin that woke it");
+        // `rtc_cntl_ll_gpio_clear_wakeup_status`: set, then clear the clear bit.
+        rtc.write(ctx, GPIO_WAKEUP, wakeup | GPIO_WAKEUP_STATUS_CLR);
+        rtc.write(ctx, GPIO_WAKEUP, wakeup & !GPIO_WAKEUP_STATUS_CLR);
+        assert_eq!(rtc.read(ctx, GPIO_WAKEUP).unwrap() & GPIO_WAKEUP_STATUS, 0);
     }
 
     #[test]

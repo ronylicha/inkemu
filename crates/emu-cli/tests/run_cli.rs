@@ -145,7 +145,7 @@ fn a_file_that_is_no_session_exits_2_before_any_rom_is_read() {
         .assert()
         .code(2)
         .stderr(contains(
-            "is refused: the file is a session of format `inkemu-session 9`, and this inkemu reads `inkemu-session 1` only",
+            "is refused: the file is a session of format `inkemu-session 9`, and this inkemu reads `inkemu-session 1` and `inkemu-session 2` only",
         ));
 }
 
@@ -165,6 +165,7 @@ fn a_session_whose_profile_would_drive_the_terminal_is_refused_with_its_text_esc
             text: text.clone(),
         },
         flash: vec![0xFF; 16 << 20],
+        sd: None,
         limits: session::Limits::default(),
         usb_host: soc_esp32c3::UsbHost::Open,
         inputs: Vec::new(),
@@ -175,6 +176,7 @@ fn a_session_whose_profile_would_drive_the_terminal_is_refused_with_its_text_esc
             instructions: 0,
             trace_hash: 0,
             flash_sha256: [0; 32],
+            sd_changes: None,
             consoles: [[0; 32]; 3],
         },
     };
@@ -323,7 +325,7 @@ fn run_help_tells_the_two_limits_apart() {
     for expected in [
         "--max-cycles <MAX_CYCLES> Stop when the CPU has executed this many cycles of its clock. The limit counts executed cycles, not device time: a sleeping CPU executes none, so a firmware that sleeps reaches it late, and one whose sleep nothing interrupts never does; --max-time bounds both",
         "--max-time <SECONDS> Stop when this many seconds of device time have elapsed since power-on (a decimal number: 30, 2.5, 0.001). Device time goes on while the CPU sleeps and across resets",
-        "0 the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was pressed, the reader of standard output went away, or the device went into a deep sleep nothing inkemu models can wake it from",
+        "0 the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was pressed, the reader of standard output went away, the device went into a deep sleep nothing inkemu models can wake it from, or the device turned its own supply off",
     ] {
         assert!(
             out.contains(expected),
@@ -367,6 +369,50 @@ fn console_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let path = dir.path().join("steps.txt");
     std::fs::write(&path, format!("inkemu-console-script 1\n{body}")).unwrap();
     (dir, path)
+}
+
+/// H6: a card, the cable or a hold of the power key, on a device whose profile has no line for
+/// it (the X3), is refused before anything of the run is opened: no flash file nor its lock is
+/// made, the image is not read (here it does not even exist), and no ROM is looked for.
+#[test]
+fn a_board_option_the_device_has_no_line_for_is_refused_before_any_file_is_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty_rom_dir = dir.path().join("roms");
+    std::fs::create_dir(&empty_rom_dir).unwrap();
+    let flash_file = dir.path().join("x3.flash");
+    let missing_card = dir.path().join("missing.img");
+    let card = ["--sd-image".to_owned(), missing_card.display().to_string()];
+    let cases: [(&[String], &str); 3] = [
+        (&card, "has no SD card slot in its profile"),
+        (
+            &["--usb-power".to_owned()],
+            "has no USB detect line in its profile",
+        ),
+        (
+            &["--power-hold".to_owned(), "10".to_owned()],
+            "has no power key in its profile",
+        ),
+    ];
+    for (option, said) in cases {
+        inkemu()
+            .args(["run", "--device", "x3", "--rom-dir"])
+            .arg(&empty_rom_dir)
+            .arg("--flash-file")
+            .arg(&flash_file)
+            .args(option)
+            .assert()
+            .code(2)
+            .stderr(
+                contains(said)
+                    .and(contains("esp32c3").not())
+                    .and(contains("missing.img").not()),
+            );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["roms"], "{option:?} left {left:?}");
+    }
 }
 
 #[test]
@@ -1877,7 +1923,7 @@ fn run_help_documents_the_flash_file_its_lock_and_its_reset() {
             .and(contains("--reset-flash"))
             .and(contains("The image is only read"))
             .and(contains(
-                "the flash file could not be written when the run ended",
+                "the flash file or the SD image could not be written",
             )),
     );
 }
@@ -4581,7 +4627,8 @@ fn x4_records_the_deep_sleep_timer_reference_firmware_through_its_wakes_and_repl
     for expected in [
         "inkemu: console script through (7 steps)\n",
         "\ninkemu: the device went into deep sleep and nothing inkemu models can wake it, so the run ends here\n",
-        "inkemu: session recorded in deep_sleep_timer.inkrec (4 inputs); `inkemu replay` replays it\n",
+        // The four of the script, and the press and release of the power key at power-on.
+        "inkemu: session recorded in deep_sleep_timer.inkrec (6 inputs); `inkemu replay` replays it\n",
     ] {
         assert!(
             run_log.contains(expected),
@@ -4623,6 +4670,245 @@ fn x4_records_the_deep_sleep_timer_reference_firmware_through_its_wakes_and_repl
         "a recorded run prints its trace hash:\n{run_log}"
     );
     assert_eq!(trace_hash_line(&log), trace, "{log}");
+}
+
+/// The trace of the run of `x4_panel_buttons` below, measured on 2026-10-15 on the development
+/// host with every other assertion of the test passing (twice, the same).
+const X4_PANEL_TRACE: &str = "trace-hash 88a64f66f1a1c1d4";
+
+/// What a user does to `x4_panel_buttons` on the wired X4: once its power key is armed, Confirm,
+/// then Down, each shown by a refresh, then the power key.
+const X4_PANEL_SCRIPT: &str = "\
+wait-for usb-serial-jtag \"x4_panel_buttons: power key released, armed\"
+press confirm
+wait 100ms
+release confirm
+wait-for usb-serial-jtag \"partial refresh 1,\"
+press down
+wait 100ms
+release down
+wait-for usb-serial-jtag \"partial refresh 2,\"
+press power
+wait 100ms
+release power
+";
+
+/// The wired X4 through the real command (sub-project 2d, ADR 0013): `x4_panel_buttons`, powered
+/// on by the gesture of the profile, holds its latch, refreshes its panel once in full, shows the
+/// presses of a console script by two differential refreshes, and lets go of its latch when its
+/// power key is pressed: the X4 goes off when the key is released, the run ends with exit code 0
+/// and says so. Recorded with `--record`, the session (the gesture and the six presses and
+/// releases) replays identically. The pixels are read by `crates/boards/tests/reference_panel.rs`.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_X4_PANEL_APP"]
+fn x4_runs_the_panel_and_buttons_reference_firmware_to_its_power_off_and_replays_it_identically() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let application = std::env::var("INKEMU_X4_PANEL_APP").expect(
+        "set INKEMU_X4_PANEL_APP to the x4_panel_buttons.bin of tools/reference-firmware/build.sh",
+    );
+    assert_eq!(
+        sha256_of(std::path::Path::new(&application)),
+        pinned_in_sums("SHA256SUMS.inputs-x4-panel-buttons", "x4_panel_buttons.bin"),
+        "{application} is not the pinned x4_panel_buttons.bin; rebuild it with tools/reference-firmware/build.sh"
+    );
+    let (_script_dir, script) = console_script(X4_PANEL_SCRIPT);
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("x4_panel_buttons.inkrec");
+    let run = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--max-time",
+            "10",
+            "--rom-dir",
+            &rom_dir,
+        ])
+        .arg("--firmware")
+        .arg(&application)
+        .arg("--console-script")
+        .arg(&script)
+        .arg("--record")
+        .arg(&session)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&run.stdout).replace('\r', "");
+    let log = String::from_utf8_lossy(&run.stderr).into_owned();
+    let mut from = 0;
+    for expected in [
+        "x4_panel_buttons: start, latch held\n",
+        "x4_panel_buttons: usb cable unplugged\n",
+        "x4_panel_buttons: battery ",
+        "x4_panel_buttons: full refresh, busy ",
+        "x4_panel_buttons: ready\n",
+        "x4_panel_buttons: power key released, armed\n",
+        "x4_panel_buttons: pressed confirm\n",
+        "x4_panel_buttons: partial refresh 1, busy ",
+        "x4_panel_buttons: pressed down\n",
+        "x4_panel_buttons: partial refresh 2, busy ",
+        "x4_panel_buttons: power key pressed, latch released\n",
+    ] {
+        let at = console[from..].find(expected).unwrap_or_else(|| {
+            panic!("`{expected}` is missing, or out of order:\n{console}\n{log}")
+        });
+        from += at + expected.len();
+    }
+    for expected in [
+        "\ninkemu: the device powered off: its board cut its supply, so the run ends here; ",
+        "inkemu: console script through (12 steps)\n",
+        // The press and release of the power key at power-on, and the six of the script.
+        "inkemu: session recorded in x4_panel_buttons.inkrec (8 inputs); `inkemu replay` replays it\n",
+    ] {
+        assert!(log.contains(expected), "`{expected}` is missing:\n{log}");
+    }
+    assert!(!log.contains("warning:"), "{log}");
+    let measured = trace_hash_line(&log);
+    assert_eq!(
+        measured,
+        Some(X4_PANEL_TRACE),
+        "the trace hash of this run is {measured:?}: when the run above is the one intended, pin it in X4_PANEL_TRACE\n{log}"
+    );
+    let replayed = inkemu()
+        .arg("replay")
+        .arg(&session)
+        .args(["--rom-dir", &rom_dir])
+        .timeout(HANG_LIMIT)
+        .output()
+        .unwrap();
+    let replay_log = String::from_utf8_lossy(&replayed.stderr).into_owned();
+    assert_eq!(replayed.status.code(), Some(0), "{replay_log}");
+    assert_eq!(
+        String::from_utf8_lossy(&replayed.stdout).replace('\r', ""),
+        console,
+        "the replay shows the console of the run"
+    );
+    assert!(
+        replay_log.contains("inkemu: the replay gives what the session recorded: "),
+        "{replay_log}"
+    );
+    assert_eq!(trace_hash_line(&replay_log), measured, "{replay_log}");
+}
+
+/// The trace of the run of `x4_panel_buttons` on a cable below, measured on 2026-10-15 on the
+/// development host with every other assertion of the test passing (twice, the same).
+const X4_PANEL_WAKE_TRACE: &str = "trace-hash b5891d847fa1e6f9";
+
+/// The cable in: the power key sends `x4_panel_buttons` into deep sleep woken by that key, half a
+/// second later the key wakes it, and its second life arms the key again.
+const X4_PANEL_WAKE_SCRIPT: &str = "\
+wait-for usb-serial-jtag \"x4_panel_buttons: power key released, armed\"
+press power
+wait 100ms
+release power
+wait-for usb-serial-jtag \"x4_panel_buttons: power key released, sleeping\"
+wait 500ms
+press power
+wait 100ms
+release power
+wait-for usb-serial-jtag \"x4_panel_buttons: power key released, armed\"
+";
+
+/// The wake of a deep sleep by a pin, recorded and replayed (spec §6.4, 2d-D11, 2d-D21): with
+/// `--usb-power`, `x4_panel_buttons` goes into deep sleep woken by the power key (GPIO3 low); a
+/// press of the key wakes it as a core reset of cause 5, and its next life says it was the key.
+/// The session (format 2: the gesture, the cable, the four presses and releases of the script)
+/// replays identically, the wake included.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_X4_PANEL_APP"]
+fn x4_records_the_wake_of_the_panel_reference_firmware_by_its_power_key_and_replays_it_identically()
+{
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let application = std::env::var("INKEMU_X4_PANEL_APP").expect(
+        "set INKEMU_X4_PANEL_APP to the x4_panel_buttons.bin of tools/reference-firmware/build.sh",
+    );
+    assert_eq!(
+        sha256_of(std::path::Path::new(&application)),
+        pinned_in_sums("SHA256SUMS.inputs-x4-panel-buttons", "x4_panel_buttons.bin"),
+        "{application} is not the pinned x4_panel_buttons.bin; rebuild it with tools/reference-firmware/build.sh"
+    );
+    let (_script_dir, script) = console_script(X4_PANEL_WAKE_SCRIPT);
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("wake.inkrec");
+    let run = inkemu()
+        .args(["run", "--device", "x4", "--usb-power", "--max-time", "10"])
+        .args(["--rom-dir", &rom_dir])
+        .arg("--firmware")
+        .arg(&application)
+        .arg("--console-script")
+        .arg(&script)
+        .arg("--record")
+        .arg(&session)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&run.stdout).replace('\r', "");
+    let log = String::from_utf8_lossy(&run.stderr).into_owned();
+    let mut from = 0;
+    for expected in [
+        "x4_panel_buttons: start, latch held\n",
+        "x4_panel_buttons: usb cable plugged\n",
+        "x4_panel_buttons: power key released, armed\n",
+        "x4_panel_buttons: power key pressed, cable in: deep sleep until the power key\n",
+        "x4_panel_buttons: power key released, sleeping\n",
+        "rst:0x5 (DSLEEP),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        "x4_panel_buttons: start, woken by the power key, latch held\n",
+        "x4_panel_buttons: usb cable plugged\n",
+        "x4_panel_buttons: full refresh, busy ",
+        "x4_panel_buttons: power key released, armed\n",
+    ] {
+        let at = console[from..].find(expected).unwrap_or_else(|| {
+            panic!("`{expected}` is missing, or out of order:\n{console}\n{log}")
+        });
+        from += at + expected.len();
+    }
+    for expected in [
+        // The wake names the pin that woke the chip, not the RTC timer.
+        "\ninkemu: woken from deep sleep by GPIO3 (rst:0x5), a core reset at ",
+        "inkemu: console script through (10 steps)\n",
+        // The press and release of the gesture, the cable, and the four of the script.
+        "inkemu: session recorded in wake.inkrec (7 inputs); `inkemu replay` replays it\n",
+    ] {
+        assert!(log.contains(expected), "`{expected}` is missing:\n{log}");
+    }
+    assert!(!log.contains("warning:"), "{log}");
+    assert!(
+        !log.contains("powered off"),
+        "the cable keeps it on:\n{log}"
+    );
+    let measured = trace_hash_line(&log);
+    assert_eq!(
+        measured,
+        Some(X4_PANEL_WAKE_TRACE),
+        "the trace hash of this run is {measured:?}: when the run above is the one intended, pin it in X4_PANEL_WAKE_TRACE\n{log}"
+    );
+    let replayed = inkemu()
+        .arg("replay")
+        .arg(&session)
+        .args(["--rom-dir", &rom_dir])
+        .timeout(HANG_LIMIT)
+        .output()
+        .unwrap();
+    let replay_log = String::from_utf8_lossy(&replayed.stderr).into_owned();
+    assert_eq!(replayed.status.code(), Some(0), "{replay_log}");
+    assert_eq!(
+        String::from_utf8_lossy(&replayed.stdout).replace('\r', ""),
+        console,
+        "the replay shows the console of the run, the wake included"
+    );
+    assert!(
+        replay_log.contains("inkemu: the replay gives what the session recorded: "),
+        "{replay_log}"
+    );
+    assert_eq!(trace_hash_line(&replay_log), measured, "{replay_log}");
 }
 
 /// The `CoreMark` score Espressif publishes for the ESP32-C3, one core at 160 MHz: "483.27
@@ -4919,5 +5205,132 @@ fn x4_records_the_uart_select_reference_firmware_typed_into_and_replays_it_ident
     assert!(
         String::from_utf8_lossy(&diverged.stdout).contains("uart_select_example: Received: z"),
         "the replay ran the changed input"
+    );
+}
+
+/// The SD image is a file of the run (design of sub-project 2e, §9): neither the flash file nor
+/// the session may be it or its journal, and both are refused before any ROM is read.
+#[test]
+fn an_sd_image_that_is_the_flash_file_or_holds_the_session_is_refused_before_any_rom_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("roms");
+    std::fs::create_dir(&empty).unwrap();
+    let card = dir.path().join("card.img");
+    inkemu()
+        .args(["run", "--device", "x4", "--rom-dir"])
+        .arg(&empty)
+        .arg("--flash-file")
+        .arg(&card)
+        .arg("--sd-image")
+        .arg(&card)
+        .assert()
+        .code(2)
+        .stderr(contains("error: ").and(contains("card.img")));
+    inkemu()
+        .args(["run", "--device", "x4", "--rom-dir"])
+        .arg(&empty)
+        .arg("--record")
+        .arg(dir.path().join(".card.img.journal"))
+        .arg("--sd-image")
+        .arg(&card)
+        .assert()
+        .code(2)
+        .stderr(contains("the journal of the SD image"));
+    inkemu()
+        .args(["run", "--device", "x4", "--sd-read-only"])
+        .assert()
+        .code(2)
+        .stderr(contains("--sd-image"));
+}
+
+/// R3: the image is opened after the ROM is read, as the application opens it: a run that has
+/// neither its ROM nor its image is refused for its ROM, and the image is not looked at.
+#[test]
+fn a_run_without_its_rom_nor_its_sd_image_is_refused_for_its_rom_as_the_application_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("roms");
+    std::fs::create_dir(&empty).unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--rom-dir"])
+        .arg(&empty)
+        .arg("--sd-image")
+        .arg(dir.path().join("missing.img"))
+        .assert()
+        .code(2)
+        .stderr(
+            contains("esp32c3_rev3_rom.elf not found").and(contains("there is no SD image").not()),
+        );
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn an_x4_run_keeps_its_sd_card_and_its_session_replays_with_it_identically() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card.img");
+    inkemu()
+        .args(["sd", "create", "--size", "64"])
+        .arg(&card)
+        .assert()
+        .success();
+    let session = dir.path().join("card.inkrec");
+    let run = inkemu()
+        .args(["run", "--device", "x4", "--max-time", "0.05", "--usb-power"])
+        .args(["--rom-dir", &rom_dir])
+        .arg("--sd-image")
+        .arg(&card)
+        .arg("--record")
+        .arg(&session)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let log = String::from_utf8_lossy(&run.stderr);
+    for expected in [
+        "card.img (64 MiB, SDSC), 0 blocks written\n",
+        // The press of the power key, the cable and the release, at power-on.
+        "inkemu: session recorded in card.inkrec (3 inputs)",
+    ] {
+        assert!(log.contains(expected), "`{expected}` is missing:\n{log}");
+    }
+    inkemu()
+        .arg("replay")
+        .arg(&session)
+        .args(["--rom-dir", &rom_dir])
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .stderr(contains("final flash, SD card and consoles"));
+}
+
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR"]
+fn a_script_presses_the_buttons_of_the_x4_and_names_those_it_does_not_have() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let run = |body: &str| {
+        let (_dir, script) = console_script(body);
+        inkemu()
+            .args(["run", "--device", "x4", "--max-time", "0.01"])
+            .args(["--rom-dir", &rom_dir])
+            .arg("--console-script")
+            .arg(&script)
+            .timeout(HANG_LIMIT)
+            .assert()
+            .get_output()
+            .clone()
+    };
+    let pressed = run("press confirm\nwait 1ms\nrelease confirm\n");
+    let log = String::from_utf8_lossy(&pressed.stderr);
+    assert_eq!(pressed.status.code(), Some(0), "{log}");
+    assert!(log.contains("console script through (3 steps)"), "{log}");
+    let refused = run("press menu\n");
+    let log = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(2), "{log}");
+    assert!(
+        log.contains(
+            "console script, line 2: the device has no button `menu`; name one of: power, back, confirm, left, right, up, down"
+        ),
+        "{log}"
     );
 }

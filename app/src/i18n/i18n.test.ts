@@ -25,6 +25,7 @@ describe("catalogs", () => {
  * name.
  */
 const ERROR_KINDS = [
+  "board",
   "button",
   "capture",
   "ended",
@@ -38,8 +39,11 @@ const ERROR_KINDS = [
   "maxTime",
   "noImage",
   "noLife",
+  "replayEnded",
   "nothingToStep",
   "notKept",
+  "notRecorded",
+  "sdCard",
   "notRecordable",
   "onItsThread",
   "powerOn",
@@ -49,6 +53,7 @@ const ERROR_KINDS = [
   "replaying",
   "replayNotRecorded",
   "rom",
+  "sdImage",
   "session",
   "stopped",
 ] as const;

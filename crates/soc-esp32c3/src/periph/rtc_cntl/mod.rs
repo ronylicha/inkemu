@@ -85,6 +85,13 @@ const WDTWPROTECT: u32 = reg("WDTWPROTECT");
 const SWD_CONF: u32 = reg("SWD_CONF");
 const SWD_WPROTECT: u32 = reg("SWD_WPROTECT");
 const FIB_SEL: u32 = reg("FIB_SEL");
+/// `PAD_HOLD` `[5:0]`: the hold of GPIO0 to GPIO5; `DIG_PAD_HOLD`: one bit a pad, of which GPIO6 to
+/// GPIO21 are taken (`gpio_ll_hold_en`, `GPIO_HOLD_MASK[n] = BIT(n)`, ESP-IDF v5.5.2
+/// `hal/esp32c3/include/hal/gpio_ll.h:435-441`, `soc/esp32c3/gpio_periph.c:36-59`).
+const PAD_HOLD: u32 = reg("PAD_HOLD");
+const DIG_PAD_HOLD: u32 = reg("DIG_PAD_HOLD");
+const RTC_PADS: u32 = 0x3F;
+const DIGITAL_PADS: u32 = 0x003F_FFC0;
 
 /// The RTC slow clock: the 136 kHz RC oscillator, 17 cycles every 20 000 cycles of the time base.
 ///
@@ -156,7 +163,7 @@ const STORE: [u32; STORE_COUNT] = [
 /// §A.1.3); the startup of an application woken from one reads `GPIO_WAKEUP`
 /// (`esp_deep_sleep_wakeup_io_reset`, DS §A.3.4). Some rows have one bit that acts, named in the
 /// description: the rest of the register is stored without effect.
-const ACCEPTED: [Accepted; 23] = [
+const ACCEPTED: [Accepted; 22] = [
     Accepted::svd(
         "RTC_CNTL",
         "OPTIONS0",
@@ -222,20 +229,14 @@ const ACCEPTED: [Accepted; 23] = [
     Accepted::svd(
         "RTC_CNTL",
         "EXT_WAKEUP_CONF",
-        "GPIO wake filter: the wake from a pin is not modelled",
-        "SP2d",
+        "GPIO wake filter: a pin at its wake level wakes the chip at once, filtered or not",
+        "SP8",
     ),
     Accepted::svd(
         "RTC_CNTL",
         "SLP_REJECT_CONF",
-        "sleep rejection: no reject source (GPIO, UART) is raised",
-        "SP2d",
-    ),
-    Accepted::svd(
-        "RTC_CNTL",
-        "GPIO_WAKEUP",
-        "GPIO wake of each pin and its status: the wake from a pin is not modelled (a GPIO wake source is refused by name at the entry into sleep)",
-        "SP2d",
+        "sleep rejection: no reject source (GPIO, UART) is raised; a light sleep is refused",
+        "SP4",
     ),
     Accepted::svd(
         "RTC_CNTL",
@@ -270,19 +271,19 @@ const ACCEPTED: [Accepted; 23] = [
     Accepted::svd(
         "RTC_CNTL",
         "DIG_ISO",
-        "digital pad isolation and hold in sleep: a pad keeps no level through a sleep or a reset",
-        "SP2d",
+        "digital pad isolation and automatic hold in sleep: a pad keeps its configuration through a deep sleep, and only its own hold bit (PAD_HOLD, DIG_PAD_HOLD) keeps its output through the reset of the wake",
+        "SP4",
     ),
     Accepted::svd(
         "RTC_CNTL",
         "PAD_HOLD",
-        "pad hold: a held pad follows its registers",
+        "the hold of GPIO0 to GPIO5 acts (a held pad keeps its output through a core reset and ignores its registers); bits 6 and above stored",
         "SP2d",
     ),
     Accepted::svd(
         "RTC_CNTL",
         "DIG_PAD_HOLD",
-        "digital pad hold: a held pad follows its registers",
+        "the hold of GPIO6 to GPIO21 acts (a held pad keeps its output through a core reset and ignores its registers); the other bits stored",
         "SP2d",
     ),
 ];
@@ -391,6 +392,13 @@ impl RtcCntl {
         self.swd_conf = SWD_CONF_RESET;
         self.swd_key = SWD_KEY;
         self.swd_fed_at = None;
+    }
+
+    /// The pads software holds, one bit a pad (ADR 0013): `PAD_HOLD` for GPIO0 to GPIO5,
+    /// `DIG_PAD_HOLD` for GPIO6 to GPIO21. The block is in the RTC domain: a core reset keeps it.
+    pub(crate) fn pad_hold_mask(&self) -> u32 {
+        let read = |offset| self.config.read(offset).unwrap_or(0);
+        (read(PAD_HOLD) & RTC_PADS) | (read(DIG_PAD_HOLD) & DIGITAL_PADS)
     }
 
     /// A reset took place: the next boot reads its cause in `RESET_STATE`. A system reset also
@@ -554,6 +562,11 @@ impl Peripheral<Ctx> for RtcCntl {
             FIB_SEL => {
                 let known = self.config.write(offset, value);
                 self.evaluate(ctx, false);
+                return known;
+            }
+            PAD_HOLD | DIG_PAD_HOLD => {
+                let known = self.config.write(offset, value);
+                ctx.note_pad_hold();
                 return known;
             }
             // Read-only: the write is reported as unmodelled.

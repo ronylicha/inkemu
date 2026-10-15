@@ -168,6 +168,15 @@ pub enum SdImageError {
         "the SD image {path} is opened read-only, and the card changed; this is a fault of inkemu: nothing is written"
     )]
     ReadOnly { path: String },
+    /// The image holds the save; only its journal is left (N4).
+    #[error(
+        "the SD image {path} holds what the device wrote, but its journal {journal} could not be removed: {detail}; it is applied again, which changes nothing, before the image is next read: make the directory of the image writable"
+    )]
+    JournalNotRemoved {
+        path: String,
+        journal: String,
+        detail: String,
+    },
     #[error(
         "cannot save the SD image {path}: cannot {action} {target}: {detail}; check that the directory is writable and has room, then run again"
     )]
@@ -311,6 +320,9 @@ pub struct SdImage {
     /// The number of writes to the image after which a write fails: a fault the tests inject.
     #[cfg(test)]
     fail_after: Option<usize>,
+    /// The journal of a save is not removed once applied: a fault the tests inject.
+    #[cfg(test)]
+    journal_stays: bool,
 }
 
 /// Whose journal an opening applies.
@@ -389,17 +401,18 @@ impl SdImage {
             .map(|(_, found)| found.map_or(Recovered::Nothing, Recovered::Finished))
     }
 
-    fn open_with(
+    /// The checks of [`SdImage::open`] that look at no file: `path` names a file, and neither it
+    /// nor its journals are among the files of the run (`claimed`). Made by a front end before
+    /// the ROM is read, so that such a run is refused without it, in the same order by the
+    /// command line and the application (R3). Gives the journal and its temporary file.
+    ///
+    /// # Errors
+    /// [`SdImageError::NoFileName`], [`SdImageError::Claimed`], [`SdImageError::JournalClaimed`].
+    pub fn refuse_the_files_of_the_run(
         path: &Path,
-        access: Access,
         claimed: &[Claimed],
-        origin: JournalOrigin,
-        log: &mut dyn Write,
-    ) -> Result<(SdImage, Option<Committed>), SdImageError> {
-        let shown_path = shown(path);
-        let no_name = || SdImageError::NoFileName {
-            path: shown_path.clone(),
-        };
+    ) -> Result<(PathBuf, PathBuf), SdImageError> {
+        let no_name = || SdImageError::NoFileName { path: shown(path) };
         let name = path.file_name().ok_or_else(no_name)?;
         if !path
             .as_os_str()
@@ -413,6 +426,18 @@ impl SdImage {
             return Err(no_name());
         };
         refuse_claimed(path, [&journal, &temporary], claimed)?;
+        Ok((journal, temporary))
+    }
+
+    fn open_with(
+        path: &Path,
+        access: Access,
+        claimed: &[Claimed],
+        origin: JournalOrigin,
+        log: &mut dyn Write,
+    ) -> Result<(SdImage, Option<Committed>), SdImageError> {
+        let shown_path = shown(path);
+        let (journal, temporary) = Self::refuse_the_files_of_the_run(path, claimed)?;
         let open_error = |e: &std::io::Error, remedy| SdImageError::Open {
             path: shown_path.clone(),
             detail: sanitize(&e.to_string()),
@@ -480,6 +505,8 @@ impl SdImage {
             pending: false,
             #[cfg(test)]
             fail_after: None,
+            #[cfg(test)]
+            journal_stays: false,
         };
         let found = image.recover(origin, log)?;
         Ok((image, found))
@@ -489,6 +516,12 @@ impl SdImage {
     #[must_use]
     pub fn shown(&self) -> &str {
         &self.shown
+    }
+
+    /// The path of the image, as it was opened: for the refusals of the other files of the run.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The capacity of the card the image is.
@@ -530,7 +563,9 @@ impl SdImage {
     /// (this one is then not written), [`SdImageError::InvalidChanges`] for changes that do not
     /// fit the card, [`SdImageError::Changed`] when the image's size changed since it was
     /// opened, [`SdImageError::ReadOnly`] for changes to an image opened read-only,
-    /// [`SdImageError::Write`] when the journal or the image cannot be written. When the journal
+    /// [`SdImageError::Write`] when the journal or the image cannot be written,
+    /// [`SdImageError::JournalNotRemoved`] when the image is written and only its journal is
+    /// left. When the journal
     /// was written but its application failed, it is applied again before the next life, and at
     /// the next opening.
     pub fn commit(&mut self, changes: &Changes<'_>) -> Result<Committed, SdImageError> {
@@ -551,9 +586,34 @@ impl SdImage {
         self.file
             .sync_all()
             .map_err(|e| self.failed("write", &self.path, &e))?;
-        self.remove_journal()?;
+        self.remove_the_applied_journal()?;
         self.pending = false;
         Ok(committed)
+    }
+
+    /// Removes the journal of a save the image now holds whole. A removal that fails says so:
+    /// the image is written, the journal is left (`pending` stays set) and applied again, which
+    /// changes nothing, before the image is next read (N4).
+    fn remove_the_applied_journal(&self) -> Result<(), SdImageError> {
+        let left = |detail: String| SdImageError::JournalNotRemoved {
+            path: self.shown.clone(),
+            journal: shown(&self.journal),
+            detail,
+        };
+        #[cfg(test)]
+        if self.journal_stays {
+            return Err(left("the test keeps it".to_owned()));
+        }
+        std::fs::remove_file(&self.journal).map_err(|e| left(sanitize(&e.to_string())))?;
+        sync_directory(&self.journal);
+        Ok(())
+    }
+
+    /// Keeps the journal of each save once it is applied: the fault of a directory that takes
+    /// no change at that very moment.
+    #[cfg(test)]
+    pub(crate) fn leave_the_journal(&mut self) {
+        self.journal_stays = true;
     }
 
     /// Applies the journal of a save that did not end, if there is one, and removes it.

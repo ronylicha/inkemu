@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use emu_core::{AnalogSource, Nanos};
+
 /// A voltage at a pin, in millivolts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Millivolts(pub u32);
@@ -213,6 +215,20 @@ impl Battery {
     }
 }
 
+/// The ladder on its pin: its voltage depends only on the keys held, which change between calls.
+impl AnalogSource for ButtonLadder {
+    fn millivolts(&mut self, _at: Nanos) -> u32 {
+        self.voltage().0
+    }
+}
+
+/// The battery on its pin: the cell's voltage through the divider, as the cell is now.
+impl AnalogSource for Battery {
+    fn millivolts(&mut self, _at: Nanos) -> u32 {
+        self.voltage().0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +399,18 @@ mod tests {
             Battery::new(Millivolts(3700), 10_000, 0),
             Err(BatteryError::ZeroBottomResistor)
         );
+    }
+
+    /// What the ADC reads at any instant is the source's voltage as its state is then.
+    #[test]
+    fn the_ladder_and_the_battery_put_their_voltage_on_their_pin() {
+        let mut ladder = x4_front();
+        assert_eq!(AnalogSource::millivolts(&mut ladder, Nanos(0)), 3300);
+        ladder.set_pressed(1, true).unwrap();
+        assert_eq!(AnalogSource::millivolts(&mut ladder, Nanos(u64::MAX)), 1645);
+        let mut battery = Battery::new(Millivolts(3900), 10_000, 10_000).unwrap();
+        assert_eq!(AnalogSource::millivolts(&mut battery, Nanos(7)), 1950);
+        battery.set_cell(Millivolts(4200));
+        assert_eq!(AnalogSource::millivolts(&mut battery, Nanos(8)), 2100);
     }
 }

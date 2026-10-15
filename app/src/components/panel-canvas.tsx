@@ -63,7 +63,7 @@ export function PanelCanvas({ panel, signal, onError }: Props) {
     const timers: number[] = [];
     host
       // The image of the emulator that announced it: the shell gives none of another.
-      .frame(signal.start)
+      .frame(signal.start, { width: panel.width, height: panel.height })
       .then((frame) => {
         if (cancelled || frame === null) {
           return;
@@ -100,7 +100,7 @@ export function PanelCanvas({ panel, signal, onError }: Props) {
         window.clearTimeout(timer);
       }
     };
-  }, [host, signal, panel.rotation]);
+  }, [host, signal, panel.rotation, panel.width, panel.height]);
 
   return (
     <div className="panel-room" ref={room}>

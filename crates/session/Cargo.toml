@@ -12,6 +12,8 @@ workspace = true
 emu-core.workspace = true
 soc-esp32c3.workspace = true
 boards.workspace = true
+# The SD card of a session: its blocks, the overlay of a life and the replay's source.
+chips.workspace = true
 sha2.workspace = true
 # The starting flash of a session is deflated; the backend flate2 resolves to is pure Rust, which
 # builds for wasm32-unknown-unknown.

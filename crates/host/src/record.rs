@@ -6,9 +6,11 @@ use crate::exit::{EXIT_DIVERGED, EXIT_ERROR, EXIT_OK};
 use crate::run::{RunEnd, RunOptions, session_end};
 use crate::session_file;
 use crate::term::sanitize;
+use boards::Wired;
+use chips::sdcard::Changes;
 use session::{
     ConsoleDigests, Cut, CutReason, Divergence, End, Limits, NoTraceHash, Outcome, ProfileText,
-    Replay, ReplayError, RomIdentity, Session, WriteError,
+    Replay, ReplayError, RomIdentity, SdCardStart, Session, WriteError,
 };
 use soc_esp32c3::{ConsoleChannel, Esp32C3, RomImage};
 use std::io::Write;
@@ -30,24 +32,29 @@ pub struct Recorder {
     rom: RomIdentity,
     profile: ProfileText,
     flash: Vec<u8>,
+    /// The SD card in the slot at power-on, as the session keeps it (boxed: a recorder sits in
+    /// the mode of a life, beside the replay's).
+    sd: Option<Box<SdCardStart>>,
     limits: Limits,
     digests: ConsoleDigests,
 }
 
 impl Recorder {
     /// Begins the record of a run of `machine`, at power-on, which runs on the ROM `rom`, the
-    /// profile `profile` and with `limits` (no cut yet).
+    /// profile `profile`, with the SD card `sd` in its slot and with `limits` (no cut yet).
     #[must_use]
     pub fn begin(
         rom: RomIdentity,
         profile: ProfileText,
         machine: &Esp32C3,
+        sd: Option<SdCardStart>,
         limits: Limits,
     ) -> Recorder {
         Recorder {
             rom,
             profile,
             flash: machine.flash_contents(),
+            sd: sd.map(Box::new),
             limits,
             digests: ConsoleDigests::default(),
         }
@@ -58,12 +65,17 @@ impl Recorder {
         &mut self.digests
     }
 
-    /// The session of `machine`, whose run ended as `end`: a run the host cut is recorded with
-    /// the device time it stopped at (G5).
+    /// The session of `machine`, whose run ended as `end` with `sd` the changes of the card in
+    /// its slot: a run the host cut is recorded with the device time it stopped at (G5).
     ///
     /// # Errors
     /// [`RecordError`] when the session cannot hold the run, or the machine keeps no trace hash.
-    pub fn finish(self, machine: &Esp32C3, end: RunEnd) -> Result<Session, RecordError> {
+    pub fn finish(
+        self,
+        machine: &Esp32C3,
+        end: RunEnd,
+        sd: Option<&Changes<'_>>,
+    ) -> Result<Session, RecordError> {
         let (limits, end) = match session_end(end) {
             Ok(reached) => (
                 self.limits,
@@ -80,11 +92,12 @@ impl Recorder {
                 End::Cut,
             ),
         };
-        let outcome = Outcome::of(machine, end, self.digests)?;
+        let outcome = Outcome::of(machine, end, self.digests, sd)?;
         Ok(Session::record(
             self.rom,
             self.profile,
             self.flash,
+            self.sd.map(|card| *card),
             limits,
             machine.input_journal(),
             outcome,
@@ -116,7 +129,7 @@ pub enum Verdict {
 }
 
 /// The verdict of the replay of `session` on `machine`, which ended as `end`, its consoles taken
-/// into `digests` to the last byte.
+/// into `digests` to the last byte, `sd` the changes of the card in its slot.
 ///
 /// # Errors
 /// [`NoTraceHash`] when the machine keeps no trace hash.
@@ -125,13 +138,14 @@ pub fn verdict(
     machine: &Esp32C3,
     end: RunEnd,
     digests: ConsoleDigests,
+    sd: Option<&Changes<'_>>,
 ) -> Result<Verdict, NoTraceHash> {
     let reached = match session_end(end) {
         Ok(reached) => reached,
         Err(reason) => return Ok(Verdict::Cut(reason)),
     };
     let end = session.limits.end_of(reached, machine.device_time());
-    let replayed = Outcome::of(machine, end, digests)?;
+    let replayed = Outcome::of(machine, end, digests, sd)?;
     let differences = session.outcome.differences(&replayed);
     Ok(if differences.is_empty() {
         Verdict::Identical
@@ -140,14 +154,15 @@ pub fn verdict(
     })
 }
 
-/// Writes the session of the run of `machine`, which ended as `end`, to `path`, and says so in
-/// `log`; `false`, after saying why, when the run is not recorded. A failed write of the file
-/// says its path and the remedy itself; a session that cannot hold the run is said with the path
-/// it was not written to.
+/// Writes the session of the run of `machine`, which ended as `end` with `sd` the changes of the
+/// card in its slot, to `path`, and says so in `log`; `false`, after saying why, when the run is
+/// not recorded. A failed write of the file says its path and the remedy itself; a session that
+/// cannot hold the run is said with the path it was not written to.
 pub fn record_session(
     recorder: Recorder,
     machine: &Esp32C3,
     end: RunEnd,
+    sd: Option<&Changes<'_>>,
     path: &Path,
     log: &mut dyn Write,
 ) -> bool {
@@ -159,7 +174,7 @@ pub fn record_session(
         );
         false
     };
-    let session = match recorder.finish(machine, end) {
+    let session = match recorder.finish(machine, end, sd) {
         Ok(session) => session,
         Err(e) => return not_recorded(log, &e),
     };
@@ -184,20 +199,16 @@ pub fn record_session(
     true
 }
 
-/// The machine that replays `session` on `rom`, which this inkemu loads as ROM revision
-/// `rom_revision` for the device of the session. A refusal is given as its message, its control
-/// characters escaped (a session comes from anywhere), with the remedy for a ROM that is not the
-/// one the session was recorded on.
+/// The wired device that replays `session` on `rom`, which this inkemu loads as ROM revision
+/// `rom_revision` for the device of the session: its machine, and its card in its slot. A
+/// refusal is given as its message, its control characters escaped (a session comes from
+/// anywhere), with the remedy for a ROM that is not the one the session was recorded on.
 ///
 /// # Errors
 /// The message of the [`ReplayError`].
-pub fn start_replay(
-    session: &Session,
-    rom: RomImage,
-    rom_revision: u16,
-) -> Result<Esp32C3, String> {
+pub fn start_replay(session: &Session, rom: RomImage, rom_revision: u16) -> Result<Wired, String> {
     match Replay::start(session, rom) {
-        Ok(replay) => Ok(replay.into_machine()),
+        Ok(replay) => Ok(replay.into_wired()),
         Err(e @ ReplayError::Rom { .. }) => Err(sanitize(&format!(
             "{e}: this inkemu loads ROM revision {rom_revision} for the device, from `inkemu rom fetch --device {}` or --rom-dir; a session recorded on another ROM replays with the inkemu that recorded it",
             session.profile.id
@@ -207,15 +218,16 @@ pub fn start_replay(
 }
 
 /// Says in `log` how the replay of `session` on `machine`, which ended as `end` with every
-/// console taken into `digests`, compares with what the session recorded, and gives the exit
-/// code of the replay: [`EXIT_OK`] when identical, [`EXIT_DIVERGED`] when it diverges, and
-/// [`EXIT_ERROR`] when nothing could be compared (a replay the host cut, a machine without its
-/// trace hash).
+/// console taken into `digests` and `sd` the changes of the card in its slot, compares with what
+/// the session recorded, and gives the exit code of the replay: [`EXIT_OK`] when identical,
+/// [`EXIT_DIVERGED`] when it diverges, and [`EXIT_ERROR`] when nothing could be compared (a
+/// replay the host cut, a machine without its trace hash).
 pub fn report_replay(
     session: &Session,
     machine: &Esp32C3,
     end: RunEnd,
     digests: ConsoleDigests,
+    sd: Option<&Changes<'_>>,
     log: &mut dyn Write,
 ) -> u8 {
     if let Some(cut) = session.limits.cut {
@@ -226,11 +238,11 @@ pub fn report_replay(
             soc_esp32c3::clock::TIME_BASE.cycles_to_nanos(cut.at) / 1_000
         );
     }
-    match verdict(session, machine, end, digests) {
+    match verdict(session, machine, end, digests, sd) {
         Ok(Verdict::Identical) => {
             let _ = writeln!(
                 log,
-                "inkemu: the replay gives what the session recorded: the same end, device time, cycles, instructions, trace hash, final flash and consoles"
+                "inkemu: the replay gives what the session recorded: the same end, device time, cycles, instructions, trace hash, final flash, SD card and consoles"
             );
             EXIT_OK
         }
@@ -321,7 +333,7 @@ mod tests {
             max_time_nanos: Some(20_000_000),
             ..Limits::default()
         };
-        let mut recorder = Recorder::begin(identity, x4_text(), &machine, limits);
+        let mut recorder = Recorder::begin(identity, x4_text(), &machine, None, limits);
         machine
             .send_console(ConsoleChannel::Uart0, Cycles(800_000), b"hi\r")
             .unwrap();
@@ -332,7 +344,7 @@ mod tests {
         };
         let end = run(&mut machine, &options, recorder.digests());
         assert_eq!(end, RunEnd::TimeLimit);
-        recorder.finish(&machine, end).unwrap()
+        recorder.finish(&machine, end, None).unwrap()
     }
 
     fn replayed(session: &Session) -> Verdict {
@@ -343,7 +355,7 @@ mod tests {
             &replay_options(session, ConsoleChannel::UsbSerialJtag),
             &mut digests,
         );
-        verdict(session, &machine, end, digests).unwrap()
+        verdict(session, &machine, end, digests, None).unwrap()
     }
 
     #[test]
@@ -389,7 +401,7 @@ mod tests {
             max_cycles: Some(1_000),
             ..Limits::default()
         };
-        let mut recorder = Recorder::begin(identity, x4_text(), &machine, limits);
+        let mut recorder = Recorder::begin(identity, x4_text(), &machine, None, limits);
         // Ctrl-C before the run: it stops at its first pass, at power-on.
         let interrupt = Interrupt::new();
         let _ = interrupt.request();
@@ -411,7 +423,7 @@ mod tests {
             &mut Vec::new(),
         );
         assert_eq!(end, RunEnd::Interrupted);
-        let session = recorder.finish(&machine, end).unwrap();
+        let session = recorder.finish(&machine, end, None).unwrap();
         assert_eq!(session.outcome.end, End::Cut);
         assert_eq!(
             session.limits.cut,
@@ -470,7 +482,7 @@ mod tests {
                 ..MachineOptions::default()
             },
         );
-        let recorder = Recorder::begin(identity, x4_text(), &machine, limits);
+        let recorder = Recorder::begin(identity, x4_text(), &machine, None, limits);
         (machine, recorder)
     }
 
@@ -501,7 +513,7 @@ mod tests {
             console,
             &mut log,
         );
-        let session = recorder.finish(machine, end).unwrap();
+        let session = recorder.finish(machine, end, None).unwrap();
         (end, session, String::from_utf8(log).unwrap())
     }
 
@@ -578,7 +590,7 @@ mod tests {
             &mut digests,
         );
         assert_eq!(
-            verdict(&session, &machine, end, digests).unwrap(),
+            verdict(&session, &machine, end, digests, None).unwrap(),
             Verdict::Identical
         );
     }
@@ -600,6 +612,7 @@ mod tests {
             recorder,
             &machine,
             RunEnd::TimeLimit,
+            None,
             &path,
             &mut log
         ));
@@ -621,6 +634,7 @@ mod tests {
             recorder,
             &machine,
             RunEnd::Budget,
+            None,
             &path,
             &mut log
         ));
@@ -646,6 +660,7 @@ mod tests {
             recorder,
             &machine,
             RunEnd::Budget,
+            None,
             &path,
             &mut log
         ));
@@ -695,7 +710,7 @@ mod tests {
                 assert_eq!(ran, end);
             }
             let mut log = Vec::new();
-            let code = report_replay(session, &machine, end, digests, &mut log);
+            let code = report_replay(session, &machine, end, digests, None, &mut log);
             (code, String::from_utf8(log).unwrap())
         };
         let (code, log) = report(&session, RunEnd::TimeLimit, true);
@@ -785,7 +800,7 @@ mod tests {
             (RunEnd::ConsoleError, CutReason::ConsoleError),
         ] {
             assert_eq!(
-                verdict(&session, &machine, end, ConsoleDigests::default()).unwrap(),
+                verdict(&session, &machine, end, ConsoleDigests::default(), None).unwrap(),
                 Verdict::Cut(reason)
             );
         }

@@ -75,3 +75,77 @@ type = "data"
 subtype = "coredump"
 offset = 0xFF0000
 size = 0x10000
+
+# The chips around the SoC and the keys of the user: docs/research/sp2d-x4-wiring.md, section 2
+# (pins, polarities, from FreeInk and CrossPoint's sources). The design of sub-project 2d, 2d-D15.
+[wiring.display]
+controller = "ssd1677"
+config = "gdeq0426t82"
+sclk = 8
+mosi = 10
+cs = 21
+dc = 4
+rst = 5
+busy = 6
+# Clockwise: the controller scans 800 × 480 and the firmware draws portrait, x' = y, y' = 479 - x
+# (CrossPoint's GfxRenderer, section 1 item 7 of the research).
+rotation = 90
+
+# The ladders: idle at the 3.3 V rail; each level is the voltage ESP-IDF's calibration curve gives,
+# at 12 dB on the X4's eFuse, to the code FreeInk records as the average of three devices
+# (InputManager.cpp:29-44, section 3 of the research): Back 3512, Confirm 2694, Left 1493,
+# Right 5; Up 2242, Down 5. The SoC's ADC converts each level back to that code within one
+# (crates/boards/src/wired tests). The front keys, left to right, as CrossPoint's
+# ButtonRemapActivity.cpp:140 orders them.
+[[wiring.ladder]]
+pin = 1
+idle_mv = 3300
+buttons = [
+  { id = "back", mv = 2448, edge = "bottom", order = 0 },
+  { id = "confirm", mv = 1896, edge = "bottom", order = 1 },
+  { id = "left", mv = 1061, edge = "bottom", order = 2 },
+  { id = "right", mv = 4, edge = "bottom", order = 3 },
+]
+
+[[wiring.ladder]]
+pin = 2
+idle_mv = 3300
+buttons = [
+  { id = "up", mv = 1584, edge = "right", order = 0 },
+  { id = "down", mv = 4, edge = "right", order = 1 },
+]
+
+# Low while pressed; released, the pad's pull-up (CrossPoint configures INPUT_PULLUP).
+[wiring.button.power]
+pin = 3
+active = "low"
+edge = "top"
+order = 0
+
+# Two 10 kΩ resistors: the pin reads half the cell.
+# ASSUMPTION: the cell's voltage, a charged cell between FreeInk's 4.2 V full and 3.45 V empty.
+[wiring.battery]
+pin = 0
+top_ohms = 10000
+bottom_ohms = 10000
+cell_mv = 3900
+
+# The latch holds the battery rail while released or high, cuts it low; GPIO20 reads high while a
+# cable powers the X4 (section 1 items 8 and 9).
+[wiring.power]
+latch = 13
+usb_detect = 20
+
+# The SD card shares the display's SCLK and MOSI (section 1 item 1).
+[wiring.sd]
+cs = 12
+miso = 7
+
+# On battery the X4 starts only while its power key is held, and CrossPoint checks it still is.
+# ASSUMPTION: how long a user holds it. CrossPoint verifies 10 ms; the stock firmware 3.0.2 holds
+# its latch only after about a second of device time (measured 2026-10-15 on the model: a hold of
+# 1000 ms lets the X4 go off when the key is let go, 1200 ms keeps it on), so a user holds it
+# longer than that.
+[power]
+key = "power"
+hold_ms = 1500

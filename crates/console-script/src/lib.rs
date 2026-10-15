@@ -21,7 +21,7 @@ mod parse;
 mod run;
 
 pub use parse::{
-    Action, MAX_LINE_BYTES, MAX_SCRIPT_BYTES, MAX_SEND_BYTES, MAX_STEPS, MAX_TEXT_BYTES,
-    MAX_TOTAL_BYTES, Script, ScriptError, ScriptErrorKind, Step, VERSION_LINE,
+    Action, MAX_BUTTON_BYTES, MAX_LINE_BYTES, MAX_SCRIPT_BYTES, MAX_SEND_BYTES, MAX_STEPS,
+    MAX_TEXT_BYTES, MAX_TOTAL_BYTES, Script, ScriptError, ScriptErrorKind, Step, VERSION_LINE,
 };
-pub use run::{RunError, ScriptRun, ScriptStatus};
+pub use run::{Refusal, RunError, ScriptRun, ScriptStatus};

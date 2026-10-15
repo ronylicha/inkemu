@@ -10,8 +10,8 @@ import { decodeFrame, type Frame } from "./frame";
 import type { Command, DeviceView, HostError, Setup, Speed, Started, Update } from "./types";
 import { isHostError } from "./types";
 
-export type FileKind = "firmware" | "bootloader" | "flash" | "session" | "romDir";
-export type SaveKind = "flashFile" | "session" | "capture";
+export type FileKind = "firmware" | "bootloader" | "flash" | "session" | "romDir" | "sdImage";
+export type SaveKind = "flashFile" | "session" | "capture" | "sdImage";
 
 /**
  * Every start is numbered by the window (`start`); a command names the start it is meant for, and
@@ -33,8 +33,11 @@ export interface HostApi {
     onUpdate: (update: Update) => void,
   ): Promise<Started>;
   command(command: Command, start: number): Promise<void>;
-  /** The image of the last refresh, `null` before the first. */
-  frame(start: number): Promise<Frame | null>;
+  /**
+   * The image of the last refresh, `null` before the first; refused (`FrameError`) when it is not
+   * an image of `panel`.
+   */
+  frame(start: number, panel: { width: number; height: number }): Promise<Frame | null>;
   saveCapture(path: string, start: number): Promise<void>;
   notices(): Promise<string>;
   /** Tells the shell the language of the interface, which its own dialogs speak. */
@@ -67,6 +70,7 @@ const FILTERS: Record<FileKind | SaveKind, { name: string; extensions: string[] 
   romDir: [],
   flashFile: [{ name: "Flash file", extensions: ["flash", "bin"] }],
   capture: [{ name: "PNG", extensions: ["png"] }],
+  sdImage: [{ name: "SD card image", extensions: ["img", "bin"] }],
 };
 
 function channelOf(onUpdate: (update: Update) => void): Channel<Update> {
@@ -118,9 +122,9 @@ export const tauriHost: HostApi = {
   openReplay: (path, romDir, speed, start, onUpdate) =>
     call<Started>("open_replay", { path, romDir, speed, start, onUpdate: channelOf(onUpdate) }),
   command,
-  frame: async (start) => {
+  frame: async (start, panel) => {
     const buffer = await call<ArrayBuffer>("frame", { start });
-    return buffer.byteLength === 0 ? null : decodeFrame(buffer);
+    return buffer.byteLength === 0 ? null : decodeFrame(buffer, panel);
   },
   saveCapture: (path, start) => command({ kind: "capture", path }, start),
   notices: () => call<string>("notices"),

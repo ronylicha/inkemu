@@ -16,7 +16,9 @@ use crate::ports::{
 };
 use crate::record::{RecordError, Recorder, Verdict, verdict};
 use crate::run::{self, RunEnd, SLICE_CYCLES};
+use crate::sd_run::LifeCard;
 use crate::utf8::Utf8Stream;
+use boards::SdHandle;
 use emu_core::Cycles;
 use session::{ConsoleDigests, NoTraceHash, Session};
 use soc_esp32c3::{ConsoleChannel, DeepSleep, Esp32C3, InputError, StopReason, UsbHost};
@@ -189,6 +191,9 @@ pub struct LifeEnd {
     pub verdict: Option<Result<Verdict, NoTraceHash>>,
     /// The session of a recorded run.
     pub session: Option<Result<Session, RecordError>>,
+    /// The card taken out of the slot, with what the life changed on it: for the SD image of a
+    /// run to keep (a replay's card is the session's, and is only compared).
+    pub card: LifeCard,
 }
 
 /// One life of a machine.
@@ -196,6 +201,8 @@ pub struct Engine {
     machine: Esp32C3,
     panel: Box<dyn PanelSource>,
     buttons: Box<dyn ButtonPort>,
+    /// The card slot of the device, from which the card is taken when the life ends.
+    sd: Option<SdHandle>,
     description: PanelDescription,
     mode: Mode,
     limits: Limits,
@@ -232,12 +239,14 @@ impl Engine {
             machine,
             panel,
             buttons,
+            sd,
         } = life;
         let description = panel.describe();
         Engine {
             machine,
             panel,
             buttons,
+            sd,
             description,
             mode,
             limits,
@@ -279,6 +288,30 @@ impl Engine {
     #[must_use]
     pub fn buttons_reach_firmware(&self) -> bool {
         self.buttons.reaches_firmware()
+    }
+
+    /// The card in the slot as a session would record it now, its blocks as the life sees them
+    /// (its image with what it wrote), the card left where it is; `None` with no card.
+    #[must_use]
+    pub fn card_as_recorded(
+        &self,
+        write_protected: bool,
+    ) -> Option<Result<session::SdCardStart, session::SdCardError>> {
+        let handle = self.sd.as_ref()?;
+        let mut lines = handle.lines();
+        let card = lines.slot_mut().card_mut()?;
+        Some(session::SdCardStart::read(
+            card.storage_mut(),
+            write_protected,
+        ))
+    }
+
+    /// The card taken out of the slot, with what the life changed on it: for the end of a life
+    /// once [`Engine::finish`] is done, and for a rescue after an internal error. Once taken,
+    /// the slot is empty.
+    #[must_use]
+    pub fn take_card(&self) -> LifeCard {
+        LifeCard::take(self.sd.as_ref())
     }
 
     /// The image of the last refresh of the panel.
@@ -422,6 +455,7 @@ impl Engine {
             StopReason::StrictMmio(_) => self.end_on(RunEnd::StrictMmio, Some(stop), output),
             StopReason::Idle => self.halt_on(Halt::Idle, stop, output),
             StopReason::DeepSleep => self.halt_on(Halt::DeepSleep, stop, output),
+            StopReason::PowerOff => self.end_on(RunEnd::PowerOff, Some(stop), output),
             StopReason::TimeBudget if paced => output.caught_up = true,
             StopReason::TimeBudget => self.end_on(RunEnd::TimeLimit, Some(stop), output),
             StopReason::CycleBudget
@@ -556,17 +590,14 @@ impl Engine {
     /// Presses or releases the button `id` at the present instant of the device.
     ///
     /// # Errors
-    /// [`ButtonError::Replaying`] during a replay, [`ButtonError::NotInSession`] for a button
-    /// that reaches the firmware while the life is recorded, [`EngineError::Ended`], or the
-    /// refusal of the port.
+    /// [`ButtonError::Replaying`] during a replay, [`EngineError::Ended`], or the refusal of the
+    /// port. A button that reaches the firmware is an input of the board, which a recorded life's
+    /// session holds (2d-D19).
     pub fn button(&mut self, id: &str, pressed: bool) -> Result<Output, EngineError> {
         if self.is_replay() {
             return Err(ButtonError::Replaying.into());
         }
         let reaches = self.buttons.reaches_firmware();
-        if reaches && self.is_recorded() {
-            return Err(ButtonError::NotInSession { id: id.to_owned() }.into());
-        }
         if let State::Ended(_) = self.state {
             return Err(EngineError::Ended);
         }
@@ -616,6 +647,7 @@ impl Engine {
     pub fn end(mut self) -> LifeEnd {
         let finished = self.finish();
         LifeEnd {
+            card: self.take_card(),
             machine: self.machine,
             end: finished.end,
             output: finished.output,
@@ -624,9 +656,10 @@ impl Engine {
         }
     }
 
-    /// [`Engine::end`], the machine left in the engine ([`Engine::machine`]): what holds the
-    /// flash stays where a caller that must keep it can read it, whatever fails after. The
-    /// engine is then done: it is not to run again.
+    /// [`Engine::end`], the machine and the card left in the engine ([`Engine::machine`],
+    /// [`Engine::take_card`]): what holds the flash and what the life wrote on its card stay
+    /// where a caller that must keep them can read them, whatever fails after. The engine is
+    /// then done: it is not to run again.
     pub fn finish(&mut self) -> Finished {
         let end = self.end_now();
         let mut output = Output::default();
@@ -636,13 +669,30 @@ impl Engine {
         run::say_where_the_run_stopped(&mut self.machine, None, &mut log);
         output.notices.extend(Notice::from_log(&log));
         let mode = std::mem::replace(&mut self.mode, Mode::Run { recorder: None });
+        // Read in the slot, not taken out of it: a panic from here on leaves the card where
+        // the rescue looks for it.
+        let slot = self.sd.as_ref().map(SdHandle::lines);
+        let changes = slot
+            .as_ref()
+            .and_then(|lines| lines.slot().card())
+            .map(|card| card.storage().changes());
         let (verdict, session) = match mode {
-            Mode::Replay { session, digests } => {
-                (Some(verdict(&session, &self.machine, end, digests)), None)
-            }
+            Mode::Replay { session, digests } => (
+                Some(verdict(
+                    &session,
+                    &self.machine,
+                    end,
+                    digests,
+                    changes.as_ref(),
+                )),
+                None,
+            ),
             Mode::Run {
                 recorder: Some(recorder),
-            } => (None, Some(recorder.finish(&self.machine, end))),
+            } => (
+                None,
+                Some(recorder.finish(&self.machine, end, changes.as_ref())),
+            ),
             Mode::Run { recorder: None } => (None, None),
         };
         Finished {
@@ -654,7 +704,7 @@ impl Engine {
     }
 }
 
-/// The end of a life without its machine ([`Engine::finish`]).
+/// The end of a life without its machine nor its card ([`Engine::finish`]).
 #[derive(Debug)]
 pub struct Finished {
     pub end: RunEnd,
@@ -669,7 +719,7 @@ pub struct Finished {
 pub(crate) mod fixtures {
     use super::*;
     use crate::pattern;
-    use crate::pattern::fixtures::{BUTTONS, PANEL};
+    use crate::pattern::fixtures::{PANEL, buttons};
     use boards::MachineOptions;
     use cpu_rv32::asm::{beq, jal, lbu, lw, sw, wfi};
     use soc_esp32c3::test_support::{HANG, T0, T1, flat_rom, print_program, stop_watchdogs};
@@ -712,11 +762,12 @@ pub(crate) mod fixtures {
         let machine = boards::builtin("x4")
             .unwrap()
             .instantiate(rom, options(recorded));
-        let (panel, buttons) = pattern::ports(PANEL, &BUTTONS);
+        let (panel, buttons) = pattern::ports(PANEL, &buttons());
         Life {
             machine,
             panel,
             buttons,
+            sd: None,
         }
     }
 
@@ -752,11 +803,12 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{echo, idle, life, run_until, text};
+    use super::fixtures::{echo, idle, life, options, run_until, text};
     use super::*;
-    use crate::ports::{ButtonSpec, Edge, PanelFrame, RefreshKind};
+    use crate::ports::{PanelFrame, Recipe as _, RefreshKind};
     use crate::record::Recorder;
     use session::{Limits as SessionLimits, ProfileText, Replay, RomIdentity};
+    use soc_esp32c3::RomImage;
 
     const UART0: ConsoleChannel = ConsoleChannel::Uart0;
 
@@ -977,24 +1029,18 @@ mod tests {
         ));
     }
 
-    /// A port whose buttons reach the firmware, as sub-project 2d's will.
-    struct Wired;
-
-    impl ButtonPort for Wired {
-        fn buttons(&self) -> &[ButtonSpec] {
-            const ONE: [ButtonSpec; 1] = [ButtonSpec {
-                id: "power",
-                edge: Edge::Top,
-                order: 0,
-            }];
-            &ONE
-        }
-        fn reaches_firmware(&self) -> bool {
-            true
-        }
-        fn set(&mut self, _: &mut Esp32C3, _: &str, _: bool) -> Result<(), ButtonError> {
-            Ok(())
-        }
+    /// A life of the wired X4 on `rom`, its power key not pressed.
+    fn wired_life(rom: RomImage, recorded: bool) -> Life {
+        let mut recipe = crate::catalog::ProfileRecipe {
+            profile: boards::builtin("x4").unwrap(),
+            rom,
+            options: options(recorded),
+            board: crate::catalog::BoardStart {
+                power_hold_ms: Some(0),
+                usb_power: false,
+            },
+        };
+        recipe.power_on(None, recorded, None).unwrap()
     }
 
     fn x4_text() -> ProfileText {
@@ -1013,7 +1059,7 @@ mod tests {
             max_time_nanos: Some(20_000_000),
             ..SessionLimits::default()
         };
-        let recorder = Recorder::begin(identity, x4_text(), &life.machine, limits);
+        let recorder = Recorder::begin(identity, x4_text(), &life.machine, None, limits);
         let mut engine = Engine::new(
             life,
             Mode::Run {
@@ -1044,7 +1090,7 @@ mod tests {
         let machine = Replay::start(&session, echo()).unwrap().into_machine();
         let (panel, buttons) = crate::pattern::ports(
             crate::pattern::fixtures::PANEL,
-            &crate::pattern::fixtures::BUTTONS,
+            &crate::pattern::fixtures::buttons(),
         );
         let (max_cycles, max_device_nanos) = session.limits.run_limits();
         let mut engine = Engine::new(
@@ -1052,6 +1098,7 @@ mod tests {
                 machine,
                 panel,
                 buttons,
+                sd: None,
             },
             Mode::Replay {
                 session: Box::new(session),
@@ -1083,17 +1130,18 @@ mod tests {
         );
     }
 
-    /// A button that reaches the firmware cannot enter a session yet: refused while recording.
+    /// 2d-D19: a button of the wired X4 reaches the firmware as an input of the board, and a
+    /// recorded life's session holds it.
     #[test]
-    fn a_button_that_reaches_the_firmware_is_refused_while_recording() {
+    fn a_button_that_reaches_the_firmware_is_journaled_and_the_session_holds_it() {
         let rom = echo();
         let identity = RomIdentity::of(3, &rom);
-        let mut wired = life(rom, true);
-        wired.buttons = Box::new(Wired);
+        let wired = wired_life(rom, true);
         let recorder = Recorder::begin(
             identity,
             x4_text(),
             &wired.machine,
+            None,
             SessionLimits::default(),
         );
         let mut engine = Engine::new(
@@ -1103,15 +1151,17 @@ mod tests {
             },
             Limits::default(),
         );
-        assert_eq!(
-            engine.button("power", true).unwrap_err(),
-            EngineError::Button(ButtonError::NotInSession { id: "power".into() })
-        );
-        // Unrecorded, the same press is taken.
-        let mut free = life(echo(), false);
-        free.buttons = Box::new(Wired);
-        let mut engine = Engine::new(free, Mode::Run { recorder: None }, Limits::default());
-        engine.button("power", true).unwrap();
+        engine.begin();
+        assert!(engine.buttons_reach_firmware());
+        engine.button("confirm", true).unwrap();
+        engine.button("confirm", false).unwrap();
+        let session = engine.end().session.unwrap().unwrap();
+        let board = session
+            .inputs
+            .iter()
+            .filter(|input| matches!(input, soc_esp32c3::AcceptedInput::Board { .. }))
+            .count();
+        assert_eq!(board, 2, "{:?}", session.inputs);
     }
 
     /// A user's stop of a running life is a cut of the host; of a waiting one, the wait.
