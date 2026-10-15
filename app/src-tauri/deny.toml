@@ -1,6 +1,8 @@
-# cargo-deny for the Tauri shell, a Cargo workspace of its own (design of sub-project 2c, C17): the
-# rules of the root deny.toml, plus what the shell's dependency tree (Tauri, WebKitGTK, GTK 3) needs,
-# each with its reason. The CI runs it in the job `app`.
+# cargo-deny for the Tauri shell, a Cargo workspace of its own (design of sub-project 2c, C17). The
+# rules of the root deny.toml, word for word, with exactly three differences, each for the shell's
+# dependency tree (Tauri, WebKitGTK, GTK 3) and with its reason below: MPL-2.0 among the licences,
+# `allow-wildcard-paths` (its path dependencies on the repository's crates), and one advisory
+# ignored. The CI runs it in the job `app`.
 
 [graph]
 all-features = true
@@ -10,7 +12,9 @@ all-features = true
 # parsing, which Tauri's HTML tooling pulls in at build time) and option-ext (through `dirs`) are used
 # unmodified; a binary that ships them carries their notices and says where their source is, which
 # the application bundle of sub-project 9 does.
-allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "MPL-2.0", "Unicode-3.0", "Zlib"]
+# The root's list plus MPL-2.0; BSD-2-Clause, which no crate of the shell uses today, stays allowed
+# as at the root (cargo-deny says so with a warning).
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MPL-2.0", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.9
 
 [[licenses.exceptions]]
