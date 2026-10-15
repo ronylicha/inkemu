@@ -145,31 +145,67 @@ fn same_place(one: &Path, other: &Path) -> bool {
 /// [`SessionFileError::Claimed`] and [`SessionFileError::TemporaryClaimed`] when the path or its
 /// temporary file is one of `claimed`.
 pub fn refuse_record_path(path: &Path, claimed: &[Claimed]) -> Result<(), SessionFileError> {
+    check_output_path(path, claimed).map_err(|refusal| match refusal {
+        OutputRefusal::NoFileName => SessionFileError::NoFileName { path: shown(path) },
+        OutputRefusal::NotAFileToWrite => SessionFileError::NotAFileToWrite { path: shown(path) },
+        OutputRefusal::NoDirectory => SessionFileError::NoDirectory { path: shown(path) },
+        OutputRefusal::Claimed { what } => SessionFileError::Claimed {
+            path: shown(path),
+            what,
+        },
+        OutputRefusal::TemporaryClaimed { temporary, what } => SessionFileError::TemporaryClaimed {
+            path: shown(path),
+            temporary,
+            what,
+        },
+    })
+}
+
+/// Why a path cannot take a file the run writes beside its own (a session, a capture of the
+/// screen); each writer words it for its user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputRefusal {
+    /// The path names no file (it ends in a separator, or is empty).
+    NoFileName,
+    /// A directory or a link stands at the path.
+    NotAFileToWrite,
+    /// The directory of the path does not exist.
+    NoDirectory,
+    /// The path is one the run reads or writes; `what` says which.
+    Claimed { what: String },
+    /// The temporary file the path is written through is one the run reads or writes.
+    TemporaryClaimed { temporary: String, what: String },
+}
+
+/// Checks that a file written at `path` through its temporary file ([`write_through_temporary`])
+/// replaces nothing in `claimed`, existing or not, and that it can be created there.
+///
+/// # Errors
+/// [`OutputRefusal`] with the first reason found.
+pub fn check_output_path(path: &Path, claimed: &[Claimed]) -> Result<(), OutputRefusal> {
     let ends_in_a_separator = path
         .as_os_str()
         .to_string_lossy()
         .ends_with(std::path::is_separator);
     let Some(temporary) = temporary_path(path).filter(|_| !ends_in_a_separator) else {
-        return Err(SessionFileError::NoFileName { path: shown(path) });
+        return Err(OutputRefusal::NoFileName);
     };
     if let Ok(metadata) = std::fs::symlink_metadata(path)
         && !metadata.is_file()
     {
-        return Err(SessionFileError::NotAFileToWrite { path: shown(path) });
+        return Err(OutputRefusal::NotAFileToWrite);
     }
     if directory_of(path).is_none() {
-        return Err(SessionFileError::NoDirectory { path: shown(path) });
+        return Err(OutputRefusal::NoDirectory);
     }
     for claim in claimed {
         if claim.holds(path) {
-            return Err(SessionFileError::Claimed {
-                path: shown(path),
+            return Err(OutputRefusal::Claimed {
                 what: claim.what().to_owned(),
             });
         }
         if claim.holds(&temporary) {
-            return Err(SessionFileError::TemporaryClaimed {
-                path: shown(path),
+            return Err(OutputRefusal::TemporaryClaimed {
                 temporary: shown(&temporary),
                 what: claim.what().to_owned(),
             });
@@ -179,39 +215,48 @@ pub fn refuse_record_path(path: &Path, claimed: &[Claimed]) -> Result<(), Sessio
 }
 
 /// Writes `bytes` to `path` through a temporary file beside it, flushed to the disk then renamed:
-/// the path holds the session of before or the new one, never part of one. A session holds the
-/// whole flash, what the firmware keeps among it (network credentials): on Unix a file created
-/// here is readable and writable by its owner only (ADR 0004 point 5).
+/// the path holds the file of before or the new one, never part of one. On Unix a file created
+/// here has `mode`, less what the process's umask removes.
 ///
 /// # Errors
-/// [`SessionFileError::Write`] with what the system said.
-pub fn write_session(path: &Path, bytes: &[u8]) -> Result<(), SessionFileError> {
-    let failed = |detail: String| SessionFileError::Write {
-        path: shown(path),
-        detail: sanitize(&detail),
-    };
-    let temporary =
-        temporary_path(path).ok_or_else(|| failed("the path names no file".to_owned()))?;
+/// What the system said, its control characters escaped.
+pub fn write_through_temporary(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    let temporary = temporary_path(path).ok_or_else(|| "the path names no file".to_owned())?;
     // A link or anything else at the temporary name is removed, never followed.
     if std::fs::symlink_metadata(&temporary).is_ok() {
-        std::fs::remove_file(&temporary).map_err(|e| failed(e.to_string()))?;
+        std::fs::remove_file(&temporary).map_err(|e| sanitize(&e.to_string()))?;
     }
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+        options.mode(mode);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let written = options.open(&temporary).and_then(|mut file| {
         file.write_all(bytes)?;
         file.sync_all()
     });
     if let Err(e) = written.and_then(|()| std::fs::rename(&temporary, path)) {
         let _ = std::fs::remove_file(&temporary);
-        return Err(failed(e.to_string()));
+        return Err(sanitize(&e.to_string()));
     }
     Ok(())
+}
+
+/// Writes the session `bytes` to `path` ([`write_through_temporary`]). A session holds the whole
+/// flash, what the firmware keeps among it (network credentials): on Unix a file created here is
+/// readable and writable by its owner only (ADR 0004 point 5).
+///
+/// # Errors
+/// [`SessionFileError::Write`] with what the system said.
+pub fn write_session(path: &Path, bytes: &[u8]) -> Result<(), SessionFileError> {
+    write_through_temporary(path, bytes, 0o600).map_err(|detail| SessionFileError::Write {
+        path: shown(path),
+        detail,
+    })
 }
 
 #[cfg(test)]

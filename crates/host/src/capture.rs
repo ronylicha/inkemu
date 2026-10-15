@@ -5,9 +5,12 @@
 //! the device: it does not depend on the size of a window or on a scaling. It is an 8-bit
 //! greyscale PNG, compressed with zlib, with no metadata.
 use crate::ports::{PanelFrame, Rotation};
+use crate::session_file::{Claimed, OutputRefusal, check_output_path, write_through_temporary};
+use crate::term::sanitize;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use std::io::Write as _;
+use std::path::Path;
 
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
 
@@ -91,6 +94,54 @@ pub fn png(frame: &PanelFrame, rotation: Rotation) -> Vec<u8> {
     chunk(&mut out, *b"IDAT", &data);
     chunk(&mut out, *b"IEND", &[]);
     out
+}
+
+/// Why a capture was not written. The messages state the cause, then the remedy; the paths they
+/// echo have their control characters escaped.
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureError {
+    #[error("the panel has shown no image yet; capture it once it has")]
+    NoImage,
+    #[error("the capture cannot be written to {path}: {reason}; choose another path")]
+    Refused { path: String, reason: String },
+    #[error(
+        "cannot write the capture {path}: {detail}; check that the directory exists and is writable"
+    )]
+    Write { path: String, detail: String },
+}
+
+/// Writes the PNG of `frame`, turned by `rotation`, to `path` through a temporary file beside it,
+/// unless the path is one of `claimed`, the files the run reads or writes: a capture never
+/// replaces the flash file, its lock, the ROM or a session.
+///
+/// # Errors
+/// [`CaptureError`] when the path is refused or the file cannot be written.
+pub fn save(
+    frame: &PanelFrame,
+    rotation: Rotation,
+    path: &Path,
+    claimed: &[Claimed],
+) -> Result<(), CaptureError> {
+    let shown = sanitize(&path.display().to_string());
+    check_output_path(path, claimed).map_err(|refusal| CaptureError::Refused {
+        path: shown.clone(),
+        reason: match refusal {
+            OutputRefusal::NoFileName => "it names no file".to_owned(),
+            OutputRefusal::NotAFileToWrite => "a directory or a link stands there".to_owned(),
+            OutputRefusal::NoDirectory => "its directory does not exist".to_owned(),
+            OutputRefusal::Claimed { what } => format!("it is {what}"),
+            OutputRefusal::TemporaryClaimed { temporary, what } => {
+                format!("it is written first to {temporary}, which is {what}")
+            }
+        },
+    })?;
+    // A capture is a picture of the screen, which its user shares: readable as the umask allows.
+    write_through_temporary(path, &png(frame, rotation), 0o644).map_err(|detail| {
+        CaptureError::Write {
+            path: shown,
+            detail,
+        }
+    })
 }
 
 #[cfg(test)]

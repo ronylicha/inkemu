@@ -21,7 +21,7 @@ use crate::ports::{Life, PanelFrame, PowerOnError, Recipe, RefreshKind};
 use crate::record::{self, Recorder, Verdict};
 use crate::rom_store::{self, RomStoreError};
 use crate::run::RunEnd;
-use crate::session_file::{self, SessionFileError};
+use crate::session_file::{self, Claimed, SessionFileError};
 use crate::term::sanitize;
 use boards::{DeviceProfile, MachineOptions, ProfileError};
 use session::{ProfileText, RomIdentity, Session};
@@ -157,24 +157,25 @@ impl LaunchError {
     }
 }
 
-/// The paths of a run, kept to judge a session path given later.
+/// The paths of a run, kept to judge a session path or a capture path given later. The flash
+/// file is the [`FlashKeeper`]'s, which holds it.
 #[derive(Clone, Debug, Default)]
 struct RunPaths {
     device: String,
     image: Option<PathBuf>,
     firmware: Option<PathBuf>,
     bootloader: Option<PathBuf>,
-    flash_file: Option<PathBuf>,
     rom_dir: Option<PathBuf>,
 }
 
 impl RunPaths {
-    fn request(&self) -> FlashRequest<'_> {
+    /// The request of the run, whose flash file is `file`.
+    fn request<'a>(&'a self, file: Option<&'a Path>) -> FlashRequest<'a> {
         FlashRequest {
             image: self.image.as_deref(),
             firmware: self.firmware.as_deref(),
             bootloader: self.bootloader.as_deref(),
-            file: self.flash_file.as_deref(),
+            file,
             reset: false,
         }
     }
@@ -306,6 +307,8 @@ enum Plan {
     Replay {
         session: Box<Session>,
         name: String,
+        /// The files the replay reads, which a capture must not replace.
+        claimed: Vec<Claimed>,
     },
 }
 
@@ -375,6 +378,7 @@ impl Launch {
             plan: Plan::Replay {
                 session: Box::new(session),
                 name,
+                claimed: Vec::new(),
             },
             notices: Vec::new(),
             look,
@@ -403,12 +407,11 @@ pub fn power_on(setup: &Setup) -> Result<Launch, LaunchError> {
         image: setup.image.clone(),
         firmware: setup.firmware.clone(),
         bootloader: setup.bootloader.clone(),
-        flash_file: setup.flash_file.clone(),
         rom_dir: setup.rom_dir.clone(),
     };
     let flash = FlashRequest {
         reset: setup.reset_flash,
-        ..paths.request()
+        ..paths.request(setup.flash_file.as_deref())
     };
     // The text of the profile it gives is the one every recorded life carries (below).
     launch::refuse_record_path(
@@ -517,6 +520,12 @@ pub fn open_replay(
         .device()
         .map_err(|e| LaunchError::Replay(sanitize(&e.to_string())))?;
     let entry = rom_store::rom_entry_for(profile.chip_revision);
+    // What a capture of the replay must not replace: the session it replays and its ROM.
+    let mut claimed = vec![Claimed::File {
+        path: path.to_path_buf(),
+        what: "the session the replay reads".to_owned(),
+    }];
+    claimed.extend(launch::rom_claim(rom_dir.as_deref(), entry));
     let rom = launch::load_rom(rom_dir, entry, &mut log)?;
     // Refused here, before the thread, for what a replay cannot start on.
     let probe = record::start_replay(&session, rom.clone(), entry.rom_revision)
@@ -557,7 +566,11 @@ pub fn open_replay(
             rom_revision: entry.rom_revision,
             profile,
         }),
-        plan: Plan::Replay { session, name },
+        plan: Plan::Replay {
+            session,
+            name,
+            claimed,
+        },
         notices: Notice::from_log(&log),
         look,
         console: shown,
@@ -591,6 +604,11 @@ pub enum Command {
     Record {
         path: PathBuf,
     },
+    /// A PNG of the screen as its user sees it, written to `path` unless the run reads or writes
+    /// that path ([`crate::capture::save`]).
+    Capture {
+        path: PathBuf,
+    },
 }
 
 /// Why a command was not done.
@@ -614,6 +632,8 @@ pub enum CommandError {
     /// the thread that waits for the answer.
     #[error("a command cannot be given from the emulator's own thread (its observer)")]
     OnItsThread,
+    #[error("{0}")]
+    Capture(#[from] crate::capture::CaptureError),
 }
 
 impl CommandError {
@@ -633,6 +653,8 @@ impl CommandError {
             CommandError::NotRecordable => "notRecordable",
             CommandError::PowerOn(_) => "powerOn",
             CommandError::OnItsThread => "onItsThread",
+            CommandError::Capture(crate::capture::CaptureError::NoImage) => "noImage",
+            CommandError::Capture(_) => "capture",
         }
     }
 }
@@ -753,7 +775,6 @@ type FrameSlot = Arc<Mutex<Option<Arc<PanelFrame>>>>;
 pub struct Handle {
     requests: Sender<Request>,
     frame: FrameSlot,
-    rotation: crate::ports::Rotation,
     /// The emulator's thread, on which a command would wait for itself.
     thread: std::thread::ThreadId,
 }
@@ -800,13 +821,6 @@ impl Handle {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
-
-    /// A PNG of the last image as the user of the device sees it.
-    #[must_use]
-    pub fn capture(&self) -> Option<Vec<u8>> {
-        self.frame()
-            .map(|frame| crate::capture::png(&frame, self.rotation))
-    }
 }
 
 /// A machine running on its own thread. Dropping it ends its last life and waits for the thread.
@@ -844,6 +858,7 @@ impl Emulator {
             ..
         } = launch;
         let slot = Arc::clone(&frame);
+        let rotation = look.panel.rotation;
         // The worker holds machines, which stay on the thread: it is built there (2c-R4).
         let thread = std::thread::Builder::new()
             .name("inkemu-device".to_owned())
@@ -865,6 +880,7 @@ impl Emulator {
                     measure: None,
                     speed_ratio: None,
                     console: ConsoleBatch::default(),
+                    rotation,
                 }
                 .serve(&receiver);
             })?;
@@ -872,7 +888,6 @@ impl Emulator {
             handle: Handle {
                 requests,
                 frame,
-                rotation: look.panel.rotation,
                 thread: thread.thread().id(),
             },
             look,
@@ -900,12 +915,6 @@ impl Emulator {
     #[must_use]
     pub fn frame(&self) -> Option<Arc<PanelFrame>> {
         self.handle.frame()
-    }
-
-    /// [`Handle::capture`].
-    #[must_use]
-    pub fn capture(&self) -> Option<Vec<u8>> {
-        self.handle.capture()
     }
 
     /// The name of the device, escaped.
@@ -967,6 +976,8 @@ struct Worker {
     measure: Option<(Instant, u64)>,
     speed_ratio: Option<f64>,
     console: ConsoleBatch,
+    /// How the panel is mounted, for a capture.
+    rotation: crate::ports::Rotation,
 }
 
 impl Worker {
@@ -1248,7 +1259,42 @@ impl Worker {
                 Ok(())
             }
             Command::Record { path } => self.record(path),
+            Command::Capture { path } => self.capture(&path),
         }
+    }
+
+    /// Writes a PNG of the last image to `path`, which must not be a file of the run.
+    fn capture(&self, path: &Path) -> Result<(), CommandError> {
+        let frame = self
+            .frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or(crate::capture::CaptureError::NoImage)?;
+        crate::capture::save(&frame, self.rotation, path, &self.claimed())?;
+        Ok(())
+    }
+
+    /// The files the run reads or writes, which nothing else it writes may replace: the inputs
+    /// of the run and its flash file, its ROM, the session it records or replays.
+    fn claimed(&self) -> Vec<Claimed> {
+        let mut claimed = match &self.plan {
+            // The flash file is the one the run holds, however the run was made.
+            Plan::Run { paths, flash, .. } => launch::claimed_paths(
+                &paths.request(flash.file.as_deref()),
+                None,
+                self.recipe_rom_entry()
+                    .map(|entry| (paths.rom_dir.as_deref(), entry)),
+            ),
+            Plan::Replay { claimed, .. } => claimed.clone(),
+        };
+        if let Some(path) = &self.recording {
+            claimed.push(Claimed::File {
+                path: path.clone(),
+                what: "the session this life is recorded into".to_owned(),
+            });
+        }
+        claimed
     }
 
     fn live_engine(&mut self) -> Result<&mut Engine, CommandError> {
@@ -1263,7 +1309,10 @@ impl Worker {
 
     fn record(&mut self, path: PathBuf) -> Result<(), CommandError> {
         let Plan::Run {
-            paths, recording, ..
+            paths,
+            recording,
+            flash,
+            ..
         } = &self.plan
         else {
             return Err(CommandError::ReplayNotRecorded);
@@ -1275,7 +1324,13 @@ impl Worker {
             Some(entry) => (paths.rom_dir.as_deref(), entry),
             None => return Err(CommandError::NotRecordable),
         };
-        launch::refuse_record_path(Some(&path), &paths.request(), None, rom, &paths.device)?;
+        launch::refuse_record_path(
+            Some(&path),
+            &paths.request(flash.file.as_deref()),
+            None,
+            rom,
+            &paths.device,
+        )?;
         self.end_life();
         self.begin_life(Some(path))
     }
@@ -1671,11 +1726,12 @@ mod tests {
             "{first:?}"
         );
         assert_eq!(emulator.frame().map(|f| f.generation), Some(1));
-        assert!(
-            emulator
-                .capture()
-                .is_some_and(|png| png.starts_with(b"\x89PNG"))
-        );
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("screen.png");
+        emulator
+            .command(Command::Capture { path: png.clone() })
+            .unwrap();
+        assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
         shows(&updates, UART0, "ready");
         emulator
             .command(Command::Console {
@@ -2289,6 +2345,47 @@ mod tests {
                 if n.text.contains("a button port broke"))),
             "{seen:#?}"
         );
+        emulator.shutdown();
+    }
+
+    /// A capture refuses every path the run reads or writes (the flash file, its lock and its
+    /// temporary file), whose content stays as it was, and writes any other.
+    #[test]
+    fn a_capture_never_replaces_a_file_of_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("flash.bin");
+        let keeper = FlashKeeper::begin(Some(file.clone()), false, None, 1 << 20).unwrap();
+        let launch = Launch::new(
+            writing_device(0x00, Arc::default()),
+            keeper,
+            Limits::default(),
+            LOOK,
+            None,
+        );
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::Frame { .. }));
+        let claimed = crate::flash_state::files_of_the_flash_file(&file);
+        assert!(claimed.len() >= 3, "{claimed:?}");
+        for (path, _) in claimed {
+            let before = std::fs::read(&path).ok();
+            let refused = emulator.command(Command::Capture { path: path.clone() });
+            assert!(
+                matches!(
+                    refused,
+                    Err(CommandError::Capture(
+                        crate::capture::CaptureError::Refused { .. }
+                    ))
+                ),
+                "{}: {refused:?}",
+                path.display()
+            );
+            assert_eq!(std::fs::read(&path).ok(), before, "{}", path.display());
+        }
+        let png = dir.path().join("screen.png");
+        emulator
+            .command(Command::Capture { path: png.clone() })
+            .unwrap();
+        assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
         emulator.shutdown();
     }
 

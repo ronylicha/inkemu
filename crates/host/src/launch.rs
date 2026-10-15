@@ -330,6 +330,20 @@ pub fn refuse_record_path(
     let Some(path) = record else {
         return Ok(None);
     };
+    let claimed = claimed_paths(flash, console_script, Some(rom));
+    session_file::refuse_record_path(path, &claimed)?;
+    Ok(Some(boards::builtin_toml(device)?))
+}
+
+/// The paths a run reads or writes, which nothing it writes besides may replace: the files given
+/// to the run, the flash file and the files beside it, and, when `rom` names the ROM of the run,
+/// the ROM file of its directory or, without a directory, the ROM cache.
+#[must_use]
+pub fn claimed_paths(
+    flash: &FlashRequest<'_>,
+    console_script: Option<&Path>,
+    rom: Option<(Option<&Path>, &RomEntry)>,
+) -> Vec<Claimed> {
     let mut claimed = Vec::new();
     for (option, input) in [
         ("--flash", flash.image),
@@ -352,24 +366,27 @@ pub fn refuse_record_path(
             },
         ));
     }
-    let (rom_dir, entry) = rom;
+    claimed.extend(rom.and_then(|(rom_dir, entry)| rom_claim(rom_dir, entry)));
+    claimed
+}
+
+/// The ROM file of `entry` in `rom_dir` or, without a directory, the ROM cache: what a run or a
+/// replay reads its ROM from. `None` without a home directory, where there is no cache.
+#[must_use]
+pub fn rom_claim(rom_dir: Option<&Path>, entry: &RomEntry) -> Option<Claimed> {
     match rom_dir {
-        Some(dir) => claimed.push(Claimed::File {
+        Some(dir) => Some(Claimed::File {
             path: dir.join(entry.elf_name),
             what: "the ROM file of --rom-dir, which the run reads".to_owned(),
         }),
         // Without a home directory there is no cache: loading the ROM says so.
-        None => {
-            if let Ok(dir) = rom_store::default_cache_dir() {
-                claimed.push(Claimed::Directory {
-                    path: dir,
-                    what: "in the ROM cache, whose files the run reads and downloads".to_owned(),
-                });
-            }
-        }
+        None => rom_store::default_cache_dir()
+            .ok()
+            .map(|dir| Claimed::Directory {
+                path: dir,
+                what: "in the ROM cache, whose files the run reads and downloads".to_owned(),
+            }),
     }
-    session_file::refuse_record_path(path, &claimed)?;
-    Ok(Some(boards::builtin_toml(device)?))
 }
 
 /// The mask ROM of `entry`, from `rom_dir`, read only, or from the per-user cache, which downloads
