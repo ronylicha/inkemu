@@ -3,7 +3,7 @@
 //! They belong to the emulator, not to one life of its machine (4a-D8): [`Points::apply`] hands
 //! them to each machine. Setting a point that is set already, or clearing one that is not, changes
 //! nothing and is no error: a click and the view it came from may cross.
-use crate::region::{Region, overlaps_flash};
+use crate::region::{Region, instruction_bus_twin, overlaps_flash};
 use soc_esp32c3::{Esp32C3, Watch, WatchOn};
 use std::collections::BTreeSet;
 
@@ -21,6 +21,10 @@ pub enum PointError {
         "a breakpoint goes on the address of an instruction, which is even: {address:#010x} is odd; give an even address"
     )]
     OddAddress { address: u32 },
+    #[error(
+        "{address:#010x} is a data-bus alias: the CPU fetches its instructions through the instruction bus, so a breakpoint there would never stop; set it at {instruction_bus:#010x}, the same cell through the instruction bus"
+    )]
+    DataBusAlias { address: u32, instruction_bus: u32 },
     #[error(
         "no instruction can be fetched at {address:#010x}, which is {}; set a breakpoint in the ROM, a RAM or the flash",
         region.describe()
@@ -46,6 +50,19 @@ pub enum PointError {
     Unmapped { address: u32 },
     #[error("a watchpoint stops on `read`, `write` or `access`, not `{name}`")]
     UnknownAccess { name: String },
+}
+
+impl PointError {
+    /// The kind of the refusal, for an interface that names it in its own words:
+    /// `dataBusAlias` for [`PointError::DataBusAlias`], whose remedy is an address the
+    /// interface may offer; `point` for the others.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            PointError::DataBusAlias { .. } => "dataBusAlias",
+            _ => "point",
+        }
+    }
 }
 
 /// The points a debugger set.
@@ -113,11 +130,17 @@ impl Points {
     /// Sets a breakpoint before the instruction at `address`.
     ///
     /// # Errors
-    /// [`PointError::OddAddress`], [`PointError::NoCode`] (registers, nothing),
-    /// [`PointError::TooManyBreakpoints`].
+    /// [`PointError::OddAddress`], [`PointError::DataBusAlias`], [`PointError::NoCode`]
+    /// (registers, nothing), [`PointError::TooManyBreakpoints`].
     pub fn set_breakpoint(&mut self, address: u32) -> Result<(), PointError> {
         if !address.is_multiple_of(2) {
             return Err(PointError::OddAddress { address });
+        }
+        if let Some(instruction_bus) = instruction_bus_twin(address) {
+            return Err(PointError::DataBusAlias {
+                address,
+                instruction_bus,
+            });
         }
         let region = Region::of(address);
         if !region.holds_code() {
@@ -257,7 +280,10 @@ pub struct WatchView {
 mod tests {
     use super::*;
     use soc_esp32c3::SocConfig;
-    use soc_esp32c3::memmap::{FLASH_DBUS_BASE, FLASH_IBUS_BASE, ROM_BASE, SRAM_DBUS_BASE};
+    use soc_esp32c3::memmap::{
+        DROM_BASE, DROM_ROM_OFFSET, FLASH_DBUS_BASE, FLASH_IBUS_BASE, ROM_BASE, SRAM_DBUS_BASE,
+        SRAM_IBUS_BASE,
+    };
     use soc_esp32c3::test_support::flat_rom;
 
     fn watch(address: u32, length: u32) -> Watch {
@@ -301,6 +327,34 @@ mod tests {
         assert!(!points.has_breakpoint(ROM_BASE + 2));
     }
 
+    /// The PC is an instruction-bus address: a breakpoint on a data-bus alias would never stop,
+    /// so it is refused with the address that would.
+    #[test]
+    fn a_breakpoint_on_a_data_bus_alias_is_refused_with_its_instruction_bus_address() {
+        let mut points = Points::default();
+        for (alias, twin) in [
+            (DROM_BASE + 8, ROM_BASE + DROM_ROM_OFFSET + 8),
+            (SRAM_DBUS_BASE + 0x40, SRAM_IBUS_BASE + 0x40),
+            (FLASH_DBUS_BASE + 0x20, FLASH_IBUS_BASE + 0x20),
+        ] {
+            let refused = points.set_breakpoint(alias).unwrap_err();
+            assert_eq!(
+                refused,
+                PointError::DataBusAlias {
+                    address: alias,
+                    instruction_bus: twin
+                }
+            );
+            assert!(
+                refused
+                    .to_string()
+                    .contains(&format!("set it at {twin:#010x}")),
+                "{refused}"
+            );
+        }
+        assert_eq!(points.breakpoints().count(), 0);
+    }
+
     #[test]
     fn breakpoints_are_bounded_and_one_set_already_is_no_new_one() {
         let mut points = Points::default();
@@ -310,7 +364,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            points.set_breakpoint(SRAM_DBUS_BASE),
+            points.set_breakpoint(SRAM_IBUS_BASE),
             Err(PointError::TooManyBreakpoints)
         );
         assert_eq!(points.set_breakpoint(ROM_BASE), Ok(()), "set already");

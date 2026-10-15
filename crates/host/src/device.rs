@@ -1054,7 +1054,7 @@ impl CommandError {
             CommandError::NotKept(_) => "notKept",
             CommandError::NotRecorded(_) => "notRecorded",
             CommandError::SdCard(_) => "sdCard",
-            CommandError::Point(_) => "point",
+            CommandError::Point(error) => error.kind(),
         }
     }
 }
@@ -4572,6 +4572,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(odd.kind(), "point");
         assert!(odd.to_string().contains("is odd"), "{odd}");
+        let alias = emulator
+            .command(Command::Breakpoint {
+                address: soc_esp32c3::memmap::SRAM_DBUS_BASE,
+                set: true,
+            })
+            .unwrap_err();
+        assert_eq!(alias.kind(), "dataBusAlias");
+        assert!(
+            alias.to_string().contains("set it at 0x40380000"),
+            "{alias}"
+        );
         let flash = emulator
             .command(Command::Watchpoint {
                 watch: Watch {

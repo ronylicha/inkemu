@@ -1011,6 +1011,9 @@ mod tests {
         assert_eq!(points_of(Some(kept)).unwrap().breakpoints().count(), 1);
         let odd: PointsRequest = serde_json::from_str(r#"{"breakpoints":[1073741825]}"#).unwrap();
         assert_eq!(points_of(Some(odd)).unwrap_err().kind, "point");
+        // 0x3fc80000, the data-bus view of the SRAM.
+        let alias: PointsRequest = serde_json::from_str(r#"{"breakpoints":[1070071808]}"#).unwrap();
+        assert_eq!(points_of(Some(alias)).unwrap_err().kind, "dataBusAlias");
     }
 
     /// The debugger reads the emulator of the start it names, stopped at the breakpoint it began

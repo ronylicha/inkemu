@@ -28,6 +28,7 @@ const ERROR_KINDS = [
   "board",
   "button",
   "capture",
+  "dataBusAlias",
   "ended",
   "firmware",
   "flashFile",

@@ -1,9 +1,9 @@
 //! The regions of the ESP32-C3's address space, as the debugger names them (memory map:
 //! `soc_esp32c3::memmap`, `docs/research/esp32c3-boot-chain.md` §A.1).
 use soc_esp32c3::memmap::{
-    DROM_BASE, DROM_SIZE, FLASH_DBUS_BASE, FLASH_IBUS_BASE, FLASH_WINDOW_SIZE, PERIPH_BASE,
-    PERIPH_SIZE, ROM_BASE, ROM_SIZE, RTC_RAM_BASE, RTC_RAM_SIZE, SRAM_DBUS_BASE, SRAM_IBUS_BASE,
-    SRAM_SIZE, SRAM0_BASE, SRAM0_SIZE,
+    DROM_BASE, DROM_ROM_OFFSET, DROM_SIZE, FLASH_DBUS_BASE, FLASH_IBUS_BASE, FLASH_WINDOW_SIZE,
+    PERIPH_BASE, PERIPH_SIZE, ROM_BASE, ROM_SIZE, RTC_RAM_BASE, RTC_RAM_SIZE, SRAM_DBUS_BASE,
+    SRAM_IBUS_BASE, SRAM_SIZE, SRAM0_BASE, SRAM0_SIZE,
 };
 
 /// What lies at an address.
@@ -93,6 +93,19 @@ impl Region {
     }
 }
 
+/// The instruction-bus address of the cell a data-bus alias names, when `address` is one: the
+/// data-bus alias of the mask ROM, the data-bus view of the SRAM, or the data window of the
+/// flash. The CPU fetches its instructions through the instruction bus, so its PC is never such
+/// an address: a breakpoint there would never stop.
+#[must_use]
+pub fn instruction_bus_twin(address: u32) -> Option<u32> {
+    let twin =
+        |base: u32, size: u32, to: u32| within(address, base, size).then(|| to + (address - base));
+    twin(DROM_BASE, DROM_SIZE, ROM_BASE + DROM_ROM_OFFSET)
+        .or_else(|| twin(SRAM_DBUS_BASE, SRAM_SIZE, SRAM_IBUS_BASE))
+        .or_else(|| twin(FLASH_DBUS_BASE, FLASH_WINDOW_SIZE, FLASH_IBUS_BASE))
+}
+
 /// Whether the instruction-bus window of the flash holds `address`: the code the CPU executes
 /// from the flash, which the disassembly reads (4a-D6).
 #[must_use]
@@ -142,6 +155,26 @@ mod tests {
         assert!(Region::Rtc.holds_code());
         assert!(!Region::Registers.holds_code());
         assert!(!Region::Unmapped.holds_code());
+    }
+
+    #[test]
+    fn each_data_bus_alias_has_its_instruction_bus_twin() {
+        assert_eq!(
+            instruction_bus_twin(DROM_BASE + 8),
+            Some(ROM_BASE + DROM_ROM_OFFSET + 8)
+        );
+        assert_eq!(
+            instruction_bus_twin(SRAM_DBUS_BASE + 0x40),
+            Some(SRAM_IBUS_BASE + 0x40)
+        );
+        assert_eq!(
+            instruction_bus_twin(FLASH_DBUS_BASE + 0x1_0000),
+            Some(FLASH_IBUS_BASE + 0x1_0000)
+        );
+        assert_eq!(instruction_bus_twin(ROM_BASE), None);
+        assert_eq!(instruction_bus_twin(SRAM_IBUS_BASE), None);
+        assert_eq!(instruction_bus_twin(FLASH_IBUS_BASE), None);
+        assert_eq!(instruction_bus_twin(RTC_RAM_BASE), None);
     }
 
     #[test]

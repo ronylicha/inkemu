@@ -202,6 +202,8 @@ export const en: Catalog = {
   "error.frame": "The image of the panel could not be read.",
   "error.notKept": "The device was powered off without keeping everything.",
   "error.point": "This point of the debugger is refused.",
+  "error.dataBusAlias":
+    "This address is a data-bus alias: the CPU never executes there, so a breakpoint would never stop. Set it at the instruction-bus address below.",
   "said.captured": "Capture saved: {name}",
   "said.recording": "The device is powered on again, and this life is recorded into {name}",
 
