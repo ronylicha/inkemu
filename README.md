@@ -288,7 +288,7 @@ pnpm tauri dev           # Vite on port 1420, then the window
 pnpm check               # Biome, the types (TypeScript 7) and the tests (Vitest)
 ```
 
-The ROM is downloaded into the cache on first use, as for `inkemu run`. The shell is a Cargo workspace of its own (`app/src-tauri`); no package is built or signed yet (sub-project 9). See [ADR 0011](docs/adr/0011-crate-hote-et-ports.md) (French).
+The ROM is downloaded into the cache on first use, as for `inkemu run`. Closing the window, quitting or a `SIGINT`/`SIGTERM` first powers the device off, so that its flash file and its session are written; what could not be kept is shown before the window goes. The shell is a Cargo workspace of its own (`app/src-tauri`); no package is built or signed yet (sub-project 9). See [ADR 0011](docs/adr/0011-crate-hote-et-ports.md) (French).
 
 ### For developers: the lockstep against QEMU
 
@@ -455,7 +455,7 @@ Un script de console dit ce que l'hôte envoie à l'appareil, et quand, en temps
 
 **L'écran est pour l'instant une mire de test.** Le SSD1677 du X4 et ses boutons sont reliés au firmware au sous-projet 2d ; d'ici là, la fenêtre le dit, et ce que montre l'écran et font les boutons vient d'une mire d'inkemu, pas du firmware. Tout le reste est l'émulateur réel : la fenêtre et la commande partagent une bibliothèque hôte, `crates/host`.
 
-Pour la lancer en développement (Node.js 24 avec corepack, la chaîne Rust du dépôt et, sous Linux, les bibliothèques des [prérequis de Tauri](https://v2.tauri.app/start/prerequisites/) : `libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev`) : `cd app`, `corepack enable`, `pnpm install`, puis `pnpm tauri dev` (Vite sur le port 1420, puis la fenêtre) ; `pnpm check` lance Biome, les types (TypeScript 7) et les tests (Vitest). La ROM est téléchargée dans le cache à la première utilisation, comme pour `inkemu run`. L'enveloppe est un espace de travail Cargo à part (`app/src-tauri`) ; aucun paquet n'est encore construit ni signé (sous-projet 9). Voir l'[ADR 0011](docs/adr/0011-crate-hote-et-ports.md).
+Pour la lancer en développement (Node.js 24 avec corepack, la chaîne Rust du dépôt et, sous Linux, les bibliothèques des [prérequis de Tauri](https://v2.tauri.app/start/prerequisites/) : `libwebkit2gtk-4.1-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev`) : `cd app`, `corepack enable`, `pnpm install`, puis `pnpm tauri dev` (Vite sur le port 1420, puis la fenêtre) ; `pnpm check` lance Biome, les types (TypeScript 7) et les tests (Vitest). La ROM est téléchargée dans le cache à la première utilisation, comme pour `inkemu run`. Fermer la fenêtre, quitter ou un `SIGINT`/`SIGTERM` éteint d'abord l'appareil, pour que son fichier de flash et sa session s'écrivent ; ce qui n'a pas pu être gardé est montré avant que la fenêtre se ferme. L'enveloppe est un espace de travail Cargo à part (`app/src-tauri`) ; aucun paquet n'est encore construit ni signé (sous-projet 9). Voir l'[ADR 0011](docs/adr/0011-crate-hote-et-ports.md).
 
 ### Pour les développeurs : le lockstep avec QEMU
 

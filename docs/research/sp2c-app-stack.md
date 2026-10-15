@@ -12,14 +12,14 @@ the registry that publishes it; nothing is from memory.
 | `tauri` (crate) | **2.12.4** (latest 2.x; 3.0.0-alpha.5 exists, not stable) | 2026-10-14 | `https://crates.io/api/v1/crates/tauri/versions` |
 | `tauri-build` | **2.7.3** | 2026-10-14 | same API |
 | `tauri-plugin-dialog` | **2.8.3** | 2026-10-14 | same API |
-| `@tauri-apps/cli` | **2.12.3** | 2026-10-14 | `npm view @tauri-apps/cli time` |
-| `@tauri-apps/api` | **2.12.4** | | `npm view @tauri-apps/api version` |
-| `@tauri-apps/plugin-dialog` | **2.8.3** | | `npm view` |
+| `@tauri-apps/cli` | **2.12.2** (2.12.3, of 2026-10-14, waits for pnpm's day: see below) | 2026-10-10 | `npm view @tauri-apps/cli time` |
+| `@tauri-apps/api` | **2.12.3** (2.12.4 of 2026-10-14 waits) | 2026-10-10 | `npm view @tauri-apps/api time` |
+| `@tauri-apps/plugin-dialog` | **2.8.2** (2.8.3 of 2026-10-14 waits) | 2026-10-10 | `npm view` |
 | `vite` | **8.3.4** (`node ^20.19.0 \|\| >=22.12.0`) | 2026-10-08 | `npm view vite time`, `engines` |
 | `typescript` | **7.0.2** (the native compiler: the package ships per-platform binaries) | 2026-07-08 | `npm view typescript time`, `dependencies` |
 | `vitest` | **5.0.4** (peer `vite ^6.4 \|\| ^7 \|\| ^8`) | | `npm view vitest peerDependencies` |
 | `@biomejs/biome` | **2.5.15** | | `npm view @biomejs/biome dist-tags` |
-| `react`, `react-dom` | **19.3.1** | | `npm view` |
+| `react`, `react-dom` | **19.3.0** (19.3.1 of 2026-10-14 waits) | 2026-09-09 | `npm view react time` |
 | `@vitejs/plugin-react` | **6.1.2** (peer `vite ^8`) | | `npm view` |
 | `@testing-library/react` | **16.3.3** | | `npm view` |
 | `@testing-library/user-event` | **14.6.8** | | `npm view` |
@@ -27,6 +27,11 @@ the registry that publishes it; nothing is from memory.
 | `pnpm` | **12.11.2** (the host has 10.33.0) | | `npm view pnpm version` |
 
 Tauri 2's crates declare `rust-version = 1.90`; the repository's toolchain is 1.99.0.
+
+**The age of a release.** The application's pnpm refuses a package published less than a day ago
+(`minimumReleaseAge: 1440`), with no exception: each npm package is the latest stable release older than
+that, which on 2026-10-15 left the Tauri packages one patch behind their crates (the Tauri CLI only requires the
+same major and minor) and React on 19.3.0. crates.io has no such policy: the crates are the latest.
 
 **The linter.** `typescript-eslint` 8.71.2, the latest, declares the peer `typescript >=4.8.4 <6.1.0`
 (`npm view typescript-eslint peerDependencies`): it cannot run on TypeScript 7, whose compiler is no longer a

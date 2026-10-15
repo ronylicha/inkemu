@@ -25,12 +25,16 @@ périmètre de SP2c.
    et ses codes de sortie ne changent pas.
 2. **Un moteur sans E/S** (`engine`) fait vivre une machine ; **un fil** (`device`) le porte, avec l'horloge
    murale, les fichiers et les commandes. La machine naît sur le fil, construite par une recette `Send`
-   (`ports::Recipe`), et n'en sort jamais. Les commandes sont servies entre deux passes et chacune rend son résultat ;
-   les mises à jour vont, dans l'ordre, à un observateur.
+   (`ports::Recipe`), et n'en sort jamais. Les commandes sont servies entre deux passes, dans l'ordre où elles ont
+   été soumises (`Handle::submit`), et chacune rend son résultat ; les mises à jour vont, dans l'ordre, à un
+   observateur, qui ne commande pas le fil depuis le fil (`CommandError::OnItsThread`). Le texte des consoles y part
+   au plus toutes les 40 ms. Une panique sur le fil n'emporte pas la flash : elle est écrite, la panique dite, et le
+   fil s'arrête en le disant. L'arrêt rend ce que la dernière vie n'a pas pu garder (`Emulator::shutdown`).
 3. **Une vie = une mise sous tension.** Le reset est celui de `CHIP_EN` : une nouvelle machine avec la flash où la
    vie d'avant l'a laissée. Chaque fin de vie écrit le fichier de flash et la session, ou donne le verdict d'un rejeu.
 4. **Les ports** (`ports::PanelSource`, `ports::ButtonPort`) sont créés avec la machine, sur le fil, et reçoivent
-   la machine à chaque appel. Le contrat est celui du §4 de la spec SP2c ; `catalog::ports_for` est le seul endroit
+   la machine à chaque appel ; une image n'existe que vérifiée (`PanelFrame::new`). Le contrat est celui du §4 de la
+   spec SP2c ; `catalog::ports_for` est le seul endroit
    qui choisit les ports d'un appareil. Jusqu'à SP2d, une mire de test les implémente, et elle le dit.
 5. **L'interface Tauri** est un espace de travail Cargo à part, qui appelle `host` par des commandes et reçoit les
    mises à jour par un canal ; l'image passe en octets bruts, à la demande.
