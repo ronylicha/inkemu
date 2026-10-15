@@ -129,13 +129,35 @@ le neutralisant puis en le rétablissant).
 
 Aucune empreinte n'a bougé.
 
+## Troisième relecture
+
+Quatre points (N1 à N4) et un reliquat de R5, en deux commits (le code et ses tests ; la documentation).
+
+- **N1** : quand le lancement enregistre, `device::open_sd` lit la carte telle qu'une session la garde
+  (`sd_run::recorded_card`) juste après l'ouverture, avant l'acceptation du fichier de flash, comme la CLI ; une carte
+  qui dépasse la borne refuse le lancement par `OpenedSd::refused`. La carte lue est gardée pour la première vie
+  enregistrée (`Plan::Run.first_card`) : une grande image n'est pas lue deux fois. Test
+  `a_recorded_start_with_a_card_too_full_is_refused_before_its_flash_file`.
+- **N2** : ADR 0014 : « en ligne de commande » pour la sauvegarde inachevée qui empêche la carte de servir ; la
+  mémoire des changements non écrits (bornée par la capacité de la carte, jusqu'à environ 2× pendant une vie), et
+  pourquoi ce n'est pas le compromis de la flash ; héritier SP4 (tableau des héritiers et cartographie).
+- **N3** : `rescue` écrit la flash d'abord, puis la carte.
+- **N4** : quand l'image a pris la sauvegarde et que seul son journal n'a pas pu être retiré,
+  `SdImageError::JournalNotRemoved` le dit (« holds what the device wrote, but its journal … could not be removed »),
+  avec le remède du dossier ; `CardKeeper` n'ajoute plus « not in … yet » dans ce cas, et garde les changements en
+  mémoire pour que la vie suivante n'attende pas ce journal. Tests au niveau de `CardKeeper` et du `NotKept` de
+  l'extinction (point d'injection `SdImage::leave_the_journal`, propre aux tests).
+- **Reliquat de R5** : une commande qui veut une vie quand un rejeu est terminé (bouton d'allumage, pas à pas…) est
+  refusée par `CommandError::ReplayEnded` (genre `replayEnded`), qui dit qu'un rejeu ne prend aucune entrée, avec ses
+  titres FR et EN ; tests dans `a_recorded_life_replays_identically` et `error-banner.test.tsx`.
+
 ## Vérifié en local
 
 `CARGO_BUILD_JOBS=3`, un conteneur Docker à la fois. `cargo fmt --all` ; `tools/ci/clippy.sh … --all-targets
 --all-features -D warnings` sur `boards`, `host`, `emu-cli` (et les crates touchées par chaque commit au moment du
 commit) ; `cargo clippy --all-targets -D warnings` et `cargo test` de l'enveloppe Tauri (`app/src-tauri`, 16 tests) ;
-`pnpm lint`, `pnpm typecheck`, Vitest (15 fichiers, 90 tests), `pnpm build`, construction release de l'enveloppe ;
-bibliothèque `host` (321 tests) et tests non ignorés de `emu-cli` après la seconde relecture ;
+`pnpm lint`, `pnpm typecheck`, Vitest (16 fichiers, 92 tests), `pnpm build`, construction release de l'enveloppe ;
+bibliothèque `host` (325 tests) et tests non ignorés de `emu-cli` après la troisième relecture ;
 `cargo test -p boards -p host -p session -p console-script` et les tests non ignorés de `emu-cli`, tout passe ;
 `cargo check --target wasm32-unknown-unknown` de `emu-core`, `chips`, `session`, `boards` ; `cargo doc --no-deps` avec
 `-D warnings` de `emu-core`, `chips`, `boards`, `session`, `host`, `soc-esp32c3`, `console-script`. Laissé à la CI : la
@@ -204,6 +226,7 @@ relectures (`870286a`, `2f645ab`), avec les cinq suites de référence.
 |---|---|
 | RAM brute du contrôleur, compteur de rafraîchissements partiels | SP4 |
 | Brancher ou débrancher le câble, faire varier la batterie, insérer ou retirer la carte pendant une vie | SP4 (`cable_input`, `SdSlot::take`/`insert` existent) |
+| Mémoire des changements de carte non écrits (R1) : bornée par la capacité de la carte, jusqu'à environ 2× pendant une vie ; à borner (fichier de reprise ou plafond), ADR 0014 | SP4, avec la vie de la carte |
 | Durée du geste dans l'interface | quand un utilisateur la demande ; la CLI l'a |
 | Câblage du X3 (UC8253, capteurs I2C) | SP3 |
 | Dossier de l'hôte exposé en FAT32 virtuel | après la livraison du 2027-01-01 |
@@ -235,10 +258,10 @@ Fichiers de la cartographie du projet à mettre à jour (la mémoire n'a pas ét
 | Fichier | Ce qui change |
 |---|---|
 | `architecture_overview.md` | SP2d fait : `boards::Wired` (machine câblée), entrées de la carte par la machine, `Supply` et `PowerOff`, réveil par broche, format de session 2 ; ADR 0013 |
-| `backend_models.md` | `emu-core` : `BoardInput`, `BoardInputs`, `Supply` ; `soc-esp32c3` : `Wake` (`RtcTimer`, `Pins`), `Diagnostic::Reset.woken_by`, `InputError::BeyondTime` ; `boards` : `Wiring`, `Wired`, `WiredOptions`, `WiredError`, `PanelHandle`, `ButtonsHandle`, `SdHandle`, `SdStart`, `BoardRequest` ; `host::ports` : `Shades`, `PanelDescription.approximate`, `ButtonError::Refused` (sans `NotInSession`), `PowerOnError::Device` ; `host::device` : `Setup.usb_power`, `Setup.sd`/`SdSetup`, `LaunchError::SdImage`, `LaunchError::Board`, `LaunchError::BlankImageLeft` (`kind()` n'est plus `const`), `CommandError::NotRecorded`, `CommandError::SdCard` (genre `sdCard`), `Recipe::power_on_by_key` ; `host::sd_run::CardKeeper` (changements de carte non écrits, en surcouche) ; `host::catalog` : `DeviceView.sd_slot` (`SdSlotView`, `SdSlotView::OF_A_DEVICE`) ; `RunEnd::PowerOff` |
-| `backend_services.md` | `boards::wiring`, `boards::wired`, `boards::check_board_request` (CLI, `Wired::power_on`, `device::power_on`) ; `host::ports_wired`, `host::catalog` (`look(&DeviceProfile)`, `life_of`, `ports_of`), `host::sd_run` ; `Engine::finish` qui lit la carte en place, `Worker.card` (`CardKeeper` : la vie suivante lit les changements non écrits, chaque fin de vie et l'extinction réessaient), `Emulator::holds_sd_image` ; `device::power_on` : `SdImage::refuse_the_files_of_the_run` avant la ROM, `open_the_card_and_accept_the_flash` et `OpenedSd` (une image vierge d'un lancement refusé est supprimée) ; enveloppe : `after_the_power_offs` (un lancement attend les extinctions en cours) ; `chips::ssd1677::lines`, échelles, batterie, bouton poussoir, `SdLines` ; `IoMatrix::millivolts`/`spi_transfer` qui appliquent d'abord les entrées dues |
+| `backend_models.md` | `emu-core` : `BoardInput`, `BoardInputs`, `Supply` ; `soc-esp32c3` : `Wake` (`RtcTimer`, `Pins`), `Diagnostic::Reset.woken_by`, `InputError::BeyondTime` ; `boards` : `Wiring`, `Wired`, `WiredOptions`, `WiredError`, `PanelHandle`, `ButtonsHandle`, `SdHandle`, `SdStart`, `BoardRequest` ; `host::ports` : `Shades`, `PanelDescription.approximate`, `ButtonError::Refused` (sans `NotInSession`), `PowerOnError::Device` ; `host::device` : `Setup.usb_power`, `Setup.sd`/`SdSetup`, `LaunchError::SdImage`, `LaunchError::Board`, `LaunchError::BlankImageLeft` (`kind()` n'est plus `const`), `CommandError::NotRecorded`, `CommandError::SdCard` (genre `sdCard`), `CommandError::ReplayEnded` (genre `replayEnded`), `Recipe::power_on_by_key` ; `host::sd_image::SdImageError::JournalNotRemoved` ; `host::sd_run::CardKeeper` (changements de carte non écrits, en surcouche) ; `host::catalog` : `DeviceView.sd_slot` (`SdSlotView`, `SdSlotView::OF_A_DEVICE`) ; `RunEnd::PowerOff` |
+| `backend_services.md` | `boards::wiring`, `boards::wired`, `boards::check_board_request` (CLI, `Wired::power_on`, `device::power_on`) ; `host::ports_wired`, `host::catalog` (`look(&DeviceProfile)`, `life_of`, `ports_of`), `host::sd_run` ; `Engine::finish` qui lit la carte en place, `Worker.card` (`CardKeeper` : la vie suivante lit les changements non écrits, chaque fin de vie et l'extinction réessaient), `Emulator::holds_sd_image` ; `device::power_on` : `SdImage::refuse_the_files_of_the_run` avant la ROM, `open_the_card_and_accept_the_flash` et `OpenedSd` (une image vierge d'un lancement refusé est supprimée ; la carte d'un lancement enregistré lue avant le fichier de flash, gardée pour la première vie dans `Plan::Run.first_card`) ; `Worker::rescue` écrit la flash puis la carte ; enveloppe : `after_the_power_offs` (un lancement attend les extinctions en cours) ; `chips::ssd1677::lines`, échelles, batterie, bouton poussoir, `SdLines` ; `IoMatrix::millivolts`/`spi_transfer` qui appliquent d'abord les entrées dues |
 | `backend_controllers.md`, `api_routes.md` | `inkemu run --power-hold`, `--usb-power`, `--sd-image`, `--sd-read-only` (refusées d'abord sur un appareil sans la ligne ; l'image ouverte après la ROM, ses chemins contrôlés avant, comme dans l'application) ; ligne « the device powered off… » (code 0) ; ligne de reset « woken from deep sleep by GPIO3 » ; ligne `sd card:` du résumé ; scripts `press`/`release` ; `x4_panel_buttons` et ses tests (`boards` `reference_panel` 2, `run_cli reference_firmware` 16, `rom-boot` 30 tests ignorés de `run_cli`) ; `INKEMU_X4_PANEL_APP` ; genres d'erreur `board` et `notRecorded` de l'enveloppe |
 | `database_schema.md` | session `inkemu-session 2` (entrées de carte, étiquette 4 ; carte SD de départ) ; image de carte écrite en place par son journal |
 | `frontend_spa.md` | l'écran du X4 est sa dalle ; mention « Rendu approché » ; état éteint et rallumage en maintenant le bouton (en rejeu : « Éteint, comme dans la session », `device.offReplayed`) ; case câble USB ; section « Carte SD » (aucune, existante, nouvelle dans les bornes que donne l'hôte, aujourd'hui 64 à 2 097 024 Mio) ; bouton « Allumer » grisé qui dit ce qui manque ; image v2, vérifiée contre la dalle (`decodeFrame(buffer, panel)`) |
 | `integrations.md` | job `reference-boot` : `INKEMU_X4_PANEL_APP`, deux suites de plus (`run_cli` 16) ; job `rom-boot` : 30 tests ignorés de `run_cli` ; `SHA256SUMS.inputs-x4-panel-buttons` (`x4_panel_buttons.bin` `82ed249a…`, BUSY par interruption) |
-| `tech_debt.md` | les héritiers du tableau ci-dessus |
+| `tech_debt.md` | les héritiers du tableau ci-dessus, dont la mémoire des changements de carte non écrits (SP4) |
