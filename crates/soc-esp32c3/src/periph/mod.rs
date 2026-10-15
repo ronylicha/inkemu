@@ -35,7 +35,7 @@ pub use efuse::Efuse;
 pub use extmem::Extmem;
 pub use i2c0::I2c0;
 pub use intmatrix::IntMatrix;
-pub use io::{AttachError, IoMatrix, SpiWires};
+pub use io::{AttachError, I2cWires, IoMatrix, SpiWires};
 pub use mmu::MmuTable;
 pub use rtc_cntl::RtcCntl;
 pub use saradc::SarAdc;
@@ -517,9 +517,9 @@ impl Peripherals {
             Event::UsbSerialJtag => self.usb_serial_jtag.wake(ctx),
             Event::ModuleReset(module) => self.reset_module(ctx, module),
             Event::Pins => self.io.wake(ctx),
-            // GP-SPI2 and the SAR ADC reach the pads through the matrix (ADR 0012).
+            // GP-SPI2, I2C0 and the SAR ADC reach the pads through the matrix (ADR 0012, 0015).
             Event::Spi2 => self.spi2.wake(ctx, &mut self.io),
-            Event::I2c0 => self.i2c0.wake(ctx),
+            Event::I2c0 => self.i2c0.wake(ctx, &mut self.io),
             Event::SarAdc => self.saradc.wake(ctx, &mut self.io),
         }
     }

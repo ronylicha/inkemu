@@ -17,6 +17,12 @@ fn command(op: u32, bytes: u32, ack_en: bool) -> u32 {
 /// START and STOP setup and hold 49 each.
 fn master(ctx: &mut Ctx) -> I2c0 {
     let mut i2c = I2c0::new();
+    configure(&mut i2c, ctx);
+    i2c
+}
+
+/// Writes the registers of [`master`] to `i2c`.
+fn configure(i2c: &mut I2c0, ctx: &mut Ctx) {
     for (offset, value) in [
         (CTR, MS_MODE | (1 << 8)),
         (CLK_CONF, 0),
@@ -30,15 +36,16 @@ fn master(ctx: &mut Ctx) -> I2c0 {
     ] {
         assert!(i2c.write(ctx, offset, value), "{offset:#x}");
     }
-    i2c
 }
 
+/// Runs the sequence under way on a bus without chips: one wake-up, at its end.
 fn run(i2c: &mut I2c0, ctx: &mut Ctx) {
     let end = ctx.next_wake().expect("a sequence runs");
     ctx.sleep_until(end);
+    let mut io = IoMatrix::new(0);
     pump(ctx, |ctx, event| {
         assert_eq!(event, Event::I2c0);
-        i2c.wake(ctx);
+        i2c.wake(ctx, &mut io);
     });
 }
 
@@ -260,4 +267,221 @@ fn the_strobes_read_zero_and_the_bus_clear_ends_at_once() {
     );
     i2c.reset(ctx);
     assert_eq!(read(&mut i2c, ctx, CTR), 0x20B, "the SVD's reset value");
+}
+
+/// The X3's bus: SCL on GPIO0, SDA on GPIO20.
+const WIRES: crate::periph::I2cWires = crate::periph::I2cWires { scl: 0, sda: 20 };
+
+/// A chip at `address` with a register file read and written through a pointer that moves on
+/// after each byte, which records what it sees with the instant, in nanoseconds.
+#[derive(Debug)]
+struct RegisterChip {
+    address: u8,
+    registers: [u8; 256],
+    pointer: u8,
+    /// The next byte written is the pointer.
+    pointer_next: bool,
+    calls: Vec<String>,
+}
+
+impl RegisterChip {
+    fn at(address: u8) -> std::rc::Rc<std::cell::RefCell<RegisterChip>> {
+        let mut registers = [0; 256];
+        registers[0x2C] = 70;
+        registers[0x2D] = 0;
+        std::rc::Rc::new(std::cell::RefCell::new(RegisterChip {
+            address,
+            registers,
+            pointer: 0,
+            pointer_next: false,
+            calls: Vec::new(),
+        }))
+    }
+}
+
+impl emu_core::I2cTarget for RegisterChip {
+    fn address(&mut self, address: u8, read: bool, at: emu_core::Nanos) -> bool {
+        self.calls
+            .push(format!("address {address:#04x} {read} {}", at.get()));
+        self.pointer_next = !read;
+        address == self.address
+    }
+
+    fn write(&mut self, byte: u8, at: emu_core::Nanos) -> bool {
+        self.calls.push(format!("write {byte:#04x} {}", at.get()));
+        if self.pointer_next {
+            self.pointer = byte;
+            self.pointer_next = false;
+        } else {
+            self.registers[usize::from(self.pointer)] = byte;
+            self.pointer = self.pointer.wrapping_add(1);
+        }
+        true
+    }
+
+    fn read(&mut self, acknowledged: bool, at: emu_core::Nanos) -> u8 {
+        self.calls.push(format!("read {acknowledged} {}", at.get()));
+        let byte = self.registers[usize::from(self.pointer)];
+        self.pointer = self.pointer.wrapping_add(1);
+        byte
+    }
+
+    fn stop(&mut self, at: emu_core::Nanos) {
+        self.calls.push(format!("stop {}", at.get()));
+    }
+}
+
+/// I2C0 with `chip` on `wires`, the matrix routing the bus to `routed`.
+fn bus_with(
+    ctx: &mut Ctx,
+    chip: &std::rc::Rc<std::cell::RefCell<RegisterChip>>,
+    wires: crate::periph::I2cWires,
+    routed: crate::periph::I2cWires,
+) -> (I2c0, IoMatrix) {
+    let mut io = IoMatrix::new(0);
+    io.route_i2c(ctx, routed);
+    io.attach_i2c(wires, Box::new(std::rc::Rc::clone(chip)))
+        .unwrap();
+    let mut i2c = master(ctx);
+    i2c.chips_attached();
+    (i2c, io)
+}
+
+/// Runs the sequence under way on a bus with chips: one wake-up for each condition.
+fn run_stepped(i2c: &mut I2c0, ctx: &mut Ctx, io: &mut IoMatrix) {
+    while i2c.running.is_some() {
+        let next = ctx.next_wake().expect("a condition is due");
+        ctx.sleep_until(next);
+        pump(ctx, |ctx, event| match event {
+            Event::I2c0 => i2c.wake(ctx, io),
+            Event::Pins => io.wake(ctx),
+            other => panic!("{other:?}"),
+        });
+    }
+}
+
+/// `i2c_master_transmit_receive` of one register byte and two data bytes, as `Wire` sends a
+/// gauge read (research `sp3-x3-firmware.md` §2.1): the list in `COMD0..COMD6`.
+fn register_read(i2c: &mut I2c0, ctx: &mut Ctx, address: u8, register: u8) {
+    for byte in [address << 1, register, address << 1 | 1] {
+        assert!(i2c.write(ctx, DATA, u32::from(byte)));
+    }
+    // The first byte read is answered with an ACK, the last with a NACK (`ack_val`).
+    for (n, cmd) in [
+        command(OP_RSTART, 0, false),
+        command(OP_WRITE, 2, true),
+        command(OP_RSTART, 0, false),
+        command(OP_WRITE, 1, true),
+        command(OP_READ, 1, false),
+        command(OP_READ, 1, false) | ACK_VAL,
+        command(OP_STOP, 0, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offset = COMD0 + 4 * u32::try_from(n).unwrap();
+        assert!(i2c.write(ctx, offset, cmd));
+    }
+    assert!(i2c.write(ctx, CTR, MS_MODE | TRANS_START));
+}
+
+/// ADR 0015: each condition reaches the chip at the instant it ends on the bus (START 100 cycles
+/// of 40 MHz, a byte 900, 25 ns a cycle), the register pointer and the repeated START included;
+/// the bytes it drives fill the RX FIFO and the sequence completes as on the controller.
+#[test]
+fn a_register_read_reaches_the_chip_condition_by_condition_and_its_bytes_come_back() {
+    let ctx = &mut Ctx::default();
+    let chip = RegisterChip::at(0x55);
+    let (mut i2c, mut io) = bus_with(ctx, &chip, WIRES, WIRES);
+    register_read(&mut i2c, ctx, 0x55, 0x2C);
+    assert_eq!(read(&mut i2c, ctx, SR) & BUS_BUSY, BUS_BUSY, "running");
+    run_stepped(&mut i2c, ctx, &mut io);
+    assert_eq!(
+        chip.borrow().calls,
+        [
+            "address 0x55 false 25000",
+            "write 0x2c 47500",
+            "address 0x55 true 72500",
+            "read true 95000",
+            "read false 117500",
+            "stop 120000",
+        ]
+    );
+    assert_eq!(ctx.now(), Cycles(120_000 * 160 / 1_000));
+    let raw = read(&mut i2c, ctx, INT_RAW);
+    assert_eq!(
+        raw & (NACK | TRANS_COMPLETE | TRANS_START_INT),
+        TRANS_COMPLETE | TRANS_START_INT
+    );
+    for n in 0..7 {
+        assert_eq!(read(&mut i2c, ctx, COMD0 + 4 * n) & DONE, DONE, "COMD{n}");
+    }
+    let status = read(&mut i2c, ctx, SR);
+    assert_eq!(
+        status & (BUS_BUSY | RESP_REC),
+        0,
+        "acknowledged, then a STOP"
+    );
+    assert_eq!((status >> TXFIFO_CNT_SHIFT) & 0x3F, 0, "all sent");
+    assert_eq!(read(&mut i2c, ctx, DATA), 70);
+    assert_eq!(read(&mut i2c, ctx, DATA), 0);
+}
+
+/// An address nobody acknowledges ends the sequence where `ack_en` expects an ACK, as on a bus
+/// without chips, with the same duration; the chip saw the address and the STOP.
+#[test]
+fn an_address_no_chip_acknowledges_ends_in_a_nack_and_a_stop_at_the_same_instant() {
+    let ctx = &mut Ctx::default();
+    let chip = RegisterChip::at(0x55);
+    let (mut i2c, mut io) = bus_with(ctx, &chip, WIRES, WIRES);
+    register_read(&mut i2c, ctx, 0x68, 0x00);
+    run_stepped(&mut i2c, ctx, &mut io);
+    assert_eq!(
+        chip.borrow().calls,
+        ["address 0x68 false 25000", "stop 27500"]
+    );
+    assert_eq!(ctx.now(), Cycles(4_400), "as the probe of an X4");
+    let raw = read(&mut i2c, ctx, INT_RAW);
+    assert_eq!(raw & (NACK | TRANS_COMPLETE), NACK);
+    assert_eq!(read(&mut i2c, ctx, COMD1) & DONE, 0, "stopped by the NACK");
+    assert_eq!(read(&mut i2c, ctx, SR) & (BUS_BUSY | RESP_REC), RESP_REC);
+}
+
+/// A chip whose pins the matrix does not route I2C0 to hears nothing, and the controller hears
+/// the pulled-up line: a NACK.
+#[test]
+fn a_chip_off_the_routed_pins_hears_nothing() {
+    let ctx = &mut Ctx::default();
+    let chip = RegisterChip::at(0x55);
+    let elsewhere = crate::periph::I2cWires { scl: 2, sda: 3 };
+    let (mut i2c, mut io) = bus_with(ctx, &chip, WIRES, elsewhere);
+    register_read(&mut i2c, ctx, 0x55, 0x2C);
+    run_stepped(&mut i2c, ctx, &mut io);
+    assert!(chip.borrow().calls.is_empty(), "{:?}", chip.borrow().calls);
+    assert_eq!(read(&mut i2c, ctx, INT_RAW) & NACK, NACK);
+}
+
+/// A write of a register reaches the chip byte by byte; a module reset keeps the chips of the
+/// board on the bus.
+#[test]
+fn a_register_write_reaches_the_chip_and_a_reset_keeps_the_board() {
+    let ctx = &mut Ctx::default();
+    let chip = RegisterChip::at(0x68);
+    let (mut i2c, mut io) = bus_with(ctx, &chip, WIRES, WIRES);
+    i2c.reset(ctx);
+    assert!(i2c.chips, "the board's chips are kept through the reset");
+    configure(&mut i2c, ctx);
+    for byte in [0x68 << 1, 0x0E, 0x04] {
+        assert!(i2c.write(ctx, DATA, byte));
+    }
+    assert!(i2c.write(ctx, COMD0, command(OP_RSTART, 0, false)));
+    assert!(i2c.write(ctx, COMD1, command(OP_WRITE, 3, true)));
+    assert!(i2c.write(ctx, COMD2, command(OP_STOP, 0, false)));
+    assert!(i2c.write(ctx, CTR, MS_MODE | TRANS_START));
+    run_stepped(&mut i2c, ctx, &mut io);
+    assert_eq!(chip.borrow().registers[0x0E], 0x04);
+    assert_eq!(
+        read(&mut i2c, ctx, INT_RAW) & TRANS_COMPLETE,
+        TRANS_COMPLETE
+    );
 }

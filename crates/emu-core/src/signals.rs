@@ -9,6 +9,7 @@
 //! - [`SpiTarget`]: the chip sits on an SPI bus the `SoC` masters, selected by its chip-select line,
 //!   with an optional data/command line;
 //! - [`AnalogSource`]: the chip puts a voltage on an analog input;
+//! - [`I2cTarget`]: the chip sits on an I2C bus the `SoC` masters, answering its address;
 //! - [`Clocked`]: the chip does work of its own over time (a display refresh) and is advanced to
 //!   the instants it names, whatever the `SoC` is doing meanwhile.
 //!
@@ -139,6 +140,37 @@ pub trait AnalogSource: std::fmt::Debug {
     fn millivolts(&mut self, at: Nanos) -> u32;
 }
 
+/// A chip on an I2C bus the `SoC` masters (ADR 0015): what it sees of each transaction, condition by
+/// condition, each at the instant it ends on the bus.
+///
+/// Every chip on the bus sees every address and every STOP; only a chip that acknowledged its
+/// address sees the bytes that follow, until the next START or STOP. A chip never stretches the
+/// clock: the `SoC` paces every bit.
+///
+/// - [`I2cTarget::address`]: a START (or a repeated START) and the address byte after it;
+/// - [`I2cTarget::write`]: a byte the master writes to the chip, which acknowledged its address for
+///   a write;
+/// - [`I2cTarget::read`]: a byte the chip drives for the master, which addressed it for a read;
+/// - [`I2cTarget::stop`]: a STOP on the bus.
+pub trait I2cTarget: std::fmt::Debug {
+    /// A START, then the address byte, ending at `at`: `address` is the seven-bit address, `read`
+    /// the direction bit (`true` for a read). Whether the chip acknowledges: `true` for an ACK
+    /// (the chip pulls SDA low on the ninth clock).
+    fn address(&mut self, address: u8, read: bool, at: Nanos) -> bool;
+
+    /// A byte the master wrote, ending at `at`, while the chip is addressed for a write. Whether
+    /// the chip acknowledges it.
+    fn write(&mut self, byte: u8, at: Nanos) -> bool;
+
+    /// The byte the chip drives for the master, ending at `at`, while it is addressed for a read.
+    /// `acknowledged` is what the master answers on the ninth clock: `true` (ACK) when it wants
+    /// another byte, `false` (NACK) for the last one.
+    fn read(&mut self, acknowledged: bool, at: Nanos) -> u8;
+
+    /// A STOP, ending at `at`: whatever was addressed is released.
+    fn stop(&mut self, at: Nanos);
+}
+
 /// A chip that does work of its own over time (a display controller running a refresh, a card
 /// finishing a write): the `SoC` advances it to each instant it names, in device time, whether
 /// the `SoC` is running, waiting for an interrupt or waiting for a timer.
@@ -244,6 +276,24 @@ impl<T: AnalogSource + ?Sized> AnalogSource for Rc<RefCell<T>> {
     }
 }
 
+impl<T: I2cTarget + ?Sized> I2cTarget for Rc<RefCell<T>> {
+    fn address(&mut self, address: u8, read: bool, at: Nanos) -> bool {
+        self.borrow_mut().address(address, read, at)
+    }
+
+    fn write(&mut self, byte: u8, at: Nanos) -> bool {
+        self.borrow_mut().write(byte, at)
+    }
+
+    fn read(&mut self, acknowledged: bool, at: Nanos) -> u8 {
+        self.borrow_mut().read(acknowledged, at)
+    }
+
+    fn stop(&mut self, at: Nanos) {
+        self.borrow_mut().stop(at);
+    }
+}
+
 impl<T: Clocked + ?Sized> Clocked for Rc<RefCell<T>> {
     fn next_deadline(&mut self, at: Nanos) -> Option<Nanos> {
         self.borrow_mut().next_deadline(at)
@@ -326,6 +376,28 @@ mod tests {
         }
     }
 
+    impl I2cTarget for Recorder {
+        fn address(&mut self, address: u8, read: bool, at: Nanos) -> bool {
+            self.calls
+                .push(format!("address {address:#04x} {read} {}", at.get()));
+            address == 0x55
+        }
+
+        fn write(&mut self, byte: u8, at: Nanos) -> bool {
+            self.calls.push(format!("write {byte:#04x} {}", at.get()));
+            true
+        }
+
+        fn read(&mut self, acknowledged: bool, at: Nanos) -> u8 {
+            self.calls.push(format!("read {acknowledged} {}", at.get()));
+            0x2C
+        }
+
+        fn stop(&mut self, at: Nanos) {
+            self.calls.push(format!("stop {}", at.get()));
+        }
+    }
+
     impl Clocked for Recorder {
         fn next_deadline(&mut self, at: Nanos) -> Option<Nanos> {
             self.calls.push(format!("next_deadline {}", at.get()));
@@ -345,6 +417,7 @@ mod tests {
         let mut as_target: Box<dyn SpiTarget> = Box::new(Rc::clone(&chip));
         let mut as_source: Box<dyn AnalogSource> = Box::new(Rc::clone(&chip));
         let mut as_clocked: Box<dyn Clocked> = Box::new(Rc::clone(&chip));
+        let mut as_i2c: Box<dyn I2cTarget> = Box::new(Rc::clone(&chip));
         assert_eq!(as_input.level(Nanos(1)), Some(Level::High));
         assert_eq!(as_input.next_change(Nanos(1)), None, "the default");
         as_output.driven(Some(Level::Low), Nanos(2));
@@ -355,6 +428,11 @@ mod tests {
         assert_eq!(as_source.millivolts(Nanos(5)), 1650);
         assert_eq!(as_clocked.next_deadline(Nanos(6)), Some(Nanos(16)));
         as_clocked.advance(Nanos(16));
+        assert!(as_i2c.address(0x55, false, Nanos(17)));
+        assert!(!as_i2c.address(0x68, true, Nanos(18)));
+        assert!(as_i2c.write(0x2C, Nanos(19)));
+        assert_eq!(as_i2c.read(false, Nanos(20)), 0x2C);
+        as_i2c.stop(Nanos(21));
         assert_eq!(
             chip.borrow().calls,
             [
@@ -365,6 +443,11 @@ mod tests {
                 "millivolts 5",
                 "next_deadline 6",
                 "advance 16",
+                "address 0x55 false 17",
+                "address 0x68 true 18",
+                "write 0x2c 19",
+                "read false 20",
+                "stop 21",
             ]
         );
     }

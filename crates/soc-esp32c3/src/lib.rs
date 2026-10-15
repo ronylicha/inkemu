@@ -42,5 +42,5 @@ pub use machine::{
     MAX_PENDING_HOST_CHANGES, Stepped, StopReason,
 };
 pub use periph::io::MAX_PENDING_BOARD_INPUTS;
-pub use periph::{AttachError, SpiWires, UsbHost};
+pub use periph::{AttachError, I2cWires, SpiWires, UsbHost};
 pub use rom::{RomError, RomImage};

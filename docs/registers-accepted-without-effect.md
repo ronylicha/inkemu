@@ -98,15 +98,15 @@ its first section says which plan takes what.
 | `0x6000e040` | `ANA_I2C.I2C_MST_ANA_CONF0` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP8 |
 | `0x6000e044` | `ANA_I2C.ANA_CONFIG` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP8 |
 | `0x6000e048` | `ANA_I2C.ANA_CONFIG2` | 1 | analog register bus: bytes are stored, the analog blocks (PLL, SAR ADC, bias) do nothing | SP8 |
-| `0x6001300c` | `I2C0.TO` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
-| `0x60013010` | `I2C0.SLAVE_ADDR` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
-| `0x60013030` | `I2C0.SDA_HOLD` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
-| `0x60013034` | `I2C0.SDA_SAMPLE` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
-| `0x60013050` | `I2C0.FILTER_CFG` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
-| `0x60013078` | `I2C0.SCL_ST_TIME_OUT` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
-| `0x6001307c` | `I2C0.SCL_MAIN_ST_TIME_OUT` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
-| `0x60013084` | `I2C0.SCL_STRETCH_CONF` | 1 | no target: nothing stretches SCL or drives SDA, so these timings and the slave side have nothing to act on | SP3 |
-| `0x600130f8` | `I2C0.DATE` | 1 | none: the version date of the block, stored as written | SP3 |
+| `0x6001300c` | `I2C0.TO` | 1 | the chips never stretch SCL and I2C0 is never a slave: these timings, timeouts and the slave side have nothing to act on | SP4 |
+| `0x60013010` | `I2C0.SLAVE_ADDR` | 1 | the chips never stretch SCL and I2C0 is never a slave: these timings, timeouts and the slave side have nothing to act on | SP4 |
+| `0x60013030` | `I2C0.SDA_HOLD` | 1 | the chips never stretch SCL and I2C0 is never a slave: these timings, timeouts and the slave side have nothing to act on | SP4 |
+| `0x60013034` | `I2C0.SDA_SAMPLE` | 1 | the chips never stretch SCL and I2C0 is never a slave: these timings, timeouts and the slave side have nothing to act on | SP4 |
+| `0x60013050` | `I2C0.FILTER_CFG` | 1 | the chips never stretch SCL and I2C0 is never a slave: these timings, timeouts and the slave side have nothing to act on | SP4 |
+| `0x60013078` | `I2C0.SCL_ST_TIME_OUT` | 1 | the chips never stretch SCL and I2C0 is never a slave: these timings, timeouts and the slave side have nothing to act on | SP4 |
+| `0x6001307c` | `I2C0.SCL_MAIN_ST_TIME_OUT` | 1 | the chips never stretch SCL and I2C0 is never a slave: these timings, timeouts and the slave side have nothing to act on | SP4 |
+| `0x60013084` | `I2C0.SCL_STRETCH_CONF` | 1 | the chips never stretch SCL and I2C0 is never a slave: these timings, timeouts and the slave side have nothing to act on | SP4 |
+| `0x600130f8` | `I2C0.DATE` | 1 | none: the version date of the block, stored as written | SP4 |
 | `0x6001ccd4` | `NRX.NRXPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x6001d054` | `BB.BBPD_CTRL` | 1 | radio memory power: there is no radio | SP5a |
 | `0x60024024` | `SPI2.DIN_MODE` | 1 | line timing compensation: a transfer is delivered whole | SP8 |
