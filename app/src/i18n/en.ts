@@ -321,6 +321,7 @@ export const en: Catalog = {
   "monitor.memory.range.none": "no page written",
   "monitor.memory.writes": "Writes (since the reset)",
   "monitor.memory.writes.value": "{all} ({since})",
+  "monitor.memory.legend": "Key to the page map",
   "monitor.memory.legend.never": "never written",
   "monitor.memory.legend.before": "written before the last reset",
   "monitor.memory.legend.since": "written since the last reset",

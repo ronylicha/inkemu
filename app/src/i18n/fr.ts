@@ -322,6 +322,7 @@ export const fr = {
   "monitor.memory.range.none": "aucune page écrite",
   "monitor.memory.writes": "Écritures (dont depuis le reset)",
   "monitor.memory.writes.value": "{all} ({since})",
+  "monitor.memory.legend": "Légende de la carte des pages",
   "monitor.memory.legend.never": "jamais écrite",
   "monitor.memory.legend.before": "écrite avant le dernier reset",
   "monitor.memory.legend.since": "écrite depuis le dernier reset",

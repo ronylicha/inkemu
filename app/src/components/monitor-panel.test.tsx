@@ -60,6 +60,12 @@ describe("MonitorPanel", () => {
     expect(map.children[3]).toHaveClass("monitor-page-since");
     expect(screen.getByText("0x3fc81000 to 0x3fc84000")).toBeInTheDocument();
     expect(screen.getByText("By page; the content is never shown.")).toBeInTheDocument();
+    const key = screen.getByRole("list", { name: "Key to the page map" });
+    expect(
+      within(key)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent?.trim()),
+    ).toEqual(["never written", "written before the last reset", "written since the last reset"]);
   });
 
   it("names the interrupt sources and the blocks the CPU reached, and the panel's refreshes", async () => {

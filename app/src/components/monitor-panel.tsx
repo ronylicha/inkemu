@@ -206,7 +206,7 @@ function Memories({ memories }: { memories: MemoryUseView[] }) {
       {memories.map((memory) => (
         <Memory key={memory.region} memory={memory} />
       ))}
-      <ul className="monitor-legend" aria-label={t("monitor.memory")}>
+      <ul className="monitor-legend" aria-label={t("monitor.memory.legend")}>
         {PAGE_STATES.map((state) => (
           <li key={state}>
             <span className={`monitor-page monitor-page-${state}`} aria-hidden="true" />{" "}
