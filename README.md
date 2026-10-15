@@ -342,7 +342,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 ## Roadmap
 
 1. RV32IMC core, minimal ESP32-C3, firmware loader, CLI: boot a firmware to its console logs. *1a done; 1b-1, the SoC skeleton and the ROM boot, done; 1b-2, flash and the bootloader, done; 1b-3a, interrupts, timers, watchdogs and reset, done; 1b-3b, flash writes and the device's flash file, done; 1b-3c, a firmware given on its own (`--firmware`), done; 1b-3d, the serial consoles in both directions, done; 1b-3e, two real firmwares of the X4 start, done; 1b-3f, deep sleep and the wake by the RTC timer, done; 1b-4a, the documentation without a warning, done; 1b-4b, recording and replaying a run, done; 1b-4c, the lockstep against QEMU over the first life of the reference image, done; 1b-4d, the lockstep through a reset, on two more reference firmwares, and on CrossPoint in local, done; 1b-4e, CoreMark within 15 % of the published score, done; the enforcement of the PMP is next.*
-2. X4 peripherals, desktop UI, e-ink rendering: **first visual milestone**
+2. X4 peripherals, desktop UI, e-ink rendering: **first visual milestone**. *2a, the chips around the SoC (the SSD1677 display controller with an optical model of the panel, the button ladders and the battery read by the ADC), as a library; the peripherals of the SoC, the desktop app and the wiring of the X4 follow.*
 3. X3 support (UC8253 panel, I2C sensors)
 4. Debugging, resource monitor, headless test runner
 5. Wi-Fi (real Internet access) and BLE
@@ -355,6 +355,7 @@ Xteink devices are the first targets. The architecture is not tied to them, and 
 
 - [Design specification](docs/superpowers/specs/2026-10-11-inkemu-design.md) (French)
 - [Xteink hardware research](docs/research/xteink-hardware.md), with a source for every fact
+- [External chips research](docs/research/sp2a-external-chips.md): the SSD1677's commands, the byte sequences the X4's firmware sends, the optical model of the panel and its assumptions, the button ladders and the battery
 - [Registers accepted without effect](docs/registers-accepted-without-effect.md): what is stored but not modelled, and the plan that makes each real
 - [ADR 0002](docs/adr/0002-flash-model-and-cache-windows.md): the flash model and the cache windows (French)
 - [ADR 0003](docs/adr/0003-contexte-des-peripheriques.md): the context every peripheral access receives, device time, and the three levels of reset (French)
@@ -473,7 +474,7 @@ Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtens
 ### Feuille de route
 
 1. Cœur RV32IMC, ESP32-C3 minimal, chargeur de firmware, CLI : démarrer un firmware jusqu'à ses journaux de console. *1a fait ; 1b-1, squelette du SoC et démarrage de la ROM, fait ; 1b-2, flash et bootloader, fait ; 1b-3a, interruptions, timers, watchdogs et reset, fait ; 1b-3b, écritures en flash et fichier de flash de l'appareil, fait ; 1b-3c, firmware fourni seul (`--firmware`), fait ; 1b-3d, consoles série dans les deux sens, fait ; 1b-3e, démarrage de deux firmwares réels du X4, fait ; 1b-3f, sommeil profond et réveil par le timer RTC, fait ; 1b-4a, documentation sans avertissement, fait ; 1b-4b, enregistrement et rejeu d'une exécution, fait ; 1b-4c, lockstep avec QEMU sur la première vie de l'image de référence, fait ; 1b-4d, lockstep à travers un reset, sur deux autres firmwares de référence et sur CrossPoint en local, fait ; 1b-4e, CoreMark à moins de 15 % du score publié, fait ; l'application de la PMP est la suivante.*
-2. Périphériques du X4, interface de bureau, rendu e-ink : **premier jalon visuel**
+2. Périphériques du X4, interface de bureau, rendu e-ink : **premier jalon visuel**. *2a, les puces autour du SoC (le contrôleur d'écran SSD1677 avec un modèle optique de la dalle, les échelles de boutons et la batterie lues par l'ADC), en bibliothèque ; les périphériques du SoC, l'application de bureau et le câblage du X4 suivent.*
 3. Prise en charge du X3 (dalle UC8253, capteurs I2C)
 4. Débogage, moniteur de ressources, exécution de tests sans écran
 5. Wi-Fi (accès Internet réel) et BLE
@@ -484,7 +485,7 @@ Espressif ESP32-C3 (RISC-V RV32IMC) : Xteink X4 et X3. Espressif ESP32-S3 (Xtens
 
 ### Documentation
 
-La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) [0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash), [0005](docs/adr/0005-bootloader-embarque.md) (bootloader embarqué), [0006](docs/adr/0006-entrees-des-consoles.md) (entrées des consoles et hôte USB), [0007](docs/adr/0007-format-des-sessions.md) (format des sessions) et [0008](docs/adr/0008-lockstep-et-differences-admises.md) (lockstep et différences admises, avec [le tableau](docs/lockstep-differences.md)) et [0009](docs/adr/0009-temps-de-reference-coremark.md) (le temps de référence : CoreMark dans ±15 % du score publié) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
+La [spécification](docs/superpowers/specs/2026-10-11-inkemu-design.md), les ADR [0002](docs/adr/0002-flash-model-and-cache-windows.md) (modèle de la flash et fenêtres de cache) [0003](docs/adr/0003-contexte-des-peripheriques.md) (contexte des périphériques, temps de l'appareil et resets) [0004](docs/adr/0004-entrees-d-une-execution-et-fichier-de-flash.md) (entrées d'une exécution et fichier de flash), [0005](docs/adr/0005-bootloader-embarque.md) (bootloader embarqué), [0006](docs/adr/0006-entrees-des-consoles.md) (entrées des consoles et hôte USB), [0007](docs/adr/0007-format-des-sessions.md) (format des sessions) et [0008](docs/adr/0008-lockstep-et-differences-admises.md) (lockstep et différences admises, avec [le tableau](docs/lockstep-differences.md)) et [0009](docs/adr/0009-temps-de-reference-coremark.md) (le temps de référence : CoreMark dans ±15 % du score publié) sont en français ; la [recherche sur le matériel Xteink](docs/research/xteink-hardware.md), la [recherche sur les puces externes](docs/research/sp2a-external-chips.md) (commandes du SSD1677, séquences du firmware du X4, modèle optique, échelles de boutons, batterie) et la [table des registres acceptés sans effet](docs/registers-accepted-without-effect.md) sont en anglais.
 
 ### Matériel tiers et licence
 
