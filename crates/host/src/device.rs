@@ -692,6 +692,23 @@ struct Request {
     reply: Sender<Result<(), CommandError>>,
 }
 
+/// The answer to come of a submitted command ([`Handle::submit`]).
+#[derive(Debug)]
+#[must_use = "a submitted command is done whether or not its answer is read"]
+pub struct Pending {
+    answer: Receiver<Result<(), CommandError>>,
+}
+
+impl Pending {
+    /// Waits for the thread to do the command, and gives its result.
+    ///
+    /// # Errors
+    /// [`CommandError`]: the command was refused, or the thread stopped before doing it.
+    pub fn wait(self) -> Result<(), CommandError> {
+        self.answer.recv().map_err(|_| CommandError::Stopped)?
+    }
+}
+
 /// The image of the last refresh, shared between the thread and its handle.
 type FrameSlot = Arc<Mutex<Option<Arc<PanelFrame>>>>;
 
@@ -719,6 +736,17 @@ impl Handle {
     /// [`CommandError`]: the command was refused, or the thread has stopped;
     /// [`CommandError::OnItsThread`] from the emulator's own thread (see [`Observer`]).
     pub fn command(&self, command: Command) -> Result<(), CommandError> {
+        self.submit(command)?.wait()
+    }
+
+    /// Gives `command` to the thread without waiting for it: the thread does the commands in the
+    /// order they were submitted, whichever thread then waits for which answer. An interface that
+    /// must not block where it receives its commands submits there and waits elsewhere.
+    ///
+    /// # Errors
+    /// [`CommandError::Stopped`] when the thread has stopped; [`CommandError::OnItsThread`] from
+    /// the emulator's own thread (see [`Observer`]).
+    pub fn submit(&self, command: Command) -> Result<Pending, CommandError> {
         if std::thread::current().id() == self.thread {
             return Err(CommandError::OnItsThread);
         }
@@ -726,7 +754,7 @@ impl Handle {
         self.requests
             .send(Request { command, reply })
             .map_err(|_| CommandError::Stopped)?;
-        answer.recv().map_err(|_| CommandError::Stopped)?
+        Ok(Pending { answer })
     }
 
     /// The image of the last refresh of the panel.
@@ -2200,6 +2228,39 @@ mod tests {
                 if n.text.contains("a button port broke"))),
             "{seen:#?}"
         );
+        emulator.shutdown();
+    }
+
+    /// Commands submitted one after the other are done in that order, whatever waits for their
+    /// answers and in whichever order.
+    #[test]
+    fn submitted_commands_are_done_in_their_order() {
+        let launch = Launch::new(
+            x4(echo()),
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits::default(),
+            LOOK,
+            None,
+        );
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        shows(&updates, UART0, "ready");
+        let handle = emulator.handle();
+        let pending: Vec<Pending> = [&b"a"[..], b"b", b"c\r"]
+            .into_iter()
+            .map(|bytes| {
+                handle
+                    .submit(Command::Console {
+                        channel: UART0,
+                        bytes: bytes.to_vec(),
+                    })
+                    .unwrap()
+            })
+            .collect();
+        // Waited for last to first: the order of the answers is not the order of the work.
+        for answer in pending.into_iter().rev() {
+            answer.wait().unwrap();
+        }
+        shows(&updates, UART0, "abc\r");
         emulator.shutdown();
     }
 
