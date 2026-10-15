@@ -13,7 +13,7 @@
 mod commands;
 mod signals;
 
-use commands::Shell;
+use commands::{ExitDecision, Shell};
 use std::io::Write as _;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager as _, RunEvent, WindowEvent};
@@ -58,17 +58,25 @@ pub fn run() -> Result<(), tauri::Error> {
         .build(tauri::generate_context!())?;
     watch_signals(app.handle().clone());
     app.run(|app, event| match event {
-        RunEvent::ExitRequested { api, code, .. }
-            if app.state::<Shell>().is_on() || app.state::<Shell>().is_closing() =>
-        {
-            api.prevent_exit();
-            if let Some(closing) = app.state::<Shell>().begin_closing() {
-                let app = app.clone();
-                std::thread::spawn(move || {
-                    power_off_telling(&app);
-                    drop(closing);
-                    app.exit(code.unwrap_or(0));
-                });
+        RunEvent::ExitRequested { api, code, .. } => {
+            match app.state::<Shell>().on_exit_request(code) {
+                ExitDecision::Exit => {}
+                // After a signal, a window closed later exits with the signal's status.
+                ExitDecision::ExitSignalled => {
+                    api.prevent_exit();
+                    app.exit(signals::SIGNALLED);
+                }
+                ExitDecision::Prevent => {
+                    api.prevent_exit();
+                    if let Some(closing) = app.state::<Shell>().begin_closing() {
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            power_off_telling(&app);
+                            drop(closing);
+                            app.exit(code.unwrap_or(0));
+                        });
+                    }
+                }
             }
         }
         // The last resort, when the process ends some other way: nothing is left to tell.
@@ -113,7 +121,12 @@ fn watch_signals(app: AppHandle) {
                 tell_the_terminal(&shell, &detail);
             }
         }),
-        Arc::new(move |code| app.exit(code)),
+        // Marked first: the exit it asks for then goes through even while a closing of the
+        // window waits on its dialog, whose own exit would be swallowed otherwise.
+        Arc::new(move |code| {
+            app.state::<Shell>().mark_signalled();
+            app.exit(code);
+        }),
         Arc::new(|code| std::process::exit(code)),
     );
     let watched = ctrlc::set_handler(move || signals.receive());

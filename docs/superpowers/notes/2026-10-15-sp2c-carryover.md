@@ -155,7 +155,9 @@ Six points, chacun avec un test qui échoue sans sa correction :
   un fil à lui et rend la main ; ce fil attend toutes les extinctions (`power_off`) puis sort en 130 sans condition,
   panique comprise, sans regarder une fermeture de fenêtre en cours ni attendre son dialogue ; tout signal suivant
   sort aussitôt en 130 (`a_second_signal_exits_at_once_while_a_slow_power_off_goes_on`,
-  `a_power_off_that_panics_still_exits`).
+  `a_power_off_that_panics_still_exits`). Le `app.exit(130)` du signal n'est plus avalé par une fermeture en cours :
+  le fil du signal lève `Shell::signalled` avant de sortir, et `Shell::on_exit_request` (fonction pure) laisse alors
+  passer la sortie ; une fenêtre fermée ensuite sort elle aussi en 130 (`a_signal_exits_even_during_a_closing`).
 - **C1** le garde-fou lit aussi le `Cargo.toml` racine et refuse `test-support` dans `workspace.dependencies.host`.
 - **C2** il reconnaît un `host` renommé (`package = "host"`) dans toute table de dépendances, et une fonction qui
   l'active par ce nom ; les manifestes sont ceux des `members` du workspace racine (motifs `/*` compris) et

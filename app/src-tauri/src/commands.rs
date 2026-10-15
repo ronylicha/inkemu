@@ -97,6 +97,20 @@ pub struct Shell {
     language: Mutex<Language>,
     /// A closing of the application is under way ([`Shell::begin_closing`]).
     closing: Arc<AtomicBool>,
+    /// A signal powered the device off and asked the application to exit ([`Shell::signalled`]).
+    signalled: AtomicBool,
+}
+
+/// What the application does when it is asked to exit ([`Shell::on_exit_request`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitDecision {
+    /// It exits.
+    Exit,
+    /// It waits: the device is on, or a closing is under way; a closing powers off first.
+    Prevent,
+    /// It exits with the status of a signal instead (130): a signal came, and this request (a
+    /// window closed afterwards) asked for another status.
+    ExitSignalled,
 }
 
 /// Refuses a command meant for the emulator of start `asked` when the one held is another (or
@@ -217,6 +231,29 @@ impl Shell {
     #[must_use]
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::SeqCst)
+    }
+
+    /// A signal has powered the device off and asks the application to exit: from now on it
+    /// exits, with 130, whatever a closing of the window is doing.
+    pub fn mark_signalled(&self) {
+        self.signalled.store(true, Ordering::SeqCst);
+    }
+
+    /// What to do with a request to exit with `code`: once a signal came, exit, with its status;
+    /// otherwise wait while the device is on or a closing is under way (2c-R17).
+    #[must_use]
+    pub fn on_exit_request(&self, code: Option<i32>) -> ExitDecision {
+        if self.signalled.load(Ordering::SeqCst) {
+            if code == Some(crate::signals::SIGNALLED) {
+                ExitDecision::Exit
+            } else {
+                ExitDecision::ExitSignalled
+            }
+        } else if self.is_on() || self.is_closing() {
+            ExitDecision::Prevent
+        } else {
+            ExitDecision::Exit
+        }
     }
 }
 
@@ -634,6 +671,25 @@ mod tests {
         drop(first);
         assert!(!shell.is_closing());
         assert!(shell.begin_closing().is_some());
+    }
+
+    /// A request to exit waits while the device is on or a closing is under way, until a signal
+    /// came: then the signal's exit goes through even during a closing, and a later request (a
+    /// window closed afterwards) exits with the signal's status.
+    #[test]
+    fn a_signal_exits_even_during_a_closing() {
+        let shell = Shell::default();
+        assert_eq!(shell.on_exit_request(None), ExitDecision::Exit);
+        assert_eq!(shell.on_exit_request(Some(0)), ExitDecision::Exit);
+        let closing = shell.begin_closing().unwrap();
+        assert_eq!(shell.on_exit_request(None), ExitDecision::Prevent);
+        assert_eq!(shell.on_exit_request(Some(130)), ExitDecision::Prevent);
+        shell.mark_signalled();
+        assert_eq!(shell.on_exit_request(Some(130)), ExitDecision::Exit);
+        assert_eq!(shell.on_exit_request(None), ExitDecision::ExitSignalled);
+        drop(closing);
+        assert_eq!(shell.on_exit_request(Some(0)), ExitDecision::ExitSignalled);
+        assert_eq!(shell.on_exit_request(Some(130)), ExitDecision::Exit);
     }
 
     /// A closing whose power-off panics still ends: the guard lets the application close again.
