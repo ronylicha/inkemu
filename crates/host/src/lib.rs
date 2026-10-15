@@ -11,6 +11,7 @@
 //! them per device.
 pub mod capture;
 pub mod catalog;
+pub mod device;
 pub mod engine;
 pub mod exit;
 pub mod firmware_file;

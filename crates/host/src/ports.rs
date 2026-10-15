@@ -265,15 +265,20 @@ pub enum PowerOnError {
     /// The flash content is longer than the flash of the device.
     #[error("{0}")]
     Flash(#[from] soc_esp32c3::FlashImageError),
+    /// A session cannot be replayed on this ROM or this device; the message says why and what to
+    /// do.
+    #[error("{0}")]
+    Replay(String),
 }
 
 /// How the emulator powers a device on, on its own thread: given once, used at every power-on.
 pub trait Recipe: Send {
     /// A machine in its power-on state with `flash` from offset 0 (`None`: erased), and its ports.
+    /// `recorded`: the life is recorded, and the machine keeps the trace hash a session holds.
     ///
     /// # Errors
     /// [`PowerOnError`] when the flash content does not fit the device.
-    fn power_on(&mut self, flash: Option<Vec<u8>>) -> Result<Life, PowerOnError>;
+    fn power_on(&mut self, flash: Option<Vec<u8>>, recorded: bool) -> Result<Life, PowerOnError>;
 }
 
 #[cfg(test)]

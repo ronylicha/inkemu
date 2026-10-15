@@ -93,13 +93,15 @@ pub struct ProfileRecipe {
 }
 
 impl Recipe for ProfileRecipe {
-    fn power_on(&mut self, flash: Option<Vec<u8>>) -> Result<Life, PowerOnError> {
+    fn power_on(&mut self, flash: Option<Vec<u8>>, recorded: bool) -> Result<Life, PowerOnError> {
         let rom = self.rom.clone();
+        let options = MachineOptions {
+            trace_hash: self.options.trace_hash || recorded,
+            ..self.options
+        };
         let machine = match flash {
-            Some(bytes) => self
-                .profile
-                .instantiate_with_flash(rom, bytes, self.options)?,
-            None => self.profile.instantiate(rom, self.options),
+            Some(bytes) => self.profile.instantiate_with_flash(rom, bytes, options)?,
+            None => self.profile.instantiate(rom, options),
         };
         let (panel, buttons) = ports_for(&self.profile);
         Ok(Life {
@@ -157,12 +159,17 @@ mod tests {
             rom: flat_rom(&[HANG]),
             options: MachineOptions::default(),
         };
-        let life = recipe.power_on(Some(vec![0x42; 16])).unwrap();
+        let life = recipe.power_on(Some(vec![0x42; 16]), false).unwrap();
         assert_eq!(life.panel.describe(), look("x4").panel);
         assert_eq!(life.buttons.buttons(), X4_BUTTONS);
         assert_eq!(&life.machine.flash_contents()[..2], [0x42, 0x42]);
-        let erased = recipe.power_on(None).unwrap();
+        assert_eq!(life.machine.trace_hash(), None);
+        let erased = recipe.power_on(None, true).unwrap();
         assert_eq!(erased.machine.flash_contents()[0], 0xFF);
-        assert!(recipe.power_on(Some(vec![0; 17 << 20])).is_err());
+        assert!(
+            erased.machine.trace_hash().is_some(),
+            "a recorded life keeps its trace hash"
+        );
+        assert!(recipe.power_on(Some(vec![0; 17 << 20]), false).is_err());
     }
 }
