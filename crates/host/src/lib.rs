@@ -13,7 +13,9 @@
 //! and [`capture`] makes a PNG of the panel.
 //!
 //! The SD card of a device (design `SP2e`, ADR 0014) is kept in an image file: [`sd_image`] opens,
-//! locks and writes it through a journal, and [`sd_format`] creates a blank FAT32 one.
+//! locks and writes it through a journal, and [`sd_format`] creates a blank FAT32 one;
+//! [`sd_run`] puts its card in the slot of the wired device for each life and commits what the
+//! life changed (design `SP2d`).
 pub mod capture;
 pub mod catalog;
 pub mod device;
@@ -31,6 +33,7 @@ pub mod run;
 pub mod script_file;
 pub mod sd_format;
 pub mod sd_image;
+pub mod sd_run;
 pub mod session_file;
 pub mod term;
 #[cfg(any(test, feature = "test-support"))]

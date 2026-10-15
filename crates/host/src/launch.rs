@@ -10,6 +10,7 @@ use crate::flash_file::{self, FlashFileError};
 use crate::flash_state::{self, FlashStateError, Input, RunFlash, Seed};
 use crate::rom_store::{self, AnnouncingFetch, ESP_ROM_ELFS, HttpFetch, RomEntry, RomSource};
 use crate::run::RunOptions;
+use crate::sd_run;
 use crate::session_file::{self, Claimed, SessionFileError};
 use crate::term::sanitize;
 use boards::{DeviceProfile, ProfileError};
@@ -315,9 +316,9 @@ pub enum RecordPathError {
 
 /// Refuses, before anything of the run, a `--record` path a session must not be written to: a
 /// path the run reads or writes, existing or not (a session is written over what is at its
-/// path): the files given to the run, the flash file and the files beside it, the ROM file of
-/// `rom` or, without a directory, the ROM cache. Gives the text of the profile of `device` that
-/// a session carries, when the run is recorded.
+/// path): the files given to the run, the flash file and the files beside it, the SD image and
+/// its journals, the ROM file of `rom` or, without a directory, the ROM cache. Gives the text of
+/// the profile of `device` that a session carries, when the run is recorded.
 ///
 /// # Errors
 /// [`RecordPathError`] when the path is refused, or the device has no built-in profile text.
@@ -325,13 +326,15 @@ pub fn refuse_record_path(
     record: Option<&Path>,
     flash: &FlashRequest<'_>,
     console_script: Option<&Path>,
+    sd_image: Option<&Path>,
     rom: (Option<&Path>, &RomEntry),
     device: &str,
 ) -> Result<Option<&'static str>, RecordPathError> {
     let Some(path) = record else {
         return Ok(None);
     };
-    let claimed = claimed_paths(flash, console_script, Some(rom));
+    let mut claimed = claimed_paths(flash, console_script, Some(rom));
+    claimed.extend(sd_run::claims(sd_image));
     session_file::refuse_record_path(path, &claimed)?;
     Ok(Some(boards::builtin_toml(device)?))
 }
@@ -630,22 +633,31 @@ mod tests {
         let entry = rom_store::rom_entry_for(profile("x4").unwrap().chip_revision);
         let rom = (Some(dir.path()), entry);
         assert!(matches!(
-            refuse_record_path(None, &flash, None, rom, "x4"),
+            refuse_record_path(None, &flash, None, None, rom, "x4"),
             Ok(None)
         ));
         assert!(matches!(
-            refuse_record_path(Some(&image), &flash, None, rom, "x4"),
+            refuse_record_path(Some(&image), &flash, None, None, rom, "x4"),
             Err(RecordPathError::Path(_))
         ));
         let text = refuse_record_path(
             Some(&dir.path().join("run.inkrec")),
             &flash,
             None,
+            None,
             rom,
             "x4",
         )
         .unwrap();
         assert_eq!(text, Some(boards::builtin_toml("x4").unwrap()));
+        // The SD image and its journal are the run's.
+        let card = dir.path().join("card.img");
+        for path in [card.clone(), dir.path().join(".card.img.journal")] {
+            assert!(matches!(
+                refuse_record_path(Some(&path), &flash, None, Some(&card), rom, "x4"),
+                Err(RecordPathError::Path(_))
+            ));
+        }
     }
 
     /// A ROM directory without the ROM is refused without a download, and nothing is announced.

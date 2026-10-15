@@ -26,12 +26,12 @@ pub const EXIT_SECOND_INTERRUPT: u8 = 130;
 pub const RUN_EXIT_CODES_HELP: &str = "\
 Exit codes:
   0  the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was
-     pressed, the reader of standard output went away, or the device went into a deep sleep
-     nothing inkemu models can wake it from
-  2  error: unknown device, missing or invalid ROM, refused flash image or flash file, standard
-     output cannot be written, or the flash file could not be written when the run ended (what
-     the firmware wrote to the flash is then lost), or the session of --record could not be
-     written
+     pressed, the reader of standard output went away, the device went into a deep sleep
+     nothing inkemu models can wake it from, or the device turned its own supply off
+  2  error: unknown device, missing or invalid ROM, refused flash image, flash file or SD image,
+     standard output cannot be written, or the flash file or the SD image could not be written
+     when the run ended (what the firmware wrote to them is then lost), or the session of
+     --record could not be written
   3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
      emulator cannot perform faithfully, flash that is not mapped, or a read through a flash
      window that may differ from the device)
@@ -47,7 +47,7 @@ Exit codes:
 pub const REPLAY_EXIT_CODES_HELP: &str = "\
 Exit codes:
   0  the replay reached the end of the session and gave what was recorded: the same end, device
-     time, cycles, instructions, trace hash, final flash and consoles
+     time, cycles, instructions, trace hash, final flash, SD card and consoles
   2  error: the session file cannot be read or is refused, the ROM is missing or is not the one
      the session was recorded on, standard output cannot be written, or the replay was cut
      before the end of its session (Ctrl-C, the reader of standard output went away): nothing

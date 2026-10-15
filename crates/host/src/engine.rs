@@ -638,12 +638,13 @@ impl Engine {
         output.notices.extend(Notice::from_log(&log));
         let mode = std::mem::replace(&mut self.mode, Mode::Run { recorder: None });
         let (verdict, session) = match mode {
-            Mode::Replay { session, digests } => {
-                (Some(verdict(&session, &self.machine, end, digests)), None)
-            }
+            Mode::Replay { session, digests } => (
+                Some(verdict(&session, &self.machine, end, digests, None)),
+                None,
+            ),
             Mode::Run {
                 recorder: Some(recorder),
-            } => (None, Some(recorder.finish(&self.machine, end))),
+            } => (None, Some(recorder.finish(&self.machine, end, None))),
             Mode::Run { recorder: None } => (None, None),
         };
         Finished {
@@ -1014,7 +1015,7 @@ mod tests {
             max_time_nanos: Some(20_000_000),
             ..SessionLimits::default()
         };
-        let recorder = Recorder::begin(identity, x4_text(), &life.machine, limits);
+        let recorder = Recorder::begin(identity, x4_text(), &life.machine, None, limits);
         let mut engine = Engine::new(
             life,
             Mode::Run {
@@ -1095,6 +1096,7 @@ mod tests {
             identity,
             x4_text(),
             &wired.machine,
+            None,
             SessionLimits::default(),
         );
         let mut engine = Engine::new(

@@ -37,6 +37,8 @@ pub const MAX_TOTAL_BYTES: usize = 512 * 1024;
 const _: () = assert!(MAX_TOTAL_BYTES + MAX_STEPS < soc_esp32c3::MAX_PENDING_HOST_BYTES);
 // Nor is a change of the USB host refused: a script holds fewer than the machine keeps.
 const _: () = assert!(MAX_STEPS < soc_esp32c3::MAX_PENDING_HOST_CHANGES);
+// Nor an input of the board, with the power-on gesture's three before them.
+const _: () = assert!(MAX_STEPS + 3 < soc_esp32c3::MAX_PENDING_BOARD_INPUTS);
 
 /// What one step does.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +59,15 @@ pub enum Action {
     },
     /// `usb-host absent|attached|open`: the USB host is in that state from the time of the step.
     UsbHost(UsbHost),
+    /// `press <button>`: the user presses the button of the device from the time of the step
+    /// (ADR 0013); the run says whether the device has it.
+    Press { button: String },
+    /// `release <button>`: the user lets the button go from the time of the step.
+    Release { button: String },
 }
+
+/// The longest button id a script names: the ids of a profile are short words (`confirm`).
+pub const MAX_BUTTON_BYTES: usize = 64;
 
 /// A step and the line it was written on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,8 +119,16 @@ pub enum ScriptErrorKind {
     LineTooLong { len: usize },
     #[error("the script has more than {MAX_STEPS} steps; split it in several scripts")]
     TooManySteps,
-    #[error("`{}` is no step; write send, wait, wait-for or usb-host", Quoted(.word))]
+    #[error(
+        "`{}` is no step; write send, wait, wait-for, usb-host, press or release",
+        Quoted(.word)
+    )]
     UnknownStep { word: String },
+    #[error(
+        "`{}` is no button id; a button id is lower-case letters, digits and `-`, at most {MAX_BUTTON_BYTES} bytes, as the device profile names it (`press confirm`)",
+        Quoted(.word)
+    )]
+    BadButton { word: String },
     #[error("`{step}` needs {what}; write it after `{step}`")]
     Missing {
         step: &'static str,
@@ -344,6 +362,12 @@ impl<'a> Cursor<'a> {
                 Action::WaitFor { channel, text }
             }
             "usb-host" => Action::UsbHost(self.host_state()?),
+            "press" => Action::Press {
+                button: self.button("press")?,
+            },
+            "release" => Action::Release {
+                button: self.button("release")?,
+            },
             other => {
                 return self.refuse(
                     start,
@@ -426,6 +450,31 @@ impl<'a> Cursor<'a> {
                 },
             ),
         }
+    }
+
+    fn button(&mut self, step: &'static str) -> Result<String, ScriptError> {
+        let Some((start, word)) = self.word() else {
+            return self.refuse(
+                self.pos,
+                ScriptErrorKind::Missing {
+                    step,
+                    what: "the id of a button of the device (back, confirm, power…)",
+                },
+            );
+        };
+        let well_formed = word.len() <= MAX_BUTTON_BYTES
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !well_formed {
+            return self.refuse(
+                start,
+                ScriptErrorKind::BadButton {
+                    word: word.to_owned(),
+                },
+            );
+        }
+        Ok(word.to_owned())
     }
 
     fn host_state(&mut self) -> Result<UsbHost, ScriptError> {
@@ -582,6 +631,8 @@ impl fmt::Display for Step {
                 write!(f, "wait-for {} \"{}\"", channel.name(), quoted(text))
             }
             Action::UsbHost(state) => write!(f, "usb-host {}", state.name()),
+            Action::Press { button } => write!(f, "press {button}"),
+            Action::Release { button } => write!(f, "release {button}"),
         }
     }
 }
@@ -661,6 +712,66 @@ mod tests {
                     }
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn press_and_release_name_a_button_and_are_written_back_as_read() {
+        let read = script("press confirm\nrelease power-2 # let go\n").unwrap();
+        assert_eq!(
+            read.steps(),
+            [
+                Step {
+                    line: 2,
+                    action: Action::Press {
+                        button: "confirm".to_owned()
+                    }
+                },
+                Step {
+                    line: 3,
+                    action: Action::Release {
+                        button: "power-2".to_owned()
+                    }
+                },
+            ]
+        );
+        assert_eq!(read.steps()[0].to_string(), "press confirm");
+        assert_eq!(read.steps()[1].to_string(), "release power-2");
+    }
+
+    #[test]
+    fn a_press_without_a_button_or_with_one_no_profile_names_is_refused() {
+        assert_eq!(
+            refusal("press\n"),
+            (
+                2,
+                6,
+                ScriptErrorKind::Missing {
+                    step: "press",
+                    what: "the id of a button of the device (back, confirm, power…)",
+                }
+            )
+        );
+        assert_eq!(
+            refusal("release Confirm\n"),
+            (
+                2,
+                9,
+                ScriptErrorKind::BadButton {
+                    word: "Confirm".to_owned()
+                }
+            )
+        );
+        assert_eq!(
+            refusal("press confirm now\n").2,
+            ScriptErrorKind::Trailing {
+                text: "now".to_owned()
+            }
+        );
+        let long = "a".repeat(MAX_BUTTON_BYTES + 1);
+        assert_eq!(
+            refusal(&format!("press {long}\n")).2,
+            ScriptErrorKind::BadButton { word: long }
         );
     }
 
@@ -807,7 +918,7 @@ mod tests {
         let message = error.to_string();
         assert_eq!(
             message,
-            "line 2, column 1: `jump\\u{1b}]0;owned\\u{7}\\u{202e}x` is no step; write send, wait, wait-for or usb-host"
+            "line 2, column 1: `jump\\u{1b}]0;owned\\u{7}\\u{202e}x` is no step; write send, wait, wait-for, usb-host, press or release"
         );
         for kind in [
             ScriptErrorKind::UnknownVersion {

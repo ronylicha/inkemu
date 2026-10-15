@@ -196,17 +196,21 @@ Options:
       --usb-host <USB_HOST>      The USB host on the USB-Serial-JTAG port when the device starts: absent (no cable), attached (the port closed: frames, nothing read) or open (a program reads and writes the port) [default: open] [possible values: absent, attached, open]
       --rom-dir <ROM_DIR>        Use the ROM ELF files of this directory and never download
       --trace-hash               Print the execution trace hash at the end (determinism checks)
-      --record <FILE>            Record the run in this file, a session that `inkemu replay` replays: the identity of the ROM (not the ROM), the device profile, the whole flash the run starts from, the limits, the USB host at power-on, every input the consoles and the USB host received with its device time, and what the run came to (its end, device time, cycles, instructions, trace hash, final flash and consoles). The file is written when the run ends, however it ends but at a second Ctrl-C: a run cut by Ctrl-C or by its reader is recorded with the device time it stopped at. The path may not be a file the run reads or writes, even one that does not exist yet (the flash file, its lock and temporary files, a ROM file), and its directory must exist. A session holds the whole flash: on Unix the file is readable and writable by its owner only. Recording turns the trace hash on
+      --record <FILE>            Record the run in this file, a session that `inkemu replay` replays: the identity of the ROM (not the ROM), the device profile, the whole flash the run starts from, the limits, the USB host at power-on, the blocks of the SD card that are not all zeros (64 MiB at most), every input the consoles, the USB host and the board (its keys, its cable) received with its device time, and what the run came to (its end, device time, cycles, instructions, trace hash, final flash, changes of the SD card and consoles). The file is written when the run ends, however it ends but at a second Ctrl-C: a run cut by Ctrl-C or by its reader is recorded with the device time it stopped at. The path may not be a file the run reads or writes, even one that does not exist yet (the flash file, its lock and temporary files, the SD image and its journals, a ROM file), and its directory must exist. A session holds the whole flash: on Unix the file is readable and writable by its owner only. Recording turns the trace hash on
+      --power-hold <MS>          How long the power key is held when the device starts, in milliseconds: on its battery the X4 starts only while its key is held, and its firmware checks that it still is. Without it, the hold of the device profile (`[power] hold_ms`); 0 presses nothing. The press and the release are inputs of the run, which a session records
+      --usb-power                A cable powers the device from power-on: its USB detection line reads high, and the supply holds whatever the firmware does with its power latch
+      --sd-image <FILE>          The image of the SD card in the slot of the device: the card's blocks, from block 0, exactly its capacity (`inkemu sd create` makes a blank one). It is locked while the run lasts, read as the card is read, and what the firmware writes is saved to it in place, through a journal beside it (.FILE.journal), when the run ends. It may not be a file the run reads or writes besides
+      --sd-read-only             Insert the card write-protected: the firmware cannot write it, and the image is never written
   -h, --help                     Print help
 
 Exit codes:
   0  the run ended normally: the cycle limit or the device-time limit was reached, Ctrl-C was
-     pressed, the reader of standard output went away, or the device went into a deep sleep
-     nothing inkemu models can wake it from
-  2  error: unknown device, missing or invalid ROM, refused flash image or flash file, standard
-     output cannot be written, or the flash file could not be written when the run ended (what
-     the firmware wrote to the flash is then lost), or the session of --record could not be
-     written
+     pressed, the reader of standard output went away, the device went into a deep sleep
+     nothing inkemu models can wake it from, or the device turned its own supply off
+  2  error: unknown device, missing or invalid ROM, refused flash image, flash file or SD image,
+     standard output cannot be written, or the flash file or the SD image could not be written
+     when the run ended (what the firmware wrote to them is then lost), or the session of
+     --record could not be written
   3  stopped by --strict-mmio (an unmodelled register, an 8/16-bit register write, an operation the
      emulator cannot perform faithfully, flash that is not mapped, or a read through a flash
      window that may differ from the device)

@@ -449,6 +449,7 @@ pub fn power_on(setup: &Setup) -> Result<Launch, LaunchError> {
         setup.record.as_deref(),
         &flash,
         None,
+        None,
         (setup.rom_dir.as_deref(), entry),
         &setup.device,
     )?;
@@ -523,7 +524,8 @@ struct ReplayRecipe {
 impl Recipe for ReplayRecipe {
     fn power_on(&mut self, _flash: Option<Vec<u8>>, _recorded: bool) -> Result<Life, PowerOnError> {
         let machine = record::start_replay(&self.session, self.rom.clone(), self.rom_revision)
-            .map_err(PowerOnError::Replay)?;
+            .map_err(PowerOnError::Replay)?
+            .machine;
         let (panel, buttons) = catalog::ports_for(&self.profile);
         Ok(Life {
             machine,
@@ -560,7 +562,8 @@ pub fn open_replay(
     let rom = launch::load_rom(rom_dir, entry, &mut log)?;
     // Refused here, before the thread, for what a replay cannot start on.
     let probe = record::start_replay(&session, rom.clone(), entry.rom_revision)
-        .map_err(LaunchError::Replay)?;
+        .map_err(LaunchError::Replay)?
+        .machine;
     let (shown, origin) = launch::shown_console(&profile, console);
     let header = launch::header(
         &profile,
@@ -1466,6 +1469,7 @@ impl Worker {
             Some(&path),
             &paths.request(flash.file.as_deref()),
             None,
+            None,
             rom,
             &paths.device,
         )?;
@@ -1536,6 +1540,7 @@ impl Worker {
                         recording.rom,
                         recording.profile,
                         &life.machine,
+                        None,
                         session_limits,
                     )),
                 }
@@ -1735,7 +1740,7 @@ fn verdict_view(
         Ok(Verdict::Identical) => {
             let _ = writeln!(
                 log,
-                "inkemu: the replay gives what the session recorded: the same end, device time, cycles, instructions, trace hash, final flash and consoles"
+                "inkemu: the replay gives what the session recorded: the same end, device time, cycles, instructions, trace hash, final flash, SD card and consoles"
             );
             VerdictView::Identical
         }

@@ -1,5 +1,5 @@
 //! inkemu command-line interface.
-use boards::MachineOptions;
+use boards::{MachineOptions, Wired, WiredOptions};
 use clap::{Parser, Subcommand};
 use console_script::ScriptRun;
 use cpu_rv32::MisalignedPolicy;
@@ -20,7 +20,10 @@ use emu_cli::script_file;
 use emu_cli::session_file;
 use emu_cli::term::sanitize;
 use host::launch::{self, FlashRequest, RunRequest};
-use session::{ConsoleDigests, ProfileText, RomIdentity};
+use host::sd_image::{Access, SdImage};
+use host::sd_run::{self, LifeCard};
+use host::session_file::Claimed;
+use session::{ConsoleDigests, ProfileText, RomIdentity, SdCardStart};
 use sha2::{Digest as _, Sha256};
 use soc_esp32c3::{ConsoleChannel, UsbHost};
 use std::fmt::Write as _;
@@ -41,6 +44,9 @@ struct Cli {
     command: Command,
 }
 
+/// One command per process, parsed once: the size of its larger variant costs nothing worth a
+/// box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Run a bare-metal RISC-V conformance test ELF (riscv-tests or riscv-arch-test) on the
@@ -156,17 +162,41 @@ enum Command {
         trace_hash: bool,
         /// Record the run in this file, a session that `inkemu replay` replays: the identity of
         /// the ROM (not the ROM), the device profile, the whole flash the run starts from, the
-        /// limits, the USB host at power-on, every input the consoles and the USB host received
-        /// with its device time, and what the run came to (its end, device time, cycles,
-        /// instructions, trace hash, final flash and consoles). The file is written when the run
+        /// limits, the USB host at power-on, the blocks of the SD card that are not all zeros
+        /// (64 MiB at most), every input the consoles, the USB host and the board (its keys, its
+        /// cable) received with its device time, and what the run came to (its end, device time,
+        /// cycles, instructions, trace hash, final flash, changes of the SD card and consoles).
+        /// The file is written when the run
         /// ends, however it ends but at a second Ctrl-C: a run cut by Ctrl-C or by its reader is
         /// recorded with the device time it stopped at. The path may not be a file the run reads
         /// or writes, even one that does not exist yet (the flash file, its lock and temporary
-        /// files, a ROM file), and its directory must exist. A session holds the whole flash: on
+        /// files, the SD image and its journals, a ROM file), and its directory must exist. A
+        /// session holds the whole flash: on
         /// Unix the file is readable and writable by its owner only. Recording turns the trace
         /// hash on.
         #[arg(long, value_name = "FILE")]
         record: Option<PathBuf>,
+        /// How long the power key is held when the device starts, in milliseconds: on its battery
+        /// the X4 starts only while its key is held, and its firmware checks that it still is.
+        /// Without it, the hold of the device profile (`[power] hold_ms`); 0 presses nothing. The
+        /// press and the release are inputs of the run, which a session records.
+        #[arg(long, value_name = "MS")]
+        power_hold: Option<u32>,
+        /// A cable powers the device from power-on: its USB detection line reads high, and the
+        /// supply holds whatever the firmware does with its power latch.
+        #[arg(long)]
+        usb_power: bool,
+        /// The image of the SD card in the slot of the device: the card's blocks, from block 0,
+        /// exactly its capacity (`inkemu sd create` makes a blank one). It is locked while the
+        /// run lasts, read as the card is read, and what the firmware writes is saved to it in
+        /// place, through a journal beside it (.FILE.journal), when the run ends. It may not be a
+        /// file the run reads or writes besides.
+        #[arg(long, value_name = "FILE")]
+        sd_image: Option<PathBuf>,
+        /// Insert the card write-protected: the firmware cannot write it, and the image is never
+        /// written.
+        #[arg(long, requires = "sd_image")]
+        sd_read_only: bool,
     },
     /// Replay a session recorded by `inkemu run --record` and compare what it gives with what was
     /// recorded.
@@ -313,6 +343,10 @@ fn main() -> ExitCode {
             rom_dir,
             trace_hash,
             record,
+            power_hold,
+            usb_power,
+            sd_image,
+            sd_read_only,
         } => run_device(
             &device,
             &FlashRequest {
@@ -324,12 +358,18 @@ fn main() -> ExitCode {
             },
             rom_dir,
             console_script.as_deref(),
-            MachineOptions {
-                strict_mmio,
-                // The outcome of a session holds the trace hash; it changes nothing the machine
-                // does.
-                trace_hash: trace_hash || record.is_some(),
-                usb_host: usb_host.into(),
+            &PowerOn {
+                options: MachineOptions {
+                    strict_mmio,
+                    // The outcome of a session holds the trace hash; it changes nothing the
+                    // machine does.
+                    trace_hash: trace_hash || record.is_some(),
+                    usb_host: usb_host.into(),
+                },
+                power_hold_ms: power_hold,
+                usb_power,
+                sd_image: sd_image.as_deref(),
+                sd_read_only,
             },
             &RunRequest {
                 max_cycles,
@@ -440,15 +480,127 @@ fn print_stdout(text: &str) -> ControlFlow<ExitCode> {
     }
 }
 
+/// How a run powers the device on: the options of its machine and what its board starts with
+/// (design of sub-project 2d, 2d-D14; design of sub-project 2e, §9).
+struct PowerOn<'a> {
+    options: MachineOptions,
+    /// `--power-hold`: the hold of the power key, the profile's without it.
+    power_hold_ms: Option<u32>,
+    /// `--usb-power`.
+    usb_power: bool,
+    /// `--sd-image`.
+    sd_image: Option<&'a Path>,
+    /// `--sd-read-only`.
+    sd_read_only: bool,
+}
+
+/// The other files of a run: its flash request, its console script, its ROM, its session.
+type RunFiles<'a> = (
+    &'a FlashRequest<'a>,
+    Option<&'a Path>,
+    (Option<&'a Path>, &'a rom_store::RomEntry),
+    Option<&'a Path>,
+);
+
+/// Opens the SD image of a run, locked, after every other file of the run is known: it may be
+/// none of them, nor have its journals among them, and none of them may be its own files. For a
+/// run that is `recorded`, the card as its session keeps it, read whole before the run: a card a
+/// session cannot hold refuses the run, not its end.
+fn open_sd_image(
+    power_on: &PowerOn<'_>,
+    (flash, console_script, rom, record): RunFiles<'_>,
+    recorded: bool,
+) -> Result<(Option<SdImage>, Option<SdCardStart>), String> {
+    let Some(path) = power_on.sd_image else {
+        return Ok((None, None));
+    };
+    let mut claimed = launch::claimed_paths(flash, console_script, Some(rom));
+    claimed.extend(record.map(|record| Claimed::File {
+        path: record.to_path_buf(),
+        what: "the session of --record, which the run writes".to_owned(),
+    }));
+    let access = if power_on.sd_read_only {
+        Access::ReadOnly
+    } else {
+        Access::ReadWrite
+    };
+    let mut image =
+        SdImage::open(path, access, &claimed, &mut io::stderr()).map_err(|e| e.to_string())?;
+    let card = recorded
+        .then(|| sd_run::recorded_card(&mut image))
+        .transpose()?;
+    Ok((Some(image), card))
+}
+
+/// The device of `profile` powered on with its wiring, `flash` in it (erased for `None`), and the
+/// card of `sd_image` in its slot.
+fn power_on_wired(
+    profile: &boards::DeviceProfile,
+    rom: soc_esp32c3::RomImage,
+    flash: Option<Vec<u8>>,
+    power_on: &PowerOn<'_>,
+    sd_image: Option<&mut SdImage>,
+) -> Result<Wired, String> {
+    let sd = sd_image
+        .map(sd_run::card_of_a_life)
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let wired = WiredOptions {
+        power_hold_ms: power_on.power_hold_ms,
+        usb_power: power_on.usb_power,
+        sd,
+    };
+    Wired::power_on(profile, rom, flash, power_on.options, wired).map_err(|e| e.to_string())
+}
+
+/// Runs `machine` to its end, showing its console, with its script and its recorder; Ctrl-C asks
+/// it to stop.
+fn execute_run(
+    machine: &mut soc_esp32c3::Esp32C3,
+    run_options: &emu_cli::run::RunOptions,
+    script: Option<&mut ScriptRun>,
+    recorder: Option<&mut Recorder>,
+) -> emu_cli::run::RunEnd {
+    let interrupt = interrupt_on_ctrl_c(
+        "the run is not affected, but interrupting it will not print its summary: use --max-cycles or --max-time to bound it",
+    );
+    execute_with_script(
+        machine,
+        run_options,
+        RunExtras {
+            script,
+            digests: recorder.map(Recorder::digests),
+        },
+        &interrupt,
+        &stdout_reader_gone,
+        &mut io::stdout().lock(),
+        &mut io::stderr().lock(),
+    )
+}
+
+/// Starts `script` on `machine`, its `press` and `release` steps naming the buttons of
+/// `buttons`, in the order of their targets on the board.
+fn start_script(
+    script: &console_script::Script,
+    machine: &mut soc_esp32c3::Esp32C3,
+    buttons: Option<&boards::ButtonsHandle>,
+) -> Result<ScriptRun, console_script::RunError> {
+    let ids: Vec<String> = buttons
+        .map(|buttons| buttons.buttons().iter().map(|b| b.id.clone()).collect())
+        .unwrap_or_default();
+    ScriptRun::start_on_board(script, machine, &ids)
+}
+
 fn run_device(
     device: &str,
     flash: &FlashRequest<'_>,
     rom_dir: Option<PathBuf>,
     console_script: Option<&Path>,
-    machine_options: MachineOptions,
+    power_on: &PowerOn<'_>,
     request: &RunRequest,
     record: Option<&Path>,
 ) -> ExitCode {
+    let machine_options = power_on.options;
     let profile = match launch::profile(device) {
         Ok(p) => p,
         Err(e) => return fail(&e),
@@ -461,8 +613,9 @@ fn run_device(
     };
     let entry = rom_store::rom_entry_for(profile.chip_revision);
     let rom = (rom_dir.as_deref(), entry);
-    let profile_text = match launch::refuse_record_path(record, flash, console_script, rom, device)
-    {
+    let sd_path = power_on.sd_image;
+    let refused = launch::refuse_record_path(record, flash, console_script, sd_path, rom, device);
+    let profile_text = match refused {
         Ok(text) => text,
         Err(e) => return fail(&e),
     };
@@ -486,18 +639,26 @@ fn run_device(
     for warning in &fresh.warnings {
         write_line(io::stderr(), &format_args!("warning: {warning}"));
     }
+    let files = (flash, console_script, rom, record);
+    let opened = open_sd_image(power_on, files, profile_text.is_some());
+    let (mut sd_image, recorded_card) = match opened {
+        Ok(opened) => opened,
+        Err(e) => return fail(&e),
+    };
     let flash_note = launch::flash_note(flash.file, &run_flash, &fresh.note, flash_size);
     let rom = match launch::load_rom(rom_dir, entry, &mut io::stderr()) {
         Ok(rom) => rom,
         Err(e) => return fail(&e),
     };
     let rom_identity = RomIdentity::of(entry.rom_revision, &rom);
-    let mut machine = match content {
-        Some(bytes) => match profile.instantiate_with_flash(rom, bytes, machine_options) {
-            Ok(machine) => machine,
-            Err(e) => return fail(&e),
-        },
-        None => profile.instantiate(rom, machine_options),
+    let Wired {
+        mut machine,
+        buttons,
+        sd: slot,
+        ..
+    } = match power_on_wired(&profile, rom, content, power_on, sd_image.as_mut()) {
+        Ok(wired) => wired,
+        Err(e) => return fail(&e),
     };
     // Nothing refuses the run from here on but its flash file: only now is what an interrupted
     // save left beside it removed. A run refused above left the directory as it found it.
@@ -512,55 +673,63 @@ fn run_device(
         ),
     );
     // What the session of the run keeps beside the machine, taken at power-on.
+    let limits = request.limits(machine_options.strict_mmio);
     let mut recorder = profile_text.map(|text| {
-        let profile = ProfileText {
+        let text = ProfileText {
             id: profile.id.clone(),
             text: text.to_owned(),
         };
-        let limits = request.limits(machine_options.strict_mmio);
-        Recorder::begin(rom_identity, profile, &machine, limits)
+        Recorder::begin(rom_identity, text, &machine, recorded_card, limits)
     });
     // The steps before the first wait are dated now, at power-on.
     let mut script_run = match script
         .as_ref()
-        .map(|script| ScriptRun::start(script, &mut machine))
+        .map(|script| start_script(script, &mut machine, buttons.as_ref()))
         .transpose()
     {
         Ok(run) => run,
         Err(e) => return fail(&e),
     };
-    let interrupt = interrupt_on_ctrl_c(
-        "the run is not affected, but interrupting it will not print its summary: use --max-cycles or --max-time to bound it",
-    );
-    let end = execute_with_script(
+    let end = execute_run(
         &mut machine,
         &run_options,
-        RunExtras {
-            script: script_run.as_mut(),
-            digests: recorder.as_mut().map(Recorder::digests),
-        },
-        &interrupt,
-        &stdout_reader_gone,
-        &mut io::stdout().lock(),
-        &mut io::stderr().lock(),
+        script_run.as_mut(),
+        recorder.as_mut(),
     );
     let script_status = script_run
         .as_ref()
         .map(|run| run.status(machine.device_time()));
     // The run is over: what follows is no part of it, and of no trace. Since the first line of
     // its summary Ctrl-C ends nothing (`execute` told `interrupt`): the summary, the save of the
-    // flash file and the write of the session are bounded (one write of the flash, one of the
-    // session, and their flushes to the disk), and they complete; the exit code is the one of
-    // the end above.
+    // flash file, of the SD image and the write of the session are bounded (one write of each,
+    // and their flushes to the disk), and they complete; the exit code is the one of the end
+    // above.
     let flash_saved = run_flash.finish(&machine, &mut io::stderr().lock());
+    let card = LifeCard::take(slot.as_ref());
+    let rest_saved =
+        save_card_and_session(&machine, end, sd_image.as_mut(), &card, recorder, record);
+    let saved = flash_saved && rest_saved;
+    ExitCode::from(exit_code_of_run(end, script_status.as_ref(), saved))
+}
+
+/// Saves what the run of `machine`, which ended as `end`, leaves besides its flash: the changes of
+/// `card` to the SD image, then its session. `true` when both are kept, or not asked for.
+fn save_card_and_session(
+    machine: &soc_esp32c3::Esp32C3,
+    end: emu_cli::run::RunEnd,
+    sd_image: Option<&mut SdImage>,
+    card: &LifeCard,
+    recorder: Option<Recorder>,
+    record: Option<&Path>,
+) -> bool {
+    let sd_saved =
+        sd_image.is_none_or(|image| sd_run::commit_and_say(image, card, &mut io::stderr().lock()));
     let session_saved = recorder.zip(record).is_none_or(|(recorder, path)| {
-        record_session(recorder, &machine, end, path, &mut io::stderr().lock())
+        let changes = card.changes();
+        let log = &mut io::stderr();
+        record_session(recorder, machine, end, changes.as_ref(), path, log)
     });
-    ExitCode::from(exit_code_of_run(
-        end,
-        script_status.as_ref(),
-        flash_saved && session_saved,
-    ))
+    sd_saved && session_saved
 }
 
 /// `inkemu replay`: replays the session in `path` as a run shows its console, then compares what
@@ -583,8 +752,12 @@ fn run_replay(path: &Path, console: Option<ConsoleChannel>, rom_dir: Option<Path
         Ok(rom) => rom,
         Err(e) => return fail(&e),
     };
-    let mut machine = match start_replay(&session, rom, entry.rom_revision) {
-        Ok(machine) => machine,
+    let Wired {
+        mut machine,
+        sd: slot,
+        ..
+    } = match start_replay(&session, rom, entry.rom_revision) {
+        Ok(wired) => wired,
         Err(message) => return fail(&message),
     };
     let (shown, origin) = launch::shown_console(&profile, console);
@@ -620,11 +793,14 @@ fn run_replay(path: &Path, console: Option<ConsoleChannel>, rom_dir: Option<Path
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
     );
+    // The card of a replay is rebuilt from the session: its changes are compared, never kept.
+    let card = LifeCard::take(slot.as_ref());
     ExitCode::from(report_replay(
         &session,
         &machine,
         end,
         digests,
+        card.changes().as_ref(),
         &mut io::stderr().lock(),
     ))
 }
