@@ -4324,8 +4324,10 @@ fn pinned_in_sums(sums: &str, file: &str) -> String {
 /// other assertion of the test passing). It was `b217bc3b287080ae` (CI run 38498719362,
 /// 2026-10-14) until sub-project 2b: the SAR ADC and I2C0 are modelled, so the first wait ends
 /// with a reading instead of the panic, and the firmware itself changed, waiting next for ADC2 to
-/// keep the panic and the core dump (decisions 2b-D14 and 2b-R4).
-const ADC_WAIT_PANIC_TRACE: &str = "trace-hash 42e50c75581ae020";
+/// keep the panic and the core dump (decisions 2b-D14 and 2b-R4): `42e50c75581ae020`. Then the
+/// firmware clears ADC2's done bit before that second wait (review of PR #18, ruling 2b-R11): one
+/// more register write, other instructions and addresses, so another trace, `20e53f8cdf1823fc`.
+const ADC_WAIT_PANIC_TRACE: &str = "trace-hash 20e53f8cdf1823fc";
 
 /// The wait for the SAR ADC that stopped `CrossPoint` 1.6.5 and the stock firmware of the X4
 /// under inkemu until sub-project 2b modelled the ADC (they are tested on the machine of a user who
