@@ -194,36 +194,43 @@ impl FlashKeeper {
         }
     }
 
-    /// The content of the next power-on, taken once.
+    /// The content of the next power-on, taken once. A content kept in memory (the start of the
+    /// run, a life that could not begin, a save that failed) is newer than the flash file: with
+    /// a file, it replaces the file at the end of the life; otherwise the file is read again.
     fn take_next(&mut self) -> Result<Option<Vec<u8>>, FlashStateError> {
-        if self.run_flash.is_none() && self.file.is_some() {
-            let (run_flash, content) =
-                RunFlash::begin(self.file.as_deref(), false, None, self.size)?;
-            self.run_flash = Some(run_flash);
-            return Ok(content);
+        if self.run_flash.is_some() {
+            return Ok(self.next.take());
         }
-        if self.run_flash.is_none() && self.next.is_some() {
-            let seed = self.next.take().map(|content| Seed {
-                input: Input::Flash,
-                content,
-            });
-            let (run_flash, content) = RunFlash::begin(None, false, seed, self.size)?;
-            self.run_flash = Some(run_flash);
-            return Ok(content);
+        let seed = self.next.take().map(|content| Seed {
+            input: Input::Flash,
+            content,
+        });
+        if seed.is_none() && self.file.is_none() {
+            return Ok(None);
         }
-        Ok(self.next.take())
+        let reset = seed.is_some();
+        let (run_flash, content) = RunFlash::begin(self.file.as_deref(), reset, seed, self.size)?;
+        self.run_flash = Some(run_flash);
+        Ok(content)
+    }
+
+    /// Gives back the content of a power-on that did not happen: the next one starts from it.
+    fn abandon(&mut self, content: Option<Vec<u8>>) {
+        self.run_flash = None;
+        self.next = content;
     }
 
     /// Ends a life for its flash: says what it started from and what became of it, writes the
     /// flash file, and keeps the content for the next life. `false` when the file could not be
-    /// written.
+    /// written: the content is then kept in memory, and written at the end of the next life.
     fn finish(&mut self, ended: &LifeEnd, log: &mut dyn std::io::Write) -> bool {
         let saved = self
             .run_flash
             .take()
             .is_none_or(|run_flash| run_flash.finish(&ended.machine, log));
-        // With a file, the next life reads it again; without, it starts from what this one left.
-        self.next = if self.file.is_some() {
+        // With a file that holds it, the next life reads it again; otherwise it starts from what
+        // this one left.
+        self.next = if self.file.is_some() && saved {
             None
         } else {
             Some(ended.machine.flash_contents())
@@ -1117,10 +1124,18 @@ impl Worker {
             }
         };
         let recorded = matches!(mode_of, Some(Some(_)));
-        let life = self
-            .recipe
-            .power_on(content, recorded)
-            .map_err(|e| CommandError::PowerOn(e.to_string()))?;
+        // A power-on that fails must not lose the content: the next one starts from it.
+        let kept = content.clone();
+        let life = match self.recipe.power_on(content, recorded) {
+            Ok(life) => life,
+            Err(e) => {
+                if let Plan::Run { flash, .. } = &mut self.plan {
+                    flash.abandon(kept);
+                }
+                return Err(CommandError::PowerOn(e.to_string()));
+            }
+        };
+        drop(kept);
         let mode = match (mode_of, &self.plan) {
             (Some(Some(recording)), _) => {
                 let session_limits = session::Limits {
@@ -1825,6 +1840,114 @@ mod tests {
         std::fs::write(&path, b"hello").unwrap();
         let error = open_replay(&path, Some(dir.path().to_path_buf()), None).unwrap_err();
         assert_eq!(error.kind(), "session", "{error}");
+    }
+
+    /// A recipe that fails its `fail_at`th power-on, and only that one.
+    struct Flaky {
+        inner: Box<dyn Recipe>,
+        calls: u32,
+        fail_at: u32,
+    }
+
+    impl Recipe for Flaky {
+        fn power_on(
+            &mut self,
+            flash: Option<Vec<u8>>,
+            recorded: bool,
+        ) -> Result<Life, PowerOnError> {
+            self.calls += 1;
+            if self.calls == self.fail_at {
+                return Err(PowerOnError::Replay("this power-on fails".into()));
+            }
+            self.inner.power_on(flash, recorded)
+        }
+    }
+
+    /// A power-on that fails keeps the flash for the next one: nothing the last life wrote is
+    /// lost, with or without a flash file.
+    #[test]
+    fn a_failed_power_on_keeps_the_flash_for_the_next() {
+        for with_file in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let powered = Arc::new(Mutex::new(Vec::new()));
+            let keeper = if with_file {
+                FlashKeeper::begin(Some(dir.path().join("flash.bin")), false, None, 1 << 20)
+                    .unwrap()
+            } else {
+                FlashKeeper::without_file(None, 1 << 20)
+            };
+            let recipe = Box::new(Flaky {
+                inner: writing_device(0x00, Arc::clone(&powered)),
+                calls: 0,
+                fail_at: 2,
+            });
+            let launch = Launch::new(
+                recipe,
+                keeper,
+                Limits {
+                    max_cycles: Some(50_000),
+                    max_device_nanos: None,
+                },
+                LOOK,
+                None,
+            );
+            let (emulator, updates) = started(launch, Speed::Fastest);
+            until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+            assert!(matches!(
+                emulator.command(Command::Reset),
+                Err(CommandError::PowerOn(_))
+            ));
+            emulator.command(Command::Reset).unwrap();
+            until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
+            emulator.shutdown();
+            let powered = powered.lock().unwrap();
+            assert_eq!(
+                *powered,
+                [None, Some(vec![0x00])],
+                "with a file: {with_file}"
+            );
+        }
+    }
+
+    /// A flash file that cannot be written keeps the content in memory: the next life starts
+    /// from it, and writes the file once it can.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_save_keeps_the_flash_for_the_next_life() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("kept");
+        std::fs::create_dir(&place).unwrap();
+        let file = place.join("flash.bin");
+        let powered = Arc::new(Mutex::new(Vec::new()));
+        let keeper = FlashKeeper::begin(Some(file.clone()), false, None, 1 << 20).unwrap();
+        let launch = Launch::new(
+            writing_device(0x00, Arc::clone(&powered)),
+            keeper,
+            Limits {
+                max_cycles: Some(50_000),
+                max_device_nanos: None,
+            },
+            LOOK,
+            None,
+        );
+        // The directory takes no new file: the save of the first life fails.
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        let first = until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            first
+                .iter()
+                .any(|u| matches!(u, Update::Notice(n) if n.level == Level::Error)),
+            "the failed save is said: {first:?}"
+        );
+        assert!(!file.exists());
+        emulator.command(Command::Reset).unwrap();
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
+        emulator.shutdown();
+        assert_eq!(*powered.lock().unwrap(), [None, Some(vec![0x00])]);
+        assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
     }
 
     /// A machine powered on with the recorder's options keeps its trace hash.
