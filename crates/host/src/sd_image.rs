@@ -389,17 +389,18 @@ impl SdImage {
             .map(|(_, found)| found.map_or(Recovered::Nothing, Recovered::Finished))
     }
 
-    fn open_with(
+    /// The checks of [`SdImage::open`] that look at no file: `path` names a file, and neither it
+    /// nor its journals are among the files of the run (`claimed`). Made by a front end before
+    /// the ROM is read, so that such a run is refused without it, in the same order by the
+    /// command line and the application (R3). Gives the journal and its temporary file.
+    ///
+    /// # Errors
+    /// [`SdImageError::NoFileName`], [`SdImageError::Claimed`], [`SdImageError::JournalClaimed`].
+    pub fn refuse_the_files_of_the_run(
         path: &Path,
-        access: Access,
         claimed: &[Claimed],
-        origin: JournalOrigin,
-        log: &mut dyn Write,
-    ) -> Result<(SdImage, Option<Committed>), SdImageError> {
-        let shown_path = shown(path);
-        let no_name = || SdImageError::NoFileName {
-            path: shown_path.clone(),
-        };
+    ) -> Result<(PathBuf, PathBuf), SdImageError> {
+        let no_name = || SdImageError::NoFileName { path: shown(path) };
         let name = path.file_name().ok_or_else(no_name)?;
         if !path
             .as_os_str()
@@ -413,6 +414,18 @@ impl SdImage {
             return Err(no_name());
         };
         refuse_claimed(path, [&journal, &temporary], claimed)?;
+        Ok((journal, temporary))
+    }
+
+    fn open_with(
+        path: &Path,
+        access: Access,
+        claimed: &[Claimed],
+        origin: JournalOrigin,
+        log: &mut dyn Write,
+    ) -> Result<(SdImage, Option<Committed>), SdImageError> {
+        let shown_path = shown(path);
+        let (journal, temporary) = Self::refuse_the_files_of_the_run(path, claimed)?;
         let open_error = |e: &std::io::Error, remedy| SdImageError::Open {
             path: shown_path.clone(),
             detail: sanitize(&e.to_string()),

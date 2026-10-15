@@ -20,7 +20,7 @@ use emu_cli::script_file;
 use emu_cli::session_file;
 use emu_cli::term::sanitize;
 use host::launch::{self, FlashRequest, RunRequest};
-use host::sd_image::{Access, SdImage};
+use host::sd_image::{Access, SdImage, SdImageError};
 use host::sd_run::{self, LifeCard};
 use host::session_file::Claimed;
 use session::{ConsoleDigests, ProfileText, RomIdentity, SdCardStart};
@@ -502,30 +502,57 @@ type RunFiles<'a> = (
     Option<&'a Path>,
 );
 
-/// Opens the SD image of a run, locked, after every other file of the run is known: it may be
-/// none of them, nor have its journals among them, and none of them may be its own files. For a
-/// run that is `recorded`, the card as its session keeps it, read whole before the run: a card a
-/// session cannot hold refuses the run, not its end.
-fn open_sd_image(
-    power_on: &PowerOn<'_>,
+/// The files of the run the SD image may not be, nor have its journals among; and, with an image,
+/// the refusal of one that is (R3): made before the ROM is read, as the application makes it.
+fn sd_claims(
+    sd_image: Option<&Path>,
     (flash, console_script, rom, record): RunFiles<'_>,
-    recorded: bool,
-) -> Result<(Option<SdImage>, Option<SdCardStart>), String> {
-    let Some(path) = power_on.sd_image else {
-        return Ok((None, None));
-    };
+) -> Result<Vec<Claimed>, SdImageError> {
     let mut claimed = launch::claimed_paths(flash, console_script, Some(rom));
     claimed.extend(record.map(|record| Claimed::File {
         path: record.to_path_buf(),
         what: "the session of --record, which the run writes".to_owned(),
     }));
+    if let Some(path) = sd_image {
+        SdImage::refuse_the_files_of_the_run(path, &claimed)?;
+    }
+    Ok(claimed)
+}
+
+/// The paths of the run its session and its SD image may not take, refused before the ROM is
+/// read: gives the text of the profile a recorded run carries, and the files the image may not be.
+fn refuse_paths(
+    device: &str,
+    power_on: &PowerOn<'_>,
+    files: RunFiles<'_>,
+) -> Result<(Option<&'static str>, Vec<Claimed>), String> {
+    let (flash, console_script, rom, record) = files;
+    let sd_image = power_on.sd_image;
+    let text = launch::refuse_record_path(record, flash, console_script, sd_image, rom, device)
+        .map_err(|e| e.to_string())?;
+    let claimed = sd_claims(sd_image, files).map_err(|e| e.to_string())?;
+    Ok((text, claimed))
+}
+
+/// Opens the SD image of a run, locked, after its ROM is read, as the application opens it: it
+/// may be none of the files of the run (`claimed`), nor have its journals among them. For a
+/// run that is `recorded`, the card as its session keeps it, read whole before the run: a card a
+/// session cannot hold refuses the run, not its end.
+fn open_sd_image(
+    power_on: &PowerOn<'_>,
+    claimed: &[Claimed],
+    recorded: bool,
+) -> Result<(Option<SdImage>, Option<SdCardStart>), String> {
+    let Some(path) = power_on.sd_image else {
+        return Ok((None, None));
+    };
     let access = if power_on.sd_read_only {
         Access::ReadOnly
     } else {
         Access::ReadWrite
     };
     let mut image =
-        SdImage::open(path, access, &claimed, &mut io::stderr()).map_err(|e| e.to_string())?;
+        SdImage::open(path, access, claimed, &mut io::stderr()).map_err(|e| e.to_string())?;
     let card = recorded
         .then(|| sd_run::recorded_card(&mut image))
         .transpose()?;
@@ -630,10 +657,9 @@ fn run_device(
     };
     let entry = rom_store::rom_entry_for(profile.chip_revision);
     let rom = (rom_dir.as_deref(), entry);
-    let sd_path = power_on.sd_image;
-    let refused = launch::refuse_record_path(record, flash, console_script, sd_path, rom, device);
-    let profile_text = match refused {
-        Ok(text) => text,
+    let refused = refuse_paths(device, power_on, (flash, console_script, rom, record));
+    let (profile_text, sd_claimed) = match refused {
+        Ok(checked) => checked,
         Err(e) => return fail(&e),
     };
     let flash_size = profile.flash.size();
@@ -656,15 +682,14 @@ fn run_device(
     for warning in &fresh.warnings {
         write_line(io::stderr(), &format_args!("warning: {warning}"));
     }
-    let files = (flash, console_script, rom, record);
-    let opened = open_sd_image(power_on, files, profile_text.is_some());
-    let (mut sd_image, recorded_card) = match opened {
-        Ok(opened) => opened,
-        Err(e) => return fail(&e),
-    };
     let flash_note = launch::flash_note(flash.file, &run_flash, &fresh.note, flash_size);
     let rom = match launch::load_rom(rom_dir, entry, &mut io::stderr()) {
         Ok(rom) => rom,
+        Err(e) => return fail(&e),
+    };
+    let opened = open_sd_image(power_on, &sd_claimed, profile_text.is_some());
+    let (mut sd_image, recorded_card) = match opened {
+        Ok(opened) => opened,
         Err(e) => return fail(&e),
     };
     let rom_identity = RomIdentity::of(entry.rom_revision, &rom);

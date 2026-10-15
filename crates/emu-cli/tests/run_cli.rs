@@ -5243,6 +5243,25 @@ fn an_sd_image_that_is_the_flash_file_or_holds_the_session_is_refused_before_any
         .stderr(contains("--sd-image"));
 }
 
+/// R3: the image is opened after the ROM is read, as the application opens it: a run that has
+/// neither its ROM nor its image is refused for its ROM, and the image is not looked at.
+#[test]
+fn a_run_without_its_rom_nor_its_sd_image_is_refused_for_its_rom_as_the_application_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("roms");
+    std::fs::create_dir(&empty).unwrap();
+    inkemu()
+        .args(["run", "--device", "x4", "--rom-dir"])
+        .arg(&empty)
+        .arg("--sd-image")
+        .arg(dir.path().join("missing.img"))
+        .assert()
+        .code(2)
+        .stderr(
+            contains("esp32c3_rev3_rom.elf not found").and(contains("there is no SD image").not()),
+        );
+}
+
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR"]
 fn an_x4_run_keeps_its_sd_card_and_its_session_replays_with_it_identically() {

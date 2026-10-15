@@ -502,23 +502,95 @@ impl Launch {
     }
 }
 
-/// The SD image of `setup`, made blank first when asked, then opened and locked: it may be none
-/// of the other files of the run (`flash`, the ROM of `rom`, the session), nor have its journals
-/// among them (design of sub-project 2e, §8).
-fn open_sd(
+/// The SD image a start opened. A blank image the start made is removed when the start is refused
+/// before the run holds it, and only that one: an image the user gave is never removed (R2).
+#[derive(Default)]
+struct OpenedSd {
+    image: Option<SdImage>,
+    /// The path of the blank image this start made, until the run holds it.
+    made: Option<PathBuf>,
+}
+
+impl OpenedSd {
+    /// The image, for the run that holds it from now on: nothing is removed.
+    fn into_image(mut self) -> Option<SdImage> {
+        self.made = None;
+        self.image.take()
+    }
+}
+
+impl Drop for OpenedSd {
+    fn drop(&mut self) {
+        // Closed and unlocked first: a file still open cannot be removed on every system. A
+        // removal that fails leaves a blank image, which the refusal of the start already
+        // explains; nothing of the user's is lost.
+        drop(self.image.take());
+        if let Some(path) = self.made.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The last steps of a start: the SD image of `setup` opened ([`open_sd`]), then the flash file
+/// of the run accepted. A blank image this start made is removed when either refuses the run.
+fn open_the_card_and_accept_the_flash(
     setup: &Setup,
     flash: &FlashRequest<'_>,
     rom: (Option<&Path>, &rom_store::RomEntry),
+    run_flash: Option<&RunFlash>,
     log: &mut Vec<u8>,
 ) -> Result<Option<SdImage>, LaunchError> {
-    let Some(sd) = &setup.sd else {
-        return Ok(None);
-    };
+    let opened = open_sd(setup, flash, rom, log)?;
+    if let Some(run_flash) = run_flash {
+        run_flash.accept(log)?;
+    }
+    Ok(opened.into_image())
+}
+
+/// The files of the run the SD image of `setup` may not be, nor have its journals among: its
+/// inputs, its flash file and the files beside it, its ROM file, the session it records.
+fn sd_claims(
+    setup: &Setup,
+    flash: &FlashRequest<'_>,
+    rom: (Option<&Path>, &rom_store::RomEntry),
+) -> Vec<Claimed> {
     let mut claimed = launch::claimed_paths(flash, None, Some(rom));
     claimed.extend(setup.record.iter().map(|record| Claimed::File {
         path: record.clone(),
         what: "the session the run records".to_owned(),
     }));
+    claimed
+}
+
+/// Refuses an SD image that is a file of the run, or has its journals among them, before the ROM
+/// is read, as `inkemu run` refuses it; the image itself is opened last (R3).
+fn refuse_an_sd_image_of_the_run(
+    setup: &Setup,
+    flash: &FlashRequest<'_>,
+    rom: (Option<&Path>, &rom_store::RomEntry),
+) -> Result<(), LaunchError> {
+    let Some(sd) = &setup.sd else {
+        return Ok(());
+    };
+    SdImage::refuse_the_files_of_the_run(&sd.path, &sd_claims(setup, flash, rom))
+        .map(drop)
+        .map_err(|e| LaunchError::SdImage(e.to_string()))
+}
+
+/// The SD image of `setup`, made blank first when asked, then opened and locked: it may be none
+/// of the other files of the run (`flash`, the ROM of `rom`, the session), nor have its journals
+/// among them (design of sub-project 2e, §8). A blank image it made and could not open is removed.
+fn open_sd(
+    setup: &Setup,
+    flash: &FlashRequest<'_>,
+    rom: (Option<&Path>, &rom_store::RomEntry),
+    log: &mut Vec<u8>,
+) -> Result<OpenedSd, LaunchError> {
+    let mut opened = OpenedSd::default();
+    let Some(sd) = &setup.sd else {
+        return Ok(opened);
+    };
+    let claimed = sd_claims(setup, flash, rom);
     if let Some(mib) = sd.create_mib {
         crate::sd_format::create_blank(
             &sd.path,
@@ -528,15 +600,18 @@ fn open_sd(
             log,
         )
         .map_err(|e| LaunchError::SdImage(e.to_string()))?;
+        opened.made = Some(sd.path.clone());
     }
     let access = if sd.read_only {
         Access::ReadOnly
     } else {
         Access::ReadWrite
     };
-    SdImage::open(&sd.path, access, &claimed, log)
-        .map(Some)
-        .map_err(|e| LaunchError::SdImage(e.to_string()))
+    opened.image = Some(
+        SdImage::open(&sd.path, access, &claimed, log)
+            .map_err(|e| LaunchError::SdImage(e.to_string()))?,
+    );
+    Ok(opened)
 }
 
 /// The card of a life over `image` with the changes `keeper` holds and, for a `recorded` life,
@@ -596,6 +671,7 @@ pub fn power_on(setup: &Setup) -> Result<Launch, LaunchError> {
         (setup.rom_dir.as_deref(), entry),
         &setup.device,
     )?;
+    refuse_an_sd_image_of_the_run(setup, &flash, (setup.rom_dir.as_deref(), entry))?;
     launch::refuse_the_images_as_flash_file(&flash)?;
     let fresh = launch::starting_flash(&profile, &flash)?;
     let size = profile.flash.size();
@@ -626,10 +702,13 @@ pub fn power_on(setup: &Setup) -> Result<Launch, LaunchError> {
     // The image last, made blank or opened only once nothing but it and the flash file can
     // refuse the run: a run refused for its ROM, its flash or its profile leaves no new image
     // behind (H5).
-    let sd = open_sd(setup, &flash, (setup.rom_dir.as_deref(), entry), &mut log)?;
-    if let Some(run_flash) = &keeper.run_flash {
-        run_flash.accept(&mut log)?;
-    }
+    let sd = open_the_card_and_accept_the_flash(
+        setup,
+        &flash,
+        (setup.rom_dir.as_deref(), entry),
+        keeper.run_flash.as_ref(),
+        &mut log,
+    )?;
     log.extend_from_slice(format!("{header}; {flash_note}\n").as_bytes());
     let recording = Recording {
         rom: RomIdentity::of(entry.rom_revision, &rom),
@@ -2841,6 +2920,69 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// R3: a card that is the flash file of the run is refused before the ROM is looked for, in
+    /// the order `inkemu run` refuses it; nothing is made.
+    #[test]
+    fn a_card_that_is_the_flash_file_is_refused_before_the_rom_as_inkemu_run_refuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = dir.path().join("card.img");
+        let setup = Setup {
+            device: "x4".into(),
+            rom_dir: Some(dir.path().to_path_buf()),
+            flash_file: Some(card.clone()),
+            sd: Some(SdSetup {
+                path: card.clone(),
+                read_only: false,
+                create_mib: Some(64),
+            }),
+            ..Setup::default()
+        };
+        let refused = power_on(&setup).unwrap_err();
+        assert_eq!(refused.kind(), "sdImage", "{refused}");
+        assert!(refused.to_string().contains("card.img"), "{refused}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// R2: a start its flash file refuses after the image is opened (what sits at the file's
+    /// temporary name cannot be removed) removes the blank image it made, and only that one: an
+    /// image the user gave stays.
+    #[test]
+    fn a_start_refused_after_its_card_removes_the_blank_image_it_made_and_only_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let flash_file = dir.path().join("x4.bin");
+        std::fs::create_dir(dir.path().join(".x4.bin.tmp")).unwrap();
+        let (run_flash, _) = RunFlash::begin(Some(&flash_file), false, None, 16 << 20).unwrap();
+        let entry = rom_store::rom_entry_for(boards::builtin("x4").unwrap().chip_revision);
+        let given = dir.path().join("given.img");
+        std::fs::File::create(&given)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        for (card, create_mib) in [(dir.path().join("new.img"), Some(64)), (given, None)] {
+            let setup = Setup {
+                device: "x4".into(),
+                flash_file: Some(flash_file.clone()),
+                sd: Some(SdSetup {
+                    path: card.clone(),
+                    read_only: false,
+                    create_mib,
+                }),
+                ..Setup::default()
+            };
+            let paths = RunPaths::of(&setup);
+            let refused = open_the_card_and_accept_the_flash(
+                &setup,
+                &paths.request(setup.flash_file.as_deref()),
+                (None, entry),
+                Some(&run_flash),
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert_eq!(refused.kind(), "flashFile", "{refused}");
+            assert_eq!(card.exists(), create_mib.is_none(), "{}", card.display());
+        }
     }
 
     /// H6: a card or the cable asked of a device without the line is refused first, before the
