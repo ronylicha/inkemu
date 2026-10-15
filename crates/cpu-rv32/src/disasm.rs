@@ -1,11 +1,11 @@
-//! The text of an instruction as a debugger shows it (design `SP4a`, 4a-D4): the registers by
+//! The text of an instruction as a debugger shows it (design `SP4a`, 4a-D1): the registers by
 //! their ABI names, the CSRs by their names, branch and jump targets as absolute addresses, and
 //! the pseudo-instructions of the RISC-V assembly manual where an instruction is one of them
 //! (`li`, `mv`, `nop`, `ret`, `j`, `jr`, `beqz`, `bnez`, `not`, `neg`, `seqz`, `snez`, `csrr`,
 //! `csrw`, `csrs`, `csrc` and their immediate forms), as GNU `objdump` writes them.
 //!
 //! A compressed instruction is written in its 32-bit form: the decoder expands it
-//! ([`crate::decode`]), and [`Decoded::len`] says it was compressed. An illegal instruction is
+//! ([`crate::decode()`]), and [`Decoded::len`] says it was compressed. An illegal instruction is
 //! written `illegal`, without its bits: a debugger may show code read from the flash, and the
 //! decoded text is all it needs.
 use crate::instr::{AluOp, BranchOp, CsrOp, Decoded, Instr, LoadOp, MulOp, Reg, StoreOp};
