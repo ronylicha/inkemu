@@ -34,6 +34,8 @@ boards = { path = "../../crates/boards" }
 soc-esp32c3 = { path = "../../crates/soc-esp32c3" }
 # The debugger's points and views (design SP4a), which the commands take and give.
 debugger = { path = "../../crates/debugger" }
+# The resource monitor's view (design SP4b), which a command gives.
+monitor = { path = "../../crates/monitor" }
 
 [dev-dependencies]
 serde_json = "1"
