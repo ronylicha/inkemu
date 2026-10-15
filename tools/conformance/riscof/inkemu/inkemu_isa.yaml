@@ -1,13 +1,16 @@
 hart_ids: [0]
 hart0:
-  ISA: RV32IMCZicsr_Zifencei
+  # Machine and user modes, as the ESP32-C3 (TRM register 1.6); the hart is inkemu's conformance
+  # bench (cpu_rv32::Core::MachineUser), with a 16-entry PMP the Sail reference has too. No Zicntr:
+  # cycle, time and instret are illegal on both models (Sail's "Zicntr" is unsupported too).
+  ISA: RV32IMCUZicsr_Zifencei
   physical_addr_sz: 32
   User_Spec_Version: '2.3'
   supported_xlen: [32]
   # Misaligned loads/stores trap (inkemu's default policy); the Sail reference is configured alike.
   hw_data_misaligned_support: false
   misa:
-    reset-val: 0x40001104
+    reset-val: 0x40101104
     rv32:
       accessible: true
       mxl:
@@ -25,6 +28,6 @@ hart0:
           warl:
             dependency_fields: []
             legal:
-              - extensions[25:0] bitmask [0x0001104, 0x0000000]
+              - extensions[25:0] bitmask [0x0101104, 0x0000000]
             wr_illegal:
               - Unchanged

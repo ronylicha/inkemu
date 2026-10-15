@@ -2,7 +2,7 @@
 use boards::{DeviceProfile, MachineOptions};
 use clap::{Parser, Subcommand};
 use console_script::ScriptRun;
-use cpu_rv32::{HartConfig, MisalignedPolicy};
+use cpu_rv32::MisalignedPolicy;
 use emu_cli::exit::{
     EXIT_ERROR, EXIT_SECOND_INTERRUPT, EXIT_TEST_FAILURE, REPLAY_EXIT_CODES_HELP,
     RUN_EXIT_CODES_HELP,
@@ -46,7 +46,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a bare-metal RISC-V conformance test ELF (riscv-tests or riscv-arch-test).
+    /// Run a bare-metal RISC-V conformance test ELF (riscv-tests or riscv-arch-test) on the
+    /// conformance bench: an RV32IMC hart with machine and user modes and a 16-entry PMP.
     Rvtest {
         elf: PathBuf,
         #[arg(long, default_value_t = 50_000_000)]
@@ -992,14 +993,11 @@ fn run_rvtest(
     trace_hash: bool,
     allow_misaligned: bool,
 ) -> ExitCode {
-    let config = HartConfig {
-        misaligned: if allow_misaligned {
-            MisalignedPolicy::Allow
-        } else {
-            MisalignedPolicy::Trap
-        },
-        ..HartConfig::default()
-    };
+    let config = emu_cli::rvtest::bench_hart(if allow_misaligned {
+        MisalignedPolicy::Allow
+    } else {
+        MisalignedPolicy::Trap
+    });
     let machine = std::fs::read(elf)
         .map_err(|e| {
             format!(

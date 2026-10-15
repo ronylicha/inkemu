@@ -14,10 +14,10 @@ anything:
 No other memory-mapped register is silent: it is either modelled or reported by name as unmodelled
 (spec §5.2), and `--strict-mmio` stops on it.
 
-The PMP CSRs (`pmpcfg0` to `pmpcfg3`, `pmpaddr0` to `pmpaddr15`) are accepted without effect too,
-and are not in the table because they are CSRs, not memory-mapped registers: on the ESP32-C3 core
-they are stored with their lock rules and **never enforced** — no access is refused because of them
-(decision D18 of plan SP1b-2). Plan SP1b-4 enforces them (decision E31 of plan SP1b-3a).
+The PMP CSRs (`pmpcfg0` to `pmpcfg3`, `pmpaddr0` to `pmpaddr15`) are not accepted without effect:
+stored with their lock rules since plan SP1b-2 (decision D18), they are enforced since plan
+SP1b-4f, at every fetch, load and store, with the rules of the ESP32-C3 (TRM §1.8; ADR 0010). They
+were never in the table, which lists memory-mapped registers.
 
 The table is generated: the lists live next to each peripheral model (`accepted()` in
 `crates/soc-esp32c3/src/periph/`). A model that is plain storage is built from its list; a model

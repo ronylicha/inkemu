@@ -1,0 +1,65 @@
+Patch to riscv-test-suite/env/arch_test.h of riscv-arch-test 3.10.0 (BSD-3-Clause, RISC-V
+International), applied by tools/conformance/run-arch-test.sh to the copy of the environment that
+both inkemu and Sail compile the tests with, after checking the original's SHA-256
+(cfb0d028baed0fd63e9bf6b8adbbd2a67d2e72b49e58a104659c5b87708f37bc).
+
+Why: the hart under test (the conformance bench, as the ESP32-C3) has machine and user modes and
+no supervisor mode. With rvtest_strap_routine defined, which 40 of the 41 tests of the group pmp32
+declare, the environment saves medeleg before its trap handler is installed and runs an S-mode
+prolog and epilog (sscratch, satp, stvec); on a hart without S-mode these trap outside the code
+segment and the environment loops for ever (report docs/research/esp32c3-pmp-and-user-mode.md
+§5.2, measured on Sail). The patch compiles out the S prolog and epilog and the medeleg accesses.
+It keeps the S handler and save area, whose static pointers the M handler reads when it relocates
+the mepc of a trap from user mode; the S handler never runs, since nothing delegates a trap to S.
+The tests themselves are not touched: their "S-mode" parts run in user mode, MPP = 1 being
+legalised to user by both models. ADR 0010.
+
+--- a/arch_test.h
++++ b/arch_test.h
+@@ -558,7 +558,12 @@
+   \MACRO_NAME M         // actual m-mode prolog/epilog/handler code
+
+         #ifdef rvtest_strap_routine
++      // inkemu: the hart under test has no S-mode. The S prolog is not instantiated (its CSRs do
++      // not exist); the S handler and save area are, for the labels and the static pointers the
++      // M handler reads (nothing delegates a trap to S, so the S handler never runs).
++      .ifnc \MACRO_NAME, RVTEST_TRAP_PROLOG
+       \MACRO_NAME S     // actual s-mode prolog/epilog/handler code
++      .endif
+
+         #ifdef rvtest_vtrap_routine
+           \MACRO_NAME V // actual v-mode prolog/epilog/handler code
+@@ -991,9 +996,7 @@
+         csrrw   T2, CSR_VEDELEG, T2     // special case: VS EDELEG available from Vmode
+ .else
+   .ifc \__MODE__ , M
+-    #ifdef rvtest_strap_routine
+-        csrrw   T2, CSR_XEDELEG, T2     // this handles M  mode save, but only if Smode exists
+-    #endif
++    // inkemu: no S-mode, so no medeleg to save and clear.
+   .else
+ //FIXME: if N-extension or anything like it is implemented, uncomment the following
+ //      csrrw   T2, CSR_XEDELEG, T2     // this handles S mode
+@@ -1745,9 +1748,7 @@
+         csrw    CSR_VEDELEG, T2 //special case: VS EDELEG available from Vmode
+ .else
+   .ifc \__MODE__ , M
+-#ifdef rvtest_strap_routine
+-        csrw    CSR_XEDELEG, T2 //this handles M  mode restore, but only if Smode exists
+-#endif
++// inkemu: no S-mode, so no medeleg to restore.
+   .else
+ //FIXME: if Umode-int-extension or anything like it is implemented, uncomment the following
+ //      csrw    CSR_XEDELEG, T2 //this handles S  mode restore
+@@ -1925,7 +1926,10 @@
+         #ifdef rvtest_vtrap_routine
+           RVTEST_TRAP_EPILOG V  // actual v-mode prolog/epilog/handler code
+         #endif
+-      RVTEST_TRAP_EPILOG S      // actual s-mode prolog/epilog/handler code
++      // inkemu: no S-mode, so no S prolog was run and there is no S epilog to run; only its end
++      // label, which the (never run) S handler names.
++      .global rvtest_Send
++rvtest_Send:
+     #endif
+    RVTEST_TRAP_EPILOG M         // actual m-mode prolog/epilog/handler code
+ #endif

@@ -1,5 +1,5 @@
-//! A single machine-mode RV32IMC hart.
-use crate::csr::{CsrFile, MSTATUS_MIE, MSTATUS_MPIE, VendorCsrs};
+//! A single RV32IMC hart: machine mode, and user mode with a PMP on the cores that have them.
+use crate::csr::{Core, CsrFile, MSTATUS_MIE, MSTATUS_MPIE, Privilege};
 use crate::dcache::DecodeCache;
 use crate::decode::decode;
 use crate::instr::Decoded;
@@ -12,6 +12,7 @@ const MTVEC_VECTORED: u32 = 1;
 const COMPRESSED_MASK: u32 = 0b11;
 /// One 16-bit instruction parcel.
 const PARCEL_MASK: u32 = 0xffff;
+const PARCEL_BYTES: u32 = 2;
 /// Bytes between two entries of a vectored trap table (one `jal`/`j` per entry).
 const VECTOR_ENTRY_BYTES: u32 = 4;
 
@@ -46,8 +47,8 @@ pub enum InterruptModel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct HartConfig {
     pub misaligned: MisalignedPolicy,
-    /// Which vendor's CSRs the hart implements besides the machine-mode ones.
-    pub vendor_csrs: VendorCsrs,
+    /// The core the hart models: its privilege modes, its PMP, its vendor's CSRs.
+    pub core: Core,
     /// Where interrupts come from: `mip` and `mie` (the default), or a line presented by a
     /// controller outside the hart ([`Hart::set_external_interrupt`]).
     pub interrupts: InterruptModel,
@@ -73,6 +74,8 @@ pub struct Hart {
     pub cycles: Cycles,
     pub instret: u64,
     pub config: HartConfig,
+    /// The mode the hart executes in ([`Hart::privilege`]).
+    pub(crate) privilege: Privilege,
     pub(crate) waiting: bool,
     /// The line an outside controller presents ([`InterruptModel::Controller`]).
     pub(crate) external: Option<u32>,
@@ -98,10 +101,11 @@ impl Hart {
         Hart {
             x: [0; 32],
             pc: reset_pc,
-            csr: CsrFile::new(config.vendor_csrs),
+            csr: CsrFile::new(config.core),
             cycles: Cycles::ZERO,
             instret: 0,
             config,
+            privilege: Privilege::Machine,
             waiting: false,
             external: None,
             dcache: DecodeCache::new(),
@@ -109,8 +113,10 @@ impl Hart {
         }
     }
 
-    /// Resets the hart: registers, CSRs (the PMP entries and their lock bits with them) and
-    /// decoded instructions are those of a new hart about to execute `reset_pc`. The cycle and
+    /// Resets the hart: registers, CSRs (the PMP entries and their lock bits with them), the mode
+    /// (machine) and decoded instructions are those of a new hart about to execute `reset_pc`; a
+    /// reset is the only way to clear a lock bit (TRM §1.8.3: "it can only be cleared through CPU
+    /// reset"). The cycle and
     /// instruction totals ([`Hart::cycles`], [`Hart::instret`]) are measures of the run, not
     /// state of the core: they go on. The decode cache is rebuilt, so its statistics
     /// ([`Hart::decode_cache_stats`]) restart at zero too.
@@ -131,8 +137,9 @@ impl Hart {
     pub fn reset(&mut self, reset_pc: u32) {
         self.x = [0; 32];
         self.pc = reset_pc;
-        self.csr = CsrFile::new(self.config.vendor_csrs);
+        self.csr = CsrFile::new(self.config.core);
         self.csr.restart_counters(self.cycles, self.instret);
+        self.privilege = Privilege::Machine;
         self.waiting = false;
         self.external = None;
         self.dcache = DecodeCache::new();
@@ -150,6 +157,13 @@ impl Hart {
     #[must_use]
     pub const fn is_waiting(&self) -> bool {
         self.waiting
+    }
+
+    /// The mode the hart executes in: machine mode from a reset and in every trap handler, user
+    /// mode after an `mret` with `MPP` = 0 on a core that has it.
+    #[must_use]
+    pub const fn privilege(&self) -> Privilege {
+        self.privilege
     }
 
     /// `(hits, misses)` of the decoded-instruction cache, for performance reporting.
@@ -193,9 +207,10 @@ impl Hart {
             // presents (the instruction after `wfi` then runs: `InterruptModel::Controller`).
             self.waiting = false;
         }
-        if self.csr.mstatus & MSTATUS_MIE != 0
-            && let Some(line) = pending
-        {
+        // A machine interrupt is always enabled below machine mode, whatever `mstatus.MIE` says
+        // (privileged specification, "Machine Status Register").
+        let enabled = self.privilege == Privilege::User || self.csr.mstatus & MSTATUS_MIE != 0;
+        if enabled && let Some(line) = pending {
             self.enter_trap(MCAUSE_INTERRUPT | line, 0);
             return Boundary::Interrupted { cause: line };
         }
@@ -238,9 +253,15 @@ impl Hart {
         }
     }
 
-    /// Serves the instruction at `pc` from the decode cache or the bus; a hit still pays the fetch timing.
+    /// Serves the instruction at `pc` from the decode cache or the bus; a hit still pays the fetch
+    /// timing, and is still checked by the PMP parcel by parcel: the cache holds decodings, not
+    /// permissions, so a write to the PMP takes effect at the next fetch without invalidating it.
     fn fetch_decoded(&mut self, bus: &mut dyn Bus) -> Result<(Decoded, u32), Trap> {
         if let Some(decoded) = self.dcache.lookup(self.pc, &*bus) {
+            self.check_fetch(self.pc)?;
+            if u32::from(decoded.len) > PARCEL_BYTES {
+                self.check_fetch(self.pc.wrapping_add(PARCEL_BYTES))?;
+            }
             let stall = bus.fetch_stall(self.pc, u32::from(decoded.len));
             return Ok((decoded, stall));
         }
@@ -253,12 +274,15 @@ impl Hart {
     }
 
     /// Fetches one parcel or two, so a 32-bit instruction may straddle a page or region boundary.
-    /// A fault on the second parcel reports that parcel's address in `tval`, as the privileged spec requires.
-    fn fetch(&self, bus: &mut dyn Bus) -> Result<(u32, u32), Trap> {
+    /// A fault on the second parcel reports that parcel's address in `tval`, as the privileged spec
+    /// requires; the PMP checks each parcel before the bus is read, as Sail does (report
+    /// `docs/research/esp32c3-pmp-and-user-mode.md` §4, §6).
+    fn fetch(&mut self, bus: &mut dyn Bus) -> Result<(u32, u32), Trap> {
         let fault = |addr: u32| Trap {
             cause: Exception::InstrAccessFault,
             tval: addr,
         };
+        self.check_fetch(self.pc)?;
         let lo = bus
             .read(self.pc, AccessSize::Half, AccessKind::Fetch)
             .map_err(|_| fault(self.pc))?;
@@ -267,7 +291,8 @@ impl Hart {
         if lo_parcel & COMPRESSED_MASK != COMPRESSED_MASK {
             return Ok((lo_parcel, lo.stall));
         }
-        let hi_addr = self.pc.wrapping_add(2);
+        let hi_addr = self.pc.wrapping_add(PARCEL_BYTES);
+        self.check_fetch(hi_addr)?;
         let hi = bus
             .read(hi_addr, AccessSize::Half, AccessKind::Fetch)
             .map_err(|_| fault(hi_addr))?;
@@ -275,6 +300,21 @@ impl Hart {
             lo_parcel | ((hi.value & PARCEL_MASK) << 16),
             lo.stall + hi.stall,
         ))
+    }
+
+    /// The PMP's verdict on fetching the parcel at `addr` in the current mode.
+    fn check_fetch(&mut self, addr: u32) -> Result<(), Trap> {
+        if self
+            .csr
+            .pmp_allows(addr, PARCEL_BYTES, AccessKind::Fetch, self.privilege)
+        {
+            Ok(())
+        } else {
+            Err(Trap {
+                cause: Exception::InstrAccessFault,
+                tval: addr,
+            })
+        }
     }
 
     fn trap(&mut self, trap: Trap, cycles: u32) -> StepOutcome {
@@ -293,7 +333,9 @@ impl Hart {
         if mie_was_set {
             csr.mstatus |= MSTATUS_MPIE;
         }
-        csr.save_privilege_on_trap();
+        // Every trap is taken in machine mode: nothing delegates one to another mode.
+        csr.save_privilege_on_trap(self.privilege);
+        self.privilege = Privilege::Machine;
         let base = csr.mtvec & !MTVEC_MODE_MASK;
         let vectored =
             csr.mtvec & MTVEC_MODE_MASK == MTVEC_VECTORED && mcause & MCAUSE_INTERRUPT != 0;
@@ -304,8 +346,8 @@ impl Hart {
         };
     }
 
-    /// `mret`: restores `MIE` from `MPIE`, sets `MPIE`, sets `MPP` to the least privileged mode
-    /// of the core, and returns the address to resume at.
+    /// `mret`: restores `MIE` from `MPIE`, sets `MPIE`, goes on in the mode `MPP` held, sets `MPP`
+    /// to the least privileged mode of the core, and returns the address to resume at.
     ///
     /// ASSUMPTION: `mret` sets `MPIE`, the rule of the RISC-V privileged specification (and what
     /// QEMU does). The ESP32-C3 TRM says `MPIE` is cleared (report IR §2.3, §7 question 6). The
@@ -316,7 +358,7 @@ impl Hart {
         let mpie = csr.mstatus & MSTATUS_MPIE != 0;
         csr.mstatus =
             (csr.mstatus & !MSTATUS_MIE) | MSTATUS_MPIE | if mpie { MSTATUS_MIE } else { 0 };
-        csr.return_privilege();
+        self.privilege = csr.return_privilege();
         csr.mepc
     }
 }
@@ -1066,7 +1108,7 @@ mod tests {
                 .unwrap();
         }
         let config = HartConfig {
-            vendor_csrs: VendorCsrs::Esp32C3,
+            core: Core::Esp32C3,
             ..HartConfig::default()
         };
         (Hart::new(0, config), ram)
@@ -1121,7 +1163,7 @@ mod tests {
     fn controller_machine(program: &[u32]) -> (Hart, Ram) {
         let (_, ram) = c3_machine(program);
         let config = HartConfig {
-            vendor_csrs: VendorCsrs::Esp32C3,
+            core: Core::Esp32C3,
             interrupts: InterruptModel::Controller,
             ..HartConfig::default()
         };
@@ -1337,6 +1379,246 @@ mod tests {
         assert!(
             matches!(outcome[0], StepOutcome::Trapped { trap, .. } if trap.cause == Exception::IllegalInstr)
         );
+    }
+
+    use crate::pmp::{PMPADDR0, PMPCFG0};
+    /// `mstatus.TW` (TRM register 1.5).
+    const MSTATUS_TW: u32 = 1 << 21;
+    const USER_CODE: u32 = 0x40;
+    const C3_TRAP_VECTOR: u32 = 0x100;
+    /// `pmpcfg` byte: NAPOT, R, W, X, unlocked.
+    const NAPOT_RWX: u32 = 0x1F;
+
+    /// An ESP32-C3 hart about to `mret` into user mode at [`USER_CODE`], with an entry that
+    /// grants user mode the whole address space and its trap vector at [`C3_TRAP_VECTOR`].
+    fn c3_user(user_code: &[u32]) -> (Hart, Ram) {
+        let mut program = vec![mret()];
+        program.resize((USER_CODE / 4) as usize, addi(0, 0, 0));
+        program.extend_from_slice(user_code);
+        let (mut h, ram) = c3_machine(&program);
+        assert!(h.csr.write(MTVEC, C3_TRAP_VECTOR));
+        assert!(h.csr.write(MEPC, USER_CODE));
+        assert!(h.csr.write(PMPADDR0, u32::MAX));
+        assert!(h.csr.write(PMPCFG0, NAPOT_RWX));
+        (h, ram)
+    }
+
+    fn trapped(outcome: StepOutcome) -> Trap {
+        match outcome {
+            StepOutcome::Trapped { trap, .. } => trap,
+            other => panic!("expected a trap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mret_with_mpp_0_enters_user_mode_where_a_machine_csr_is_an_illegal_instruction() {
+        let (mut h, mut m) = c3_user(&[csrrs(6, MSTATUS, 0)]);
+        assert_eq!(
+            h.privilege(),
+            Privilege::Machine,
+            "a reset starts in machine mode"
+        );
+        run(&mut h, &mut m, 1);
+        assert_eq!((h.privilege(), h.pc), (Privilege::User, USER_CODE));
+        let trap = trapped(h.step(&mut m, &OneCycle));
+        assert_eq!(trap.cause, Exception::IllegalInstr);
+        assert_eq!(trap.tval, csrrs(6, MSTATUS, 0));
+        assert_eq!(h.x[6], 0, "nothing was read");
+        assert_eq!(h.privilege(), Privilege::Machine);
+        assert_eq!((h.pc, h.csr.mepc), (C3_TRAP_VECTOR, USER_CODE));
+        assert_eq!(
+            h.csr.mstatus & MSTATUS_MPP_M,
+            0,
+            "MPP says the trap came from user mode"
+        );
+    }
+
+    #[test]
+    fn ecall_in_user_mode_is_cause_8_and_a_user_csr_is_reachable() {
+        let (mut h, mut m) = c3_user(&[csrrwi(0, PCER_USER, 1), ecall()]);
+        run(&mut h, &mut m, 2);
+        let trap = trapped(h.step(&mut m, &OneCycle));
+        assert_eq!(trap.cause, Exception::EcallU);
+        assert_eq!(h.csr.mcause, 8);
+        assert_eq!(h.csr.read(PCER_USER, h.cycles, h.instret), Some(1));
+    }
+
+    #[test]
+    fn mret_in_user_mode_is_an_illegal_instruction() {
+        let (mut h, mut m) = c3_user(&[mret()]);
+        run(&mut h, &mut m, 1);
+        let trap = trapped(h.step(&mut m, &OneCycle));
+        assert_eq!((trap.cause, trap.tval), (Exception::IllegalInstr, mret()));
+    }
+
+    #[test]
+    fn wfi_in_user_mode_waits_unless_tw_makes_it_an_illegal_instruction() {
+        let (mut h, mut m) = c3_user(&[wfi()]);
+        run(&mut h, &mut m, 2);
+        assert!(h.is_waiting(), "TW clear");
+        let (mut h, mut m) = c3_user(&[wfi()]);
+        assert!(h.csr.write(MSTATUS, MSTATUS_TW));
+        run(&mut h, &mut m, 1);
+        let trap = trapped(h.step(&mut m, &OneCycle));
+        assert_eq!((trap.cause, trap.tval), (Exception::IllegalInstr, wfi()));
+    }
+
+    #[test]
+    fn a_line_is_taken_in_user_mode_whatever_mstatus_mie_says() {
+        let mut program = vec![mret()];
+        program.resize((USER_CODE / 4) as usize, addi(0, 0, 0));
+        program.extend([addi(1, 0, 1), addi(1, 1, 1)]);
+        let (mut h, mut m) = controller_machine(&program);
+        assert!(h.csr.write(MTVEC, C3_TRAP_VECTOR));
+        assert!(h.csr.write(MEPC, USER_CODE));
+        assert!(h.csr.write(PMPADDR0, u32::MAX));
+        assert!(h.csr.write(PMPCFG0, NAPOT_RWX));
+        run(&mut h, &mut m, 2);
+        assert_eq!(h.csr.mstatus & MSTATUS_MIE, 0, "MPIE was clear at the mret");
+        h.set_external_interrupt(Some(3));
+        assert_eq!(
+            h.step(&mut m, &OneCycle),
+            StepOutcome::Interrupted { cause: 3 }
+        );
+        assert_eq!(h.privilege(), Privilege::Machine);
+        assert_eq!(h.csr.mstatus & MSTATUS_MPP_M, 0);
+        assert_eq!(h.x[1], 1);
+    }
+
+    #[test]
+    fn user_mode_cannot_fetch_where_no_entry_grants_it() {
+        let (mut h, mut m) = c3_user(&[addi(1, 0, 1)]);
+        assert!(h.csr.write(PMPCFG0, 0));
+        run(&mut h, &mut m, 1);
+        let trap = trapped(h.step(&mut m, &OneCycle));
+        assert_eq!(
+            (trap.cause, trap.tval),
+            (Exception::InstrAccessFault, USER_CODE)
+        );
+        assert_eq!(h.x[1], 0);
+        assert_eq!(h.last_instruction(), None, "nothing was fetched");
+    }
+
+    #[test]
+    fn a_locked_entry_refuses_a_store_of_machine_mode_and_the_memory_keeps_its_value() {
+        // [0x800, 0x1000) read-only for every mode; the program below it runs unchecked.
+        let (mut h, mut m) = c3_machine(&[
+            addi(5, 0, 0x7FF),
+            addi(5, 5, 1),
+            addi(6, 0, 0x55),
+            sw(6, 5, 0),
+            lw(7, 5, 0),
+        ]);
+        assert!(h.csr.write(MTVEC, C3_TRAP_VECTOR));
+        m.write(0x800, AccessSize::Word, 0x1234).unwrap();
+        assert!(h.csr.write(PMPADDR0, 0x800 >> 2));
+        assert!(h.csr.write(PMPADDR0 + 1, 0x1000 >> 2));
+        assert!(h.csr.write(PMPCFG0, (0x80 | 0x08 | 0x01) << 8));
+        run(&mut h, &mut m, 3);
+        let trap = trapped(h.step(&mut m, &OneCycle));
+        assert_eq!(
+            (trap.cause, trap.tval),
+            (Exception::StoreAccessFault, 0x800)
+        );
+        assert_eq!(h.csr.mcause, 7);
+        h.pc = 16;
+        run(&mut h, &mut m, 1);
+        assert_eq!(
+            h.x[7], 0x1234,
+            "the load is granted, the store wrote nothing"
+        );
+    }
+
+    #[test]
+    fn a_cached_decoding_does_not_bypass_a_pmp_written_after_it() {
+        let (mut h, mut m) = c3_machine(&[addi(1, 1, 1)]);
+        assert!(h.csr.write(MTVEC, C3_TRAP_VECTOR));
+        run(&mut h, &mut m, 1);
+        h.pc = 0;
+        run(&mut h, &mut m, 1);
+        assert_eq!(h.x[1], 2);
+        let (hits, _) = h.decode_cache_stats();
+        assert!(hits > 0, "the instruction is cached");
+        // Lock the word at 0 without X: machine mode may no longer fetch it.
+        assert!(h.csr.write(PMPCFG0, 0x80 | 0x10 | 0x01));
+        h.pc = 0;
+        let trap = trapped(h.step(&mut m, &OneCycle));
+        assert_eq!((trap.cause, trap.tval), (Exception::InstrAccessFault, 0));
+        assert_eq!(h.x[1], 2);
+    }
+
+    #[test]
+    fn the_second_parcel_of_an_instruction_is_checked_on_its_own_cached_or_not() {
+        // `c.nop` at 0, a 32-bit `addi` at 2 whose second parcel is the word at 4, which a
+        // locked NA4 entry keeps machine mode from fetching.
+        let mut ram = Ram::new(0, 0x1000);
+        let mut bytes = vec![0x01, 0x00];
+        bytes.extend(addi(1, 1, 1).to_le_bytes());
+        ram.load(0, &bytes).unwrap();
+        let mut h = Hart::new(
+            2,
+            HartConfig {
+                core: Core::Esp32C3,
+                ..HartConfig::default()
+            },
+        );
+        assert!(h.csr.write(MTVEC, C3_TRAP_VECTOR));
+        run(&mut h, &mut ram, 1);
+        assert_eq!(h.x[1], 1, "decoded and cached before the PMP changes");
+        assert!(h.csr.write(PMPADDR0, 1));
+        assert!(h.csr.write(PMPCFG0, 0x80 | 0x10 | 0x01));
+        h.pc = 2;
+        let trap = trapped(h.step(&mut ram, &OneCycle));
+        assert_eq!(
+            (trap.cause, trap.tval),
+            (Exception::InstrAccessFault, 4),
+            "cached"
+        );
+        let mut fresh = Hart::new(2, h.config);
+        assert!(fresh.csr.write(MTVEC, C3_TRAP_VECTOR));
+        assert!(fresh.csr.write(PMPADDR0, 1));
+        assert!(fresh.csr.write(PMPCFG0, 0x80 | 0x10 | 0x01));
+        let trap = trapped(fresh.step(&mut ram, &OneCycle));
+        assert_eq!(
+            (trap.cause, trap.tval),
+            (Exception::InstrAccessFault, 4),
+            "not cached"
+        );
+    }
+
+    #[test]
+    fn on_the_bench_mprv_checks_a_load_of_machine_mode_as_mpps_mode() {
+        let mut ram = Ram::new(0, 0x1000);
+        ram.load(0, &lw(7, 0, 0x400).to_le_bytes()).unwrap();
+        let mut h = Hart::new(
+            0,
+            HartConfig {
+                core: Core::MachineUser,
+                ..HartConfig::default()
+            },
+        );
+        assert!(h.csr.write(MTVEC, TRAP_VECTOR));
+        // MPRV with MPP = user: the load is a user-mode access, and no entry grants it.
+        assert!(h.csr.write(MSTATUS, 1 << 17));
+        let trap = trapped(h.step(&mut ram, &OneCycle));
+        assert_eq!((trap.cause, trap.tval), (Exception::LoadAccessFault, 0x400));
+        // MPRV with MPP = machine: machine mode, which no entry restricts.
+        h.pc = 0;
+        assert!(h.csr.write(MSTATUS, (1 << 17) | MSTATUS_MPP_M));
+        assert!(matches!(
+            h.step(&mut ram, &OneCycle),
+            StepOutcome::Retired { .. }
+        ));
+    }
+
+    #[test]
+    fn a_reset_puts_the_hart_back_in_machine_mode() {
+        let (mut h, mut m) = c3_user(&[addi(1, 0, 1)]);
+        run(&mut h, &mut m, 1);
+        assert_eq!(h.privilege(), Privilege::User);
+        h.reset(0);
+        assert_eq!(h.privilege(), Privilege::Machine);
+        assert_eq!(h.csr.read(PMPCFG0, h.cycles, h.instret), Some(0));
     }
 
     #[test]

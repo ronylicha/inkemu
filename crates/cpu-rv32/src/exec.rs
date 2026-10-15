@@ -1,4 +1,5 @@
 //! Semantics of each decoded instruction.
+use crate::csr::Privilege;
 use crate::hart::{Hart, MisalignedPolicy};
 use crate::instr::{AluOp, BranchOp, CsrOp, Decoded, Instr, LoadOp, MulOp, Reg, StoreOp};
 use crate::trap::{Exception, Trap};
@@ -121,24 +122,40 @@ impl Hart {
                 done(InstrClass::Csr, next)
             }
             Instr::Fence | Instr::FenceI => done(InstrClass::System, next),
-            Instr::Ecall => {
-                return Err(trap(Exception::EcallM, 0));
+            Instr::Ecall | Instr::Ebreak | Instr::Mret | Instr::Wfi => {
+                return self.exec_privileged(d, next);
             }
-            Instr::Ebreak => {
-                return Err(trap(Exception::Breakpoint, self.pc));
-            }
-            Instr::Mret => {
-                let target = self.return_from_trap();
-                done(InstrClass::System, target)
-            }
-            Instr::Wfi => Done {
-                wait: true,
-                ..done(InstrClass::System, next)
-            },
             Instr::Illegal(raw) => {
                 return Err(trap(Exception::IllegalInstr, raw));
             }
         })
+    }
+
+    /// `ecall`, `ebreak`, `mret` and `wfi`: what they do depends on the mode the hart is in.
+    fn exec_privileged(&mut self, d: Decoded, next: u32) -> Result<Done, Trap> {
+        let user = self.privilege == Privilege::User;
+        match d.instr {
+            Instr::Ecall if user => Err(trap(Exception::EcallU, 0)),
+            Instr::Ecall => Err(trap(Exception::EcallM, 0)),
+            Instr::Ebreak => Err(trap(Exception::Breakpoint, self.pc)),
+            // `mret` belongs to machine mode (privileged specification); TRM register 1.5 for
+            // `wfi`: "If this bit is set, executing WFI instruction in User mode will cause
+            // illegal instruction exception."
+            Instr::Mret if user => Err(trap(Exception::IllegalInstr, d.raw)),
+            Instr::Wfi if user && self.csr.user_wfi_traps() => {
+                Err(trap(Exception::IllegalInstr, d.raw))
+            }
+            Instr::Mret => {
+                let target = self.return_from_trap();
+                Ok(Done::simple(InstrClass::System, target))
+            }
+            Instr::Wfi => Ok(Done {
+                wait: true,
+                ..Done::simple(InstrClass::System, next)
+            }),
+            // INVARIANT: `execute` sends only the four instructions above here.
+            _ => Err(trap(Exception::IllegalInstr, d.raw)),
+        }
     }
 
     fn exec_load(
@@ -155,10 +172,12 @@ impl Hart {
             LoadOp::W => AccessSize::Word,
         };
         self.check_alignment(addr, size, Exception::LoadMisaligned)?;
-        let out = bus.read(addr, size, AccessKind::Load).map_err(|_| Trap {
+        let fault = Trap {
             cause: Exception::LoadAccessFault,
             tval: addr,
-        })?;
+        };
+        self.check_data(addr, size, AccessKind::Load, fault)?;
+        let out = bus.read(addr, size, AccessKind::Load).map_err(|_| fault)?;
         // The bus contract already guarantees a right-aligned, zero-extended value; masking here
         // keeps a peripheral that returns its whole register word from leaking upper bits into rd.
         let value = match op {
@@ -189,14 +208,34 @@ impl Hart {
             StoreOp::W => AccessSize::Word,
         };
         self.check_alignment(addr, size, Exception::StoreMisaligned)?;
-        let stall = bus.write(addr, size, value).map_err(|_| Trap {
+        let fault = Trap {
             cause: Exception::StoreAccessFault,
             tval: addr,
-        })?;
+        };
+        self.check_data(addr, size, AccessKind::Store, fault)?;
+        let stall = bus.write(addr, size, value).map_err(|_| fault)?;
         Ok(Done {
             stall,
             ..Done::simple(InstrClass::Store, next_pc)
         })
+    }
+
+    /// The PMP's verdict on a load or a store: checked in the mode `MPRV` gives, after the
+    /// alignment (an address-misaligned exception comes before an access fault) and before the
+    /// bus is touched, so a refused store writes nothing.
+    fn check_data(
+        &mut self,
+        addr: u32,
+        size: AccessSize,
+        kind: AccessKind,
+        fault: Trap,
+    ) -> Result<(), Trap> {
+        let privilege = self.csr.data_privilege(self.privilege);
+        if self.csr.pmp_allows(addr, size.bytes(), kind, privilege) {
+            Ok(())
+        } else {
+            Err(fault)
+        }
     }
 
     fn check_alignment(&self, addr: u32, size: AccessSize, cause: Exception) -> Result<(), Trap> {
@@ -221,6 +260,10 @@ impl Hart {
             tval: d.raw,
         };
         let operand = if uimm { u32::from(src) } else { self.r(src) };
+        // A CSR above the current mode does not exist for the instruction: it reads nothing.
+        if !self.csr.accessible(csr, self.privilege) {
+            return Err(illegal);
+        }
         // `csrrw` to x0 only writes (the specification: "shall not read the CSR"); every other
         // form reads.
         if op != CsrOp::Rw || rd != 0 {

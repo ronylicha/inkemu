@@ -339,6 +339,11 @@ hors du modèle (SP1b-4f) : un `mret` vers le mode utilisateur continue en mode 
 firmware mesuré ne fait. Les empreintes de trace épinglées n'ont pas changé (la suite des PC est la
 même). Le numéro 1 n'est pas repris.
 
+**Révision du 2026-10-15 (SP1b-4f, ADR 0010).** Le mode utilisateur est modélisé : un `mret` avec
+`MPP` = 0 y entre, et un CSR machine, `mret`, `wfi` sous `TW` y sont des instructions illégales.
+Aucune fenêtre n'y entre (ni la ROM, ni le bootloader, ni ESP-IDF : rapport
+`docs/research/esp32c3-boot-chain.md`, « Privilege ») ; aucune ligne n'est ajoutée.
+
 ### Ligne 2 — `mie` au reset
 
 La matrice de QEMU précharge `mie` à `0x0EEE` au reset (`target/riscv/esp_cpu.c`, commentaire de
@@ -980,6 +985,20 @@ csr gardé au reset 0x3A2 bits gardés 0x07070707 masque 0x07000507
 csr gardé au reset 0x3A3 bits gardés 0x07070707 masque 0x00000300
 ```
 
+**Révision du 2026-10-15 (SP1b-4f, ADR 0010 ; `docs/research/esp32c3-pmp-and-user-mode.md` §3,
+§8).** inkemu fait désormais respecter la PMP ; la phrase « inkemu ne fait pas respecter la PMP »
+ci-dessus ne vaut plus. La ligne reste vraie et inchangée : les bits R, W, X que QEMU garde sont ceux
+d'entrées dont A et L sont effacés, donc éteintes ; une entrée éteinte ne protège rien, ni chez QEMU
+ni chez inkemu, et le mode machine n'est contrôlé que par des entrées verrouillées. La copie ne
+change toujours que le registre destination. Mesure, paramètres et usages inchangés.
+
+Deux différences de règles entre la PMP de QEMU (la spécification) et celle d'inkemu (le TRM de
+l'ESP32-C3) ne font pas de ligne, faute de fenêtre qui les exerce : la priorité statique (QEMU
+laisse décider l'entrée de plus petit numéro, la puce accorde l'accès si une entrée qui le contient
+l'autorise) et le TOR vide (QEMU lui donne l'adresse 0). ESP-IDF pose 16 entrées TOR contiguës et
+sans chevauchement, sur lesquelles les deux règles donnent le même verdict pour tout accès ; si un
+firmware chevauchait des entrées, la première divergence serait comparée comme les autres.
+
 ### Ligne 27 — après `esp_restart`, ou un reset de module que QEMU ignore
 
 Après le reset, la ROM, le bootloader et l'application relisent des registres que la première vie a
@@ -1354,7 +1373,8 @@ seulement.
 
 - Les CSR que QEMU n'imprime pas ou qu'inkemu n'a pas sous ce nom : PMP, `mcountinhibit`, `mpcer`,
   `mpcmr`, sinon à travers leurs lectures dans un registre (ligne 26 pour la PMP). Un rangement n'est
-  comparé qu'à travers les chargements qui le relisent.
+  comparé qu'à travers les chargements qui le relisent. Ce que la PMP refuse (depuis SP1b-4f) se voit,
+  lui, des deux côtés : un piège, son `mepc` et son `mcause` au premier bloc du gestionnaire.
 - Un bloc qu'une interruption a préempté (ci-dessous) : l'état qu'il porte est comparé au premier
   bloc du gestionnaire, `mepc` et `mcause` compris.
 - Ce que les copies de valeurs et les réglages remplacent (moniteur de pile, changement d'horloge,

@@ -12,8 +12,8 @@ use crate::periph::UsbHost;
 use crate::reset::ResetCause;
 use crate::rom::RomImage;
 use cpu_rv32::{
-    Boundary, DatasheetTiming, Decoded, Exception, Hart, HartConfig, InterruptModel,
-    MisalignedPolicy, QemuIcountTiming, StepOutcome, Trap, VendorCsrs,
+    Boundary, Core, DatasheetTiming, Decoded, Exception, Hart, HartConfig, InterruptModel,
+    MisalignedPolicy, QemuIcountTiming, StepOutcome, Trap,
 };
 use emu_core::{Cycles, Frequency, TimingModel, TraceHash};
 
@@ -359,7 +359,7 @@ impl Esp32C3 {
         // silicon trace or the SP1b-4 lockstep settles it.
         let hart_config = HartConfig {
             misaligned: MisalignedPolicy::Allow,
-            vendor_csrs: VendorCsrs::Esp32C3,
+            core: Core::Esp32C3,
             interrupts: InterruptModel::Controller,
         };
         let mut bus = SocBus::new(rom, flash, config);
@@ -656,7 +656,7 @@ impl Esp32C3 {
         let outcome = self.hart.step(&mut self.bus, self.pricing.model());
         if let StepOutcome::Trapped { trap, .. } = outcome
             // An `ecall` is a request to the trap handler, not a fault worth reporting.
-            && trap.cause != Exception::EcallM
+            && !trap.cause.is_environment_call()
         {
             self.bus.ctx.diag.record(Diagnostic::Exception {
                 cause: trap.cause,
