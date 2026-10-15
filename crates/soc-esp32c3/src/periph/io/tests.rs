@@ -471,6 +471,55 @@ fn a_transfer_reaches_the_selected_chip_with_its_dc_and_its_answer_comes_back() 
     );
 }
 
+/// A key of the board (input 0) that the chip on the bus answers with: 1 pressed, 0 released.
+#[derive(Debug, Default)]
+struct KeyOnTheBus {
+    pressed: bool,
+}
+
+impl BoardInputs for KeyOnTheBus {
+    fn check(&self, _input: BoardInput) -> Result<(), emu_core::BoardInputError> {
+        Ok(())
+    }
+
+    fn apply(&mut self, input: BoardInput, _at: Nanos) {
+        self.pressed = input.value == 1;
+    }
+}
+
+impl SpiTarget for KeyOnTheBus {
+    fn select(&mut self, _selected: bool, _at: Nanos) {}
+
+    fn transfer(&mut self, _dc: Option<Level>, _mosi: &[u8], miso: &mut [u8], _at: Nanos) {
+        miso.fill(u8::from(self.pressed));
+    }
+}
+
+/// E1, its branch of the bus: an input of the board that acts at the very instant a transfer
+/// ends is seen by the chip, though its own event has not run yet (a live run arms the two in
+/// another order than its replay).
+#[test]
+fn a_transfer_at_the_instant_a_board_input_acts_sees_it() {
+    let ctx = &mut Ctx::default();
+    let mut io = IoMatrix::new(0x8);
+    x4_bus(&mut io, ctx);
+    let key = Rc::new(RefCell::new(KeyOnTheBus::default()));
+    io.attach_board_inputs(Box::new(Rc::clone(&key)));
+    io.attach_spi(ctx, DISPLAY, Box::new(Rc::clone(&key)))
+        .unwrap();
+    write(&mut io, ctx, OUT_W1TC, 1 << 21);
+    let pressed = BoardInput {
+        target: 0,
+        value: 1,
+    };
+    io.queue_board_input(ctx, ctx.now(), pressed).unwrap();
+    // The instant it acts at: its event is armed, not run.
+    ctx.advance_time_base(1);
+    assert_eq!(io.board_inputs_pending(), 1);
+    assert_eq!(io.spi_transfer(ctx, &[0]), [1]);
+    assert_eq!(io.board_inputs_pending(), 0);
+}
+
 #[test]
 fn a_chip_whose_clock_or_mosi_pin_carries_no_spi_signal_hears_nothing() {
     let ctx = &mut Ctx::default();

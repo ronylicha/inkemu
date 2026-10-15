@@ -219,7 +219,7 @@ de SP2b.
 | `next_change` | demandé seulement quand `GPIO_PINn.INT_TYPE` ≠ 0 ; en sommeil profond, seules les puces cadencées sont avancées, les broches ne sont pas évaluées | SP2d ajoute l'évaluation des broches de réveil en sommeil et leur `next_change` (2d-D11) |
 | `inputs_changed` | appelle `IoMatrix::settle` | l'application d'une entrée de carte appelle le même `settle` |
 | Conversion de l'ADC | `Calibration::reading` est `pub(crate)` | les tensions des échelles se vérifient par une conversion réelle de la machine (un petit programme qui lance une conversion), sans rien exposer |
-| `PAD_HOLD`, `DIG_PAD_HOLD`, `GPIO_WAKEUP`, `EXT_WAKEUP_CONF`, `DIG_ISO` | stockés sans effet (table de `rtc_cntl/mod.rs`) ; `WAKEUP_ENA` bit 2 est signalé puis ignoré (le sommeil ne se fie qu'au timer) | SP2d leur donne leur effet (2d-D11, 2d-D12) et retire le refus |
+| `PAD_HOLD`, `DIG_PAD_HOLD`, `GPIO_WAKEUP`, `EXT_WAKEUP_CONF`, `DIG_ISO` | stockés sans effet (table de `rtc_cntl/mod.rs`) ; `WAKEUP_ENA` bit 2 est signalé puis ignoré (le sommeil ne se fie qu'au timer) | SP2d donne leur effet à `PAD_HOLD`, `DIG_PAD_HOLD`, `GPIO_WAKEUP` et `EXT_WAKEUP_CONF` (2d-D11, 2d-D12) et retire le refus ; `DIG_ISO` reste accepté sans effet (2d-D12, ADR 0013 point 5) |
 
 **SP2e (carte SD, PR #19, non fusionné).** Sa spec §9 liste ses ajouts aux tâches 0, 4, 9, 11 à 15, 17 et 18 :
 `chips::sdcard::lines::SdLines` (`SpiTarget` d'un `SdSlot`, base 1 GHz), `[wiring.sd] cs = 12, miso = 7`
