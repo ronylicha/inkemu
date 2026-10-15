@@ -13,7 +13,7 @@
 //! zeros. It is written under a temporary name, mode `0600` on Unix, flushed, then renamed.
 use crate::flash_state::temporary_path;
 use crate::term::sanitize;
-use chips::sdcard::MAX_CAPACITY_BYTES;
+use chips::sdcard::{Capacity, MAX_CAPACITY_BYTES};
 use std::fs::OpenOptions;
 use std::io::{Seek as _, SeekFrom, Write as _};
 use std::path::Path;
@@ -147,6 +147,19 @@ impl Fat32Layout {
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.total_sectors * SECTOR
+    }
+
+    /// What the image is, in one line: its size, the kind of card it makes, its volume.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let kind = Capacity::new(self.bytes()).map_or("no", |capacity| capacity.kind().name());
+        format!(
+            "{} MiB {kind} card, FAT32, {} clusters of {} bytes, label {}",
+            self.bytes() / MIB,
+            self.clusters,
+            self.sectors_per_cluster * SECTOR,
+            String::from_utf8_lossy(&self.label).trim_end()
+        )
     }
 
     /// The first sector of the first FAT, from the start of the image.
@@ -454,6 +467,16 @@ mod tests {
         assert_eq!(
             &Fat32Layout::new(64, "my card").unwrap().label,
             b"MY CARD    "
+        );
+        assert_eq!(
+            Fat32Layout::new(64, "my card").unwrap().describe(),
+            "64 MiB SDSC card, FAT32, 114688 clusters of 512 bytes, label MY CARD"
+        );
+        assert!(
+            Fat32Layout::new(4096, DEFAULT_LABEL)
+                .unwrap()
+                .describe()
+                .starts_with("4096 MiB SDHC/SDXC card, FAT32, 1044480 clusters of 4096 bytes")
         );
     }
 

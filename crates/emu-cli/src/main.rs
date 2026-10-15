@@ -191,6 +191,28 @@ enum Command {
         #[command(subcommand)]
         action: RomAction,
     },
+    /// Manage the image files of SD cards.
+    Sd {
+        #[command(subcommand)]
+        action: SdAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SdAction {
+    /// Create a blank SD image: an empty FAT32 volume, which the file takes on disk only as it is
+    /// written. Exit codes: 0 created; 2 refused (size, label, path) or not written.
+    Create {
+        /// Where to create the image; an existing file is never replaced.
+        path: PathBuf,
+        /// The size of the card in MiB, from 64 to 2097024 (up to 2 GiB a standard-capacity
+        /// card, above a high-capacity one).
+        #[arg(long)]
+        size: u64,
+        /// The volume label: up to 11 letters, digits, spaces and FAT's punctuation.
+        #[arg(long, default_value = host::sd_format::DEFAULT_LABEL)]
+        label: String,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -317,6 +339,27 @@ fn main() -> ExitCode {
                     rom_dir,
                 },
         } => run_rom_fetch(device.as_deref(), all, rom_dir),
+        Command::Sd {
+            action: SdAction::Create { path, size, label },
+        } => run_sd_create(&path, size, &label),
+    }
+}
+
+/// `inkemu sd create`: the image, then a line that says what it is.
+fn run_sd_create(path: &Path, mebibytes: u64, label: &str) -> ExitCode {
+    match host::sd_format::create_blank(path, mebibytes, label) {
+        Ok(layout) => {
+            let line = format!(
+                "{}: {}\n",
+                sanitize(&path.display().to_string()),
+                layout.describe()
+            );
+            match print_stdout(&line) {
+                ControlFlow::Continue(()) => ExitCode::SUCCESS,
+                ControlFlow::Break(code) => code,
+            }
+        }
+        Err(e) => fail(&e),
     }
 }
 
