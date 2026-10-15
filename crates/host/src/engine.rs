@@ -614,6 +614,20 @@ impl Engine {
     /// line does, and gives the verdict of a replay or the session of a recorded run.
     #[must_use]
     pub fn end(mut self) -> LifeEnd {
+        let finished = self.finish();
+        LifeEnd {
+            machine: self.machine,
+            end: finished.end,
+            output: finished.output,
+            verdict: finished.verdict,
+            session: finished.session,
+        }
+    }
+
+    /// [`Engine::end`], the machine left in the engine ([`Engine::machine`]): what holds the
+    /// flash stays where a caller that must keep it can read it, whatever fails after. The
+    /// engine is then done: it is not to run again.
+    pub fn finish(&mut self) -> Finished {
         let end = self.end_now();
         let mut output = Output::default();
         self.take_consoles(&mut output, true);
@@ -621,7 +635,8 @@ impl Engine {
         let mut log = Vec::new();
         run::say_where_the_run_stopped(&mut self.machine, None, &mut log);
         output.notices.extend(Notice::from_log(&log));
-        let (verdict, session) = match self.mode {
+        let mode = std::mem::replace(&mut self.mode, Mode::Run { recorder: None });
+        let (verdict, session) = match mode {
             Mode::Replay { session, digests } => {
                 (Some(verdict(&session, &self.machine, end, digests)), None)
             }
@@ -630,14 +645,24 @@ impl Engine {
             } => (None, Some(recorder.finish(&self.machine, end))),
             Mode::Run { recorder: None } => (None, None),
         };
-        LifeEnd {
-            machine: self.machine,
+        Finished {
             end,
             output,
             verdict,
             session,
         }
     }
+}
+
+/// The end of a life without its machine ([`Engine::finish`]).
+#[derive(Debug)]
+pub struct Finished {
+    pub end: RunEnd,
+    pub output: Output,
+    /// The verdict of a replay.
+    pub verdict: Option<Result<Verdict, NoTraceHash>>,
+    /// The session of a recorded run.
+    pub session: Option<Result<Session, RecordError>>,
 }
 
 #[cfg(test)]

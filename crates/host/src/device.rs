@@ -13,7 +13,7 @@
 //! again for the next life, a recorded session is written, a replay gives its verdict.
 use crate::catalog::{self, Look, ProfileRecipe};
 use crate::engine::{
-    Engine, EngineError, Halt, Level, LifeEnd, Limits, MachineStatus, Mode, Notice, Output, State,
+    Engine, EngineError, Halt, Level, Limits, MachineStatus, Mode, Notice, Output, State,
 };
 use crate::flash_state::{FlashStateError, Input, RunFlash, Seed};
 use crate::launch::{self, FlashRequest, RecordPathError, RunRequest, StartError};
@@ -25,7 +25,7 @@ use crate::session_file::{self, Claimed, SessionFileError};
 use crate::term::sanitize;
 use boards::{DeviceProfile, MachineOptions, ProfileError};
 use session::{ProfileText, RomIdentity, Session};
-use soc_esp32c3::{ConsoleChannel, RomImage, UsbHost};
+use soc_esp32c3::{ConsoleChannel, Esp32C3, RomImage, UsbHost};
 use std::io::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -276,17 +276,19 @@ impl FlashKeeper {
     /// Ends a life for its flash: says what it started from and what became of it, writes the
     /// flash file, and keeps the content for the next life. `false` when the file could not be
     /// written: the content is then kept in memory, and written at the end of the next life.
-    fn finish(&mut self, ended: &LifeEnd, log: &mut dyn std::io::Write) -> bool {
+    fn finish(&mut self, machine: &Esp32C3, log: &mut dyn std::io::Write) -> bool {
+        // Released only once written: a panic while writing leaves the file to the rescue.
         let saved = self
             .run_flash
-            .take()
-            .is_none_or(|run_flash| run_flash.finish(&ended.machine, log));
+            .as_ref()
+            .is_none_or(|run_flash| run_flash.finish(machine, log));
+        self.run_flash = None;
         // With a file that holds it, the next life reads it again; otherwise it starts from what
         // this one left.
         self.next = if self.file.is_some() && saved {
             None
         } else {
-            Some(ended.machine.flash_contents())
+            Some(machine.flash_contents())
         };
         saved
     }
@@ -836,8 +838,13 @@ pub struct Emulator {
     device_name: String,
     /// The flash file the run holds, locked, until its thread ends.
     flash_file: Option<PathBuf>,
+    /// Why the thread stopped on an internal error, if it did ([`Worker::rescue`]).
+    fault: Fault,
     thread: Option<JoinHandle<()>>,
 }
+
+/// Why a thread stopped on an internal error: written by its rescue, read by its power-off.
+type Fault = Arc<Mutex<Option<String>>>;
 
 impl std::fmt::Debug for Emulator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -870,6 +877,8 @@ impl Emulator {
         };
         let slot = Arc::clone(&frame);
         let rotation = look.panel.rotation;
+        let fault = Fault::default();
+        let rescued = Arc::clone(&fault);
         // The worker holds machines, which stay on the thread: it is built there (2c-R4).
         let thread = std::thread::Builder::new()
             .name("inkemu-device".to_owned())
@@ -892,6 +901,8 @@ impl Emulator {
                     speed_ratio: None,
                     console: ConsoleBatch::default(),
                     rotation,
+                    powering: None,
+                    fault: rescued,
                 }
                 .serve(&receiver);
             })?;
@@ -905,6 +916,7 @@ impl Emulator {
             console,
             device_name,
             flash_file,
+            fault,
             thread: Some(thread),
         })
     }
@@ -959,8 +971,8 @@ impl Emulator {
     ///
     /// # Errors
     /// [`CommandError::NotKept`] when the last life could not keep its flash file or its session:
-    /// what a closing application tells its user. A thread that had already stopped (after an
-    /// internal error, which it said) gives no error.
+    /// what a closing application tells its user; also when the thread stopped on an internal
+    /// error (a panic), before or during this power-off, with that error first.
     pub fn shutdown(mut self) -> Result<(), CommandError> {
         self.stop_and_join()
     }
@@ -971,9 +983,17 @@ impl Emulator {
         };
         let stopped = self.command(Command::Stop);
         let _ = thread.join();
-        match stopped {
-            Err(CommandError::Stopped) => Ok(()),
-            other => other,
+        // A thread that stopped on an internal error, before this command or while doing it,
+        // says so: its last life did not end as a power-off ends one.
+        let fault = self
+            .fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        match (stopped, fault) {
+            (_, Some(fault)) => Err(CommandError::NotKept(fault)),
+            (Err(CommandError::Stopped), None) => Ok(()),
+            (other, None) => other,
         }
     }
 }
@@ -1009,6 +1029,10 @@ struct Worker {
     console: ConsoleBatch,
     /// How the panel is mounted, for a capture.
     rotation: crate::ports::Rotation,
+    /// The content of a power-on under way, until its machine holds it: a panic meanwhile
+    /// leaves it to the rescue.
+    powering: Option<Vec<u8>>,
+    fault: Fault,
 }
 
 impl Worker {
@@ -1095,42 +1119,62 @@ impl Worker {
     /// dropped.
     fn rescue(&mut self, panic: &(dyn std::any::Any + Send)) {
         let mut log = Vec::new();
-        // The flash first: telling the observer may panic again.
-        if let Some(engine) = self.engine.take() {
-            let content = catch_unwind(AssertUnwindSafe(|| engine.machine().flash_contents()));
-            match (content, &mut self.plan) {
-                (Ok(content), Plan::Run { flash, .. }) => {
-                    let _ = catch_unwind(AssertUnwindSafe(|| flash.rescue(content, &mut log)));
-                }
-                (Err(_), Plan::Run { .. }) => {
-                    let _ = writeln!(
-                        log,
-                        "error: the flash of the device could not be read after the internal error: what the last life wrote to it is lost"
-                    );
-                }
-                (_, Plan::Replay { .. }) => {}
+        // The flash first: telling the observer may panic again. A life that ended before the
+        // panic left none to keep; a power-on that did not finish leaves the content it was
+        // given.
+        let content = match self.engine.take() {
+            Some(engine) => {
+                let content = catch_unwind(AssertUnwindSafe(|| engine.machine().flash_contents()))
+                    .map_err(drop);
+                // A machine whose drop panics must not keep the interface from hearing of it.
+                let _ = catch_unwind(AssertUnwindSafe(move || drop(engine)));
+                Some(content)
             }
-            // A machine whose drop panics must not keep the interface from hearing of it.
-            let _ = catch_unwind(AssertUnwindSafe(move || drop(engine)));
+            None => self.powering.take().map(Ok),
+        };
+        match (content, &mut self.plan) {
+            (Some(Ok(content)), Plan::Run { flash, .. }) => {
+                let _ = catch_unwind(AssertUnwindSafe(|| flash.rescue(content, &mut log)));
+            }
+            (Some(Err(())), Plan::Run { .. }) => {
+                let _ = writeln!(
+                    log,
+                    "error: the flash of the device could not be read after the internal error: what the last life wrote to it is lost"
+                );
+            }
+            _ => {}
         }
         let text = panic
             .downcast_ref::<&str>()
             .map(|text| (*text).to_owned())
             .or_else(|| panic.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "no message".to_owned());
+        let said = format!(
+            "error: the emulator stopped on an internal error: {}",
+            sanitize(&text)
+        );
+        let notices = Notice::from_log(&log);
+        // What a power-off answers from now on: the life did not end as it should, whatever
+        // the rescue kept (its session, its last console text are lost).
+        let fault = std::iter::once(said.clone())
+            .chain(
+                notices
+                    .iter()
+                    .filter(|notice| notice.level == Level::Error)
+                    .map(|notice| notice.text.clone()),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        *self.fault.lock().unwrap_or_else(PoisonError::into_inner) = Some(fault);
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            self.notice(
-                Level::Error,
-                format!(
-                    "error: the emulator stopped on an internal error: {}",
-                    sanitize(&text)
-                ),
-            );
-            for notice in Notice::from_log(&log) {
+            self.notice(Level::Error, said);
+            for notice in notices {
                 self.tell(Update::Notice(notice));
             }
-            self.tell(Update::Stopped);
         }));
+        // On its own, nothing before it: an observer that panics on a notice or on console text
+        // still hears that the thread stopped.
+        let _ = catch_unwind(AssertUnwindSafe(|| (self.observer)(Update::Stopped)));
     }
 
     /// Sends `update` after the console text waiting, so that the observer hears everything in
@@ -1407,18 +1451,19 @@ impl Worker {
             }
         };
         let recorded = matches!(mode_of, Some(Some(_)));
-        // A power-on that fails must not lose the content: the next one starts from it.
-        let kept = content.clone();
+        // A power-on that fails must not lose the content: the next one starts from it. Until a
+        // machine holds it, it stays here, where a panic leaves it to the rescue.
+        self.powering.clone_from(&content);
         let life = match self.recipe.power_on(content, recorded) {
             Ok(life) => life,
             Err(e) => {
+                let kept = self.powering.take();
                 if let Plan::Run { flash, .. } = &mut self.plan {
                     flash.abandon(kept);
                 }
                 return Err(CommandError::PowerOn(e.to_string()));
             }
         };
-        drop(kept);
         let mode = match (mode_of, &self.plan) {
             (Some(Some(recording)), _) => {
                 let session_limits = session::Limits {
@@ -1445,9 +1490,10 @@ impl Worker {
         self.recording = if recorded { record } else { None };
         self.life += 1;
         self.last_end = None;
-        let mut engine = Engine::new(life, mode, limits);
+        // The machine holds the flash from here: the rescue reads it there.
+        let engine = self.engine.insert(Engine::new(life, mode, limits));
+        self.powering = None;
         let output = engine.begin();
-        self.engine = Some(engine);
         self.emit(output);
         self.rebase();
         Ok(())
@@ -1458,26 +1504,33 @@ impl Worker {
     ///
     /// Gives the errors of what the life had to keep (its session, its flash file): the reasons
     /// a power-off must tell its user before the application closes.
+    ///
+    /// The order keeps what the user owns first: the life is finished with its machine left in
+    /// the engine, where [`Worker::rescue`] can read the flash; the flash file is written, then
+    /// the session; only then is the machine dropped and the observer told. A panic before the
+    /// flash is written leaves it to the rescue; one after has nothing left to lose.
     fn end_life(&mut self) -> Vec<String> {
-        let Some(engine) = self.engine.take() else {
+        let Some(engine) = self.engine.as_mut() else {
             return Vec::new();
         };
-        let mut ended = engine.end();
-        let output = std::mem::take(&mut ended.output);
-        self.emit(output);
+        let mut finished = engine.finish();
+        let mut flash_log = Vec::new();
+        if let (Plan::Run { flash, .. }, Some(engine)) = (&mut self.plan, self.engine.as_ref()) {
+            flash.finish(engine.machine(), &mut flash_log);
+        }
         let mut session_log = Vec::new();
-        if let (Some(result), Some(path)) = (ended.session.take(), self.recording.take()) {
+        if let (Some(result), Some(path)) = (finished.session.take(), self.recording.take()) {
             write_session(result, &path, &mut session_log);
         }
+        // Kept: the machine goes.
+        self.engine = None;
         let mut verdict_log = Vec::new();
-        let verdict = ended
+        let verdict = finished
             .verdict
             .take()
             .map(|result| verdict_view(result, &mut verdict_log));
-        let mut flash_log = Vec::new();
-        if let Plan::Run { flash, .. } = &mut self.plan {
-            flash.finish(&ended, &mut flash_log);
-        }
+        let output = std::mem::take(&mut finished.output);
+        self.emit(output);
         let session_notices = Notice::from_log(&session_log);
         let flash_notices = Notice::from_log(&flash_log);
         let errors = session_notices
@@ -1493,10 +1546,10 @@ impl Worker {
         {
             self.tell(Update::Notice(notice));
         }
-        self.last_end = Some(ended.end);
+        self.last_end = Some(finished.end);
         self.tell(Update::LifeEnded {
             life: self.life,
-            end: ended.end,
+            end: finished.end,
             verdict,
         });
         errors
@@ -2404,7 +2457,122 @@ mod tests {
             emulator.command(Command::Run),
             Err(CommandError::Stopped)
         ));
-        emulator.shutdown().unwrap();
+        // The power-off says the life did not end as it should.
+        let ended = emulator.shutdown();
+        assert!(
+            matches!(&ended, Err(CommandError::NotKept(text)) if text.contains("a panel port broke")),
+            "{ended:?}"
+        );
+    }
+
+    /// The updates of an emulator whose observer panics on the updates `breaks` accepts, after
+    /// passing them on.
+    fn started_breaking(
+        launch: Launch,
+        breaks: fn(&Update) -> bool,
+    ) -> (Emulator, Receiver<Update>) {
+        let (sender, updates) = mpsc::channel();
+        let emulator = Emulator::start(
+            launch,
+            Speed::Fastest,
+            Box::new(move |update| {
+                let broken = breaks(&update);
+                let _ = sender.send(update);
+                assert!(!broken, "an observer broke");
+            }),
+        )
+        .unwrap();
+        (emulator, updates)
+    }
+
+    /// An observer that panics on the first line the end of a life says (where the run stopped)
+    /// loses nothing: the flash file is written before anyone is told, and the power-off says
+    /// the life did not end as it should.
+    #[test]
+    fn a_panic_on_the_end_of_a_life_keeps_the_flash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("flash.bin");
+        let keeper = FlashKeeper::begin(Some(file.clone()), false, None, 1 << 20).unwrap();
+        let launch = Launch::new(
+            writing_device(0x00, Arc::default()),
+            keeper,
+            Limits::default(),
+            LOOK,
+            None,
+        );
+        let (emulator, updates) = started_breaking(
+            launch,
+            |u| matches!(u, Update::Notice(n) if n.text.starts_with("inkemu: stopped at pc")),
+        );
+        // A second refresh is a second of device time: the firmware wrote its byte long before.
+        until(&updates, |u| {
+            matches!(u, Update::Frame { generation: 2, .. })
+        });
+        let ended = emulator.shutdown();
+        assert!(
+            matches!(&ended, Err(CommandError::NotKept(text)) if text.contains("an observer broke")),
+            "{ended:?}"
+        );
+        assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
+        until(&updates, |u| matches!(u, Update::Stopped));
+    }
+
+    /// An observer that panics on every notice still hears that the thread stopped.
+    #[test]
+    fn the_end_of_a_rescue_is_said_even_to_a_broken_observer() {
+        let launch = Launch::new(
+            breaking_device(true),
+            FlashKeeper::without_file(None, 1 << 20),
+            Limits::default(),
+            LOOK,
+            None,
+        );
+        let (emulator, updates) = started_breaking(launch, |u| matches!(u, Update::Notice(_)));
+        until(&updates, |u| matches!(u, Update::Stopped));
+        assert!(emulator.shutdown().is_err());
+    }
+
+    /// A power-on that panics loses nothing: the flash a life left in memory (its file could not
+    /// be written) is written by the rescue.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_during_a_power_on_keeps_the_flash() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("kept");
+        std::fs::create_dir(&place).unwrap();
+        let file = place.join("flash.bin");
+        let keeper = FlashKeeper::begin(Some(file.clone()), false, None, 1 << 20).unwrap();
+        let mut inner = writing_device(0x00, Arc::default());
+        let mut calls = 0;
+        let recipe = Box::new(FnRecipe(move |flash: Option<Vec<u8>>, recorded: bool| {
+            calls += 1;
+            assert!(calls < 2, "a power-on broke");
+            inner.power_on(flash, recorded).unwrap()
+        }));
+        let launch = Launch::new(
+            recipe,
+            keeper,
+            Limits {
+                max_cycles: Some(50_000),
+                max_device_nanos: None,
+            },
+            LOOK,
+            None,
+        );
+        // The directory takes no new file: the save of the first life fails, its flash stays in
+        // memory.
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!file.exists());
+        assert!(matches!(
+            emulator.command(Command::Reset),
+            Err(CommandError::Stopped)
+        ));
+        assert!(matches!(emulator.shutdown(), Err(CommandError::NotKept(_))));
+        assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
     }
 
     /// A port that panics during a command answers it as stopped, and the thread says so.
@@ -2430,7 +2598,7 @@ mod tests {
                 if n.text.contains("a button port broke"))),
             "{seen:#?}"
         );
-        emulator.shutdown().unwrap();
+        assert!(matches!(emulator.shutdown(), Err(CommandError::NotKept(_))));
     }
 
     /// A capture refuses every path the run reads or writes (the flash file, its lock and its
