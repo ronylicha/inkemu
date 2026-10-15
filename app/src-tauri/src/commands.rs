@@ -96,7 +96,7 @@ pub struct Shell {
     stopping: Stopping,
     language: Mutex<Language>,
     /// A closing of the application is under way ([`Shell::begin_closing`]).
-    closing: AtomicBool,
+    closing: Arc<AtomicBool>,
 }
 
 /// Refuses a command meant for the emulator of start `asked` when the one held is another (or
@@ -204,10 +204,13 @@ impl Shell {
             .unwrap_or_default()
     }
 
-    /// Marks the application as closing: `true` for the first request, which powers off and
-    /// closes; the requests that follow only wait for it (2c-R17).
-    pub fn begin_closing(&self) -> bool {
-        !self.closing.swap(true, Ordering::SeqCst)
+    /// Marks the application as closing: the guard for the first request, which powers off and
+    /// closes; `None` for the requests that follow, which only wait for it (2c-R17). The closing
+    /// ends when the guard drops, however its holder ends (a panic included).
+    #[must_use]
+    pub fn begin_closing(&self) -> Option<ClosingGuard> {
+        (!self.closing.swap(true, Ordering::SeqCst))
+            .then(|| ClosingGuard(Arc::clone(&self.closing)))
     }
 
     /// Whether a closing is under way.
@@ -215,10 +218,16 @@ impl Shell {
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::SeqCst)
     }
+}
 
-    /// The closing is done: the window may go.
-    pub fn end_closing(&self) {
-        self.closing.store(false, Ordering::SeqCst);
+/// A closing under way ([`Shell::begin_closing`]): dropped when it ends, however it ends, so
+/// that a closing that failed never keeps the application from closing again.
+#[derive(Debug)]
+pub struct ClosingGuard(Arc<AtomicBool>);
+
+impl Drop for ClosingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -618,12 +627,27 @@ mod tests {
     fn a_second_request_to_close_waits_for_the_first() {
         let shell = Shell::default();
         assert!(!shell.is_closing());
-        assert!(shell.begin_closing());
-        assert!(!shell.begin_closing());
+        let first = shell.begin_closing();
+        assert!(first.is_some());
+        assert!(shell.begin_closing().is_none());
         assert!(shell.is_closing());
-        shell.end_closing();
+        drop(first);
         assert!(!shell.is_closing());
-        assert!(shell.begin_closing());
+        assert!(shell.begin_closing().is_some());
+    }
+
+    /// A closing whose power-off panics still ends: the guard lets the application close again.
+    #[test]
+    fn a_closing_that_panics_still_ends() {
+        let shell = Shell::default();
+        let closing = shell.begin_closing().unwrap();
+        let broke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _closing = closing;
+            panic!("a power-off broke");
+        }));
+        assert!(broke.is_err());
+        assert!(!shell.is_closing());
+        assert!(shell.begin_closing().is_some());
     }
 
     #[test]

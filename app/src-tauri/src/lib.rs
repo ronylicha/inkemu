@@ -13,6 +13,7 @@
 mod commands;
 
 use commands::Shell;
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager as _, RunEvent, WindowEvent};
 use tauri_plugin_dialog::{DialogExt as _, MessageDialogKind};
@@ -42,11 +43,12 @@ pub fn run() -> Result<(), tauri::Error> {
                 // The window stays until the device is off and its dialog answered; closing it
                 // again meanwhile only waits for the first closing, whose dialog must show.
                 api.prevent_close();
-                if shell.begin_closing() {
+                if let Some(closing) = shell.begin_closing() {
                     let window = window.clone();
                     std::thread::spawn(move || {
                         power_off_telling(window.app_handle());
-                        window.state::<Shell>().end_closing();
+                        // Ended before the window goes; a panic above ends it too.
+                        drop(closing);
                         let _ = window.close();
                     });
                 }
@@ -59,11 +61,11 @@ pub fn run() -> Result<(), tauri::Error> {
             if app.state::<Shell>().is_on() || app.state::<Shell>().is_closing() =>
         {
             api.prevent_exit();
-            if app.state::<Shell>().begin_closing() {
+            if let Some(closing) = app.state::<Shell>().begin_closing() {
                 let app = app.clone();
                 std::thread::spawn(move || {
                     power_off_telling(&app);
-                    app.state::<Shell>().end_closing();
+                    drop(closing);
                     app.exit(code.unwrap_or(0));
                 });
             }
@@ -72,8 +74,7 @@ pub fn run() -> Result<(), tauri::Error> {
         RunEvent::Exit => {
             let shell = app.state::<Shell>();
             if let Err(detail) = shell.power_off() {
-                let (title, text) = commands::closing_dialog(shell.language(), &detail);
-                eprintln!("{title}\n{text}");
+                tell_the_terminal(&shell, &detail);
             }
         }
         _ => {}
@@ -104,24 +105,35 @@ fn watch_signals(app: AppHandle) {
         if signalled.swap(true, Ordering::SeqCst) {
             std::process::exit(130);
         }
-        let shell = app.state::<Shell>();
         // A closing under way powers off and exits itself, after its dialog: the signal leaves
         // it to it (a second signal still exits at once).
-        if !shell.begin_closing() {
+        let Some(closing) = app.state::<Shell>().begin_closing() else {
             return;
-        }
+        };
         // No dialog: the user may be gone (a session that ends); the same words, in the
-        // interface's language, go to the terminal.
-        if let Err(detail) = shell.power_off() {
-            let (title, text) = commands::closing_dialog(shell.language(), &detail);
-            eprintln!("{title}\n{text}");
-        }
-        shell.end_closing();
+        // interface's language, go to the terminal. The application exits whatever the
+        // power-off did, a panic included: a signal that does not end it would be lost.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let shell = app.state::<Shell>();
+            if let Err(detail) = shell.power_off() {
+                tell_the_terminal(&shell, &detail);
+            }
+        }));
+        drop(closing);
         app.exit(130);
     });
     if let Err(e) = watched {
-        eprintln!(
+        // A terminal that is gone (`EPIPE`, `EIO`) is not a reason to stop.
+        let _ = writeln!(
+            std::io::stderr(),
             "inkemu: signals are not watched ({e}); close the window to power the device off"
         );
     }
+}
+
+/// Writes what the last life could not keep to the terminal, in the interface's language. A
+/// terminal that is gone (`EPIPE`, `EIO`) takes nothing, and nothing panics for it.
+fn tell_the_terminal(shell: &Shell, detail: &str) {
+    let (title, text) = commands::closing_dialog(shell.language(), detail);
+    let _ = writeln!(std::io::stderr(), "{title}\n{text}");
 }
