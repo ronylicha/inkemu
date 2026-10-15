@@ -175,11 +175,11 @@ impl Esp32C3 {
 mod tests {
     use super::*;
     use crate::StopReason;
-    use crate::config::SocConfig;
+    use crate::config::{SocConfig, Timing};
     use crate::debug::{Access, WatchOn};
     use crate::memmap::{ROM_BASE, SRAM_DBUS_BASE};
     use crate::test_support::{HANG, T0, T1, T2, flat_rom, stop_watchdogs, store_register};
-    use cpu_rv32::asm::{addi, jal, lui, lw, sw, wfi};
+    use cpu_rv32::asm::{addi, bne, csrrci, csrrsi, csrrw, jal, lui, lw, mret, sw, wfi};
 
     /// The address of word `index` of a program the flat ROM holds.
     fn at(index: usize) -> u32 {
@@ -321,6 +321,197 @@ mod tests {
         assert_eq!(stopped.x(), plain.x());
         assert_eq!(stopped.pc(), plain.pc());
         assert_eq!(word(&stopped, SRAM_DBUS_BASE), word(&plain, SRAM_DBUS_BASE));
+    }
+
+    /// Where the interrupting program puts its vector table, and how its parts are laid out.
+    const VECTORS: u32 = ROM_BASE + 0x1000;
+    /// The CPU line the SYSTIMER alarm is routed to: its vector is entry 4 of the table.
+    const TIMER_LINE: u32 = 4;
+    /// The handler, after the 32 entries of the table.
+    const HANDLER: u32 = VECTORS + 4 * 32;
+    const MSTATUS: u16 = 0x300;
+    const MTVEC: u16 = 0x305;
+    const MEPC: u16 = 0x341;
+    const MSTATUS_MIE: u8 = 1 << 3;
+    /// The alarm's period, in counts of the 16 MHz SYSTIMER: 25 µs, about 500 CPU cycles.
+    const ALARM_PERIOD: u32 = 400;
+    /// The passes of the loop between two `wfi`s.
+    const PASSES: i32 = 16;
+    const S1: u8 = 9;
+    const A3: u8 = 13;
+    const A4: u8 = 14;
+    const A5: u8 = 15;
+
+    fn reg(peripheral: &str, register: &str) -> u32 {
+        svd_regs::esp32c3::addr(peripheral, register)
+    }
+
+    /// `sw` of the word in `value` to `addr`, through `base`: `addr` split as `lui` and a signed
+    /// 12-bit offset, so the handler keeps off the registers the loop uses.
+    fn store_through(base: u8, value: u8, addr: u32) -> [u32; 2] {
+        let page = addr.wrapping_add(0x800) & 0xFFFF_F000;
+        [
+            lui(base, page),
+            sw(value, base, addr.wrapping_sub(page).cast_signed()),
+        ]
+    }
+
+    /// A periodic SYSTIMER alarm on line 4, taken while a loop counts in the first word of the
+    /// SRAM; every 16 passes the loop masks interrupts and waits in `wfi`, which the masked line
+    /// ends, then unmasks them and the interrupt is taken at once. The handler clears the alarm
+    /// and counts itself in the second word. Returns the program, the addresses of the loop's
+    /// instructions, and the instruction after the `wfi`'s unmasking.
+    fn interrupting() -> (Vec<u32>, Vec<u32>, u32) {
+        let mut body = stop_watchdogs();
+        body.extend([lui(T0, VECTORS), csrrw(0, MTVEC, T0)]);
+        body.extend(store_register(
+            reg("INTERRUPT_CORE0", "SYSTIMER_TARGET0_INT_MAP"),
+            TIMER_LINE,
+        ));
+        body.extend(store_register(
+            reg("INTERRUPT_CORE0", "CPU_INT_PRI_0") + 4 * TIMER_LINE,
+            1,
+        ));
+        body.extend(store_register(
+            reg("INTERRUPT_CORE0", "CPU_INT_ENABLE"),
+            1 << TIMER_LINE,
+        ));
+        body.extend(store_register(reg("SYSTIMER", "INT_ENA"), 1));
+        // `TARGET0_CONF`: bit 30 `PERIOD_MODE`, and the period.
+        body.extend(store_register(
+            reg("SYSTIMER", "TARGET0_CONF"),
+            (1 << 30) | ALARM_PERIOD,
+        ));
+        body.extend(store_register(reg("SYSTIMER", "COMP0_LOAD"), 1));
+        // `CONF`: its reset value with `TARGET0_WORK_EN`, bit 24.
+        body.extend(store_register(
+            reg("SYSTIMER", "CONF"),
+            0x4600_0000 | (1 << 24),
+        ));
+        body.extend([
+            csrrsi(0, MSTATUS, MSTATUS_MIE),
+            lui(T0, SRAM_DBUS_BASE),
+            addi(T1, 0, 0),
+            addi(S1, 0, PASSES),
+        ]);
+        let first = body.len();
+        body.extend([
+            addi(T1, T1, 1),
+            sw(T1, T0, 0),
+            lw(T2, T0, 0),
+            addi(S1, S1, -1),
+            bne(S1, 0, -16),
+            csrrci(0, MSTATUS, MSTATUS_MIE),
+            wfi(),
+            csrrsi(0, MSTATUS, MSTATUS_MIE),
+            addi(S1, 0, PASSES),
+            jal(0, -36),
+        ]);
+        let loop_at: Vec<u32> = (first..body.len()).map(at).collect();
+        let after_unmasking = at(first + 8);
+        let table = usize::try_from((VECTORS - ROM_BASE) / 4).unwrap();
+        assert!(body.len() <= table, "the body overlaps the vector table");
+        body.resize(table, HANG);
+        let mut vectors = [HANG; 32];
+        vectors[TIMER_LINE as usize] = jal(0, (HANDLER - (VECTORS + 4 * TIMER_LINE)).cast_signed());
+        body.extend(vectors);
+        body.push(addi(A4, 0, 1));
+        body.extend(store_through(A5, A4, reg("SYSTIMER", "INT_CLR")));
+        body.extend([
+            lui(A3, SRAM_DBUS_BASE),
+            lw(A4, A3, 4),
+            addi(A4, A4, 1),
+            sw(A4, A3, 4),
+            mret(),
+        ]);
+        (body, loop_at, after_unmasking)
+    }
+
+    /// What two runs must agree on to be the same run.
+    fn outcome(m: &Esp32C3) -> (Option<u64>, Cycles, u64, u64, [u32; 32], u32, [u32; 2]) {
+        (
+            m.trace_hash(),
+            m.cycles(),
+            m.instructions(),
+            m.device_time_nanos(),
+            m.x(),
+            m.pc(),
+            [word(m, SRAM_DBUS_BASE), word(m, SRAM_DBUS_BASE + 4)],
+        )
+    }
+
+    /// A run with interrupts, `wfi`s a masked line ends, and a device-time limit, stopped at a
+    /// breakpoint on the handler's entry, on every instruction of the loop (the interrupted one
+    /// among them) and after the unmasking, and at two watchpoints, is the run made in calls
+    /// without points, under both timing models: the points change nothing of what executes.
+    #[test]
+    fn stopping_with_interrupts_wfi_and_a_time_limit_changes_nothing_of_the_run() {
+        let (program, loop_at, after_unmasking) = interrupting();
+        let limit = Some(1_000_000);
+        for timing in [Timing::Datasheet, Timing::QemuIcount] {
+            let config = SocConfig {
+                trace_hash: true,
+                timing,
+                ..SocConfig::default()
+            };
+            let mut plain = machine(&program, &config);
+            let plain_end = loop {
+                match plain.run_within(FAR, limit) {
+                    StopReason::Asleep => {}
+                    reason => break reason,
+                }
+            };
+            assert_eq!(plain_end, StopReason::TimeBudget, "{timing:?}");
+
+            let mut stopped = machine(&program, &config);
+            let mut breakpoints = loop_at.clone();
+            breakpoints.push(HANDLER);
+            stopped.set_breakpoints(&breakpoints);
+            stopped.set_watchpoints(&[
+                Watch {
+                    address: SRAM_DBUS_BASE,
+                    length: 4,
+                    on: WatchOn::Access,
+                },
+                Watch {
+                    address: SRAM_DBUS_BASE + 4,
+                    length: 4,
+                    on: WatchOn::Write,
+                },
+            ]);
+            let (mut handler_entries, mut watched) = (0u32, 0u32);
+            let mut interrupted: Vec<u32> = Vec::new();
+            let mut resumed_at_interrupted = 0u32;
+            let mut after_wfi = 0u32;
+            let stopped_end = loop {
+                match stopped.run_stopping(FAR, limit) {
+                    RunStop::Debug(DebugStop::Breakpoint { pc }) if pc == HANDLER => {
+                        handler_entries += 1;
+                        interrupted.push(stopped.csr(MEPC).unwrap());
+                    }
+                    RunStop::Debug(DebugStop::Breakpoint { pc }) => {
+                        assert!(breakpoints.contains(&pc), "{pc:#x}");
+                        resumed_at_interrupted += u32::from(interrupted.last() == Some(&pc));
+                        after_wfi += u32::from(pc == after_unmasking);
+                    }
+                    RunStop::Debug(DebugStop::Watchpoint(_)) => watched += 1,
+                    RunStop::Machine(StopReason::Asleep) => {}
+                    RunStop::Machine(reason) => break reason,
+                }
+            };
+            assert_eq!(stopped_end, plain_end, "{timing:?}");
+            assert_eq!(outcome(&stopped), outcome(&plain), "{timing:?}");
+            let handled = word(&plain, SRAM_DBUS_BASE + 4);
+            assert!(handled > 10, "{timing:?}: {handled} interrupts");
+            assert_eq!(handler_entries, handled, "{timing:?}: one stop per entry");
+            assert!(
+                interrupted.iter().all(|pc| loop_at.contains(pc)),
+                "{timing:?}: {interrupted:x?}"
+            );
+            assert!(resumed_at_interrupted > 0, "{timing:?}");
+            assert!(after_wfi > 0, "{timing:?}: the loop went past its wfi");
+            assert!(watched > handled, "{timing:?}: {watched} accesses");
+        }
     }
 
     #[test]

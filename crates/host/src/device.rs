@@ -4698,4 +4698,106 @@ mod tests {
         assert_eq!(stops, 7, "two breakpoints and five stores");
         assert_eq!(verdict, Some(VerdictView::Identical));
     }
+
+    /// A breakpoint stop or a watchpoint stop, as the journal says it.
+    fn is_a_stop(update: &Update) -> bool {
+        matches!(update, Update::Notice(n) if n.text.starts_with("inkemu: breakpoint") || n.text.starts_with("inkemu: watchpoint"))
+    }
+
+    /// A session with input from the console, replayed stopped at points on the way of that
+    /// input (where `echo` reads each byte, and where it stores each to the FIFO), gives the
+    /// verdict "identical": the stops change nothing of when the input reaches the machine.
+    #[test]
+    fn a_replay_with_console_input_stopped_at_points_is_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.inkrec");
+        // A breakpoint on the `addi` of `e`, before the echo loop: each life stops there, so
+        // the input goes in at a known place of the recorded life.
+        let mut before_the_loop = Points::default();
+        before_the_loop.set_breakpoint(ROM_BASE + 4 * 3).unwrap();
+        let launch = Launch::new(
+            x4(echo()),
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits {
+                max_cycles: None,
+                max_device_nanos: Some(20_000_000),
+            },
+            look(),
+            Some(x4_recording()),
+        )
+        .with_points(before_the_loop);
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, is_a_stop);
+        emulator.command(Command::Run).unwrap();
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+        emulator
+            .command(Command::Record { path: path.clone() })
+            .unwrap();
+        until(&updates, is_a_stop);
+        emulator
+            .command(Command::Console {
+                channel: UART0,
+                bytes: b"hi\r".to_vec(),
+            })
+            .unwrap();
+        emulator.command(Command::Run).unwrap();
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
+        emulator.shutdown().unwrap();
+
+        let session = session_file::read_session(&path).unwrap();
+        let replay_of = session.clone();
+        let recipe = Box::new(FnRecipe(move |_: Option<Vec<u8>>, _: bool| {
+            let machine = session::Replay::start(&replay_of, echo())
+                .unwrap()
+                .into_machine();
+            let (panel, buttons) = pattern::ports(PANEL, &fixture_buttons());
+            Life {
+                machine,
+                panel,
+                buttons,
+                sd: None,
+            }
+        }));
+        // `echo` prints `ready` in 11 words, then polls the FIFO (word 11), reads a byte
+        // (word 13) and stores it back (word 14).
+        let mut points = Points::default();
+        points.set_breakpoint(ROM_BASE + 4 * 3).unwrap();
+        points.set_breakpoint(ROM_BASE + 4 * 13).unwrap();
+        points
+            .set_watchpoint(Watch {
+                address: crate::engine::fixtures::UART0,
+                length: 4,
+                on: WatchOn::Write,
+            })
+            .unwrap();
+        let (replay, updates) = started(
+            Launch::replay(recipe, session, "run.inkrec".to_owned(), look()).with_points(points),
+            Speed::Fastest,
+        );
+        let mut stops = 0;
+        let mut echoed = String::new();
+        let verdict = loop {
+            let seen = until(&updates, |u| {
+                matches!(u, Update::LifeEnded { .. }) || is_a_stop(u)
+            });
+            for update in &seen {
+                if let Update::Console { channel, text } = update
+                    && *channel == UART0.name()
+                {
+                    echoed.push_str(text);
+                }
+            }
+            if let Some(Update::LifeEnded { verdict, .. }) = seen.last() {
+                break verdict.clone();
+            }
+            stops += 1;
+            replay.command(Command::Run).unwrap();
+        };
+        assert!(echoed.ends_with("hi\r"), "{echoed:?}");
+        assert_eq!(
+            stops, 12,
+            "the `addi` of `e`, three reads, five stores of `ready`, three of the echo"
+        );
+        assert_eq!(verdict, Some(VerdictView::Identical));
+    }
 }
