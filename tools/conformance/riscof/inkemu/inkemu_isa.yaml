@@ -1,7 +1,8 @@
 hart_ids: [0]
 hart0:
   # Machine and user modes, as the ESP32-C3 (TRM register 1.6); the hart is inkemu's conformance
-  # bench (cpu_rv32::Core::MachineUser), with a 16-entry PMP the Sail reference has too.
+  # bench (cpu_rv32::Core::MachineUser), with a 16-entry PMP the Sail reference has too. No Zicntr:
+  # cycle, time and instret are illegal on both models (Sail's "Zicntr" is unsupported too).
   ISA: RV32IMCUZicsr_Zifencei
   physical_addr_sz: 32
   User_Spec_Version: '2.3'

@@ -15,8 +15,9 @@ comparé » ; `docs/registers-accepted-without-effect.md`.
 - **Le mode utilisateur de la puce est modélisé** (`misa` `0x40101104`, `MPP` {0, 3}, `TW`, `ecall` cause 8, CSR et
   `mret` illégaux en U, interruption prise en U quel que soit `MIE`).
 - **Le banc de conformité** (`Core::MachineUser`) a les modes M et U et une PMP de 16 entrées avec les choix de Sail ;
-  `inkemu rvtest` et les riscv-tests tournent dessus : **65 riscv-tests exécutés, 2 exclus** (64 et 3 avant ;
-  `rv32mi-p-pmpaddr` passe).
+  `inkemu rvtest` et les riscv-tests tournent dessus : **64 riscv-tests exécutés, 3 exclus**, épinglés dans
+  `versions.env` (`RISCV_TESTS_RAN`, `RISCV_TESTS_SKIPPED`) ; `rv32mi-p-pmpaddr` passe et sort de l'exclusion,
+  `rv32mi-p-zicntr` y entre à la relecture (le banc n'a pas de Zicntr, comme Sail configuré).
 - **arch-test : `pmp32` réactivé, 41 tests ; total 133** (`ARCH_TEST_EXPECTED` `I=39 M=8 C=29 Zifencei=1
   privilege=15 pmp32=41`). En local le 2026-10-15 : `ARCH_TEST_ONLY=pmp32 tools/conformance/run-arch-test.sh`
   → 41 sur 41 ; mutation (le banc avec les règles de la puce) → 3 sur 41, défaite. Environnement d'arch-test corrigé
@@ -28,6 +29,25 @@ comparé » ; `docs/registers-accepted-without-effect.md`.
   identiques (ligne 26 : 13 usages).
 - **Coût** : non mesurable sur le poste (R90 ; médianes 27,0 s avant, 28,2 s après sur CoreMark à 2 s, une charge
   de 10 à 37 sur 16 cœurs pendant les mesures). La durée du test CoreMark en CI (68 s avant) est la référence.
+
+## Relecture (PR #15, tête `c64fa5d`, 2026-10-15) : quatre constats corrigés
+
+- **I1** : le nombre de riscv-tests exécutés était affiché, jamais comparé. Les effectifs sont épinglés dans
+  `versions.env` à côté d'`ARCH_TEST_EXPECTED`, et `riscv_tests.rs` (job `check`, `cargo test --workspace`)
+  échoue sur tout autre compte ; vérifié en le faussant d'une unité.
+- **M1** : la décision 2 de l'ADR 0010 disait le mode machine contrôlé par les seules entrées verrouillées sur
+  les deux cœurs ; c'est vrai de la puce, pas du banc, où toute entrée active participe (une entrée non
+  verrouillée qui contient l'accès accorde tout et masque les suivantes, une correspondance partielle refuse).
+  Reformulée ; un test unitaire épingle le masquage sous les deux règles.
+- **M2** : le compteur de génération des verdicts de page faisait le tour en `u32`, et après 2^32 écritures de
+  la PMP un verdict périmé redevenait valide. La génération part de 1, 0 marque une case vide, et au bout du
+  compteur toutes les cases sont vidées ; un test force le compteur à sa dernière valeur (défait sans le
+  vidage). Empreintes 12 s, 40 000 001 cycles, `adc_wait_panic` et `deep_sleep_timer` revérifiées, inchangées.
+- **E1** : `inkemu_rv32imc.json` déclare `Zicntr` non pris en charge, et Sail 0.15 rend alors `cycle`,
+  `time`, `instret` illégaux dans tous les modes (`zicntr_control.sail`), alors que le banc y répondait. Le
+  banc est aligné sur sa déclaration (déclarer Zicntr demanderait un `time` qu'il n'a pas) ;
+  `rv32mi-p-zicntr` est exclu et un test épingle son échec au cas 2. Effectifs arch-test inchangés (la
+  sélection ne dépend que de l'ISA, inchangée) ; groupe `privilege` relancé en local : 15 sur 15.
 
 ## Les reports, tranchés
 
@@ -68,7 +88,8 @@ L1–L12 de la spec et R79–R91 du plan ; les plus engageantes :
 - **Vérifié en local** (poste partagé, charge 10 à 37 sur 16 cœurs) : `cargo fmt --all --check` ; `tools/ci/clippy.sh`
   (`-D warnings`, toutes cibles et fonctionnalités) sur `cpu-rv32`, `soc-esp32c3`, `emu-cli`, `lockstep` ; rustdoc
   (`-D warnings`, éléments privés) sur les mêmes ; `cargo check --target wasm32-unknown-unknown` sur `cpu-rv32`,
-  `soc-esp32c3`, `lockstep` ; les tests non ignorés de ces quatre crates (`cpu-rv32` 144, `soc-esp32c3`,
+  `soc-esp32c3`, `lockstep` ; les tests non ignorés de ces quatre crates (`cpu-rv32` 144, 146 après la
+  relecture, `soc-esp32c3`,
   `emu-cli` dont `riscv_tests` et `rvtest_cli`, `lockstep`) ; deux mutations vérifiées (contrôle sur un succès du
   cache de décodage ; règles de la puce sur le banc contre `pmp32`) ; les empreintes et la fenêtre `hello`
   ci-dessus ; le groupe `pmp32` contre Sail (image `inkemu/riscof` reconstruite avec `patch`).

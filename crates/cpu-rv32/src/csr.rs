@@ -54,9 +54,6 @@ const MISA_U: u32 = 1 << 20;
 const READ_ONLY_MASK: u16 = 0xC00;
 /// Bits `[9:8]` of a CSR address: the lowest privilege that may access it (Privileged spec §2.1).
 const CSR_PRIVILEGE_SHIFT: u16 = 8;
-/// `mcounteren` bits for `cycle` and `instret`.
-const COUNTEREN_CY: u32 = 1 << 0;
-const COUNTEREN_IR: u32 = 1 << 2;
 
 /// The privilege mode a hart executes in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -86,9 +83,12 @@ pub enum Core {
     /// and user modes and a 16-entry PMP as the privileged specification has them, with the
     /// choices the Sail reference model makes as `tools/conformance/riscof/sail` configures it.
     /// `MPP` keeps machine or user and turns any other value into user, `MPRV` and `TW` exist,
-    /// `mcounteren` tells which counters user mode may read; the PMP follows the specification's
-    /// rules (`pmp::PmpRules::Specification`). Report `docs/research/esp32c3-pmp-and-user-mode.md`
-    /// §4.
+    /// `mcounteren` exists with every bit writable; the PMP follows the specification's rules
+    /// (`pmp::PmpRules::Specification`). As the bench declares no Zicntr (ISA
+    /// `RV32IMCUZicsr_Zifencei`, Sail's `Zicntr` unsupported), `cycle`, `time` and `instret` do not
+    /// exist in any mode, `mcounteren` gates nothing, and the counters are machine mode's
+    /// `mcycle` and `minstret`, which Sail always has (`model/core/counters.sail`). Report
+    /// `docs/research/esp32c3-pmp-and-user-mode.md` §4.
     MachineUser,
     /// The ESP32-C3 core (TRM chapter 1): machine and user modes, `misa` `0x40101104`, its PMP
     /// with the TRM's rules (`pmp::PmpRules::Esp32C3`), `ustatus`, the performance counter.
@@ -200,6 +200,9 @@ impl CsrFile {
             MEPC => self.mepc,
             MCAUSE => self.mcause,
             MTVAL => self.mtval,
+            // No Zicntr on the bench: Sail 0.15 makes `cycle`, `cycleh`, `instret` and `instreth`
+            // accessible only when it is enabled (`model/extensions/Zicntr/zicntr_control.sail`).
+            CYCLE | CYCLEH | INSTRET | INSTRETH if self.core == Core::MachineUser => return None,
             MCYCLE | CYCLE => low(cyc),
             MCYCLEH | CYCLEH => high(cyc),
             MINSTRET | INSTRET => low(ret),
@@ -385,22 +388,11 @@ impl CsrFile {
     }
 
     /// Whether `privilege` may access the CSR at `addr`: bits `[9:8]` of the address name the
-    /// lowest mode that may (privileged specification §2.1; TRM §1.8.3 for the PMP's), and on the
-    /// conformance bench `mcounteren` tells whether user mode may read `cycle` and `instret`.
-    /// Whether the CSR exists is the business of [`CsrFile::read`].
+    /// lowest mode that may (privileged specification §2.1; TRM §1.8.3 for the PMP's). Whether the
+    /// CSR exists is the business of [`CsrFile::read`].
     #[must_use]
-    pub fn accessible(&self, addr: u16, privilege: Privilege) -> bool {
-        if (addr >> CSR_PRIVILEGE_SHIFT) & 0b11 > privilege.level() {
-            return false;
-        }
-        if privilege == Privilege::User && self.core == Core::MachineUser {
-            return match addr {
-                CYCLE | CYCLEH => self.mcounteren & COUNTEREN_CY != 0,
-                INSTRET | INSTRETH => self.mcounteren & COUNTEREN_IR != 0,
-                _ => true,
-            };
-        }
-        true
+    pub const fn accessible(&self, addr: u16, privilege: Privilege) -> bool {
+        (addr >> CSR_PRIVILEGE_SHIFT) & 0b11 <= privilege.level()
     }
 
     /// Whether `wfi` in user mode is an illegal instruction (`mstatus.TW`, TRM register 1.5).
@@ -691,18 +683,24 @@ mod tests {
     }
 
     #[test]
-    fn on_the_bench_mcounteren_tells_which_counters_user_mode_may_read() {
+    fn the_bench_has_mcounteren_and_no_unprivileged_counter_as_sail_without_zicntr() {
         let mut csr = CsrFile::new(Core::MachineUser);
+        // Every bit writable (Sail's `base.mcounteren_writable_bits`), and nothing it would gate.
+        assert!(csr.write(MCOUNTEREN, u32::MAX));
+        assert_eq!(csr.read(MCOUNTEREN, Cycles::ZERO, 0), Some(u32::MAX));
         for addr in [CYCLE, CYCLEH, INSTRET, INSTRETH] {
-            assert!(!csr.accessible(addr, Privilege::User), "{addr:#x}");
-            assert!(csr.accessible(addr, Privilege::Machine), "{addr:#x}");
+            assert_eq!(csr.read(addr, Cycles(5), 7), None, "{addr:#x}");
         }
-        assert!(csr.write(MCOUNTEREN, COUNTEREN_CY));
-        assert_eq!(csr.read(MCOUNTEREN, Cycles::ZERO, 0), Some(COUNTEREN_CY));
-        assert!(csr.accessible(CYCLE, Privilege::User));
-        assert!(csr.accessible(CYCLEH, Privilege::User));
-        assert!(!csr.accessible(INSTRET, Privilege::User));
-        // Only the bench has it: the ESP32-C3's CSR list does not name it (TRM table 1.4.1).
+        assert_eq!(csr.read(MCYCLE, Cycles(5), 7), Some(5));
+        assert_eq!(csr.read(MINSTRET, Cycles(5), 7), Some(7));
+        // The other cores keep the counters they had.
+        for core in [Core::MachineOnly, Core::Esp32C3] {
+            let other = CsrFile::new(core);
+            assert_eq!(other.read(CYCLE, Cycles(5), 7), Some(5), "{core:?}");
+            assert_eq!(other.read(INSTRET, Cycles(5), 7), Some(7), "{core:?}");
+        }
+        // Only the bench has `mcounteren`: the ESP32-C3's CSR list does not name it (TRM table
+        // 1.4.1).
         let mut c3 = CsrFile::new(Core::Esp32C3);
         assert_eq!(c3.read(MCOUNTEREN, Cycles::ZERO, 0), None);
         assert!(!c3.write(MCOUNTEREN, 1));

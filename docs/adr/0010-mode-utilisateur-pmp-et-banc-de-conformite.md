@@ -32,7 +32,11 @@ Ce que disent les sources (rapport `docs/research/esp32c3-pmp-and-user-mode.md`,
    - `MachineUser` : **le banc de conformité**, modes machine et utilisateur, PMP de 16 entrées, les choix de la
      spécification que Sail fait quand `tools/conformance/riscof/sail` le configure (priorité statique, `MPP` non
      nominal légalisé en U, `MPRV`, `TW`, `mcounteren`, bits 5–6 de `pmpcfg` lus à 0, `pmpaddr` sur 30 bits) ;
-     `inkemu rvtest`, les riscv-tests et riscv-arch-test tournent dessus ;
+     `inkemu rvtest`, les riscv-tests et riscv-arch-test tournent dessus. **Pas de Zicntr** (relecture du
+     2026-10-15) : l'ISA n'en déclare pas et Sail est configuré sans, ce qui rend `cycle`, `time` et `instret`
+     illégaux dans tous les modes ; le banc fait de même (seuls `mcycle` et `minstret` du mode machine restent),
+     `mcounteren` existe et ne garde rien. Déclarer Zicntr demanderait un `time` que le banc n'a pas.
+     `rv32mi-p-zicntr` est exclu des riscv-tests, et un test épingle qu'il échoue à sa première lecture de `cycle` ;
    - `Esp32C3` : la puce selon le TRM — modes machine et utilisateur, `misa` `0x40101104`, `MPP` réglé par son bit
      bas, `TW`, pas de `MPRV` ni de `mcounteren` ; PMP **sans priorité statique** ; ce qu'une écriture garde est ce
      que QEMU garde (octet entier, `pmpaddr` sur 32 bits).

@@ -100,6 +100,16 @@ fn all_riscv_tests_pass_except_documented_skips() {
     );
 }
 
+/// The bench declares no Zicntr, as Sail is configured (`"Zicntr": {"supported": false}`): the
+/// first read of `cycle` in `rv32mi-p-zicntr` must trap, and the test fail at its case 2. If it
+/// passed, the bench would claim an extension the reference model of arch-test does not have.
+#[test]
+fn the_skipped_zicntr_test_fails_at_its_first_read_of_cycle() {
+    let bytes = std::fs::read(fixture_dir().join("rv32mi-p-zicntr")).unwrap();
+    let mut m = TestMachine::from_elf(&bytes, bench()).unwrap();
+    assert_eq!(m.run(MAX_STEPS), RunResult::Failed { test_number: 2 });
+}
+
 #[test]
 fn fixture_directory_matches_the_sha256_manifest() {
     let listed = manifest();

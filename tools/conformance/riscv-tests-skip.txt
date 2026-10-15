@@ -1,3 +1,4 @@
-# One test per line: <file name> # <reason>. A skip is only allowed for a feature the current stage does not implement yet.
+# One test per line: <file name> # <reason>. A skip is only allowed for a feature the current stage does not implement yet, or one the bench does not have by design; then a test of riscv_tests.rs pins how it fails.
 rv32ui-p-ma_data # misaligned data accesses trap by default (MisalignedPolicy::Trap); the C3 behaviour is arbitrated by the QEMU lockstep in SP1b (spec §4.4)
 rv32mi-p-breakpoint # Sdtrig trigger CSRs (tselect/tdata1/tdata2/tcontrol) not implemented; the ESP32-C3 trigger CSRs go with the debugger to sub-project 4 (note 2026-10-14-sp1b-4-decoupage.md)
+rv32mi-p-zicntr # the bench has no Zicntr (ISA RV32IMCUZicsr_Zifencei, Sail configured with Zicntr unsupported: cycle/time/instret illegal in every mode, model/extensions/Zicntr/zicntr_control.sail); riscv_tests.rs pins that it fails at test 2, the first read of cycle

@@ -47,6 +47,13 @@ group name and expected vs actual).
   trap-handler signatures; the override keeps U, makes a `pmpcfg` write of R = 0 with W = 1 leave
   the entry as it was (`PMP_Ignore`, as inkemu and QEMU), and lets `wfi` wait in user mode unless
   `mstatus.TW` is set. Sail's default PMP (16 entries, grain 0) is the bench's.
+- **No Zicntr, on either side.** The ISA declares none and Sail is configured with
+  `"Zicntr": {"supported": false}`: Sail 0.15 then makes `cycle`, `time`, `instret` and their high
+  halves illegal in every mode (`model/extensions/Zicntr/zicntr_control.sail`) and keeps machine
+  mode's `mcycle` and `minstret` (`model/core/counters.sail`). The bench does the same;
+  `mcounteren` exists, every bit writable, and gates nothing. Declaring Zicntr instead would need a
+  `time` the bench does not have. The riscv-test `rv32mi-p-zicntr` is skipped for it, and
+  `crates/emu-cli/tests/riscv_tests.rs` pins that it fails at its first read of `cycle`.
 
 ### Misaligned-access policy: three places that must change together
 
