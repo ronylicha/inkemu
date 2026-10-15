@@ -413,8 +413,6 @@ fn a_request_of_the_board_is_checked_against_the_profile_without_a_machine() {
     );
 }
 
-/// ADR 0015: the X3 powers on with its UC8253, its keys, its switched card slot and the three
-/// chips of its I2C bus; it has no supply to cut, and no cable line.
 /// Puts GPIO0, GPIO10 and GPIO20 in GPIO function, inputs without the pads' own pulls, nothing
 /// driving them, then copies `GPIO_IN` into `a0` for ever.
 fn read_released_lines() -> Vec<u32> {
@@ -447,6 +445,8 @@ fn the_x3_board_pulls_up_its_i2c_bus_and_its_display_data_line() {
     assert_eq!(x4.machine.x()[usize::from(A0)] >> 10 & 1, 0);
 }
 
+/// ADR 0015: the X3 powers on with its UC8253, its keys, its switched card slot and the three
+/// chips of its I2C bus; it has no supply to cut, and no cable line.
 #[test]
 fn the_x3_powers_on_wired_with_its_i2c_chips() {
     let x3 = builtin("x3").unwrap();
