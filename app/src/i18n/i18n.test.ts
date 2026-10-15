@@ -19,6 +19,47 @@ describe("catalogs", () => {
   });
 });
 
+/**
+ * Every kind of refusal the host and the shell give (`CommandError::kind`, `StartError::kind`,
+ * `ErrorDto::new` in `app/src-tauri`): the banner shows the host's bare text for a kind it cannot
+ * name.
+ */
+const ERROR_KINDS = [
+  "button",
+  "capture",
+  "ended",
+  "firmware",
+  "flashFile",
+  "flashImage",
+  "input",
+  "ipc",
+  "maxCycles",
+  "maxTime",
+  "noImage",
+  "noLife",
+  "nothingToStep",
+  "notRecordable",
+  "onItsThread",
+  "powerOn",
+  "profile",
+  "recordPath",
+  "replay",
+  "replaying",
+  "replayNotRecorded",
+  "rom",
+  "session",
+  "stopped",
+] as const;
+
+describe("refusals", () => {
+  it("are named in both languages for every kind the host gives", () => {
+    for (const kind of ERROR_KINDS) {
+      expect(Object.keys(fr), kind).toContain(`error.${kind}`);
+      expect(Object.keys(en), kind).toContain(`error.${kind}`);
+    }
+  });
+});
+
 describe("language", () => {
   it("is the first of the system's that inkemu speaks", () => {
     expect(detectLanguage(["de-DE", "fr-CA", "en"])).toBe("fr");
