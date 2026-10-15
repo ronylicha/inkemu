@@ -114,17 +114,19 @@ symbols nvs_rw_value_cxx
 # component, copied unmodified into this directory (coremark_example/PROVENANCE.md): the build has no
 # network and no component manager. Its copied files are checked first, against their pinned hashes;
 # the CoreMark run rules ask for the benchmark's files unmodified. The directory must hold exactly
-# the files the sums list, plus PROVENANCE.md, ours: a file added to it (a source the component's
-# CMakeLists.txt would never name, or a header that shadows one) fails the check as a changed one
-# does.
+# the files the sums list, plus PROVENANCE.md, ours, each a regular file: anything added to it (a
+# source the component's CMakeLists.txt would never name, a header that shadows one, a symbolic link,
+# which sha256sum would follow) fails the check as a changed file does. Every entry but a directory
+# is listed with its type (`f` regular file, `l` symbolic link, ...), and the pinned list is of
+# regular files only.
 coremark_files() {
-  (cd /ref/coremark_example && find . -type f ! -path ./PROVENANCE.md | sed 's|^\./||' | LC_ALL=C sort)
+  (cd /ref/coremark_example && find . ! -type d ! -path ./PROVENANCE.md -printf '%y %P\n' | LC_ALL=C sort)
 }
 pinned_coremark_files() {
-  sed 's/^[0-9a-f]\{64\}  //' /ref/SHA256SUMS.coremark-sources | LC_ALL=C sort
+  sed 's/^[0-9a-f]\{64\}  /f /' /ref/SHA256SUMS.coremark-sources | LC_ALL=C sort
 }
 if ! diff <(pinned_coremark_files) <(coremark_files) >&2; then
-  echo "error: the files of coremark_example are not those SHA256SUMS.coremark-sources pins (\"<\" missing, \">\" not pinned, above); it holds the copy of espressif/coremark 1.1.0~2 and PROVENANCE.md only (coremark_example/PROVENANCE.md)" >&2
+  echo "error: the entries of coremark_example are not the regular files SHA256SUMS.coremark-sources pins (above, each with its type, f a regular file, l a symbolic link: \"<\" missing, \">\" not pinned); it holds the copy of espressif/coremark 1.1.0~2 and PROVENANCE.md only (coremark_example/PROVENANCE.md)" >&2
   exit 1
 fi
 if ! (cd /ref/coremark_example && sha256sum --quiet -c /ref/SHA256SUMS.coremark-sources); then
