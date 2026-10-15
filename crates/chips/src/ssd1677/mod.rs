@@ -10,6 +10,7 @@
 
 mod config;
 mod diagnostic;
+pub mod lines;
 mod panel;
 mod ram;
 pub mod reference;
@@ -269,6 +270,14 @@ impl Ssd1677 {
             dropped: 0,
             config,
         })
+    }
+
+    /// Whether `command` reads from the chip (`0x1B`, `0x27`, `0x2D`, `0x2E`, `0x2F`): after it,
+    /// with D/C# high, the chip drives the data line. Who wires the chip uses it to know when the
+    /// half-duplex line is the chip's.
+    #[must_use]
+    pub fn is_read_command(command: u8) -> bool {
+        matches!(kind(command), Some(Kind::Read))
     }
 
     /// The parameters the chip was built with.

@@ -42,6 +42,8 @@ pub struct PanelImage {
     pub kind: RefreshKind,
     /// A hardware reset cut the display short: the image is the state the glass had reached.
     pub interrupted: bool,
+    /// The instant the display began driving the glass (`Cycles::ZERO` at power-on).
+    pub started: Cycles,
     /// The instant the display ended (or was cut).
     pub at: Cycles,
 }
@@ -160,6 +162,7 @@ impl Panel {
                 generation: 0,
                 kind: RefreshKind::PowerOn,
                 interrupted: false,
+                started: Cycles::ZERO,
                 at: Cycles::ZERO,
             },
             geometry,
@@ -260,6 +263,7 @@ impl Panel {
             generation: self.image.generation + 1,
             kind: display.kind,
             interrupted: until_ns.is_some(),
+            started: display.started,
             at,
         };
     }

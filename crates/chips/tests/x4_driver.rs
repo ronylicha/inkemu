@@ -205,6 +205,11 @@ fn a_full_refresh_shows_the_frame_buffer_upright_in_about_two_seconds() {
     assert_eq!((image.width, image.height), (800, 480));
     assert_eq!((image.generation, image.kind), (1, RefreshKind::Full));
     assert!(!image.interrupted);
+    assert_eq!(
+        image.at.get() - image.started.get(),
+        ms(1_600),
+        "the image dates the waveform: from its first frame to its last"
+    );
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
             let expected = if page(x, y) { 0 } else { 255 };
