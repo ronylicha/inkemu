@@ -199,6 +199,8 @@ export function App() {
         <StatusPanel status={status} lastEnd={state.lastEnd} />
         {debuggerOpen ? (
           <DebugPanel
+            // A new start shows its own machine: nothing of the panel of the one before stays.
+            key={state.current}
             start={state.current}
             status={state.phase === "on" ? status : null}
             onCommand={(next) => host.command(next, state.current)}

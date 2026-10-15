@@ -61,7 +61,6 @@ export function DebugPanel({ start, status, onCommand, dispatch }: Props) {
   /** Asks to read again, whatever the run does: a refresh, a point set or cleared. */
   const [asks, setAsks] = useState(0);
   const seenAsks = useRef(0);
-  const latest = useRef(0);
   const code = useAddressField();
   const memory = useAddressField(`0x${SRAM_START.toString(16)}`);
   const breakpoint = useAddressField();
@@ -71,12 +70,15 @@ export function DebugPanel({ start, status, onCommand, dispatch }: Props) {
   const [watchOn, setWatchOn] = useState<WatchOn>("write");
 
   const moving = status?.run === "running";
-  // Where the machine shown is, as the status says it, empty with none: the view is read again
-  // when it changes while the run does not move (a new life, a stop, a step, an end).
+  // What the view follows of the status. Empty before a first life (a refused start has no
+  // machine to read); the life alone while the run moves, since it is read at the user's request
+  // then; where the machine is when it does not move (a stop, a step, a halt, an end).
   const where =
-    status === null
+    status === null || status.life === 0
       ? ""
-      : `${status.life}:${status.run}:${status.machine?.instructions ?? ""}:${status.machine?.pc ?? ""}`;
+      : moving
+        ? `${status.life}:moving`
+        : `${status.life}:${status.run}:${status.machine?.instructions ?? ""}:${status.machine?.pc ?? ""}`;
 
   useEffect(() => {
     if (where === "") {
@@ -87,8 +89,8 @@ export function DebugPanel({ start, status, onCommand, dispatch }: Props) {
       return;
     }
     seenAsks.current = asks;
-    latest.current += 1;
-    const asked = latest.current;
+    // A view asked before this one, or for a start this panel no longer shows, is dropped.
+    let wanted = true;
     host
       .inspect(
         {
@@ -99,21 +101,35 @@ export function DebugPanel({ start, status, onCommand, dispatch }: Props) {
         start,
       )
       .then((next) => {
-        if (asked === latest.current) {
+        if (wanted) {
           setView(next);
           dispatch({ type: "points", start, points: next.points });
         }
       })
       .catch((reason: unknown) => {
-        if (asked === latest.current) {
+        if (wanted) {
           dispatch({ type: "failed", error: asHostError(reason) });
         }
       });
+    return () => {
+      wanted = false;
+    };
   }, [host, start, moving, where, codeAt, memoryAt, asks, dispatch]);
 
+  /** Reads the machine again, whether the run moves or not. */
+  const askAgain = () => setAsks((n) => n + 1);
+  /** Shows the code from `address` (`null`: around the PC), read now. */
+  const showCodeAt = (address: number | null) => {
+    setCodeAt(address);
+    askAgain();
+  };
+  const showMemoryAt = (address: number) => {
+    setMemoryAt(address);
+    askAgain();
+  };
   const send = (command: Command) => {
     onCommand(command)
-      .then(() => setAsks((n) => n + 1))
+      .then(askAgain)
       .catch((reason: unknown) => dispatch({ type: "failed", error: asHostError(reason) }));
   };
   const setBreakpoint = (address: number, set: boolean) =>
@@ -164,7 +180,7 @@ export function DebugPanel({ start, status, onCommand, dispatch }: Props) {
     <section id="debugger" className="debugger" aria-labelledby="debugger-title">
       <div className="debugger-head">
         <h2 id="debugger-title">{t("debug.title")}</h2>
-        <button type="button" onClick={() => setAsks((n) => n + 1)}>
+        <button type="button" onClick={askAgain}>
           {t("debug.refresh")}
         </button>
       </div>
@@ -183,10 +199,7 @@ export function DebugPanel({ start, status, onCommand, dispatch }: Props) {
           </section>
           <section aria-labelledby="debugger-code">
             <h3 id="debugger-code">{t("debug.code")}</h3>
-            <form
-              className="debugger-form"
-              onSubmit={submitAddress(code, (address) => setCodeAt(address))}
-            >
+            <form className="debugger-form" onSubmit={submitAddress(code, showCodeAt)}>
               <label>
                 {t("debug.code.goTo")}{" "}
                 <input
@@ -199,7 +212,7 @@ export function DebugPanel({ start, status, onCommand, dispatch }: Props) {
                 />
               </label>
               <button type="submit">{t("debug.code.show")}</button>
-              <button type="button" onClick={() => setCodeAt(null)} disabled={codeAt === null}>
+              <button type="button" onClick={() => showCodeAt(null)} disabled={codeAt === null}>
                 {t("debug.code.followPc")}
               </button>
             </form>
@@ -209,10 +222,7 @@ export function DebugPanel({ start, status, onCommand, dispatch }: Props) {
           <div className="debugger-stack">
             <section aria-labelledby="debugger-memory">
               <h3 id="debugger-memory">{t("debug.memory")}</h3>
-              <form
-                className="debugger-form"
-                onSubmit={submitAddress(memory, (address) => setMemoryAt(address))}
-              >
+              <form className="debugger-form" onSubmit={submitAddress(memory, showMemoryAt)}>
                 <label>
                   {t("debug.memory.at")}{" "}
                   <input

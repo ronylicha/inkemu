@@ -1,7 +1,9 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import type { Command, Status } from "../ipc/types";
+import { I18nProvider } from "../i18n/i18n-provider";
+import { HostContext } from "../ipc/host";
+import type { Command, DebugView, Status } from "../ipc/types";
 import { debugView, fakeHost, status } from "../test/fake-host";
 import { renderWith } from "../test/render";
 import { DebugPanel } from "./debug-panel";
@@ -201,6 +203,65 @@ describe("DebugPanel", () => {
     const { host } = panel(null);
     expect(screen.getByText("Power a device on to debug it.")).toBeInTheDocument();
     expect(host.inspect).not.toHaveBeenCalled();
+  });
+
+  it("asks nothing of a start that powered no life on", () => {
+    const { host } = panel(status({ life: 0, run: "ended", machine: null }));
+    expect(host.inspect).not.toHaveBeenCalled();
+  });
+
+  it("reads a running device again when the user asks for other memory", async () => {
+    const user = userEvent.setup();
+    const { host } = panel(status({ run: "running" }));
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    const field = await screen.findByRole("textbox", { name: "Memory at the address" });
+    await user.clear(field);
+    await user.type(field, "50000000{Enter}");
+    await waitFor(() => expect(host.inspect).toHaveBeenCalledTimes(2));
+    expect(host.inspect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ memory: { address: 0x5000_0000, length: 256 } }),
+      3,
+    );
+  });
+
+  it("drops a view the host gives after a later one was asked for", async () => {
+    let answerFirst: (view: DebugView) => void = () => undefined;
+    let refuseFirst: (reason: unknown) => void = () => undefined;
+    const host = fakeHost();
+    vi.mocked(host.inspect)
+      .mockImplementationOnce(
+        () =>
+          new Promise<DebugView>((resolve, reject) => {
+            answerFirst = resolve;
+            refuseFirst = reject;
+          }),
+      )
+      .mockImplementationOnce(async () =>
+        debugView({ cpu: { ...debugView().cpu, pc: 0x4000_0100 } }),
+      );
+    const dispatch = vi.fn();
+    const element = (current: Status) => (
+      <HostContext.Provider value={host}>
+        <I18nProvider language="en">
+          <DebugPanel
+            start={3}
+            status={current}
+            onCommand={async () => undefined}
+            dispatch={dispatch}
+          />
+        </I18nProvider>
+      </HostContext.Provider>
+    );
+    const before = paused();
+    const { rerender } = render(element(before));
+    const moved = before.machine === null ? null : { ...before.machine, pc: 0x4000_0100 };
+    rerender(element({ ...before, machine: moved }));
+    expect(await screen.findByText("0x40000100")).toBeInTheDocument();
+    answerFirst(debugView());
+    refuseFirst({ kind: "stopped", message: "the emulator has stopped" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByText("0x40000100")).toBeInTheDocument();
+    expect(dispatch).not.toHaveBeenCalledWith(expect.objectContaining({ type: "failed" }));
   });
 
   it("speaks French", async () => {
