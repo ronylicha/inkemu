@@ -22,6 +22,13 @@ describe("monitor formats", () => {
     expect(duration(12_345_000_000, "en")).toBe(`12.3${NBSP}s`);
   });
 
+  it("chooses the unit for the rounded value: 999.9 µs is 1 ms", () => {
+    expect(duration(999_900, "en")).toBe(`1${NBSP}ms`);
+    expect(duration(999.9, "en")).toBe(`1${NBSP}µs`);
+    expect(charge(0.9996, "en")).toBe(`1${NBSP}µAh`);
+    expect(current(999.6, "en")).toBe(`1${NBSP}mA`);
+  });
+
   it("writes currents and charges in µA or mA, nAh, µAh or mAh", () => {
     expect(current(5, "en")).toBe(`5${NBSP}µA`);
     expect(current(23_000, "fr")).toBe(`23${NBSP}mA`);

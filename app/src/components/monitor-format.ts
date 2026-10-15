@@ -30,8 +30,15 @@ function short(value: number, unit: string, language: Language): string {
   return `${numbers(language, { maximumSignificantDigits: 3 }).format(value)}${NBSP}${unit}`;
 }
 
+/** `value` rounded to the three significant digits it is written with, so that the unit is chosen
+ * for what is written: 999.9 µs is written 1 ms, not 1,000 µs. */
+function rounded(value: number): number {
+  return value === 0 ? 0 : Number(value.toPrecision(3));
+}
+
 /** A duration in nanoseconds, in ns, µs, ms or s. */
-export function duration(nanos: number, language: Language): string {
+export function duration(exact: number, language: Language): string {
+  const nanos = rounded(exact);
   if (nanos < 1e3) {
     return short(nanos, "ns", language);
   }
@@ -45,14 +52,16 @@ export function duration(nanos: number, language: Language): string {
 }
 
 /** A current in microamperes, in µA or mA. */
-export function current(microamps: number, language: Language): string {
+export function current(exact: number, language: Language): string {
+  const microamps = rounded(exact);
   return microamps < 1000
     ? short(microamps, "µA", language)
     : short(microamps / 1000, "mA", language);
 }
 
 /** A charge in microampere-hours, in nAh, µAh or mAh. */
-export function charge(microampHours: number, language: Language): string {
+export function charge(exact: number, language: Language): string {
+  const microampHours = rounded(exact);
   if (microampHours === 0) {
     return short(0, "µAh", language);
   }
