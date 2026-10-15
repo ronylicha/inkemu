@@ -81,15 +81,31 @@ pub(crate) struct Pmp {
 /// same for every access that stays inside the page.
 #[derive(Clone, Debug)]
 struct PageVerdicts {
-    /// Bumped at every change of an entry: a verdict of another generation is stale.
+    /// Bumped at every change of an entry: a verdict of another generation is stale. Never 0, the
+    /// mark of an empty slot; when it would run past `u32::MAX` it starts again at 1 with every slot
+    /// emptied, so that no verdict of an earlier round is taken for a fresh one (`advance`).
     generation: u32,
     slots: Box<[Slot; VERDICT_SLOTS]>,
+}
+
+impl PageVerdicts {
+    const FIRST_GENERATION: u32 = 1;
+
+    /// Every verdict is stale from here on.
+    fn advance(&mut self) {
+        if let Some(next) = self.generation.checked_add(1) {
+            self.generation = next;
+        } else {
+            self.slots.fill(Slot::default());
+            self.generation = Self::FIRST_GENERATION;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Slot {
     page: u32,
-    /// The generation the slot was filled at, plus one: 0 is an empty slot.
+    /// The generation the slot was filled at: 0 is an empty slot.
     filled: u32,
     /// Permissions granted to user mode and to machine mode; `None` when they depend on where in
     /// the page the access falls.
@@ -107,7 +123,7 @@ impl Pmp {
             user_entries: 0,
             machine_entries: 0,
             verdicts: PageVerdicts {
-                generation: 0,
+                generation: PageVerdicts::FIRST_GENERATION,
                 slots: Box::new([Slot::default(); VERDICT_SLOTS]),
             },
         }
@@ -186,7 +202,7 @@ impl Pmp {
         }
         self.user_entries = self.entries_applying(Privilege::User);
         self.machine_entries = self.entries_applying(Privilege::Machine);
-        self.verdicts.generation = self.verdicts.generation.wrapping_add(1);
+        self.verdicts.advance();
     }
 
     /// One bit per entry that takes part in the checks of `privilege`.
@@ -240,7 +256,7 @@ impl Pmp {
         }
         let page = addr >> PAGE_SHIFT;
         let slot_index = usize::try_from(page).map_or(0, |p| p % VERDICT_SLOTS);
-        let filled = self.verdicts.generation.wrapping_add(1);
+        let filled = self.verdicts.generation;
         let slot = self.verdicts.slots[slot_index];
         let slot = if slot.filled == filled && slot.page == page {
             slot
@@ -803,6 +819,25 @@ mod tests {
             "a cached verdict is not reused"
         );
         assert!(p.allows(0x4038_0000, 4, Load, Machine));
+    }
+
+    #[test]
+    fn a_verdict_of_an_earlier_round_of_the_generation_counter_is_not_reused() {
+        let mut p = c3();
+        set_addr(&mut p, 0, word(0x2000));
+        configure(&mut p, 0, TOR | R);
+        // The verdict of page 0 is taken at generation 1.
+        p.verdicts.generation = PageVerdicts::FIRST_GENERATION;
+        assert!(p.allows(0x100, 4, Load, User));
+        // 2^32 − 2 changes later the counter is at its last value; the next change brings it back
+        // to 1, the generation the stale verdict carries.
+        p.verdicts.generation = u32::MAX;
+        configure(&mut p, 0, TOR);
+        assert_eq!(p.verdicts.generation, PageVerdicts::FIRST_GENERATION);
+        assert!(
+            !p.allows(0x100, 4, Load, User),
+            "the verdict filled at generation 1 of the earlier round is gone"
+        );
     }
 
     /// The verdict of every entry, without the page verdicts.
