@@ -6,7 +6,10 @@
 //! the application or a `SIGINT`/`SIGTERM` first powers it off, as its power button would, so
 //! that its last life writes its flash file and its session (2c-R17). A power-off that could not
 //! keep them is told to the user before the window goes, in the language the interface speaks
-//! (`set_language`), in a dialog or, for a signal, on the terminal.
+//! (`set_language`), in a dialog or, for a signal, on the terminal. Each waits for every
+//! power-off under way, an emulator a new start replaced included: the shell stays "on" until the
+//! last one has written its files. A second signal exits at once, with 130: a power-off still
+//! under way then loses what its last life had not written yet (its flash file, its session).
 mod commands;
 
 use commands::Shell;
@@ -84,7 +87,8 @@ fn power_off_telling(app: &AppHandle) {
 }
 
 /// On `SIGINT` or `SIGTERM` (Ctrl-C in the terminal that started it, a session that ends), the
-/// application powers the device off and exits; a second signal exits at once.
+/// application powers the device off, waits for every power-off under way, and exits; a second
+/// signal exits at once, losing what a power-off under way had not written yet.
 fn watch_signals(app: AppHandle) {
     let signalled = AtomicBool::new(false);
     let watched = ctrlc::set_handler(move || {

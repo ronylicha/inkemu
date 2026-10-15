@@ -9,7 +9,7 @@ use host::engine::{Limits, Notice};
 use serde::{Deserialize, Serialize};
 use soc_esp32c3::{ConsoleChannel, UsbHost};
 use std::path::PathBuf;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use tauri::State;
 use tauri::ipc::{Channel, Response};
 
@@ -40,29 +40,96 @@ pub fn closing_dialog(language: Language, detail: &str) -> (String, String) {
     (title.to_owned(), format!("{lead}\n\n{detail}"))
 }
 
-/// The emulator the window drives, if one runs, and the language the interface speaks.
+/// The emulator the window drives, with the number the interface gave its start: every command
+/// names the start it is meant for (2c-R18).
+#[derive(Debug)]
+struct Running {
+    start: u64,
+    emulator: Emulator,
+}
+
+/// The power-offs under way: an emulator taken from the shell still writes its flash file and
+/// its session until its thread ends. The application waits for them before it closes (2c-R17).
+#[derive(Clone, Debug, Default)]
+struct Stopping(Arc<(Mutex<usize>, Condvar)>);
+
+impl Stopping {
+    /// One more power-off under way, until the guard is dropped.
+    fn begin(&self) -> StopGuard {
+        *self.0.0.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        StopGuard(self.clone())
+    }
+
+    fn under_way(&self) -> bool {
+        *self.0.0.lock().unwrap_or_else(PoisonError::into_inner) > 0
+    }
+
+    /// Waits until no power-off is under way.
+    fn wait(&self) {
+        let (count, ended) = &*self.0;
+        let mut count = count.lock().unwrap_or_else(PoisonError::into_inner);
+        while *count > 0 {
+            count = ended.wait(count).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// A power-off under way ([`Stopping::begin`]); dropped when it ends, however it ends.
+#[derive(Debug)]
+struct StopGuard(Stopping);
+
+impl Drop for StopGuard {
+    fn drop(&mut self) {
+        let (count, ended) = &*self.0.0;
+        let mut count = count.lock().unwrap_or_else(PoisonError::into_inner);
+        *count = count.saturating_sub(1);
+        ended.notify_all();
+    }
+}
+
+/// The emulator the window drives, if one runs, the power-offs under way, and the language the
+/// interface speaks.
 #[derive(Debug, Default)]
 pub struct Shell {
-    emulator: Mutex<Option<Emulator>>,
+    running: Mutex<Option<Running>>,
+    stopping: Stopping,
     language: Mutex<Language>,
 }
 
+/// Refuses a command meant for the emulator of start `asked` when the one held is another (or
+/// none): a command queued for an emulator that a new start replaced never reaches the new one.
+fn same_start(held: Option<u64>, asked: u64) -> Result<(), ErrorDto> {
+    if held == Some(asked) {
+        Ok(())
+    } else {
+        Err(ErrorDto::from(CommandError::Stopped))
+    }
+}
+
 impl Shell {
-    /// Ends the last life of the running emulator, if any, and waits for it.
+    /// Ends the last life of the running emulator, if any, and waits for it and for every other
+    /// power-off under way (an emulator a new start replaced).
     ///
     /// # Errors
     /// What the last life could not keep (its flash file, its session), one error per line: the
     /// application tells its user before it closes.
     pub fn power_off(&self) -> Result<(), String> {
-        let running = self
-            .emulator
+        let ended = match self.take() {
+            Some((emulator, _under_way)) => emulator.shutdown().map_err(|e| e.to_string()),
+            None => Ok(()),
+        };
+        self.stopping.wait();
+        ended
+    }
+
+    /// Takes the running emulator, counted as a power-off under way until the guard drops.
+    /// Taken and counted under the lock: the shell is never seen off while one writes.
+    fn take(&self) -> Option<(Emulator, StopGuard)> {
+        self.running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        match running {
-            Some(emulator) => emulator.shutdown().map_err(|e| e.to_string()),
-            None => Ok(()),
-        }
+            .take()
+            .map(|running| (running.emulator, self.stopping.begin()))
     }
 
     /// The language the interface last said it speaks; English until it says.
@@ -71,39 +138,56 @@ impl Shell {
         *self.language.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether an emulator runs, which a power-off must end before the application closes.
+    /// Whether an emulator runs or a power-off is under way: either must end before the
+    /// application closes.
+    #[must_use]
     pub fn is_on(&self) -> bool {
-        self.emulator
+        // The lock first: a power-off is counted before the lock that takes it is released.
+        let running = self
+            .running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
+            .is_some();
+        running || self.stopping.under_way()
     }
 
     /// Whether the running emulator holds the flash file at `path`.
     fn holds_flash_file(&self, path: &std::path::Path) -> bool {
-        self.emulator
+        self.running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .is_some_and(|emulator| emulator.holds_flash_file(path))
+            .is_some_and(|running| running.emulator.holds_flash_file(path))
     }
 
+    /// A handle to the running emulator, whichever it is: for its image.
     fn handle(&self) -> Result<Handle, ErrorDto> {
-        self.emulator
+        self.running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .map(Emulator::handle)
+            .map(|running| running.emulator.handle())
             .ok_or_else(|| ErrorDto::from(CommandError::Stopped))
     }
 
-    /// Keeps `emulator`, and gives back the one it replaces (two starts at once), which the caller
-    /// powers off without holding the lock.
-    fn keep(&self, emulator: Emulator) -> Option<Emulator> {
-        self.emulator
+    /// A handle to the emulator of start `start`, refused when another runs ([`same_start`]).
+    fn handle_of(&self, start: u64) -> Result<Handle, ErrorDto> {
+        let running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        same_start(running.as_ref().map(|running| running.start), start)?;
+        running
+            .as_ref()
+            .map(|running| running.emulator.handle())
+            .ok_or_else(|| ErrorDto::from(CommandError::Stopped))
+    }
+
+    /// Keeps `emulator` as start `start`, and gives back the one it replaces (two starts at
+    /// once), counted as a power-off under way, which the caller powers off without the lock.
+    fn keep(&self, start: u64, emulator: Emulator) -> Option<(Emulator, StopGuard)> {
+        self.running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .replace(emulator)
+            .replace(Running { start, emulator })
+            .map(|replaced| (replaced.emulator, self.stopping.begin()))
     }
 }
 
@@ -267,6 +351,7 @@ async fn start(
     shell: &Shell,
     launch: device::Launch,
     speed: Speed,
+    number: u64,
     channel: Channel<Update>,
 ) -> Result<StartedDto, ErrorDto> {
     let started = StartedDto {
@@ -285,10 +370,16 @@ async fn start(
         }),
     )
     .map_err(|e| ErrorDto::new("powerOn", e))?;
-    if let Some(replaced) = shell.keep(emulator) {
+    if let Some((replaced, under_way)) = shell.keep(number, emulator) {
         // What its last life could not keep reaches the journal through its own updates, which
-        // the interface keeps (app/src/state/reducer.ts).
-        let _ = tauri::async_runtime::spawn_blocking(move || replaced.shutdown()).await?;
+        // the interface keeps (app/src/state/reducer.ts). Counted until it ends: the
+        // application does not close while it writes.
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let ended = replaced.shutdown();
+            drop(under_way);
+            ended
+        })
+        .await?;
     }
     Ok(started)
 }
@@ -322,6 +413,7 @@ pub async fn power_on(
     shell: State<'_, Shell>,
     setup: SetupDto,
     speed: Speed,
+    start: u64,
     on_update: Channel<Update>,
 ) -> Result<StartedDto, ErrorDto> {
     let setup = setup.into_setup()?;
@@ -334,7 +426,7 @@ pub async fn power_on(
         off_the_main_thread(shell).await?;
     }
     let launch = tauri::async_runtime::spawn_blocking(move || device::power_on(&setup)).await??;
-    start(shell, launch, speed, on_update).await
+    self::start(shell, launch, speed, start, on_update).await
 }
 
 /// Opens a session and replays it as `inkemu replay` does.
@@ -344,25 +436,26 @@ pub async fn open_replay(
     path: PathBuf,
     rom_dir: Option<PathBuf>,
     speed: Speed,
+    start: u64,
     on_update: Channel<Update>,
 ) -> Result<StartedDto, ErrorDto> {
     // A replay holds no file of a run: the device that runs goes on until the replay is ready.
     let launch =
         tauri::async_runtime::spawn_blocking(move || device::open_replay(&path, rom_dir, None))
             .await??;
-    start(shell.inner(), launch, speed, on_update).await
+    self::start(shell.inner(), launch, speed, start, on_update).await
 }
 
 /// Powers off the emulator that runs, off the interface's thread: its last life writes its files.
 async fn off_the_main_thread(shell: &Shell) -> Result<(), ErrorDto> {
-    let running = shell
-        .emulator
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
-    if let Some(emulator) = running {
+    if let Some((emulator, under_way)) = shell.take() {
         // What its last life could not keep reaches the journal through its own updates.
-        let _ = tauri::async_runtime::spawn_blocking(move || emulator.shutdown()).await?;
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            let ended = emulator.shutdown();
+            drop(under_way);
+            ended
+        })
+        .await?;
     }
     Ok(())
 }
@@ -378,9 +471,10 @@ async fn off_the_main_thread(shell: &Shell) -> Result<(), ErrorDto> {
 pub fn command(
     shell: State<'_, Shell>,
     command: CommandDto,
+    start: u64,
     answer: Channel<Option<ErrorDto>>,
 ) -> Result<(), ErrorDto> {
-    let pending = shell.handle()?.submit(command.into_command()?)?;
+    let pending = shell.handle_of(start)?.submit(command.into_command()?)?;
     tauri::async_runtime::spawn_blocking(move || {
         // A window that closed takes no answer.
         let _ = answer.send(pending.wait().err().map(ErrorDto::from));
@@ -514,6 +608,34 @@ mod tests {
         );
         assert!(text.ends_with("\n\nx"), "{text}");
         assert!(serde_json::from_str::<Language>(r#""de""#).is_err());
+    }
+
+    /// A power-off under way (a slow one: its flash file is still being written) keeps the
+    /// shell on, and a power-off of the shell waits for it: the application cannot close
+    /// before it ends.
+    #[test]
+    fn a_power_off_under_way_keeps_the_shell_on_until_it_ends() {
+        let shell = Shell::default();
+        let under_way = shell.stopping.begin();
+        assert!(shell.is_on());
+        let slow = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(under_way);
+        });
+        let asked = std::time::Instant::now();
+        assert_eq!(shell.power_off(), Ok(()));
+        assert!(asked.elapsed() >= std::time::Duration::from_millis(250));
+        assert!(!shell.is_on());
+        slow.join().unwrap();
+    }
+
+    /// A command is for the emulator of one start: refused as stopped when another runs, or none.
+    #[test]
+    fn a_command_for_a_replaced_emulator_is_refused() {
+        assert!(same_start(Some(2), 2).is_ok());
+        assert_eq!(same_start(Some(3), 2).unwrap_err().kind, "stopped");
+        assert_eq!(same_start(None, 2).unwrap_err().kind, "stopped");
+        assert_eq!(Shell::default().handle_of(1).unwrap_err().kind, "stopped");
     }
 
     #[test]

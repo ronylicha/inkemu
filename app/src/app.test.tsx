@@ -29,6 +29,7 @@ describe("App", () => {
         record: null,
       }),
       "realTime",
+      1,
       expect.any(Function),
     );
     expect(await screen.findByText(/inkemu: Xteink X4/)).toBeInTheDocument();
@@ -50,7 +51,8 @@ describe("App", () => {
     expect(screen.getByText("160 MHz")).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("Run: Running");
     await user.click(screen.getByRole("button", { name: "Pause" }));
-    expect(host.command).toHaveBeenCalledWith({ kind: "pause" });
+    // To the emulator of the first start.
+    expect(host.command).toHaveBeenCalledWith({ kind: "pause" }, 1);
   });
 
   it("names a refused start in its own words and keeps the host's text as the detail", async () => {
@@ -122,6 +124,26 @@ describe("App", () => {
       expect(screen.getByRole("log", { name: "USB-Serial-JTAG" })).toHaveTextContent("first still"),
     );
     expect(screen.getByRole("button", { name: "Pause" })).toBeEnabled();
+    // The device that runs is still the first start's: commands go to it.
+    await user.click(screen.getByRole("button", { name: "Pause" }));
+    expect(host.command).toHaveBeenLastCalledWith({ kind: "pause" }, 1);
+  });
+
+  it("sends commands to the emulator of the last start, which the shell checks", async () => {
+    const host = fakeHost();
+    const user = userEvent.setup();
+    renderWith(<App />, { host });
+    await powerOn(user);
+    await screen.findByText(/inkemu: Xteink X4/);
+    await powerOn(user);
+    await waitFor(() => expect(host.powerOn).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(host.powerOn).mock.calls[1]?.[2]).toBe(2);
+    act(() => {
+      host.send({ event: "status", data: status() });
+    });
+    const pause = await screen.findByRole("button", { name: "Pause" });
+    await user.click(pause);
+    expect(host.command).toHaveBeenLastCalledWith({ kind: "pause" }, 2);
   });
 
   it("says in the journal where a capture went, and why one was refused", async () => {
@@ -137,7 +159,7 @@ describe("App", () => {
     const capture = await screen.findByRole("button", { name: "Capture the screen" });
     await waitFor(() => expect(capture).toBeEnabled());
     await user.click(capture);
-    expect(host.saveCapture).toHaveBeenCalledWith("/home/user/out.png");
+    expect(host.saveCapture).toHaveBeenCalledWith("/home/user/out.png", 1);
     await waitFor(() =>
       expect(screen.getByRole("log", { name: "Journal" })).toHaveTextContent(
         "Capture saved: out.png",

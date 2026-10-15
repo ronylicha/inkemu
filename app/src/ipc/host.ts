@@ -13,19 +13,29 @@ import { isHostError } from "./types";
 export type FileKind = "firmware" | "bootloader" | "flash" | "session" | "romDir";
 export type SaveKind = "flashFile" | "session" | "capture";
 
+/**
+ * Every start is numbered by the window (`start`); a command names the start it is meant for, and
+ * the shell refuses it, as stopped, when another emulator has replaced that one (2c-R18).
+ */
 export interface HostApi {
   devices(): Promise<DeviceView[]>;
-  powerOn(setup: Setup, speed: Speed, onUpdate: (update: Update) => void): Promise<Started>;
+  powerOn(
+    setup: Setup,
+    speed: Speed,
+    start: number,
+    onUpdate: (update: Update) => void,
+  ): Promise<Started>;
   openReplay(
     path: string,
     romDir: string | null,
     speed: Speed,
+    start: number,
     onUpdate: (update: Update) => void,
   ): Promise<Started>;
-  command(command: Command): Promise<void>;
+  command(command: Command, start: number): Promise<void>;
   /** The image of the last refresh, `null` before the first. */
   frame(): Promise<Frame | null>;
-  saveCapture(path: string): Promise<void>;
+  saveCapture(path: string, start: number): Promise<void>;
   notices(): Promise<string>;
   /** Tells the shell the language of the interface, which its own dialogs speak. */
   setLanguage(language: Language): Promise<void>;
@@ -85,7 +95,7 @@ export function serialized<A extends unknown[], T>(
  * Gives a command to the emulator: the shell gives it at once, in the order it received it, and
  * answers through a channel once the emulator has done it.
  */
-function sendCommand(command: Command): Promise<void> {
+function sendCommand(command: Command, start: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const answer = new Channel<HostError | null>();
     answer.onmessage = (refusal) => {
@@ -95,7 +105,7 @@ function sendCommand(command: Command): Promise<void> {
         reject(asHostError(refusal));
       }
     };
-    call<void>("command", { command, answer }).catch(reject);
+    call<void>("command", { command, start, answer }).catch(reject);
   });
 }
 
@@ -103,16 +113,16 @@ const command = serialized(sendCommand);
 
 export const tauriHost: HostApi = {
   devices: () => call<DeviceView[]>("devices"),
-  powerOn: (setup, speed, onUpdate) =>
-    call<Started>("power_on", { setup, speed, onUpdate: channelOf(onUpdate) }),
-  openReplay: (path, romDir, speed, onUpdate) =>
-    call<Started>("open_replay", { path, romDir, speed, onUpdate: channelOf(onUpdate) }),
+  powerOn: (setup, speed, start, onUpdate) =>
+    call<Started>("power_on", { setup, speed, start, onUpdate: channelOf(onUpdate) }),
+  openReplay: (path, romDir, speed, start, onUpdate) =>
+    call<Started>("open_replay", { path, romDir, speed, start, onUpdate: channelOf(onUpdate) }),
   command,
   frame: async () => {
     const buffer = await call<ArrayBuffer>("frame");
     return buffer.byteLength === 0 ? null : decodeFrame(buffer);
   },
-  saveCapture: (path) => command({ kind: "capture", path }),
+  saveCapture: (path, start) => command({ kind: "capture", path }, start),
   notices: () => call<string>("notices"),
   setLanguage: (language) => call<void>("set_language", { language }),
   pickFile: async (kind) => {

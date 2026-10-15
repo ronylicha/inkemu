@@ -99,17 +99,34 @@ describe("reducer", () => {
     expect(state.journal.at(-1)?.text).toBe("error: the flash was not saved");
   });
 
-  it("shows a new emulator from its first update, even before its start is answered", () => {
+  it("shows a new emulator from the answer to its start, its lines before what it said first", () => {
     let state = send(started(), 1, text("uart0", "old"));
     state = reducer(state, { type: "starting", start: 2 });
     state = send(state, 1, text("uart0", " more"));
     expect(state.consoles.uart0).toBe("old more");
-    state = send(state, 2, text("uart0", "new"));
+    state = send(state, 2, text("uart0", "new"), {
+      event: "notice",
+      data: { level: "info", text: "early" },
+    });
+    // Not shown yet: the one shown is still the first.
+    expect(state.current).toBe(1);
+    expect(state.consoles.uart0).toBe("old more");
+    state = reducer(state, { type: "started", start: 2, started: answer });
     expect(state.current).toBe(2);
     expect(state.consoles.uart0).toBe("new");
-    state = reducer(state, { type: "started", start: 2, started: answer });
-    expect(state.consoles.uart0).toBe("new");
     expect(state.starting).toBeNull();
+    expect(state.journal.slice(-2).map((entry) => entry.text)).toEqual([
+      "inkemu: Xteink X4",
+      "early",
+    ]);
+  });
+
+  it("forgets what a refused start's emulator said", () => {
+    let state = reducer(started(), { type: "starting", start: 2 });
+    state = send(state, 2, text("uart0", "never"));
+    state = reducer(state, { type: "failed", start: 2, error: { kind: "rom", message: "m" } });
+    expect(state.early).toEqual([]);
+    expect(state.current).toBe(1);
   });
 
   it("leaves the device that runs as it is when a start is refused, and shows why", () => {

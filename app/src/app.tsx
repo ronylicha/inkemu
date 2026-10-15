@@ -56,16 +56,20 @@ export function App() {
   }, [host]);
 
   const failed = (reason: unknown) => dispatch({ type: "failed", error: asHostError(reason) });
+  // Commands go to the emulator shown, by the number of its start: one queued behind a new start
+  // is refused rather than reaching the new emulator.
   const command = (next: Command) => {
-    host.command(next).catch(failed);
+    host.command(next, state.current).catch(failed);
   };
 
   /** Starts what `begin` starts, numbered, its updates gathered per frame. */
-  const start = (begin: (onUpdate: (update: Update) => void) => Promise<Started>) => {
+  const start = (
+    begin: (number: number, onUpdate: (update: Update) => void) => Promise<Started>,
+  ) => {
     starts.current += 1;
     const number = starts.current;
     dispatch({ type: "starting", start: number });
-    begin((update) => batcher.push(number, update))
+    begin(number, (update) => batcher.push(number, update))
       .then((started) => {
         batcher.flush();
         dispatch({ type: "started", start: number, started });
@@ -77,14 +81,14 @@ export function App() {
 
   const powerOn = (setup: Setup) => {
     setAsking(false);
-    start((onUpdate) => host.powerOn(setup, speed, onUpdate));
+    start((number, onUpdate) => host.powerOn(setup, speed, number, onUpdate));
   };
 
   const replay = async () => {
     try {
       const path = await host.pickFile("session");
       if (path !== null) {
-        start((onUpdate) => host.openReplay(path, null, speed, onUpdate));
+        start((number, onUpdate) => host.openReplay(path, null, speed, number, onUpdate));
       }
     } catch (reason) {
       failed(reason);
@@ -97,7 +101,7 @@ export function App() {
       if (path === null) {
         return;
       }
-      await host.command({ kind: "record", path });
+      await host.command({ kind: "record", path }, state.current);
       dispatch({
         type: "said",
         notice: { level: "info", text: t("said.recording", { name: fileName(path) }) },
@@ -113,7 +117,7 @@ export function App() {
       if (path === null) {
         return;
       }
-      await host.saveCapture(path);
+      await host.saveCapture(path, state.current);
       dispatch({
         type: "said",
         notice: { level: "info", text: t("said.captured", { name: fileName(path) }) },

@@ -4,7 +4,9 @@
 // Every start is numbered by the window (`start`), and every update carries the number of the
 // emulator that sent it: the state shows one emulator, and an emulator that a newer one replaced
 // may still be sending its last updates. Of those, only the notices are kept, in the journal (what
-// its last life could not keep, for instance); the rest would show another device (2c-R18).
+// its last life could not keep, for instance); the rest would show another device (2c-R18). A new
+// emulator is shown from the answer to its start: what it sent before is kept until then, after
+// the answer's lines.
 
 import type {
   ConsoleChannel,
@@ -40,6 +42,8 @@ export interface AppState {
   current: number;
   /** The number of a start not answered yet, which the shown emulator outlives if it is refused. */
   starting: number | null;
+  /** What the emulator of that start sent before its answer, shown with the answer. */
+  early: Update[];
   devices: DeviceView[];
   device: string;
   look: Look | null;
@@ -84,6 +88,7 @@ export function initialState(): AppState {
     phase: "off",
     current: 0,
     starting: null,
+    early: [],
     devices: [],
     device: "x4",
     look: null,
@@ -150,20 +155,18 @@ function applyUpdate(state: AppState, update: Update): AppState {
 }
 
 function applyUpdates(state: AppState, start: number, updates: readonly Update[]): AppState {
-  let next = state;
   if (start === state.starting && start !== state.current) {
-    // The new emulator speaks before its start is answered: it is the one shown from now on.
-    next = adopt(state, start);
-  } else if (start !== state.current) {
+    // The new emulator speaks before its start is answered: kept until the answer, whose lines
+    // (the first of the run) come first in the journal.
+    return { ...state, early: [...state.early, ...updates] };
+  }
+  if (start !== state.current) {
     return withNotices(
       state,
       updates.flatMap((update) => (update.event === "notice" ? [update.data] : [])),
     );
   }
-  for (const update of updates) {
-    next = applyUpdate(next, update);
-  }
-  return next;
+  return updates.reduce(applyUpdate, state);
 }
 
 export function reducer(state: AppState, action: Action): AppState {
@@ -176,28 +179,34 @@ export function reducer(state: AppState, action: Action): AppState {
     case "selectDevice":
       return { ...state, device: action.device };
     case "starting":
-      return { ...state, starting: action.start, error: null };
+      return { ...state, starting: action.start, early: [], error: null };
     case "started": {
-      // Adopted already when it spoke first; its phase is then what its updates made it.
-      const shown = state.current === action.start ? state : adopt(state, action.start);
-      return withNotices(
+      if (action.start !== state.starting) {
+        return state;
+      }
+      // Its lines first, then what it said while its start was answered.
+      const shown = withNotices(
         {
-          ...shown,
-          starting: state.starting === action.start ? null : state.starting,
+          ...adopt(state, action.start),
+          starting: null,
+          early: [],
           look: action.started.look,
           deviceName: action.started.deviceName,
           console: action.started.console,
         },
         action.started.notices,
       );
+      return state.early.reduce(applyUpdate, shown);
     }
-    case "failed":
+    case "failed": {
+      const answered = action.start !== undefined && action.start === state.starting;
       return {
         ...state,
-        starting:
-          action.start !== undefined && action.start === state.starting ? null : state.starting,
+        starting: answered ? null : state.starting,
+        early: answered ? [] : state.early,
         error: action.error,
       };
+    }
     case "updates":
       return applyUpdates(state, action.start, action.updates);
     case "said":

@@ -66,11 +66,11 @@ export function fakeHost(overrides: Partial<HostApi> = {}): FakeHost {
   };
   const host: HostApi = {
     devices: vi.fn(async () => [X4]),
-    powerOn: vi.fn(async (_setup, _speed, onUpdate) => {
+    powerOn: vi.fn(async (_setup, _speed, _start, onUpdate) => {
       listener = onUpdate;
       return started;
     }),
-    openReplay: vi.fn(async (_path, _romDir, _speed, onUpdate) => {
+    openReplay: vi.fn(async (_path, _romDir, _speed, _start, onUpdate) => {
       listener = onUpdate;
       return started;
     }),
