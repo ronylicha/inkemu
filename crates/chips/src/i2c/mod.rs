@@ -303,4 +303,59 @@ mod tests {
             assert!(text.contains(';'), "a cause, then a remedy: {text}");
         }
     }
+
+    /// A deterministic xorshift generator for the test below.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Whatever a master puts on the bus, in whatever order, no chip panics: STARTs to its own
+    /// address (mostly) or another, reads and writes, bytes acknowledged or not, STOPs or none,
+    /// repeated STARTs, and time that moves on by nanoseconds or by years.
+    #[test]
+    fn no_sequence_of_conditions_makes_a_chip_panic() {
+        use emu_core::I2cTarget;
+
+        let mut chips: Vec<(u8, Box<dyn I2cTarget>)> = vec![
+            (
+                0x55,
+                Box::new(bq27220::Bq27220::new(bq27220::Bq27220Config::default()).unwrap()),
+            ),
+            (
+                0x68,
+                Box::new(ds3231::Ds3231::new(ds3231::Ds3231Config::default()).unwrap()),
+            ),
+            (
+                0x6B,
+                Box::new(qmi8658::Qmi8658::new(qmi8658::Qmi8658Config::default()).unwrap()),
+            ),
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for (own, chip) in &mut chips {
+            let mut now: u64 = 0;
+            for _ in 0..200_000 {
+                let draw = xorshift(&mut state);
+                let [operation, choice, byte, ..] = draw.to_le_bytes();
+                let at = Nanos(now);
+                match operation % 16 {
+                    0..=2 => {
+                        let address = if choice % 4 == 0 { byte & 0x7F } else { *own };
+                        let _ = chip.address(address, choice % 2 == 0, at);
+                    }
+                    3..=8 => {
+                        let _ = chip.write(byte, at);
+                    }
+                    9..=12 => {
+                        let _ = chip.read(choice % 8 != 0, at);
+                    }
+                    13 => chip.stop(at),
+                    14 => now = now.saturating_add(u64::from(byte) << (choice % 48)),
+                    _ => now = now.saturating_add(u64::from(choice) * 1_000),
+                }
+            }
+        }
+    }
 }

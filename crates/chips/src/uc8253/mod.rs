@@ -305,6 +305,24 @@ impl Ram {
             }
         }
     }
+
+    /// Copies the pixels of `area` from NEW to OLD (`N2OCP`), a byte of eight pixels at a time:
+    /// the copy runs after every refresh, over up to the whole RAM.
+    fn copy_new_to_old(&mut self, area: Area) {
+        let [old, new] = &mut self.planes;
+        for y in area.y0..=area.y1 {
+            let row = usize::from(y) * ROW_BYTES;
+            for column in (area.x0 / 8)..=(area.x1 / 8) {
+                let first = (column * 8).max(area.x0) % 8;
+                let last = (column * 8 + 7).min(area.x1) % 8;
+                let mask = (0xFF_u8 >> first) & (0xFF_u8 << (7 - last));
+                let at = row + usize::from(column);
+                if let (Some(target), Some(&source)) = (old.get_mut(at), new.get(at)) {
+                    *target = (*target & !mask) | (source & mask);
+                }
+            }
+        }
+    }
 }
 
 /// The supply and reset state of the chip.
@@ -965,25 +983,7 @@ impl Uc8253 {
             }
         }
         if until_ns.is_none() && self.regs.copies_new_to_old(self.config.variant) {
-            let area = refresh.area;
-            for y in area.y0..=area.y1 {
-                for x in area.x0..=area.x1 {
-                    if let Some(bit) = self.ram.bit(Plane::New, x, y) {
-                        self.ram.write(
-                            Plane::Old,
-                            x,
-                            y,
-                            if bit { 0x80 } else { 0 },
-                            Area {
-                                x0: x,
-                                y0: y,
-                                x1: x,
-                                y1: y,
-                            },
-                        );
-                    }
-                }
-            }
+            self.ram.copy_new_to_old(refresh.area);
         }
         self.image = PanelImage {
             width: self.config.panel.sources,

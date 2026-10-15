@@ -446,3 +446,91 @@ fn the_x3_probe_through_the_lines_reads_the_variant() {
         assert_eq!(read, expected);
     }
 }
+
+/// A deterministic xorshift generator for the test below.
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// Whatever a firmware sends, in whatever order, the chip neither panics nor stops counting:
+/// commands (mostly ones it knows, so that their data reach every register), data, reads, resets,
+/// waits to its deadlines and jumps of time, on both variants. Now and then the driver resets the
+/// chip and runs its own full refresh in the middle of the stream, so that the refreshes start,
+/// and the stream then cuts them, reads during them and rewrites their registers.
+#[test]
+fn no_sequence_of_bytes_resets_and_reads_makes_the_chip_panic() {
+    let known: Vec<u8> = (0..=u8::MAX)
+        .filter(|&command| {
+            let mut chip = Uc8253::new(Uc8253Config::xteink_x3(), ONE_GIGAHERTZ).unwrap();
+            chip.write_command(Cycles(0), command);
+            chip.take_diagnostics().is_empty()
+        })
+        .collect();
+    assert!(known.len() > 20, "{known:?}");
+    let black = frame_with_black(0, 792, 0, 528);
+    for (mut config, seed) in [
+        (Uc8253Config::xteink_x3(), 0x9E37_79B9_7F4A_7C15_u64),
+        (Uc8253Config::xteink_x3_uc8279d(), 0xD1B5_4A32_D192_ED03_u64),
+    ] {
+        // A glass of 16 sources on every gate: each refresh reaches every row of the RAM a scan
+        // and a window can name, at a cost the test can pay for thousands of refreshes.
+        config.panel = Uc8253Geometry {
+            sources: 16,
+            gates: 600,
+            ..config.panel
+        };
+        let mut driver = Driver::new(config);
+        let mut state = seed;
+        for step in 0..100_000 {
+            if step % 25_000 == 12_500 {
+                driver.chip.set_reset(driver.at(), true);
+                driver.now += 10 * MS;
+                driver.chip.set_reset(driver.at(), false);
+                driver.wait();
+                driver.init();
+                // The stream's window and partial mode, if it set them, stay in force.
+                driver.full(&black);
+            }
+            let draw = xorshift(&mut state);
+            let [operation, choice, byte, data, ..] = draw.to_le_bytes();
+            let at = driver.at();
+            match operation % 16 {
+                0..=4 => {
+                    let command = if choice % 4 == 0 {
+                        byte
+                    } else {
+                        known[usize::from(byte) % known.len()]
+                    };
+                    driver.chip.write_command(at, command);
+                }
+                5..=10 => driver.chip.write_data(at, data),
+                11 => {
+                    let _ = driver.chip.read_data(at);
+                }
+                12 => {
+                    driver.chip.set_reset(at, true);
+                    driver.now += u64::from(choice) * 10_000;
+                    driver.chip.set_reset(driver.at(), false);
+                }
+                13 => {
+                    if let Some(next) = driver.chip.next_deadline() {
+                        driver.now = driver.now.max(next.get());
+                        driver.chip.advance(driver.at());
+                    }
+                }
+                _ => driver.now += u64::from(choice) * 10_000,
+            }
+            let _ = driver.chip.busy_pin(driver.at());
+            let _ = driver.chip.take_diagnostics();
+        }
+        let image = driver.chip.panel_image();
+        assert!(image.generation > 0, "refreshes ran");
+        assert_eq!(
+            image.pixels.len(),
+            usize::from(image.width) * usize::from(image.height)
+        );
+    }
+}
