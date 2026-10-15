@@ -5,12 +5,13 @@
 #   flash_nvs.bin      the nvs_rw_value_cxx example, which keeps a restart counter in NVS;
 #   flash_nvs_ota.bin  the same application under the stock partition table of the X4
 #                      (tests/fixtures/partitions/x4-stock.bin), whose bootloader writes otadata;
-# and seven applications alone, which the tests boot behind the bootloader inkemu ships:
+# and eight applications alone, which the tests boot behind the bootloader inkemu ships:
 # uart_select.bin, usb_serial_jtag_echo.bin and usb_serial_jtag_console.bin (the serial consoles),
 # adc_wait_panic.bin (the wait for the SAR ADC that stopped CrossPoint, then a wait that ends in a
 # panic and a core dump), deep_sleep_timer.bin (three deep sleeps woken by the RTC timer, then one
 # with no wake source), coremark_example.bin (Espressif's CoreMark example, whose score holds the
-# timing model) and soc_signals.bin (GPIO, GP-SPI2, the SAR ADC and I2C0 on the pins of the X4).
+# timing model), soc_signals.bin (GPIO, GP-SPI2, the SAR ADC and I2C0 on the pins of the X4) and
+# x4_panel_buttons.bin (the latch, the panel, the button ladders and the power key of the wired X4).
 # Everything third-party runs inside Docker, in one container run. One artefact of this build is
 # committed: its bootloader, the one inkemu ships (third_party/esp-idf-bootloader/, the same bytes);
 # nothing else built here is.
@@ -46,3 +47,4 @@ echo "$out/adc_wait_panic.bin"
 echo "$out/deep_sleep_timer.bin"
 echo "$out/coremark_example.bin"
 echo "$out/soc_signals.bin"
+echo "$out/x4_panel_buttons.bin"

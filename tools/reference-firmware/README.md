@@ -34,6 +34,7 @@ X4 (`crates/boards/tests/reference_signals.rs`) boot them behind the bootloader 
 | `usb_serial_jtag_console.bin` | `usb_serial_jtag_console/` of this directory, ours (Apache-2.0): USB-Serial-JTAG is the console, each line read is echoed; it needs a USB host that reads the port | type `hello\r` | `SHA256SUMS.inputs-usj-console` |
 | `adc_wait_panic.bin` | `adc_wait_panic/` of this directory, ours (Apache-2.0): it reads a register of I2C0, starts a conversion of ADC1 and waits for its end with interrupts masked, as CrossPoint 1.6.5 does, and prints the reading; then it clears ADC2's done bit and waits the same way for ADC2, which converts nothing, until the interrupt watchdog panics; the panic writes a core dump to the `coredump` partition, and the next life says it found it | read its two lives, the reading, the absence of warnings and its trace hash | `SHA256SUMS.inputs-adc-wait-panic` |
 | `soc_signals.bin` | `soc_signals/` of this directory, ours (Apache-2.0): through the ESP-IDF drivers and on the pins of the X4, a GPIO output (the panel's reset) and an input whose interrupt counts both edges (BUSY); GP-SPI2 in CPU mode to two devices, one under a hardware chip select with a data/command line, one under a software chip select; a one-shot read of the SAR ADC calibrated by the eFuse; a probe of I2C0. Its console is USB-Serial-JTAG | attach a panel, an SD card and a voltage to the pins (`crates/boards/tests/reference_signals.rs`), and read what each saw, what the firmware prints and its trace hash | `SHA256SUMS.inputs-soc-signals` |
+| `x4_panel_buttons.bin` | `x4_panel_buttons/` of this directory, ours (Apache-2.0): the wired board of the X4 as a firmware uses it, through the ESP-IDF drivers. It holds the latch of its supply (GPIO13), reads the cable (GPIO20) and the battery (GPIO0, half the cell); drives the SSD1677 on GP-SPI2 as the X4's drivers do (gates scanned with SM = 1, the top row of the glass in the last RAM row) for a full refresh of a frame and a square; reads the two button ladders every 20 ms and shows each press by a black square and a differential refresh; arms its power key once the gesture of the board has released it; pressed again on battery, it lets go of the latch, and with the cable in it goes into deep sleep woken by the power key (GPIO3 low), its next life drawing a second corner square. Its console is USB-Serial-JTAG | press buttons and the power key from a console script, read the console, the refreshes and the pixels of the panel (`crates/boards/tests/reference_panel.rs`), the end of the run with the device off, the wake by the key on a cable, the trace hash, and the record and replay | `SHA256SUMS.inputs-x4-panel-buttons` |
 | `deep_sleep_timer.bin` | `deep_sleep_timer/` of this directory, ours (Apache-2.0): it counts its lives in RTC memory (`RTC_DATA_ATTR`) and prints, at each, its reset reason, its wake cause, the runs of its own wake stub (`RTC_IRAM_ATTR esp_wake_deep_sleep`, which the ROM calls only when the CRC of the RTC fast memory matches) and the milliseconds it slept; lives 1 to 3 sleep 2 s on the RTC timer, life 4 sleeps with no wake source | read its four lives, the three wakes (`rst:0x5 (DSLEEP)`), the stub run once per wake, the end of the run with the device asleep, and its trace hash | `SHA256SUMS.inputs-deep-sleep-timer` |
 | `coremark_example.bin` | `coremark_example/` of this directory: Espressif's `espressif/coremark` 1.1.0~2, its example and its component (the EEMBC sources, Apache-2.0 with the CoreMark Acceptable Use Agreement; Espressif's port, Apache-2.0; the example, CC0-1.0), copied unmodified (`coremark_example/PROVENANCE.md`); CoreMark's sources at `-O3 -fjump-tables -ftree-switch-conversion`, its code in IRAM, timed by `esp_timer` | read the CRCs of the 2K performance run, `Correct operation validated`, the score (within 15 % of the 483.27 the ESP32-C3 datasheet publishes: criterion 5, ADR 0009) and its trace hash | `SHA256SUMS.inputs-coremark` |
 
@@ -45,7 +46,7 @@ configured the same way, its own file adding `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 `adc_wait_panic`, whose file adds the stock partition table of the X4 (`partitions.csv`, a copy of
 `tests/fixtures/partitions/x4-stock.csv`) and `CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y`, and so is
 `soc_signals`, whose file adds `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`: its hardware chip select is
-GPIO21, the transmit pad of UART0.
+GPIO21, the transmit pad of UART0; `x4_panel_buttons` adds the same line for the same reason.
 `deep_sleep_timer` ships no file of its own: it is built with the reference configuration alone, in
 which `CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP` keeps its default (`y`), so that ESP-IDF enters
 deep sleep through `rtc_deep_sleep_start` and the CRC unit of the RTC fast memory.
@@ -85,11 +86,13 @@ Run the tests that need the images, those of the machine and those of the `inkem
       INKEMU_ADC_WAIT_PANIC_APP="$PWD/target/reference-firmware/adc_wait_panic.bin" \
       INKEMU_DEEP_SLEEP_TIMER_APP="$PWD/target/reference-firmware/deep_sleep_timer.bin" \
       INKEMU_COREMARK_APP="$PWD/target/reference-firmware/coremark_example.bin" \
-      INKEMU_SOC_SIGNALS_APP="$PWD/target/reference-firmware/soc_signals.bin"
+      INKEMU_SOC_SIGNALS_APP="$PWD/target/reference-firmware/soc_signals.bin" \
+      INKEMU_X4_PANEL_APP="$PWD/target/reference-firmware/x4_panel_buttons.bin"
     cargo test --release -p soc-esp32c3 --test reference_boot -- --ignored
     cargo test --release -p emu-cli --test run_cli reference_firmware -- --ignored
     cargo test --release -p console-script --test reference_firmware -- --ignored
     cargo test --release -p boards --test reference_signals -- --ignored
+    cargo test --release -p boards --test reference_panel -- --ignored
 
 The tests of `inkemu run --firmware` boot the application images alone: they take them out of the
 merged images, from 0x10000, and check them against `SHA256SUMS.inputs` and `SHA256SUMS.inputs-nvs`

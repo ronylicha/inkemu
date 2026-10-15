@@ -4628,6 +4628,128 @@ fn x4_records_the_deep_sleep_timer_reference_firmware_through_its_wakes_and_repl
     assert_eq!(trace_hash_line(&log), trace, "{log}");
 }
 
+/// The trace of the run of `x4_panel_buttons` below, measured on 2026-10-15 on the development
+/// host with every other assertion of the test passing (twice, the same).
+const X4_PANEL_TRACE: &str = "trace-hash 5b35ac6a537bf727";
+
+/// What a user does to `x4_panel_buttons` on the wired X4: once its power key is armed, Confirm,
+/// then Down, each shown by a refresh, then the power key.
+const X4_PANEL_SCRIPT: &str = "\
+wait-for usb-serial-jtag \"x4_panel_buttons: power key released, armed\"
+press confirm
+wait 100ms
+release confirm
+wait-for usb-serial-jtag \"partial refresh 1,\"
+press down
+wait 100ms
+release down
+wait-for usb-serial-jtag \"partial refresh 2,\"
+press power
+wait 100ms
+release power
+";
+
+/// The wired X4 through the real command (sub-project 2d, ADR 0013): `x4_panel_buttons`, powered
+/// on by the gesture of the profile, holds its latch, refreshes its panel once in full, shows the
+/// presses of a console script by two differential refreshes, and lets go of its latch when its
+/// power key is pressed: the X4 goes off when the key is released, the run ends with exit code 0
+/// and says so. Recorded with `--record`, the session (the gesture and the six presses and
+/// releases) replays identically. The pixels are read by `crates/boards/tests/reference_panel.rs`.
+///
+/// `reference_firmware` is in the name: it selects the tests of the CI job that has the image.
+#[test]
+#[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_X4_PANEL_APP"]
+fn x4_runs_the_panel_and_buttons_reference_firmware_to_its_power_off_and_replays_it_identically() {
+    let rom_dir = std::env::var("INKEMU_ROM_ELF_DIR").expect("set INKEMU_ROM_ELF_DIR");
+    let application = std::env::var("INKEMU_X4_PANEL_APP").expect(
+        "set INKEMU_X4_PANEL_APP to the x4_panel_buttons.bin of tools/reference-firmware/build.sh",
+    );
+    assert_eq!(
+        sha256_of(std::path::Path::new(&application)),
+        pinned_in_sums("SHA256SUMS.inputs-x4-panel-buttons", "x4_panel_buttons.bin"),
+        "{application} is not the pinned x4_panel_buttons.bin; rebuild it with tools/reference-firmware/build.sh"
+    );
+    let (_script_dir, script) = console_script(X4_PANEL_SCRIPT);
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("x4_panel_buttons.inkrec");
+    let run = inkemu()
+        .args([
+            "run",
+            "--device",
+            "x4",
+            "--max-time",
+            "10",
+            "--rom-dir",
+            &rom_dir,
+        ])
+        .arg("--firmware")
+        .arg(&application)
+        .arg("--console-script")
+        .arg(&script)
+        .arg("--record")
+        .arg(&session)
+        .timeout(HANG_LIMIT)
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let console = String::from_utf8_lossy(&run.stdout).replace('\r', "");
+    let log = String::from_utf8_lossy(&run.stderr).into_owned();
+    let mut from = 0;
+    for expected in [
+        "x4_panel_buttons: start, latch held\n",
+        "x4_panel_buttons: usb cable unplugged\n",
+        "x4_panel_buttons: battery ",
+        "x4_panel_buttons: full refresh, busy ",
+        "x4_panel_buttons: ready\n",
+        "x4_panel_buttons: power key released, armed\n",
+        "x4_panel_buttons: pressed confirm\n",
+        "x4_panel_buttons: partial refresh 1, busy ",
+        "x4_panel_buttons: pressed down\n",
+        "x4_panel_buttons: partial refresh 2, busy ",
+        "x4_panel_buttons: power key pressed, latch released\n",
+    ] {
+        let at = console[from..].find(expected).unwrap_or_else(|| {
+            panic!("`{expected}` is missing, or out of order:\n{console}\n{log}")
+        });
+        from += at + expected.len();
+    }
+    for expected in [
+        "\ninkemu: the device powered off: its board cut its supply, so the run ends here; ",
+        "inkemu: console script through (12 steps)\n",
+        // The press and release of the power key at power-on, and the six of the script.
+        "inkemu: session recorded in x4_panel_buttons.inkrec (8 inputs); `inkemu replay` replays it\n",
+    ] {
+        assert!(log.contains(expected), "`{expected}` is missing:\n{log}");
+    }
+    assert!(!log.contains("warning:"), "{log}");
+    let measured = trace_hash_line(&log);
+    assert_eq!(
+        measured,
+        Some(X4_PANEL_TRACE),
+        "the trace hash of this run is {measured:?}: when the run above is the one intended, pin it in X4_PANEL_TRACE\n{log}"
+    );
+    let replayed = inkemu()
+        .arg("replay")
+        .arg(&session)
+        .args(["--rom-dir", &rom_dir])
+        .timeout(HANG_LIMIT)
+        .output()
+        .unwrap();
+    let replay_log = String::from_utf8_lossy(&replayed.stderr).into_owned();
+    assert_eq!(replayed.status.code(), Some(0), "{replay_log}");
+    assert_eq!(
+        String::from_utf8_lossy(&replayed.stdout).replace('\r', ""),
+        console,
+        "the replay shows the console of the run"
+    );
+    assert!(
+        replay_log.contains("inkemu: the replay gives what the session recorded: "),
+        "{replay_log}"
+    );
+    assert_eq!(trace_hash_line(&replay_log), measured, "{replay_log}");
+}
+
 /// The `CoreMark` score Espressif publishes for the ESP32-C3, one core at 160 MHz: "483.27
 /// `CoreMark`; 3.02 `CoreMark`/MHz" (ESP32-C3 Series Datasheet v2.4, 2026-05-06, page 3; spec §4.2 and §10.3
 /// criterion 5; ADR 0009). The datasheet names neither compiler nor flags; the other published
