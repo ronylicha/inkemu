@@ -1,6 +1,6 @@
 # ADR 0008 — Lockstep et différences admises
 
-- Date : 2026-10-14 (révisée le même jour après les revues de la politique et de la machine, puis après la seconde revue : section « Révision du 2026-10-14, seconde revue » ; étendue par SP1b-4d : section « Révision du 2026-10-14, SP1b-4d », puis « Révision du 2026-10-14, relectures de SP1b-4d », « Révision du 2026-10-14, seconde relecture de SP1b-4d » et « Révision du 2026-10-14, troisième relecture de SP1b-4d »)
+- Date : 2026-10-14 (révisée le même jour après les revues de la politique et de la machine, puis après la seconde revue : section « Révision du 2026-10-14, seconde revue » ; étendue par SP1b-4d : section « Révision du 2026-10-14, SP1b-4d », puis « Révision du 2026-10-14, relectures de SP1b-4d », « Révision du 2026-10-14, seconde relecture de SP1b-4d » et « Révision du 2026-10-14, troisième relecture de SP1b-4d » ; sources corrigées par SP1b-4e : « Révision du 2026-10-15, SP1b-4e » et « Révision du 2026-10-15, relecture de SP1b-4e »)
 - Statut : accepté (plan SP1b-4c ; plan SP1b-4d pour la traversée du reset, les fenêtres et CrossPoint)
 - Spec : `docs/superpowers/specs/2026-10-14-sp1b-4c-design.md` (décisions H1–H11, et sa correction du 2026-10-14) ; spec globale §4.4, §10.2 point 10, §10.3 critère 3
 
@@ -269,3 +269,45 @@ Trois points mineurs (m-1, m-2, m-3) ; décisions R52–R54 du plan.
   et l'inspection finales, finissent dans les 300 s environ (chaque appel tué ajoute jusqu'à 50 ms
   de sondage et son arrêt, comme celui du client). Un lancement qui ne peut pas démarrer QEMU
   finit en 10 minutes environ, et non 11 ; les plafonds des étapes de la CI ne changent pas.
+
+## Révision du 2026-10-15, SP1b-4e
+
+Les deux reports de SP1b-4d sur l'instant des interruptions, lus dans les sources de l'étiquette
+`esp-develop-9.2.2-20250817` d'`espressif/qemu`, celle du build épinglé (`QEMU_ESP_BUILD`) ; rapport
+`docs/research/coremark-esp32c3.md` §6, décisions K8 de la spec et R61–R63 du plan de SP1b-4e.
+
+- **La ligne 4 citait la mauvaise version de QEMU.** Ses fonctions (`esp32c3_intmatrix_line_should_assert`,
+  `esp_cpu_update_parent_irq`) sont celles de la branche `esp-develop`, plus récente. Dans l'étiquette, la
+  matrice envoie une impulsion et garde un bit « en attente » collant ; le CPU ramène toutes les lignes sur
+  `MEIP`, ne le baisse pas quand il prend l'interruption, et ne le baisse qu'à une vérification avec `MIE`
+  posé si plus rien n'est en attente. Les trois instructions que la ligne admet après le rangement du seuil
+  s'expliquent, à la lecture de ce code, par ce `MEIP` resté levé jusqu'au `csrs mstatus` (déduit, non
+  observé dans QEMU). La source de la ligne est corrigée (tableau, révision datée ; commentaire
+  d'`IntMatrix::asserted_as_qemu`) ; sa mesure, ses paramètres et les épingles des fenêtres ne changent pas.
+- **Le `MEIP` d'`usb_serial_jtag_echo`.** Seul fait établi : l'USB-Serial-JTAG de l'étiquette n'a pas de
+  sortie d'interruption, ce qui réfute l'hypothèse d'une source haute chez QEMU. La cause proposée — le bit
+  « en attente » collant de l'interruption logicielle (ligne 3), prise puis restée en attente sous le
+  nouveau seuil, qui garde `MEIP` levé — est **déduite du code de QEMU et de l'état à l'arrêt, non
+  observée dans QEMU**. Pas de ligne : une ligne appartient à une fenêtre qui l'utilise (R35), et aucune
+  application composée n'a de fenêtre tant que le tick n'est pas tranché. Reporté avec lui au sous-projet 8,
+  qui l'observera dans QEMU (moniteur ou gdbstub) avant d'en faire une ligne.
+- **Le tick : une des deux instructions s'explique par un raisonnement sur le code, non mesuré.** QEMU
+  ancre l'alarme sur son horloge virtuelle lue pendant le rangement, que le décompte des instructions sous
+  `-icount` fait compter le rangement (`esp_systimer.c`, `icount-common.c`) ; inkemu l'ancre au début du
+  rangement. L'autre instruction n'est pas dans `esp_systimer.c` : aucun réglage `QemuCompat` (règle de
+  SP1b-4d), et l'ancrage d'inkemu reste une hypothèse que la puce tranchera (sous-projet 8).
+
+## Révision du 2026-10-15, relecture de SP1b-4e
+
+- **La référence des sources de QEMU est l'étiquette `esp-develop-9.2.2-20250817`**, celle du build
+  épinglé ; l'image `espressif/idf:v5.5.2` ne contient que le binaire (`--version` : `9.2.2
+  (esp_develop_9.2.2_20250817)`, lu dans l'image), les sources sont lues à l'étiquette. Le tableau
+  citait la branche `esp-develop`. Relues contre l'étiquette : les fichiers des lignes 9 et 37
+  (`esp32c3_rtc_cntl.c`), 17 (`esp32c3.c`), 20 et 27 (`esp32c3_clk.c`), 28 et 32 (`esp32c3_spi.c`), 30
+  (`esp32c3_cache.c`) sont identiques dans les deux ; celui des lignes 15, 24 et 39 (`esp_systimer.c`) ne
+  diffère que par des traces de débogage, et chaque fonction citée y est. La ligne 2 citait
+  `esp_cpu_has_work`, absente de l'étiquette : la valeur de `mie` au reset y vient de
+  `esp32c3_intmatrix_reset_hold`. Seules les sources des lignes 2 et 4 sont corrigées ; aucune mesure,
+  aucun paramètre, aucune épingle ne change (`docs/lockstep-differences.md`, révisions du même jour).
+- **Ce qui est établi et ce qui est déduit** est séparé dans les deux points ci-dessus (spec K8 et plan
+  R61–R63 de SP1b-4e) : la réfutation de l'hypothèse USB-Serial-JTAG est le seul fait établi.

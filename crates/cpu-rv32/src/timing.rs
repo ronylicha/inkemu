@@ -1,8 +1,10 @@
 //! Initial, uncalibrated instruction costs (spec §4.2). Memory wait states are added by the bus.
 //!
 //! Espressif publishes no per-instruction latencies for the ESP32-C3 core (spec §1.3). Every
-//! value below is an estimate for a single-issue, short-pipeline RISC-V core. They are fitted
-//! against `CoreMark` in `SP1b`; until then the model reports `is_calibrated() == false`.
+//! value below is an estimate for a single-issue, short-pipeline RISC-V core, and the model
+//! reports `is_calibrated() == false`. `CoreMark` holds their average on its own instruction mix
+//! within 15 % of the score Espressif publishes (spec §10.3 criterion 5, ADR 0009); it fits none
+//! of them. They are fitted only against a device, by the calibration bench of sub-project 8.
 
 use emu_core::{InstrClass, TimingModel};
 
@@ -18,16 +20,17 @@ const BRANCH_TAKEN: u32 = 3;
 const BRANCH_NOT_TAKEN: u32 = 1;
 /// Estimate: unconditional jumps refill the pipeline like a taken branch.
 const JUMP: u32 = 3;
-/// Estimate: hardware multiplier, pending `CoreMark` fitting in `SP1b`.
+/// Estimate: hardware multiplier; to be measured on a device (sub-project 8).
 const MUL: u32 = 2;
-/// Estimate: iterative divider, pending `CoreMark` fitting in `SP1b`.
+/// Estimate: iterative divider; to be measured on a device (sub-project 8).
 const DIV: u32 = 33;
-/// Estimate: CSR access, pending `CoreMark` fitting in `SP1b`.
+/// Estimate: CSR access; to be measured on a device (sub-project 8).
 const CSR: u32 = 1;
-/// Estimate: system instructions (`ECALL`, `EBREAK`, `MRET`, `WFI`), pending `CoreMark` fitting in `SP1b`.
+/// Estimate: system instructions (`ECALL`, `EBREAK`, `MRET`, `WFI`); to be measured on a device
+/// (sub-project 8).
 const SYSTEM: u32 = 3;
 
-/// Datasheet-derived starting point for instruction timing. Not calibrated.
+/// Estimated starting point for instruction timing. Not calibrated.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DatasheetTiming;
 
