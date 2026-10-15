@@ -24,10 +24,6 @@ pub const STUCK_CLOCKED_INSTANTS: u32 = 1_000;
 /// diagnostic, and that table would hide the later resets.
 pub const MAX_LISTED_RESETS: usize = 4096;
 
-/// `WAKEUP_STATE.WAKEUP_ENA` bit 2, the GPIO wake (`RTC_GPIO_TRIG_EN`,
-/// `IDF:esp_hw_support/port/esp32c3/include/soc/rtc.h:664`; report DS §A.5).
-const GPIO_WAKE: u32 = 1 << 2;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Direction {
     Read,
@@ -551,17 +547,10 @@ impl Unsupported {
                 f,
                 "RTC_CNTL.STATE0.SLEEP_EN asks for a light sleep (DIG_PWC {dig_pwc:#010x} keeps the digital domain powered, pc {pc:#010x}), which inkemu does not model, so the request was rejected as the chip rejects one (INT_RAW.SLP_REJECT) and the firmware goes on; use deep sleep (esp_deep_sleep_start) or keep the CPU awake"
             ),
-            Unsupported::SleepWakeSource { wakeup_ena } => {
-                let gpio = if wakeup_ena & GPIO_WAKE != 0 {
-                    "; the GPIO wake (bit 2) belongs to sub-project 2d, which wires the buttons of the X4"
-                } else {
-                    ""
-                };
-                write!(
-                    f,
-                    "the chip went into deep sleep with wake sources inkemu does not model (WAKEUP_ENA {wakeup_ena:#07x}, pc {pc:#010x}){gpio}, so only the RTC timer (bit 3) can wake it; wake it with the RTC timer (esp_sleep_enable_timer_wakeup) or expect it to sleep for the rest of the run"
-                )
-            }
+            Unsupported::SleepWakeSource { wakeup_ena } => write!(
+                f,
+                "the chip went into deep sleep with wake sources inkemu does not model (WAKEUP_ENA {wakeup_ena:#07x}, pc {pc:#010x}), so only the RTC timer (bit 3) and the pins (bit 2) can wake it; wake it with the RTC timer (esp_sleep_enable_timer_wakeup) or a pin (esp_deep_sleep_enable_gpio_wakeup), or expect it to sleep for the rest of the run"
+            ),
             Unsupported::SleepSignal { state0 } => write!(
                 f,
                 "RTC_CNTL.STATE0 was written with SW_CPU_INT, SLP_WAKEUP or SLP_REJECT set (value {state0:#010x}, pc {pc:#010x}), signals inkemu does not model, so nothing was raised; leave bits 0, 29 and 30 clear"
@@ -1727,12 +1716,8 @@ mod tests {
                 "asks for a light sleep (DIG_PWC 0x00555010 keeps the digital domain powered",
             ),
             (
-                unsupported(Unsupported::SleepWakeSource { wakeup_ena: 0xC }),
-                "(WAKEUP_ENA 0x0000c, pc 0x40381000); the GPIO wake (bit 2) belongs to sub-project 2d",
-            ),
-            (
                 unsupported(Unsupported::SleepWakeSource { wakeup_ena: 0x48 }),
-                "(WAKEUP_ENA 0x00048, pc 0x40381000), so only the RTC timer (bit 3) can wake it",
+                "(WAKEUP_ENA 0x00048, pc 0x40381000), so only the RTC timer (bit 3) and the pins (bit 2) can wake it",
             ),
             (
                 unsupported(Unsupported::SleepSignal { state0: 1 }),

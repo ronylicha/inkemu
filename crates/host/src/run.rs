@@ -769,24 +769,29 @@ fn flush_the_other_consoles(
 #[must_use]
 pub fn deep_sleep_line(sleep: &DeepSleep) -> String {
     let since = sleep.since_nanos / 1_000;
+    let pins = sleep.wake_sources & DeepSleep::GPIO != 0;
     let waits = match sleep.timer_wake_nanos {
-        Some(wake) => format!("the RTC timer wakes it at {} us", wake / 1_000),
+        Some(wake) => {
+            let or_pins = if pins {
+                ", or a wake pin before then"
+            } else {
+                ""
+            };
+            format!("the RTC timer wakes it at {} us{or_pins}", wake / 1_000)
+        }
         None if sleep.wake_sources == 0 => {
             "it waits for nothing: the firmware enabled no wake source".to_owned()
         }
         None => {
-            // The RTC timer is modelled: enabled as a source without its alarm, it wakes
-            // nothing, which is not the same as a source inkemu lacks.
-            let unmodelled = sleep.wake_sources & !DeepSleep::TIMER;
-            let waits = if unmodelled == 0 {
-                "it waits for nothing".to_owned()
+            // The RTC timer and the pins are modelled: the timer enabled as a source without its
+            // alarm wakes nothing, which is not the same as a source inkemu lacks.
+            let unmodelled = sleep.wake_sources & !(DeepSleep::TIMER | DeepSleep::GPIO);
+            let waits = if unmodelled != 0 {
+                "it waits for a wake source inkemu does not model"
+            } else if pins {
+                "it waits for a wake pin (GPIO, bit 2): a button of the device wakes it"
             } else {
-                let gpio = if unmodelled & DeepSleep::GPIO != 0 {
-                    " (GPIO, bit 2, belongs to sub-project 2d)"
-                } else {
-                    ""
-                };
-                format!("it waits for a wake source inkemu does not model{gpio}")
+                "it waits for nothing"
             };
             let timer = if sleep.wake_sources & DeepSleep::TIMER != 0 {
                 "; the RTC timer is a wake source but its alarm is not enabled \
@@ -1718,16 +1723,19 @@ mod tests {
     }
 
     #[test]
-    fn a_gpio_wake_is_named_and_the_run_ends_asleep() {
-        // F5: what CrossPoint arms before it sleeps, GPIO alone.
+    fn a_sleep_on_the_pins_alone_with_nothing_to_press_them_ends_the_run_asleep() {
+        // F5: what CrossPoint arms before it sleeps, GPIO alone; a machine with no board has
+        // nothing to bring a pin to its level, and the run ends there, without a warning.
         let run = run_bounded(deep_sleeping(1 << 2 << 15, 0), UNLIMITED);
         assert_eq!(run.end, RunEnd::DeepSleep);
-        for line in [
-            "warning: the chip went into deep sleep with wake sources inkemu does not model (WAKEUP_ENA 0x00004, pc ",
-            "it waits for a wake source inkemu does not model (GPIO, bit 2, belongs to sub-project 2d): WAKEUP_ENA 0x00004\n",
-        ] {
-            assert!(run.log.contains(line), "`{line}` is missing:\n{}", run.log);
-        }
+        assert!(
+            run.log.contains(
+                "it waits for a wake pin (GPIO, bit 2): a button of the device wakes it: WAKEUP_ENA 0x00004\n"
+            ),
+            "{}",
+            run.log
+        );
+        assert!(!run.log.contains("warning:"), "{}", run.log);
     }
 
     #[test]
@@ -1803,7 +1811,11 @@ mod tests {
         );
         assert_eq!(
             line(None, DeepSleep::TIMER | DeepSleep::GPIO),
-            "inkemu: the device is in deep sleep since 1500 us of device time; it waits for a wake source inkemu does not model (GPIO, bit 2, belongs to sub-project 2d): WAKEUP_ENA 0x0000c; the RTC timer is a wake source but its alarm is not enabled (SLP_TIMER1.MAIN_TIMER_ALARM_EN)"
+            "inkemu: the device is in deep sleep since 1500 us of device time; it waits for a wake pin (GPIO, bit 2): a button of the device wakes it: WAKEUP_ENA 0x0000c; the RTC timer is a wake source but its alarm is not enabled (SLP_TIMER1.MAIN_TIMER_ALARM_EN)"
+        );
+        assert_eq!(
+            line(Some(3_500_000), DeepSleep::TIMER | DeepSleep::GPIO),
+            "inkemu: the device is in deep sleep since 1500 us of device time; the RTC timer wakes it at 3500 us, or a wake pin before then"
         );
     }
 

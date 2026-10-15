@@ -572,3 +572,57 @@ fn a_reset_returns_the_registers_to_their_values_and_keeps_the_chips_which_hear_
         "still attached"
     );
 }
+
+/// A held pad keeps its output and its pulls through a reset of the digital domain and ignores its
+/// registers until released (`gpio_hold_en`, ADR 0013).
+#[test]
+fn a_held_pad_keeps_its_output_through_a_reset_and_follows_its_registers_once_released() {
+    let ctx = &mut Ctx::default();
+    let mut io = IoMatrix::new(0x8);
+    let watcher = Rc::new(RefCell::new(Watcher::default()));
+    io.attach_output(ctx, 13, Box::new(Rc::clone(&watcher)))
+        .unwrap();
+    output(&mut io, ctx, 13, false);
+    assert_eq!(watcher.borrow().heard.last(), Some(&Some(Level::Low)));
+    io.set_hold(ctx, 1 << 13);
+    write(&mut io, ctx, OUT_W1TS, 1 << 13);
+    assert_eq!(
+        watcher.borrow().heard.last(),
+        Some(&Some(Level::Low)),
+        "a held pad ignores its registers"
+    );
+    io.reset(ctx);
+    assert_eq!(
+        watcher.borrow().heard.last(),
+        Some(&Some(Level::Low)),
+        "and keeps its output through a reset"
+    );
+    io.set_hold(ctx, 0);
+    assert_eq!(
+        watcher.borrow().heard.last(),
+        Some(&None),
+        "released, it follows its registers, reset: not an output"
+    );
+}
+
+/// The levels of the wake pins of a deep sleep: a chip's, else the pad's pull, read without the
+/// pads being worked out.
+#[test]
+fn the_wake_pins_read_their_chip_or_their_pull() {
+    let ctx = &mut Ctx::default();
+    let mut io = IoMatrix::new(0x8);
+    let key = driver(None);
+    io.attach_input(ctx, 3, Box::new(Rc::clone(&key))).unwrap();
+    write(&mut io, ctx, pad_reg(3), GPIO_PAD | (1 << 8));
+    let low_on_3 = [None, None, None, Some(Level::Low), None, None];
+    assert_eq!(io.wake_levels(ctx, &low_on_3), 0, "released: the pull-up");
+    key.borrow_mut().level = Some(Level::Low);
+    assert_eq!(io.wake_levels(ctx, &low_on_3), 1 << 3);
+    assert_eq!(io.wake_pins_change(ctx, &low_on_3), None);
+    key.borrow_mut().later = Some((Nanos(5_000), None));
+    let change = io.wake_pins_change(ctx, &low_on_3).unwrap();
+    assert_eq!(change, crate::clock::TIME_BASE.nanos_to_cycles(5_000));
+    let high_on_2 = [None, None, Some(Level::High), None, None, None];
+    write(&mut io, ctx, pad_reg(2), GPIO_PAD);
+    assert_eq!(io.wake_levels(ctx, &high_on_2), 0, "no chip, no pull: low");
+}

@@ -314,6 +314,113 @@ fn a_write_that_cuts_the_supply_stops_the_run_at_that_instruction() {
     assert_eq!(on_cable.power_lost_nanos(), None);
 }
 
+fn rtc(name: &str) -> u32 {
+    svd_regs::esp32c3::addr("RTC_CNTL", name)
+}
+
+/// The index of the word the program of [`sleep_until_the_key`] parks at once woken.
+const WOKEN: usize = 24;
+
+/// A program that, on a chip woken from a deep sleep (`SLP_WAKEUP_CAUSE` not 0), parks at word
+/// [`WOKEN`]; otherwise arms GPIO3 low as its one wake source, as `esp_deep_sleep_enable_gpio_wakeup`
+/// and `gpio_deep_sleep_wakeup_prepare` do (the pull-up of the pad), and sleeps.
+fn sleep_until_the_key() -> Vec<u32> {
+    use cpu_rv32::asm::bne;
+    let mut program = Vec::new();
+    program.extend(load_register(rtc("SLP_WAKEUP_CAUSE")));
+    program.push(bne(T1, 0, i32::try_from(4 * (WOKEN - 2)).unwrap()));
+    program.extend(store_register(
+        svd_regs::esp32c3::addr("IO_MUX", "GPIO3"),
+        (1 << 12) | (1 << 9) | (1 << 8),
+    ));
+    program.extend(store_register(
+        rtc("GPIO_WAKEUP"),
+        1 << (31 - 3) | 4 << (23 - 9) | 1 << 7,
+    ));
+    program.extend(store_register(rtc("WAKEUP_STATE"), (1 << 2) << 15));
+    program.extend(store_register(
+        rtc("DIG_PWC"),
+        0x0055_5010 | 1 << 31 | 1 << 30 | 1 << 27,
+    ));
+    program.extend(store_register(rtc("STATE0"), 1 << 31));
+    program.push(HANG);
+    assert_eq!(program.len(), WOKEN);
+    program.push(HANG);
+    program
+}
+
+fn quiet_wired(program: &[u32], board: &Rc<RefCell<Board>>) -> Esp32C3 {
+    let mut m = wired(program, board);
+    // The board on a cable: the latch plays no part here.
+    board.borrow_mut().cable = true;
+    m.inputs_changed();
+    m
+}
+
+#[test]
+fn a_key_pressed_during_a_deep_sleep_wakes_the_chip_at_its_instant() {
+    let board = Rc::new(RefCell::new(Board::default()));
+    let mut m = quiet_wired(&sleep_until_the_key(), &board);
+    let press = Cycles(2 * crate::clock::SECOND);
+    m.send_board_input(press, key(true)).unwrap();
+    // A call gives control back after each second of sleep (`StopReason::Asleep`).
+    while m.run_within(Cycles(u64::MAX), Some(3_000_000_000)) == StopReason::Asleep {}
+    assert_eq!(m.pc(), RESET_PC + 4 * u32::try_from(WOKEN).unwrap());
+    let resets: Vec<_> = m
+        .drain_diagnostics()
+        .into_iter()
+        .filter_map(|d| match d {
+            Diagnostic::Reset { cause, at_us, .. } => Some((cause, at_us)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        resets,
+        [(ResetCause::DeepSleep, (press.get() + 1) * 25 / 4 / 1_000)],
+        "woken at the instant the key acted"
+    );
+    assert_eq!(
+        bus_word(&mut m, rtc("GPIO_WAKEUP")) & 0x3F,
+        1 << 3,
+        "GPIO3 woke it"
+    );
+}
+
+#[test]
+fn a_key_already_held_at_the_entry_wakes_the_chip_at_once() {
+    let board = Rc::new(RefCell::new(Board::default()));
+    let mut m = quiet_wired(&sleep_until_the_key(), &board);
+    m.send_board_input(Cycles(0), key(true)).unwrap();
+    m.run_within(Cycles(400), None);
+    assert_eq!(m.pc(), RESET_PC + 4 * u32::try_from(WOKEN).unwrap());
+    assert!(m.deep_sleep().is_none());
+}
+
+#[test]
+fn a_sleep_nothing_can_end_but_a_key_ends_the_run_and_resumes_with_the_key() {
+    let board = Rc::new(RefCell::new(Board::default()));
+    let mut m = quiet_wired(&sleep_until_the_key(), &board);
+    assert_eq!(
+        m.run_within(Cycles(u64::MAX), Some(1_000_000_000)),
+        StopReason::DeepSleep
+    );
+    let state = m.deep_sleep().unwrap();
+    assert_eq!(state.wake_sources, DeepSleep::GPIO);
+    let at = m.device_time();
+    m.send_board_input(at, key(true)).unwrap();
+    m.run_within(Cycles(u64::MAX), Some(m.device_time_nanos() + 1_000_000));
+    assert_eq!(m.pc(), RESET_PC + 4 * u32::try_from(WOKEN).unwrap());
+}
+
+/// An aligned word read straight off the bus.
+fn bus_word(m: &mut Esp32C3, addr: u32) -> u32 {
+    use emu_core::{AccessKind, AccessSize, Bus};
+    m.bus
+        .read(addr, AccessSize::Word, AccessKind::Load)
+        .unwrap()
+        .value
+}
+
 #[test]
 fn a_supply_off_at_power_on_runs_nothing() {
     let board = Rc::new(RefCell::new(Board {

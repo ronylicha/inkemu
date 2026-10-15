@@ -177,7 +177,7 @@ pub struct DeepSleep {
 impl DeepSleep {
     /// `WAKEUP_ENA` bit 3: the RTC timer.
     pub const TIMER: u32 = 1 << 3;
-    /// `WAKEUP_ENA` bit 2: GPIO, a function of sub-project 2.
+    /// `WAKEUP_ENA` bit 2: the wake pins, GPIO0 to GPIO5 (ADR 0013).
     pub const GPIO: u32 = 1 << 2;
 }
 
@@ -787,6 +787,10 @@ impl Esp32C3 {
         if let Some(cause) = self.bus.ctx.take_reset() {
             self.reset(cause);
         }
+        if self.bus.ctx.take_pad_hold_written() {
+            let held = self.bus.periph.rtc_cntl.pad_hold_mask();
+            self.bus.periph.io.set_hold(&mut self.bus.ctx, held);
+        }
         // After the reset: a reset asked for by the same instruction ends the sleep at once.
         if self.bus.ctx.take_deep_sleep_entered() {
             self.powered_down = self.bus.periph.rtc_cntl.is_in_deep_sleep();
@@ -794,6 +798,11 @@ impl Esp32C3 {
                 // The console channels go no further than this instant whatever a front end
                 // calls during the sleep: where a run is cut changes nothing (F10).
                 self.bus.periph.power_down(&self.bus.ctx);
+                // A wake pin already at its level wakes the chip at once (ADR 0013).
+                self.check_gpio_wake();
+                if let Some(cause) = self.bus.ctx.take_reset() {
+                    self.reset(cause);
+                }
             }
         }
         if self.bus.ctx.take_clock_written() {
@@ -889,7 +898,14 @@ impl Esp32C3 {
         let now = self.bus.ctx.now();
         let call = self.bus.periph.rtc_cntl.next_call();
         let chips = self.bus.periph.io.clocked_deadline(&self.bus.ctx);
-        let next = match (call, chips) {
+        let pins = self
+            .bus
+            .periph
+            .rtc_cntl
+            .gpio_wake_levels()
+            .and_then(|wanted| self.bus.periph.io.wake_pins_change(&self.bus.ctx, &wanted));
+        let board = [chips, pins].into_iter().flatten().min();
+        let next = match (call, board) {
             (None, None) => return Sleep::NothingDue,
             (Some(a), Some(b)) => a.min(b),
             (Some(only), None) | (None, Some(only)) => only,
@@ -900,8 +916,17 @@ impl Esp32C3 {
             return Sleep::CutAtDeadline;
         }
         self.bus.ctx.sleep_until(target);
-        if chips.is_some_and(|chips| chips <= target) {
+        if board.is_some_and(|board| board <= target) {
+            // The chips and the board's inputs first, then the wake pins, which they may have
+            // brought to their level (ADR 0013).
             self.bus.periph.io.advance_clocked(&mut self.bus.ctx);
+            self.check_gpio_wake();
+            if let Some(cause) = self.bus.ctx.take_reset() {
+                let pc = self.hart.pc;
+                self.reset(cause);
+                self.service(pc);
+                return Sleep::Until(target.get() - now.get());
+            }
         }
         if call.is_some_and(|call| call <= target) {
             self.bus.wake_rtc_domain();
@@ -913,6 +938,19 @@ impl Esp32C3 {
             }
         }
         Sleep::Until(target.get() - now.get())
+    }
+
+    /// The pins that wake a sleeping chip and are at their wake level now wake it: `RTC_CNTL`
+    /// latches the cause and asks for the reset of cause 5 (ADR 0013).
+    fn check_gpio_wake(&mut self) {
+        let Some(wanted) = self.bus.periph.rtc_cntl.gpio_wake_levels() else {
+            return;
+        };
+        let pins = self.bus.periph.io.wake_levels(&self.bus.ctx, &wanted);
+        self.bus
+            .periph
+            .rtc_cntl
+            .wake_on_pins(&mut self.bus.ctx, pins);
     }
 
     /// Applies a reset (TRM §6.1): the peripherals of its level return to their reset state, the
@@ -934,6 +972,10 @@ impl Esp32C3 {
             at_us,
         });
         self.bus.reset(cause, pc, sp);
+        // A system reset clears the holds of `RTC_CNTL`; a core reset keeps them, and the held
+        // pads keep their output through it.
+        let held = self.bus.periph.rtc_cntl.pad_hold_mask();
+        self.bus.periph.io.set_hold(&mut self.bus.ctx, held);
         // The flash-window page versions (`SocBus::page_version`) restart at 0 with the MMU and
         // the cache registers: a version can repeat with another mapping. That is safe only
         // because `Hart::reset` builds a new decode cache, at every level.

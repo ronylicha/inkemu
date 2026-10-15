@@ -76,8 +76,8 @@ its first section says which plan takes what.
 | `0x6000802c` | `RTC_CNTL.TIMER5` | 1 | minimum sleep time: a sleep of any length is entered | SP8 |
 | `0x60008030` | `RTC_CNTL.TIMER6` | 1 | peripheral power-up timing: a wake from deep sleep takes no time | SP8 |
 | `0x60008034` | `RTC_CNTL.ANA_CONF` | 1 | analog configuration, glitch reset | SP8 |
-| `0x60008064` | `RTC_CNTL.EXT_WAKEUP_CONF` | 1 | GPIO wake filter: the wake from a pin is not modelled | SP2d |
-| `0x60008068` | `RTC_CNTL.SLP_REJECT_CONF` | 1 | sleep rejection: no reject source (GPIO, UART) is raised | SP2d |
+| `0x60008064` | `RTC_CNTL.EXT_WAKEUP_CONF` | 1 | GPIO wake filter: a pin at its wake level wakes the chip at once, filtered or not | SP8 |
+| `0x60008068` | `RTC_CNTL.SLP_REJECT_CONF` | 1 | sleep rejection: no reject source (GPIO, UART) is raised; a light sleep is refused | SP4 |
 | `0x60008070` | `RTC_CNTL.CLK_CONF` | 1 | RTC fast clock source and dividers (a slow clock other than the RC oscillator is refused) | SP8 |
 | `0x60008074` | `RTC_CNTL.SLOW_CLK_CONF` | 1 | RTC slow clock divider | SP8 |
 | `0x60008078` | `RTC_CNTL.SDIO_CONF` | 1 | flash supply (VDD_SDIO) regulator and its power-down in sleep: no effect to see without a power model | SP4 |
@@ -85,12 +85,11 @@ its first section says which plan takes what.
 | `0x60008080` | `RTC_CNTL.RTC_CNTL` | 1 | RTC regulator and digital bias | SP8 |
 | `0x60008084` | `RTC_CNTL.PWC` | 1 | RTC power-domain control: no effect to see without a power model | SP4 |
 | `0x60008088` | `RTC_CNTL.DIG_PWC` | 1 | digital power domains in sleep (Wi-Fi, BT, CPU, peripherals) and their forced power-up: no effect to see without a power model (DG_WRAP_PD_EN acts: read at the write of SLEEP_EN, set it makes the sleep deep, clear a light sleep, which is refused) | SP4 |
-| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation and hold in sleep: a pad keeps no level through a sleep or a reset | SP2d |
-| `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | pad hold: a held pad follows its registers | SP2d |
-| `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | digital pad hold: a held pad follows its registers | SP2d |
+| `0x6000808c` | `RTC_CNTL.DIG_ISO` | 1 | digital pad isolation and automatic hold in sleep: a pad keeps its configuration through a deep sleep, and only its own hold bit (PAD_HOLD, DIG_PAD_HOLD) keeps its output through the reset of the wake | SP4 |
+| `0x600080d0` | `RTC_CNTL.PAD_HOLD` | 1 | the hold of GPIO0 to GPIO5 acts (a held pad keeps its output through a core reset and ignores its registers); bits 6 and above stored | SP2d |
+| `0x600080d4` | `RTC_CNTL.DIG_PAD_HOLD` | 1 | the hold of GPIO6 to GPIO21 acts (a held pad keeps its output through a core reset and ignores its registers); the other bits stored | SP2d |
 | `0x600080d8` | `RTC_CNTL.BROWN_OUT` | 1 | brown-out detector: the supply is always good | SP2d |
 | `0x6000810c` | `RTC_CNTL.FIB_SEL` | 1 | brown-out and glitch reset selection (the super watchdog bit acts) | SP2d |
-| `0x60008110` | `RTC_CNTL.GPIO_WAKEUP` | 1 | GPIO wake of each pin and its status: the wake from a pin is not modelled (a GPIO wake source is refused by name at the entry into sleep) | SP2d |
 | `0x6000811c` | `RTC_CNTL.SENSOR_CTRL` | 1 | SAR ADC power forcing: the ADC converts whatever it says | SP2d |
 | `0x60009000` | `IO_MUX.PIN_CTRL` | 23 | clock outputs (PIN_CTRL); of each pad, the drive strength, the input filter and the sleep settings (the function, the pulls and the input enable act) | SP2d |
 | `0x600090fc` | `IO_MUX.DATE` | 1 | none: the version date of the block, stored as written | SP2d |

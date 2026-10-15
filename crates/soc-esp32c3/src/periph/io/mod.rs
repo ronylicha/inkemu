@@ -297,6 +297,12 @@ pub struct IoMatrix {
     chips: Chips,
     /// The inputs of the board's user and its supply (ADR 0013).
     board: board::Board,
+    /// The pads software holds (`RTC_CNTL.PAD_HOLD`, `DIG_PAD_HOLD`), bit `n` for pad `n`, and the
+    /// output each held pad keeps: what it drove when its hold was set, through any reset of the
+    /// digital domain, whatever its registers say, until the hold is released.
+    held: u32,
+    held_drive: [Option<Level>; PADS],
+    held_pad: [u32; PADS],
     /// The wake-up at the instant an attached chip said its level may change, a clocked chip
     /// must be advanced, or an input of the board acts, whichever comes first.
     wake: Deadline,
@@ -320,6 +326,9 @@ impl IoMatrix {
                 clocked: Vec::new(),
             },
             board: board::Board::default(),
+            held: 0,
+            held_drive: [None; PADS],
+            held_pad: [0; PADS],
             wake: Deadline::default(),
         };
         for pad in 0..PADS {
@@ -434,6 +443,69 @@ impl IoMatrix {
     /// The instant the board's supply failed, once it has.
     pub(crate) const fn power_lost(&self) -> Option<Cycles> {
         self.board.power_lost()
+    }
+
+    /// The pads software holds became `mask` (`RTC_CNTL.pad_hold_mask`): a pad newly held keeps
+    /// what it drives now and its pulls; a pad released follows its registers again.
+    pub(crate) fn set_hold(&mut self, ctx: &mut Ctx, mask: u32) {
+        let mask = mask & PAD_MASK;
+        for pad in 0..PADS {
+            let bit = 1 << pad;
+            if mask & bit != 0 && self.held & bit == 0 {
+                self.held_drive[pad] = self.drive_of_registers(pad);
+                self.held_pad[pad] = self.regs.pads[pad];
+            }
+        }
+        self.held = mask;
+        self.settle(ctx);
+    }
+
+    /// The IO MUX register a pad's pulls are read from: the one it had when its hold was set, for
+    /// a held pad.
+    fn pad_config(&self, pad: usize) -> u32 {
+        if self.held & (1 << pad) != 0 {
+            self.held_pad[pad]
+        } else {
+            self.regs.pads[pad]
+        }
+    }
+
+    /// Of the pins `wanted` names with a level (GPIO0 to GPIO5, a deep sleep's wake pins), those
+    /// at that level now, bit `n` for GPIO`n`: what an attached chip drives, else the pad's own
+    /// drive and pulls, which a deep sleep keeps. The pads are read without being worked out: the
+    /// digital domain has no power, and nothing hears them.
+    pub(crate) fn wake_levels(&mut self, ctx: &Ctx, wanted: &[Option<Level>]) -> u32 {
+        let at = nanos(ctx);
+        let mut hit = 0;
+        for (pad, level) in wanted.iter().enumerate().take(PADS) {
+            let Some(level) = *level else { continue };
+            let external = self.chips.inputs[pad]
+                .as_mut()
+                .and_then(|chip| chip.level(at));
+            if pad::level(self.drive_of(pad), external, self.pad_config(pad)) == level {
+                hit |= 1 << pad;
+            }
+        }
+        hit
+    }
+
+    /// The first instant after the present time at which a chip on one of the pins `wanted` names
+    /// said its level may change, in cycles of the time base.
+    pub(crate) fn wake_pins_change(
+        &mut self,
+        ctx: &Ctx,
+        wanted: &[Option<Level>],
+    ) -> Option<Cycles> {
+        let at = nanos(ctx);
+        wanted
+            .iter()
+            .enumerate()
+            .take(PADS)
+            .filter(|(_, level)| level.is_some())
+            .filter_map(|(pad, _)| self.chips.inputs[pad].as_mut()?.next_change(at))
+            .filter(|&change| change > at)
+            .min()
+            .map(|change| TIME_BASE.nanos_to_cycles(u128::from(change.get())))
     }
 
     /// Attaches a chip that is advanced in device time; its first deadline is armed at once.
@@ -637,7 +709,7 @@ impl IoMatrix {
             let external = self.chips.inputs[pad]
                 .as_mut()
                 .and_then(|chip| chip.level(at));
-            if pad::level(driven, external, self.regs.pads[pad]).is_high() {
+            if pad::level(driven, external, self.pad_config(pad)).is_high() {
                 levels |= 1 << pad;
             }
         }
@@ -657,8 +729,16 @@ impl IoMatrix {
         self.arm(ctx, at);
     }
 
-    /// What the chip drives on pad `pad` now.
+    /// What the chip drives on pad `pad` now: what it kept when its hold was set, for a held pad.
     fn drive_of(&self, pad: usize) -> Option<Level> {
+        if self.held & (1 << pad) != 0 {
+            return self.held_drive[pad];
+        }
+        self.drive_of_registers(pad)
+    }
+
+    /// What the registers drive on pad `pad`, its hold aside.
+    fn drive_of_registers(&self, pad: usize) -> Option<Level> {
         let gpio = Drive {
             level: Level::from_bool((self.regs.out >> pad) & 1 != 0),
             enable: (self.regs.enable >> pad) & 1 != 0,
