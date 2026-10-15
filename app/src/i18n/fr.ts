@@ -184,6 +184,8 @@ export const fr = {
   "error.powerOn": "L’appareil ne peut pas être mis sous tension.",
   "error.stopped": "L’émulateur est arrêté.",
   "error.noLife": "L’exécution est terminée : faites un reset pour rallumer l’appareil.",
+  "error.replayEnded":
+    "Le rejeu est terminé, et un rejeu ne prend aucune entrée : faites un reset pour rejouer la session depuis son début.",
   "error.replaying": "Un rejeu ne prend aucune entrée.",
   "error.ended": "L’exécution est terminée.",
   "error.nothingToStep": "L’appareil attend une entrée : rien à exécuter pas à pas.",

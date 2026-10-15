@@ -39,6 +39,7 @@ const ERROR_KINDS = [
   "maxTime",
   "noImage",
   "noLife",
+  "replayEnded",
   "nothingToStep",
   "notKept",
   "notRecorded",

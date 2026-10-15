@@ -184,6 +184,8 @@ export const en: Catalog = {
   "error.powerOn": "The device cannot be powered on.",
   "error.stopped": "The emulator has stopped.",
   "error.noLife": "The run has ended: reset to power the device on again.",
+  "error.replayEnded":
+    "The replay has ended, and a replay takes no input: reset to replay the session from its start.",
   "error.replaying": "A replay takes no input.",
   "error.ended": "The run has ended.",
   "error.nothingToStep": "The device waits for an input: there is nothing to step.",

@@ -88,7 +88,7 @@ impl LifeCard {
 /// notice of the commit when it has one, or the error. `false` when the changes are not kept.
 pub fn commit_and_say(image: &mut SdImage, card: &LifeCard, log: &mut dyn Write) -> bool {
     card.changes()
-        .is_none_or(|changes| commit_changes(image, &changes, log))
+        .is_none_or(|changes| commit_changes(image, &changes, log).is_ok())
 }
 
 /// One layer of changes over the content a card starts from.
@@ -188,22 +188,30 @@ impl CardKeeper {
         let Some(unwritten) = &self.unwritten else {
             return true;
         };
-        let written = commit_changes(image, &unwritten.0.borrow().changes(), log);
-        if written {
-            self.unwritten = None;
-        } else {
-            let _ = writeln!(
-                log,
-                "error: what the device wrote to its SD card is not in {} yet: it is kept in memory, the next life of the device starts from it, and it is written again when a life ends and when the device is powered off; free some room on the disk of the image, or make its directory writable",
-                image.shown()
-            );
+        let committed = commit_changes(image, &unwritten.0.borrow().changes(), log);
+        match committed {
+            Ok(()) => self.unwritten = None,
+            // The image holds them: its error says so and what frees the journal. They stay in
+            // memory all the same, so that the next life does not wait for that journal (N4).
+            Err(SdImageError::JournalNotRemoved { .. }) => {}
+            Err(_) => {
+                let _ = writeln!(
+                    log,
+                    "error: what the device wrote to its SD card is not in {} yet: it is kept in memory, the next life of the device starts from it, and it is written again when a life ends and when the device is powered off; free some room on the disk of the image, or make its directory writable",
+                    image.shown()
+                );
+            }
         }
-        written
+        self.unwritten.is_none()
     }
 }
 
-/// [`commit_and_say`] of `changes`.
-fn commit_changes(image: &mut SdImage, changes: &Changes<'_>, log: &mut dyn Write) -> bool {
+/// [`commit_and_say`] of `changes`: the error said in `log` is given back.
+fn commit_changes(
+    image: &mut SdImage,
+    changes: &Changes<'_>,
+    log: &mut dyn Write,
+) -> Result<(), SdImageError> {
     let capacity = image.capacity();
     let written = changes.written_count();
     match image.commit(changes) {
@@ -218,11 +226,11 @@ fn commit_changes(image: &mut SdImage, changes: &Changes<'_>, log: &mut dyn Writ
             if let Some(notice) = committed.notice() {
                 let _ = writeln!(log, "warning: {notice}");
             }
-            true
+            Ok(())
         }
         Err(e) => {
             let _ = writeln!(log, "error: {e}");
-            false
+            Err(e)
         }
     }
 }
@@ -236,6 +244,39 @@ mod tests {
     /// The first byte of block `lba` of the image at `path`.
     fn byte_of(path: &Path, lba: usize) -> u8 {
         std::fs::read(path).unwrap()[lba * BLOCK_BYTES]
+    }
+
+    /// N4: a save the image holds whole, of which only the journal could not be removed, is said
+    /// as that, with its remedy, never as changes missing from the image; they stay in memory
+    /// for the next life, which does not wait for the journal.
+    #[test]
+    fn a_save_whose_journal_alone_stays_is_said_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.img");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let mut image = SdImage::open(&path, Access::ReadWrite, &[], &mut Vec::new()).unwrap();
+        let mut keeper = CardKeeper::default();
+        let mut life = Overlay::new(keeper.card_of_a_life(&mut image).unwrap().source);
+        life.write_block(3, &[0x5A; BLOCK_BYTES]).unwrap();
+        keeper.take_in(LifeCard {
+            storage: Some(life),
+        });
+        image.leave_the_journal();
+        let mut log = Vec::new();
+        assert!(!keeper.commit_and_say(&mut image, &mut log));
+        let log = String::from_utf8(log).unwrap();
+        assert!(
+            log.starts_with("error: the SD image ")
+                && log.contains("holds what the device wrote, but its journal ")
+                && log.ends_with("make the directory of the image writable\n"),
+            "{log}"
+        );
+        assert!(!log.contains("not in"), "{log}");
+        assert_eq!(byte_of(&path, 3), 0x5A, "the image holds it");
+        assert!(keeper.is_unwritten());
     }
 
     /// R1: a life's changes the image did not take are read by the next life, which builds on
