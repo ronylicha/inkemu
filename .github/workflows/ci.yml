@@ -181,7 +181,7 @@ jobs:
           INKEMU_COREMARK_APP: ${{ runner.temp }}/reference-firmware/coremark_example.bin
         # Exact test counts, and every suite run whatever the one before it did, as in rom-boot:
         # see tools/ci/run-ignored-tests.sh. The CoreMark test runs about 2.2 billion instructions
-        # (90 s on a development host).
+        # (68 s in this job on 2026-10-15).
         run: |
           failed=0
           tools/ci/run-ignored-tests.sh 13 --release -p soc-esp32c3 --test reference_boot -- --ignored || failed=1

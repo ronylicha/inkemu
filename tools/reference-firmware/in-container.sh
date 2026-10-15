@@ -113,7 +113,20 @@ symbols nvs_rw_value_cxx
 # fourth with no wake source. The last one, coremark_example, is Espressif's CoreMark example and
 # component, copied unmodified into this directory (coremark_example/PROVENANCE.md): the build has no
 # network and no component manager. Its copied files are checked first, against their pinned hashes;
-# the CoreMark run rules ask for the benchmark's files unmodified.
+# the CoreMark run rules ask for the benchmark's files unmodified. The directory must hold exactly
+# the files the sums list, plus PROVENANCE.md, ours: a file added to it (a source the component's
+# CMakeLists.txt would never name, or a header that shadows one) fails the check as a changed one
+# does.
+coremark_files() {
+  (cd /ref/coremark_example && find . -type f ! -path ./PROVENANCE.md | sed 's|^\./||' | LC_ALL=C sort)
+}
+pinned_coremark_files() {
+  sed 's/^[0-9a-f]\{64\}  //' /ref/SHA256SUMS.coremark-sources | LC_ALL=C sort
+}
+if ! diff <(pinned_coremark_files) <(coremark_files) >&2; then
+  echo "error: the files of coremark_example are not those SHA256SUMS.coremark-sources pins (\"<\" missing, \">\" not pinned, above); it holds the copy of espressif/coremark 1.1.0~2 and PROVENANCE.md only (coremark_example/PROVENANCE.md)" >&2
+  exit 1
+fi
 if ! (cd /ref/coremark_example && sha256sum --quiet -c /ref/SHA256SUMS.coremark-sources); then
   echo "error: a file of coremark_example is not the copy of espressif/coremark 1.1.0~2 its hash pins (see above); restore it from the release (coremark_example/PROVENANCE.md), never edit the sums" >&2
   exit 1

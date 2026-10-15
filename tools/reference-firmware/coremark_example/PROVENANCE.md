@@ -24,7 +24,9 @@ the reference build runs without network and with the component manager off, so 
 found in `components/` instead, under the name `coremark` the example's `PRIV_REQUIRES` gives.
 
 Nothing is modified. `../SHA256SUMS.coremark-sources` pins every copied file; `in-container.sh`
-checks them before the build and stops at the first difference. The CoreMark run rules ask for the
+checks them before the build and stops at the first difference. It also checks that the directory
+holds those files and this one only: a file added here, which the build could pick up, stops it
+as a changed file does. The CoreMark run rules ask for the
 benchmark's files unmodified (`components/coremark/coremark/README.md`, and the MD5 sums of
 `coremark.md5`, which these copies match).
 

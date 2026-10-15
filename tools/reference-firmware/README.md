@@ -50,8 +50,9 @@ deep sleep through `rtc_deep_sleep_start` and the CRC unit of the RTC fast memor
 example asks the manager for `espressif/coremark`, so the component is copied into
 `coremark_example/components/coremark/`, where ESP-IDF finds it under the name the example requires.
 Every copied file is pinned in `SHA256SUMS.coremark-sources` (the hashes of the registry's
-`CHECKSUMS.json` for the release), and `in-container.sh` checks them before it builds: CoreMark's run
-rules ask for its files unmodified. CoreMark is a trademark of EEMBC; what the firmware prints under
+`CHECKSUMS.json` for the release), and `in-container.sh` checks them before it builds, together with
+the list of the directory's files, which must be those of the sums plus `PROVENANCE.md` (a file
+added stops the build): CoreMark's run rules ask for its files unmodified. CoreMark is a trademark of EEMBC; what the firmware prints under
 inkemu is the output of an emulated chip, not a result of a device.
 
 The firmwares of real units (CrossPoint 1.6.5 and the stock firmware of the X4) are not built here:
@@ -94,7 +95,8 @@ bytes from 65,536 of `flash_hello.bin`, `nvs_rw_value_cxx.bin` the 161,312 bytes
     cargo run --release -p emu-cli -- run --device x4 --firmware hello_world.bin --max-time 12
 
 CoreMark is an application already; it prints its score after about 17.5 s of device time
-(about 2.2 billion instructions, 90 s on a development host):
+(about 2.2 billion instructions; the test that runs it took 68 s in the CI on 2026-10-15, and 87 to
+102 s on the development host, about 110 s for the run alone there):
 
     cargo run --release -p emu-cli -- run --device x4 --console uart0 --max-time 20 \
       --firmware target/reference-firmware/coremark_example.bin
