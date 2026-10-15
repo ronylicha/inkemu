@@ -267,11 +267,16 @@ fn the_stock_firmware_powered_on_by_the_gesture() {
 }
 
 /// `CrossPoint` 1.6.5 on the X3 (ADR 0015). Its first boot finds the three chips of the I2C bus,
-/// takes the device for an X3 and keeps the verdict in NVS, then stops for good on a lock of
-/// Arduino's `Wire` that its own failed read of the gauge left taken (research
-/// `sp3-x3-firmware.md` §7): a firmware's fault, which a unit shows too. The second boot reads the
-/// verdict back, never takes that path, mounts the card and draws its home screen, which the
-/// rotation of the profile turns upright in the portrait.
+/// takes the device for an X3 and keeps the verdict in NVS, then blocks for good on the mutex of
+/// Arduino's `Wire` (research `sp3-x3-firmware.md` §7): the probe's `Wire.end()` keeps the mutex
+/// but frees the buffers, the read of the gauge's current that follows takes the mutex in
+/// `beginTransmission` and returns from `endTransmission` on the NULL buffer before giving it
+/// back, and the next `Wire.begin()` takes it again from the same task. Nothing on that path
+/// touches the hardware, and upstream removed it after 1.6.5 (crosspoint-reader PR #3809). The
+/// second boot reads the verdict back: no probe ran, the mutex does not exist, `beginTransmission`
+/// says so and takes nothing; it mounts the card and draws its home screen, which the rotation of
+/// the profile turns upright in the portrait. The lines each boot prints are the signature of the
+/// two states of the mutex, and the test checks them.
 #[test]
 #[ignore = "needs INKEMU_ROM_ELF_DIR and INKEMU_CROSSPOINT_X3_X4 (a file of the user's)"]
 fn crosspoint_1_6_5_on_the_x3_reaches_its_home_screen_at_its_second_boot() {
@@ -311,6 +316,22 @@ fn crosspoint_1_6_5_on_the_x3_reaches_its_home_screen_at_its_second_boot() {
         "the three chips answer: {}",
         first.console
     );
+    // The mutex exists and is free: `beginTransmission` takes it silently, `endTransmission` fails
+    // on the NULL buffer without giving it back; the next `Wire.begin()` never returns.
+    assert!(
+        first
+            .console
+            .contains("endTransmission(): NULL TX buffer pointer"),
+        "{}",
+        first.console
+    );
+    for absent in ["could not acquire lock", "SDK IMU", "Hardware detect"] {
+        assert!(
+            !first.console.contains(absent),
+            "{absent}: {}",
+            first.console
+        );
+    }
     let (emulator, second) = life_of(None, 10);
     let png = capture_dir().join("crosspoint-1.6.5-x3.png");
     emulator
@@ -328,6 +349,8 @@ fn crosspoint_1_6_5_on_the_x3_reaches_its_home_screen_at_its_second_boot() {
     eprintln!("console tail: {}", tail(&second.console, 1500));
     for line in [
         "Using cached device type: X3",
+        // No probe ran: the mutex was never created, and `beginTransmission` takes nothing.
+        "beginTransmission(): could not acquire lock",
         "SDK IMU initialized",
         "SDK RTC found",
         "[SD] SD card detected",
