@@ -8,7 +8,7 @@ use super::*;
 use crate::AcceptedInput;
 use crate::test_support::{HANG, T1, T2, flat_rom, load_register, store_register};
 use cpu_rv32::asm::{addi, beq, wfi};
-use emu_core::{GpioInput, GpioOutput, Level, Nanos};
+use emu_core::{AnalogSource, GpioInput, GpioOutput, Level, Nanos};
 
 /// The key of the tests (target 0) on GPIO3, to ground, and a power latch on GPIO13 (target 1 is
 /// the cable): the supply holds while the cable is in, the latch is not driven low, or the key
@@ -63,6 +63,13 @@ impl GpioOutput for Board {
 impl Supply for Board {
     fn powered(&mut self, _at: Nanos) -> bool {
         self.cable || !self.latch_low || self.pressed
+    }
+}
+
+/// The key on a ladder too: GPIO1 reads the rail released, ground pressed.
+impl AnalogSource for Board {
+    fn millivolts(&mut self, _at: Nanos) -> u32 {
+        if self.pressed { 0 } else { 3_300 }
     }
 }
 
@@ -239,6 +246,91 @@ fn a_key_given_as_the_run_goes_and_given_at_power_on_make_the_same_run() {
         );
     }
     assert_eq!(live.1, RESET_PC + 4 * 10, "the loop left on the key");
+}
+
+fn saradc(name: &str) -> u32 {
+    svd_regs::esp32c3::addr("APB_SARADC", name)
+}
+
+/// A one-shot conversion of GPIO1 (ADC1 channel 1, 12 dB) as `adc_oneshot` starts it, the clock
+/// as `adc_oneshot_hal_setup` leaves it (APB / 16, `SAR_CLK_DIV` 1), then a park: the reading
+/// stays in `SAR1DATA_STATUS`.
+fn convert_gpio1() -> Vec<u32> {
+    let sample = (1 << 31) | (1 << 25) | (3 << 23);
+    let mut program = Vec::new();
+    program.extend(store_register(saradc("CLKM_CONF"), 15 | (2 << 21)));
+    program.extend(store_register(saradc("CTRL"), 0x4000_0040 | (1 << 7)));
+    program.extend(store_register(saradc("ONETIME_SAMPLE"), sample));
+    program.extend(store_register(saradc("ONETIME_SAMPLE"), sample | (1 << 29)));
+    program.push(HANG);
+    program
+}
+
+/// The ladder machine: [`wired`] with the board's voltage on GPIO1.
+fn ladder(board: &Rc<RefCell<Board>>) -> Esp32C3 {
+    let mut m = wired(&convert_gpio1(), board);
+    m.attach_analog(1, Box::new(Rc::clone(board))).unwrap();
+    m
+}
+
+/// The device time the conversion has started by: the program parked.
+fn started() -> Cycles {
+    let board = Rc::new(RefCell::new(Board::default()));
+    let mut m = ladder(&board);
+    while m.pc() != RESET_PC + 4 * 16 {
+        m.step();
+    }
+    m.device_time()
+}
+
+/// The reading and the trace hash of [`convert_gpio1`] with the key pressed at `date`, given once
+/// the conversion has started (`live`, as a script or a window gives a dated key while the run
+/// goes) or at power-on (as a replay gives it).
+fn convert_pressed_at(date: Cycles, start: Cycles, live: bool) -> (u32, u64) {
+    let board = Rc::new(RefCell::new(Board::default()));
+    let mut m = ladder(&board);
+    if live {
+        while m.device_time() < start {
+            m.step();
+        }
+    }
+    m.send_board_input(date, key(true)).unwrap();
+    m.run_within(Cycles(start.get() + 20_000), None);
+    assert_eq!(board.borrow().applied.len(), 1);
+    (
+        bus_word(&mut m, saradc("SAR1DATA_STATUS")),
+        m.trace_hash().unwrap(),
+    )
+}
+
+/// A key that acts at the very cycle a conversion ends is seen by it whether the key was given
+/// as the run went or at power-on: the machine applies the inputs due before it asks an analog
+/// chip, whatever order the two events were armed in. The end is found first (the first date
+/// whose key the conversion misses), then every date around it is tried, so one of them makes
+/// the key act at that very cycle.
+#[test]
+fn a_conversion_ending_as_a_key_acts_reads_the_same_live_and_replayed() {
+    const STEP: u64 = 64;
+    let start = started();
+    let pressed = |reading: u32| reading & 0xFFF < 100;
+    let missed = (0..20_000 / STEP)
+        .map(|n| n * STEP)
+        .find(|&offset| !pressed(convert_pressed_at(Cycles(start.get() + offset), start, false).0))
+        .expect("a key dated after the end of the conversion is missed");
+    assert!(missed > 0, "the key dated at the start is seen");
+    let mut seen = 0;
+    for offset in missed - STEP..=missed {
+        let date = Cycles(start.get() + offset);
+        let live = convert_pressed_at(date, start, true);
+        let replayed = convert_pressed_at(date, start, false);
+        assert_eq!(live, replayed, "the key dated {date:?}");
+        seen += u64::from(pressed(live.0));
+    }
+    assert!(
+        (1..=STEP).contains(&seen),
+        "the window holds the end of the conversion: {seen} of {} dates seen",
+        STEP + 1
+    );
 }
 
 /// GPIO13 made a GPIO (function 1), then enabled as an output: `OUT` holds 0 since reset, so the

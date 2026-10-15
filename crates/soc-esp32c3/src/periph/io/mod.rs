@@ -548,6 +548,9 @@ impl IoMatrix {
     pub(crate) fn spi_transfer(&mut self, ctx: &mut Ctx, mosi: &[u8]) -> Vec<u8> {
         let at = nanos(ctx);
         self.advance_due(ctx, at);
+        // An input of the board due now acts before a chip is asked, whatever order its event
+        // and this one were armed in: a live run and its replay arm them in different orders.
+        self.board.apply_due(ctx.now());
         let clocks = self.pads_carrying(pad::FSPICLK);
         let data = self.pads_carrying(pad::FSPID);
         let (miso_pad, rest) = match self.input_of(pad::FSPIQ) {
@@ -584,6 +587,9 @@ impl IoMatrix {
     pub(crate) fn millivolts(&mut self, ctx: &mut Ctx, pad: usize) -> u32 {
         let at = nanos(ctx);
         self.advance_due(ctx, at);
+        // As in `spi_transfer`: a key due at the cycle a conversion ends is seen by it, live or
+        // replayed, whichever of the two events was armed first.
+        self.board.apply_due(ctx.now());
         if let Some((_, source)) = self.chips.analog.iter_mut().find(|(p, _)| *p == pad) {
             let millivolts = source.millivolts(at);
             // The call may have changed what a clocked chip has to do.
