@@ -669,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_mode_is_checked_against_locked_entries_only() {
+    fn only_a_locked_entry_restricts_machine_mode() {
         for mut p in [c3(), spec()] {
             set_addr(&mut p, 0, word(0x1000));
             configure(&mut p, 0, TOR);
@@ -682,6 +682,41 @@ mod tests {
             assert!(!p.allows(0x800, 4, Store, Machine), "locked, no permission");
             assert!(p.allows(0x1000, 4, Store, Machine), "outside every entry");
         }
+    }
+
+    /// Entry 0, unlocked, holds [0, 0x1000); entry 1, locked and read-only, holds [0, 0x2000).
+    fn unlocked_over_locked(p: &mut Pmp) {
+        set_addr(p, 0, word(0x1000));
+        configure(p, 0, TOR);
+        // NAPOT at 0, ten trailing ones: 2^(10 + 3) = 0x2000 bytes.
+        set_addr(p, 1, 0x3FF);
+        configure(p, 1, L | NAPOT | R);
+    }
+
+    #[test]
+    fn on_the_bench_an_unlocked_entry_takes_part_in_machine_mode_checks() {
+        // Specification rules: every active entry matches machine mode; an unlocked one that holds
+        // the access grants everything and hides the entries after it, and one that holds only part
+        // of it refuses it.
+        let mut p = spec();
+        unlocked_over_locked(&mut p);
+        assert!(
+            p.allows(0x800, 4, Store, Machine),
+            "entry 0 decides: everything, entry 1's read-only is hidden"
+        );
+        assert!(
+            !p.allows(0x1800, 4, Store, Machine),
+            "only entry 1 holds it: read-only"
+        );
+        assert!(
+            !p.allows(0x0FFE, 4, Load, Machine),
+            "entry 0 holds part of it: refused, though entry 1 holds it all and grants R"
+        );
+        // The ESP32-C3: an unlocked entry does not apply to machine mode at all.
+        let mut c = c3();
+        unlocked_over_locked(&mut c);
+        assert!(!c.allows(0x800, 4, Store, Machine), "entry 1 decides");
+        assert!(c.allows(0x0FFE, 4, Load, Machine), "entry 1 holds it all");
     }
 
     /// Entry 0 grants only reads of [0x1000, 0x2000), entry 1 reads and writes of [0, 0x4000):

@@ -37,10 +37,18 @@ Ce que disent les sources (rapport `docs/research/esp32c3-pmp-and-user-mode.md`,
      bas, `TW`, pas de `MPRV` ni de `mcounteren` ; PMP **sans priorité statique** ; ce qu'une écriture garde est ce
      que QEMU garde (octet entier, `pmpaddr` sur 32 bits).
 2. **Une seule PMP pour les deux cœurs** (`cpu_rv32::pmp`) : mêmes registres, mêmes verrous, même décodage des plages
-   (OFF, TOR, NA4, NAPOT ; un TOR dont la borne basse n'est pas sous la borne haute ne correspond à rien), mêmes
-   règles de mode (le mode machine n'est contrôlé que par les entrées verrouillées ; aucune entrée : machine
-   autorisée, utilisateur refusé). Seules diffèrent la combinaison des entrées et les détails WARL ci-dessus. Une
-   écriture R = 0 avec W = 1 laisse l'entrée telle quelle sur les deux cœurs (QEMU ; Sail configuré `PMP_Ignore`).
+   (OFF, TOR, NA4, NAPOT ; un TOR dont la borne basse n'est pas sous la borne haute ne correspond à rien), même
+   défaut (aucune entrée qui s'applique : machine autorisée, utilisateur refusé), même effet du verrou (seule une
+   entrée verrouillée restreint le mode machine ; une entrée non verrouillée lui accorde tout). Diffèrent la
+   combinaison des entrées, les entrées qui comptent pour le mode machine et les détails WARL ci-dessus :
+   - **sur la puce**, seules les entrées verrouillées s'appliquent au mode machine (TRM §1.8.3) : une entrée non
+     verrouillée ne le touche pas, ni pour accorder ni pour refuser ;
+   - **sur le banc** (règles `Specification`, celles de Sail), toute entrée active participe, en mode machine comme
+     en mode utilisateur : une entrée non verrouillée qui contient l'accès accorde tout au mode machine et masque les
+     entrées suivantes, même verrouillées, et une entrée qui n'en contient qu'une partie le refuse.
+
+   Une écriture R = 0 avec W = 1 laisse l'entrée telle quelle sur les deux cœurs (QEMU ; Sail configuré
+   `PMP_Ignore`).
 3. **Le contrôle** : chaque parcelle de 16 bits d'un fetch, avant le cache de décodage (qui ne garde que des
    décodages : une écriture de la PMP prend effet au fetch suivant sans rien invalider) ; chaque chargement et
    rangement, après le contrôle d'alignement, avant le bus. Une faute PMP a la cause d'une faute de bus (1, 5, 7) et
