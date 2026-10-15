@@ -96,7 +96,7 @@ pub enum Claimed {
 
 impl Claimed {
     /// Whether `path` is this file or a file of this directory, whether it exists or not.
-    fn holds(&self, path: &Path) -> bool {
+    pub(crate) fn holds(&self, path: &Path) -> bool {
         match self {
             Claimed::File { path: file, .. } => same_place(path, file),
             Claimed::Directory { path: dir, .. } => directory_of(path)
@@ -105,7 +105,7 @@ impl Claimed {
         }
     }
 
-    fn what(&self) -> &str {
+    pub(crate) fn what(&self) -> &str {
         match self {
             Claimed::File { what, .. } | Claimed::Directory { what, .. } => what,
         }

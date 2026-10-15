@@ -11,6 +11,9 @@
 //! image and the buttons of a device plug in, with a test pattern ([`pattern`]) until the display
 //! is wired, and [`catalog`] chooses them per device. [`utf8`] decodes the consoles as they speak
 //! and [`capture`] makes a PNG of the panel.
+//!
+//! The SD card of a device (design `SP2e`, ADR 0014) is kept in an image file: [`sd_image`] opens,
+//! locks and writes it through a journal, and [`sd_format`] creates a blank FAT32 one.
 pub mod capture;
 pub mod catalog;
 pub mod device;
@@ -26,6 +29,8 @@ pub mod record;
 pub mod rom_store;
 pub mod run;
 pub mod script_file;
+pub mod sd_format;
+pub mod sd_image;
 pub mod session_file;
 pub mod term;
 #[cfg(any(test, feature = "test-support"))]
