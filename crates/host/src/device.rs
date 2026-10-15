@@ -54,6 +54,41 @@ const MAX_LAG_NANOS: u64 = 50_000_000;
 const STATUS_EVERY: Duration = Duration::from_millis(100);
 /// The time over which the speed of the run is measured.
 const SPEED_WINDOW: Duration = Duration::from_secs(1);
+/// The shortest time between two console updates while text keeps coming (2c-R15): a firmware
+/// that prints on every pass would otherwise send an update per pass, hundreds a second.
+const CONSOLE_EVERY: Duration = Duration::from_millis(40);
+
+/// Console text waiting to be sent, joined while it stays on one channel, in the order it came.
+#[derive(Debug, Default)]
+struct ConsoleBatch {
+    texts: Vec<(ConsoleChannel, String)>,
+    last_sent: Option<Instant>,
+}
+
+impl ConsoleBatch {
+    fn push(&mut self, channel: ConsoleChannel, text: String) {
+        match self.texts.last_mut() {
+            Some((last, held)) if *last == channel => held.push_str(&text),
+            _ => self.texts.push((channel, text)),
+        }
+    }
+
+    /// Whether text waits and the last sending is at least [`CONSOLE_EVERY`] before `now`.
+    fn due(&self, now: Instant) -> bool {
+        !self.texts.is_empty()
+            && self
+                .last_sent
+                .is_none_or(|last| now.saturating_duration_since(last) >= CONSOLE_EVERY)
+    }
+
+    /// The text waiting, sent at `now`.
+    fn take(&mut self, now: Instant) -> Vec<(ConsoleChannel, String)> {
+        if !self.texts.is_empty() {
+            self.last_sent = Some(now);
+        }
+        std::mem::take(&mut self.texts)
+    }
+}
 
 /// What the interface asks a run to be: the options of `inkemu run`.
 #[derive(Clone, Debug, Default)]
@@ -829,6 +864,7 @@ impl Emulator {
                     recording: None,
                     measure: None,
                     speed_ratio: None,
+                    console: ConsoleBatch::default(),
                 }
                 .serve(&receiver);
             })?;
@@ -930,6 +966,7 @@ struct Worker {
     /// The host instant and the device time the speed is measured from.
     measure: Option<(Instant, u64)>,
     speed_ratio: Option<f64>,
+    console: ConsoleBatch,
 }
 
 impl Worker {
@@ -966,6 +1003,8 @@ impl Worker {
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             } else {
+                // Nothing runs until a command comes: the text waiting is sent now.
+                self.flush_console(true);
                 match requests.recv() {
                     Ok(request) => Some(request),
                     Err(_) => break,
@@ -989,7 +1028,7 @@ impl Worker {
                     }
                 }
                 if stop {
-                    (self.observer)(Update::Stopped);
+                    self.tell(Update::Stopped);
                     return;
                 }
                 continue;
@@ -1005,12 +1044,13 @@ impl Worker {
             self.rescue(&*panic);
             return;
         }
-        (self.observer)(Update::Stopped);
+        self.tell(Update::Stopped);
     }
 
     /// Ends a run that panicked: writes the flash the device left, says why the emulator
-    /// stopped, and sends [`Update::Stopped`]. Whatever else the life held (its session, its
-    /// last console text) is not trusted after a panic and is dropped.
+    /// stopped, and sends [`Update::Stopped`]. The console text of the passes that completed is
+    /// sent; what else the life held (its session, its end) is not trusted after a panic and is
+    /// dropped.
     fn rescue(&mut self, panic: &(dyn std::any::Any + Send)) {
         let mut log = Vec::new();
         // The flash first: telling the observer may panic again.
@@ -1045,10 +1085,32 @@ impl Worker {
                 ),
             );
             for notice in Notice::from_log(&log) {
-                (self.observer)(Update::Notice(notice));
+                self.tell(Update::Notice(notice));
             }
-            (self.observer)(Update::Stopped);
+            self.tell(Update::Stopped);
         }));
+    }
+
+    /// Sends `update` after the console text waiting, so that the observer hears everything in
+    /// the order it happened.
+    fn tell(&mut self, update: Update) {
+        self.flush_console(true);
+        (self.observer)(update);
+    }
+
+    /// Sends the console text waiting: now when `now`, else only when the last console update is
+    /// old enough ([`CONSOLE_EVERY`]).
+    fn flush_console(&mut self, now: bool) {
+        let at = Instant::now();
+        if !now && !self.console.due(at) {
+            return;
+        }
+        for (channel, text) in self.console.take(at) {
+            (self.observer)(Update::Console {
+                channel: channel.name(),
+                text,
+            });
+        }
     }
 
     fn wants_to_run(&self) -> bool {
@@ -1060,29 +1122,28 @@ impl Worker {
     }
 
     fn notice(&mut self, level: Level, text: String) {
-        (self.observer)(Update::Notice(Notice { level, text }));
+        self.tell(Update::Notice(Notice { level, text }));
     }
 
-    /// Sends what a call of the engine produced.
+    /// Sends what a call of the engine produced; its console text joins the text waiting, which
+    /// goes at most every [`CONSOLE_EVERY`] (2c-R15).
     fn emit(&mut self, output: Output) {
         for (channel, text) in output.console {
-            (self.observer)(Update::Console {
-                channel: channel.name(),
-                text,
-            });
+            self.console.push(channel, text);
         }
         for notice in output.notices {
-            (self.observer)(Update::Notice(notice));
+            self.tell(Update::Notice(notice));
         }
         if let Some(frame) = output.frame {
             let (generation, refresh) = (frame.generation, frame.refresh);
             *self.frame.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
-            (self.observer)(Update::Frame {
+            self.tell(Update::Frame {
                 generation,
                 refresh,
                 life: self.life,
             });
         }
+        self.flush_console(false);
     }
 
     /// Starts the pace and the measure of speed from now.
@@ -1323,10 +1384,10 @@ impl Worker {
             flash.finish(&ended, &mut log);
         }
         for notice in Notice::from_log(&log) {
-            (self.observer)(Update::Notice(notice));
+            self.tell(Update::Notice(notice));
         }
         self.last_end = Some(ended.end);
-        (self.observer)(Update::LifeEnded {
+        self.tell(Update::LifeEnded {
             life: self.life,
             end: ended.end,
             verdict,
@@ -1379,7 +1440,7 @@ impl Worker {
         self.measure_speed();
         let status = self.status();
         self.last_status = Some(Instant::now());
-        (self.observer)(Update::Status(status));
+        self.tell(Update::Status(status));
     }
 
     fn measure_speed(&mut self) {
@@ -2229,6 +2290,63 @@ mod tests {
             "{seen:#?}"
         );
         emulator.shutdown();
+    }
+
+    /// Console text is joined while it stays on one channel, sent at once the first time, then at
+    /// most every [`CONSOLE_EVERY`].
+    #[test]
+    fn console_text_is_sent_in_batches() {
+        let mut batch = ConsoleBatch::default();
+        let start = Instant::now();
+        assert!(!batch.due(start), "nothing waits");
+        batch.push(UART0, "a".into());
+        batch.push(UART0, "b".into());
+        batch.push(ConsoleChannel::UsbSerialJtag, "c".into());
+        batch.push(UART0, "d".into());
+        assert!(batch.due(start));
+        assert_eq!(
+            batch.take(start),
+            [
+                (UART0, "ab".to_owned()),
+                (ConsoleChannel::UsbSerialJtag, "c".to_owned()),
+                (UART0, "d".to_owned())
+            ]
+        );
+        batch.push(UART0, "e".into());
+        assert!(!batch.due(start + CONSOLE_EVERY / 2));
+        assert!(batch.due(start + CONSOLE_EVERY));
+    }
+
+    /// A firmware that prints on every pass reaches the observer in few updates, all its text in
+    /// order.
+    #[test]
+    fn a_chatty_firmware_sends_few_console_updates() {
+        // Prints `x` on UART0 for ever, from every pass.
+        let mut program = stop_watchdogs();
+        program.extend(soc_esp32c3::test_support::print_program(0x6000_0000, b"x"));
+        program.push(cpu_rv32::asm::jal(0, -4));
+        let launch = Launch::new(
+            x4(flat_rom(&program)),
+            FlashKeeper::without_file(None, 16 << 20),
+            Limits::default(),
+            LOOK,
+            None,
+        );
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        let watched = Instant::now();
+        let (mut sent, mut shown) = (0_usize, 0_usize);
+        while watched.elapsed() < Duration::from_millis(600) {
+            if let Ok(Update::Console { text, .. }) = updates.recv_timeout(WAIT) {
+                assert!(text.bytes().all(|byte| byte == b'x'), "{text:?}");
+                sent += 1;
+                shown += text.len();
+            }
+        }
+        emulator.shutdown();
+        assert!(shown > 100, "the firmware printed {shown} bytes");
+        // At most one batch per 40 ms, one per status (every 100 ms), and the first: 30 at most
+        // in 600 ms, where a pass per update would have sent hundreds.
+        assert!(sent <= 30, "{sent} console updates for {shown} bytes");
     }
 
     /// Commands submitted one after the other are done in that order, whatever waits for their
