@@ -226,9 +226,11 @@ export const en: Catalog = {
     "The device runs: the view below is the state at the last refresh. Pause it, or refresh.",
   "debug.stop.breakpoint": "Stopped at the breakpoint {pc}, before its instruction.",
   "debug.stop.watchpoint.read":
-    "Stopped: the instruction at {pc} read {size} bytes at {address} (value {value}).",
+    "Stopped: the instruction at {pc} read {bytes} at {address} (value {value}).",
   "debug.stop.watchpoint.write":
-    "Stopped: the instruction at {pc} wrote {size} bytes at {address} (value {value}).",
+    "Stopped: the instruction at {pc} wrote {bytes} at {address} (value {value}).",
+  "debug.bytes.one": "{count} byte",
+  "debug.bytes.other": "{count} bytes",
   "debug.cpu": "Processor",
   "debug.pc": "PC",
   "debug.privilege": "Mode",
@@ -274,7 +276,7 @@ export const en: Catalog = {
   "debug.watch.on.write": "writes",
   "debug.watch.on.access": "reads and writes",
   "debug.watch.set": "Watch",
-  "debug.watch.item": "{length} bytes at {address}, {on}",
+  "debug.watch.item": "{bytes} at {address}, {on}",
   "debug.remove.watchpoint": "Remove the watchpoint: {item}",
   "debug.invalidAddress": "An address in hexadecimal, 1 to 8 digits, such as 0x3fc80000.",
   "debug.invalidLength": "A number of bytes from 1 to 4096.",

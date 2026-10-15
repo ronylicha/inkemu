@@ -14,6 +14,12 @@ import type {
 import { hexByte, hiddenRegions, memoryRows, textOf } from "./debug-format";
 import { hex32, labelOf } from "./labels";
 
+/** `count` bytes in words: singular for one, plural above; never 0 here (an access is 1 to 4
+ * bytes, a watchpoint 1 to 4096). */
+export function bytesText(t: Translate, count: number): string {
+  return t(count === 1 ? "debug.bytes.one" : "debug.bytes.other", { count });
+}
+
 /** The sentence that says why the debugger stopped the run. */
 export function stopText(t: Translate, stop: StopView): string {
   if (stop.kind === "breakpoint") {
@@ -21,7 +27,7 @@ export function stopText(t: Translate, stop: StopView): string {
   }
   return t(stop.access === "read" ? "debug.stop.watchpoint.read" : "debug.stop.watchpoint.write", {
     pc: hex32(stop.pc),
-    size: stop.size,
+    bytes: bytesText(t, stop.size),
     address: hex32(stop.address),
     value: `0x${stop.value.toString(16)}`,
   });
@@ -30,7 +36,7 @@ export function stopText(t: Translate, stop: StopView): string {
 /** A watchpoint in words, for its line and its remove button. */
 export function watchText(t: Translate, watch: Watchpoint): string {
   return t("debug.watch.item", {
-    length: watch.length,
+    bytes: bytesText(t, watch.length),
     address: hex32(watch.address),
     on: labelOf(t, "debug.watch.on", watch.on),
   });

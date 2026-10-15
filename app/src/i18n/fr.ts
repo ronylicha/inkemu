@@ -226,9 +226,11 @@ export const fr = {
     "L’appareil avance : la vue ci-dessous est l’état au dernier rafraîchissement. Mettez en pause ou rafraîchissez.",
   "debug.stop.breakpoint": "Arrêté au point d’arrêt {pc}, avant son instruction.",
   "debug.stop.watchpoint.read":
-    "Arrêté : l’instruction à {pc} a lu {size} octets à {address} (valeur {value}).",
+    "Arrêté : l’instruction à {pc} a lu {bytes} à {address} (valeur {value}).",
   "debug.stop.watchpoint.write":
-    "Arrêté : l’instruction à {pc} a écrit {size} octets à {address} (valeur {value}).",
+    "Arrêté : l’instruction à {pc} a écrit {bytes} à {address} (valeur {value}).",
+  "debug.bytes.one": "{count} octet",
+  "debug.bytes.other": "{count} octets",
   "debug.cpu": "Processeur",
   "debug.pc": "PC",
   "debug.privilege": "Mode",
@@ -275,7 +277,7 @@ export const fr = {
   "debug.watch.on.write": "les écritures",
   "debug.watch.on.access": "les lectures et les écritures",
   "debug.watch.set": "Surveiller",
-  "debug.watch.item": "{length} octets à {address}, {on}",
+  "debug.watch.item": "{bytes} à {address}, {on}",
   "debug.remove.watchpoint": "Retirer le point de surveillance : {item}",
   "debug.invalidAddress": "Une adresse en hexadécimal, de 1 à 8 chiffres, par exemple 0x3fc80000.",
   "debug.invalidLength": "Un nombre d’octets de 1 à 4096.",
