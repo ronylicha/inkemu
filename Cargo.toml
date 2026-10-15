@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/emu-core", "crates/cpu-rv32", "crates/firmware", "crates/emu-cli", "crates/svd-gen", "crates/svd-regs", "crates/soc-esp32c3", "crates/boards", "crates/console-script", "crates/session", "crates/lockstep", "crates/lockstep-cli", "crates/chips", "crates/host", "crates/debugger"]
+members = ["crates/emu-core", "crates/cpu-rv32", "crates/firmware", "crates/emu-cli", "crates/svd-gen", "crates/svd-regs", "crates/soc-esp32c3", "crates/boards", "crates/console-script", "crates/session", "crates/lockstep", "crates/lockstep-cli", "crates/chips", "crates/host", "crates/debugger", "crates/monitor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -22,6 +22,7 @@ lockstep = { path = "crates/lockstep", version = "0.1.0" }
 chips = { path = "crates/chips", version = "0.1.0" }
 host = { path = "crates/host", version = "0.1.0" }
 debugger = { path = "crates/debugger", version = "0.1.0" }
+monitor = { path = "crates/monitor", version = "0.1.0" }
 thiserror = "2"
 sha2 = "0.11"
 sha1 = "0.11"

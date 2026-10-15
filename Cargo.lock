@@ -653,6 +653,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "monitor"
+version = "0.1.0"
+dependencies = [
+ "cpu-rv32",
+ "emu-core",
+ "serde",
+ "serde_json",
+ "soc-esp32c3",
+ "svd-regs",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
