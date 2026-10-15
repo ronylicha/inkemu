@@ -8,7 +8,10 @@ pub const MSTATUS: u16 = 0x300;
 pub const MISA: u16 = 0x301;
 pub const MIE: u16 = 0x304;
 pub const MTVEC: u16 = 0x305;
-/// Which counters user mode may read (the conformance bench only, [`Core::MachineUser`]).
+/// `mcounteren`. On the conformance bench ([`Core::MachineUser`]) it exists, every bit writable,
+/// and has no effect: without Zicntr there is no unprivileged counter for it to let user mode read
+/// (Sail configured alike). The ESP32-C3 ([`Core::Esp32C3`], TRM table 1.4.1) and the plain hart
+/// ([`Core::MachineOnly`]) do not have it.
 pub const MCOUNTEREN: u16 = 0x306;
 pub const MSCRATCH: u16 = 0x340;
 pub const MEPC: u16 = 0x341;
