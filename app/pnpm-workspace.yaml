@@ -1,0 +1,22 @@
+# pnpm refuses a package published less than a day ago (supply-chain policy). The versions below are
+# the latest stable releases of Tauri 2 and React, read on 2026-10-15 for this application
+# (docs/research/sp2c-app-stack.md) and younger than that day: each is excepted by its exact version,
+# and every other package, direct or not, stays under the policy.
+minimumReleaseAge: 1440
+minimumReleaseAgeExclude:
+  - '@tauri-apps/api@2.12.4'
+  - '@tauri-apps/cli-darwin-arm64@2.12.3'
+  - '@tauri-apps/cli-darwin-x64@2.12.3'
+  - '@tauri-apps/cli-linux-arm-gnueabihf@2.12.3'
+  - '@tauri-apps/cli-linux-arm64-gnu@2.12.3'
+  - '@tauri-apps/cli-linux-arm64-musl@2.12.3'
+  - '@tauri-apps/cli-linux-riscv64-gnu@2.12.3'
+  - '@tauri-apps/cli-linux-x64-gnu@2.12.3'
+  - '@tauri-apps/cli-linux-x64-musl@2.12.3'
+  - '@tauri-apps/cli-win32-arm64-msvc@2.12.3'
+  - '@tauri-apps/cli-win32-ia32-msvc@2.12.3'
+  - '@tauri-apps/cli-win32-x64-msvc@2.12.3'
+  - '@tauri-apps/cli@2.12.3'
+  - '@tauri-apps/plugin-dialog@2.8.3'
+  - react-dom@19.3.1
+  - react@19.3.1
