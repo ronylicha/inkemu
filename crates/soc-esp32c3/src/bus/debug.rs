@@ -57,9 +57,29 @@ impl SocBus {
         self.watch_hit.take()
     }
 
-    /// The byte at `addr` as it is, without the effects of a load: no peripheral is called, no
-    /// cache state nor fault register changes, nothing is reported.
+    /// [`SocBus::peek_byte_with`] counting no page as code but the pages executed.
+    #[cfg(test)]
     pub(crate) fn peek_byte(&self, addr: u32) -> Peeked {
+        self.peek_byte_with(addr, None)
+    }
+
+    /// The 64 KiB flash page a byte of a flash window maps to, when one does.
+    pub(crate) fn flash_page_of(&self, addr: u32) -> Option<u32> {
+        match locate(addr, 1) {
+            Some(Region::Flash { offset, .. }) => self
+                .flash_offset(offset)
+                .ok()
+                .map(|flash_offset| flash_offset / MMU_PAGE_BYTES),
+            _ => None,
+        }
+    }
+
+    /// The byte at `addr` as it is, without the effects of a load: no peripheral is called, no
+    /// cache state nor fault register changes, nothing is reported. A byte of the flash is given
+    /// from a page the CPU executed, or from `code_page`: the page of the instruction the CPU is
+    /// about to execute, which it may not have fetched yet (a breakpoint stops before the
+    /// fetch). That page is not added to the note of the pages executed.
+    pub(crate) fn peek_byte_with(&self, addr: u32, code_page: Option<u32>) -> Peeked {
         let byte = |bytes: Result<&[u8], emu_core::BusError>| {
             bytes
                 .ok()
@@ -77,7 +97,10 @@ impl SocBus {
             Some(Region::Sram0) => byte(self.sram0.bytes(addr, 1)),
             Some(Region::Rtc) => byte(self.rtc.bytes(addr, 1)),
             Some(Region::Flash { offset, .. }) => match self.flash_offset(offset) {
-                Ok(flash_offset) if self.executed.contains(flash_offset / MMU_PAGE_BYTES) => {
+                Ok(flash_offset)
+                    if self.executed.contains(flash_offset / MMU_PAGE_BYTES)
+                        || code_page == Some(flash_offset / MMU_PAGE_BYTES) =>
+                {
                     let mut out = [0u8];
                     self.periph.spi1.flash().read(flash_offset, &mut out);
                     Peeked::Flash(out[0])
@@ -308,6 +331,50 @@ mod tests {
         .unwrap();
         assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x2_0000), Peeked::Flash(0x93));
         assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x1_0000), Peeked::NotExecuted);
+    }
+
+    /// The note is of flash pages, not of addresses: an entry the firmware points elsewhere shows
+    /// a page the CPU never fetched from, which is not executed, whatever ran at that address.
+    #[test]
+    fn an_mmu_entry_pointed_elsewhere_shows_a_page_not_executed() {
+        let mut b = mapped_bus();
+        b.read(
+            FLASH_IBUS_BASE + 0x1_0000,
+            AccessSize::Half,
+            AccessKind::Fetch,
+        )
+        .unwrap();
+        assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x1_0000), Peeked::Flash(0x13));
+        b.write(MMU_TABLE_BASE + 4, AccessSize::Word, 2).unwrap();
+        assert_eq!(b.peek_byte(FLASH_IBUS_BASE + 0x1_0000), Peeked::NotExecuted);
+        b.write(MMU_TABLE_BASE + 4, AccessSize::Word, 1).unwrap();
+        assert_eq!(
+            b.peek_byte(FLASH_IBUS_BASE + 0x1_0000),
+            Peeked::Flash(0x13),
+            "pointed back at the page executed"
+        );
+    }
+
+    /// The page of the PC counts as code before its first fetch, and only for the read.
+    #[test]
+    fn the_page_of_the_pc_is_read_as_code_without_being_noted() {
+        let b = mapped_bus();
+        let pc_page = b.flash_page_of(FLASH_IBUS_BASE + 0x2_0000);
+        assert_eq!(pc_page, Some(2));
+        assert_eq!(
+            b.peek_byte_with(FLASH_IBUS_BASE + 0x2_0000, pc_page),
+            Peeked::Flash(0x93)
+        );
+        assert_eq!(
+            b.peek_byte_with(FLASH_IBUS_BASE + 0x1_0000, pc_page),
+            Peeked::NotExecuted
+        );
+        assert_eq!(
+            b.peek_byte(FLASH_IBUS_BASE + 0x2_0000),
+            Peeked::NotExecuted,
+            "not noted"
+        );
+        assert_eq!(b.flash_page_of(SRAM_DBUS_BASE), None);
     }
 
     /// A program or an erase changes what a page holds: what the CPU executed there is gone, and

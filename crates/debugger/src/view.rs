@@ -304,12 +304,35 @@ fn instruction_at(machine: &Esp32C3, address: u32) -> Option<Decoded> {
     Some(decode(parcel | u32::from(u16::from_le_bytes(high)) << 16))
 }
 
+/// Whether the instruction at `address`, which could not be read, could not be read because a
+/// byte of it lies in a page of the flash the CPU did not execute: the first byte of its first
+/// parcel that is not code, or of its second parcel when the first is code and announces 32
+/// bits. An instruction that straddles an executed page and one not executed is so.
+fn unread_flash(machine: &Esp32C3, address: u32) -> bool {
+    let first_unread = |peeked: Vec<Peeked>| {
+        peeked
+            .into_iter()
+            .find(|byte| !matches!(byte, Peeked::Byte(_) | Peeked::Flash(_)))
+    };
+    let low = machine.peek(address, 2);
+    let parcel = match low.as_slice() {
+        [
+            Peeked::Byte(a) | Peeked::Flash(a),
+            Peeked::Byte(b) | Peeked::Flash(b),
+        ] => u16::from_le_bytes([*a, *b]),
+        _ => return first_unread(low) == Some(Peeked::NotExecuted),
+    };
+    parcel & 0b11 == 0b11
+        && address
+            .checked_add(2)
+            .is_some_and(|high| first_unread(machine.peek(high, 2)) == Some(Peeked::NotExecuted))
+}
+
 /// One line at `address`.
 fn line(machine: &Esp32C3, points: &Points, address: u32) -> Line {
     let decoded = instruction_at(machine, address);
-    let not_executed = decoded.is_none()
-        && in_flash_code(address)
-        && machine.peek(address, 1).first() == Some(&Peeked::NotExecuted);
+    let not_executed =
+        decoded.is_none() && in_flash_code(address) && unread_flash(machine, address);
     Line {
         address,
         not_executed,
@@ -641,6 +664,70 @@ mod tests {
             code_bytes.bytes, [None; 4],
             "the memory view never shows the flash"
         );
+    }
+
+    /// A machine whose flash holds `image`, whose ROM maps MMU entries 1 and 2 to flash pages 1
+    /// and 2 and jumps to `jump_to`, run until `breakpoint` stops it or for a while.
+    fn from_the_flash(image: Vec<u8>, jump_to: u32, breakpoint: Option<u32>) -> Esp32C3 {
+        let mut program = stop_watchdogs();
+        program.extend(store_register(MMU_TABLE_BASE + 4, 1));
+        program.extend(store_register(MMU_TABLE_BASE + 8, 2));
+        program.extend([lui(5, jump_to), jalr(0, 5, 0)]);
+        let mut machine =
+            Esp32C3::with_flash(flat_rom(&program), image, &SocConfig::default()).unwrap();
+        let mut points = Points::default();
+        if let Some(at) = breakpoint {
+            points.set_breakpoint(at).unwrap();
+        }
+        points.apply(&mut machine);
+        machine.run_stopping(Cycles(100_000), None);
+        machine
+    }
+
+    /// A breakpoint at the first instruction of a page stops the CPU before its first fetch from
+    /// it: the line of the PC is the code the CPU is about to execute, and reads as such.
+    #[test]
+    fn the_line_of_the_pc_reads_in_a_page_not_executed_yet() {
+        let code_page = FLASH_IBUS_BASE + 0x2_0000;
+        let mut image = vec![0xffu8; 0x3_0000];
+        image[0x2_0000..0x2_0004].copy_from_slice(&addi(10, 10, 1).to_le_bytes());
+        image[0x2_0004..0x2_0008].copy_from_slice(&HANG.to_le_bytes());
+        let machine = from_the_flash(image, code_page, Some(code_page));
+        assert_eq!(machine.pc(), code_page, "stopped before the first fetch");
+        let lines = disassembly(&machine, &Points::default(), &ViewRequest::default());
+        let current = lines.iter().find(|line| line.current).unwrap();
+        assert_eq!(text(current), "addi a0, a0, 1");
+        assert!(!current.not_executed);
+        // Read as code for the view, not noted: the memory view still shows no flash byte.
+        let bytes = memory(
+            &machine,
+            MemoryRequest {
+                address: code_page,
+                length: 4,
+            },
+        );
+        assert_eq!(bytes.bytes, [None; 4]);
+    }
+
+    /// A 32-bit instruction whose first parcel ends an executed page and whose second begins a
+    /// page not executed is not read, because of that page.
+    #[test]
+    fn an_instruction_across_an_executed_page_and_one_not_executed_is_not_executed() {
+        let executed = FLASH_IBUS_BASE + 0x1_0000;
+        let mut image = vec![0xffu8; 0x3_0000];
+        image[0x1_0000..0x1_0004].copy_from_slice(&HANG.to_le_bytes());
+        let across = addi(10, 10, 1).to_le_bytes();
+        image[0x1_FFFE..0x2_0002].copy_from_slice(&across);
+        let machine = from_the_flash(image, executed, None);
+        assert_eq!(machine.pc(), executed, "parked in page 1");
+        let request = ViewRequest {
+            disassembly_at: Some(FLASH_IBUS_BASE + 0x1_FFFE),
+            disassembly_lines: Some(1),
+            memory: None,
+        };
+        let line = &disassembly(&machine, &Points::default(), &request)[0];
+        assert!(line.instruction.is_none());
+        assert!(line.not_executed, "not executed, not unreadable");
     }
 
     #[test]

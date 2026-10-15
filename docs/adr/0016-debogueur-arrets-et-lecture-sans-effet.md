@@ -44,7 +44,13 @@ flash n'est affiché.
    décodage manque, jamais relu pendant l'exécution, gardé à travers les resets, retiré d'une page qu'une
    programmation ou un effacement change) ; `peek` ne donne aucun octet d'une autre page (`Peeked::NotExecuted`),
    que la vue dit « non exécutée ». Une page projetée pour des données reste ainsi illisible, même lue par l'alias
-   d'instructions. Du code exécuté, le désassemblage ne donne que le texte décodé, sans encodage ni bits (une
+   d'instructions. La page de l'instruction au PC compte aussi comme code, sans entrer dans la note : le processeur
+   va l'exécuter, et un point d'arrêt l'arrête avant son premier fetch. Une instruction à cheval sur une page
+   exécutée et une page qui ne l'est pas est dite « non exécutée ». **La granularité est la page de 64 Kio**, celle
+   de la MMU : des données rangées dans une page d'où le processeur a exécuté du code (constantes, tables, chaînes
+   placées par l'éditeur de liens à côté du code) restent décodables par le désassemblage, comme du code. ESP-IDF
+   aligne ses segments de flash sur des pages de MMU, si bien que `.rodata` et `.text` d'une application sont dans
+   des pages distinctes ; une image construite autrement peut mêler les deux dans une page. Du code exécuté, le désassemblage ne donne que le texte décodé, sans encodage ni bits (une
    instruction illégale s'écrit `illegal`). Rien de ce que lit le débogueur n'entre au journal, dans un
    fichier, une session ou la sortie de la CLI ; la ligne du journal d'un arrêt de surveillance ne porte une valeur
    que d'une région permise.

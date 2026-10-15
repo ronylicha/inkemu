@@ -123,6 +123,30 @@ Aucun point bloquant, deux importants et cinq mineurs, tous corrigés. Chaque co
   décimal qui tient sur 32 bits. Une longueur hors bornes va à l'hôte, qui la refuse avec ses bornes (4a-R8). Tests
   Vitest.
 
+Vérification de ces corrections (`b5415ea`, puis le commit qui suit) : six points de plus.
+
+1. **Ligne du PC dans une page jamais exécutée** : `peek` compte comme code la page physique de l'instruction au PC
+   (`SocBus::flash_page_of`, `peek_byte_with`), sans l'ajouter à la note. Un arrêt avant le premier fetch d'une page
+   montre l'instruction du PC. Tests : `the_line_of_the_pc_reads_in_a_page_not_executed_yet` (`debugger`) et
+   `the_page_of_the_pc_is_read_as_code_without_being_noted` (`soc-esp32c3`).
+2. **Tests de I1** :
+   - `an_mmu_entry_pointed_elsewhere_shows_a_page_not_executed` : page exécutée, entrée de MMU repointée, puis
+     `NotExecuted` ;
+   - `stopping_in_code_from_the_flash_changes_nothing_of_the_run` : un code fetché depuis la flash, arrêté sur chaque
+     instruction de sa boucle et à un point de surveillance, garde empreinte, cycles, instructions, temps, registres
+     et mémoire, sous les deux tarifs.
+3. **Test d'équivalence aux interruptions** : le gestionnaire compte ses entrées dans `s2`. Les arrêts à l'entrée
+   sont comparés à ce compte de l'exécution sans point : égaux, ou un de plus quand la limite de temps tombe à la
+   frontière de la première instruction du gestionnaire.
+4. **Rejeu `host`** : `a_replay_whose_stops_are_not_where_the_input_came_is_identical`, avec des points d'arrêt sur
+   les mots 13 à 15 de la boucle d'écho seulement. L'entrée arrive entre deux arrêts ; on compte neuf arrêts et le
+   verdict est « identique ».
+5. **Granularité de 64 Kio** : documentée dans l'ADR 0016 §6. Des données rangées dans une page exécutée restent
+   décodables.
+6. **Instruction de 4 octets à cheval** sur une page exécutée et une qui ne l'est pas : elle est dite « non
+   exécutée » (`unread_flash` dans `view.rs`). Test :
+   `an_instruction_across_an_executed_page_and_one_not_executed_is_not_executed`.
+
 Les messages des douze premiers commits ont été réécrits par la coordination, pour retirer des lignes de trailer.
 
 ## Vérifié en local

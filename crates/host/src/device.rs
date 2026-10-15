@@ -4704,13 +4704,9 @@ mod tests {
         matches!(update, Update::Notice(n) if n.text.starts_with("inkemu: breakpoint") || n.text.starts_with("inkemu: watchpoint"))
     }
 
-    /// A session with input from the console, replayed stopped at points on the way of that
-    /// input (where `echo` reads each byte, and where it stores each to the FIFO), gives the
-    /// verdict "identical": the stops change nothing of when the input reaches the machine.
-    #[test]
-    fn a_replay_with_console_input_stopped_at_points_is_identical() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("run.inkrec");
+    /// A session of `echo` recorded at `path`, with `hi\r` sent to UART0 while the recorded life
+    /// stood at a breakpoint on the `addi` of `e` (word 3), before the echo loop.
+    fn session_with_console_input(path: &std::path::Path) -> session::Session {
         // A breakpoint on the `addi` of `e`, before the echo loop: each life stops there, so
         // the input goes in at a known place of the recorded life.
         let mut before_the_loop = Points::default();
@@ -4731,7 +4727,9 @@ mod tests {
         emulator.command(Command::Run).unwrap();
         until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
         emulator
-            .command(Command::Record { path: path.clone() })
+            .command(Command::Record {
+                path: path.to_path_buf(),
+            })
             .unwrap();
         until(&updates, is_a_stop);
         emulator
@@ -4743,8 +4741,15 @@ mod tests {
         emulator.command(Command::Run).unwrap();
         until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
         emulator.shutdown().unwrap();
+        session_file::read_session(path).unwrap()
+    }
 
-        let session = session_file::read_session(&path).unwrap();
+    /// `session` replayed with `points`, run on after each stop: the stops, what UART0 showed,
+    /// and the verdict.
+    fn replay_stopped_at(
+        session: session::Session,
+        points: Points,
+    ) -> (u32, String, Option<VerdictView>) {
         let replay_of = session.clone();
         let recipe = Box::new(FnRecipe(move |_: Option<Vec<u8>>, _: bool| {
             let machine = session::Replay::start(&replay_of, echo())
@@ -4758,18 +4763,6 @@ mod tests {
                 sd: None,
             }
         }));
-        // `echo` prints `ready` in 11 words, then polls the FIFO (word 11), reads a byte
-        // (word 13) and stores it back (word 14).
-        let mut points = Points::default();
-        points.set_breakpoint(ROM_BASE + 4 * 3).unwrap();
-        points.set_breakpoint(ROM_BASE + 4 * 13).unwrap();
-        points
-            .set_watchpoint(Watch {
-                address: crate::engine::fixtures::UART0,
-                length: 4,
-                on: WatchOn::Write,
-            })
-            .unwrap();
         let (replay, updates) = started(
             Launch::replay(recipe, session, "run.inkrec".to_owned(), look()).with_points(points),
             Speed::Fastest,
@@ -4793,10 +4786,55 @@ mod tests {
             stops += 1;
             replay.command(Command::Run).unwrap();
         };
+        (stops, echoed, verdict)
+    }
+
+    /// A session with input from the console, replayed stopped at points on the way of that
+    /// input (where `echo` reads each byte, and where it stores each to the FIFO), gives the
+    /// verdict "identical": the stops change nothing of when the input reaches the machine.
+    #[test]
+    fn a_replay_with_console_input_stopped_at_points_is_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_with_console_input(&dir.path().join("run.inkrec"));
+        // `echo` prints `ready` in 11 words, then polls the FIFO (word 11), reads a byte
+        // (word 13) and stores it back (word 14).
+        let mut points = Points::default();
+        points.set_breakpoint(ROM_BASE + 4 * 3).unwrap();
+        points.set_breakpoint(ROM_BASE + 4 * 13).unwrap();
+        points
+            .set_watchpoint(Watch {
+                address: crate::engine::fixtures::UART0,
+                length: 4,
+                on: WatchOn::Write,
+            })
+            .unwrap();
+        let (stops, echoed, verdict) = replay_stopped_at(session, points);
         assert!(echoed.ends_with("hi\r"), "{echoed:?}");
         assert_eq!(
             stops, 12,
             "the `addi` of `e`, three reads, five stores of `ready`, three of the echo"
+        );
+        assert_eq!(verdict, Some(VerdictView::Identical));
+    }
+
+    /// The same session replayed with breakpoints in the echo loop only: no stop is at the
+    /// boundary where the input was given (word 3), so the input reaches the machine between two
+    /// stops, inside a call that runs on; the replay is still identical.
+    #[test]
+    fn a_replay_whose_stops_are_not_where_the_input_came_is_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_with_console_input(&dir.path().join("run.inkrec"));
+        // The read of a byte (word 13), its store (word 14) and the jump back (word 15): reached
+        // only once a byte has arrived; not the poll (word 11), which spins until then.
+        let mut points = Points::default();
+        for word in 13..=15 {
+            points.set_breakpoint(ROM_BASE + 4 * word).unwrap();
+        }
+        let (stops, echoed, verdict) = replay_stopped_at(session, points);
+        assert!(echoed.ends_with("hi\r"), "{echoed:?}");
+        assert_eq!(
+            stops, 9,
+            "three words of the loop for each of the three bytes"
         );
         assert_eq!(verdict, Some(VerdictView::Identical));
     }

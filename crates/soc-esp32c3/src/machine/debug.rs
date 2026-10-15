@@ -153,13 +153,18 @@ impl Esp32C3 {
     /// The `length` bytes from `address` as they are, without the effects of a load: the mask
     /// ROM and the RAMs as bytes, a flash window through its MMU entries, a peripheral register
     /// not read (a read may change it). Nothing is reported and nothing changes.
+    ///
+    /// Of the flash, a byte is given only from a 64 KiB page the CPU fetched an instruction from
+    /// in this life, or from the page of the instruction at the PC, which the CPU is about to
+    /// execute; any other is [`Peeked::NotExecuted`] (ADR 0016 §6).
     #[must_use]
     pub fn peek(&self, address: u32, length: u32) -> Vec<Peeked> {
+        let pc_page = self.bus.flash_page_of(self.hart.pc);
         (0..length)
             .map(|index| {
                 address
                     .checked_add(index)
-                    .map_or(Peeked::Unmapped, |at| self.bus.peek_byte(at))
+                    .map_or(Peeked::Unmapped, |at| self.bus.peek_byte_with(at, pc_page))
             })
             .collect()
     }
@@ -177,9 +182,10 @@ mod tests {
     use crate::StopReason;
     use crate::config::{SocConfig, Timing};
     use crate::debug::{Access, WatchOn};
-    use crate::memmap::{ROM_BASE, SRAM_DBUS_BASE};
+    use crate::memmap::{FLASH_IBUS_BASE, ROM_BASE, SRAM_DBUS_BASE};
+    use crate::periph::mmu::MMU_TABLE_BASE;
     use crate::test_support::{HANG, T0, T1, T2, flat_rom, stop_watchdogs, store_register};
-    use cpu_rv32::asm::{addi, bne, csrrci, csrrsi, csrrw, jal, lui, lw, mret, sw, wfi};
+    use cpu_rv32::asm::{addi, bne, csrrci, csrrsi, csrrw, jal, jalr, lui, lw, mret, sw, wfi};
 
     /// The address of word `index` of a program the flat ROM holds.
     fn at(index: usize) -> u32 {
@@ -338,6 +344,8 @@ mod tests {
     /// The passes of the loop between two `wfi`s.
     const PASSES: i32 = 16;
     const S1: u8 = 9;
+    /// The handler's count of its entries.
+    const S2: u8 = 18;
     const A3: u8 = 13;
     const A4: u8 = 14;
     const A5: u8 = 15;
@@ -415,7 +423,8 @@ mod tests {
         let mut vectors = [HANG; 32];
         vectors[TIMER_LINE as usize] = jal(0, (HANDLER - (VECTORS + 4 * TIMER_LINE)).cast_signed());
         body.extend(vectors);
-        body.push(addi(A4, 0, 1));
+        // The handler counts its entries in `s2` first: a run without points counts them too.
+        body.extend([addi(S2, S2, 1), addi(A4, 0, 1)]);
         body.extend(store_through(A5, A4, reg("SYSTIMER", "INT_CLR")));
         body.extend([
             lui(A3, SRAM_DBUS_BASE),
@@ -503,7 +512,14 @@ mod tests {
             assert_eq!(outcome(&stopped), outcome(&plain), "{timing:?}");
             let handled = word(&plain, SRAM_DBUS_BASE + 4);
             assert!(handled > 10, "{timing:?}: {handled} interrupts");
-            assert_eq!(handler_entries, handled, "{timing:?}: one stop per entry");
+            // The entries the run without points made, by the handler's own count. The last stop
+            // at the entry may be at the boundary where the time limit then ends the run, before
+            // the entry's first instruction: one stop more than entries counted, never fewer.
+            let entries = plain.x()[usize::from(S2)];
+            assert!(
+                (entries..=entries + 1).contains(&handler_entries),
+                "{timing:?}: {handler_entries} stops at the entry, {entries} entries"
+            );
             assert!(
                 interrupted.iter().all(|pc| loop_at.contains(pc)),
                 "{timing:?}: {interrupted:x?}"
@@ -511,6 +527,62 @@ mod tests {
             assert!(resumed_at_interrupted > 0, "{timing:?}");
             assert!(after_wfi > 0, "{timing:?}: the loop went past its wfi");
             assert!(watched > handled, "{timing:?}: {watched} accesses");
+        }
+    }
+
+    /// The flash code of [`code_from_the_flash`] runs from this address: MMU entry 1, page 1.
+    const FLASH_CODE: u32 = FLASH_IBUS_BASE + 0x1_0000;
+
+    /// The counting loop of [`counting`] in flash page 1, which a program in the ROM maps through
+    /// MMU entry 1 and jumps to. Returns the ROM, the flash image and the loop's addresses.
+    fn code_from_the_flash() -> (Vec<u32>, Vec<u8>, Vec<u32>) {
+        let code = [
+            lui(T0, SRAM_DBUS_BASE),
+            addi(T1, 0, 0),
+            addi(T1, T1, 1),
+            sw(T1, T0, 0),
+            lw(T2, T0, 0),
+            jal(0, -12),
+        ];
+        let mut image = vec![0xffu8; 0x2_0000];
+        for (word, at) in code.iter().zip((0x1_0000..).step_by(4)) {
+            image[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let mut rom = stop_watchdogs();
+        rom.extend(store_register(MMU_TABLE_BASE + 4, 1));
+        rom.extend([lui(T0, FLASH_CODE), jalr(0, T0, 0)]);
+        let loop_at = (2..6).map(|index| FLASH_CODE + 4 * index).collect();
+        (rom, image, loop_at)
+    }
+
+    /// Code fetched from the flash, stopped at breakpoints on each instruction of its loop and at
+    /// a watchpoint, runs as without points, under both timing models.
+    #[test]
+    fn stopping_in_code_from_the_flash_changes_nothing_of_the_run() {
+        let (rom, image, loop_at) = code_from_the_flash();
+        let end = Cycles(20_000);
+        for timing in [Timing::Datasheet, Timing::QemuIcount] {
+            let config = SocConfig {
+                trace_hash: true,
+                timing,
+                ..SocConfig::default()
+            };
+            let mut plain = Esp32C3::with_flash(flat_rom(&rom), image.clone(), &config).unwrap();
+            assert_eq!(plain.run_within(end, None), StopReason::CycleBudget);
+            let mut stopped = Esp32C3::with_flash(flat_rom(&rom), image.clone(), &config).unwrap();
+            stopped.set_breakpoints(&loop_at);
+            stopped.set_watchpoints(&[Watch {
+                address: SRAM_DBUS_BASE,
+                length: 4,
+                on: WatchOn::Write,
+            }]);
+            let mut stops = 0u32;
+            while let RunStop::Debug(_) = stopped.run_stopping(end, None) {
+                stops += 1;
+            }
+            assert!(stops > 1_000, "{timing:?}: {stops} stops");
+            assert!(loop_at.contains(&plain.pc()), "{timing:?}: in the flash");
+            assert_eq!(outcome(&stopped), outcome(&plain), "{timing:?}");
         }
     }
 
