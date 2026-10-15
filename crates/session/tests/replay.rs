@@ -15,12 +15,13 @@
 //! stopped at. That the replay, given that instant as a device-time limit, stops at the same
 //! cycles is what a session rests on (R4); it is checked here after every kind of stop.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration test: a panic is a test failure
-use boards::MachineOptions;
-use cpu_rv32::asm::{addi, blt, bne, jal, lbu, lui, lw, sw, wfi};
-use emu_core::Cycles;
+use boards::{MachineOptions, SdHandle, SdStart, Wired, WiredOptions};
+use chips::sdcard::{Overlay, SdCard, SdCardConfig, SparseBlocks};
+use cpu_rv32::asm::{addi, blt, bne, jal, lbu, lui, lw, mul, sw, wfi};
+use emu_core::{BoardInput, Cycles};
 use session::{
     ConsoleDigests, Cut, CutReason, End, Limits, Outcome, ProfileText, Quantity, Replay,
-    ReplayError, RomIdentity, Session,
+    ReplayError, RomIdentity, SdCardStart, Session, changes_sha256,
 };
 use soc_esp32c3::clock::TIME_BASE;
 use soc_esp32c3::test_support::{
@@ -124,6 +125,32 @@ fn waiting() -> Vec<u32> {
     program
 }
 
+/// The X4's latch (GPIO13) held high, then the power key (GPIO3, pulled up) awaited released,
+/// then pressed: the latch is then cut, and the X4 goes off when the key is let go.
+fn power_off_on_the_key() -> Vec<u32> {
+    const GPIO_FUNCTION: u32 = 1 << 12;
+    const FUN_WPU: u32 = 1 << 8;
+    const FUN_IE: u32 = 1 << 9;
+    let mut program = stop_watchdogs();
+    program.extend(store_register(reg("IO_MUX", "GPIO13"), GPIO_FUNCTION));
+    program.extend(store_register(reg("GPIO", "OUT_W1TS"), 1 << 13));
+    program.extend(store_register(reg("GPIO", "ENABLE_W1TS"), 1 << 13));
+    program.extend(store_register(
+        reg("IO_MUX", "GPIO3"),
+        GPIO_FUNCTION | FUN_IE | FUN_WPU,
+    ));
+    // Bit 3 of `GPIO_IN` times 2^28 is the sign bit: negative while the key is released.
+    program.push(lui(T3, 1 << 28));
+    let gpio_in = load_register(reg("GPIO", "IN"));
+    program.extend(gpio_in);
+    program.extend([mul(T1, T1, T3), blt(T1, 0, 8), jal(0, -16)]);
+    program.extend(gpio_in);
+    program.extend([mul(T1, T1, T3), blt(T1, 0, -12)]);
+    program.extend(store_register(reg("GPIO", "OUT_W1TC"), 1 << 13));
+    program.push(HANG);
+    program
+}
+
 const fn ms(millis: u64) -> Cycles {
     Cycles(millis * TIME_BASE.hz() / 1_000)
 }
@@ -178,6 +205,10 @@ struct Firmware {
     after_call: fn(&mut Esp32C3, &[u8], u32) -> u32,
     /// The device time a call runs at most: the host looks at the machine that often.
     pace: Option<Cycles>,
+    /// How long the X4's power key is held at power-on, in milliseconds (0: not pressed).
+    power_hold_ms: u32,
+    /// An SD card in the slot, holding a boot sector.
+    card: bool,
 }
 
 const THREE_LIVES: Firmware = Firmware {
@@ -241,6 +272,8 @@ const THREE_LIVES: Firmware = Firmware {
         }
     },
     pace: Some(ms(1)),
+    power_hold_ms: 0,
+    card: false,
 };
 
 const WAITING: Firmware = Firmware {
@@ -254,23 +287,63 @@ const WAITING: Firmware = Firmware {
     },
     after_call: |_, _, stage| stage,
     pace: None,
+    power_hold_ms: 0,
+    card: false,
+};
+
+/// The power key: the gesture holds it 5 ms; the host presses it again at 20 ms and lets it go at
+/// 30 ms, the firmware having cut the latch in between. A card sits in the slot.
+const POWER: Firmware = Firmware {
+    program: power_off_on_the_key,
+    at_power_on: |m| {
+        let key = |value| BoardInput { target: 0, value };
+        m.send_board_input(ms(20), key(1)).unwrap();
+        m.send_board_input(ms(30), key(0)).unwrap();
+    },
+    after_call: |_, _, stage| stage,
+    pace: None,
+    power_hold_ms: 5,
+    card: true,
 };
 
 fn rom(firmware: &Firmware) -> RomImage {
     flat_rom(&(firmware.program)())
 }
 
-/// Records the run of `firmware`, cut by the host as `cutting` says.
-fn record(firmware: &Firmware, cutting: Cutting) -> Recorded {
-    let profile = boards::builtin("x4").unwrap();
-    let rom = rom(firmware);
-    let rom_identity = RomIdentity::of(3, &rom);
+/// The wired X4 `firmware` runs on, with its card when it has one, as the command line powers it
+/// on: the machine, the slot, and the card as the session records it.
+fn power_on(
+    firmware: &Firmware,
+    rom: RomImage,
+) -> (Esp32C3, Option<SdHandle>, Option<SdCardStart>) {
     let options = MachineOptions {
         strict_mmio: true,
         trace_hash: true,
         usb_host: UsbHost::Attached,
     };
-    let mut m = profile.instantiate(rom, options);
+    let card = firmware.card.then(|| {
+        let mut blocks = SparseBlocks::new(2048);
+        blocks.insert(0, [0xEB; 512]).unwrap();
+        SdCardStart::read(&mut blocks, false).unwrap()
+    });
+    let wired = WiredOptions {
+        power_hold_ms: Some(firmware.power_hold_ms),
+        usb_power: false,
+        sd: card.as_ref().map(|card| SdStart {
+            source: Box::new(card.source()),
+            config: SdCardConfig::default(),
+        }),
+    };
+    let profile = boards::builtin("x4").unwrap();
+    let Wired { machine, sd, .. } = Wired::power_on(&profile, rom, None, options, wired).unwrap();
+    (machine, sd, card)
+}
+
+/// Records the run of `firmware`, cut by the host as `cutting` says.
+fn record(firmware: &Firmware, cutting: Cutting) -> Recorded {
+    let rom = rom(firmware);
+    let rom_identity = RomIdentity::of(3, &rom);
+    let (mut m, slot, card) = power_on(firmware, rom);
     let start = m.flash_contents();
     (firmware.at_power_on)(&mut m);
     m.watch_console(ConsoleChannel::Uart0, true);
@@ -344,7 +417,11 @@ fn record(firmware: &Firmware, cutting: Cutting) -> Recorded {
         }),
         ..Limits::default()
     };
-    let outcome = Outcome::of(&m, end, consoles).unwrap();
+    let storage = slot
+        .and_then(|slot| slot.take_card())
+        .map(SdCard::into_storage);
+    let changes = storage.as_ref().map(Overlay::changes);
+    let outcome = Outcome::of(&m, end, consoles, changes.as_ref()).unwrap();
     let profile = ProfileText {
         id: "x4".to_owned(),
         text: boards::builtin_toml("x4").unwrap().to_owned(),
@@ -353,6 +430,7 @@ fn record(firmware: &Firmware, cutting: Cutting) -> Recorded {
         rom_identity,
         profile,
         start,
+        card,
         limits,
         m.input_journal(),
         outcome,
@@ -452,6 +530,54 @@ fn a_session_replays_to_its_outcome_whatever_the_slices() {
     for slice in [u64::MAX, 1, 7, 997, 7_919] {
         assert_eq!(
             replay(&THREE_LIVES, &session, slice),
+            session.outcome,
+            "slices of {slice}"
+        );
+    }
+}
+
+/// ADR 0013 and the design of sub-project 2e, §7: the gesture and the key of the board, the
+/// supply cut by the latch and the card of the slot replay to the same power-off, whatever the
+/// slices, from the session or from its bytes.
+#[test]
+fn a_wired_session_with_board_inputs_and_a_card_replays_to_its_power_off() {
+    let session = record(&POWER, Cutting::Not).session;
+    assert_eq!(session.outcome.end, End::PowerOff);
+    let board: Vec<(Cycles, BoardInput)> = session
+        .inputs
+        .iter()
+        .filter_map(|input| match *input {
+            AcceptedInput::Board { at, input } => Some((at, input)),
+            _ => None,
+        })
+        .collect();
+    let key = |value| BoardInput { target: 0, value };
+    assert_eq!(
+        board,
+        [
+            (Cycles(0), key(1)),
+            (ms(5), key(0)),
+            (ms(20), key(1)),
+            (ms(30), key(0))
+        ],
+        "the gesture, then the host"
+    );
+    // The release acts one cycle of the time base after its date, the instruction under way
+    // ended: the run stops at the end of that instruction.
+    let off = session.outcome.device_time;
+    assert!(
+        ms(30) < off && off <= ms(30) + 16,
+        "off once the key is let go: {off:?}"
+    );
+    let card = session.sd.as_ref().unwrap();
+    assert_eq!((card.blocks(), card.ranges().len()), (2048, 1));
+    let nothing_changed = changes_sha256(&Overlay::new(SparseBlocks::new(1)).changes());
+    assert_eq!(session.outcome.sd_changes, Some(nothing_changed));
+    let read = Session::from_bytes(&session.to_bytes().unwrap()).unwrap();
+    assert_eq!(read, session);
+    for slice in [u64::MAX, 1, 7, 997, 7_919] {
+        assert_eq!(
+            replay(&POWER, &read, slice),
             session.outcome,
             "slices of {slice}"
         );

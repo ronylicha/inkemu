@@ -936,6 +936,7 @@ name = "session"
 version = "0.1.0"
 dependencies = [
  "boards",
+ "chips",
  "cpu-rv32",
  "emu-core",
  "flate2",

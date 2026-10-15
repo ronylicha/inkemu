@@ -54,7 +54,7 @@ pub struct WiredOptions {
 }
 
 /// Why a device cannot be powered on with its wiring.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WiredError {
     #[error(transparent)]
     Flash(#[from] FlashImageError),

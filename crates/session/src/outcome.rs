@@ -1,4 +1,6 @@
 //! What a run came to, the limits that ended it, and how a replay is compared with it (G3, G6).
+use crate::sd::changes_sha256;
+use chips::sdcard::Changes;
 use emu_core::Cycles;
 use sha2::{Digest as _, Sha256};
 use soc_esp32c3::clock::TIME_BASE;
@@ -221,6 +223,9 @@ pub struct Outcome {
     pub trace_hash: u64,
     /// The SHA-256 of the whole flash at the end.
     pub flash_sha256: [u8; 32],
+    /// The SD card at the end, `None` an empty slot: the SHA-256 of what the last life changed on
+    /// it ([`crate::changes_sha256`]).
+    pub sd_changes: Option<[u8; 32]>,
     /// The SHA-256 of everything each console sent, in [`ConsoleChannel::ALL`] order: what was
     /// taken during the run and what the end flushed.
     pub consoles: [[u8; 32]; 3],
@@ -228,7 +233,8 @@ pub struct Outcome {
 
 impl Outcome {
     /// The outcome of `machine`, whose run ended as `end`, its consoles taken into `consoles`
-    /// to the last byte ([`Esp32C3::flush_console`] included).
+    /// to the last byte ([`Esp32C3::flush_console`] included), and the changes `sd` of the card
+    /// in its slot, `None` for an empty slot.
     ///
     /// # Errors
     /// [`NoTraceHash`] when the machine keeps no trace hash.
@@ -236,6 +242,7 @@ impl Outcome {
         machine: &Esp32C3,
         end: End,
         consoles: ConsoleDigests,
+        sd: Option<&Changes<'_>>,
     ) -> Result<Outcome, NoTraceHash> {
         let trace_hash = machine.trace_hash().ok_or(NoTraceHash)?;
         Ok(Outcome {
@@ -245,6 +252,7 @@ impl Outcome {
             instructions: machine.instructions(),
             trace_hash,
             flash_sha256: Sha256::digest(machine.flash_contents()).into(),
+            sd_changes: sd.map(changes_sha256),
             consoles: consoles.finish(),
         })
     }
@@ -291,6 +299,14 @@ impl Outcome {
             self.flash_sha256 != replayed.flash_sha256,
             &|o| hex(&o.flash_sha256),
         );
+        compare(
+            Quantity::FinalSdCard,
+            self.sd_changes != replayed.sd_changes,
+            &|o| {
+                o.sd_changes
+                    .map_or_else(|| "no card".to_owned(), |d| hex(&d))
+            },
+        );
         for channel in ConsoleChannel::ALL {
             let at = place(channel);
             compare(
@@ -323,6 +339,7 @@ pub enum Quantity {
     Instructions,
     TraceHash,
     FinalFlash,
+    FinalSdCard,
     Console(ConsoleChannel),
 }
 
@@ -335,6 +352,9 @@ impl fmt::Display for Quantity {
             Quantity::Instructions => f.write_str("the instructions"),
             Quantity::TraceHash => f.write_str("the trace hash"),
             Quantity::FinalFlash => f.write_str("the SHA-256 of the final flash"),
+            Quantity::FinalSdCard => {
+                f.write_str("the SHA-256 of what the run changed on the SD card")
+            }
             Quantity::Console(channel) => write!(f, "the SHA-256 of console {}", channel.name()),
         }
     }
@@ -389,8 +409,22 @@ mod tests {
             instructions: 19,
             trace_hash: 0xabcd,
             flash_sha256: [1; 32],
+            sd_changes: None,
             consoles: [[2; 32], [3; 32], [4; 32]],
         }
+    }
+
+    #[test]
+    fn the_changes_of_the_card_are_compared_and_shown_as_no_card_when_absent() {
+        let replayed = Outcome {
+            sd_changes: Some([6; 32]),
+            ..outcome()
+        };
+        let differences = outcome().differences(&replayed);
+        assert_eq!(differences.len(), 1);
+        assert_eq!(differences[0].quantity, Quantity::FinalSdCard);
+        assert_eq!(differences[0].recorded, "no card");
+        assert_eq!(differences[0].replayed, hex(&[6; 32]));
     }
 
     #[test]

@@ -165,6 +165,7 @@ fn a_session_whose_profile_would_drive_the_terminal_is_refused_with_its_text_esc
             text: text.clone(),
         },
         flash: vec![0xFF; 16 << 20],
+        sd: None,
         limits: session::Limits::default(),
         usb_host: soc_esp32c3::UsbHost::Open,
         inputs: Vec::new(),
@@ -175,6 +176,7 @@ fn a_session_whose_profile_would_drive_the_terminal_is_refused_with_its_text_esc
             instructions: 0,
             trace_hash: 0,
             flash_sha256: [0; 32],
+            sd_changes: None,
             consoles: [[0; 32]; 3],
         },
     };

@@ -80,11 +80,12 @@ impl Recorder {
                 End::Cut,
             ),
         };
-        let outcome = Outcome::of(machine, end, self.digests)?;
+        let outcome = Outcome::of(machine, end, self.digests, None)?;
         Ok(Session::record(
             self.rom,
             self.profile,
             self.flash,
+            None,
             limits,
             machine.input_journal(),
             outcome,
@@ -131,7 +132,7 @@ pub fn verdict(
         Err(reason) => return Ok(Verdict::Cut(reason)),
     };
     let end = session.limits.end_of(reached, machine.device_time());
-    let replayed = Outcome::of(machine, end, digests)?;
+    let replayed = Outcome::of(machine, end, digests, None)?;
     let differences = session.outcome.differences(&replayed);
     Ok(if differences.is_empty() {
         Verdict::Identical

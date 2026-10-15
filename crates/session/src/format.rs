@@ -5,15 +5,20 @@
 //! ROM revision (`u16`) and the SHA-256 of the ROM image; the profile id (`u8` length) and text
 //! (`u32` length) and the SHA-256 of the text; the flash size (`u32`), the SHA-256 of the flash,
 //! the length of the deflated flash (`u32`) and its bytes; the SD card at the start (`u8`
-//! presence, 0: no card; a card is the format's place for sub-project 2e); `--strict-mmio`
+//! presence, 0: an empty slot, 1: a card, then its capacity in blocks of 512 (`u64`), whether it
+//! is write-protected (`u8`), the number of its ranges of blocks that are not all zeros (`u32`),
+//! each range (`u64` first block, `u32` count; sorted, disjoint, not adjacent, not empty, within
+//! the card), the length of their deflated bytes (`u32`) and those bytes, and the fingerprint of
+//! [`SdCardStart::fingerprint`]; design of sub-project 2e, §7); `--strict-mmio`
 //! (`u8`), `--max-cycles` and `--max-time` (each a `u8` presence, then a `u64` when present); the
 //! cut (a `u8` reason, 0 for none, then the `u64` instant); the USB host at power-on (`u8`); the
 //! number of inputs (`u32`), then each input: a `u8` tag (0 `uart0`, 1 `usb-serial-jtag`, 2
 //! `uart1`, 3 the USB host, 4 the board), the `u64` date, then for a console a `u32` length and
 //! the bytes, for the host a `u8` state, for the board a `u16` target and a `u32` value; the
 //! outcome: the end (`u8`), device time, cycles, instructions and trace hash (`u64` each), the
-//! SHA-256 of the final flash, the SD card at the end (`u8` presence, 0: none), then the SHA-256
-//! of each console. Dates and instants are in cycles of the time base. Nothing follows.
+//! SHA-256 of the final flash, the SD card at the end (`u8` presence, 0: none, 1: then the
+//! SHA-256 of what the last life changed on it, [`crate::changes_sha256`]), then the SHA-256 of
+//! each console. Dates and instants are in cycles of the time base. Nothing follows.
 //!
 //! The format 1 is the same without the two presences of an SD card and without inputs of the
 //! board.
@@ -24,7 +29,11 @@
 //! bytes left can hold, then pushed one by one as they are read. The flash is inflated into the size of the device of the
 //! profile, checked against the size the file gives and against [`MAX_FLASH_BYTES`] first.
 use crate::outcome::{Cut, CutReason, End, Limits, Outcome, hex, place};
+use crate::sd::{
+    BlockRange, MAX_DEFLATED_SD_BYTES, MAX_SD_NONZERO_BYTES, MAX_SD_RANGES, SdCardStart,
+};
 use boards::{DeviceProfile, ProfileError};
+use chips::sdcard::{BLOCK_BYTES, Capacity};
 use emu_core::BoardInput;
 use emu_core::Cycles;
 use flate2::write::DeflateEncoder;
@@ -86,8 +95,14 @@ const CONSOLE_INPUT_HEAD: usize = 1 + 8 + 4;
 const HOST_INPUT_BYTES: usize = 1 + 8 + 1;
 /// The tag, the date, the target and the value of an input of the board.
 const BOARD_INPUT_BYTES: usize = 1 + 8 + 2 + 4;
-/// The outcome, the presence of an SD card at the end included.
-const OUTCOME_BYTES: usize = 1 + 4 * 8 + SHA256_BYTES * 4 + 1;
+/// The outcome, the SD card at the end and the SHA-256 of its changes included.
+const OUTCOME_BYTES: usize = 1 + 4 * 8 + SHA256_BYTES * 4 + 1 + SHA256_BYTES;
+/// A range of the SD card: its first block and its count.
+const SD_RANGE_BYTES: usize = 8 + 4;
+/// The SD card at the start, every field at its bound: presence, capacity, protection, ranges,
+/// deflated data, fingerprint.
+const SD_CARD_BYTES: usize =
+    1 + 8 + 1 + 4 + MAX_SD_RANGES * SD_RANGE_BYTES + 4 + MAX_DEFLATED_SD_BYTES + SHA256_BYTES;
 /// The longest session: every field at its bound. A console input of `n` bytes costs
 /// `CONSOLE_INPUT_HEAD + n` bytes of file, one of its channel's chunks and at least `max(n, 1)`
 /// of its bytes, so a channel's inputs take at most `CONSOLE_INPUT_HEAD` bytes of file per chunk
@@ -104,7 +119,7 @@ pub const MAX_SESSION_BYTES: usize = MAGIC.len()
     + SHA256_BYTES
     + 4
     + MAX_DEFLATED_FLASH_BYTES
-    + 1
+    + SD_CARD_BYTES
     + 1
     + 2 * 9
     + 9
@@ -161,6 +176,8 @@ pub struct Session {
     pub profile: ProfileText,
     /// The whole flash the run started from, erased bytes included.
     pub flash: Vec<u8>,
+    /// The SD card in the slot when the run started; `None` an empty slot, or a device without one.
+    pub sd: Option<SdCardStart>,
     pub limits: Limits,
     /// The USB host at power-on.
     pub usb_host: UsbHost,
@@ -181,8 +198,15 @@ pub enum Field {
     FlashSize,
     FlashSha256,
     DeflatedFlash,
-    /// The SD card the run started with.
+    /// The SD card the run started with: its presence.
     SdCard,
+    SdCardCapacity,
+    SdCardProtection,
+    SdCardRangeCount,
+    /// Range `n` of the card, counted from 0.
+    SdCardRange(usize),
+    SdCardData,
+    SdCardSha256,
     StrictMmio,
     MaxCycles,
     MaxTime,
@@ -222,6 +246,12 @@ impl fmt::Display for Field {
             Field::FlashSha256 => f.write_str("the SHA-256 of the starting flash"),
             Field::DeflatedFlash => f.write_str("the deflated starting flash"),
             Field::SdCard => f.write_str("the starting SD card"),
+            Field::SdCardCapacity => f.write_str("the capacity of the starting SD card"),
+            Field::SdCardProtection => f.write_str("the write protection of the starting SD card"),
+            Field::SdCardRangeCount => f.write_str("the number of ranges of the starting SD card"),
+            Field::SdCardRange(index) => write!(f, "range {index} of the starting SD card"),
+            Field::SdCardData => f.write_str("the deflated blocks of the starting SD card"),
+            Field::SdCardSha256 => f.write_str("the fingerprint of the starting SD card"),
             Field::StrictMmio => f.write_str("--strict-mmio"),
             Field::MaxCycles => f.write_str("--max-cycles"),
             Field::MaxTime => f.write_str("--max-time"),
@@ -302,8 +332,14 @@ pub enum ReadError {
         "the starting flash inflates to {found} bytes, not the {expected} the session gives; the file is damaged"
     )]
     InflatedSize { expected: u32, found: usize },
+    #[error("the blocks of the starting SD card {detail}; the file is damaged")]
+    SdCardData { detail: String },
     #[error("{source}")]
     Profile { source: ProfileError },
+    #[error(
+        "the session holds an SD card and the profile `{id}` of its device has no slot for one; the file is damaged or was not written by inkemu"
+    )]
+    NoSdSlot { id: String },
     #[error(
         "the starting flash holds {flash} bytes, and the profile of the session gives its device {device}; the file is damaged"
     )]
@@ -348,13 +384,36 @@ pub enum WriteError {
     #[error("{source}")]
     Profile { source: ProfileError },
     #[error(
+        "the run started with an SD card and the profile `{id}` has no slot for one; record the run with the profile of a device that has one"
+    )]
+    NoSdSlot { id: String },
+    #[error(
         "the end is {end} but the limits {cut}; a cut run ends with its cut, and a run with a cut is cut",
         end = end.name(),
         cut = if *cut { "hold a cut" } else { "hold no cut" }
     )]
     EndAndCut { end: End, cut: bool },
-    #[error("the starting flash cannot be deflated: {detail}")]
+    #[error("the starting flash or SD card cannot be deflated: {detail}")]
     Deflate { detail: String },
+}
+
+/// Whether the device of `device` has an SD card slot.
+fn has_sd_slot(device: &DeviceProfile) -> bool {
+    device
+        .wiring
+        .as_ref()
+        .is_some_and(|wiring| wiring.sd.is_some())
+}
+
+/// `bytes` deflated.
+fn deflate(bytes: &[u8]) -> Result<Vec<u8>, WriteError> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(bytes)
+        .and_then(|()| encoder.finish())
+        .map_err(|e| WriteError::Deflate {
+            detail: e.to_string(),
+        })
 }
 
 /// What the inputs of a session take of its bounds, as they are read or written.
@@ -457,8 +516,8 @@ const fn cut_code(reason: CutReason) -> u8 {
 }
 
 impl Session {
-    /// The session of a run: `rom`, `profile` and `flash` it started from, `limits` that cut it,
-    /// the inputs `journal` holds and the `outcome` it came to.
+    /// The session of a run: `rom`, `profile`, `flash` and the SD card `sd` it started from,
+    /// `limits` that cut it, the inputs `journal` holds and the `outcome` it came to.
     ///
     /// # Errors
     /// [`WriteError::IncompleteJournal`] when the journal passed one of its bounds,
@@ -468,6 +527,7 @@ impl Session {
         rom: RomIdentity,
         profile: ProfileText,
         flash: Vec<u8>,
+        sd: Option<SdCardStart>,
         limits: Limits,
         journal: &InputJournal,
         outcome: Outcome,
@@ -482,6 +542,7 @@ impl Session {
             rom,
             profile,
             flash,
+            sd,
             limits,
             usb_host: journal.usb_host_at_power_on(),
             inputs: journal.inputs().to_vec(),
@@ -523,6 +584,11 @@ impl Session {
                 device: device.flash.size(),
             });
         }
+        if self.sd.is_some() && !has_sd_slot(&device) {
+            return Err(WriteError::NoSdSlot {
+                id: self.profile.id.clone(),
+            });
+        }
         if (self.outcome.end == End::Cut) != self.limits.cut.is_some() {
             return Err(WriteError::EndAndCut {
                 end: self.outcome.end,
@@ -560,13 +626,7 @@ impl Session {
     /// The bytes of the session, its bounds unchecked: the tests of the reader write with it
     /// what a writer would refuse.
     fn encode(&self) -> Result<Vec<u8>, WriteError> {
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-        let deflated = encoder
-            .write_all(&self.flash)
-            .and_then(|()| encoder.finish())
-            .map_err(|e| WriteError::Deflate {
-                detail: e.to_string(),
-            })?;
+        let deflated = deflate(&self.flash)?;
         if deflated.len() > MAX_DEFLATED_FLASH_BYTES {
             return Err(WriteError::TooLarge {
                 field: Field::DeflatedFlash,
@@ -592,8 +652,7 @@ impl Session {
         let deflated_len = u32::try_from(deflated.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&deflated_len.to_le_bytes());
         out.extend_from_slice(&deflated);
-        // No SD card: the place the card of sub-project 2e takes in the format.
-        out.push(0);
+        self.encode_sd_card(&mut out)?;
         out.push(u8::from(self.limits.strict_mmio));
         for limit in [self.limits.max_cycles, self.limits.max_time_nanos] {
             match limit {
@@ -647,12 +706,48 @@ impl Session {
             out.extend_from_slice(&value.to_le_bytes());
         }
         out.extend_from_slice(&outcome.flash_sha256);
-        // No SD card at the end either.
-        out.push(0);
+        match outcome.sd_changes {
+            Some(digest) => {
+                out.push(1);
+                out.extend_from_slice(&digest);
+            }
+            None => out.push(0),
+        }
         for digest in &outcome.consoles {
             out.extend_from_slice(digest);
         }
         Ok(out)
+    }
+
+    /// The SD card at the start, as §7 of the design of sub-project 2e lays it out. A card comes
+    /// only from [`SdCardStart::read`] or the reader, whose ranges are canonical and bounded.
+    fn encode_sd_card(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let Some(card) = &self.sd else {
+            out.push(0);
+            return Ok(());
+        };
+        let deflated = deflate(&card.data)?;
+        if deflated.len() > MAX_DEFLATED_SD_BYTES {
+            return Err(WriteError::TooLarge {
+                field: Field::SdCardData,
+                value: deflated.len() as u64,
+                max: MAX_DEFLATED_SD_BYTES as u64,
+            });
+        }
+        out.push(1);
+        out.extend_from_slice(&card.blocks.to_le_bytes());
+        out.push(u8::from(card.write_protected));
+        let count = u32::try_from(card.ranges.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for range in &card.ranges {
+            out.extend_from_slice(&range.first.to_le_bytes());
+            out.extend_from_slice(&range.count.to_le_bytes());
+        }
+        let len = u32::try_from(deflated.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&deflated);
+        out.extend_from_slice(&card.fingerprint());
+        Ok(())
     }
 
     /// The session these bytes hold.
@@ -682,7 +777,10 @@ impl Session {
             .device()
             .map_err(|source| ReadError::Profile { source })?;
         let flash = reader.flash(device.flash.size())?;
-        reader.no_sd_card(Field::SdCard)?;
+        let sd = reader.sd_card()?;
+        if sd.is_some() && !has_sd_slot(&device) {
+            return Err(ReadError::NoSdSlot { id: profile.id });
+        }
         let strict_mmio = match reader.u8(Field::StrictMmio)? {
             0 => false,
             1 => true,
@@ -719,6 +817,7 @@ impl Session {
             rom,
             profile,
             flash,
+            sd,
             limits,
             usb_host,
             inputs,
@@ -817,19 +916,102 @@ impl<'a> Reader<'a> {
         Err(ReadError::NotASession)
     }
 
-    /// The presence of an SD card in a session of the format 2: this inkemu holds none, so 0 is
-    /// the one value the field takes. A session of the format 1 has no such field.
-    fn no_sd_card(&mut self, field: Field) -> Result<(), ReadError> {
+    /// The presence of an SD card (`field`): `false` in a session of the format 1, which has no
+    /// such field.
+    fn sd_presence(&mut self, field: Field) -> Result<bool, ReadError> {
         if self.format < 2 {
-            return Ok(());
+            return Ok(false);
         }
         match self.u8(field)? {
-            0 => Ok(()),
+            0 => Ok(false),
+            1 => Ok(true),
             other => Err(ReadError::Invalid {
                 field,
                 value: other.into(),
             }),
         }
+    }
+
+    /// The SD card at the start, checked to be canonical: the ranges sorted, disjoint, not
+    /// adjacent, not empty, within the card and within [`MAX_SD_NONZERO_BYTES`], every block
+    /// they hold not all zeros, the fingerprint that of what was read.
+    fn sd_card(&mut self) -> Result<Option<SdCardStart>, ReadError> {
+        if !self.sd_presence(Field::SdCard)? {
+            return Ok(None);
+        }
+        let blocks = self.u64(Field::SdCardCapacity)?;
+        let invalid = |field, value| ReadError::Invalid { field, value };
+        let capacity = blocks
+            .checked_mul(BLOCK_BYTES as u64)
+            .ok_or(invalid(Field::SdCardCapacity, blocks))?;
+        Capacity::new(capacity).map_err(|_| invalid(Field::SdCardCapacity, blocks))?;
+        let write_protected = match self.u8(Field::SdCardProtection)? {
+            0 => false,
+            1 => true,
+            other => return Err(invalid(Field::SdCardProtection, other.into())),
+        };
+        let count = self.length(Field::SdCardRangeCount, MAX_SD_RANGES)?;
+        // At most MAX_SD_RANGES, and no more than the bytes left hold.
+        let room = (self.bytes.len() - self.at) / SD_RANGE_BYTES;
+        let mut ranges: Vec<BlockRange> = Vec::with_capacity(count.min(room));
+        let mut total: u64 = 0;
+        for index in 0..count {
+            let field = Field::SdCardRange(index);
+            let range = BlockRange {
+                first: self.u64(field)?,
+                count: self.u32(field)?,
+            };
+            let after_last = ranges.last().map_or(0, |last| last.end() + 1);
+            let canonical = range.count > 0
+                && range.first >= after_last
+                && range
+                    .first
+                    .checked_add(u64::from(range.count))
+                    .is_some_and(|end| end <= blocks);
+            if !canonical {
+                return Err(invalid(field, range.first));
+            }
+            total += u64::from(range.count) * BLOCK_BYTES as u64;
+            if total > MAX_SD_NONZERO_BYTES as u64 {
+                return Err(ReadError::TooLarge {
+                    field: Field::SdCardRangeCount,
+                    value: total,
+                    max: MAX_SD_NONZERO_BYTES as u64,
+                });
+            }
+            ranges.push(range);
+        }
+        let deflated_len = self.length(Field::SdCardData, MAX_DEFLATED_SD_BYTES)?;
+        let deflated = self.take(deflated_len, Field::SdCardData)?;
+        // `total` was bounded by MAX_SD_NONZERO_BYTES above.
+        let expected = usize::try_from(total).unwrap_or(usize::MAX);
+        let data = inflate_exact(deflated, expected).map_err(|failure| ReadError::SdCardData {
+            detail: failure.describe(expected),
+        })?;
+        if let Some(zero) = data
+            .as_chunks::<BLOCK_BYTES>()
+            .0
+            .iter()
+            .position(|block| block.iter().all(|&byte| byte == 0))
+        {
+            return Err(invalid(Field::SdCardData, zero as u64));
+        }
+        let card = SdCardStart {
+            blocks,
+            write_protected,
+            ranges,
+            data,
+        };
+        let recorded = self.sha256(Field::SdCardSha256)?;
+        let computed = card.fingerprint();
+        if computed != recorded {
+            return Err(ReadError::Sha256Mismatch {
+                field: Field::SdCardSha256,
+                recorded: hex(&recorded),
+                computed: hex(&computed),
+            });
+        }
+        Ok(Some(card))
     }
 
     fn text(&mut self, len: usize, field: Field) -> Result<String, ReadError> {
@@ -1004,7 +1186,11 @@ impl<'a> Reader<'a> {
         let instructions = self.u64(Field::Instructions)?;
         let trace_hash = self.u64(Field::TraceHash)?;
         let flash_sha256 = self.sha256(Field::FinalFlashSha256)?;
-        self.no_sd_card(Field::FinalSdCard)?;
+        let sd_changes = if self.sd_presence(Field::FinalSdCard)? {
+            Some(self.sha256(Field::FinalSdCard)?)
+        } else {
+            None
+        };
         let mut consoles = [[0u8; 32]; 3];
         for channel in ConsoleChannel::ALL {
             consoles[place(channel)] = self.sha256(Field::ConsoleSha256(channel))?;
@@ -1016,6 +1202,7 @@ impl<'a> Reader<'a> {
             instructions,
             trace_hash,
             flash_sha256,
+            sd_changes,
             consoles,
         })
     }
@@ -1029,34 +1216,68 @@ fn too_large((field, value, max): (Field, u64, u64)) -> ReadError {
 /// stream that does not inflate to `size` bytes, that stops before its last block, or that is
 /// followed by more bytes is refused.
 fn inflate(deflated: &[u8], size: u32) -> Result<Vec<u8>, ReadError> {
-    let expected = size as usize;
-    // `size` was checked against `MAX_FLASH_BYTES` and the device of the profile before: the
-    // capacity is bounded by a constant. The byte past it tells a stream that inflates further.
-    let mut flash = Vec::with_capacity(expected + 1);
+    inflate_exact(deflated, size as usize).map_err(|failure| match failure {
+        Inflation::Failed(detail) => ReadError::Inflate { detail },
+        Inflation::Size(found) => ReadError::InflatedSize {
+            expected: size,
+            found,
+        },
+        Inflation::Unfinished => ReadError::Inflate {
+            detail: UNFINISHED_STREAM.to_owned(),
+        },
+        Inflation::Unused(count) => ReadError::UnusedDeflatedBytes { count },
+    })
+}
+
+const UNFINISHED_STREAM: &str = "the deflated stream stops before its last block";
+
+/// Why a deflated stream is not exactly the bytes expected.
+enum Inflation {
+    Failed(String),
+    /// It inflates to this many bytes (one past the expected, for a longer stream).
+    Size(usize),
+    Unfinished,
+    /// This many bytes follow its end.
+    Unused(usize),
+}
+
+impl Inflation {
+    fn describe(&self, expected: usize) -> String {
+        match self {
+            Inflation::Failed(detail) => format!("cannot be inflated ({detail})"),
+            Inflation::Size(found) => {
+                format!("inflate to {found} bytes, not the {expected} their ranges hold")
+            }
+            Inflation::Unfinished => {
+                "stop before the last block of their deflated stream".to_owned()
+            }
+            Inflation::Unused(count) => {
+                format!("are followed by {count} bytes inside their length")
+            }
+        }
+    }
+}
+
+/// The `expected` bytes the deflated stream `deflated` holds, the whole stream used. `expected`
+/// is bounded by a constant by every caller.
+fn inflate_exact(deflated: &[u8], expected: usize) -> Result<Vec<u8>, Inflation> {
+    // The byte past `expected` tells a stream that inflates further.
+    let mut inflated = Vec::with_capacity(expected + 1);
     let mut decompress = Decompress::new(false);
     let status = decompress
-        .decompress_vec(deflated, &mut flash, FlushDecompress::Finish)
-        .map_err(|e| ReadError::Inflate {
-            detail: e.to_string(),
-        })?;
-    if flash.len() != expected {
-        return Err(ReadError::InflatedSize {
-            expected: size,
-            found: flash.len(),
-        });
+        .decompress_vec(deflated, &mut inflated, FlushDecompress::Finish)
+        .map_err(|e| Inflation::Failed(e.to_string()))?;
+    if inflated.len() != expected {
+        return Err(Inflation::Size(inflated.len()));
     }
     if status != Status::StreamEnd {
-        return Err(ReadError::Inflate {
-            detail: "the deflated stream stops before its last block".to_owned(),
-        });
+        return Err(Inflation::Unfinished);
     }
     let used = usize::try_from(decompress.total_in()).unwrap_or(usize::MAX);
     if used < deflated.len() {
-        return Err(ReadError::UnusedDeflatedBytes {
-            count: deflated.len() - used,
-        });
+        return Err(Inflation::Unused(deflated.len() - used));
     }
-    Ok(flash)
+    Ok(inflated)
 }
 
 #[cfg(test)]

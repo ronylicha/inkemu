@@ -33,6 +33,7 @@ fn outcome(end: End) -> Outcome {
         instructions: 190,
         trace_hash: 0x0123_4567_89ab_cdef,
         flash_sha256: [7; 32],
+        sd_changes: None,
         consoles: [[1; 32], [2; 32], [3; 32]],
     }
 }
@@ -51,6 +52,7 @@ fn session() -> Session {
             text: TINY_PROFILE.to_owned(),
         },
         flash,
+        sd: None,
         limits: Limits {
             strict_mmio: true,
             max_cycles: Some(1_000_000),
@@ -137,7 +139,8 @@ fn layout(bytes: &[u8]) -> Layout {
         usb_host: strict + 20,
         count: strict + 21,
         first_input: strict + 25,
-        end: bytes.len() - OUTCOME_BYTES,
+        // The session holds no card at the end: its outcome is without the SHA-256 of changes.
+        end: bytes.len() - (OUTCOME_BYTES - SHA256_BYTES),
     }
 }
 
@@ -234,23 +237,235 @@ fn an_input_of_the_board_in_a_session_of_the_format_1_is_refused() {
     );
 }
 
+/// The tiny device with a display and an SD card slot.
+fn tiny_wired_profile() -> String {
+    format!(
+        "{TINY_PROFILE}\n[wiring.display]\ncontroller = \"ssd1677\"\nconfig = \"gdeq0426t82\"\nsclk = 8\nmosi = 10\ncs = 21\ndc = 4\nrst = 5\nbusy = 6\nrotation = 90\n[wiring.sd]\ncs = 12\nmiso = 7\n"
+    )
+}
+
+/// A card of 64 blocks holding blocks 1, 2, 3 and 40.
+fn card() -> SdCardStart {
+    use chips::sdcard::{BlockStorage as _, MemoryStorage};
+    let mut storage = MemoryStorage::new(64);
+    for lba in [1, 2, 3, 40] {
+        let block = [u8::try_from(lba).unwrap(); BLOCK_BYTES];
+        storage.write_block(lba, &block).unwrap();
+    }
+    SdCardStart::read(&mut storage, true).unwrap()
+}
+
+/// [`session`] on the tiny wired device, with [`card`] in its slot and a card at the end.
+fn card_session() -> Session {
+    let mut session = session();
+    session.profile.text = tiny_wired_profile();
+    session.sd = Some(card());
+    session.outcome.sd_changes = Some([5; 32]);
+    session
+}
+
+/// Where the card of `bytes`, written from [`card_session`], begins: its presence.
+fn card_at(bytes: &[u8]) -> usize {
+    let id_len = MAGIC.len() + 2 + 32;
+    let text_len = id_len + 1 + "tiny".len();
+    let deflated_len = text_len + 4 + tiny_wired_profile().len() + 32 + 4 + 32;
+    let deflated = u32::from_le_bytes(bytes[deflated_len..deflated_len + 4].try_into().unwrap());
+    deflated_len + 4 + deflated as usize
+}
+
 #[test]
-fn an_sd_card_is_no_value_this_inkemu_reads_in_a_session() {
+fn a_session_with_an_sd_card_goes_to_bytes_and_back_unchanged() {
+    let session = card_session();
+    let bytes = session.to_bytes().unwrap();
+    assert_eq!(Session::from_bytes(&bytes).unwrap(), session);
+    let at = card_at(&bytes);
+    assert_eq!(bytes[at], 1, "a card");
+    assert_eq!(bytes[at + 1..at + 9], 64u64.to_le_bytes(), "its capacity");
+    assert_eq!(bytes[at + 9], 1, "write-protected");
+    assert_eq!(bytes[at + 10..at + 14], 2u32.to_le_bytes(), "two ranges");
+    assert_eq!(bytes[at + 14..at + 22], 1u64.to_le_bytes());
+    assert_eq!(bytes[at + 22..at + 26], 3u32.to_le_bytes());
+    assert_eq!(bytes[at + 26..at + 34], 40u64.to_le_bytes());
+}
+
+#[test]
+fn a_card_on_a_device_without_a_slot_is_refused_both_ways() {
+    let mut session = card_session();
+    session.profile.text = TINY_PROFILE.to_owned();
+    assert_eq!(
+        session.to_bytes(),
+        Err(WriteError::NoSdSlot {
+            id: "tiny".to_owned()
+        })
+    );
+    assert_eq!(
+        read(&session.encode().unwrap()),
+        ReadError::NoSdSlot {
+            id: "tiny".to_owned()
+        }
+    );
+}
+
+#[test]
+fn a_presence_of_a_card_other_than_0_or_1_is_refused() {
     let bytes = session().to_bytes().unwrap();
     let layout = layout(&bytes);
     assert_eq!(
-        read(&patched(layout.sd_card, &[1])),
+        read(&patched(layout.sd_card, &[2])),
         ReadError::Invalid {
             field: Field::SdCard,
-            value: 1
+            value: 2
         }
     );
     assert_eq!(
-        read(&patched(layout.end + 1 + 4 * 8 + 32, &[1])),
+        read(&patched(layout.end + 1 + 4 * 8 + 32, &[2])),
         ReadError::Invalid {
             field: Field::FinalSdCard,
+            value: 2
+        }
+    );
+}
+
+/// The bytes of [`card_session`] with `value` written at `offset` from the start of its card.
+fn card_patched(offset: usize, value: &[u8]) -> Vec<u8> {
+    let mut bytes = card_session().to_bytes().unwrap();
+    let at = card_at(&bytes) + offset;
+    bytes[at..at + value.len()].copy_from_slice(value);
+    bytes
+}
+
+#[test]
+fn ranges_that_are_not_canonical_are_refused_by_their_index() {
+    let range = |index| Field::SdCardRange(index);
+    // The second range starts where the first ends: adjacent ranges are one.
+    assert_eq!(
+        read(&card_patched(26, &4u64.to_le_bytes())),
+        ReadError::Invalid {
+            field: range(1),
+            value: 4
+        }
+    );
+    // Before the first: not sorted.
+    assert_eq!(
+        read(&card_patched(26, &0u64.to_le_bytes())),
+        ReadError::Invalid {
+            field: range(1),
+            value: 0
+        }
+    );
+    // Empty.
+    assert_eq!(
+        read(&card_patched(22, &0u32.to_le_bytes())),
+        ReadError::Invalid {
+            field: range(0),
             value: 1
         }
+    );
+    // Past the end of the card.
+    assert_eq!(
+        read(&card_patched(26, &64u64.to_le_bytes())),
+        ReadError::Invalid {
+            field: range(1),
+            value: 64
+        }
+    );
+}
+
+#[test]
+fn a_card_of_no_size_or_with_a_bad_protection_is_refused() {
+    assert_eq!(
+        read(&card_patched(1, &0u64.to_le_bytes())),
+        ReadError::Invalid {
+            field: Field::SdCardCapacity,
+            value: 0
+        }
+    );
+    assert_eq!(
+        read(&card_patched(1, &u64::MAX.to_le_bytes())),
+        ReadError::Invalid {
+            field: Field::SdCardCapacity,
+            value: u64::MAX
+        }
+    );
+    assert_eq!(
+        read(&card_patched(9, &[2])),
+        ReadError::Invalid {
+            field: Field::SdCardProtection,
+            value: 2
+        }
+    );
+}
+
+#[test]
+fn more_ranges_or_blocks_than_a_session_holds_are_refused() {
+    let one_too_many = u32::try_from(MAX_SD_RANGES).unwrap() + 1;
+    assert_eq!(
+        read(&card_patched(10, &one_too_many.to_le_bytes())),
+        ReadError::TooLarge {
+            field: Field::SdCardRangeCount,
+            value: MAX_SD_RANGES as u64 + 1,
+            max: MAX_SD_RANGES as u64
+        }
+    );
+    // One range of more blocks than the bound, in a card large enough to hold it.
+    let mut session = card_session();
+    let card = session.sd.as_mut().unwrap();
+    card.blocks = 1 << 20;
+    let mut bytes = session.encode().unwrap();
+    let at = card_at(&bytes);
+    let too_many = u32::try_from(MAX_SD_NONZERO_BYTES / BLOCK_BYTES).unwrap() + 1;
+    bytes[at + 22..at + 26].copy_from_slice(&too_many.to_le_bytes());
+    assert!(
+        matches!(
+            read(&bytes),
+            ReadError::TooLarge {
+                field: Field::SdCardRangeCount,
+                ..
+            }
+        ),
+        "{:?}",
+        read(&bytes)
+    );
+}
+
+#[test]
+fn a_card_whose_blocks_or_fingerprint_do_not_agree_is_refused() {
+    let mut session = card_session();
+    let card = session.sd.as_mut().unwrap();
+    // A block of zeros among the ranges: not canonical.
+    card.data[BLOCK_BYTES..2 * BLOCK_BYTES].fill(0);
+    assert_eq!(
+        read(&session.encode().unwrap()),
+        ReadError::Invalid {
+            field: Field::SdCardData,
+            value: 1
+        }
+    );
+    // One block less than the ranges hold.
+    let mut session = card_session();
+    session.sd.as_mut().unwrap().data.truncate(3 * BLOCK_BYTES);
+    let short = read(&session.encode().unwrap());
+    assert!(
+        matches!(&short, ReadError::SdCardData { detail } if detail.contains("not the 2048")),
+        "{short}"
+    );
+    // The fingerprint changed.
+    let bytes = card_session().to_bytes().unwrap();
+    // Presence, capacity, protection, count, two ranges: the length of the data.
+    let length = card_at(&bytes) + 1 + 8 + 1 + 4 + 2 * 12;
+    let deflated = u32::from_le_bytes(bytes[length..length + 4].try_into().unwrap()) as usize;
+    let mut changed = bytes.clone();
+    changed[length + 4 + deflated] ^= 1;
+    assert!(
+        matches!(
+            read(&changed),
+            ReadError::Sha256Mismatch {
+                field: Field::SdCardSha256,
+                ..
+            }
+        ),
+        "{:?}",
+        read(&changed)
     );
 }
 
@@ -757,7 +972,12 @@ fn a_profile_the_session_cannot_rebuild_is_refused() {
 fn the_longest_session_is_within_the_bound_the_front_end_reads() {
     // Each channel at both its bounds, every chunk with its head.
     const PER_CHANNEL: usize = MAX_CONSOLE_CHUNKS * CONSOLE_INPUT_HEAD + MAX_CONSOLE_BYTES;
-    const { assert!(MAX_SESSION_BYTES > 3 * PER_CHANNEL + MAX_DEFLATED_FLASH_BYTES) };
-    // A front end may hold a whole file in memory.
-    const { assert!(MAX_SESSION_BYTES < 64 * MIB) };
+    const {
+        assert!(
+            MAX_SESSION_BYTES > 3 * PER_CHANNEL + MAX_DEFLATED_FLASH_BYTES + MAX_DEFLATED_SD_BYTES
+        );
+    };
+    // A front end may hold a whole file in memory: the flash, the 64 MiB of a card (design of
+    // sub-project 2e, §7) and the inputs.
+    const { assert!(MAX_SESSION_BYTES < 96 * MIB) };
 }

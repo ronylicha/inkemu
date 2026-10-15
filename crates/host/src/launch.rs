@@ -36,7 +36,8 @@ pub fn profile(id: &str) -> Result<DeviceProfile, ProfileError> {
         | ProfileError::MissingConsole { .. }
         | ProfileError::IdMismatch { .. }
         | ProfileError::Partitions { .. }
-        | ProfileError::NoBootloader { .. }) => other,
+        | ProfileError::NoBootloader { .. }
+        | ProfileError::Wiring { .. }) => other,
     })
 }
 
