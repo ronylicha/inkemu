@@ -213,6 +213,15 @@ export function reducer(state: AppState, action: Action): AppState {
       return state.early.reduce(applyUpdate, shown);
     }
     case "failed": {
+      if (
+        action.start !== undefined &&
+        action.start !== state.starting &&
+        action.start !== state.current
+      ) {
+        // A start already set aside (a later one took its place): its answer is a line of the
+        // journal, not a refusal of anything the user is doing now.
+        return withNotices(state, [{ level: "warning", text: action.error.message }]);
+      }
       const answered = action.start !== undefined && action.start === state.starting;
       return {
         ...state,

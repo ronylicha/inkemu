@@ -122,6 +122,21 @@ describe("reducer", () => {
     ]);
   });
 
+  it("keeps the answer of a start set aside in the journal, without a banner", () => {
+    let state = started(started(), 2);
+    state = reducer(state, {
+      type: "failed",
+      start: 1,
+      error: { kind: "stopped", message: "the emulator has stopped" },
+    });
+    expect(state.error).toBeNull();
+    expect(state.current).toBe(2);
+    expect(state.journal.at(-1)).toMatchObject({
+      level: "warning",
+      text: "the emulator has stopped",
+    });
+  });
+
   it("forgets what a refused start's emulator said", () => {
     let state = reducer(started(), { type: "starting", start: 2 });
     state = send(state, 2, text("uart0", "never"));
