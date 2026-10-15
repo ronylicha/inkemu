@@ -15,7 +15,7 @@ struct Host {
 }
 
 impl Host {
-    fn new(image: &SdImage) -> Host {
+    fn new(image: &mut SdImage) -> Host {
         let config = SdCardConfig {
             write_protected: image.write_protected(),
             timing: SdTiming {
@@ -139,9 +139,9 @@ fn mounts_as_sdfat_would(host: &mut Host) -> u32 {
 fn a_blank_standard_capacity_image_mounts_through_the_card_and_keeps_a_life_s_write() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("card.img");
-    create_blank(&path, 64, DEFAULT_LABEL).unwrap();
+    create_blank(&path, 64, DEFAULT_LABEL, &[]).unwrap();
     let mut image = SdImage::open(&path, Access::ReadWrite, &[], &mut Vec::new()).unwrap();
-    let mut host = Host::new(&image);
+    let mut host = Host::new(&mut image);
     assert_eq!(host.initialize(), CardKind::Sdsc);
     let root = mounts_as_sdfat_would(&mut host);
     assert_eq!(host.read(root)[..11], *b"INKEMU     ");
@@ -151,8 +151,8 @@ fn a_blank_standard_capacity_image_mounts_through_the_card_and_keeps_a_life_s_wr
     image.commit(&card.storage().changes()).unwrap();
     drop(card);
     drop(image);
-    let image = SdImage::open(&path, Access::ReadWrite, &[], &mut Vec::new()).unwrap();
-    let mut next = Host::new(&image);
+    let mut image = SdImage::open(&path, Access::ReadWrite, &[], &mut Vec::new()).unwrap();
+    let mut next = Host::new(&mut image);
     next.initialize();
     assert_eq!(next.read(root + 1), [0x42; BLOCK_BYTES]);
 }
@@ -161,9 +161,9 @@ fn a_blank_standard_capacity_image_mounts_through_the_card_and_keeps_a_life_s_wr
 fn a_blank_high_capacity_image_mounts_through_the_card() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("big.img");
-    create_blank(&path, 4096, "BIG").unwrap();
-    let image = SdImage::open(&path, Access::ReadOnly, &[], &mut Vec::new()).unwrap();
-    let mut host = Host::new(&image);
+    create_blank(&path, 4096, "BIG", &[]).unwrap();
+    let mut image = SdImage::open(&path, Access::ReadOnly, &[], &mut Vec::new()).unwrap();
+    let mut host = Host::new(&mut image);
     assert_eq!(host.initialize(), CardKind::Sdhc);
     let root = mounts_as_sdfat_would(&mut host);
     assert_eq!(host.read(root)[..11], *b"BIG        ");

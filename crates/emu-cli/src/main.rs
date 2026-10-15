@@ -347,7 +347,8 @@ fn main() -> ExitCode {
 
 /// `inkemu sd create`: the image, then a line that says what it is.
 fn run_sd_create(path: &Path, mebibytes: u64, label: &str) -> ExitCode {
-    match host::sd_format::create_blank(path, mebibytes, label) {
+    // A creation alone: no other file of a run to keep apart from.
+    match host::sd_format::create_blank(path, mebibytes, label, &[]) {
         Ok(layout) => {
             let line = format!(
                 "{}: {}\n",
