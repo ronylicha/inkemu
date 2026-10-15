@@ -41,8 +41,11 @@ v2.4 donne 483,27 pour un cœur à 160 MHz, sans compilateur ni options ; l'exem
 - Le job `reference-boot` construit `coremark_example.bin` (sources d'Espressif copiées sans modification, vérifiées
   contre le registre) et exécute un test qui échoue hors de la bande : vérifié par une mutation (coût ALU doublé :
   295,53, −38,8 %, le test échoue).
-- Le critère ne voit que la borne basse : un modèle trop rapide d'au plus 15 % passerait ; seul un appareil le
-  dirait. Les coûts relatifs des classes (branchement pris, division…) ne sont pas vérifiés par CoreMark.
+- Le test vérifie les deux bornes, mais la borne haute (555,76) est hors d'atteinte d'un modèle qui coûte au
+  moins un cycle par instruction : un cycle pour chacune donne environ 537. Seule la borne basse peut donc
+  faire échouer un modèle de cœur à une instruction par cycle ; un modèle trop rapide d'au plus 15 % passerait,
+  seul un appareil le dirait. Les coûts relatifs des classes (branchement pris, division…) ne sont pas
+  vérifiés par CoreMark.
 - La ligne de l'erreur standard qui nomme le modèle ne change pas : `datasheet-uncalibrated (not calibrated)`.
 - Le score qu'imprime CoreMark sous inkemu n'est jamais présenté comme un score CoreMark d'un appareil (accord
   d'usage de la marque, CM §2).

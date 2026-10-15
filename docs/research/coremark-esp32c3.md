@@ -17,7 +17,8 @@ ran on the host. Earlier work this report builds on: `docs/research/sp1b-test-or
 3. **The criterion bounds an average, not a model.** On CoreMark's instruction mix the band
    [410.78, 555.76] holds any model whose average cost is between about 0.97 and 1.31 cycles per
    instruction (R from M, §4.3). A model that prices every instruction at one cycle scores about
-   537 and passes; the lower bound is the only one a single-issue core can cross.
+   537 and passes. The test checks both bounds, but a model that costs at least one cycle per
+   instruction cannot reach the upper one: only the lower bound can fail such a model.
 4. **The build is offline and reproducible**: the component and the example are copied unmodified
    into `tools/reference-firmware/coremark_example/`, each file checked against the registry's
    `CHECKSUMS.json`; two clean builds gave the same `coremark_example.bin` (M, §3).
@@ -25,16 +26,20 @@ ran on the host. Earlier work this report builds on: `docs/research/sp1b-test-or
    trademark only, and forbids its use with a modified copy (clause 1.2). Copying the sources
    unmodified into the repository is allowed; inkemu's output is not a CoreMark result of a device
    and is never presented as one (M, §2).
-6. **Hand-over of SP1b-4d, `MEIP` in `usb_serial_jtag_echo`: cause found in the pinned QEMU.** Its
-   USB-Serial-JTAG has no interrupt output at all; its interrupt matrix keeps a sticky pending bit
-   for a source that rose while the CPU could not take it, and its CPU leaves `MEIP` up while the
-   matrix reports one. The `MEIP` QEMU shows after `csrs mstatus` is that stale bit, an artefact
-   of the pinned QEMU, not a state of inkemu (M for the code, R for the reading, §6.2). Row 4 of the lockstep table cites a newer branch of QEMU than the build the
-   lockstep runs; the mechanism it calls "not identified" is this one.
-7. **Hand-over of SP1b-4d, the tick two instructions late in QEMU: one of the two is sourced.**
-   QEMU anchors the periodic alarm at its virtual clock read during the store, which counts the
-   store; inkemu at the start of the store. The other instruction is not in `esp_systimer.c`
-   (M, §6.1).
+6. **Hand-over of SP1b-4d, `MEIP` in `usb_serial_jtag_echo`: the hypothesis of SP1b-4d is refuted,
+   the cause is deduced, not observed.** Established (M): the pinned QEMU's USB-Serial-JTAG has no
+   interrupt output at all. Deduced from QEMU's code and the state at the stop, not observed in
+   QEMU (R, §6.2): its interrupt matrix keeps a sticky pending bit for a source that rose while the
+   CPU could not take it, its CPU leaves `MEIP` up while the matrix reports one, and the `MEIP` QEMU
+   shows after `csrs mstatus` would be that stale bit, not a state of inkemu. Observing it in QEMU
+   (monitor or gdbstub) is left to sub-project 8. Row 4 of the lockstep table cites a newer branch
+   of QEMU than the build the lockstep runs (M); the same reading accounts for the mechanism it
+   calls "not identified" (R).
+7. **Hand-over of SP1b-4d, the tick two instructions late in QEMU: one of the two is explained by
+   reasoning on QEMU's code, not measured.** QEMU anchors the periodic alarm at its virtual clock
+   read during the store (M, the code), which QEMU's count of a block's instructions under `-icount`
+   makes include the store (R); inkemu anchors at the start of the store. The other instruction is
+   not in `esp_systimer.c` (M, §6.1).
 
 ## 1. The published scores
 
@@ -128,6 +133,7 @@ Total time (secs): 14.130000
 Iterations/Sec   : 424.628450
 Iterations       : 6000
 Compiler version : GCC14.2.0
+Compiler flags   : -ffunction-sections -fdata-sections -gdwarf-4 -ggdb -nostartfiles -nostartfiles -Og -fno-shrink-wrap [35 × -fdebug-prefix-map=…] -fstrict-volatile-bitfields -fno-jump-tables -fno-tree-switch-conversion -std=gnu17 -O3 -fjump-tables -ftree-switch-conversion
 Memory location  : IRAM
 seedcrc          : 0xe9f5
 [0]crclist       : 0xe714
@@ -135,13 +141,23 @@ seedcrc          : 0xe9f5
 [0]crcstate      : 0x8e3a
 [0]crcfinal      : 0xa14c
 Correct operation validated. See README.md for run and reporting rules.
+CoreMark 1.0 : 424.628450 / GCC14.2.0 -ffunction-sections -fdata-sections -gdwarf-4 -ggdb -nostartfiles -nostartfiles -Og -fno-shrink-wrap [35 × -fdebug-prefix-map=…] -fstrict-volatile-bitfields -fno-jump-tables -fno-tree-switch-conversion -std=gnu17 -O3 -fjump-tables -ftree-switch-conversion / IRAM
 CPU frequency: 160 MHz
 I (17532) main_task: Returned from app_main()
 ```
 
+The extract starts at `Running coremark...` (the boot before it is left out) and is the console
+otherwise whole, but for one shortening, marked `[35 × -fdebug-prefix-map=…]` in the two lines that
+carry the flags: the 35 options `-fdebug-prefix-map=<path>=<name>` the reproducible build adds (from
+`/opt/esp/idf=/IDF` to the toolchain's `esp-14.2.0_20251107` directory), which only rename paths
+in the debug information. The CoreMark sources are compiled at `-O3` (the last `-O` wins over the
+global `-Og`), with jump tables, code in IRAM.
+
 Standard error: no warning; `stopped … after 2792650730 cycles (2208654520 instructions)`, 20 s of
-device time, CPU clock 160 MHz, `trace-hash bfb20978732b673f`. The same run to 40 s gave the same
-score (M). 110 s of wall time on the development host (about 20 M instructions/s).
+device time, `CPU clock at 160 MHz`, `trace-hash bfb20978732b673f`. The same run to 40 s gave the
+same score (M). Durations, measured: the run alone 110 s of wall time on the development host
+(about 20 M instructions/s); the test that runs it 87 s and 102 s on that host (two runs, load
+differing), and **68 s in the CI** (job `reference-boot` of PR #14, "finished in 68.26s").
 
 The CRCs are those Espressif's example prints (P2), and `crcfinal` 0xa14c is that of 6000
 iterations. CoreMark chooses its iterations from its own timing (`core_main.c`: 1, 10, 100, 1000
@@ -209,7 +225,8 @@ file, `hw/timer/esp_systimer.c` `f653119f…`, `hw/timer/esp32c3_systimer.c` `6f
   decremented at its start (`icount_get_executed`, lines 71–75; `icount_get_raw_locked`, 105–126),
   and an I/O access is the last instruction of its block: `now` includes the store (M for the code;
   R for "includes", from QEMU's block accounting). inkemu anchors the alarm at the device time the
-  store starts (`Systimer::write_conf`, an `ASSUMPTION:`): **one instruction**.
+  store starts (`Systimer::write_conf`, an `ASSUMPTION:`): **one instruction, by reasoning, not
+  measured**.
 - The other is not in `esp_systimer.c`: 10 ms is an exact number of 8 ns instructions, and the
   alarm is not rounded to a count of the counter (M). Candidates left: the deadline rounded up to
   an instruction by `icount_round` (lines 224–228) when the clock's bias is not a multiple of 8 ns,
@@ -248,16 +265,46 @@ take it (inside another handler: the run took one interrupt before and had one b
 so its pending bit is set; QEMU takes line 3 when `MIE` returns, keeps the bit (the source stays
 high until the handler of line 3 clears it, later), and at `csrs mstatus` the callback finds line 3
 pending below the new threshold: no pulse, no trap, but "pending", so `MEIP` stays up. inkemu's
-controller does not show its lines through `mip` (row 4) and shows 0. The bit comes from how the
-pinned QEMU funnels its lines into `MEIP` and keeps its pending bits, not from a state of inkemu.
-What is not done: the line pending in QEMU is inferred from the code and the state at the stop, not
-read out of QEMU.
+controller does not show its lines through `mip` (row 4) and shows 0. On this reading the bit comes
+from how the pinned QEMU funnels its lines into `MEIP` and keeps its pending bits, not from a state
+of inkemu. **This is deduced from QEMU's code and the state at the stop, not observed in QEMU**: the
+pending bit was not read out of QEMU (its monitor or gdbstub could; left to sub-project 8). The only
+established fact of this section is the refutation of the USB-Serial-JTAG hypothesis.
 
 Row 4 of `docs/lockstep-differences.md` describes QEMU's `MEIP` as the level of a line enabled,
 high and at or above the threshold, citing `esp32c3_intmatrix_line_should_assert` and
 `esp_cpu_update_parent_irq`: those functions are in the branch `esp-develop`, **not in the tag the
 lockstep runs** (M). Its "three instructions after a store of the threshold that brings the line
-down, mechanism not identified" are the same stale `MEIP`: up from the interrupt taken until the
+down, mechanism not identified" are, on the same reading, that stale `MEIP`: up from the interrupt taken until the
 check after `csrs mstatus` (store of the threshold, `fence`, `li`, `csrs`) (R, consistent with the
 1 112 × 3 measured). The row stays as it is — its measure holds in the three windows of the CI —
 and its source is corrected by a dated revision.
+
+### 6.3 The table's QEMU sources against the tag (review of SP1b-4e, 2026-10-15)
+
+The table said its QEMU sources were those of the branch `esp-develop`. The image
+`espressif/idf:v5.5.2` holds QEMU's binary, headers, libraries and data, not its sources (M: the
+directory `/opt/esp/tools/qemu-riscv32/esp_develop_9.2.2_20250817/qemu/` has `bin`, `include`,
+`lib`, `share`); its binary says `QEMU emulator version 9.2.2 (esp_develop_9.2.2_20250817)` (M,
+`--version` run in the image). The sources are read at the tag of that name and compared with the
+branch, file by file (SHA-256, first 16 hex digits):
+
+| File | Rows | Tag | Branch |
+|---|---|---|---|
+| `hw/misc/esp32c3_rtc_cntl.c` | 9, 37 | `3e8f80499b29ac02` | identical |
+| `hw/riscv/esp32c3.c` | 17 | `77cac6c5da7b3933` | identical |
+| `hw/riscv/esp32c3_clk.c` | 20, 27 | `b78618b8425926e5` | identical |
+| `hw/ssi/esp32c3_spi.c` | 28, 32 | `89a425929b4191cb` | identical |
+| `hw/misc/esp32c3_cache.c` | 30 | `a29978da537389a4` | identical |
+| `hw/timer/esp32c3_systimer.c` | 15, 24, 39 | `6f47915ee122adf6` | identical |
+| `hw/timer/esp_systimer.c` | 15, 24, 39 | `f653119f127f212b` | debug traces only (`SYSTIMER_DEBUG`) |
+| `target/riscv/esp_cpu.c` | 2, 4, 5 | `59c3d76d415e3c75` | differs (§6.2) |
+| `hw/riscv/esp32c3_intmatrix.c` | 2, 4 | `db5bf9e542be64ce` | differs (§6.2) |
+
+Every QEMU function a row's section names is in the tag (M: a search of each), but two:
+`esp_cpu_has_work` (row 2) and the two functions of row 4, which are the branch's. Row 2's value
+at reset comes, in the tag, from `esp32c3_intmatrix_reset_hold` (lines 345–346: `mie` written
+`BIT(12) - 1`); the 0x0EEE QEMU shows is the measure, and that it is what the generic RISC-V core
+keeps of 0xFFF was not read. Row 5's functions (`esp_cpu_get_cycles`, `esp_cpu_csr_write`) are the
+same in both. No measure, parameter, use or pin changes; the sources of rows 2 and 4 are corrected
+by dated revisions.
