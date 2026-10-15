@@ -580,6 +580,12 @@ fn attach_controller<C: PanelController + 'static>(
         "wiring.display.mosi",
         machine.attach_input(display.mosi, Box::new(inputs.data)),
     )?;
+    if display.mosi_pull_up {
+        attached(
+            "wiring.display.mosi_pull_up",
+            machine.pull_up_on_board(display.mosi),
+        )?;
+    }
     machine.attach_clocked(Box::new(Rc::clone(lines)));
     Ok(())
 }
@@ -632,6 +638,11 @@ fn attach_i2c(machine: &mut Esp32C3, wiring: &Wiring) -> Result<Option<I2cHandle
         scl: bus.scl,
         sda: bus.sda,
     };
+    if bus.pull_up {
+        for pin in [bus.scl, bus.sda] {
+            attached("wiring.i2c.pull_up", machine.pull_up_on_board(pin))?;
+        }
+    }
     // The checks of the profile built each chip once already: these refusals are those of a
     // profile built by hand, past `DeviceProfile::from_toml`.
     let refused = |key: &'static str, error: &dyn std::fmt::Display| WiredError::I2cChip {

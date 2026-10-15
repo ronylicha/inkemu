@@ -345,6 +345,10 @@ pub struct IoMatrix {
     held: u32,
     held_drive: [Option<Level>; PADS],
     held_pad: [u32; PADS],
+    /// The pads a resistor of the board pulls up, bit `n` for pad `n` (an I2C bus, a data line a
+    /// chip releases): read high when nothing drives them, whatever the pad's own pulls and through
+    /// any reset, since they are not the chip's.
+    board_pull_ups: u32,
     /// The wake-up at the instant an attached chip said its level may change, a clocked chip
     /// must be advanced, or an input of the board acts, whichever comes first.
     wake: Deadline,
@@ -372,6 +376,7 @@ impl IoMatrix {
             held: 0,
             held_drive: [None; PADS],
             held_pad: [0; PADS],
+            board_pull_ups: 0,
             wake: Deadline::default(),
         };
         for pad in 0..PADS {
@@ -513,6 +518,31 @@ impl IoMatrix {
         }
     }
 
+    /// The pulls of pad `pad` as its level sees them: the pad's own, and a pull-up of the board.
+    ///
+    /// ASSUMPTION: a resistor of the board (a few kΩ) wins over the pad's internal pull-down (about
+    /// 45 kΩ in the DC characteristics of the ESP32-C3 datasheet): the line reads high. No source measures a board's resistor
+    /// against the pad's; an I2C bus at 400 kHz needs one strong enough to rise in a bit time.
+    fn pulls(&self, pad: usize) -> u32 {
+        let board = if self.board_pull_ups & (1 << pad) != 0 {
+            pad::FUN_WPU
+        } else {
+            0
+        };
+        self.pad_config(pad) | board
+    }
+
+    /// Pulls pin `pin` up on the board (a resistor to the supply): a line nobody drives reads high
+    /// from now on, through any reset. The pads are worked out again at once.
+    /// # Errors
+    /// [`AttachError::NoSuchPin`].
+    pub(crate) fn pull_up_on_board(&mut self, ctx: &mut Ctx, pin: u8) -> Result<(), AttachError> {
+        let pad = pad_of(pin)?;
+        self.board_pull_ups |= 1 << pad;
+        self.settle(ctx);
+        Ok(())
+    }
+
     /// Of the pins `wanted` names with a level (GPIO0 to GPIO5, a deep sleep's wake pins), those
     /// at that level now, bit `n` for GPIO`n`: what an attached chip drives, else the pad's own
     /// drive and pulls, which a deep sleep keeps. The pads are read without being worked out: the
@@ -525,7 +555,7 @@ impl IoMatrix {
             let external = self.chips.inputs[pad]
                 .as_mut()
                 .and_then(|chip| chip.level(at));
-            if pad::level(self.drive_of(pad), external, self.pad_config(pad)) == level {
+            if pad::level(self.drive_of(pad), external, self.pulls(pad)) == level {
                 hit |= 1 << pad;
             }
         }
@@ -857,17 +887,19 @@ impl IoMatrix {
     }
 
     /// Routes I2C0 to `wires` as ESP-IDF's `i2c_master` does (`i2c_common_set_pins`): each pad in
-    /// GPIO function, input enabled, pulled up and open drain, the output signal through the
-    /// matrix and the input signal read from it.
+    /// GPIO function, input enabled, open drain, pulled up when `pulled_up` (the driver's
+    /// `enable_internal_pullup`), the output signal through the matrix and the input signal read
+    /// from it.
     #[cfg(test)]
-    pub(crate) fn route_i2c(&mut self, ctx: &mut Ctx, wires: I2cWires) {
+    pub(crate) fn route_i2c(&mut self, ctx: &mut Ctx, wires: I2cWires, pulled_up: bool) {
         /// `GPIO_FUNCm_IN_SEL_CFG.SEL`: the signal comes through the matrix.
         const SIG_IN_SEL: u32 = 1 << 6;
+        let pull = if pulled_up { pad::FUN_WPU } else { 0 };
         for (pin, signal) in [(wires.scl, pad::I2C_SCL), (wires.sda, pad::I2C_SDA)] {
             let n = u32::from(pin);
             let gpio_function = 1 << 12;
             let writes = [
-                (PAD0 + 4 * n, gpio_function | FUN_IE | pad::FUN_WPU),
+                (PAD0 + 4 * n, gpio_function | FUN_IE | pull),
                 (PIN0 + 4 * n, PAD_DRIVER),
                 (FUNC0_OUT_SEL_CFG + 4 * n, signal),
                 (FUNC0_IN_SEL_CFG + 4 * signal, SIG_IN_SEL | n),
@@ -914,7 +946,7 @@ impl IoMatrix {
             let external = self.chips.inputs[pad]
                 .as_mut()
                 .and_then(|chip| chip.level(at));
-            if pad::level(driven, external, self.pad_config(pad)).is_high() {
+            if pad::level(driven, external, self.pulls(pad)).is_high() {
                 levels |= 1 << pad;
             }
         }

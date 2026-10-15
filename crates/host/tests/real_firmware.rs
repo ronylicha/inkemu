@@ -316,6 +316,15 @@ fn crosspoint_1_6_5_on_the_x3_reaches_its_home_screen_at_its_second_boot() {
         "the three chips answer: {}",
         first.console
     );
+    // The UC8253 drives nothing on a read: the board's pull-up makes the three bytes `FF`, as
+    // reported from the field, and `FreeInk` keeps the first batch's controller (ADR 0015).
+    assert!(
+        first
+            .console
+            .contains("X3 stock probe VER=FF FF FF BUSY-timeout=0 -> UC8253\n"),
+        "{}",
+        first.console
+    );
     // The mutex exists and is free: `beginTransmission` takes it silently, `endTransmission` fails
     // on the NULL buffer without giving it back; the next `Wire.begin()` never returns.
     assert!(

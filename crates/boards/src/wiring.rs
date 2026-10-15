@@ -166,6 +166,9 @@ pub struct DisplayWiring {
     pub rst: u8,
     pub busy: u8,
     pub rotation: Rotation,
+    /// A resistor of the board pulls the data line up: released by the `SoC` and by the
+    /// controller, it reads high (the X3, whose `UC8253` drives nothing on a read).
+    pub mosi_pull_up: bool,
 }
 
 /// Keys that pull one ADC pin to a level each.
@@ -220,6 +223,9 @@ pub struct SdWiring {
 pub struct I2cWiring {
     pub scl: u8,
     pub sda: u8,
+    /// Resistors of the board pull SCL and SDA up: a line nobody drives reads high, whatever the
+    /// pads' own pulls. Every profile says it.
+    pub pull_up: bool,
     /// A BQ27220 fuel gauge, at `0x55`.
     pub gauge: Option<Bq27220Config>,
     /// A DS3231 real-time clock, at `0x68`.
@@ -338,6 +344,8 @@ struct RawDisplay {
     rst: u8,
     busy: u8,
     rotation: u16,
+    #[serde(default)]
+    mosi_pull_up: bool,
 }
 
 #[derive(Deserialize)]
@@ -402,6 +410,7 @@ struct RawSd {
 struct RawI2c {
     scl: u8,
     sda: u8,
+    pull_up: bool,
     bq27220: Option<RawGauge>,
     ds3231: Option<RawClock>,
     qmi8658: Option<RawMotion>,
@@ -558,6 +567,7 @@ fn display(raw: &RawDisplay, pins: &mut Pins) -> Result<DisplayWiring, String> {
         rst: raw.rst,
         busy: raw.busy,
         rotation,
+        mosi_pull_up: raw.mosi_pull_up,
     })
 }
 
@@ -765,6 +775,7 @@ fn i2c(raw: RawI2c, pins: &mut Pins) -> Result<I2cWiring, String> {
     Ok(I2cWiring {
         scl: raw.scl,
         sda: raw.sda,
+        pull_up: raw.pull_up,
         gauge,
         clock,
         motion,
@@ -856,6 +867,8 @@ mod tests {
         );
         assert_eq!(display.config.size(), (792, 528));
         assert!(display.config.is_approximation());
+        assert!(display.mosi_pull_up, "the data line reads 0xFF released");
+        assert!(wiring.i2c.as_ref().unwrap().pull_up, "the bus is pulled up");
         let ids: Vec<String> = wiring.buttons().into_iter().map(|b| b.id).collect();
         assert_eq!(
             ids,
@@ -897,7 +910,7 @@ mod tests {
         );
     }
 
-    const I2C: &str = "[wiring.i2c]\nscl = 0\nsda = 20\n";
+    const I2C: &str = "[wiring.i2c]\nscl = 0\nsda = 20\npull_up = true\n";
 
     #[test]
     fn the_i2c_chips_are_refused_as_the_chips_refuse_them_naming_the_key() {
@@ -922,11 +935,22 @@ mod tests {
                 "{detail}"
             );
         }
-        let detail = refusal(&format!("{DISPLAY}[wiring.i2c]\nscl = 4\nsda = 20\n"));
+        let detail = refusal(&format!(
+            "{DISPLAY}[wiring.i2c]\nscl = 4\nsda = 20\npull_up = true\n"
+        ));
         assert!(
             detail.starts_with("`wiring.i2c.scl` = 4: GPIO4 is already `wiring.display.dc`"),
             "{detail}"
         );
+    }
+
+    /// A bus says whether the board pulls it up: a profile cannot leave it out.
+    #[test]
+    fn an_i2c_bus_without_its_pull_ups_said_is_refused() {
+        let error = load(&format!("{DISPLAY}[wiring.i2c]\nscl = 0\nsda = 20\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing field `pull_up`"), "{error}");
     }
 
     #[test]

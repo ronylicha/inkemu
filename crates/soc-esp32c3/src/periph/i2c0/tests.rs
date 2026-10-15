@@ -339,7 +339,7 @@ fn bus_with(
     routed: crate::periph::I2cWires,
 ) -> (I2c0, IoMatrix) {
     let mut io = IoMatrix::new(0);
-    io.route_i2c(ctx, routed);
+    io.route_i2c(ctx, routed, true);
     io.attach_i2c(wires, Box::new(std::rc::Rc::clone(chip)))
         .unwrap();
     let mut i2c = master(ctx);
@@ -484,4 +484,189 @@ fn a_register_write_reaches_the_chip_and_a_reset_keeps_the_board() {
         read(&mut i2c, ctx, INT_RAW) & TRANS_COMPLETE,
         TRANS_COMPLETE
     );
+}
+
+/// The X3's bus, routed by a firmware that leaves the pads' own pull-ups off (`Wire` and
+/// `i2c_master` may), with the chip at 0x55 and, when `board`, the resistors of the board on SCL
+/// and SDA.
+fn unpulled_bus(
+    ctx: &mut Ctx,
+    chip: &std::rc::Rc<std::cell::RefCell<RegisterChip>>,
+    board: bool,
+) -> (I2c0, IoMatrix) {
+    let mut io = IoMatrix::new(0);
+    io.route_i2c(ctx, WIRES, false);
+    if board {
+        for pin in [WIRES.scl, WIRES.sda] {
+            io.pull_up_on_board(ctx, pin).unwrap();
+        }
+    }
+    io.attach_i2c(WIRES, Box::new(std::rc::Rc::clone(chip)))
+        .unwrap();
+    let mut i2c = master(ctx);
+    i2c.chips_attached();
+    (i2c, io)
+}
+
+/// A read of `count` bytes from `address`, the address byte sent without its ACK checked: the
+/// bytes are what the line carries, whoever answers.
+fn unchecked_read(i2c: &mut I2c0, ctx: &mut Ctx, address: u8, count: u32) {
+    assert!(i2c.write(ctx, DATA, u32::from(address << 1 | 1)));
+    for (n, cmd) in [
+        command(OP_RSTART, 0, false),
+        command(OP_WRITE, 1, false),
+        command(OP_READ, count, false) | ACK_VAL,
+        command(OP_STOP, 0, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offset = COMD0 + 4 * u32::try_from(n).unwrap();
+        assert!(i2c.write(ctx, offset, cmd));
+    }
+    assert!(i2c.write(ctx, CTR, MS_MODE | TRANS_START));
+}
+
+/// ADR 0015: with the pads' own pull-ups off, the resistors of the board hold the released lines
+/// high: an address nobody acknowledges gets a NACK, and a byte nobody drives reads `0xFF`, as on
+/// a bus without chips; the chip at its own address still answers.
+#[test]
+fn with_the_pads_unpulled_the_boards_pull_ups_make_an_absent_address_a_nack_and_a_read_ff() {
+    // Each sequence on a bus of its own: a NACK leaves unsent bytes in the TX FIFO.
+    let ctx = &mut Ctx::default();
+    let chip = RegisterChip::at(0x55);
+    let (mut i2c, mut io) = unpulled_bus(ctx, &chip, true);
+    register_read(&mut i2c, ctx, 0x68, 0x00);
+    run_stepped(&mut i2c, ctx, &mut io);
+    assert_eq!(read(&mut i2c, ctx, INT_RAW) & (NACK | TRANS_COMPLETE), NACK);
+
+    let ctx = &mut Ctx::default();
+    let (mut i2c, mut io) = unpulled_bus(ctx, &chip, true);
+    unchecked_read(&mut i2c, ctx, 0x68, 2);
+    run_stepped(&mut i2c, ctx, &mut io);
+    assert_eq!(
+        [read(&mut i2c, ctx, DATA), read(&mut i2c, ctx, DATA)],
+        [0xFF, 0xFF]
+    );
+
+    let ctx = &mut Ctx::default();
+    let (mut i2c, mut io) = unpulled_bus(ctx, &chip, true);
+    register_read(&mut i2c, ctx, 0x55, 0x2C);
+    run_stepped(&mut i2c, ctx, &mut io);
+    assert_eq!(read(&mut i2c, ctx, INT_RAW) & NACK, 0);
+    assert_eq!(read(&mut i2c, ctx, DATA), 70);
+}
+
+/// What a command list left: the interrupt bits right after `TRANS_START` and once it ended, the
+/// instant it ended, its `DONE` bits, the state of the bus and the bytes of the RX FIFO.
+#[derive(Debug, PartialEq, Eq)]
+struct Left {
+    raw_at_start: u32,
+    raw: u32,
+    ended: Cycles,
+    done: u32,
+    bus: u32,
+    received: Vec<u32>,
+}
+
+/// Runs the list `list` writes, with `tx` in the TX FIFO, on a bus without chips or, when
+/// `chips`, on the X3's bus with a chip at 0x55 that the list never addresses.
+fn left_by(chips: bool, tx: &[u32], list: &[u32]) -> Left {
+    let ctx = &mut Ctx::default();
+    let chip = RegisterChip::at(0x55);
+    let (mut i2c, mut io) = if chips {
+        bus_with(ctx, &chip, WIRES, WIRES)
+    } else {
+        (master(ctx), IoMatrix::new(0))
+    };
+    for &byte in tx {
+        assert!(i2c.write(ctx, DATA, byte));
+    }
+    for (n, &cmd) in list.iter().enumerate() {
+        let offset = COMD0 + 4 * u32::try_from(n).unwrap();
+        assert!(i2c.write(ctx, offset, cmd));
+    }
+    assert!(i2c.write(ctx, CTR, MS_MODE | TRANS_START));
+    let raw_at_start = read(&mut i2c, ctx, INT_RAW);
+    if chips {
+        run_stepped(&mut i2c, ctx, &mut io);
+    } else {
+        run(&mut i2c, ctx);
+    }
+    let rx = (read(&mut i2c, ctx, SR) >> RXFIFO_CNT_SHIFT) & 0x3F;
+    Left {
+        raw_at_start,
+        raw: read(&mut i2c, ctx, INT_RAW),
+        ended: ctx.now(),
+        done: (0..8).fold(0, |done, n| {
+            done | u32::from(read(&mut i2c, ctx, COMD0 + 4 * n) & DONE != 0) << n
+        }),
+        bus: read(&mut i2c, ctx, SR) & (BUS_BUSY | RESP_REC),
+        received: (0..rx).map(|_| read(&mut i2c, ctx, DATA)).collect(),
+    }
+}
+
+/// The two paths of I2C0 agree wherever nobody answers (ADR 0015): the same list gives the same
+/// interrupts, at the same instant, with the same `DONE` bits, bus state and bytes, whether chips
+/// are on the bus or not. A list that lasts no time publishes at the next wake-up on both, a READ
+/// of no byte raises no `BYTE_TRANS_DONE` on either.
+#[test]
+fn the_same_list_leaves_the_same_on_a_bus_with_and_without_chips() {
+    let address = 0x68 << 1;
+    let lists: [(&[u32], &[u32]); 6] = [
+        (&[], &[command(OP_END, 0, false)]),
+        (
+            &[],
+            &[command(OP_READ, 0, false), command(OP_STOP, 0, false)],
+        ),
+        (
+            &[address],
+            &[
+                command(OP_RSTART, 0, false),
+                command(OP_WRITE, 1, true),
+                command(OP_STOP, 0, false),
+            ],
+        ),
+        (
+            &[address | 1],
+            &[
+                command(OP_RSTART, 0, false),
+                command(OP_WRITE, 1, false),
+                command(OP_READ, 0, false),
+                command(OP_READ, 2, false) | ACK_VAL,
+                command(OP_STOP, 0, false),
+            ],
+        ),
+        (
+            &[address],
+            &[
+                command(OP_RSTART, 0, false),
+                command(OP_WRITE, 2, false),
+                command(OP_STOP, 0, false),
+            ],
+        ),
+        (&[], &[7 << OP_SHIFT, command(OP_STOP, 0, false)]),
+    ];
+    for (tx, list) in lists {
+        let without = left_by(false, tx, list);
+        let with = left_by(true, tx, list);
+        assert_eq!(with, without, "{list:x?}");
+        assert_eq!(
+            without.raw_at_start & !TXFIFO_WM,
+            0,
+            "{list:x?}: nothing yet"
+        );
+    }
+}
+
+/// Without a pull-up anywhere, a released line reads low: an absent address seems acknowledged
+/// and a byte nobody drives reads `0x00`. The board's resistors are what the test above relies on.
+#[test]
+fn without_any_pull_up_a_released_bus_reads_low() {
+    let ctx = &mut Ctx::default();
+    let chip = RegisterChip::at(0x55);
+    let (mut i2c, mut io) = unpulled_bus(ctx, &chip, false);
+    unchecked_read(&mut i2c, ctx, 0x68, 1);
+    run_stepped(&mut i2c, ctx, &mut io);
+    assert_eq!(read(&mut i2c, ctx, DATA), 0x00);
 }

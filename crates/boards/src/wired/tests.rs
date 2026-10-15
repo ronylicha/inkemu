@@ -415,6 +415,38 @@ fn a_request_of_the_board_is_checked_against_the_profile_without_a_machine() {
 
 /// ADR 0015: the X3 powers on with its UC8253, its keys, its switched card slot and the three
 /// chips of its I2C bus; it has no supply to cut, and no cable line.
+/// Puts GPIO0, GPIO10 and GPIO20 in GPIO function, inputs without the pads' own pulls, nothing
+/// driving them, then copies `GPIO_IN` into `a0` for ever.
+fn read_released_lines() -> Vec<u32> {
+    let mut program = stop_watchdogs();
+    for pin in ["GPIO0", "GPIO10", "GPIO20"] {
+        program.extend(store_register(
+            register("IO_MUX", pin),
+            GPIO_FUNCTION | FUN_IE,
+        ));
+    }
+    let top = program.len();
+    program.extend(load_register(register("GPIO", "IN")));
+    program.push(asm::addi(A0, T1, 0));
+    let back = i32::try_from((program.len() - top) * 4).unwrap();
+    program.push(asm::jal(0, -back));
+    program
+}
+
+/// The X3's board pulls up SCL (GPIO0), SDA (GPIO20) and the display's data line (GPIO10): with
+/// the pads' own pulls off and nothing driving them, they read high (ADR 0015). The X4's data line
+/// has no such resistor: it reads low.
+#[test]
+fn the_x3_board_pulls_up_its_i2c_bus_and_its_display_data_line() {
+    let lines = (1 << 0) | (1 << 10) | (1 << 20);
+    let mut x3 = power_on(&builtin("x3").unwrap(), &read_released_lines(), no_hold());
+    run_to(&mut x3.machine, 100_000);
+    assert_eq!(x3.machine.x()[usize::from(A0)] & lines, lines);
+    let mut x4 = power_on(&x4(), &read_released_lines(), no_hold());
+    run_to(&mut x4.machine, 100_000);
+    assert_eq!(x4.machine.x()[usize::from(A0)] >> 10 & 1, 0);
+}
+
 #[test]
 fn the_x3_powers_on_wired_with_its_i2c_chips() {
     let x3 = builtin("x3").unwrap();

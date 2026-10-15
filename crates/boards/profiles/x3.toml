@@ -97,6 +97,12 @@ busy = 6
 # Clockwise: the glass shows the framebuffer as FreeInk holds it, 792 × 528, and the firmware draws
 # portrait into it with x' = y, y' = 527 - x (section 9): a quarter turn clockwise shows it upright.
 rotation = 90
+# The data line is pulled up on the board: on the first batch's UC8253, which drives nothing on a
+# read, released lines read uniform 0xFF "through the pull-up (field-confirmed)" (research
+# sp3-x3-chips.md, section 1, point 3, and section 2.6, citing Papyrix's X3 notes), and FreeInk's
+# probe turns the pin into an input without a pull of its own (sp3-x3-firmware.md, section 2.2).
+# ASSUMPTION: the resistor's value; it wins over the pad's pulls.
+mosi_pull_up = true
 
 # The ladders are the X4's: same pins, same thresholds, "X3 and X4 share this pinout" (section 9),
 # so the X4's levels. The side keys differ: Up on the left edge, Down on the right (section 9).
@@ -140,6 +146,11 @@ power = 13
 [wiring.i2c]
 scl = 0
 sda = 20
+# ASSUMPTION: resistors of the board pull SCL and SDA up. No schematic, firmware or photograph of
+# the X3 found names them (docs/research/sp3-x3-chips.md, section 1, point 5); an I2C bus at
+# 400 kHz always has them, the pads' own pull-ups (about 45 kΩ) being too weak for its rise times.
+# Arduino's Wire turns the pads' pull-ups on as well (sp3-x3-firmware.md, section 7).
+pull_up = true
 
 # ASSUMPTION: a battery at rest, 3.85 V and 70 %, discharging 15 mA (chips research, section 3.5).
 [wiring.i2c.bq27220]

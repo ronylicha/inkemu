@@ -182,6 +182,9 @@ struct Timing {
 /// The condition of the bus whose end the wake-up of a stepped sequence marks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
+    /// `TRANS_START` was written: the list is planned at the next wake-up, at the same instant,
+    /// as a bus without chips publishes a list that lasts no time (`run`).
+    Begin,
     /// The START of an RSTART command.
     Start,
     /// The next byte of the TX FIFO, written.
@@ -320,6 +323,7 @@ impl I2c0 {
         let cmd = self.command(stepping.command);
         let bit = 1 << stepping.command;
         match stepping.step {
+            Step::Begin => {}
             Step::Start => {
                 stepping.outcome.busy = true;
                 stepping.outcome.raised |= TRANS_START_INT;
@@ -543,7 +547,10 @@ impl I2c0 {
                 OP_READ => {
                     outcome.received += bytes;
                     cycles += BITS_PER_BYTE * bit * u64::try_from(bytes).unwrap_or(0);
-                    outcome.raised |= BYTE_TRANS_DONE;
+                    // A byte moved, as a bus with chips counts it (`step`): none for a READ of 0.
+                    if bytes > 0 {
+                        outcome.raised |= BYTE_TRANS_DONE;
+                    }
                 }
                 OP_STOP => {
                     cycles += stop;
@@ -588,7 +595,7 @@ impl I2c0 {
                 period,
                 command: 0,
                 byte: 0,
-                step: Step::Start,
+                step: Step::Begin,
                 address_next: false,
                 outcome: Outcome {
                     busy: self.busy,
@@ -597,7 +604,7 @@ impl I2c0 {
                 bytes: Vec::new(),
             });
             self.busy = true;
-            self.plan(ctx, stepping);
+            self.arm(ctx, stepping, 0);
             return;
         }
         let (outcome, cycles) = self.run();

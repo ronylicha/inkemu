@@ -1301,6 +1301,15 @@ impl Esp32C3 {
         Ok(())
     }
 
+    /// Pulls pin `pin` up on the board, as a resistor to the supply does (the lines of an I2C bus,
+    /// a data line a chip releases): when nothing drives it, it reads high, whatever the pad's
+    /// own pulls and through any reset of the chip.
+    /// # Errors
+    /// [`AttachError::NoSuchPin`] when the pin does not exist.
+    pub fn pull_up_on_board(&mut self, pin: u8) -> Result<(), AttachError> {
+        self.bus.periph.io.pull_up_on_board(&mut self.bus.ctx, pin)
+    }
+
     /// Attaches a chip that does work of its own over time (a display controller running a
     /// refresh): the machine advances it to each deadline it names, in device time, whether the
     /// CPU runs, waits for an interrupt, sleeps until a timer or the chip is in deep sleep (the
