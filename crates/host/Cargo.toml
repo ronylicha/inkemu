@@ -40,6 +40,8 @@ nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Reads the manifests of the repository: `test-support` stays out of every normal build.
+toml.workspace = true
 # The shape the interface reads the updates in.
 serde_json = "1"
 svd-regs.workspace = true
