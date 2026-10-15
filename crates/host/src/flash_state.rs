@@ -882,6 +882,21 @@ impl RunFlash {
         seed: Option<Seed>,
         size: u32,
     ) -> Result<(RunFlash, Option<Vec<u8>>), FlashStateError> {
+        let mut seed = seed;
+        Self::begin_keeping(flash_file, reset, &mut seed, size)
+    }
+
+    /// [`RunFlash::begin`], which takes `seed` only when it succeeds: a failure leaves it to the
+    /// caller, for a content that exists nowhere else (the flash a life left, kept in memory).
+    ///
+    /// # Errors
+    /// As [`RunFlash::begin`].
+    pub fn begin_keeping(
+        flash_file: Option<&Path>,
+        reset: bool,
+        seed: &mut Option<Seed>,
+        size: u32,
+    ) -> Result<(RunFlash, Option<Vec<u8>>), FlashStateError> {
         let input = seed.as_ref().map(|seed| seed.input);
         Self::take(flash_file, reset, seed, size).map_err(|error| match error {
             // The file is judged before the seed is looked at: the remedy names what was given.
@@ -900,7 +915,7 @@ impl RunFlash {
     fn take(
         flash_file: Option<&Path>,
         reset: bool,
-        seed: Option<Seed>,
+        seed: &mut Option<Seed>,
         size: u32,
     ) -> Result<(RunFlash, Option<Vec<u8>>), FlashStateError> {
         let state = flash_file
@@ -910,7 +925,7 @@ impl RunFlash {
         // size is not a flash of this device, and `--reset-flash` must not destroy it.
         let from_file = match &state {
             Some(state) if state.exists()? => {
-                if let Some(seed) = &seed
+                if let Some(seed) = seed.as_ref()
                     && !reset
                 {
                     return Err(FlashStateError::BothGiven {
@@ -922,9 +937,10 @@ impl RunFlash {
             }
             _ => false,
         };
+        // Nothing fails past this point: the seed is taken only now.
         let content = match &state {
             Some(state) if from_file => Some(state.load()?),
-            _ => seed.map(|seed| seed.content),
+            _ => seed.take().map(|seed| seed.content),
         };
         let start_sha256 = content_sha256(content.as_deref().unwrap_or_default(), size);
         Ok((

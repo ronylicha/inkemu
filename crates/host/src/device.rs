@@ -201,7 +201,7 @@ impl FlashKeeper {
         if self.run_flash.is_some() {
             return Ok(self.next.take());
         }
-        let seed = self.next.take().map(|content| Seed {
+        let mut seed = self.next.take().map(|content| Seed {
             input: Input::Flash,
             content,
         });
@@ -209,7 +209,11 @@ impl FlashKeeper {
             return Ok(None);
         }
         let reset = seed.is_some();
-        let (run_flash, content) = RunFlash::begin(self.file.as_deref(), reset, seed, self.size)?;
+        let begun = RunFlash::begin_keeping(self.file.as_deref(), reset, &mut seed, self.size);
+        // A file that cannot be taken now (its directory, its lock) must not lose the content:
+        // the next power-on tries again from it.
+        self.next = seed.map(|seed| seed.content);
+        let (run_flash, content) = begun?;
         self.run_flash = Some(run_flash);
         Ok(content)
     }
@@ -1943,6 +1947,45 @@ mod tests {
             "the failed save is said: {first:?}"
         );
         assert!(!file.exists());
+        emulator.command(Command::Reset).unwrap();
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
+        emulator.shutdown();
+        assert_eq!(*powered.lock().unwrap(), [None, Some(vec![0x00])]);
+        assert_eq!(std::fs::read(&file).unwrap()[0x3000], 0x00);
+    }
+
+    /// A power-on refused because the flash file cannot be taken keeps the content in memory:
+    /// a later power-on starts from it, and writes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_flash_file_that_cannot_be_taken_keeps_the_flash() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let place = dir.path().join("kept");
+        std::fs::create_dir(&place).unwrap();
+        let file = place.join("flash.bin");
+        let powered = Arc::new(Mutex::new(Vec::new()));
+        let keeper = FlashKeeper::begin(Some(file.clone()), false, None, 1 << 20).unwrap();
+        let launch = Launch::new(
+            writing_device(0x00, Arc::clone(&powered)),
+            keeper,
+            Limits {
+                max_cycles: Some(50_000),
+                max_device_nanos: None,
+            },
+            LOOK,
+            None,
+        );
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (emulator, updates) = started(launch, Speed::Fastest);
+        until(&updates, |u| matches!(u, Update::LifeEnded { life: 1, .. }));
+        // The directory still takes no file: the lock of the next life cannot be made.
+        let refused = emulator.command(Command::Reset);
+        std::fs::set_permissions(&place, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(refused, Err(CommandError::PowerOn(_))),
+            "{refused:?}"
+        );
         emulator.command(Command::Reset).unwrap();
         until(&updates, |u| matches!(u, Update::LifeEnded { life: 2, .. }));
         emulator.shutdown();
