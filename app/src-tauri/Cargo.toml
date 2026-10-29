@@ -21,11 +21,11 @@ name = "inkemu-app"
 path = "src/main.rs"
 
 [build-dependencies]
-tauri-build = { version = "2.7.3", features = [] }
+tauri-build = { version = "2.7.4", features = [] }
 
 [dependencies]
-tauri = { version = "2.12.4", features = [] }
-tauri-plugin-dialog = "2.8.3"
+tauri = { version = "2.12.5", features = [] }
+tauri-plugin-dialog = "2.8.4"
 serde = { version = "1", features = ["derive"] }
 # SIGINT and SIGTERM power the device off before the application exits, as in the command line.
 ctrlc = { version = "3.5", features = ["termination"] }
